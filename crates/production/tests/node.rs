@@ -299,7 +299,7 @@ fn a_stopped_host_starts_again_on_its_own_data() {
     assert!(history.get_state_by_epoch(Epoch::GENESIS).is_none());
     assert!(history.states_since(Epoch::GENESIS).is_empty());
     let transaction = test_transaction(1);
-    assert!(!kept.submit(Arc::new(transaction.clone())));
+    assert!(!kept.submit(transaction.clone()));
     let previewed = Builder::new_current_thread()
         .build()
         .unwrap()

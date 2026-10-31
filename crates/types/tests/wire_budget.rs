@@ -824,8 +824,8 @@ fn a_terms_entry_encodes_under_its_weight() {
 struct ResponseWire {
     header: BlockHeader,
     qc: QuorumCertificate,
-    transactions: Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>,
-    certificates: Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)>,
+    transactions: Vec<(TxHash, Option<Verifiable<Transaction>>)>,
+    certificates: Vec<(FinalizationHash, Option<Verifiable<Finalization>>)>,
     provisions: ProvisionsWire,
     abandonment_records: Vec<AbandonmentRecord>,
     state_claims: Vec<StateClaim>,
@@ -837,7 +837,7 @@ struct ResponseWire {
 /// The provisions payload of [`ResponseWire`], in both forms.
 #[derive(Hbor)]
 enum ProvisionsWire {
-    Live(Vec<(ProvisionHash, Option<Arc<Verifiable<Provisions>>>)>),
+    Live(Vec<(ProvisionHash, Option<Verifiable<Provisions>>)>),
     Sealed {
         hashes: Vec<ProvisionHash>,
         engagements: Vec<Engagement>,
@@ -1200,7 +1200,7 @@ fn a_stating_half_of_a_full_tick_encodes_within_the_frame() {
     let half = Finalization::new(
         tick_id,
         TickHalf::Stated,
-        Some(Arc::new(certificate)),
+        Some(certificate),
         Capped::new(receipts).expect("a receipt per outcome"),
     );
     assert_eq!(half.validate_against_certificates(), Ok(()));

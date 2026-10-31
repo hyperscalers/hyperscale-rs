@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
+use std::sync::Arc;
 
 use hyperscale_crypto::{VerifiedSignature, Verifier};
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
@@ -37,7 +38,7 @@ const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.atteste
 ///
 /// The signed value is `global_receipt_root`, a merkle root over the whole
 /// tick's outcome leaves, so a copy can carry any subset of them and still
-/// prove itself: the leaves it holds plus [`Self::proof`] rebuild the
+/// prove itself: the leaves it holds plus its multiproof rebuild the
 /// signed root. The producing shard is party to its entire tick, so its
 /// own copy carries every leaf and needs no proof; a copy sent to a
 /// participating shard carries the outcomes naming that shard, and its
@@ -47,7 +48,15 @@ const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.atteste
 /// copy holds, and decoding rebuilds the root from the carried leaves at
 /// their stated indices. A complete copy is the case where those are all
 /// of them and the proof is empty, which is why it needs no marker.
-pub struct ExecutionCertificate {
+///
+/// Every clone shares one allocation, so moving a certificate between
+/// its raw, verifiable and verified forms, or fanning it out to every
+/// hosted shard, copies a pointer rather than its outcomes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExecutionCertificate(Arc<Carried>);
+
+/// What every clone of one [`ExecutionCertificate`] shares.
+struct Carried {
     tick_id: TickId,
     vote_anchor_ts: WeightedTimestamp,
     global_receipt_root: GlobalReceiptRoot,
@@ -72,37 +81,20 @@ pub struct ExecutionCertificate {
 impl Debug for ExecutionCertificate {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExecutionCertificate")
-            .field("tick_id", &self.tick_id)
-            .field("vote_anchor_ts", &self.vote_anchor_ts)
-            .field("global_receipt_root", &self.global_receipt_root)
-            .field("tx_count", &self.tx_count)
-            .field("leaf_indices", &self.leaf_indices)
-            .field("tx_outcomes", &self.tx_outcomes)
-            .field("proof", &self.proof.len())
-            .field("aggregated_signature", &self.aggregated_signature)
-            .field("signers", &self.signers)
+            .field("tick_id", &self.0.tick_id)
+            .field("vote_anchor_ts", &self.0.vote_anchor_ts)
+            .field("global_receipt_root", &self.0.global_receipt_root)
+            .field("tx_count", &self.0.tx_count)
+            .field("leaf_indices", &self.0.leaf_indices)
+            .field("tx_outcomes", &self.0.tx_outcomes)
+            .field("proof", &self.0.proof.len())
+            .field("aggregated_signature", &self.0.aggregated_signature)
+            .field("signers", &self.0.signers)
             .finish_non_exhaustive()
     }
 }
 
-impl Clone for ExecutionCertificate {
-    fn clone(&self) -> Self {
-        Self {
-            tick_id: self.tick_id,
-            vote_anchor_ts: self.vote_anchor_ts,
-            global_receipt_root: self.global_receipt_root,
-            tx_count: self.tx_count,
-            leaf_indices: self.leaf_indices.clone(),
-            tx_outcomes: self.tx_outcomes.clone(),
-            proof: self.proof.clone(),
-            aggregated_signature: self.aggregated_signature,
-            signers: self.signers.clone(),
-            cached_bytes: self.cached_bytes.clone(),
-        }
-    }
-}
-
-impl PartialEq for ExecutionCertificate {
+impl PartialEq for Carried {
     fn eq(&self, other: &Self) -> bool {
         self.tick_id == other.tick_id
             && self.vote_anchor_ts == other.vote_anchor_ts
@@ -116,7 +108,7 @@ impl PartialEq for ExecutionCertificate {
     }
 }
 
-impl Eq for ExecutionCertificate {}
+impl Eq for Carried {}
 
 // Manual codec: cached_bytes is derived, not serialized.
 //
@@ -134,7 +126,7 @@ impl Eq for ExecutionCertificate {}
 // complete copy also carries no proof — its wire form is today's plus the
 // leaf count.
 
-impl HborWidth for ExecutionCertificate {
+impl HborWidth for Carried {
     const MIN_ENCODED_LEN: usize = 1;
 }
 
@@ -182,14 +174,14 @@ fn decode_leaf_indices(mut bytes: &[u8], count: usize) -> Result<Vec<u32>, HborD
     }
 }
 
-impl HborEncode for ExecutionCertificate {
+impl HborEncode for Carried {
     fn encode<S: Sink>(&self, encoder: &mut HborEncoder<S>) -> Result<(), HborEncodeError> {
         encoder.nested(&self.tick_id)?;
         encoder.nested(&self.vote_anchor_ts)?;
         encoder.nested(&self.global_receipt_root)?;
         encoder.nested(&self.tx_count)?;
         encoder.nested(&self.tx_outcomes)?;
-        if self.is_complete() {
+        if self.tx_outcomes.len() == self.tx_count as usize {
             encoder.write_sized(&[])?;
         } else {
             encoder.write_sized(&encode_leaf_indices(&self.leaf_indices)?)?;
@@ -200,7 +192,7 @@ impl HborEncode for ExecutionCertificate {
     }
 }
 
-impl HborDecode for ExecutionCertificate {
+impl HborDecode for Carried {
     fn decode(decoder: &mut HborDecoder<'_>) -> Result<Self, HborDecodeError> {
         let tick_id: TickId = decoder.nested()?;
         let vote_anchor_ts: WeightedTimestamp = decoder.nested()?;
@@ -246,7 +238,7 @@ impl HborDecode for ExecutionCertificate {
             ));
         }
 
-        let mut ec = Self {
+        Ok(Self {
             tick_id,
             vote_anchor_ts,
             global_receipt_root,
@@ -257,9 +249,23 @@ impl HborDecode for ExecutionCertificate {
             aggregated_signature,
             signers,
             cached_bytes: None,
-        };
-        ec.populate_cached_bytes();
-        Ok(ec)
+        })
+    }
+}
+
+impl HborWidth for ExecutionCertificate {
+    const MIN_ENCODED_LEN: usize = Carried::MIN_ENCODED_LEN;
+}
+
+impl HborEncode for ExecutionCertificate {
+    fn encode<S: Sink>(&self, encoder: &mut HborEncoder<S>) -> Result<(), HborEncodeError> {
+        self.0.encode(encoder)
+    }
+}
+
+impl HborDecode for ExecutionCertificate {
+    fn decode(decoder: &mut HborDecoder<'_>) -> Result<Self, HborDecodeError> {
+        Ok(Self::sealed(Carried::decode(decoder)?))
     }
 }
 
@@ -275,7 +281,7 @@ impl ExecutionCertificate {
         signers: SignerBitfield,
     ) -> Self {
         let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
-        let mut ec = Self {
+        Self::sealed(Carried {
             tick_id,
             vote_anchor_ts,
             global_receipt_root,
@@ -286,9 +292,14 @@ impl ExecutionCertificate {
             aggregated_signature,
             signers,
             cached_bytes: None,
-        };
-        ec.populate_cached_bytes();
-        ec
+        })
+    }
+
+    /// Whether `other` is a clone of this very certificate, sharing its
+    /// body, rather than an equal copy decoded or built apart from it.
+    #[must_use]
+    pub fn same_body(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     /// The copy of this certificate a shard party to `keep` needs: the
@@ -317,9 +328,10 @@ impl ExecutionCertificate {
             "only a complete certificate can be projected"
         );
         let (leaf_indices, tx_outcomes): (Vec<u32>, Vec<TxOutcome>) = self
+            .0
             .leaf_indices
             .iter()
-            .zip(self.tx_outcomes.iter())
+            .zip(self.0.tx_outcomes.iter())
             .filter(|(_, outcome)| keep.contains(&outcome.tx_hash()))
             .map(|(&index, outcome)| (index, outcome.clone()))
             .unzip();
@@ -327,43 +339,41 @@ impl ExecutionCertificate {
             return None;
         }
 
-        let leaves: Vec<Hash> = self.tx_outcomes.iter().map(tx_outcome_leaf).collect();
+        let leaves: Vec<Hash> = self.0.tx_outcomes.iter().map(tx_outcome_leaf).collect();
         let proof = compute_sparse_proof(&leaves, &leaf_indices);
-        let mut ec = Self {
-            tick_id: self.tick_id,
-            vote_anchor_ts: self.vote_anchor_ts,
-            global_receipt_root: self.global_receipt_root,
-            tx_count: self.tx_count,
+        Some(Self::sealed(Carried {
+            tick_id: self.0.tick_id,
+            vote_anchor_ts: self.0.vote_anchor_ts,
+            global_receipt_root: self.0.global_receipt_root,
+            tx_count: self.0.tx_count,
             leaf_indices,
             tx_outcomes: Capped::new(tx_outcomes)
                 .expect("a list under the cap its source already met"),
             proof: Capped::new(proof).expect("a list under the cap its source already met"),
-            aggregated_signature: self.aggregated_signature,
-            signers: self.signers.clone(),
+            aggregated_signature: self.0.aggregated_signature,
+            signers: self.0.signers.clone(),
             cached_bytes: None,
-        };
-        ec.populate_cached_bytes();
-        Some(ec)
+        }))
     }
 
     /// Number of outcomes in the whole tick, however many this copy
     /// carries. The receipt tree's leaf count.
     #[must_use]
-    pub const fn tx_count(&self) -> u32 {
-        self.tx_count
+    pub fn tx_count(&self) -> u32 {
+        self.0.tx_count
     }
 
     /// Whether this copy carries every outcome of its tick.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.tx_outcomes.len() == self.tx_count as usize
+        self.0.tx_outcomes.len() == self.0.tx_count as usize
     }
 
     /// Receipt-tree leaf index of each carried outcome, parallel to
     /// [`Self::tx_outcomes`].
     #[must_use]
     pub fn leaf_indices(&self) -> &[u32] {
-        &self.leaf_indices
+        &self.0.leaf_indices
     }
 
     /// Whether this copy carries an outcome for `tx_hash`. A transaction
@@ -371,15 +381,16 @@ impl ExecutionCertificate {
     /// says nothing about it.
     #[must_use]
     pub fn covers(&self, tx_hash: &TxHash) -> bool {
-        self.tx_outcomes
+        self.0
+            .tx_outcomes
             .iter()
             .any(|outcome| &outcome.tx_hash() == tx_hash)
     }
 
     /// Self-contained tick identifier (shard + height + remote dependencies).
     #[must_use]
-    pub const fn tick_id(&self) -> &TickId {
-        &self.tick_id
+    pub fn tick_id(&self) -> &TickId {
+        &self.0.tick_id
     }
 
     /// Consensus height at which quorum was reached.
@@ -387,38 +398,38 @@ impl ExecutionCertificate {
     /// Must match the `vote_anchor_ts` in the aggregated votes. Needed to
     /// reconstruct the signing message for signature verification.
     #[must_use]
-    pub const fn vote_anchor_ts(&self) -> WeightedTimestamp {
-        self.vote_anchor_ts
+    pub fn vote_anchor_ts(&self) -> WeightedTimestamp {
+        self.0.vote_anchor_ts
     }
 
     /// Merkle root over per-tx outcome leaves.
     #[must_use]
-    pub const fn global_receipt_root(&self) -> GlobalReceiptRoot {
-        self.global_receipt_root
+    pub fn global_receipt_root(&self) -> GlobalReceiptRoot {
+        self.0.global_receipt_root
     }
 
     /// Per-transaction outcomes (in tick order = block order).
     #[must_use]
     pub fn tx_outcomes(&self) -> &Vec<TxOutcome> {
-        &self.tx_outcomes
+        &self.0.tx_outcomes
     }
 
     /// signature aggregated signature from 2f+1 validators.
     #[must_use]
-    pub(crate) const fn aggregated_signature(&self) -> AggregateSignature {
-        self.aggregated_signature
+    pub(crate) fn aggregated_signature(&self) -> AggregateSignature {
+        self.0.aggregated_signature
     }
 
     /// Which validators signed (bitfield indexed by committee position).
     #[must_use]
-    pub const fn signers(&self) -> &SignerBitfield {
-        &self.signers
+    pub fn signers(&self) -> &SignerBitfield {
+        &self.0.signers
     }
 
     /// The shard that produced this certificate.
     #[must_use]
-    pub const fn shard_id(&self) -> ShardId {
-        self.tick_id.shard_id()
+    pub fn shard_id(&self) -> ShardId {
+        self.0.tick_id.shard_id()
     }
 
     /// Deadline past which this certificate is provably useless on every shard.
@@ -429,19 +440,19 @@ impl ExecutionCertificate {
     /// abort), so no shard can still reference this EC.
     #[must_use]
     pub fn deadline(&self) -> WeightedTimestamp {
-        self.vote_anchor_ts.plus(RETENTION_HORIZON)
+        self.0.vote_anchor_ts.plus(RETENTION_HORIZON)
     }
 
     /// Block height (the block containing the tick's transactions).
     #[must_use]
-    pub const fn block_height(&self) -> BlockHeight {
-        self.tick_id.block_height()
+    pub fn block_height(&self) -> BlockHeight {
+        self.0.tick_id.block_height()
     }
 
     /// Pre-serialized wire bytes, if available.
     #[must_use]
     pub fn cached_wire_bytes(&self) -> Option<&[u8]> {
-        self.cached_bytes.as_deref()
+        self.0.cached_bytes.as_deref()
     }
 
     /// Content hash over the full wire encoding (including
@@ -455,7 +466,7 @@ impl ExecutionCertificate {
     /// Panics if HBOR encoding fails — closed type, infallible in practice.
     #[must_use]
     pub fn wire_hash(&self) -> Hash {
-        self.cached_bytes.as_deref().map_or_else(
+        self.0.cached_bytes.as_deref().map_or_else(
             || {
                 let bytes = hbor_to_vec(self).expect("EC HBOR encoding must succeed");
                 Hash::from_parts(&[&bytes])
@@ -478,16 +489,18 @@ impl ExecutionCertificate {
     pub fn attested_digest(&self) -> Hash {
         Hash::from_parts(&[
             CERTIFICATE_DIGEST_TAG,
-            &self.tick_id.shard_id().to_le_bytes(),
-            &self.tick_id.block_height().inner().to_le_bytes(),
-            &self.vote_anchor_ts.as_millis().to_le_bytes(),
-            self.global_receipt_root.as_raw().as_bytes(),
-            &self.tx_count.to_le_bytes(),
+            &self.0.tick_id.shard_id().to_le_bytes(),
+            &self.0.tick_id.block_height().inner().to_le_bytes(),
+            &self.0.vote_anchor_ts.as_millis().to_le_bytes(),
+            self.0.global_receipt_root.as_raw().as_bytes(),
+            &self.0.tx_count.to_le_bytes(),
         ])
     }
 
-    fn populate_cached_bytes(&mut self) {
-        self.cached_bytes = Some(hbor_to_vec(self).expect("EC HBOR encoding must succeed"));
+    /// Share `carried` with its wire encoding cached beside it.
+    fn sealed(mut carried: Carried) -> Self {
+        carried.cached_bytes = Some(hbor_to_vec(&carried).expect("EC HBOR encoding must succeed"));
+        Self(Arc::new(carried))
     }
 
     /// Build the canonical signing message used by every constituent vote
@@ -499,10 +512,10 @@ impl ExecutionCertificate {
     pub(crate) fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(
             &ExecutionVoteMessage::counting(
-                self.vote_anchor_ts,
-                self.tick_id,
-                self.global_receipt_root,
-                self.tx_count,
+                self.0.vote_anchor_ts,
+                self.0.tick_id,
+                self.0.global_receipt_root,
+                self.0.tx_count,
             ),
             network,
         )
@@ -561,12 +574,12 @@ impl Verify<&ExecutionCertificateContext<'_>> for ExecutionCertificate {
             .public_keys
             .iter()
             .enumerate()
-            .filter(|(i, _)| self.signers.is_set(*i))
+            .filter(|(i, _)| self.0.signers.is_set(*i))
             .map(|(_, pk)| *pk)
             .collect();
 
         if signer_keys.is_empty() {
-            if self.aggregated_signature == AggregateSignature::ZERO {
+            if self.0.aggregated_signature == AggregateSignature::ZERO {
                 return Ok(Verified::new_unchecked(self.clone()));
             }
             return Err(ExecutionCertificateVerifyError::EmptySignersWithNonZeroSignature);
@@ -575,7 +588,7 @@ impl Verify<&ExecutionCertificateContext<'_>> for ExecutionCertificate {
         let message = self.signing_message(ctx.network);
         if !ctx.verifier.verify_aggregate_same_message(
             &message,
-            &self.aggregated_signature,
+            &self.0.aggregated_signature,
             &signer_keys,
         ) {
             return Err(ExecutionCertificateVerifyError::BadAggregatedSignature);
@@ -711,7 +724,7 @@ mod tests {
     use hyperscale_hbor::{Capped, from_slice as hbor_from_slice};
 
     use super::*;
-    use crate::{BlockHeight, ExecutionOutcome, GlobalReceiptHash, TxHash};
+    use crate::{BlockHeight, ExecutionOutcome, GlobalReceiptHash, TxHash, Verifiable};
 
     fn outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -1026,7 +1039,7 @@ mod tests {
             SignerBitfield::new(4),
         );
         assert!(cert.is_complete());
-        assert!(cert.proof.is_empty());
+        assert!(cert.0.proof.is_empty());
 
         let decoded: ExecutionCertificate =
             hbor_from_slice(&hbor_to_vec(&cert).expect("encode")).expect("decode");
@@ -1128,6 +1141,26 @@ mod tests {
         );
     }
 
+    /// The host fans one certificate out to every hosted shard, and the
+    /// verified form a store holds is lifted to the verifiable one each
+    /// shard admits; both must hand over the one body.
+    #[test]
+    fn every_form_of_a_certificate_shares_one_body() {
+        let outcomes: Vec<TxOutcome> = (1..=4).map(outcome).collect();
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let verified = Verified::new_unchecked(cert.clone());
+        let wire: Verifiable<ExecutionCertificate> = verified.clone().into();
+        assert!(Arc::ptr_eq(&cert.0, &verified.0));
+        assert!(Arc::ptr_eq(&cert.0, &wire.as_unverified().0));
+    }
+
     /// A forged outcome swapped into a projection fails the decode-side
     /// rebuild: the leaf it hashes to does not sit under the signed root.
     #[test]
@@ -1144,8 +1177,9 @@ mod tests {
         let keep: HashSet<TxHash> = std::iter::once(outcomes[2].tx_hash()).collect();
         let mut projected = cert.project_to(&keep).expect("one outcome kept");
 
-        projected.tx_outcomes[0] = outcome(200);
-        projected.populate_cached_bytes();
+        Arc::get_mut(&mut projected.0)
+            .expect("a fresh projection is unshared")
+            .tx_outcomes[0] = outcome(200);
         let bytes = hbor_to_vec(&projected).expect("encode");
         let err = hbor_from_slice::<ExecutionCertificate>(&bytes)
             .expect_err("a forged outcome must fail the rebuild");
@@ -1169,8 +1203,9 @@ mod tests {
         let keep: HashSet<TxHash> = std::iter::once(outcomes[2].tx_hash()).collect();
         let mut projected = cert.project_to(&keep).expect("one outcome kept");
 
-        projected.leaf_indices[0] = 3;
-        projected.populate_cached_bytes();
+        Arc::get_mut(&mut projected.0)
+            .expect("a fresh projection is unshared")
+            .leaf_indices[0] = 3;
         let bytes = hbor_to_vec(&projected).expect("encode");
         let err = hbor_from_slice::<ExecutionCertificate>(&bytes)
             .expect_err("a relocated outcome must fail the rebuild");
@@ -1194,8 +1229,9 @@ mod tests {
         let keep: HashSet<TxHash> = std::iter::once(outcomes[0].tx_hash()).collect();
         let mut projected = cert.project_to(&keep).expect("one outcome kept");
 
-        projected.tx_count = 4;
-        projected.populate_cached_bytes();
+        Arc::get_mut(&mut projected.0)
+            .expect("a fresh projection is unshared")
+            .tx_count = 4;
         let bytes = hbor_to_vec(&projected).expect("encode");
         let err = hbor_from_slice::<ExecutionCertificate>(&bytes)
             .expect_err("a restated leaf count must fail the rebuild");
@@ -1220,7 +1256,7 @@ mod tests {
         // the empty blob length and the empty proof length are the two
         // bytes immediately before the signature.
         let mut forged = hbor_to_vec(&cert).expect("encode");
-        let marker = hbor_to_vec(&cert.aggregated_signature).expect("encode");
+        let marker = hbor_to_vec(&cert.0.aggregated_signature).expect("encode");
         let at = forged
             .windows(marker.len())
             .position(|window| window == marker.as_slice())

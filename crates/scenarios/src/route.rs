@@ -10,7 +10,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{self, Display, Formatter, Write};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hyperscale_effects_bridge::ProtocolHasher;
@@ -949,7 +948,7 @@ pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster
     let local_transfer = |c: &mut C, amount: u128| {
         let tx = build_transfer_tx(&payer_key, payer, caller, amount, validity_around(c.now()));
         let hash = tx.hash();
-        c.submit(Arc::new(tx));
+        c.submit(tx);
         hash
     };
 
@@ -978,7 +977,7 @@ pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster
         validity_around(c.now()),
     );
     let route_hash = route.hash();
-    c.submit(Arc::new(route));
+    c.submit(route);
     assert!(
         c.run_until(epochs(8), |c| matches!(
             row(c, route_hash),
@@ -999,7 +998,7 @@ pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster
         validity,
     );
     let swap_hash = swap.hash();
-    c.submit(Arc::new(swap));
+    c.submit(swap);
     assert!(
         c.run_until(epochs(2), |c| row(c, swap_hash) == Some(RowState::Pending)),
         "the swap must commit and wait behind the held reserves; its row stands {:?}",
@@ -2442,7 +2441,7 @@ impl VenueLoad {
             let (key, from, to) = &pairs[self.round % LOAD_PAIRS];
             let tx = build_transfer_tx(key, *from, *to, 1, validity_around(c.now()));
             *last = Some(tx.hash());
-            c.submit(Arc::new(tx));
+            c.submit(tx);
         }
         self.round += 1;
     }
@@ -2782,7 +2781,7 @@ fn route_held_past_a_certificates_life<C: FaultableCluster>(c: &mut C, late: Lat
         validity_around(c.now()),
     );
     let swap_hash = swap.hash();
-    c.submit(Arc::new(swap));
+    c.submit(swap);
     load.run(c, epoch * 8, |c| {
         c.tx_status(swap_hash)
             .is_some_and(|status| status.is_final())
@@ -2846,7 +2845,7 @@ fn hold_past_a_certificates_life<C: FaultableCluster>(
     c.with_derivation(|derivation| route.try_declared(derivation))
         .expect("a scenario route declares its terms");
     let closes = Window::Stating.of(Deadline::of_transaction(&route)).end;
-    c.submit(Arc::new(route));
+    c.submit(route);
 
     let stated =
         |c: &C, venue: ShardId| matches!(row_on(c, venue, hash), Some(RowState::Stated { .. }));
@@ -3432,7 +3431,7 @@ fn blocks_between(from: Option<BlockHeight>, to: Option<BlockHeight>) -> Option<
 /// The routes of a load: every one offered, the ones still out, and the
 /// pairs free to take another.
 struct Flight {
-    routes: BTreeMap<TxHash, Arc<Transaction>>,
+    routes: BTreeMap<TxHash, Transaction>,
     /// Each route still out, with the pair it runs through.
     flying: BTreeMap<TxHash, usize>,
     free: VecDeque<usize>,
@@ -3654,7 +3653,7 @@ impl LoadCast {
             };
             let nth = flight.routes.len();
             let (key, trader) = &self.traders[nth % self.traders.len()];
-            let route = Arc::new(build_route_tx(
+            let route = build_route_tx(
                 key,
                 *trader,
                 (&self.firsts[pair].meta, &self.seconds[pair].meta),
@@ -3662,9 +3661,9 @@ impl LoadCast {
                 ROUTE_INPUT + u128::try_from(nth).expect("a count of routes"),
                 0,
                 window,
-            ));
+            );
             let after = step * u32::try_from(slot).unwrap_or(u32::MAX);
-            flight.spread &= c.submit_after(after, Arc::clone(&route));
+            flight.spread &= c.submit_after(after, route.clone());
             flight.flying.insert(route.hash(), pair);
             flight.routes.insert(route.hash(), route);
         }

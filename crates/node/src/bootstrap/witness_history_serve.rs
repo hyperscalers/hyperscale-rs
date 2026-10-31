@@ -1,12 +1,11 @@
 //! Inbound snap-sync witness-history serving.
 
-use hyperscale_hbor::Capped;
-use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
-use hyperscale_types::MAX_WITNESSES_PER_FETCH;
 use hyperscale_types::network::request::GetWitnessHistoryRequest;
 use hyperscale_types::network::response::{GetWitnessHistoryResponse, WitnessHistoryChunk};
 use tracing::{debug, warn};
+
+use crate::serve::Answer;
 
 /// Serve an inbound snap-sync witness-history request.
 ///
@@ -49,8 +48,8 @@ pub fn serve_witness_history_request<S: ShardStorage>(
     if start > count {
         return unavailable;
     }
-    let limit = (req.limit as usize).clamp(1, MAX_WITNESSES_PER_FETCH) as u64;
-    let end = count.min(start.saturating_add(limit));
+    let mut answer = Answer::of(req.limit as usize);
+    let end = count.min(start.saturating_add(answer.limit() as u64));
     let payloads = pending_chain.get_beacon_witness_payload_range(start, end);
     if (payloads.len() as u64) < end - start {
         debug!(
@@ -62,15 +61,9 @@ pub fn serve_witness_history_request<S: ShardStorage>(
         );
         return unavailable;
     }
+    answer.offer_all(payloads, |_| 0);
+    let payloads = answer.finish();
 
-    // The clamped limit already holds the window under the cap; a chunk
-    // past it is one this answer cannot express, and no answer is better
-    // than one the joiner would refuse.
-    let Ok(payloads) = Capped::new(payloads) else {
-        return unavailable;
-    };
-
-    record_fetch_response_sent("witness_history", payloads.len());
     GetWitnessHistoryResponse {
         history: Some(WitnessHistoryChunk {
             header: header.clone(),

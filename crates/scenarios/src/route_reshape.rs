@@ -15,7 +15,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::genesis::GenesisPackages;
@@ -1799,11 +1798,11 @@ fn offer_the_load<C: Cluster>(
     venue: &StockedVenue,
     cut: WeightedTimestamp,
     samples: &mut Vec<LoadSample>,
-) -> (BTreeMap<TxHash, Arc<Transaction>>, TimestampRange) {
+) -> (BTreeMap<TxHash, Transaction>, TimestampRange) {
     let survivor = STRADDLER_SURVIVOR;
     let callers = load_callers();
     let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
-    let mut offered: BTreeMap<TxHash, Arc<Transaction>> = BTreeMap::new();
+    let mut offered: BTreeMap<TxHash, Transaction> = BTreeMap::new();
     let mut committed: BTreeSet<TxHash> = BTreeSet::new();
     let mut last_window = validity_around(c.now());
     while offered.len() < LOAD_SWAPS && clock(c) < cut {
@@ -1818,7 +1817,7 @@ fn offer_the_load<C: Cluster>(
         for _ in 0..wanted.min(LOAD_SWAPS - offered.len()) {
             let (key, caller) = &callers[offered.len() % callers.len()];
             let input = LOAD_INPUT + u128::try_from(offered.len()).expect("a count of swaps");
-            let swap = Arc::new(build_swap_tx(
+            let swap = build_swap_tx(
                 key,
                 *caller,
                 &venue.meta,
@@ -1826,8 +1825,8 @@ fn offer_the_load<C: Cluster>(
                 input,
                 0,
                 last_window,
-            ));
-            c.submit(Arc::clone(&swap));
+            );
+            c.submit(swap.clone());
             offered.insert(swap.hash(), swap);
         }
         let from = height(c);
@@ -1856,7 +1855,7 @@ impl StrandedLeg {
     ///
     /// Panics if the harness reads no member rows, or if a waiting row
     /// is no swap of the load.
-    fn read<C: Cluster>(c: &C, load: &BTreeMap<TxHash, Arc<Transaction>>) -> Vec<Self> {
+    fn read<C: Cluster>(c: &C, load: &BTreeMap<TxHash, Transaction>) -> Vec<Self> {
         c.member_rows(STRADDLER_SURVIVOR)
             .expect("the harness reads the survivor's member rows")
             .into_iter()
@@ -2119,7 +2118,7 @@ impl Accounts {
     /// Panics if a swap of the load does not derive.
     fn of<C: Cluster>(
         c: &C,
-        load: &BTreeMap<TxHash, Arc<Transaction>>,
+        load: &BTreeMap<TxHash, Transaction>,
         bystanders: &[(Ed25519PrivateKey, PrincipalAddr)],
         venue: &StockedVenue,
     ) -> Self {
@@ -2838,7 +2837,7 @@ fn cast_late_threshold_vote<C: Cluster>(c: &mut C, split_bytes: u64, lead: u64) 
             activate_at,
             validity_around(c.now()),
         );
-        c.submit(Arc::new(vote));
+        c.submit(vote);
         if c.run_until(epochs(6), |c| {
             c.beacon_state().is_some_and(|state| {
                 state.param_votes.values().any(|proposal| {
@@ -2896,7 +2895,7 @@ pub fn a_venue_sealed_on_a_fresh_split_child_runs<C: Cluster>(c: &mut C) {
         validity_around(c.now()),
     );
     let hash = swap.hash();
-    c.submit(Arc::new(swap));
+    c.submit(swap);
     let status = await_tx_terminal(c, hash, epochs(24));
     assert!(
         matches!(

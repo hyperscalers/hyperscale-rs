@@ -5,7 +5,7 @@
 //! [`impl Verify<&ProvisionsContext<'_>>`](Verify::verify) below.
 
 use std::fmt::{self, Debug, Formatter};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
@@ -31,8 +31,17 @@ use crate::{
 ///
 /// The content hash is computed lazily on first call to [`Self::hash`] and
 /// cached for the lifetime of the value.
+///
+/// Every clone shares one allocation, the cached hash included, so moving
+/// a bundle between its raw, verifiable and verified forms copies a
+/// pointer, not its entries.
+#[derive(Clone, Hbor)]
+#[hbor(transparent)]
+pub struct Provisions(Arc<Carried>);
+
+/// What every clone of one [`Provisions`] shares.
 #[derive(Hbor)]
-pub struct Provisions {
+struct Carried {
     source_shard: ShardId,
     target_shard: ShardId,
     block_height: BlockHeight,
@@ -47,7 +56,7 @@ pub struct Provisions {
     transactions: Capped<Vec<ProvisionEntry>, MAX_TXS_PER_BLOCK>,
 
     /// Lazily-computed content hash (blake3 over HBOR-encoded content fields).
-    /// Populated on first [`Self::hash`] call; not on the wire.
+    /// Populated on first [`Provisions::hash`] call; not on the wire.
     #[hbor(skip)]
     hash: OnceLock<ProvisionHash>,
 }
@@ -56,29 +65,11 @@ impl Debug for Provisions {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Provision")
             .field("hash", &self.hash())
-            .field("source_shard", &self.source_shard)
-            .field("target_shard", &self.target_shard)
-            .field("block_height", &self.block_height)
-            .field("transactions", &self.transactions.len())
+            .field("source_shard", &self.0.source_shard)
+            .field("target_shard", &self.0.target_shard)
+            .field("block_height", &self.0.block_height)
+            .field("transactions", &self.0.transactions.len())
             .finish_non_exhaustive()
-    }
-}
-
-impl Clone for Provisions {
-    fn clone(&self) -> Self {
-        let cloned_hash = OnceLock::new();
-        if let Some(h) = self.hash.get() {
-            let _ = cloned_hash.set(*h);
-        }
-        Self {
-            source_shard: self.source_shard,
-            target_shard: self.target_shard,
-            block_height: self.block_height,
-            source_block_ts: self.source_block_ts,
-            proof: self.proof.clone(),
-            transactions: self.transactions.clone(),
-            hash: cloned_hash,
-        }
     }
 }
 
@@ -95,7 +86,7 @@ impl Provisions {
     /// first call to [`Self::hash`]. The entry cap is enforced at encode
     /// and decode, not here.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         source_shard: ShardId,
         target_shard: ShardId,
         block_height: BlockHeight,
@@ -103,7 +94,7 @@ impl Provisions {
         proof: MerkleInclusionProof,
         transactions: Capped<Vec<ProvisionEntry>, MAX_TXS_PER_BLOCK>,
     ) -> Self {
-        Self {
+        Self(Arc::new(Carried {
             source_shard,
             target_shard,
             block_height,
@@ -111,57 +102,57 @@ impl Provisions {
             proof,
             transactions,
             hash: OnceLock::new(),
-        }
+        }))
     }
 
     /// Source shard that committed this block.
     #[must_use]
-    pub const fn source_shard(&self) -> ShardId {
-        self.source_shard
+    pub fn source_shard(&self) -> ShardId {
+        self.0.source_shard
     }
 
     /// Target shard the bundle is destined for.
     #[must_use]
-    pub const fn target_shard(&self) -> ShardId {
-        self.target_shard
+    pub fn target_shard(&self) -> ShardId {
+        self.0.target_shard
     }
 
     /// Block height at which the state was committed.
     #[must_use]
-    pub const fn block_height(&self) -> BlockHeight {
-        self.block_height
+    pub fn block_height(&self) -> BlockHeight {
+        self.0.block_height
     }
 
     /// The source block's parent-QC weighted timestamp, as carried on the
     /// wire and checked against the commit-proven header at verification.
     #[must_use]
-    pub const fn source_block_ts(&self) -> WeightedTimestamp {
-        self.source_block_ts
+    pub fn source_block_ts(&self) -> WeightedTimestamp {
+        self.0.source_block_ts
     }
 
     /// Aggregated merkle multiproof covering all entries for this block.
     #[must_use]
-    pub const fn proof(&self) -> &MerkleInclusionProof {
-        &self.proof
+    pub fn proof(&self) -> &MerkleInclusionProof {
+        &self.0.proof
     }
 
     /// Per-transaction entries.
     #[must_use]
     pub fn transactions(&self) -> &Vec<ProvisionEntry> {
-        &self.transactions
+        &self.0.transactions
     }
 
     /// Content hash, computed on first call and cached.
     #[must_use]
     pub fn hash(&self) -> ProvisionHash {
-        *self.hash.get_or_init(|| {
+        *self.0.hash.get_or_init(|| {
             Self::compute_hash(
-                self.source_shard,
-                self.target_shard,
-                self.block_height,
-                self.source_block_ts,
-                &self.proof,
-                &self.transactions,
+                self.0.source_shard,
+                self.0.target_shard,
+                self.0.block_height,
+                self.0.source_block_ts,
+                &self.0.proof,
+                &self.0.transactions,
             )
         })
     }
@@ -222,6 +213,7 @@ impl Provisions {
     #[must_use]
     pub fn all_entries_deduped(&self) -> Vec<SubstateEntry> {
         let mut entries: Vec<SubstateEntry> = self
+            .0
             .transactions
             .iter()
             .flat_map(|tx| tx.entries.iter().cloned())
@@ -234,17 +226,13 @@ impl Provisions {
     /// Get the transaction hashes in these provisions.
     #[must_use]
     pub fn tx_hashes(&self) -> Vec<TxHash> {
-        self.transactions.iter().map(|tx| tx.tx_hash).collect()
+        self.0.transactions.iter().map(|tx| tx.tx_hash).collect()
     }
 
     /// Create a dummy `Provisions` for testing.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
-    pub const fn dummy(
-        source_shard: ShardId,
-        target_shard: ShardId,
-        block_height: BlockHeight,
-    ) -> Self {
+    pub fn dummy(source_shard: ShardId, target_shard: ShardId, block_height: BlockHeight) -> Self {
         Self::new(
             source_shard,
             target_shard,
@@ -329,20 +317,20 @@ impl Verify<&ProvisionsContext> for Provisions {
         // and consumers key what they absorb — the source of every entry,
         // and which requirement it satisfies — off the bundle's field.
         let source_shard = ctx.anchor.shard;
-        if self.source_shard != source_shard {
+        if self.0.source_shard != source_shard {
             return Err(ProvisionsVerifyError::SourceShardMismatch);
         }
 
         // The carried source-block timestamp must be the anchor's own
         // parent-QC reading: receivers consume it as the transaction
         // clock, so it clears verification or the bundle does not.
-        if self.source_block_ts != ctx.anchor.ts {
+        if self.0.source_block_ts != ctx.anchor.ts {
             return Err(ProvisionsVerifyError::SourceBlockTsMismatch);
         }
 
         let entries = self.all_entries_deduped();
 
-        if self.proof.as_bytes().is_empty() {
+        if self.0.proof.as_bytes().is_empty() {
             if entries.is_empty() {
                 return Ok(Verified::new_unchecked(self.clone()));
             }
@@ -357,6 +345,7 @@ impl Verify<&ProvisionsContext> for Provisions {
         // ones the source's chain attested.
         let keys: Vec<SubstateKey> = entries.iter().map(|entry| entry.key).collect();
         let attested = self
+            .0
             .proof
             .inclusions(ctx.anchor.state_root, source_shard, &keys)
             .map_err(|error| match error {
@@ -414,8 +403,8 @@ mod tests {
     use hyperscale_vm_types::{LocalKey, SubstateKey};
 
     use super::*;
-    use crate::CertifiedBlockHeader;
     use crate::test_utils::test_prefix;
+    use crate::{CertifiedBlockHeader, Verifiable};
 
     fn cell(owner: u8, local: u8) -> SubstateKey {
         SubstateKey {
@@ -426,6 +415,22 @@ mod tests {
 
     fn test_entry(seed: u8) -> SubstateEntry {
         SubstateEntry::new(cell(seed, seed), Some(Bytes::from_array([seed, seed + 1])))
+    }
+
+    /// The coordinator queues the verified form and a proposal carries
+    /// the verifiable one; lifting between them hands over the one
+    /// bundle rather than copying its entries.
+    #[test]
+    fn every_form_of_a_bundle_shares_one_body() {
+        let raw = Provisions::dummy(
+            ShardId::leaf(1, 1),
+            ShardId::leaf(2, 2),
+            BlockHeight::new(7),
+        );
+        let verified = Verified::<Provisions>::from_local(raw.clone());
+        let wire: Verifiable<Provisions> = verified.clone().into();
+        assert!(Arc::ptr_eq(&raw.0, &verified.0));
+        assert!(Arc::ptr_eq(&raw.0, &wire.as_unverified().0));
     }
 
     #[test]
@@ -690,8 +695,16 @@ mod tests {
             let items = vec![entry(1)];
             let (state_root, proof) = build_jmt(&items);
             let verified_header = header_with_state_root(state_root);
-            let mut provisions = provisions_with(proof, items);
-            provisions.source_shard = ShardId::leaf(1, 1);
+            let honest = provisions_with(proof, items);
+            let provisions = Provisions::new(
+                ShardId::leaf(1, 1),
+                honest.target_shard(),
+                honest.block_height(),
+                honest.source_block_ts(),
+                honest.proof().clone(),
+                Capped::new(honest.transactions().clone())
+                    .expect("the honest bundle's own entries"),
+            );
             let ctx = ProvisionsContext {
                 anchor: Anchor::of(&verified_header),
             };

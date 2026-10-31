@@ -47,8 +47,8 @@ pub enum FetchRequest {
     ///
     /// Routing rules the ids do not carry themselves: transactions,
     /// local provisions and finalizations are intra-shard, so `shard` is
-    /// local; remote provisions, execution certificates and shard
-    /// witnesses route to the source shard, which has to be carried
+    /// local; remote provisions and execution certificates route to the
+    /// source shard, which has to be carried
     /// because the requester knows only that the payload is that
     /// shard's business; a state proof routes to its anchor's shard,
     /// whose committee holds the JMT version the anchor's height names.

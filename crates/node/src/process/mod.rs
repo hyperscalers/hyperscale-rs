@@ -11,6 +11,7 @@
 mod canonical_txs;
 mod fan_out;
 mod network_handlers;
+mod single_flight;
 mod tx_status;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -18,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-pub(crate) use canonical_txs::CanonicalTxs;
+pub use canonical_txs::CanonicalTxs;
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{
@@ -34,10 +35,10 @@ use hyperscale_types::{
     Derivation, Epoch, MAX_TXS_PER_BLOCK, ShardId, TopologySchedule, TopologySnapshot, Transaction,
     Unresolved, ValidatorId, Verifier,
 };
-pub(crate) use network_handlers::register_shard_request_handlers;
+pub use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
 
-use crate::event::{Attachment, BeaconScopedInput, HostEvent, ShardScopedInput};
+use crate::event::{Attachment, BeaconScopedInput, HostEvent, ShardInbox, ShardScopedInput};
 use crate::shard::cross_shard::serve_cells_request;
 use crate::shard::mempool::DeferredTransaction;
 use crate::shard::{DispatchHandles, SharedTopologySnapshot};
@@ -47,7 +48,7 @@ use crate::shard::{DispatchHandles, SharedTopologySnapshot};
 /// Handler closures and RPC fan-out `.load()` for an atomic snapshot on
 /// every use; the map is swapped only when shard participation changes,
 /// and the reconfiguring thread is the sole writer.
-pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, Sender<HostEvent>>>>;
+pub type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, ShardInbox>>>;
 
 /// Process-scoped resources shared across every hosted shard.
 ///
@@ -138,7 +139,7 @@ where
     /// lock, and every change to that map or to the topology re-routes
     /// what is held after the change, so a submission is never parked
     /// behind a change that has already released the queue.
-    parked_submissions: Mutex<VecDeque<Arc<Transaction>>>,
+    parked_submissions: Mutex<VecDeque<Transaction>>,
 }
 
 /// How many submissions a host holds while it seats a reshape successor:
@@ -159,7 +160,6 @@ where
         network: Arc<N>,
         verifier: Arc<dyn Verifier>,
         dispatch: D,
-        shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>>,
         beacon_event_sender: Sender<HostEvent>,
         topology_snapshot: SharedTopologySnapshot,
         (epoch, topology_schedule): (Epoch, Arc<TopologySchedule>),
@@ -180,7 +180,7 @@ where
             network,
             verifier,
             dispatch,
-            shard_event_senders: Arc::new(ArcSwap::from_pointee(shard_event_senders)),
+            shard_event_senders: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             beacon_event_sender,
             next_attachment: AtomicU64::new(0),
             topology_snapshot,
@@ -205,12 +205,6 @@ where
             validator,
             self.next_attachment.fetch_add(1, Ordering::Relaxed),
         )
-    }
-
-    /// Process-level beacon chain storage handle.
-    #[must_use]
-    pub fn beacon_storage(&self) -> &Arc<dyn BeaconStorage> {
-        &self.beacon_storage
     }
 
     /// This node's derivation, held by its engine — what a replica built
@@ -255,30 +249,17 @@ where
     }
 
     /// Shared lock-free topology snapshot handle, refreshed on every
-    /// `Action::TopologyChanged`. Long-running consumers hold the
+    /// `FoldAction::TopologyChanged`. Long-running consumers hold the
     /// handle and re-load to observe beacon commits.
     #[must_use]
     pub const fn topology_snapshot(&self) -> &SharedTopologySnapshot {
         &self.topology_snapshot
     }
 
-    /// Sender for `shard`'s event channel (an owned clone — crossbeam
-    /// senders are cheap `Arc` handles).
-    ///
-    /// # Panics
-    /// Panics if `shard` isn't hosted by this `ProcessIo`.
-    pub(crate) fn shard_sender(&self, shard: ShardId) -> Sender<HostEvent> {
-        self.shard_event_senders
-            .load()
-            .get(&shard)
-            .unwrap_or_else(|| panic!("shard {shard:?} not hosted by this ProcessIo"))
-            .clone()
-    }
-
     /// Install the event sender for a newly hosted `shard`. The
     /// reconfiguring thread is the sole writer, so the clone-modify-store
     /// needs no CAS retry; concurrent readers keep their loaded snapshot.
-    pub(crate) fn insert_shard_sender(&self, shard: ShardId, sender: Sender<HostEvent>) {
+    pub(crate) fn insert_shard_sender(&self, shard: ShardId, sender: ShardInbox) {
         let mut map = (**self.shard_event_senders.load()).clone();
         map.insert(shard, sender);
         self.shard_event_senders.store(Arc::new(map));
@@ -313,7 +294,7 @@ where
     /// [`SubmitFanout::GossipOnly`] — gossip still goes out via some
     /// hosted shard, but no shard admits or takes ownership — or, on a
     /// host seated nowhere, [`SubmitFanout::PublishDirect`].
-    pub(crate) fn compute_submit_fanout(&self, tx: &Arc<Transaction>) -> SubmitFanout {
+    pub(crate) fn compute_submit_fanout(&self, tx: &Transaction) -> SubmitFanout {
         // Ingress bytes are unverified, and routing is a derivation the
         // envelope has to earn: asking an envelope that derives no
         // routing which shards it touches is asking for an answer it
@@ -337,10 +318,14 @@ where
         let Some((hosted, touched_shards)) = self.route_or_park(tx) else {
             return SubmitFanout::Parked;
         };
+        let route = |(&shard, inbox): (&ShardId, &ShardInbox)| ShardRoute {
+            shard,
+            sender: inbox.internal().clone(),
+        };
         let mut hosted_touched = hosted
             .iter()
-            .copied()
-            .filter(|s| touched_shards.contains(s));
+            .filter(|(shard, _)| touched_shards.contains(shard))
+            .map(route);
 
         if let Some(source) = hosted_touched.next() {
             SubmitFanout::Admit {
@@ -348,7 +333,7 @@ where
                 passive: hosted_touched.collect(),
                 touched_shards,
             }
-        } else if let Some(host) = hosted.first().copied() {
+        } else if let Some(host) = hosted.iter().next().map(route) {
             // No touched shard is hosted, but the host carries some shard
             // it can flush outbound gossip through.
             SubmitFanout::GossipOnly {
@@ -360,23 +345,25 @@ where
         }
     }
 
-    /// The shards this host serves and the shards a derived `tx` touches,
-    /// or `None` once `tx` is parked because none of the first is among
-    /// the second and the host is still seating the successor one is.
-    /// Both are read under the parking lock, so a change that releases the
-    /// queue either finds this submission in it or is seen by this read.
-    fn route_or_park(&self, tx: &Arc<Transaction>) -> Option<(Vec<ShardId>, Vec<ShardId>)> {
+    /// The sender map this host serves its shards from and the shards a
+    /// derived `tx` touches, or `None` once `tx` is parked because no
+    /// served shard is touched and the host is still seating the successor
+    /// one is. Both are read under the parking lock, so a change that
+    /// releases the queue either finds this submission in it or is seen by
+    /// this read.
+    fn route_or_park(&self, tx: &Transaction) -> Option<(ShardSenders, Vec<ShardId>)> {
         let mut parked = self
             .parked_submissions
             .lock()
             .expect("parked submissions lock");
         let topology = self.topology_snapshot.load();
         let touched: Vec<ShardId> = topology.all_shards_for_transaction(tx);
-        let hosted: Vec<ShardId> = self.shard_event_senders.load().keys().copied().collect();
+        let senders = self.shard_event_senders.load_full();
+        let hosted: Vec<ShardId> = senders.keys().copied().collect();
         if hosted.iter().any(|shard| touched.contains(shard))
             || !seating_successor(&topology, &hosted, &touched)
         {
-            return Some((hosted, touched));
+            return Some((senders, touched));
         }
         if parked.len() >= MAX_PARKED_SUBMISSIONS
             && let Some(evicted) = parked.pop_front()
@@ -386,7 +373,7 @@ where
                 "Dropping a parked submission: the queue is full"
             );
         }
-        parked.push_back(Arc::clone(tx));
+        parked.push_back(tx.clone());
         None
     }
 }
@@ -423,16 +410,23 @@ where
                 .lock()
                 .expect("parked submissions lock"),
         );
+        // The submitter was answered when the transaction parked, so a
+        // release that fails to route has no one left to tell.
         for tx in released {
-            self.submit_transaction(&tx);
+            if !self.submit_transaction(&tx) {
+                tracing::warn!(
+                    tx_hash = ?tx.hash(),
+                    "Dropping a parked submission: its release did not route"
+                );
+            }
         }
     }
 
     /// Publish `tx` to each of `touched_shards` as gossip of its own, for a
     /// host seated nowhere: no shard loop batches it, and the receiving
     /// committees verify it as any gossip.
-    pub(crate) fn publish_direct(&self, tx: &Arc<Transaction>, touched_shards: &[ShardId]) {
-        let gossip = TransactionGossip::new(Capped::from_array([Arc::clone(tx)]));
+    pub(crate) fn publish_direct(&self, tx: &Transaction, touched_shards: &[ShardId]) {
+        let gossip = TransactionGossip::new(Capped::from_array([tx.clone()]));
         for &dst in touched_shards {
             self.network.broadcast_to_shard(dst, &gossip);
         }
@@ -442,12 +436,14 @@ where
     /// [`Self::shard_event_senders`] according to
     /// [`Self::compute_submit_fanout`].
     ///
-    /// Returns `true` if every send succeeded; `false` only on shutdown
-    /// (a closed channel). Used by the production RPC submission
-    /// closure — callers on tokio worker threads can invoke this
-    /// concurrently because `compute_submit_fanout` only reads the
-    /// lock-free topology snapshot and the immutable sender map.
-    pub fn submit_transaction(&self, tx: &Arc<Transaction>) -> bool {
+    /// Returns `true` if every send succeeded; `false` on a closed channel
+    /// (shutdown, or a shard detached after the route was read). Used by
+    /// the production RPC submission closure — callers on tokio worker
+    /// threads can invoke this concurrently with each other and with a
+    /// shard's detach, because the fanout routes from one load of the
+    /// sender map and carries the senders it picked.
+    #[must_use]
+    pub fn submit_transaction(&self, tx: &Transaction) -> bool {
         // Seed the canonical-instance cache so gossip echoes of this tx
         // arriving on other hosted shards' topics share its validation
         // verdict.
@@ -458,7 +454,7 @@ where
 
     /// Carry out `fanout` for `tx`. Returns `false` only on shutdown (a
     /// closed channel) or for an envelope that derives no routing.
-    pub(crate) fn apply_submit_fanout(&self, tx: &Arc<Transaction>, fanout: SubmitFanout) -> bool {
+    pub(crate) fn apply_submit_fanout(&self, tx: &Transaction, fanout: SubmitFanout) -> bool {
         let mut ok = true;
         match fanout {
             SubmitFanout::Admit {
@@ -467,21 +463,21 @@ where
                 touched_shards,
             } => {
                 let env = HostEvent::shard(
-                    source,
+                    source.shard,
                     ShardScopedInput::AdmitAndGossipTransaction {
-                        tx: Arc::clone(tx),
+                        tx: tx.clone(),
                         touched_shards,
                     },
                 );
-                if self.shard_sender(source).send(env).is_err() {
+                if source.sender.send(env).is_err() {
                     ok = false;
                 }
-                for shard in passive {
+                for route in passive {
                     let env = HostEvent::shard(
-                        shard,
-                        ShardScopedInput::AdmitTransaction { tx: Arc::clone(tx) },
+                        route.shard,
+                        ShardScopedInput::AdmitTransaction { tx: tx.clone() },
                     );
-                    if self.shard_sender(shard).send(env).is_err() {
+                    if route.sender.send(env).is_err() {
                         ok = false;
                     }
                 }
@@ -491,13 +487,13 @@ where
                 touched_shards,
             } => {
                 let env = HostEvent::shard(
-                    host,
+                    host.shard,
                     ShardScopedInput::GossipTransaction {
-                        tx: Arc::clone(tx),
+                        tx: tx.clone(),
                         touched_shards,
                     },
                 );
-                if self.shard_sender(host).send(env).is_err() {
+                if host.sender.send(env).is_err() {
                     ok = false;
                 }
             }
@@ -506,7 +502,7 @@ where
             }
             SubmitFanout::WantsRecords { wanted } => {
                 let env = HostEvent::Beacon(BeaconScopedInput::SubmissionWantsRecords {
-                    deferred: DeferredTransaction::new(Arc::clone(tx), wanted),
+                    deferred: DeferredTransaction::new(tx.clone(), wanted),
                 });
                 if self.beacon_event_sender.send(env).is_err() {
                     ok = false;
@@ -642,19 +638,30 @@ fn newest_epoch(schedule: &TopologySchedule) -> Option<Epoch> {
     schedule.retained_epochs().map(|(_, newest)| newest)
 }
 
+/// One loaded snapshot of [`ProcessIo::shard_event_senders`].
+type ShardSenders = Arc<BTreeMap<ShardId, ShardInbox>>;
+
+/// A hosted shard a submission routes to, with the sender it was hosted
+/// under when the route was read. A shard detached since then still takes
+/// the send, into a channel that dies with its receiver.
+pub struct ShardRoute {
+    pub(crate) shard: ShardId,
+    pub(crate) sender: Sender<HostEvent>,
+}
+
 /// Routing decision for a locally-submitted transaction. Returned by
-/// [`ProcessIo::compute_submit_fanout`]; consumed by `NodeHost` (sim)
-/// or the production routing thread.
-pub(crate) enum SubmitFanout {
+/// [`ProcessIo::compute_submit_fanout`]; carried out by
+/// [`ProcessIo::apply_submit_fanout`].
+pub enum SubmitFanout {
     /// At least one hosted shard is in the tx's touched set. `source`
     /// admits, takes `locally_submitted` ownership, and gossips out;
     /// `passive` admit only.
     Admit {
         /// First hosted touched shard — source of outbound gossip and
         /// sole owner of the `locally_submitted` flag for this tx.
-        source: ShardId,
+        source: ShardRoute,
         /// Hosted touched shards other than the source — admit-only.
-        passive: Vec<ShardId>,
+        passive: Vec<ShardRoute>,
         /// Every shard the tx touches (declared reads ∪ writes).
         /// Carried to the source so it can enqueue outbound gossip
         /// for each destination.
@@ -665,7 +672,7 @@ pub(crate) enum SubmitFanout {
     /// entry.
     GossipOnly {
         /// Arbitrary hosted shard chosen to enqueue outbound gossip.
-        host: ShardId,
+        host: ShardRoute,
         /// Every shard the tx touches (declared reads ∪ writes).
         touched_shards: Vec<ShardId>,
     },

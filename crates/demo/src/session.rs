@@ -1,11 +1,9 @@
 //! The simulation session and its event derivation.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_transactions::{Ceilings, Client, Terms};
@@ -202,7 +200,7 @@ fn settlement_events(
     wt: u64,
     shard: ShardId,
     height: BlockHeight,
-    provisions: &[Arc<Verifiable<Provisions>>],
+    provisions: &[Verifiable<Provisions>],
     state_claims: &[StateClaim],
     certificates: &SharedCertificates,
 ) {
@@ -551,12 +549,8 @@ impl Session {
             }
         }
         let hash = tx.hash();
-        let tx = Arc::new(tx);
-        self.runner.schedule_initial_event(
-            0,
-            Duration::from_millis(1),
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
-        );
+        self.runner
+            .schedule_submission(0, Duration::from_millis(1), tx);
         self.nonce += 1;
         self.tracked.insert(hash, None);
         self.pending

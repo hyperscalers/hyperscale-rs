@@ -1,8 +1,6 @@
 //! Beacon-proposal notification — one committee member's per-epoch
 //! submission, unicast to the rest of the beacon committee.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 
 use crate::{BeaconProposal, Epoch, MessageClass, NetworkMessage, ValidatorId, Verifiable};
@@ -38,7 +36,7 @@ pub struct BeaconProposalNotification {
     /// `(network, epoch)` signing context.
     pub epoch: Epoch,
     /// The proposal: witnesses + VRF reveal.
-    pub proposal: Arc<Verifiable<BeaconProposal>>,
+    pub proposal: Verifiable<BeaconProposal>,
 }
 
 impl BeaconProposalNotification {
@@ -49,7 +47,7 @@ impl BeaconProposalNotification {
     pub fn new(
         sender: ValidatorId,
         epoch: Epoch,
-        proposal: impl Into<Arc<Verifiable<BeaconProposal>>>,
+        proposal: impl Into<Verifiable<BeaconProposal>>,
     ) -> Self {
         Self {
             sender,
@@ -82,11 +80,8 @@ mod tests {
 
     #[test]
     fn hbor_round_trip() {
-        let n = BeaconProposalNotification::new(
-            ValidatorId::new(3),
-            Epoch::new(7),
-            Arc::new(Verifiable::from(sample_proposal())),
-        );
+        let n =
+            BeaconProposalNotification::new(ValidatorId::new(3), Epoch::new(7), sample_proposal());
         let bytes = hbor_to_vec(&n).unwrap();
         let decoded: BeaconProposalNotification = hbor_from_slice(&bytes).unwrap();
         assert_eq!(n, decoded);

@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, ActionContext, CommitSource, FetchIds, Gate, Parallelism, ParentJudgement,
-    PreparedBlock, ProtocolEvent, QcSubject, Signing, TimerId,
+    Action, ActionContext, CommitSource, ConsensusAction, FetchIds, Gate, Parallelism,
+    ParentJudgement, PreparedBlock, ProtocolEvent, QcSubject, Signing, StateRootCheck, TimerId,
 };
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::{ExecutionMode, Executor};
@@ -276,8 +276,8 @@ enum SimEvent {
         round: Round,
         block: Arc<Block>,
         block_hash: BlockHash,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
+        provisions: Vec<Verifiable<Provisions>>,
         bytes_delta: i64,
         answers: AnswerDelta,
         additions: AnswerAdditions,
@@ -367,7 +367,7 @@ pub struct ShardCoordinatorSim {
     /// pool; `try_propose_for` threads it into the proposer's
     /// `ready_txs`; `on_block_header` reads it through the
     /// `lookup_tx` data-availability closure.
-    tx_pools: Vec<HashMap<TxHash, Arc<Verified<Transaction>>>>,
+    tx_pools: Vec<HashMap<TxHash, Verified<Transaction>>>,
     /// Identity-agnostic topology shared by every replica. A single-committee
     /// schedule — the sim runs within one epoch, so every weighted timestamp
     /// resolves to the same committee.
@@ -753,9 +753,8 @@ impl ShardCoordinatorSim {
     ) {
         let idx = self.idx_of(replica);
         let pool = &self.tx_pools[idx];
-        let lookup_tx = |hash: &TxHash| -> Option<Arc<Verifiable<Transaction>>> {
-            pool.get(hash)
-                .map(|tx| Arc::new(Verifiable::from((**tx).clone())))
+        let lookup_tx = |hash: &TxHash| -> Option<Verifiable<Transaction>> {
+            pool.get(hash).map(|tx| Verifiable::from(tx.clone()))
         };
         let actions = self.coordinators[idx].on_block_header(
             &self.topology_schedule,
@@ -899,9 +898,9 @@ impl ShardCoordinatorSim {
     /// Admit `tx` into every replica's local pool. See
     /// [`Self::admit_transaction_on`] for the per-replica variant
     /// used to model partial-availability tests.
-    pub fn admit_transaction(&mut self, tx: &Arc<Verified<Transaction>>) {
+    pub fn admit_transaction(&mut self, tx: &Verified<Transaction>) {
         for idx in 0..self.n() {
-            self.admit_transaction_on(idx, Arc::clone(tx));
+            self.admit_transaction_on(idx, tx.clone());
         }
     }
 
@@ -909,9 +908,9 @@ impl ShardCoordinatorSim {
     /// `on_transactions_admitted` + the latched proposal retry on
     /// that replica only. Used to model partial-availability
     /// faults where a single replica's DA gate matters.
-    pub fn admit_transaction_on(&mut self, idx: usize, tx: Arc<Verified<Transaction>>) {
+    pub fn admit_transaction_on(&mut self, idx: usize, tx: Verified<Transaction>) {
         let hash = tx.hash();
-        let tx_slice = [Arc::clone(&tx)];
+        let tx_slice = [tx.clone()];
         self.tx_pools[idx].insert(hash, tx);
         let actions =
             self.coordinators[idx].on_transactions_admitted(&self.topology_schedule, &tx_slice);
@@ -1027,8 +1026,7 @@ impl ShardCoordinatorSim {
     /// pool as `ready_txs`. Tx-only equivalent of the production
     /// gather (no finalizations, no provisions).
     fn try_propose_for(&mut self, idx: usize) -> Vec<Action> {
-        let ready_txs: Vec<Arc<Verified<Transaction>>> =
-            self.tx_pools[idx].values().cloned().collect();
+        let ready_txs: Vec<Verified<Transaction>> = self.tx_pools[idx].values().cloned().collect();
         let state_claims = self.offered_claims.clone();
         self.coordinators[idx].try_propose(&self.topology_schedule, |_| ProposalInputs {
             ready_txs,
@@ -1273,31 +1271,12 @@ impl ShardCoordinatorSim {
     /// re-enter `try_propose` once if any path latched a retry.
     fn drain_post_dispatch(&mut self, to_idx: usize) -> Vec<Action> {
         let mut actions = Vec::new();
-        for ready in self.coordinators[to_idx].drain_ready_state_root_verifications() {
-            actions.push(Action::VerifyStateRoot {
-                block_hash: ready.block_hash,
-                parent_block_hash: ready.parent_block_hash,
-                parent_state_root: ready.parent_state_root,
-                parent_block_height: ready.parent_block_height,
-                expected_root: ready.expected_root,
-                finalizations: ready.finalizations,
-                creations: ready.creations,
-                block_height: ready.block_height,
-                claimed_split_child_roots: ready.claimed_split_child_roots,
-                split_child_roots_required: ready.split_child_roots_required,
-                terminal_settled_txs_required: ready.terminal_settled_txs_required,
-                claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
-                parent_weighted_timestamp: ready.parent_weighted_timestamp,
-                settled_txs_window_floor: ready.settled_txs_window_floor,
-                parent_sweep_frontier: ready.parent_sweep_frontier,
-                claimed_sweep_frontier: ready.claimed_sweep_frontier,
-                frontier: ready.frontier,
-                members: ready.members,
-                parent_judgement: ready.parent_judgement,
-                state_claims: ready.state_claims,
-                transactions: ready.transactions,
-            });
-        }
+        actions.extend(
+            self.coordinators[to_idx]
+                .drain_ready_state_root_verifications()
+                .into_iter()
+                .map(|check| Action::Consensus(ConsensusAction::VerifyStateRoot(Box::new(check)))),
+        );
         if self.coordinators[to_idx].take_ready_proposal() {
             actions.extend(self.try_propose_for(to_idx));
         }
@@ -1311,9 +1290,8 @@ impl ShardCoordinatorSim {
         // touch only the coordinator, so re-bind locally below.
         if let SimEvent::BlockHeader { header, manifest } = env.event {
             let pool = &self.tx_pools[to_idx];
-            let lookup_tx = |hash: &TxHash| -> Option<Arc<Verifiable<Transaction>>> {
-                pool.get(hash)
-                    .map(|tx| Arc::new(Verifiable::from((**tx).clone())))
+            let lookup_tx = |hash: &TxHash| -> Option<Verifiable<Transaction>> {
+                pool.get(hash).map(|tx| Verifiable::from(tx.clone()))
             };
             return self.coordinators[to_idx].on_block_header(
                 &self.topology_schedule,
@@ -1411,7 +1389,7 @@ impl ShardCoordinatorSim {
         emitter_idx: usize,
         me: ValidatorId,
         key: &Arc<dyn Signer>,
-        action: Action,
+        action: ConsensusAction,
     ) -> (Vec<ProtocolEvent>, Vec<PreparedBlock>) {
         let production = self
             .production
@@ -1451,7 +1429,7 @@ impl ShardCoordinatorSim {
     /// Run `action`, a signing action, through the production handler as
     /// the replica at `idx`, under a key that reads the replica's stored
     /// registers at each signature it makes.
-    pub fn sign_in_production(&self, idx: usize, action: Action) -> SignedInProduction {
+    pub fn sign_in_production(&self, idx: usize, action: ConsensusAction) -> SignedInProduction {
         let me = self.members[idx].0;
         let probe = Arc::new(RegisterProbe {
             inner: Arc::clone(&self.sks[idx]),
@@ -1474,7 +1452,12 @@ impl ShardCoordinatorSim {
     /// as the replica at `emitter_idx`: its prepared block joins the
     /// replica's pending chain and the proposal it reports is queued
     /// back to it.
-    fn build_in_production(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
+    fn build_in_production(
+        &mut self,
+        emitter_idx: usize,
+        me: ValidatorId,
+        action: ConsensusAction,
+    ) {
         let key = Arc::clone(&self.sks[emitter_idx]);
         let (reported, prepared) = self.run_in_production(emitter_idx, me, &key, action);
         for block in prepared {
@@ -1526,17 +1509,19 @@ impl ShardCoordinatorSim {
 
     #[allow(clippy::too_many_lines)] // single dispatch over shard-emitted Action variants
     fn absorb_one(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
-        if self.production.is_some() && matches!(action, Action::BuildProposal { .. }) {
-            self.build_in_production(emitter_idx, me, action);
+        if self.production.is_some()
+            && let Action::Consensus(build @ ConsensusAction::BuildProposal { .. }) = action
+        {
+            self.build_in_production(emitter_idx, me, build);
             return;
         }
         match action {
-            Action::BroadcastBlockHeader {
+            Action::Consensus(ConsensusAction::BroadcastBlockHeader {
                 header,
                 manifest,
                 recipients: committee_ids,
                 position,
-            } => {
+            }) => {
                 // Mirror the production sign handler: the proposer's spent
                 // round is durable before the header signature exists.
                 self.storages[emitter_idx].persist_vote_position(me, &position);
@@ -1605,7 +1590,7 @@ impl ShardCoordinatorSim {
                     }
                 }
             }
-            Action::SignAndBroadcastBlockVote {
+            Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote {
                 block_hash,
                 parent_block_hash,
                 height,
@@ -1614,7 +1599,7 @@ impl ShardCoordinatorSim {
                 next_proposers,
                 position,
                 signer: _,
-            } => {
+            }) => {
                 self.votes_cast[emitter_idx].push((block_hash, round));
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
@@ -1667,7 +1652,11 @@ impl ShardCoordinatorSim {
                     event: SimEvent::VerifiedVote { vote: verified },
                 });
             }
-            Action::SignAndBroadcastQcAnnouncement { qc, recipients, .. } => {
+            Action::Consensus(ConsensusAction::SignAndBroadcastQcAnnouncement {
+                qc,
+                recipients,
+                ..
+            }) => {
                 let mut announcement = QcAnnouncementNotification {
                     qc,
                     sender: me,
@@ -1688,14 +1677,14 @@ impl ShardCoordinatorSim {
                     });
                 }
             }
-            Action::SignAndBroadcastTimeout {
+            Action::Consensus(ConsensusAction::SignAndBroadcastTimeout {
                 round,
                 high_qc,
                 high_tc,
                 recipients,
                 position,
                 signer: _,
-            } => {
+            }) => {
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
                 self.storages[emitter_idx].persist_vote_position(me, &position);
@@ -1732,10 +1721,10 @@ impl ShardCoordinatorSim {
                     event: SimEvent::VerifiedTimeout { timeout: verified },
                 });
             }
-            Action::VerifyTimeout {
+            Action::Consensus(ConsensusAction::VerifyTimeout {
                 timeout,
                 voter_public_key,
-            } => {
+            }) => {
                 // Mirror the production handler: the consensus crypto pool
                 // verifies the share (inline here) and feeds the verified
                 // timeout back to the emitter's `TimeoutKeeper`.
@@ -1754,7 +1743,7 @@ impl ShardCoordinatorSim {
             // light-client gossip; the single-shard sim has
             // nothing to deliver it to. Folds into the no-op
             // bucket below.
-            Action::BuildProposal {
+            Action::Consensus(ConsensusAction::BuildProposal {
                 shard_id,
                 chain_origin,
                 proposer,
@@ -1794,7 +1783,7 @@ impl ShardCoordinatorSim {
                 manifest,
                 timeout_cert,
                 standing_answers,
-            } => {
+            }) => {
                 // ExtendStaleParent re-parents the proposal onto an ancestor
                 // whose QC round sits below the honest lock, so honest
                 // replicas decline it under the safe-vote rule. It stays
@@ -1982,7 +1971,7 @@ impl ShardCoordinatorSim {
                     },
                 });
             }
-            Action::VerifyAndBuildQuorumCertificate {
+            Action::Consensus(ConsensusAction::VerifyAndBuildQuorumCertificate {
                 block_hash,
                 shard_id,
                 height,
@@ -1993,7 +1982,7 @@ impl ShardCoordinatorSim {
                 verified_votes,
                 total_votes,
                 binding,
-            } => {
+            }) => {
                 let result = verify_and_build_qc(
                     &BlsVerifier,
                     &self.network,
@@ -2017,12 +2006,12 @@ impl ShardCoordinatorSim {
                     },
                 });
             }
-            Action::VerifyQcSignature {
+            Action::Consensus(ConsensusAction::VerifyQcSignature {
                 qc,
                 public_keys,
                 quorum_threshold,
                 subject,
-            } => {
+            }) => {
                 let qc_ctx = QcContext {
                     verifier: &BlsVerifier,
                     network: &self.network,
@@ -2038,10 +2027,10 @@ impl ShardCoordinatorSim {
                     event: SimEvent::QcSignatureVerified { subject, result },
                 });
             }
-            Action::VerifyBodyRoot {
+            Action::Consensus(ConsensusAction::VerifyBodyRoot {
                 block,
                 validity_anchor,
-            } => {
+            }) => {
                 let result = block.header().body_root().verify(&BodyRootContext {
                     block: &block,
                     validity_anchor,
@@ -2055,12 +2044,12 @@ impl ShardCoordinatorSim {
                     ),
                 });
             }
-            Action::VerifyProvisionTxRoots {
+            Action::Consensus(ConsensusAction::VerifyProvisionTxRoots {
                 block_hash,
                 expected,
                 transactions,
                 topology_snapshot,
-            } => {
+            }) => {
                 let committing = committing_shards(&topology_snapshot);
                 let ptx_ctx = ProvisionTxRootsContext {
                     local_shard: self.shard,
@@ -2078,7 +2067,7 @@ impl ShardCoordinatorSim {
                     ),
                 });
             }
-            Action::VerifyBeaconWitnessRoot {
+            Action::Consensus(ConsensusAction::VerifyBeaconWitnessRoot {
                 block_hash,
                 expected_root,
                 expected_leaf_count,
@@ -2099,7 +2088,7 @@ impl ShardCoordinatorSim {
                 thresholds,
                 finalizations,
                 topology_snapshot,
-            } => {
+            }) => {
                 let receipts: Vec<StoredReceipt> = finalizations
                     .iter()
                     .flat_map(|fw| fw.receipts().iter().cloned())
@@ -2136,29 +2125,30 @@ impl ShardCoordinatorSim {
                     ),
                 });
             }
-            Action::VerifyStateRoot {
-                block_hash,
-                transactions,
-                parent_block_hash,
-                parent_state_root,
-                parent_block_height,
-                expected_root,
-                finalizations,
-                creations,
-                block_height,
-                claimed_split_child_roots,
-                split_child_roots_required,
-                terminal_settled_txs_required,
-                claimed_terminal_settled_txs,
-                parent_weighted_timestamp,
-                settled_txs_window_floor,
-                parent_sweep_frontier,
-                claimed_sweep_frontier,
-                frontier,
-                members,
-                parent_judgement,
-                state_claims,
-            } => {
+            Action::Consensus(ConsensusAction::VerifyStateRoot(check)) => {
+                let StateRootCheck {
+                    block_hash,
+                    transactions,
+                    parent_block_hash,
+                    parent_state_root,
+                    parent_block_height,
+                    expected_root,
+                    finalizations,
+                    creations,
+                    block_height,
+                    claimed_split_child_roots,
+                    split_child_roots_required,
+                    terminal_settled_txs_required,
+                    claimed_terminal_settled_txs,
+                    parent_weighted_timestamp,
+                    settled_txs_window_floor,
+                    parent_sweep_frontier,
+                    claimed_sweep_frontier,
+                    frontier,
+                    members,
+                    parent_judgement,
+                    state_claims,
+                } = *check;
                 let computed_terminal_settled_txs = terminal_settled_txs_required.then(|| {
                     self.pending_chains[emitter_idx]
                         .terminal_settled_txs_root(
@@ -2375,13 +2365,12 @@ impl ShardCoordinatorSim {
                 self.pace_timers
                     .insert(emitter_idx, self.now.plus(duration));
             }
-            Action::BroadcastCertifiedBlockHeader { .. }
+            Action::Consensus(ConsensusAction::BroadcastCertifiedBlockHeader { .. })
             | Action::SetTimer { .. }
             | Action::CancelTimer { .. }
-            | Action::TopologyChanged { .. }
             | Action::AbandonFetch(_)
             | Action::ReopenSyncHeight { .. } => {
-                // Timers, topology changes, fetch abandons, sync reopens
+                // Timers, fetch abandons, sync reopens
                 // (tests feed synced blocks by hand), and cross-shard
                 // light-client gossip have no in-sim delivery target.
             }

@@ -13,20 +13,21 @@ use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, BeaconFetchIds, FetchIds, FetchRequest, TimerId};
+use hyperscale_core::{BeaconBlockCheck, BeaconFetchIds, FoldAction};
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
-    BlockHeight, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlockHeader,
-    ConsensusPublicKey, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp,
-    NetworkDefinition, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT, RatifyRound, SKIP_TIMEOUT,
-    ShardId, ShardVoteEquivocationContext, ShardWitnessPayload, SlotEffects, TopologySchedule,
+    BlockHeight, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
+    CertifiedBlockHeader, CommitProofVerifyError, ConsensusPublicKey, Epoch, GenesisConfigHash,
+    Hash, LeafIndex, LocalTimestamp, NetworkDefinition, PcVoteEquivocationContext,
+    RATIFY_ROUND_TIMEOUT, RatifyRound, SKIP_TIMEOUT, ShardForkProofVerifyError, ShardId,
+    ShardVoteEquivocationContext, ShardWitnessPayload, SlotEffects, TopologySchedule,
     TopologySnapshot, ValidatorId, Verifiable, Verified, Verifier, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
 use crate::coordinator::{LocalChainAnchors, resumed_schedule, retention_floor, widen_schedule};
-use crate::participant::BeaconParticipant;
+use crate::participant::{BeaconParticipant, ProposalAdmission};
 use crate::shard_source::{ChunkFetchId, ShardSourceTracker};
 use crate::state::{apply_epoch, apply_input_for};
 use crate::verification::BeaconVerificationPipeline;
@@ -74,7 +75,7 @@ pub struct Adopted {
     pub effects: SlotEffects,
     /// The fold's own actions: the commit, the topology and the witness
     /// fetches the adoption released.
-    pub actions: Vec<Action>,
+    pub actions: Vec<FoldAction>,
 }
 
 /// A follower of the beacon chain.
@@ -87,7 +88,7 @@ pub struct BeaconFold {
     /// Latest committed beacon block paired with its authenticating
     /// cert. Carried so SPC instance bootstrap and ratify anchor
     /// checks read `prev_block_hash` without a storage roundtrip.
-    pub(crate) latest_block: Arc<Verified<CertifiedBeaconBlock>>,
+    pub(crate) latest_block: Verified<CertifiedBeaconBlock>,
 
     /// Beacon committee that governed the tip epoch, captured before
     /// its fold advanced the state. A competing block for the adopted
@@ -124,7 +125,7 @@ pub struct BeaconFold {
     /// timestamp over the window from [`retention_floor`] through
     /// `current_epoch + 1`. The `+1` lookahead entry is finalized an epoch
     /// before its window opens. A node-local cache, not consensus-critical.
-    pub(crate) topology_schedule: TopologySchedule,
+    pub(crate) topology_schedule: Arc<TopologySchedule>,
 
     /// The shard chains registered with the fold, each with its committed
     /// frontier.
@@ -160,8 +161,8 @@ impl BeaconFold {
     /// match `expected_config_hash`.
     pub fn new(
         verifier: Arc<dyn Verifier>,
-        latest_block: Arc<Verified<CertifiedBeaconBlock>>,
-        history: Vec<BeaconState>,
+        latest_block: Verified<CertifiedBeaconBlock>,
+        history: Vec<impl Borrow<BeaconState>>,
         network: NetworkDefinition,
         expected_config_hash: GenesisConfigHash,
     ) -> Self {
@@ -172,7 +173,7 @@ impl BeaconFold {
                 "genesis block config_hash doesn't match operator config",
             );
         }
-        let latest = history.last().expect(LATEST_STATE_EXPECT);
+        let latest = history.last().expect(LATEST_STATE_EXPECT).borrow();
         let latest_epoch = latest.current_epoch;
         let mut topology_schedule = resumed_schedule(&history, &network);
         // No fold published the genesis window, so at genesis it is its
@@ -187,13 +188,18 @@ impl BeaconFold {
         // fold when the loaded history carries one; the live state
         // stands in otherwise (see the field docs).
         let tip_epoch_source = if history.len() >= 2 {
-            &history[history.len() - 2]
+            history[history.len() - 2].borrow()
         } else {
             latest
         };
         let tip_epoch_committee = tip_epoch_source.derive_beacon_committee();
         let tip_epoch_pool = tip_epoch_source.derive_active_pool();
-        let state = history.into_iter().next_back().expect(LATEST_STATE_EXPECT);
+        let state = history
+            .into_iter()
+            .next_back()
+            .expect(LATEST_STATE_EXPECT)
+            .borrow()
+            .clone();
         Self {
             verifier,
             state,
@@ -203,7 +209,7 @@ impl BeaconFold {
             verification: BeaconVerificationPipeline::new(),
             shard_source: ShardSourceTracker::new(),
             host_on_committee: false,
-            topology_schedule,
+            topology_schedule: Arc::new(topology_schedule),
             hosted: BTreeMap::new(),
             next_registration: 0,
             network,
@@ -244,7 +250,7 @@ impl BeaconFold {
     /// every crossing the fold already holds, which no further header
     /// may arrive to ask for; leaving drops the pooled witness chunks and
     /// releases the in-flight witness fetches.
-    pub fn set_host_on_committee(&mut self, on: bool) -> Vec<Action> {
+    pub fn set_host_on_committee(&mut self, on: bool) -> Vec<FoldAction> {
         let was = mem::replace(&mut self.host_on_committee, on);
         match (was, on) {
             (false, true) => {
@@ -278,21 +284,32 @@ impl BeaconFold {
 
     /// The tip: the latest adopted block.
     #[must_use]
-    pub const fn latest_block(&self) -> &Arc<Verified<CertifiedBeaconBlock>> {
+    pub const fn latest_block(&self) -> &Verified<CertifiedBeaconBlock> {
         &self.latest_block
     }
 
     /// The topology schedule the fold keeps, from the retention floor
     /// through the lookahead.
     #[must_use]
-    pub const fn schedule(&self) -> &TopologySchedule {
+    pub fn schedule(&self) -> &TopologySchedule {
+        &self.topology_schedule
+    }
+
+    /// [`Self::schedule`], shared: the copy the fold's next adoption
+    /// leaves alone, cloning its own before it changes it.
+    #[must_use]
+    pub const fn shared_schedule(&self) -> &Arc<TopologySchedule> {
         &self.topology_schedule
     }
 
     /// Insert the windows `history` carries below the schedule's oldest
     /// retained epoch — see [`widen_schedule`](crate::coordinator::widen_schedule).
     pub fn widen<B: Borrow<BeaconState>>(&mut self, history: &[B]) {
-        widen_schedule(&mut self.topology_schedule, history, &self.network);
+        widen_schedule(
+            Arc::make_mut(&mut self.topology_schedule),
+            history,
+            &self.network,
+        );
     }
 
     /// The source-shard headers and witness chunks the fold holds.
@@ -337,7 +354,7 @@ impl BeaconFold {
 
     /// The live topology snapshot: the schedule's head.
     #[must_use]
-    pub(crate) const fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
+    pub(crate) fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
         self.topology_schedule.head()
     }
 
@@ -347,7 +364,7 @@ impl BeaconFold {
     /// success [`Self::on_beacon_block_verified`] hands the verified
     /// block off to [`Self::adopt`]. A block more than one epoch
     /// ahead of the local tip is dropped and triggers gap-fill sync
-    /// ([`Action::StartBeaconBlockSync`]) to fetch the missing epochs in
+    /// ([`FoldAction::StartBeaconBlockSync`]) to fetch the missing epochs in
     /// order.
     ///
     /// Cert verification uses `self.state.committee` for Normal blocks
@@ -358,8 +375,8 @@ impl BeaconFold {
     /// problem handled elsewhere.
     pub fn on_beacon_block_received(
         &mut self,
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
-    ) -> Vec<Action> {
+        block: Verifiable<CertifiedBeaconBlock>,
+    ) -> Vec<FoldAction> {
         let epoch = block.epoch();
         let tip_epoch = self.latest_block.epoch();
         if epoch <= tip_epoch {
@@ -384,7 +401,7 @@ impl BeaconFold {
             // claimed epoch is only a target hint — the runner's sync
             // backs off on epochs that don't exist, so a bogus far-future
             // epoch can't busy-loop the network.
-            return vec![Action::StartBeaconBlockSync { target: epoch }];
+            return vec![FoldAction::StartBeaconBlockSync { target: epoch }];
         }
 
         if block.prev_block_hash() != self.latest_block.block_hash() {
@@ -424,8 +441,8 @@ impl BeaconFold {
     /// adoption — the live state's sets are post-fold.
     fn tip_competitor_verification(
         &mut self,
-        block: &Arc<Verifiable<CertifiedBeaconBlock>>,
-    ) -> Option<Vec<Action>> {
+        block: &Verifiable<CertifiedBeaconBlock>,
+    ) -> Option<Vec<FoldAction>> {
         if block.epoch() != self.latest_block.epoch()
             || block.epoch() == Epoch::GENESIS
             || block.prev_block_hash() != self.latest_block.prev_block_hash()
@@ -442,7 +459,7 @@ impl BeaconFold {
         );
         let equivocation_signers = self.equivocation_signers_for(block.block());
         Some(self.dispatch_block_verification(
-            Arc::clone(block),
+            block.clone(),
             self.tip_epoch_committee.clone(),
             self.tip_epoch_pool.clone(),
             equivocation_signers,
@@ -474,28 +491,28 @@ impl BeaconFold {
     }
 
     /// Dispatch a block's cert + equivocation verification. Returns a
-    /// single [`Action::VerifyBeaconBlock`] on a fresh slot, or an empty
+    /// single [`FoldAction::VerifyBeaconBlock`] on a fresh slot, or an empty
     /// vector when the slot is already in flight or already verified —
     /// the in-flight slot's result drives admission for any duplicate.
     fn dispatch_block_verification(
         &mut self,
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: Verifiable<CertifiedBeaconBlock>,
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,
         active_pool: Vec<(ValidatorId, ConsensusPublicKey)>,
         equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
-    ) -> Vec<Action> {
+    ) -> Vec<FoldAction> {
         if !self.verification.mark_block_in_flight(block.block_hash()) {
             return Vec::new();
         }
-        vec![Action::VerifyBeaconBlock {
+        vec![FoldAction::VerifyBeaconBlock(BeaconBlockCheck {
             block,
             committee,
             active_pool,
             equivocation_signers,
-        }]
+        })]
     }
 
-    /// A previously-dispatched [`Action::VerifyBeaconBlock`] has
+    /// A previously-dispatched [`FoldAction::VerifyBeaconBlock`] has
     /// returned. Clear the pipeline slot, and on the `Ok` arm adopt
     /// the verified block (unless the tip has since moved past it).
     /// Drops silently on the `Err` arm.
@@ -513,7 +530,7 @@ impl BeaconFold {
     /// the evidence rather than continuing on a forked beacon chain.
     pub fn on_beacon_block_verified(
         &mut self,
-        result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
+        result: Result<Verified<CertifiedBeaconBlock>, CertifiedBeaconBlockVerifyError>,
     ) -> Option<Adopted> {
         let block = match result {
             Ok(b) => b,
@@ -583,7 +600,7 @@ impl BeaconFold {
     /// the epoch after the tip adopts: every path that certifies an
     /// epoch reaches here, and the first to arrive is the one that
     /// folds it, so `apply_epoch` never sees a regression.
-    pub fn adopt(&mut self, block: Arc<Verified<CertifiedBeaconBlock>>) -> Option<Adopted> {
+    pub fn adopt(&mut self, block: Verified<CertifiedBeaconBlock>) -> Option<Adopted> {
         let epoch = block.epoch();
         if epoch != self.state.current_epoch.next() {
             return None;
@@ -601,7 +618,7 @@ impl BeaconFold {
             block.epoch(),
             input,
         );
-        self.latest_block = Arc::clone(&block);
+        self.latest_block = block.clone();
 
         // Refresh the head and record the active snapshot for the just-applied
         // epoch plus the lookahead for the next, then drop entries every
@@ -609,25 +626,22 @@ impl BeaconFold {
         // resolve its committee a full epoch before its window opens.
         let head = Arc::new(self.state.derive_topology_snapshot(self.network.clone()));
         let epoch = self.state.current_epoch;
-        self.topology_schedule.set_head(Arc::clone(&head));
-        self.topology_schedule.insert(epoch, head);
+        let schedule = Arc::make_mut(&mut self.topology_schedule);
+        schedule.set_head(Arc::clone(&head));
+        schedule.insert(epoch, head);
         let lookahead = Arc::new(
             self.state
                 .derive_next_topology_snapshot(self.network.clone()),
         );
-        self.topology_schedule
-            .insert_lookahead(epoch.next(), lookahead);
+        schedule.insert_lookahead(epoch.next(), lookahead);
         // Latched before the eviction reads the floor: a chain caught up
         // to its terminal whose last commit preceded this fold reads past
         // its terminal only now, and only while its window is held.
         for chain in self.hosted.values_mut() {
             latch_terminal(&self.topology_schedule, chain);
         }
-        self.topology_schedule.evict_below(retention_floor(
-            &self.state,
-            self.hosted_committee_floor(),
-            self.now,
-        ));
+        let floor = retention_floor(&self.state, self.hosted_committee_floor(), self.now);
+        Arc::make_mut(&mut self.topology_schedule).evict_below(floor);
 
         // Evict chunks the boundary fold has now consumed — those starting
         // below each shard's advanced applied watermark
@@ -649,13 +663,13 @@ impl BeaconFold {
         // committee actually changed. The commit precedes it so a shard
         // never hears of an epoch that is not yet durable.
         let mut actions = vec![
-            Action::CommitBeaconBlock {
+            FoldAction::CommitBeaconBlock {
                 block,
                 state: Box::new(self.state.clone()),
             },
-            Action::TopologyChanged {
+            FoldAction::TopologyChanged {
                 epoch: self.state.current_epoch,
-                schedule: Arc::new(self.topology_schedule.clone()),
+                schedule: Arc::clone(&self.topology_schedule),
             },
         ];
         // Release in-flight witness fetches the boundary fold just consumed
@@ -690,8 +704,8 @@ impl BeaconFold {
     pub fn on_local_block_committed(
         &mut self,
         token: ChainRegistration,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
-    ) -> Vec<Action> {
+        certified_header: &Verified<CertifiedBlockHeader>,
+    ) -> Vec<FoldAction> {
         if !self.hosted.contains_key(&token) {
             return Vec::new();
         }
@@ -721,7 +735,7 @@ impl BeaconFold {
     pub fn on_certified_local_header(
         &mut self,
         token: ChainRegistration,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) {
         if self.hosted.contains_key(&token) {
             self.record_source_header(certified_header);
@@ -739,8 +753,8 @@ impl BeaconFold {
     /// [`fetch_witness_chunk`](Self::fetch_witness_chunk).
     pub fn on_source_header(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
-    ) -> Vec<Action> {
+        certified_header: &Verified<CertifiedBlockHeader>,
+    ) -> Vec<FoldAction> {
         self.record_source_header(certified_header);
         if !self.host_on_committee {
             return Vec::new();
@@ -754,7 +768,7 @@ impl BeaconFold {
     /// askers' awaiting proposals want re-evaluating.
     pub fn admit_proven_for<'a>(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
         participants: impl IntoIterator<Item = &'a BeaconParticipant>,
     ) -> bool {
         let (shard, height) = (certified_header.shard_id(), certified_header.height());
@@ -765,15 +779,15 @@ impl BeaconFold {
             return false;
         }
         self.shard_source
-            .admit_proven_boundary(Arc::clone(certified_header));
+            .admit_proven_boundary(certified_header.clone());
         true
     }
 
     /// Hold `certified_header` in the shard's window and note any
     /// epoch-boundary crossing it makes visible.
-    fn record_source_header(&mut self, certified_header: &Arc<Verified<CertifiedBlockHeader>>) {
+    fn record_source_header(&mut self, certified_header: &Verified<CertifiedBlockHeader>) {
         self.shard_source
-            .on_verified_source_header(Arc::clone(certified_header));
+            .on_verified_source_header(certified_header.clone());
         self.shard_source.observe_crossing(
             certified_header.header().shard_id(),
             self.state.chain_config.epoch_windows(),
@@ -807,7 +821,7 @@ impl BeaconFold {
         lo: LeafIndex,
         payloads: Vec<ShardWitnessPayload>,
         range_proof: Vec<Hash>,
-    ) -> Option<Vec<Action>> {
+    ) -> Option<Vec<FoldAction>> {
         if !self.host_on_committee {
             return Some(Vec::new());
         }
@@ -857,7 +871,7 @@ impl BeaconFold {
     /// gap-filling to do across responses. `chunk_bounds` already caps the
     /// run at the fold's per-epoch budget, which bounds the work one
     /// header can trigger.
-    pub(crate) fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<Action> {
+    pub(crate) fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<FoldAction> {
         let (anchor, block_height, prior, chunk_end) = {
             let Some(crossing) =
                 boundary::crossing_to_source(&self.state, &self.shard_source, shard)
@@ -891,18 +905,16 @@ impl BeaconFold {
         // tracker's record is for cancellation, not dedup.
         self.shard_source
             .register_pending_fetch(shard, block_height, anchor, prior, chunk_end);
-        vec![Action::Fetch(FetchRequest::Ask {
-            ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(vec![(
+        vec![FoldAction::Fetch {
+            ids: BeaconFetchIds::Witnesses(vec![(
                 shard,
                 block_height,
                 anchor,
                 LeafIndex::new(prior),
                 LeafIndex::new(chunk_end),
-            )])),
+            )]),
             shard,
-            preferred: None,
-            class: None,
-        })]
+        }]
     }
 
     /// Re-issue witness-chunk fetches for terminated shards whose terminal
@@ -915,7 +927,7 @@ impl BeaconFold {
     /// never landed); once it folds, the boundary advances its watermark and
     /// the terminal record drops, ending the re-drive. The fold seeds a
     /// split's children or composes a merge's parent.
-    pub fn redrive_terminal_witness_fetches(&mut self) -> Vec<Action> {
+    pub fn redrive_terminal_witness_fetches(&mut self) -> Vec<FoldAction> {
         if !self.host_on_committee {
             return Vec::new();
         }
@@ -978,29 +990,6 @@ impl BeaconFold {
                 .handoff_evidence_expiry(shard)
                 .is_some_and(|expiry| now > expiry)
         })
-    }
-
-    /// Schedule the first `BeaconCommitteeStart` timer so the upcoming
-    /// epoch's SPC instance bootstraps. Subsequent epochs self-arm when a
-    /// participant settles an adoption; this only covers the resume gap
-    /// from a freshly-built or just-loaded fold.
-    ///
-    /// Fires at the next epoch's wall-clock boundary (the close of the
-    /// current epoch's window), or immediately if
-    /// `now` is already past it. Tests that want fast beacon kickoff
-    /// override `chain_config.epoch_duration_ms` in the genesis config.
-    #[must_use]
-    pub fn on_startup(&self) -> Vec<Action> {
-        vec![
-            Action::SetTimer {
-                id: TimerId::BeaconCommitteeStart,
-                duration: self.duration_until_next_epoch_boundary(),
-            },
-            Action::SetTimer {
-                id: TimerId::BeaconRatifyTrigger,
-                duration: self.duration_until_next_ratify_fire(),
-            },
-        ]
     }
 
     /// Wall-clock boundary of the upcoming epoch — the close of the current
@@ -1109,56 +1098,80 @@ impl BeaconFold {
 
     /// Verify the equivocation evidence embedded in `proposal` and
     /// return the proposal with each `Verifiable` marker upgraded in
-    /// place, or `None` if any entry is unverifiable. An entry verifies
-    /// when both signatures check out under the named validator's pubkey
-    /// (from `state.validators`); evidence naming an unknown validator
-    /// is unverifiable. A forged sig can't be made to pass, so an honest
-    /// node never votes for it. The upgraded markers ride the pooled
-    /// proposal through to `apply_epoch`.
+    /// place. An entry verifies when both signatures check out under the
+    /// named validator's pubkey (from `state.validators`). A forged sig
+    /// can't be made to pass, so an honest node never votes for it. The
+    /// upgraded markers ride the pooled proposal through to `apply_epoch`.
+    ///
+    /// # Errors
+    ///
+    /// [`ProposalAdmission::Refuted`] when an entry fails under its
+    /// validator's registered key, which never changes, and otherwise
+    /// [`ProposalAdmission::Abstained`] when an entry names a validator
+    /// this fold has not registered yet.
     pub(crate) fn upgrade_proposal_equivocations(
         &self,
         proposal: &Verified<BeaconProposal>,
-    ) -> Option<Verified<BeaconProposal>> {
+    ) -> Result<Verified<BeaconProposal>, ProposalAdmission> {
         let mut equivocations = Vec::with_capacity(proposal.equivocations().len());
+        let mut unjudged = false;
         for ev in proposal.equivocations() {
-            let rec = self.state.validators.get(&ev.validator)?;
+            let Some(rec) = self.state.validators.get(&ev.validator) else {
+                unjudged = true;
+                continue;
+            };
             let mut ev = ev.clone();
             ev.upgrade_in_place(&PcVoteEquivocationContext {
                 verifier: self.verifier.as_ref(),
                 network: &self.network,
                 committee: &[(ev.validator, rec.pubkey)],
             })
-            .ok()?;
+            .map_err(|_| ProposalAdmission::Refuted)?;
             equivocations.push(ev);
+        }
+        if unjudged {
+            return Err(ProposalAdmission::Abstained);
         }
         proposal
             .clone()
             .with_verified_equivocations(
                 Capped::new(equivocations).expect("a list under the cap its source already met"),
             )
-            .ok()
+            .map_err(|_| ProposalAdmission::Abstained)
     }
 
-    /// Marker-upgrade every shard double-vote pair in `proposal`, or
-    /// `None` if any entry names an unregistered validator or fails
-    /// signature verification under the registered key. The registry
-    /// resolves ex-members and revoked keys alike, so evidence about a
-    /// rotated-out signer still admits.
+    /// Marker-upgrade every shard double-vote pair in `proposal`. The
+    /// registry resolves ex-members and revoked keys alike, so evidence
+    /// about a rotated-out signer still admits.
+    ///
+    /// # Errors
+    ///
+    /// [`ProposalAdmission::Refuted`] when a pair fails signature
+    /// verification under its validator's registered key, and otherwise
+    /// [`ProposalAdmission::Abstained`] when a pair names a validator this
+    /// fold has not registered yet.
     pub(crate) fn upgrade_proposal_vote_equivocations(
         &self,
         proposal: &Verified<BeaconProposal>,
-    ) -> Option<Verified<BeaconProposal>> {
+    ) -> Result<Verified<BeaconProposal>, ProposalAdmission> {
         let mut vote_equivocations = Vec::with_capacity(proposal.vote_equivocations().len());
+        let mut unjudged = false;
         for ev in proposal.vote_equivocations() {
-            let rec = self.state.validators.get(&ev.validator)?;
+            let Some(rec) = self.state.validators.get(&ev.validator) else {
+                unjudged = true;
+                continue;
+            };
             let mut ev = ev.clone();
             ev.upgrade_in_place(&ShardVoteEquivocationContext {
                 verifier: self.verifier.as_ref(),
                 network: &self.network,
                 pubkey: &rec.pubkey,
             })
-            .ok()?;
+            .map_err(|_| ProposalAdmission::Refuted)?;
             vote_equivocations.push(ev);
+        }
+        if unjudged {
+            return Err(ProposalAdmission::Abstained);
         }
         proposal
             .clone()
@@ -1166,11 +1179,11 @@ impl BeaconFold {
                 Capped::new(vote_equivocations)
                     .expect("a list under the cap its source already met"),
             )
-            .ok()
+            .map_err(|_| ProposalAdmission::Abstained)
     }
 
-    /// Every fork proof in `proposal` verifies against the local topology
-    /// schedule and sits under its own shard's map key. A proof
+    /// Whether every fork proof in `proposal` verifies against the local
+    /// topology schedule and sits under its own shard's map key. A proof
     /// self-authenticates (each side carries the accused committee's
     /// aggregated signatures), so this re-verifies from scratch — the
     /// `Verifiable` marker is never trusted to skip the gate, exactly as
@@ -1190,26 +1203,78 @@ impl BeaconFold {
     /// before left, so all read the same seating, and a proposer prunes
     /// its own buffer by the same rule
     /// ([`prune_folded_evidence`](crate::participant::BeaconParticipant::prune_folded_evidence)).
-    pub(crate) fn fork_proofs_admissible(&self, proposal: &Verified<BeaconProposal>) -> bool {
-        proposal.fork_proofs().iter().all(|(shard, proof)| {
+    ///
+    /// # Errors
+    ///
+    /// [`ProposalAdmission::Refuted`] when a proof is mis-keyed or false
+    /// by its own structure; otherwise [`ProposalAdmission::Abstained`]
+    /// when a proof is judged against the schedule: its QCs' committees
+    /// are resolved from a recovery-bridged view a proposer that verified
+    /// the proof earlier may not have shared.
+    pub(crate) fn fork_proofs_admissible(
+        &self,
+        proposal: &Verified<BeaconProposal>,
+    ) -> Result<(), ProposalAdmission> {
+        let mut verdict = Ok(());
+        for (shard, proof) in proposal.fork_proofs() {
             let proof = proof.as_unverified();
-            *shard == proof.shard()
-                && self.state.next_shard_committees.contains_key(shard)
-                && proof
-                    .verify(self.verifier.as_ref(), &self.topology_schedule)
-                    .is_ok()
+            if *shard != proof.shard() {
+                return Err(ProposalAdmission::Refuted);
+            }
+            if !self.state.next_shard_committees.contains_key(shard) {
+                verdict = Err(ProposalAdmission::Abstained);
+                continue;
+            }
+            match proof.verify(self.verifier.as_ref(), &self.topology_schedule) {
+                Ok(()) => {}
+                Err(err) if refutes_fork_proof(&err) => return Err(ProposalAdmission::Refuted),
+                Err(_) => verdict = Err(ProposalAdmission::Abstained),
+            }
+        }
+        verdict
+    }
+
+    /// What `candidate` verifies under, once the fields no signature
+    /// covers hold: it extends the tip, and its shard contributions are
+    /// the canonical projection of its committed proposals. The SPC cert
+    /// authenticates the proposals alone, so a Byzantine assembler's
+    /// variant projection (fabricated, stale, extra or omitted) must
+    /// never become the value an honest member prevotes. `None` when
+    /// either fails.
+    #[must_use]
+    pub fn candidate_keys(&self, candidate: &CandidateBeaconBlock) -> Option<CandidateKeys> {
+        if candidate.prev_block_hash() != self.latest_block.block_hash()
+            || candidate.epoch() != self.state.current_epoch.next()
+        {
+            trace!(
+                epoch = candidate.epoch().inner(),
+                "BeaconCandidate doesn't extend the local tip — dropping",
+            );
+            return None;
+        }
+        if !rules::contributions_well_formed(&self.state, candidate.block()) {
+            warn!(
+                epoch = candidate.epoch().inner(),
+                "BeaconCandidate has malformed shard contributions — dropping",
+            );
+            return None;
+        }
+        Some(CandidateKeys {
+            committee: self.state.derive_beacon_committee(),
+            equivocation_signers: self.equivocation_signers_for(candidate.block()),
         })
     }
 
     /// VRF-verify a fetched proposal under `validator`'s registered
     /// pubkey, or `None` with a warn when the validator is unknown or
     /// the reveal fails.
-    pub(crate) fn verify_fetched_proposal(
+    #[must_use]
+    pub fn verify_fetched_proposal(
         &self,
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Arc<Verifiable<BeaconProposal>>,
-    ) -> Option<Arc<Verified<BeaconProposal>>> {
+        proposal: Verifiable<BeaconProposal>,
+    ) -> Option<Verified<BeaconProposal>> {
         let Some(record) = self.state.validators.get(&validator) else {
             warn!(
                 ?validator,
@@ -1223,8 +1288,8 @@ impl BeaconFold {
             epoch,
             sender_pk: record.pubkey,
         };
-        match Arc::unwrap_or_clone(proposal).upgrade(&ctx) {
-            Ok(verified) => Some(Arc::new(verified)),
+        match proposal.upgrade(&ctx) {
+            Ok(verified) => Some(verified),
             Err((_, err)) => {
                 warn!(
                     ?validator,
@@ -1238,6 +1303,33 @@ impl BeaconFold {
     }
 }
 
+/// Whether `err` shows a fork proof false by its own bytes: its commit
+/// proofs do not hold together, or the two do not contradict. A QC that
+/// fails against a schedule-resolved committee, or a committee the
+/// schedule cannot resolve, is a judgement of this member's schedule.
+const fn refutes_fork_proof(err: &ShardForkProofVerifyError) -> bool {
+    match err {
+        ShardForkProofVerifyError::ProofA(proof) | ShardForkProofVerifyError::ProofB(proof) => {
+            !matches!(proof, CommitProofVerifyError::Qc(_))
+        }
+        ShardForkProofVerifyError::ShardMismatch
+        | ShardForkProofVerifyError::HeightMismatch
+        | ShardForkProofVerifyError::NotConflicting => true,
+        ShardForkProofVerifyError::CommitteeUnresolved
+        | ShardForkProofVerifyError::CommitteeCountMismatch => false,
+    }
+}
+
+/// The keys a candidate's certificates verify under.
+pub struct CandidateKeys {
+    /// The beacon committee, in the positional order the SPC cert's
+    /// signer bitfields read.
+    pub committee: Vec<(ValidatorId, ConsensusPublicKey)>,
+    /// The validators the committed proposals' equivocation evidence
+    /// names; empty when it names none.
+    pub equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
+}
+
 /// Latch `chain` terminal once `schedule` reads its committed block
 /// anchor past its shard's terminal window.
 fn latch_terminal(schedule: &TopologySchedule, chain: &mut HostedChain) {
@@ -1246,11 +1338,9 @@ fn latch_terminal(schedule: &TopologySchedule, chain: &mut HostedChain) {
     }
 }
 
-fn abandon_witnesses(ids: Vec<ChunkFetchId>) -> Vec<Action> {
+fn abandon_witnesses(ids: Vec<ChunkFetchId>) -> Vec<FoldAction> {
     if ids.is_empty() {
         return Vec::new();
     }
-    vec![Action::AbandonFetch(FetchIds::Beacon(
-        BeaconFetchIds::Witnesses(ids),
-    ))]
+    vec![FoldAction::AbandonFetch(BeaconFetchIds::Witnesses(ids))]
 }

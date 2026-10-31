@@ -15,7 +15,8 @@
 use std::collections::BTreeSet;
 
 use hyperscale_core::{
-    Action, CommitSource, FetchIds, FetchRequest, ProtocolEvent, QcSubject, SyncClaimId, TimerId,
+    Action, CommitSource, ConsensusAction, FetchIds, FetchRequest, ProtocolEvent, QcSubject,
+    StateRootCheck, SyncClaimId, TimerId,
 };
 use hyperscale_types::{
     Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn, Epoch,
@@ -215,8 +216,7 @@ use crate::validation::{
     validate_coast_block_for_vote, validate_header, validate_proposer,
 };
 use crate::verification::{
-    InFlightCheck, ReadyStateRootVerification, SubstateCountSource, VerificationPipeline,
-    committed_cells_for,
+    InFlightCheck, SubstateCountSource, VerificationPipeline, committed_cells_for,
 };
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
@@ -811,8 +811,8 @@ fn restored_pending_blocks(voted_blocks: &[Arc<Block>]) -> (PendingBlocks, Vec<B
         recovered_blocks.push(block.header().hash());
         let mut pending = PendingBlock::from_complete_block(
             block,
-            block.certificates().iter().map(Arc::clone).collect(),
-            block.provisions().iter().map(Arc::clone).collect(),
+            block.certificates().to_vec(),
+            block.provisions().to_vec(),
             LocalTimestamp::ZERO,
         );
         pending
@@ -830,7 +830,7 @@ fn restored_pending_blocks(voted_blocks: &[Arc<Block>]) -> (PendingBlocks, Vec<B
 /// and the beacon reads the shard's own chain from its header as early as
 /// a remote observer could.
 fn certified_block_landed(certified: Arc<Verified<CertifiedBlock>>) -> Vec<Action> {
-    let certified_header = Arc::new(certified.certified_header());
+    let certified_header = certified.certified_header();
     vec![
         Action::AttachCertifiedUncommitted { certified },
         Action::Continuation(ProtocolEvent::LocalBlockCertified { certified_header }),
@@ -2069,14 +2069,14 @@ impl ShardCoordinator {
                     .copied()
                     .filter(|&member| member != signer)
                     .partition(|member| self.signers.contains_key(member));
-                Action::SignAndBroadcastReadySignal {
+                Action::Consensus(ConsensusAction::SignAndBroadcastReadySignal {
                     shard: self.local_shard,
                     wt_window_start,
                     wt_window_end,
                     recipients,
                     local_recipient: !local.is_empty(),
                     signer,
-                }
+                })
             })
             .collect()
     }
@@ -2804,7 +2804,7 @@ impl ShardCoordinator {
             self.local_shard,
             block.height(),
             anchor,
-            block.transactions().iter().map(|tx| tx.as_unverified()),
+            block.transactions().iter().map(Verifiable::as_unverified),
             MemberSections {
                 certificates: block.certificates(),
                 records: block.abandonment_records(),
@@ -2814,7 +2814,7 @@ impl ShardCoordinator {
             derived_terms(
                 committee,
                 self.local_shard,
-                block.transactions().iter().map(|tx| tx.as_unverified()),
+                block.transactions().iter().map(Verifiable::as_unverified),
             ),
         )
     }
@@ -3078,7 +3078,7 @@ impl ShardCoordinator {
                 local,
                 height,
                 anchor,
-                payload.transactions.iter().map(|tx| &***tx),
+                payload.transactions.iter().map(|tx| &**tx),
                 MemberSections {
                     certificates: &payload.finalizations,
                     records: &payload.abandonment_records,
@@ -3088,7 +3088,7 @@ impl ShardCoordinator {
                 derived_terms(
                     committee,
                     local,
-                    payload.transactions.iter().map(|tx| &***tx),
+                    payload.transactions.iter().map(|tx| &**tx),
                 ),
             ));
         }
@@ -3275,9 +3275,10 @@ impl ShardCoordinator {
         }
         debug_assert!(
             goes_out
-                || !actions
-                    .iter()
-                    .any(|action| matches!(action, Action::BuildProposal { .. })),
+                || !actions.iter().any(|action| matches!(
+                    action,
+                    Action::Consensus(ConsensusAction::BuildProposal { .. })
+                )),
             "a build predicted not to go out, and so asked for no content, was dispatched"
         );
         actions
@@ -4316,9 +4317,9 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         header: &BlockHeader,
         manifest: BlockManifest,
-        lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
+        lookup_tx: impl Fn(&TxHash) -> Option<Verifiable<Transaction>>,
+        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Verifiable<Finalization>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height();
@@ -4445,7 +4446,7 @@ impl ShardCoordinator {
         let scheduled_vote_verification = actions.iter().any(|a| {
             matches!(
                 a,
-                Action::VerifyQcSignature { subject, .. }
+                Action::Consensus(ConsensusAction::VerifyQcSignature { subject, .. })
                     if !matches!(subject, QcSubject::SyncClaim(_))
             )
         });
@@ -4499,7 +4500,7 @@ impl ShardCoordinator {
         // this gate a Byzantine proposer can pass `validate_header` (which
         // only checks signer-power, not signatures) and have us unlock vote
         // locks / fire two-chain commit on a forged QC. The vote-flow path
-        // dispatches `Action::VerifyQcSignature` when we want to vote on
+        // dispatches `ConsensusAction::VerifyQcSignature` when we want to vote on
         // this block; on success `on_qc_signature_verified` re-enters the
         // adoption logic via `try_adopt_verified_qc`.
         //
@@ -4742,12 +4743,12 @@ impl ShardCoordinator {
         qc: Verifiable<QuorumCertificate>,
         id: SyncClaimId,
     ) -> Action {
-        Action::VerifyQcSignature {
+        Action::Consensus(ConsensusAction::VerifyQcSignature {
             qc,
             public_keys: committee_public_keys(committee, self.local_shard),
             quorum_threshold: committee.quorum_threshold_for_shard(self.local_shard),
             subject: QcSubject::SyncClaim(id),
-        }
+        })
     }
 
     /// One committee answered sync claim `id`.
@@ -5355,12 +5356,12 @@ impl ShardCoordinator {
             // marker on the embedded parent_qc so the handler can short-
             // circuit when the wrapper arrives `Verifiable::Verified`
             // (cache hit, local dispatch).
-            return vec![Action::VerifyQcSignature {
+            return vec![Action::Consensus(ConsensusAction::VerifyQcSignature {
                 qc: header.parent_qc_verifiable().clone(),
                 public_keys,
                 quorum_threshold,
                 subject: QcSubject::ParentOf(block_hash),
-            }];
+            })];
         }
 
         // Genesis QC - vote directly (no signature to verify)
@@ -5936,16 +5937,18 @@ impl ShardCoordinator {
         // ratcheted registers, signs on the consensus crypto pool,
         // broadcasts, and feeds the signed vote back for local VoteSet
         // tracking via VerifiedBlockVoteReceived.
-        vec![Action::SignAndBroadcastBlockVote {
-            block_hash,
-            parent_block_hash,
-            height,
-            round,
-            timestamp,
-            next_proposers,
-            position: self.vote_position(position, Some(block_hash)),
-            signer: voter,
-        }]
+        vec![Action::Consensus(
+            ConsensusAction::SignAndBroadcastBlockVote {
+                block_hash,
+                parent_block_hash,
+                height,
+                round,
+                timestamp,
+                next_proposers,
+                position: self.vote_position(position, Some(block_hash)),
+                signer: voter,
+            },
+        )]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -6232,7 +6235,7 @@ impl ShardCoordinator {
 
     /// Handle QC verification and building result.
     ///
-    /// Called when the runner completes `Action::VerifyAndBuildQuorumCertificate`.
+    /// Called when the runner completes `ConsensusAction::VerifyAndBuildQuorumCertificate`.
     ///
     /// If QC was built successfully under the vote set's current
     /// `binding`, enqueues `QuorumCertificateFormed` event; one built under
@@ -6320,7 +6323,7 @@ impl ShardCoordinator {
 
     /// Handle QC signature verification result.
     ///
-    /// Called when the runner completes `Action::VerifyQcSignature`.
+    /// Called when the runner completes `ConsensusAction::VerifyQcSignature`.
     /// On success, the verified QC rides in the event payload — no
     /// separate cache lookup needed. `subject` routes the result: a synced
     /// block's own QC goes to block sync, a header's `parent_qc` to the
@@ -6738,7 +6741,7 @@ impl ShardCoordinator {
 
     /// Handle proposal built by the runner.
     ///
-    /// Called when the runner completes `Action::BuildProposal`. The runner has
+    /// Called when the runner completes `ConsensusAction::BuildProposal`. The runner has
     /// computed the state root, built the complete block, and cached the `WriteBatch`
     /// for efficient commit later.
     #[instrument(skip(self, topology_schedule, block, finalizations), fields(height = %height.inner(), round = round.inner()))]
@@ -6750,8 +6753,8 @@ impl ShardCoordinator {
         round: Round,
         block: &Block,
         block_hash: BlockHash,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
+        provisions: Vec<Verifiable<Provisions>>,
         bytes_delta: i64,
         answers: AnswerDelta,
         additions: AnswerAdditions,
@@ -6858,12 +6861,12 @@ impl ShardCoordinator {
         // the self-vote's own persist finds nothing left to write.
         let header_position =
             self.vote_position(position.voted(round, parent_qc_round), Some(block_hash));
-        let mut actions = vec![Action::BroadcastBlockHeader {
+        let mut actions = vec![Action::Consensus(ConsensusAction::BroadcastBlockHeader {
             header: Box::new(block.header().clone()),
             manifest: Box::new(manifest),
             recipients,
             position: header_position,
-        }];
+        })];
 
         // The proposer votes its own block, and so does every eligible
         // sibling the safe-vote rule admits. The replica built the block
@@ -7188,11 +7191,13 @@ impl ShardCoordinator {
             (self.designated_sender(committee)?, vec![next])
         };
         self.announced_round = Some(qc.round());
-        Some(Action::SignAndBroadcastQcAnnouncement {
-            qc: (**qc).clone(),
-            recipients,
-            signer,
-        })
+        Some(Action::Consensus(
+            ConsensusAction::SignAndBroadcastQcAnnouncement {
+                qc: (**qc).clone(),
+                recipients,
+                signer,
+            },
+        ))
     }
 
     /// The signer that speaks for this replica where no signer's role
@@ -7993,7 +7998,9 @@ impl ShardCoordinator {
                 certified.qc_verified().clone(),
             )
             .expect("Verified<CertifiedBlock> binds qc.block_hash to header.hash");
-            actions.push(Action::BroadcastCertifiedBlockHeader { certified_header });
+            actions.push(Action::Consensus(
+                ConsensusAction::BroadcastCertifiedBlockHeader { certified_header },
+            ));
         }
 
         Some(height)
@@ -8320,18 +8327,18 @@ impl ShardCoordinator {
         // per-EC signature predicate via the source committee's signature over
         // the body root, so the ticks can be
         // admitted to the canonical store on receipt.
-        let synced_finalizations: Vec<Arc<Verifiable<Finalization>>> = block
+        let synced_finalizations: Vec<Verifiable<Finalization>> = block
             .certificates()
             .iter()
             .map(|fw| {
-                // Reuse a live marker when present (local dispatch) by keeping the
-                // existing `Arc`; otherwise mint via the committed-block gate.
+                // Reuse a live marker when present (local dispatch);
+                // otherwise mint via the committed-block gate.
                 if fw.is_verified() {
-                    Arc::clone(fw)
+                    fw.clone()
                 } else {
                     let verified =
                         Verified::<Finalization>::from_committed_block(fw.as_unverified().clone());
-                    Arc::new(verified.into())
+                    verified.into()
                 }
             })
             .collect();
@@ -8678,14 +8685,16 @@ impl ShardCoordinator {
             // after the signer gave up on it (Rule 1).
             position.last_voted_round = position.last_voted_round.max(round);
             let position = *position;
-            actions.push(Action::SignAndBroadcastTimeout {
-                round,
-                high_qc: high_qc.clone(),
-                high_tc: timeout_cert.clone(),
-                recipients: members.iter().copied().filter(|v| *v != signer).collect(),
-                position: self.vote_position(position, None),
-                signer,
-            });
+            actions.push(Action::Consensus(
+                ConsensusAction::SignAndBroadcastTimeout {
+                    round,
+                    high_qc: high_qc.clone(),
+                    high_tc: timeout_cert.clone(),
+                    recipients: members.iter().copied().filter(|v| *v != signer).collect(),
+                    position: self.vote_position(position, None),
+                    signer,
+                },
+            ));
         }
         actions
     }
@@ -8811,10 +8820,10 @@ impl ShardCoordinator {
                  BeaconState invariant (committees subset of validators) violated"
             )
         });
-        actions.push(Action::VerifyTimeout {
+        actions.push(Action::Consensus(ConsensusAction::VerifyTimeout {
             timeout: timeout.clone(),
             voter_public_key,
-        });
+        }));
         actions
     }
 
@@ -9560,11 +9569,11 @@ impl ShardCoordinator {
     pub fn on_transactions_admitted(
         &mut self,
         topology_schedule: &TopologySchedule,
-        txs: &[Arc<Verified<Transaction>>],
+        txs: &[Verified<Transaction>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for tx in txs {
-            let wrapped: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from((**tx).clone()));
+            let wrapped: Verifiable<Transaction> = Verifiable::from(tx.clone());
             for block_hash in self.pending_blocks.receive_transaction(&wrapped) {
                 actions.extend(self.dispatch_block_complete(topology_schedule, block_hash));
             }
@@ -9592,7 +9601,7 @@ impl ShardCoordinator {
     pub fn on_finalizations_admitted(
         &mut self,
         topology_schedule: &TopologySchedule,
-        ticks: &[Arc<Verifiable<Finalization>>],
+        ticks: &[Verifiable<Finalization>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for fw in ticks {
@@ -9621,7 +9630,7 @@ impl ShardCoordinator {
     pub fn on_provisions_admitted(
         &mut self,
         topology_schedule: &TopologySchedule,
-        provisions: &[Arc<Verifiable<Provisions>>],
+        provisions: &[Verifiable<Provisions>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for batch in provisions {
@@ -9930,7 +9939,7 @@ impl ShardCoordinator {
     /// [`VerificationPipeline::take_ready_state_root_verifications`] and
     /// resolves each against the chain view via
     /// [`VerificationPipeline::resolve_ready_state_root_verification`].
-    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<ReadyStateRootVerification> {
+    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<StateRootCheck> {
         let taken = self.verification.take_ready_state_root_verifications();
         if taken.is_empty() {
             return Vec::new();
@@ -10254,7 +10263,7 @@ mod tests {
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-    use hyperscale_core::Action;
+    use hyperscale_core::{Action, Delegated};
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::{awaited_core, crossings_consumed, member_of, terms_of};
     use hyperscale_hbor::{Bytes, Capped};
@@ -10306,7 +10315,7 @@ mod tests {
 
     use super::*;
     use crate::action_handlers::{Named, Naming, build_proposal};
-    use crate::admission::{RecordsSection, Section, TransactionsSection, admit_all, unwrapped};
+    use crate::admission::{RecordsSection, Section, TransactionsSection, admit_all};
     use crate::parent_checks::{AtParent, proposal_claims, refused_at_parent, within_the_cap};
 
     impl ShardCoordinator {
@@ -10502,9 +10511,9 @@ mod tests {
         .signed_by(ValidatorId::new(0))
     }
 
-    fn precut_tx(seed: u8, opens_ms: u64) -> Arc<Transaction> {
+    fn precut_tx(seed: u8, opens_ms: u64) -> Transaction {
         test_utils::install_stub_protocol_statics();
-        Arc::new(test_utils::stub_transaction(
+        test_utils::stub_transaction(
             test_utils::test_principal(seed),
             &[test_utils::test_prefix(seed)],
             1_000,
@@ -10512,7 +10521,7 @@ mod tests {
                 WeightedTimestamp::from_millis(opens_ms),
                 WeightedTimestamp::from_millis(opens_ms + 100_000),
             ),
-        ))
+        )
     }
 
     /// A probe candidate and the end of its range.
@@ -10574,7 +10583,7 @@ mod tests {
             BlockHeight::new(11),
             10_600,
             ValidatorId::new(1),
-            vec![Arc::clone(&before), Arc::clone(&after)],
+            vec![before.clone(), after],
             vec![],
         );
         install_complete_block(&mut state, &block);
@@ -10825,7 +10834,7 @@ mod tests {
     fn engaging_chain(from: BlockHash) -> Vec<Block> {
         let half = u64::try_from(RETENTION_HORIZON.as_millis() / 2).expect("fits");
         let bundle = |height: u64, seeds: &[u8]| {
-            Arc::new(Verifiable::from(Provisions::new(
+            Verifiable::from(Provisions::new(
                 ENGAGING_PAYER,
                 ShardId::ROOT,
                 BlockHeight::new(height),
@@ -10838,7 +10847,7 @@ mod tests {
                         .collect(),
                 )
                 .expect("a list written out in a test"),
-            )))
+            ))
         };
         let mut parent = from;
         (1..=4u8)
@@ -10916,11 +10925,7 @@ mod tests {
                 Capped::new(
                     transactions
                         .iter()
-                        .map(|tx| {
-                            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                                tx.clone(),
-                            )))
-                        })
+                        .map(|tx| Verifiable::from(Verified::new_unchecked_for_test(tx.clone())))
                         .collect(),
                 )
                 .expect("a list written out in a test"),
@@ -11449,12 +11454,9 @@ mod tests {
         ProposalPayload {
             transactions: transactions
                 .iter()
-                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.clone())))
+                .map(|tx| Verified::new_unchecked_for_test(tx.clone()))
                 .collect(),
-            finalizations: finalizations
-                .into_iter()
-                .map(|fw| Arc::new(Verifiable::from(fw)))
-                .collect(),
+            finalizations: finalizations.into_iter().map(Verifiable::from).collect(),
             provisions: Vec::new(),
             abandonment_records: Vec::new(),
             state_claims: Vec::new(),
@@ -11472,14 +11474,14 @@ mod tests {
         Finalization::new(
             tick,
             half,
-            Some(Arc::new(ExecutionCertificate::new(
+            Some(ExecutionCertificate::new(
                 tick,
                 WeightedTimestamp::from_millis(1_000),
                 GlobalReceiptRoot::ZERO,
                 Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
-            ))),
+            )),
             Capped::empty(),
         )
     }
@@ -11999,9 +12001,7 @@ mod tests {
                 &departed,
                 &frame,
                 Some(|_: &ProposalAsk<'_>| ProposalInputs {
-                    finalizations: vec![Arc::new(Verifiable::from(all_legs_beside_the_sibling(
-                        &pair,
-                    )))],
+                    finalizations: vec![Verifiable::from(all_legs_beside_the_sibling(&pair))],
                     ..ProposalInputs::default()
                 }),
             )
@@ -13065,10 +13065,7 @@ mod tests {
                     &schedule,
                     &frame,
                     Some(|_: &ProposalAsk<'_>| ProposalInputs {
-                        finalizations: finalizations
-                            .into_iter()
-                            .map(|fw| Arc::new(Verifiable::from(fw)))
-                            .collect(),
+                        finalizations: finalizations.into_iter().map(Verifiable::from).collect(),
                         verdict_claims: vec![claim.clone()],
                         ..ProposalInputs::default()
                     }),
@@ -14163,7 +14160,7 @@ mod tests {
             header,
             transactions,
             certificates,
-            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(engaging))])),
+            provisions: Arc::new(Capped::from_array([Verifiable::from(engaging)])),
             abandonment_records,
             state_claims,
             tick_manifest,
@@ -14265,7 +14262,7 @@ mod tests {
         rows: &MemberIndex,
         committee: &TopologySnapshot,
         local: ShardId,
-        transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+        transactions: &mut Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK>,
         fitted: bool,
     ) -> Named {
         let manifest = ManifestInputs::default();
@@ -14292,12 +14289,12 @@ mod tests {
     /// `transactions` verified and in hash order, as a block carries them.
     fn in_block_order(
         mut transactions: Vec<Transaction>,
-    ) -> Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK> {
+    ) -> Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK> {
         transactions.sort_by_key(Transaction::hash);
         Capped::new(
             transactions
                 .into_iter()
-                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx)))
+                .map(Verified::new_unchecked_for_test)
                 .collect(),
         )
         .expect("a list written out in a test")
@@ -14405,7 +14402,7 @@ mod tests {
         assert!(tick_terms_admit_block(stated_weight(&fitted)));
         let dropped = offered.len() - kept.len();
         assert!(dropped > 0);
-        let unnamed = |list: &[Arc<Verified<Transaction>>]| -> Vec<TxHash> {
+        let unnamed = |list: &[Verified<Transaction>]| -> Vec<TxHash> {
             list.iter()
                 .map(|tx| tx.hash())
                 .filter(|tx| !ready.contains(tx))
@@ -14777,9 +14774,9 @@ mod tests {
         };
         let block = Block::Live {
             header,
-            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(
+            transactions: Arc::new(Capped::from_array([Verifiable::from(
                 Verified::new_unchecked_for_test(unrouted),
-            ))])),
+            )])),
             certificates,
             provisions,
             abandonment_records,
@@ -14810,7 +14807,7 @@ mod tests {
         else {
             unreachable!("a chained block is live")
         };
-        let bundle = Arc::new(Verifiable::from(Provisions::new(
+        let bundle = Verifiable::from(Provisions::new(
             ENGAGING_PAYER,
             ShardId::ROOT,
             header.height(),
@@ -14822,7 +14819,7 @@ mod tests {
                     .collect(),
             )
             .expect("a list written out in a test"),
-        )));
+        ));
         Block::Live {
             header,
             transactions,
@@ -15138,8 +15135,8 @@ mod tests {
         let local = ShardId::leaf(1, 0);
         let payer_owner = test_utils::test_principal(0x81);
         let local_owner = test_utils::test_principal(0x01);
-        let tx: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_utils::stub_transaction(
+        let tx: Verifiable<Transaction> = Verifiable::from(Verified::new_unchecked_for_test(
+            test_utils::stub_transaction(
                 payer_owner,
                 &[local_owner.address(), payer_owner.address()],
                 1_000,
@@ -15147,7 +15144,7 @@ mod tests {
                     WeightedTimestamp::ZERO,
                     WeightedTimestamp::from_millis(100_000),
                 ),
-            )),
+            ),
         ));
         assert_eq!(
             topo.shard_trie().shard_for_prefix(tx.fee_payer()),
@@ -15171,16 +15168,14 @@ mod tests {
             header,
             transactions,
             certificates,
-            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(
-                Provisions::new(
-                    ENGAGING_PAYER,
-                    local,
-                    BlockHeight::new(7),
-                    WeightedTimestamp::ZERO,
-                    MerkleInclusionProof::dummy(),
-                    Capped::from_array([ProvisionEntry::new(tx.hash(), Capped::empty())]),
-                ),
-            ))])),
+            provisions: Arc::new(Capped::from_array([(Verifiable::from(Provisions::new(
+                ENGAGING_PAYER,
+                local,
+                BlockHeight::new(7),
+                WeightedTimestamp::ZERO,
+                MerkleInclusionProof::dummy(),
+                Capped::from_array([ProvisionEntry::new(tx.hash(), Capped::empty())]),
+            )))])),
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
@@ -15206,7 +15201,7 @@ mod tests {
             header: block_chained_on(BlockHeight::new(2), state.committed_hash, 2_000)
                 .header()
                 .clone(),
-            transactions: Arc::new(Capped::from_array([Arc::clone(&tx)])),
+            transactions: Arc::new(Capped::from_array([tx])),
             certificates: Arc::new(Capped::empty()),
             provisions: Arc::new(Capped::empty()),
             abandonment_records: Arc::new(Capped::empty()),
@@ -15538,9 +15533,10 @@ mod tests {
         let parent_actions =
             state.submit_synced_block_for_verification(&schedule, certify(&parent, ED - 1));
         assert!(
-            parent_actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            parent_actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "the parent dispatches first and stays in flight",
         );
 
@@ -15549,7 +15545,9 @@ mod tests {
         let keys = actions
             .iter()
             .find_map(|a| match a {
-                Action::VerifyQcSignature { public_keys, .. } => Some(public_keys),
+                Action::Consensus(ConsensusAction::VerifyQcSignature { public_keys, .. }) => {
+                    Some(public_keys)
+                }
                 _ => None,
             })
             .expect("the child dispatches QC verification");
@@ -15780,7 +15778,7 @@ mod tests {
         for tx in [&crossing, &staying] {
             mempool.on_transaction_gossip(
                 &split,
-                Arc::new(Verified::new_unchecked_for_test(tx.clone())),
+                Verified::new_unchecked_for_test(tx.clone()),
                 LocalTimestamp::ZERO,
             );
         }
@@ -15920,9 +15918,9 @@ mod tests {
         let third = toward(2);
         let mut ready = vec![third.clone(), staying.clone()];
         ready.sort_by_key(Transaction::hash);
-        let ready: Vec<Arc<Verified<Transaction>>> = ready
+        let ready: Vec<Verified<Transaction>> = ready
             .into_iter()
-            .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx)))
+            .map(Verified::new_unchecked_for_test)
             .collect();
 
         let mut rows_at_parent = Vec::new();
@@ -16010,13 +16008,16 @@ mod tests {
         state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(ED - 2);
 
         let actions = state.dispatch_or_park_beacon_witness(&schedule, child.hash());
-        let Some(Action::VerifyBeaconWitnessRoot {
+        let Some(Action::Consensus(ConsensusAction::VerifyBeaconWitnessRoot {
             committee_anchor_epoch,
             parent_committee_anchor_epoch,
             ..
-        }) = actions
-            .iter()
-            .find(|a| matches!(a, Action::VerifyBeaconWitnessRoot { .. }))
+        })) = actions.iter().find(|a| {
+            matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyBeaconWitnessRoot { .. })
+            )
+        })
         else {
             panic!("the block's witness root dispatches: {actions:?}");
         };
@@ -16395,9 +16396,10 @@ mod tests {
         install_complete_block(&mut state, &level);
         let actions = state.trigger_qc_verification_or_vote(&topology_schedule, level_hash);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "level anchor must proceed to parent-QC verification: {actions:?}"
         );
     }
@@ -16456,9 +16458,10 @@ mod tests {
 
         let actions = state.trigger_qc_verification_or_vote(&topology_schedule, child_hash);
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "a wrong proposer never reaches verification: {actions:?}"
         );
         assert!(
@@ -16569,11 +16572,10 @@ mod tests {
             |_| None,
             |_| None,
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+        )));
     }
 
     /// A header can both claim a block sync (missing parent) and itself be
@@ -17008,7 +17010,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::VerifyQcSignature { qc, subject: QcSubject::SyncClaim(_), .. }
+                Action::Consensus(ConsensusAction::VerifyQcSignature { qc, subject: QcSubject::SyncClaim(_), .. })
                     if qc.block_hash() == certified
             )),
             "the certified parent must be claimed for a sync; got {actions:?}",
@@ -17243,11 +17245,10 @@ mod tests {
             QcSubject::ParentOf(block_hash),
             Ok(verified),
         );
-        assert!(
-            !after_qc
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
-        );
+        assert!(!after_qc.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+        )));
 
         // Body and state roots complete — beacon witness root still pending.
         state.on_block_check_completed(
@@ -17262,11 +17263,10 @@ mod tests {
             VerificationKind::StateRoot,
             CheckOutcome::checked(),
         );
-        assert!(
-            !after_state
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
-        );
+        assert!(!after_state.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+        )));
 
         // Beacon witness root completes — now we vote.
         let after_roots = state.on_block_check_completed(
@@ -17275,11 +17275,10 @@ mod tests {
             VerificationKind::BeaconWitnessRoot,
             CheckOutcome::checked(),
         );
-        assert!(
-            after_roots
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
-        );
+        assert!(after_roots.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+        )));
     }
 
     /// A pending block whose own anchor lies in a window the schedule has
@@ -17372,11 +17371,10 @@ mod tests {
             QcSubject::ParentOf(block_hash),
             Ok(verified),
         );
-        assert!(
-            !after_qc
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
-        );
+        assert!(!after_qc.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+        )));
 
         // Body and state roots complete — beacon witness root still pending.
         state.on_block_check_completed(
@@ -17391,11 +17389,10 @@ mod tests {
             VerificationKind::StateRoot,
             CheckOutcome::checked(),
         );
-        assert!(
-            !after_state
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
-        );
+        assert!(!after_state.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+        )));
 
         // Every check completes, but the block's anchor window is not
         // committed here: no vote, and the block stays pending.
@@ -17406,9 +17403,10 @@ mod tests {
             CheckOutcome::checked(),
         );
         assert!(
-            !after_roots
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })),
+            !after_roots.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+            )),
             "a block judged in an uncommitted window draws no vote"
         );
 
@@ -17419,9 +17417,10 @@ mod tests {
         }
         let redriven = state.on_beacon_block_persisted(&topology_schedule);
         assert!(
-            redriven
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })),
+            redriven.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+            )),
             "the beacon block that commits the window re-drives the vote"
         );
     }
@@ -17526,11 +17525,10 @@ mod tests {
             |_| None,
             |_| None,
         );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
-        );
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+        )));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -17636,10 +17634,10 @@ mod tests {
         let actions = advance_one_round(&mut state, &topology_schedule, &keys);
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::BuildProposal {
+            Action::Consensus(ConsensusAction::BuildProposal {
                 is_fallback: true,
                 ..
-            }
+            })
         )));
     }
 
@@ -17658,7 +17656,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::BuildProposal { .. })),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. }))),
             "no proposal at a timed-out round; got {actions:?}",
         );
     }
@@ -17672,9 +17670,9 @@ mod tests {
         let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(2);
         state.set_time(LocalTimestamp::from_millis(100_000));
         let actions = advance_one_round(&mut state, &topology_schedule, &keys);
-        let Some(Action::BuildProposal { height, round, .. }) = actions
+        let Some(Action::Consensus(ConsensusAction::BuildProposal { height, round, .. })) = actions
             .iter()
-            .find(|a| matches!(a, Action::BuildProposal { .. }))
+            .find(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. })))
         else {
             panic!("the leader builds on entering its round; got {actions:?}");
         };
@@ -17709,7 +17707,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::SignAndBroadcastTimeout { round, .. } if *round == Round::new(2)
+                Action::Consensus(ConsensusAction::SignAndBroadcastTimeout { round, .. }) if *round == Round::new(2)
             )),
             "got {actions:?}",
         );
@@ -17822,9 +17820,10 @@ mod tests {
         // counted, this threshold would have tripped one timeout earlier.
         let actions = state.on_verified_timeout(&topology_schedule, mk(2));
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastTimeout { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::SignAndBroadcastTimeout { .. })
+            )),
             "f+1 committee timeouts should amplify",
         );
     }
@@ -18009,7 +18008,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BuildProposal { height, round, parent_block_hash, timeout_cert: Some(tc), .. }
+                Action::Consensus(ConsensusAction::BuildProposal { height, round, parent_block_hash, timeout_cert: Some(tc), .. })
                     if *height == BlockHeight::new(2)
                         && *round == led
                         && *parent_block_hash == block_hash
@@ -18064,7 +18063,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BuildProposal { height, round, parent_block_hash, timeout_cert: Some(tc), .. }
+                Action::Consensus(ConsensusAction::BuildProposal { height, round, parent_block_hash, timeout_cert: Some(tc), .. })
                     if *height == BlockHeight::new(2)
                         && *round == led
                         && *parent_block_hash == block_hash
@@ -18129,7 +18128,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::VerifyQcSignature { subject: QcSubject::ParentOf(hash), .. }
+                Action::Consensus(ConsensusAction::VerifyQcSignature { subject: QcSubject::ParentOf(hash), .. })
                     if *hash == child_hash
             )),
             "the applied parent re-enters the child's vote path: {actions:?}",
@@ -18691,7 +18690,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::VerifyTimeout { .. })),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::VerifyTimeout { .. }))),
             "a share from a member the new committee dropped is refused: {actions:?}"
         );
 
@@ -18702,7 +18701,7 @@ mod tests {
             .expect("the round elapsed");
         assert!(
             own.iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastTimeout { round, .. } if *round == Round::new(7))),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::SignAndBroadcastTimeout { round, .. }) if *round == Round::new(7))),
             "{own:?}"
         );
         for voter in [4, 2, 10] {
@@ -18733,7 +18732,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::VerifyTimeout { .. })),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::VerifyTimeout { .. }))),
             "a tallied voter's retransmit is screened: {actions:?}"
         );
         assert_eq!(cut.state.view(), Round::new(8));
@@ -18828,9 +18827,11 @@ mod tests {
         let resent: Vec<BTreeSet<ValidatorId>> = actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndBroadcastTimeout {
-                    round, recipients, ..
-                } if *round == Round::new(7) => Some(recipients.iter().copied().collect()),
+                Action::Consensus(ConsensusAction::SignAndBroadcastTimeout {
+                    round,
+                    recipients,
+                    ..
+                }) if *round == Round::new(7) => Some(recipients.iter().copied().collect()),
                 _ => None,
             })
             .collect();
@@ -18923,9 +18924,10 @@ mod tests {
         assert_eq!(cut.high_tc_round(), Some(Round::new(7)));
         assert_eq!(cut.state.view(), Round::new(8));
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+            )),
             "{actions:?}"
         );
     }
@@ -19026,7 +19028,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::VerifyQcSignature { subject: QcSubject::ParentOf(hash), .. }
+                Action::Consensus(ConsensusAction::VerifyQcSignature { subject: QcSubject::ParentOf(hash), .. })
                     if *hash == block.hash()
             )),
             "the drop re-drives the held block's vote: {actions:?}"
@@ -19163,7 +19165,7 @@ mod tests {
         assert_eq!(proposed(&actions), [tx.hash()]);
         assert!(actions.iter().any(|action| matches!(
             action,
-            Action::BuildProposal { round, timeout_cert: Some(tc), .. }
+            Action::Consensus(ConsensusAction::BuildProposal { round, timeout_cert: Some(tc), .. })
                 if *round == Round::new(10) && tc.round() == Round::new(9)
         )));
     }
@@ -19189,7 +19191,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastTimeout { round, .. } if *round == Round::new(8))),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::SignAndBroadcastTimeout { round, .. }) if *round == Round::new(8))),
             "{actions:?}"
         );
     }
@@ -19229,12 +19231,12 @@ mod tests {
         while !queue.is_empty() {
             let mut follow_ups = Vec::new();
             for action in queue {
-                let Action::VerifyQcSignature {
+                let Action::Consensus(ConsensusAction::VerifyQcSignature {
                     qc,
                     public_keys,
                     quorum_threshold,
                     subject: subject @ QcSubject::SyncClaim(_),
-                } = action
+                }) = action
                 else {
                     continue;
                 };
@@ -19268,10 +19270,10 @@ mod tests {
         actions.iter().any(|a| {
             matches!(
                 a,
-                Action::VerifyQcSignature {
+                Action::Consensus(ConsensusAction::VerifyQcSignature {
                     subject: QcSubject::SyncClaim(_),
                     ..
-                }
+                })
             )
         })
     }
@@ -19937,7 +19939,10 @@ mod tests {
 
             let announced = state.announce_qc(&topology_schedule, block.hash(), &qc);
             let recipients = match announced {
-                Some(Action::SignAndBroadcastQcAnnouncement { recipients, .. }) => Some(recipients),
+                Some(Action::Consensus(ConsensusAction::SignAndBroadcastQcAnnouncement {
+                    recipients,
+                    ..
+                })) => Some(recipients),
                 None => None,
                 other => panic!("unexpected action {other:?}"),
             };
@@ -19967,7 +19972,9 @@ mod tests {
 
         assert!(matches!(
             state.announce_qc(&topology_schedule, block.hash(), &qc),
-            Some(Action::SignAndBroadcastQcAnnouncement { .. })
+            Some(Action::Consensus(
+                ConsensusAction::SignAndBroadcastQcAnnouncement { .. }
+            ))
         ));
         assert!(
             state
@@ -19980,7 +19987,7 @@ mod tests {
     #[test]
     fn on_unverified_timeout_delegates_committee_share() {
         // Wire timeouts are screened on the shard loop thread, then their
-        // signature share is verified off-thread via `Action::VerifyTimeout`. Outsiders,
+        // signature share is verified off-thread via `ConsensusAction::VerifyTimeout`. Outsiders,
         // stale rounds, and already-tallied voters are dropped before delegating
         // — no pairing check is spent on a share that would be discarded.
         let (mut state, topology_schedule) = make_test_state();
@@ -20004,7 +20011,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::VerifyTimeout { .. })),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::VerifyTimeout { .. }))),
             "a fresh committee timeout should be delegated",
         );
 
@@ -20211,7 +20218,7 @@ mod tests {
     fn offers_timeout_at(actions: &[Action], round: Round) -> bool {
         actions
             .iter()
-            .any(|a| matches!(a, Action::SignAndBroadcastTimeout { round: r, .. } if *r == round))
+            .any(|a| matches!(a, Action::Consensus(ConsensusAction::SignAndBroadcastTimeout { round: r, .. }) if *r == round))
     }
 
     /// A retained ex-member's timeout is the only carrier of the halted
@@ -20794,7 +20801,7 @@ mod tests {
     fn builds_a_proposal(actions: &[Action]) -> bool {
         actions
             .iter()
-            .any(|a| matches!(a, Action::BuildProposal { .. }))
+            .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. })))
     }
 
     /// The hold sits on the one entry every proposal kind passes through:
@@ -21240,13 +21247,13 @@ mod tests {
         let built: Vec<_> = actions
             .iter()
             .filter_map(|action| match action {
-                Action::BuildProposal {
+                Action::Consensus(ConsensusAction::BuildProposal {
                     height,
                     round,
                     parent_block_hash,
                     parent_qc,
                     ..
-                } => Some((*height, *round, *parent_block_hash, parent_qc.height())),
+                }) => Some((*height, *round, *parent_block_hash, parent_qc.height())),
                 _ => None,
             })
             .collect();
@@ -21272,7 +21279,7 @@ mod tests {
         let reported: Vec<_> = actions
             .iter()
             .filter_map(|action| match action {
-                Action::SignAndBroadcastTimeout { high_qc, .. } => {
+                Action::Consensus(ConsensusAction::SignAndBroadcastTimeout { high_qc, .. }) => {
                     Some((high_qc.block_hash(), high_qc.height()))
                 }
                 _ => None,
@@ -21480,9 +21487,10 @@ mod tests {
         };
 
         assert!(
-            admit(RecoveryCause::Halt)
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            admit(RecoveryCause::Halt).iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "a halt recovery admits the retained suffix for QC verification",
         );
         assert!(
@@ -21624,7 +21632,10 @@ mod tests {
         };
         let batch_binding = |actions: &[Action]| {
             actions.iter().find_map(|action| match action {
-                Action::VerifyAndBuildQuorumCertificate { binding, .. } => Some(*binding),
+                Action::Consensus(ConsensusAction::VerifyAndBuildQuorumCertificate {
+                    binding,
+                    ..
+                }) => Some(*binding),
                 _ => None,
             })
         };
@@ -21780,7 +21791,7 @@ mod tests {
 
         // Should emit BuildProposal for height 4 even with empty content.
         let has_build_proposal = actions.iter().any(
-            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight::new(4)),
+            |a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { height, .. }) if height == &BlockHeight::new(4)),
         );
 
         assert!(
@@ -21883,18 +21894,16 @@ mod tests {
 
     /// A transaction admission takes on a root-shard block anchored at
     /// `anchor_ms`.
-    fn admissible_at(anchor_ms: u64) -> Arc<Verified<Transaction>> {
+    fn admissible_at(anchor_ms: u64) -> Verified<Transaction> {
         test_utils::install_stub_protocol_statics();
         let payer = test_utils::test_principal(0x21);
-        Arc::new(Verified::new_unchecked_for_test(
-            test_utils::stub_transaction(
-                payer,
-                &[payer.address()],
-                1_000,
-                TimestampRange::new(
-                    WeightedTimestamp::from_millis(anchor_ms.saturating_sub(1_000)),
-                    WeightedTimestamp::from_millis(anchor_ms + 1_000),
-                ),
+        Verified::new_unchecked_for_test(test_utils::stub_transaction(
+            payer,
+            &[payer.address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::from_millis(anchor_ms.saturating_sub(1_000)),
+                WeightedTimestamp::from_millis(anchor_ms + 1_000),
             ),
         ))
     }
@@ -21902,12 +21911,12 @@ mod tests {
     /// A gather that records it was asked and offers `tx` alone.
     fn offering<'a>(
         asked: &'a Cell<bool>,
-        tx: &'a Arc<Verified<Transaction>>,
+        tx: &'a Verified<Transaction>,
     ) -> impl Fn(&ProposalAsk<'_>) -> ProposalInputs + 'a {
         |_| {
             asked.set(true);
             ProposalInputs {
-                ready_txs: vec![Arc::clone(tx)],
+                ready_txs: vec![tx.clone()],
                 ..ProposalInputs::default()
             }
         }
@@ -21919,7 +21928,7 @@ mod tests {
         for tx in transactions {
             mempool.on_transaction_gossip(
                 schedule.head(),
-                Arc::new(Verified::new_unchecked_for_test(tx.clone())),
+                Verified::new_unchecked_for_test(tx.clone()),
                 LocalTimestamp::ZERO,
             );
         }
@@ -21931,7 +21940,7 @@ mod tests {
         actions
             .iter()
             .find_map(|action| match action {
-                Action::BuildProposal { transactions, .. } => {
+                Action::Consensus(ConsensusAction::BuildProposal { transactions, .. }) => {
                     Some(transactions.iter().map(|tx| tx.hash()).collect())
                 }
                 _ => None,
@@ -21987,9 +21996,10 @@ mod tests {
             Some(qc.block_hash())
         );
         assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::BuildProposal { .. })),
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Consensus(ConsensusAction::BuildProposal { .. })
+            )),
             "a seat that does not lead the round builds nothing: {actions:?}"
         );
         assert_eq!(asked.get(), 0, "and is never asked");
@@ -22007,9 +22017,12 @@ mod tests {
             ProposalInputs::default()
         };
         let builds = |actions: &[Action]| {
-            actions
-                .iter()
-                .any(|action| matches!(action, Action::BuildProposal { .. }))
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Consensus(ConsensusAction::BuildProposal { .. })
+                )
+            })
         };
         let next = BlockHeight::new(4);
 
@@ -22305,7 +22318,7 @@ mod tests {
         ));
         let proposes = |actions: &[Action]| {
             actions.iter().any(
-                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4)),
+                |a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { height, .. }) if *height == BlockHeight::new(4)),
             )
         };
 
@@ -22371,7 +22384,7 @@ mod tests {
         };
         let proposes = |actions: &[Action]| {
             actions.iter().any(
-                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4)),
+                |a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { height, .. }) if *height == BlockHeight::new(4)),
             )
         };
         let paced = |actions: &[Action]| {
@@ -22457,7 +22470,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::BuildProposal { .. })),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. }))),
             "a locally formed QC must drive the next proposal: {actions:?}"
         );
     }
@@ -22524,7 +22537,7 @@ mod tests {
         assert!(
             first
                 .iter()
-                .all(|a| !matches!(a, Action::BuildProposal { .. })),
+                .all(|a| !matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. }))),
             "first try_propose should have deferred, not dispatched"
         );
         assert!(
@@ -22554,7 +22567,7 @@ mod tests {
         let third = state.try_propose(&topology_schedule, offering(&asked, &tx));
         assert!(
             third.iter().any(
-                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
+                |a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { height, .. }) if *height == BlockHeight::new(4))
             ),
             "third try_propose should dispatch the BuildProposal"
         );
@@ -22610,7 +22623,7 @@ mod tests {
         assert!(
             first
                 .iter()
-                .all(|a| !matches!(a, Action::BuildProposal { .. })),
+                .all(|a| !matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. }))),
             "an unresolvable substate walk must park, not dispatch"
         );
         assert!(!asked.get(), "a parked build asks for no content");
@@ -22629,7 +22642,7 @@ mod tests {
         let second = state.try_propose(&snapshot, offering(&asked, &tx));
         assert!(
             second.iter().any(
-                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
+                |a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { height, .. }) if *height == BlockHeight::new(4))
             ),
             "the retry must dispatch the BuildProposal the park was holding"
         );
@@ -22700,9 +22713,10 @@ mod tests {
             |_| None,
         );
         assert!(
-            actions1
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            actions1.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "first block must trigger QC verification"
         );
 
@@ -22741,9 +22755,10 @@ mod tests {
             |_| None,
         );
         assert!(
-            !actions2
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            !actions2.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "second block must reuse cached verification"
         );
     }
@@ -22838,9 +22853,10 @@ mod tests {
         // The forged QC must trigger signature verification rather than being
         // accepted as a cache hit.
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "forged QC reusing cached block_hash must still trigger signature verification"
         );
 
@@ -22858,11 +22874,11 @@ mod tests {
     // Helpers retained for no-duplicate-transactions walk tests below
     // ═══════════════════════════════════════════════════════════════════════════
 
-    fn make_test_tx_with_seed(seed: u8) -> Arc<Verifiable<Transaction>> {
-        Arc::new(Verifiable::from(test_transaction(seed)))
+    fn make_test_tx_with_seed(seed: u8) -> Verifiable<Transaction> {
+        Verifiable::from(test_transaction(seed))
     }
 
-    fn sort_txs_by_hash(txs: &mut [Arc<Verifiable<Transaction>>]) {
+    fn sort_txs_by_hash(txs: &mut [Verifiable<Transaction>]) {
         txs.sort_by_key(|tx| tx.hash());
     }
 
@@ -22907,7 +22923,7 @@ mod tests {
         assert!(state.is_block_syncing());
 
         // Ready txs must be dropped — sync blocks are always empty.
-        let ready_txs = vec![Arc::new(test_utils::verified_test_transaction(1))];
+        let ready_txs = vec![(test_utils::verified_test_transaction(1))];
         let actions = state.try_propose(&topology_schedule, |_| ProposalInputs {
             ready_txs,
             ..ProposalInputs::default()
@@ -22915,14 +22931,14 @@ mod tests {
 
         let proposal = actions
             .iter()
-            .find(|a| matches!(a, Action::BuildProposal { .. }))
+            .find(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. })))
             .expect("sync block should still produce BuildProposal");
-        let Action::BuildProposal {
+        let Action::Consensus(ConsensusAction::BuildProposal {
             is_fallback,
             transactions,
             finalizations,
             ..
-        } = proposal
+        }) = proposal
         else {
             unreachable!()
         };
@@ -22967,9 +22983,9 @@ mod tests {
         state.set_block_syncing(true);
 
         let actions = state.try_propose(&topology_schedule, |_| ProposalInputs::default());
-        let Some(Action::BuildProposal { timestamp, .. }) = actions
+        let Some(Action::Consensus(ConsensusAction::BuildProposal { timestamp, .. })) = actions
             .iter()
-            .find(|a| matches!(a, Action::BuildProposal { .. }))
+            .find(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. })))
         else {
             panic!("expected BuildProposal");
         };
@@ -23003,7 +23019,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::BuildProposal { .. })),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. }))),
             "first proposal should build"
         );
 
@@ -23021,10 +23037,10 @@ mod tests {
             height,
             round,
         );
-        assert!(
-            vote.iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
-        );
+        assert!(vote.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+        )));
         assert_eq!(state.sole().last_voted_round, round);
 
         // The retry at the same view must be a no-op, not a sibling build.
@@ -23097,10 +23113,10 @@ mod tests {
         let classification = actions
             .iter()
             .find_map(|a| match a {
-                Action::BuildProposal {
+                Action::Consensus(ConsensusAction::BuildProposal {
                     classification_topology_snapshot: classification_topology,
                     ..
-                } => Some(classification_topology),
+                }) => Some(classification_topology),
                 _ => None,
             })
             .expect("a BuildProposal must dispatch");
@@ -23203,12 +23219,12 @@ mod tests {
         let signals: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndBroadcastReadySignal {
+                Action::Consensus(ConsensusAction::SignAndBroadcastReadySignal {
                     wt_window_start,
                     wt_window_end,
                     recipients,
                     ..
-                } => Some((wt_window_start, wt_window_end, recipients)),
+                }) => Some((wt_window_start, wt_window_end, recipients)),
                 _ => None,
             })
             .collect();
@@ -23237,7 +23253,12 @@ mod tests {
         let actions = state.on_beacon_block_persisted(&topology_schedule);
         let signals = actions
             .iter()
-            .filter(|a| matches!(a, Action::SignAndBroadcastReadySignal { .. }))
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::Consensus(ConsensusAction::SignAndBroadcastReadySignal { .. })
+                )
+            })
             .count();
         assert_eq!(
             signals, 1,
@@ -23327,9 +23348,10 @@ mod tests {
         );
         let actions = state.on_beacon_block_persisted(&schedule);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "expected VerifyQcSignature after epoch adoption; got {actions:?}"
         );
         assert!(
@@ -23382,9 +23404,10 @@ mod tests {
         // Beacon still behind epoch 5: the block re-parks, nothing dispatches.
         let actions = state.on_beacon_block_persisted(&schedule);
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyBeaconWitnessRoot { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyBeaconWitnessRoot { .. })
+            )),
             "a still-behind beacon must not dispatch: {actions:?}"
         );
 
@@ -23395,9 +23418,10 @@ mod tests {
         );
         let actions = state.on_beacon_block_persisted(&schedule);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyBeaconWitnessRoot { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyBeaconWitnessRoot { .. })
+            )),
             "epoch adoption must replay the parked beacon-witness verification; got {actions:?}"
         );
     }
@@ -23477,11 +23501,10 @@ mod tests {
             &topology_schedule,
             CertifiedBlock::new_unchecked(block, qc),
         );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+        )));
         let qc = make_test_qc(block_hash, BlockHeight::new(4));
         let actions = state.on_qc_signature_verified(
             &topology_schedule,
@@ -23810,11 +23833,10 @@ mod tests {
         };
 
         let (hash5, actions) = deliver(&mut state, 5, hash4, 100);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+        )));
         let (hash6, _) = deliver(&mut state, 6, hash5, 110);
         let (hash7, _) = deliver(&mut state, 7, hash6, 120);
 
@@ -23838,9 +23860,10 @@ mod tests {
         let (hash5b, actions) = deliver(&mut state, 5, hash4, 200);
         assert_ne!(hash5b, hash5);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "re-fetched block at the hole must resubmit for verification; got {actions:?}"
         );
     }
@@ -23885,11 +23908,10 @@ mod tests {
 
         // The losing sibling at height 4 arrives first and applies.
         let (loser, actions) = deliver(&mut state, 4, 100);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+        )));
         let qc = make_test_qc(loser, BlockHeight::new(4));
         let _ = state.on_qc_signature_verified(
             &topology_schedule,
@@ -23902,9 +23924,10 @@ mod tests {
         let (winner, actions) = deliver(&mut state, 4, 200);
         assert_ne!(winner, loser);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "certified sibling at an applied height must resubmit for verification; got {actions:?}"
         );
         let qc = make_test_qc(winner, BlockHeight::new(4));
@@ -24050,9 +24073,10 @@ mod tests {
             "the reopen names the sibling the child extends; got {actions:?}"
         );
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "no committee is guessed for a child whose parent is missing; got {actions:?}"
         );
         assert!(
@@ -24073,7 +24097,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::VerifyQcSignature { subject: QcSubject::SyncedBlock(hash), .. } if *hash == child_hash
+                Action::Consensus(ConsensusAction::VerifyQcSignature { subject: QcSubject::SyncedBlock(hash), .. }) if *hash == child_hash
             )),
             "the child drains once its parent applies; got {actions:?}"
         );
@@ -24164,7 +24188,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::VerifyQcSignature { subject: QcSubject::SyncedBlock(hash), .. }
+                Action::Consensus(ConsensusAction::VerifyQcSignature { subject: QcSubject::SyncedBlock(hash), .. })
                     if *hash == child_hash
             )),
             "the chain's block goes to verification past the parentless ones; got {actions:?}"
@@ -24294,7 +24318,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::VerifyQcSignature { subject: QcSubject::ParentOf(h), .. } if *h == block_hash
+                Action::Consensus(ConsensusAction::VerifyQcSignature { subject: QcSubject::ParentOf(h), .. }) if *h == block_hash
             )),
             "got {actions:?}"
         );
@@ -24304,7 +24328,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::VerifyQcSignature { subject: QcSubject::SyncedBlock(h), .. } if *h == block_hash
+                Action::Consensus(ConsensusAction::VerifyQcSignature { subject: QcSubject::SyncedBlock(h), .. }) if *h == block_hash
             )),
             "got {actions:?}"
         );
@@ -24362,11 +24386,10 @@ mod tests {
         );
         let actions = state.try_vote_on_block(&topology_schedule, block_hash, height, round);
 
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+        )));
         assert_eq!(state.sole().last_voted_round, round);
     }
 
@@ -24549,9 +24572,10 @@ mod tests {
             "sub-quorum sync block must produce no VerifyQcSignature dispatch"
         );
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
             "must not reach signature verification with sub-quorum signers"
         );
     }
@@ -24659,7 +24683,7 @@ mod tests {
             BlockHeight::new(1),
             1_000,
             ValidatorId::new(1),
-            vec![Arc::new(unrouted)],
+            vec![unrouted],
             vec![],
         );
         let qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -24843,11 +24867,11 @@ mod tests {
 
         let find_proposal = |actions: &[Action]| -> (bool, ProposerTimestamp) {
             for a in actions {
-                if let Action::BuildProposal {
+                if let Action::Consensus(ConsensusAction::BuildProposal {
                     is_fallback,
                     timestamp,
                     ..
-                } = a
+                }) = a
                 {
                     return (*is_fallback, *timestamp);
                 }
@@ -24900,7 +24924,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::BuildProposal { .. }))
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. })))
         );
     }
 
@@ -24996,7 +25020,7 @@ mod tests {
         let (state, topology) = make_test_state();
         let declaring = |seed: u8, compute: u64| {
             let payer = test_principal(seed);
-            Arc::new(stub_transaction_declaring(
+            stub_transaction_declaring(
                 payer,
                 &[],
                 &[],
@@ -25004,9 +25028,9 @@ mod tests {
                 1_000,
                 vec![compute],
                 test_validity_range(),
-            ))
+            )
         };
-        let block_of = |txs: Vec<Arc<Transaction>>| {
+        let block_of = |txs: Vec<Transaction>| {
             make_live_block(
                 ShardId::ROOT,
                 BlockHeight::new(1),
@@ -25030,7 +25054,7 @@ mod tests {
         // exactly, the ceiling and the signature's verification
         // together; a thirty-third carries it past.
         let share = MAX_BLOCK_COMPUTE / 32 - DeclaredWork::signature(SchemeId::ED25519).compute;
-        let full: Vec<Arc<Transaction>> = (1..=32u8).map(|seed| declaring(seed, share)).collect();
+        let full: Vec<Transaction> = (1..=32u8).map(|seed| declaring(seed, share)).collect();
         state
             .admit_transactions(&topology, &block_of(full.clone()))
             .expect("a block at the cap is admitted");
@@ -25692,7 +25716,7 @@ mod tests {
             admit_all::<TransactionsSection<'_>>(
                 &ctx,
                 &mut TransactionsFold::beside(&provisions),
-                block.transactions().iter().map(unwrapped),
+                block.transactions().iter().map(Verifiable::as_unverified),
             )
         }
 
@@ -26156,7 +26180,10 @@ mod tests {
             .initiate_resolutions_verification(block_hash, &block, &sched);
 
         assert!(
-            matches!(actions.as_slice(), [Action::VerifyResolutions { .. }]),
+            matches!(
+                actions.as_slice(),
+                [Action::Consensus(ConsensusAction::VerifyResolutions { .. })]
+            ),
             "the names go to the store whatever the schedule still carries: {actions:?}",
         );
         assert!(
@@ -26191,7 +26218,7 @@ mod tests {
         assert!(
             matches!(
                 actions.as_slice(),
-                [Action::VerifyResolutions { entries, .. }] if *entries == vec![figures_of(b"tx")]
+                [Action::Consensus(ConsensusAction::VerifyResolutions { entries, .. })] if *entries == vec![figures_of(b"tx")]
             ),
             "the names go to the store: {actions:?}"
         );
@@ -27151,9 +27178,12 @@ mod tests {
     }
 
     fn votes(actions: &[Action]) -> bool {
-        actions
-            .iter()
-            .any(|action| matches!(action, Action::SignAndBroadcastBlockVote { .. }))
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote { .. })
+            )
+        })
     }
 
     /// A block adding nothing is voted for by a voter holding no count;
@@ -27244,11 +27274,11 @@ mod tests {
         let (built_on, count) = actions
             .iter()
             .find_map(|action| match action {
-                Action::BuildProposal {
+                Action::Consensus(ConsensusAction::BuildProposal {
                     parent_block_hash,
                     standing_answers,
                     ..
-                } => Some((*parent_block_hash, standing_answers.clone())),
+                }) => Some((*parent_block_hash, standing_answers.clone())),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("seat 2 leads round 2: {actions:?}"));
@@ -27547,14 +27577,13 @@ mod tests {
 
         let parent = Model(BTreeMap::new());
         let kept = |standing: Option<&StandingAnswers>| {
-            let mut offered: Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK> =
-                Capped::new(
-                    transactions
-                        .iter()
-                        .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.clone())))
-                        .collect(),
-                )
-                .expect("within the block");
+            let mut offered: Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK> = Capped::new(
+                transactions
+                    .iter()
+                    .map(|tx| Verified::new_unchecked_for_test(tx.clone()))
+                    .collect(),
+            )
+            .expect("within the block");
             let (claims, cut, dropped) = within_the_cap(
                 standing,
                 trie,
@@ -27691,9 +27720,12 @@ mod tests {
     }
 
     fn builds(actions: &[Action]) -> bool {
-        actions
-            .iter()
-            .any(|action| matches!(action, Action::BuildProposal { .. }))
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::Consensus(ConsensusAction::BuildProposal { .. })
+            )
+        })
     }
 
     /// The delay the proposal pace timer among `actions` is armed for.
@@ -27959,7 +27991,7 @@ mod tests {
         assert!(
             actions.iter().any(|action| matches!(
                 action,
-                Action::BuildProposal { ready_signals, .. } if ready_signals.len() == 1
+                Action::Consensus(ConsensusAction::BuildProposal { ready_signals, .. }) if ready_signals.len() == 1
             )),
             "the block carries the signal: {actions:?}"
         );
@@ -28124,7 +28156,9 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndBroadcastBlockVote { signer, .. } => Some(*signer),
+                Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote {
+                    signer, ..
+                }) => Some(*signer),
                 _ => None,
             })
             .collect()
@@ -28134,9 +28168,11 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndBroadcastTimeout { round, signer, .. } if *round == at => {
-                    Some(*signer)
-                }
+                Action::Consensus(ConsensusAction::SignAndBroadcastTimeout {
+                    round,
+                    signer,
+                    ..
+                }) if *round == at => Some(*signer),
                 _ => None,
             })
             .collect()
@@ -28213,8 +28249,10 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::BroadcastBlockHeader { position, .. }
-                | Action::SignAndBroadcastBlockVote { position, .. } => Some((
+                Action::Consensus(
+                    ConsensusAction::BroadcastBlockHeader { position, .. }
+                    | ConsensusAction::SignAndBroadcastBlockVote { position, .. },
+                ) => Some((
                     position.registers.clone(),
                     position.justification.iter().map(|b| b.hash()).collect(),
                 )),
@@ -28321,7 +28359,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::BuildProposal { .. })),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. }))),
             "got {actions:?}",
         );
         assert!(!state.will_propose_next(&schedule));
@@ -28405,7 +28443,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BroadcastBlockHeader { header, recipients, .. }
+                Action::Consensus(ConsensusAction::BroadcastBlockHeader { header, recipients, .. })
                     if header.hash() == own.hash()
                         && !recipients.contains(&ValidatorId::new(1))
             )),
@@ -28428,9 +28466,11 @@ mod tests {
         let recipients = actions
             .iter()
             .find_map(|action| match action {
-                Action::BroadcastBlockHeader {
-                    header, recipients, ..
-                } if header.hash() == own.hash() => Some(recipients.clone()),
+                Action::Consensus(ConsensusAction::BroadcastBlockHeader {
+                    header,
+                    recipients,
+                    ..
+                }) if header.hash() == own.hash() => Some(recipients.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("the block's header is broadcast; got {actions:?}"));
@@ -28505,9 +28545,13 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(100_000));
         let (own, actions) =
             own_round_one_block_built(&mut state, &schedule, AnswerAdditions::default());
-        let Some(Action::BroadcastBlockHeader { position, .. }) = actions
-            .iter()
-            .find(|a| matches!(a, Action::BroadcastBlockHeader { .. }))
+        let Some(Action::Consensus(ConsensusAction::BroadcastBlockHeader { position, .. })) =
+            actions.iter().find(|a| {
+                matches!(
+                    a,
+                    Action::Consensus(ConsensusAction::BroadcastBlockHeader { .. })
+                )
+            })
         else {
             panic!("the proposer broadcasts its header; got {actions:?}");
         };
@@ -28583,7 +28627,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BuildProposal { proposer, round, .. }
+                Action::Consensus(ConsensusAction::BuildProposal { proposer, round, .. })
                     if *proposer == ValidatorId::new(2) && *round == Round::new(2)
             )),
             "got {actions:?}",
@@ -28820,9 +28864,11 @@ mod tests {
         install_complete_block(&mut state, &block);
         let qc = quorum_over_round_one(&state, &keys, &block);
 
-        let Some(Action::SignAndBroadcastQcAnnouncement {
-            recipients, signer, ..
-        }) = state.announce_qc(&schedule, block.hash(), &qc)
+        let Some(Action::Consensus(ConsensusAction::SignAndBroadcastQcAnnouncement {
+            recipients,
+            signer,
+            ..
+        })) = state.announce_qc(&schedule, block.hash(), &qc)
         else {
             panic!("the attached proposer announces");
         };
@@ -28840,7 +28886,7 @@ mod tests {
         let qc = quorum_over_round_one(&other, &keys, &block);
         assert!(matches!(
             other.announce_qc(&schedule, block.hash(), &qc),
-            Some(Action::SignAndBroadcastQcAnnouncement { signer, recipients, .. })
+            Some(Action::Consensus(ConsensusAction::SignAndBroadcastQcAnnouncement { signer, recipients, .. }))
                 if signer == ValidatorId::new(0) && recipients == ids(&[2])
         ));
     }
@@ -28935,14 +28981,14 @@ mod tests {
         let signals: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndBroadcastReadySignal {
+                Action::Consensus(ConsensusAction::SignAndBroadcastReadySignal {
                     signer,
                     recipients,
                     local_recipient,
                     wt_window_start,
                     wt_window_end,
                     ..
-                } => Some((
+                }) => Some((
                     *signer,
                     recipients.clone(),
                     *local_recipient,
@@ -28996,7 +29042,9 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndBroadcastReadySignal { signer, .. } => Some(*signer),
+                Action::Consensus(ConsensusAction::SignAndBroadcastReadySignal {
+                    signer, ..
+                }) => Some(*signer),
                 _ => None,
             })
             .collect()
@@ -29118,7 +29166,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BuildProposal { proposer, round, .. }
+                Action::Consensus(ConsensusAction::BuildProposal { proposer, round, .. })
                     if *proposer == ValidatorId::new(2) && *round == Round::new(2)
             )),
             "{actions:?}"
@@ -29136,7 +29184,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BroadcastBlockHeader { header, .. } if header.hash() == own.hash()
+                Action::Consensus(ConsensusAction::BroadcastBlockHeader { header, .. }) if header.hash() == own.hash()
             )),
             "{actions:?}"
         );
@@ -29357,9 +29405,10 @@ mod tests {
         time_out_current_round(&mut state, &schedule);
         let fired = state.check_round_timeout(&schedule).unwrap_or_default();
         assert!(
-            !fired
-                .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastTimeout { .. })),
+            !fired.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::SignAndBroadcastTimeout { .. })
+            )),
             "{fired:?}"
         );
         state.queue_ready_proposal();
@@ -29370,7 +29419,12 @@ mod tests {
             state
                 .on_beacon_block_persisted(&schedule)
                 .iter()
-                .all(|a| a.signer().is_none())
+                .all(|a| match a {
+                    Action::Consensus(action) => action.signer().is_none(),
+                    Action::Execution(action) => action.signer().is_none(),
+                    Action::Provisions(action) => action.signer().is_none(),
+                    _ => true,
+                })
         );
     }
 
@@ -29714,7 +29768,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BuildProposal { proposer, round, .. }
+                Action::Consensus(ConsensusAction::BuildProposal { proposer, round, .. })
                     if *proposer == ValidatorId::new(2) && *round == view
             )),
             "{actions:?}"
@@ -29729,7 +29783,7 @@ mod tests {
         );
         assert!(state.check_sync_health(&schedule).iter().any(|a| matches!(
             a,
-            Action::SignAndBroadcastTimeout { signer, .. } if *signer == ValidatorId::new(2)
+            Action::Consensus(ConsensusAction::SignAndBroadcastTimeout { signer, .. }) if *signer == ValidatorId::new(2)
         )));
     }
 
@@ -29906,10 +29960,15 @@ mod tests {
         install_complete_block(&mut fresh, &six);
         fresh.latest_qc = Some(halted_qc);
         let _ = fresh.view_change.advance_on_qc(Round::new(7));
-        let Some(Action::SignAndBroadcastTimeout { round, high_qc, .. }) = fired.iter().find(|a| {
-            matches!(a, Action::SignAndBroadcastTimeout { signer, .. }
+        let Some(Action::Consensus(ConsensusAction::SignAndBroadcastTimeout {
+            round,
+            high_qc,
+            ..
+        })) = fired.iter().find(|a| {
+            matches!(a, Action::Consensus(ConsensusAction::SignAndBroadcastTimeout { signer, .. })
                     if *signer == ValidatorId::new(1))
-        }) else {
+        })
+        else {
             panic!("the offer is in the fire: {fired:?}");
         };
         assert_eq!(high_qc.round(), Round::new(7));

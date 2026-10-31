@@ -27,6 +27,19 @@
 //! A shard that fails either, or never answers, is simply absent from
 //! the gathered anchors, and the preview refuses by naming it. There is
 //! no arm in which an unverified cell reaches the run.
+//!
+//! What is verified is presence, not completeness. Every point key is
+//! proven present or absent, and every entry an interval returns is
+//! proven under the root; but an entry's leaf is keyed by a digest of
+//! its owner, collection and order, so the tree's order is not the
+//! collection's and nothing proves the interval holds no entry the
+//! server left out. A server can answer an interval narrower than it
+//! holds, and the run reads the gap as empty. A range-derived read in a
+//! preview is the serving peer's word on what is missing, so every
+//! interval a peer answered is recorded in the gathering's `unproven`
+//! set, which the report carries out to the caller — short of a single
+//! order, which has one leaf to stand on: proven present when its entry
+//! came back, or proven absent when it did not.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,15 +47,16 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crossbeam::channel::{Sender, bounded};
-use hyperscale_engine::{DeclaredReads, FetchedCells};
+use hyperscale_engine::{DeclaredReads, FetchedCells, UnprovenInterval};
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::entry_leaf_value;
 use hyperscale_types::network::request::GetCellsRequest;
 use hyperscale_types::network::response::GetCellsResponse;
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    BlockHeight, CertifiedBlockHeader, EntryKey, MerkleInclusionProof, ProtocolHasher, QcContext,
-    ShardId, StateRoot, SubstateKey, TopologySnapshot, Verified, Verifier, Verify, entry_leaf_key,
+    BlockHeight, CertifiedBlockHeader, EntryKey, Inclusion, MerkleInclusionProof, ProtocolHasher,
+    QcContext, ShardId, StateRoot, SubstateKey, TopologySnapshot, Verified, Verifier, Verify,
+    entry_leaf_key,
 };
 
 /// How long the whole gathering may take.
@@ -78,7 +92,7 @@ fn absorb(
     let Some(attested) = verify_anchor(shard, anchor, topology, verifier) else {
         return false;
     };
-    fold_attested(
+    let Some(unproven) = fold_attested(
         shard,
         ask,
         response,
@@ -86,15 +100,29 @@ fn absorb(
         attested.header().state_root(),
         attested.header().height(),
         into,
-    )
+    ) else {
+        return false;
+    };
+    // Here and not in the fold, because the gap is about who answered:
+    // this node's own store is no more a stranger's word than the
+    // snapshot the run reads itself.
+    into.unproven.extend(unproven);
+    true
 }
 
 /// Fold an answer whose anchor has already been verified, checking every
 /// value against what `root` attests for its leaf.
 ///
+/// Returns the intervals the answer does not prove whole, or `None` when
+/// it does not stand.
+///
 /// Split from [`absorb`] because this half is the one that decides
 /// whether a server can lie about *contents*, and it is checkable
-/// against a root without a committee in hand.
+/// against a root without a committee in hand. An interval's entries are
+/// each proven present, and the interval is proven whole only where it
+/// is a single order: by its entry coming back, or by the proof claiming
+/// that order's leaf absent. A server that carries no such claim has
+/// answered the order on its word, as it has every wider interval.
 fn fold_attested(
     shard: ShardId,
     ask: &DeclaredReads,
@@ -103,12 +131,12 @@ fn fold_attested(
     root: StateRoot,
     height: BlockHeight,
     into: &mut FetchedCells,
-) -> bool {
+) -> Option<Vec<UnprovenInterval>> {
     // Positional, so a short answer is not a partial one: an interval
     // the server dropped would otherwise go unasked-about, and the proof
     // over the leaves that remain still reconstructs.
     if response.ranges.len() != ask.ranges.len() {
-        return false;
+        return None;
     }
     // Every leaf the answer stands on, with the value claimed for it,
     // rebuilt from what the server returned — so the proof is checked
@@ -141,14 +169,49 @@ fn fold_attested(
         }
     }
 
-    let Ok(inclusions) = proof.inclusions(root, shard, &leaves) else {
-        return false;
-    };
-    for (claim, (_, inclusion)) in claimed.iter().zip(&inclusions) {
-        if claim.as_ref().map(|value| jmt_value_hash(value)) != inclusion.value_hash() {
-            return false;
+    // Which intervals the answer proves whole. Only a single order can
+    // be: by its entry coming back, proven above, or by the proof
+    // claiming its leaf absent when nothing did. A proof may carry that
+    // claim or not and stand either way, so its leaf is asked about
+    // apart from the ones the answer stands on.
+    let mut unproven = Vec::new();
+    let mut empty_orders = Vec::new();
+    for (range, answer) in ask.ranges.iter().zip(&response.ranges) {
+        if range.lo != range.hi {
+            unproven.push(UnprovenInterval::from(range));
+        } else if answer.entries.is_empty() {
+            empty_orders.push(range);
+        } else if !answer.entries.iter().any(|(order, _)| *order == range.lo) {
+            unproven.push(UnprovenInterval::from(range));
         }
     }
+    let stated = leaves.len();
+    leaves.extend(empty_orders.iter().map(|range| {
+        entry_leaf_key(
+            &ProtocolHasher,
+            EntryKey {
+                owner: range.owner,
+                collection: range.collection,
+                order: range.lo,
+            },
+        )
+    }));
+
+    let inclusions = proof.claimed_inclusions(root, shard, &leaves).ok()?;
+    let (stated_inclusions, empty_inclusions) = inclusions.split_at(stated);
+    for (claim, (_, inclusion)) in claimed.iter().zip(stated_inclusions) {
+        let inclusion = (*inclusion)?;
+        if claim.as_ref().map(|value| jmt_value_hash(value)) != inclusion.value_hash() {
+            return None;
+        }
+    }
+    unproven.extend(
+        empty_orders
+            .into_iter()
+            .zip(empty_inclusions)
+            .filter(|(_, (_, inclusion))| *inclusion != Some(Inclusion::Absent))
+            .map(|(range, _)| UnprovenInterval::from(range)),
+    );
 
     // Keyed by what was asked, carrying what the root attested for it:
     // a pair the server volunteered under some other key was never a
@@ -169,7 +232,7 @@ fn fold_attested(
         );
     }
     into.anchors.insert(shard, height);
-    true
+    Some(unproven)
 }
 
 /// The header, if its quorum certificate is `shard`'s committee's.
@@ -201,7 +264,7 @@ fn verify_anchor(
         public_keys: &keys,
         quorum_threshold: topology.quorum_threshold_for_shard(shard),
     };
-    // SAFETY for `from_qc_attestation`: the committee that signed this
+    // Why `from_qc_attestation` holds: the committee that signed this
     // QC accepted the header before voting, and the check above is that
     // the signature is that committee's. Local per-root verification is
     // neither possible here — this node holds none of that shard's
@@ -362,10 +425,12 @@ fn absorb_own(
         anchor.header().height(),
         into,
     )
+    .is_some()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use hyperscale_crypto_bls::BlsVerifier;
@@ -383,7 +448,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeaderParts,
         GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ValidatorId,
-        WitnessSources,
+        WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -444,12 +509,21 @@ mod tests {
 
     /// A store of eight entries, and the root its only commit produced.
     fn served(ask: &DeclaredReads) -> (GetCellsResponse, StateRoot) {
+        served_over(0..8, ask)
+    }
+
+    /// [`served`], over a store holding `orders`.
+    fn served_over(
+        orders: impl IntoIterator<Item = u128>,
+        ask: &DeclaredReads,
+    ) -> (GetCellsResponse, StateRoot) {
         let storage = Arc::new(SimShardStorage::default());
-        let written: Vec<(u128, Option<Vec<u8>>)> = (0u128..8)
+        let written: Vec<(u128, Option<Vec<u8>>)> = orders
+            .into_iter()
             .map(|order| {
                 (
                     order,
-                    Some(vec![u8::try_from(order).expect("eight entries"); 4]),
+                    Some(vec![u8::try_from(order).expect("a small order"); 4]),
                 )
             })
             .collect();
@@ -474,6 +548,29 @@ mod tests {
                 cap: 4,
             }]),
         }
+    }
+
+    /// `response`, re-anchored on a header `committee` signed over `root`
+    /// so the stranger's path verifies it: the fixture store's own anchor
+    /// carries a placeholder certificate no committee signed.
+    fn signed_by(
+        committee: &TestCommittee,
+        mut response: GetCellsResponse,
+        root: StateRoot,
+    ) -> GetCellsResponse {
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: SHARD,
+            height: BlockHeight::new(1),
+            state_root: root,
+            ..Default::default()
+        });
+        let qc = committee.sign_qc(
+            &header,
+            &committee.quorum_indices(),
+            WeightedTimestamp::ZERO,
+        );
+        response.anchor = Some(Box::new(CertifiedBlockHeader::new(header, qc)));
+        response
     }
 
     /// A network that answers every request with `response` and keeps
@@ -674,7 +771,8 @@ mod tests {
                 root,
                 BlockHeight::new(1),
                 &mut into
-            ),
+            )
+            .is_some(),
             "the shard's own answer stands under its own root"
         );
         assert_eq!(into.entries.len(), 1, "and the entries it carried are kept");
@@ -683,7 +781,7 @@ mod tests {
         tampered.ranges[0].entries[0].1 = Bytes::from_array([0xFF; 4]);
         let mut nothing = FetchedCells::default();
         assert!(
-            !fold_attested(
+            fold_attested(
                 SHARD,
                 &ask,
                 &tampered,
@@ -691,7 +789,8 @@ mod tests {
                 root,
                 BlockHeight::new(1),
                 &mut nothing
-            ),
+            )
+            .is_none(),
             "a value the root never attested is refused"
         );
         assert!(
@@ -784,6 +883,10 @@ mod tests {
             4,
             "with the entries its own store holds, up to the cap the declaration named"
         );
+        assert!(
+            fetched.unproven.is_empty(),
+            "and an interval this node answered itself is not a stranger's word"
+        );
     }
 
     /// A cell the server volunteered under a key nobody asked for is
@@ -817,7 +920,8 @@ mod tests {
                 root,
                 BlockHeight::new(1),
                 &mut into
-            ),
+            )
+            .is_some(),
             "the intervals that were asked for still stand under the root"
         );
         assert_eq!(into.entries.len(), 1, "so the answer's own content is kept");
@@ -825,6 +929,298 @@ mod tests {
             into.cells.is_empty(),
             "and the volunteered cell is not, having no leaf behind it"
         );
+    }
+
+    /// An interval a peer answered with an entry left out still verifies,
+    /// and the gathering names it as resting on that peer's word.
+    ///
+    /// The peer answers `[0, MAX]` as though it were `[1, MAX]`: every
+    /// entry it returns is a genuine leaf, so the proof reconstructs and
+    /// the shard stands in the anchors, and the run would read order 0 as
+    /// absent. Nothing in the answer can say otherwise, so the interval is
+    /// reported rather than trusted.
+    #[test]
+    fn an_interval_a_peer_answered_short_is_named_unproven() {
+        let ask = one_range();
+        let key = entry_key(OWNER_SEED, 0);
+        let mut narrower = ask.clone();
+        narrower.ranges[0].lo = 1;
+        let (response, root) = served(&narrower);
+        let committee = TestCommittee::new(4, 7);
+        let topology = Arc::new(committee.topology_snapshot(1));
+        let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
+
+        let peer = Answering::new(signed_by(&committee, response, root), 0);
+        let fetched = gather(
+            &BTreeMap::from([(SHARD, ask.clone())]),
+            &topology,
+            &peer,
+            &verifier,
+            &|_, _| None,
+        );
+        assert!(
+            fetched.anchors.contains_key(&SHARD),
+            "every entry the peer returned stands under the root, so the answer verifies"
+        );
+        assert_eq!(
+            fetched
+                .entries_in_range(key.owner, key.collection, 0, u128::MAX, 8)
+                .iter()
+                .map(|(order, _)| *order)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "and the run would read order 0 as absent"
+        );
+        assert_eq!(
+            fetched.unproven,
+            BTreeSet::from([UnprovenInterval::from(&ask.ranges[0])]),
+            "so the interval is named as the peer's word"
+        );
+    }
+
+    /// Point reads a peer answered are proven present or absent, and a
+    /// width-one interval whose entry came back has nothing left to omit:
+    /// none of them is named unproven.
+    #[test]
+    fn proven_reads_a_peer_answered_are_not_named_unproven() {
+        let key = entry_key(OWNER_SEED, 0);
+        let ask = DeclaredReads {
+            keys: Capped::from_array([test_key(0x5A)]),
+            ranges: Capped::from_array([CellRange {
+                owner: key.owner,
+                collection: key.collection,
+                lo: 2,
+                hi: 2,
+                cap: 1,
+            }]),
+        };
+        let (response, root) = served(&ask);
+        let committee = TestCommittee::new(4, 7);
+        let topology = Arc::new(committee.topology_snapshot(1));
+        let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
+
+        let peer = Answering::new(signed_by(&committee, response, root), 0);
+        let fetched = gather(
+            &BTreeMap::from([(SHARD, ask)]),
+            &topology,
+            &peer,
+            &verifier,
+            &|_, _| None,
+        );
+        assert!(fetched.anchors.contains_key(&SHARD), "the answer verifies");
+        assert!(
+            fetched.unproven.is_empty(),
+            "and every read in it is proven: {:?}",
+            fetched.unproven
+        );
+    }
+
+    /// A single order and an absent point key, so the proof is not empty
+    /// once the order's own claim is cut out of it.
+    fn one_order(order: u128) -> DeclaredReads {
+        let key = entry_key(OWNER_SEED, 0);
+        DeclaredReads {
+            keys: Capped::from_array([test_key(0x5A)]),
+            ranges: Capped::from_array([CellRange {
+                owner: key.owner,
+                collection: key.collection,
+                lo: order,
+                hi: order,
+                cap: 1,
+            }]),
+        }
+    }
+
+    /// `ask` gathered from a peer answering with `response`, anchored on a
+    /// header the committee signed over `root`.
+    fn gathered_from(
+        ask: &DeclaredReads,
+        response: GetCellsResponse,
+        root: StateRoot,
+    ) -> (FetchedCells, Option<ResponseVerdict>) {
+        let committee = TestCommittee::new(4, 7);
+        let topology = Arc::new(committee.topology_snapshot(1));
+        let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
+        let peer = Answering::new(signed_by(&committee, response, root), 0);
+        let fetched = gather(
+            &BTreeMap::from([(SHARD, ask.clone())]),
+            &topology,
+            &peer,
+            &verifier,
+            &|_, _| None,
+        );
+        let verdict = peer
+            .verdict
+            .lock()
+            .expect("no other thread holds it")
+            .take();
+        (fetched, verdict)
+    }
+
+    /// A single order a peer answered empty, with the proof claiming its
+    /// leaf absent, has nothing left to omit and is not named unproven.
+    #[test]
+    fn a_single_order_proven_absent_is_not_named_unproven() {
+        let ask = one_order(9);
+        let (response, root) = served(&ask);
+        assert!(
+            response.ranges[0].entries.is_empty(),
+            "order 9 was never written"
+        );
+
+        let (fetched, verdict) = gathered_from(&ask, response, root);
+        assert!(fetched.anchors.contains_key(&SHARD), "the answer verifies");
+        assert!(matches!(verdict, Some(ResponseVerdict::Accept)));
+        assert!(
+            fetched.unproven.is_empty(),
+            "and the empty order is proven empty: {:?}",
+            fetched.unproven
+        );
+    }
+
+    /// A single order a peer answered empty with no claim on its leaf is
+    /// the peer's word, as any wider interval is.
+    ///
+    /// The rest of the proof stands, so the answer is kept; it is only
+    /// the order's emptiness that nothing attests.
+    #[test]
+    fn a_single_order_answered_empty_without_a_proof_is_named_unproven() {
+        let ask = one_order(9);
+        let (mut response, root) = served(&ask);
+        let proof = response.proof.as_ref().expect("the tip is answerable");
+        response.proof = Some(proof.restrict(&ask.keys).expect("the point key is claimed"));
+
+        let (fetched, verdict) = gathered_from(&ask, response, root);
+        assert!(
+            fetched.anchors.contains_key(&SHARD),
+            "the point key still stands under the root"
+        );
+        assert!(matches!(verdict, Some(ResponseVerdict::Accept)));
+        assert_eq!(
+            fetched.unproven,
+            BTreeSet::from([UnprovenInterval::from(&ask.ranges[0])]),
+            "and the order nothing proves empty is named"
+        );
+    }
+
+    /// A single order a peer answered empty while it holds an entry is
+    /// never read as proven empty.
+    ///
+    /// Two ways to try it. An absence claim taken from a tree without the
+    /// entry does not reconstruct the root the committee signed, so the
+    /// whole answer is refused and the peer told so. The honest proof
+    /// with the entry dropped from the answer claims the leaf present,
+    /// which proves nothing empty, so the order stays the peer's word.
+    #[test]
+    fn a_single_order_whose_entry_is_held_is_not_proven_empty() {
+        let ask = one_order(2);
+        let (honest, root) = served(&ask);
+        assert_eq!(honest.ranges[0].entries.len(), 1, "order 2 is held");
+
+        let (mut forged, _) = served_over((0..8).filter(|order| *order != 2), &ask);
+        assert!(forged.ranges[0].entries.is_empty());
+        forged.anchor = None;
+        let (fetched, verdict) = gathered_from(&ask, forged, root);
+        assert!(
+            !fetched.anchors.contains_key(&SHARD),
+            "an absence the signed root does not hold refuses the answer"
+        );
+        assert!(matches!(verdict, Some(ResponseVerdict::Reject)));
+
+        let mut withheld = honest;
+        withheld.ranges[0].entries = Capped::empty();
+        let (fetched, verdict) = gathered_from(&ask, withheld, root);
+        assert!(fetched.anchors.contains_key(&SHARD));
+        assert!(matches!(verdict, Some(ResponseVerdict::Accept)));
+        assert_eq!(
+            fetched.unproven,
+            BTreeSet::from([UnprovenInterval::from(&ask.ranges[0])]),
+            "a leaf proven present proves the order anything but empty"
+        );
+    }
+
+    /// Intervals past every order the store holds, asked with no point
+    /// key beside them: an answer that returns no entry at all.
+    fn empty_ranges() -> DeclaredReads {
+        let key = entry_key(OWNER_SEED, 0);
+        let range = |lo: u128, hi: u128, cap: u32| CellRange {
+            owner: key.owner,
+            collection: key.collection,
+            lo,
+            hi,
+            cap,
+        };
+        DeclaredReads {
+            keys: Capped::empty(),
+            ranges: Capped::from_array([
+                range(100, 200, 4),
+                range(8, u128::MAX, 2),
+                range(9, 9, 0),
+            ]),
+        }
+    }
+
+    /// A peer answering intervals that hold nothing, asked with no point
+    /// key, is believed and the intervals it cannot prove empty named.
+    ///
+    /// The answer returns no entry, so it stands on no leaf the asker
+    /// derives; what ties it to the signed root is the claim the server
+    /// makes on each interval's first order. Without one the proof claims
+    /// nothing, which reconstructs no root but the empty one, and the
+    /// shard would be refused for telling the truth.
+    #[test]
+    fn intervals_answered_empty_with_no_point_key_are_kept_and_named() {
+        let ask = empty_ranges();
+        let (response, root) = served(&ask);
+        assert!(
+            response.ranges.iter().all(|range| range.entries.is_empty()),
+            "no interval reaches an order the store holds"
+        );
+
+        let (fetched, verdict) = gathered_from(&ask, response, root);
+        assert!(
+            fetched.anchors.contains_key(&SHARD),
+            "an honest empty answer stands under the signed root"
+        );
+        assert!(matches!(verdict, Some(ResponseVerdict::Accept)));
+        assert_eq!(
+            fetched.unproven,
+            BTreeSet::from([
+                UnprovenInterval::from(&ask.ranges[0]),
+                UnprovenInterval::from(&ask.ranges[1]),
+            ]),
+            "the wider intervals are the peer's word; the single order is proven empty"
+        );
+    }
+
+    /// An answer to intervals that hold nothing carrying an entry the
+    /// root never held, or a proof taken over another tree, is refused.
+    #[test]
+    fn intervals_answered_with_a_forged_entry_are_refused() {
+        let ask = empty_ranges();
+        let (honest, root) = served(&ask);
+
+        let mut invented = honest;
+        invented.ranges[0]
+            .entries
+            .push((150, Bytes::from_array([0xAB; 4])))
+            .expect("under the interval's cap");
+        let (fetched, verdict) = gathered_from(&ask, invented, root);
+        assert!(
+            !fetched.anchors.contains_key(&SHARD),
+            "an entry with no claim behind it refuses the answer"
+        );
+        assert!(matches!(verdict, Some(ResponseVerdict::Reject)));
+
+        let (mut elsewhere, _) = served_over(100..104, &ask);
+        assert!(!elsewhere.ranges[0].entries.is_empty());
+        elsewhere.anchor = None;
+        let (fetched, verdict) = gathered_from(&ask, elsewhere, root);
+        assert!(
+            !fetched.anchors.contains_key(&SHARD),
+            "entries another tree holds do not stand under the signed root"
+        );
+        assert!(matches!(verdict, Some(ResponseVerdict::Reject)));
     }
 
     /// An interval the server simply left out is refused rather than
@@ -844,7 +1240,7 @@ mod tests {
         short.ranges.clear();
         let mut nothing = FetchedCells::default();
         assert!(
-            !fold_attested(
+            fold_attested(
                 SHARD,
                 &ask,
                 &short,
@@ -852,7 +1248,8 @@ mod tests {
                 root,
                 BlockHeight::new(1),
                 &mut nothing
-            ),
+            )
+            .is_none(),
             "an answer naming fewer intervals than were asked is not a partial answer"
         );
     }

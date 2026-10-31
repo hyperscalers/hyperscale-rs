@@ -246,7 +246,7 @@ fn test_transactions_batch_with_indexed_block() {
     let storage = SimShardStorage::default();
     let block = make_test_block(BlockHeight::new(1));
 
-    let tx = Arc::new(Verifiable::from(test_transaction(42)));
+    let tx = Verifiable::from(test_transaction(42));
     let tx_hash = tx.hash();
     let block = match block {
         Block::Live {
@@ -610,7 +610,7 @@ fn a_rebuilt_store_carries_signed_rounds() {
 fn block_with_txs(
     height: BlockHeight,
     anchor_wt_ms: u64,
-    txs: Vec<Arc<Verifiable<Transaction>>>,
+    txs: Vec<Verifiable<Transaction>>,
 ) -> Block {
     match make_test_block_with_anchor_wt(height, anchor_wt_ms) {
         Block::Live {
@@ -638,18 +638,18 @@ fn block_with_txs(
 
 /// A transaction whose signed window ends at `end_ms` — the deadline the
 /// fold has to recover for it.
-fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
+fn dedup_tx(seed: u8, end_ms: u64) -> Verifiable<Transaction> {
     install_stub_protocol_statics();
     let validity = TimestampRange::new(
         WeightedTimestamp::ZERO,
         WeightedTimestamp::from_millis(end_ms),
     );
-    Arc::new(Verifiable::from(stub_transaction(
+    Verifiable::from(stub_transaction(
         test_principal(seed),
         &[test_prefix(seed)],
         1_000,
         validity,
-    )))
+    ))
 }
 
 /// The fold records the names a finalization *decided*, as the live
@@ -677,10 +677,10 @@ fn dedup_window_records_only_what_a_finalization_decided() {
             events: Capped::empty(),
         }),
     );
-    let leg = Arc::new(Verifiable::from(
+    let leg = Verifiable::from(
         make_leg_finalization(BlockHeight::new(1), tx_hash)
             .with_receipts(Capped::from_array([receipt])),
-    ));
+    );
     let block = push_certificate(block_with_txs(BlockHeight::new(1), 1_000, vec![tx]), leg);
     commit_empty(&storage, &block);
 

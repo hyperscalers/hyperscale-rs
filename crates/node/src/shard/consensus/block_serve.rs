@@ -128,7 +128,7 @@ pub fn serve_block_request<S: ShardStorage>(
         return GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory));
     }
 
-    let resolved: Vec<(ProvisionHash, Option<Arc<Provisions>>)> = provision_hashes
+    let resolved: Vec<(ProvisionHash, Option<Provisions>)> = provision_hashes
         .iter()
         .map(|h| (*h, provision_store.get(*h)))
         .collect();
@@ -154,9 +154,9 @@ pub fn serve_block_request<S: ShardStorage>(
     // `Block::Live.provisions`; encoding lands at `Verifiable::Unverified`
     // on the receiver and verification proceeds from there. Missing
     // entries returned `not_found` above, so every body resolves here.
-    let provisions: Vec<Arc<Verifiable<Provisions>>> = resolved
+    let provisions: Vec<Verifiable<Provisions>> = resolved
         .into_iter()
-        .filter_map(|(_, p)| p.map(|raw| Arc::new((*raw).clone().into())))
+        .filter_map(|(_, p)| p.map(Verifiable::from))
         .collect();
 
     GetBlockResponse::found(ElidedCertifiedBlock::elide(
@@ -259,7 +259,7 @@ mod tests {
             header,
             transactions,
             certificates,
-            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
+            provisions: Arc::new(Capped::from_array([Verifiable::from(bundle)])),
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),

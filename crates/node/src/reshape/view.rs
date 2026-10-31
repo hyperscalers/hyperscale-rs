@@ -3,11 +3,10 @@
 //! Both harnesses gate reshape on the same committed-state projection: a shard's
 //! boundary anchor projects (`Some`) exactly once it seeds — the projection
 //! drops zeroed genesis placeholders ([`BeaconState::derive_topology_snapshot`]
-//! filters `block_hash == ZERO`), so `boundary(shard).is_some()` is equivalent to
-//! the raw `BeaconState.boundaries[shard].block_hash != ZERO` the simulation used
-//! to read directly. Routing both the production supervisor and the simulation
-//! driver through these predicates gives one definition of the gate, so neither
-//! hand-rolls it and they cannot silently diverge.
+//! filters `block_hash == ZERO`), so `boundary(shard).is_some()` means the
+//! committed `BeaconState.boundaries[shard]` carries a real block. The
+//! production supervisor and the simulation driver both read the gate through
+//! these predicates, so it has one definition.
 //!
 //! [`BeaconState::derive_topology_snapshot`]: hyperscale_types::BeaconState::derive_topology_snapshot
 
@@ -49,7 +48,7 @@ impl<'a> ReshapeView<'a> {
 
     /// The schedule the view reads.
     #[must_use]
-    pub const fn schedule(&self) -> &'a TopologySchedule {
+    pub(crate) const fn schedule(&self) -> &'a TopologySchedule {
         self.schedule
     }
 
@@ -74,6 +73,30 @@ impl<'a> ReshapeView<'a> {
         }
         let terminal = self.topology_snapshot().scheduled_terminal(shard)?;
         Some(windows.window_of(terminal).end)
+    }
+
+    /// Whether `parent`'s split into `child` is past the point the beacon
+    /// can cancel it: its cut is scheduled, or it has executed and `child`
+    /// stands in the trie with a committee of its own.
+    ///
+    /// Before that, a split the beacon cancels or lapses leaves nothing of
+    /// itself but its cohort's absence.
+    #[must_use]
+    pub(crate) fn split_irrevocable(&self, parent: ShardId, child: ShardId) -> bool {
+        (self.topology_snapshot().split_pending(parent) && self.terminal_cut(parent).is_some())
+            || !self.committee(child).is_empty()
+    }
+
+    /// Whether the merge reforming `parent` is past the point the beacon
+    /// can cancel it: its children's cut is scheduled, or it has executed
+    /// and `parent` stands in the trie with a committee of its own.
+    #[must_use]
+    pub(crate) fn merge_irrevocable(&self, parent: ShardId) -> bool {
+        let head = self.topology_snapshot();
+        <[ShardId; 2]>::from(parent.children())
+            .into_iter()
+            .any(|child| !head.split_pending(child) && self.terminal_cut(child).is_some())
+            || !self.committee(parent).is_empty()
     }
 
     /// The chain's network definition — the domain every signature and QC
@@ -131,14 +154,18 @@ impl<'a> ReshapeView<'a> {
 
     /// The shard's full committee — the ready-signal broadcast recipients.
     #[must_use]
-    pub fn committee(&self, shard: ShardId) -> &[ValidatorId] {
+    pub(crate) fn committee(&self, shard: ShardId) -> &[ValidatorId] {
         self.topology_snapshot().committee_for_shard(shard)
     }
 
     /// The split child `validator` syncs as an observer of `parent`'s pending
     /// split, or `None` when it holds no observer seat there.
     #[must_use]
-    pub fn observer_child(&self, parent: ShardId, validator: ValidatorId) -> Option<ShardId> {
+    pub(crate) fn observer_child(
+        &self,
+        parent: ShardId,
+        validator: ValidatorId,
+    ) -> Option<ShardId> {
         self.topology_snapshot()
             .reshape_observer_child(parent, validator)
     }
@@ -146,7 +173,7 @@ impl<'a> ReshapeView<'a> {
     /// The parent `validator` reforms as a keeper of `child` in a pending
     /// merge, or `None` when it holds no keeper seat there.
     #[must_use]
-    pub fn keeper_parent(&self, child: ShardId, validator: ValidatorId) -> Option<ShardId> {
+    pub(crate) fn keeper_parent(&self, child: ShardId, validator: ValidatorId) -> Option<ShardId> {
         self.topology_snapshot()
             .reshape_keeper_parent(child, validator)
     }
@@ -200,14 +227,6 @@ impl<'a> ReshapeView<'a> {
         self.topology_snapshot().boundary(shard).is_some()
     }
 
-    /// Whether both of `parent`'s split children have seeded — the gate a
-    /// splitting parent's observers flip on.
-    #[must_use]
-    pub fn children_seeded(&self, parent: ShardId) -> bool {
-        let (left, right) = parent.children();
-        self.seeded(left) && self.seeded(right)
-    }
-
     /// Whether `parent`'s merge has executed — the beacon seated a live
     /// committee on the reformed parent and composed its anchor. The gate a
     /// merge's keepers build and flip on.
@@ -219,22 +238,6 @@ impl<'a> ReshapeView<'a> {
     #[must_use]
     pub(crate) fn merge_composed(&self, parent: ShardId) -> bool {
         self.seeded(parent) && !self.committee(parent).is_empty()
-    }
-
-    /// Whether both of `parent`'s split children are live — each has produced
-    /// past its genesis, not merely seeded. The make-before-break cutover: a
-    /// splitting parent's committee may dissolve only once this holds.
-    #[must_use]
-    pub fn children_live(&self, parent: ShardId) -> bool {
-        self.topology_snapshot().children_live(parent)
-    }
-
-    /// Whether `shard`'s reshape successor(s) are live — both split children, or
-    /// a merge's reformed parent producing under a live committee. The signal a
-    /// terminating committee waits on before it stops finalizing and serving.
-    #[must_use]
-    pub fn successors_live(&self, shard: ShardId) -> bool {
-        self.topology_snapshot().successors_live(shard)
     }
 }
 
@@ -337,17 +340,6 @@ mod tests {
             0,
         );
         assert_eq!(ReshapeView::new(&unwindowed).terminal_cut(parent), None);
-    }
-
-    #[test]
-    fn children_seeded_requires_both_children() {
-        let parent = ShardId::ROOT;
-        let (left, right) = parent.children();
-
-        let seeded = |shards: &[ShardId]| windowed(snapshot_with_seeded(shards), 1_000);
-        assert!(!ReshapeView::new(&seeded(&[])).children_seeded(parent));
-        assert!(!ReshapeView::new(&seeded(&[left])).children_seeded(parent));
-        assert!(ReshapeView::new(&seeded(&[left, right])).children_seeded(parent));
     }
 
     #[test]

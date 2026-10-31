@@ -64,7 +64,10 @@ pub struct Metrics {
 
     // === Shard Loop Channel Depths ===
     pub callback_channel_depth: GaugeVec,
+    pub network_channel_depth: GaugeVec,
     pub timer_channel_depth: GaugeVec,
+    pub network_inputs_refused: CounterVec,
+    pub network_inputs_over_share: CounterVec,
 
     // === Transaction Ingress ===
     pub tx_ingress_rejected_syncing: Counter,
@@ -419,9 +422,30 @@ impl Metrics {
             )
             .unwrap(),
 
+            network_channel_depth: register_gauge_vec!(
+                "hyperscale_network_channel_depth",
+                "Inbound peer inputs queued on a shard loop's bounded network channel",
+                &["shard"]
+            )
+            .unwrap(),
+
             timer_channel_depth: register_gauge_vec!(
                 "hyperscale_timer_channel_depth",
                 "Timer fires queued on a shard loop's timer channel",
+                &["shard"]
+            )
+            .unwrap(),
+
+            network_inputs_refused: register_counter_vec!(
+                "hyperscale_network_inputs_refused_total",
+                "Inbound peer inputs refused because the shard loop's network channel was full",
+                &["shard", "kind"]
+            )
+            .unwrap(),
+
+            network_inputs_over_share: register_counter_vec!(
+                "hyperscale_network_inputs_over_share_total",
+                "Inbound peer inputs refused because their peer already held its share of the shard loop's network channel",
                 &["shard"]
             )
             .unwrap(),
@@ -1230,12 +1254,16 @@ impl MetricsRecorder for PrometheusRecorder {
             .observe(latency_secs);
     }
 
-    fn set_shard_channel_depths(&self, shard: u64, callback: usize, timer: usize) {
+    fn set_shard_channel_depths(&self, shard: u64, callback: usize, network: usize, timer: usize) {
         let shard = shard.to_string();
         self.metrics
             .callback_channel_depth
             .with_label_values(&[&shard])
             .set(callback as f64);
+        self.metrics
+            .network_channel_depth
+            .with_label_values(&[&shard])
+            .set(network as f64);
         self.metrics
             .timer_channel_depth
             .with_label_values(&[&shard])
@@ -1505,6 +1533,20 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics
             .eager_proposals
             .with_label_values(&[reason])
+            .inc();
+    }
+
+    fn record_network_input_refused(&self, shard: u64, kind: &str) {
+        self.metrics
+            .network_inputs_refused
+            .with_label_values(&[&shard.to_string(), kind])
+            .inc();
+    }
+
+    fn record_network_input_over_share(&self, shard: u64) {
+        self.metrics
+            .network_inputs_over_share
+            .with_label_values(&[&shard.to_string()])
             .inc();
     }
 

@@ -8,9 +8,10 @@
 //! when the beacon composes the same value.
 
 use hyperscale_types::{
-    Anchor, Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardId, TerminalRef,
-    WeightedTimestamp,
+    Anchor, Block, BlockHeader, QuorumCertificate, ShardId, TerminalRef, WeightedTimestamp,
 };
+
+use crate::reshape::genesis::DerivedGenesis;
 
 /// Derive a merged parent's genesis block and chain origin from its two
 /// children's certified terminal blocks.
@@ -43,12 +44,12 @@ use hyperscale_types::{
 /// # Errors
 ///
 /// Fails when a quorum certificate does not certify its terminal block.
-pub(crate) fn merge_genesis_from_terminals(
+pub fn merge_genesis_from_terminals(
     parent: ShardId,
     left: (&BlockHeader, &QuorumCertificate),
     right: (&BlockHeader, &QuorumCertificate),
     cut_wt: WeightedTimestamp,
-) -> Result<(Block, ChainOrigin, Vec<Anchor>), String> {
+) -> Result<DerivedGenesis, String> {
     let (left_terminal, left_qc) = left;
     let (right_terminal, right_qc) = right;
     if left_qc.block_hash() != left_terminal.hash() {
@@ -59,7 +60,7 @@ pub(crate) fn merge_genesis_from_terminals(
     }
     // The one shared derivation, so a keeper reforming the parent installs
     // exactly the block the beacon fold composes from the same terminals.
-    let (genesis, origin) = Block::merge_parent_genesis_from_terminals(
+    let (block, origin) = Block::merge_parent_genesis_from_terminals(
         parent,
         TerminalRef {
             state_root: left_terminal.state_root(),
@@ -78,7 +79,11 @@ pub(crate) fn merge_genesis_from_terminals(
         .map(BlockHeader::as_terminal_anchor)
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default();
-    Ok((genesis, origin, predecessors))
+    Ok(DerivedGenesis {
+        block,
+        origin,
+        predecessors,
+    })
 }
 
 #[cfg(test)]
@@ -154,7 +159,11 @@ mod tests {
             cut_wt,
         );
 
-        let (genesis, origin, predecessors) = merge_genesis_from_terminals(
+        let DerivedGenesis {
+            block: genesis,
+            origin,
+            predecessors,
+        } = merge_genesis_from_terminals(
             parent,
             (&left_terminal, &left_qc),
             (&right_terminal, &right_qc),
@@ -234,7 +243,7 @@ mod tests {
     ) -> Vec<Anchor> {
         let left_qc = certifying_qc(left_terminal, 2_400);
         let right_qc = certifying_qc(right_terminal, 2_600);
-        let (_, _, predecessors) = merge_genesis_from_terminals(
+        let DerivedGenesis { predecessors, .. } = merge_genesis_from_terminals(
             parent,
             (left_terminal, &left_qc),
             (right_terminal, &right_qc),
@@ -266,7 +275,7 @@ mod tests {
                 cut_wt,
             )
             .expect("derives")
-            .0
+            .block
             .hash()
         };
 

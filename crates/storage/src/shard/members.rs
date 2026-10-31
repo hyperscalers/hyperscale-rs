@@ -815,7 +815,7 @@ pub struct MemberInputs {
 #[derive(Debug, Clone, Copy)]
 pub struct MemberSections<'a> {
     /// Its finalizations, each settling or stating members.
-    pub certificates: &'a [Arc<Verifiable<Finalization>>],
+    pub certificates: &'a [Verifiable<Finalization>],
     /// Its abandonment records, whose names cover the rows standing for
     /// them.
     pub records: &'a [AbandonmentRecord],
@@ -836,7 +836,7 @@ impl MemberInputs {
                 header.shard_id(),
                 header.height(),
                 header.parent_qc().weighted_timestamp(),
-                block.transactions().iter().map(|tx| tx.as_unverified()),
+                block.transactions().iter().map(Verifiable::as_unverified),
                 MemberSections {
                     certificates: block.certificates(),
                     records: block.abandonment_records(),
@@ -1977,7 +1977,7 @@ pub fn colliding_member_row(
 /// builds from; a dropped transaction stays pooled.
 pub fn without_colliding_member_rows<const N: usize>(
     shard: ShardId,
-    transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, N>,
+    transactions: &mut Capped<Vec<Verified<Transaction>>, N>,
     state: &(impl Substates + ?Sized),
 ) {
     let mut named = BTreeSet::new();

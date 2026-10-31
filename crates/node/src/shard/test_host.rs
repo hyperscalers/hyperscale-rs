@@ -2,9 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::{Receiver, unbounded};
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::SyncDispatch;
@@ -18,14 +19,17 @@ use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, test_pool};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
-    GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
-    NetworkDefinition, Randomness, ShardAnchor, ShardId, Signer, Stake, TopologySnapshot,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verified, genesis_config_hash, shard_prefix_path,
+    AggregateError, AggregateSignature, BeaconChainConfig, BeaconGenesisConfig, BeaconState,
+    BlockHeight, CertifiedBeaconBlock, ConsensusPublicKey, ConsensusSignature, GenesisConfigHash,
+    GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, Randomness,
+    ShardAnchor, ShardId, Signer, Stake, TopologySnapshot, ValidatorId, ValidatorInfo,
+    ValidatorSet, Verified, VerifiedSignature, Verifier, VrfProof, genesis_config_hash,
+    shard_prefix_path,
 };
 
-use crate::shard::{HostEvent, ShardLoop};
-use crate::{HostedChain, NodeConfig, NodeHost, ReplicaConfig};
+use crate::event::{HostEvent, ShardInbox};
+use crate::shard::ShardLoop;
+use crate::{HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 
 pub const SHARD: ShardId = ShardId::leaf(1, 0);
 
@@ -36,7 +40,7 @@ pub type Loop = ShardLoop<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 /// committee.
 pub struct Fixture {
     pub committee: TestCommittee,
-    genesis_block: Arc<Verified<CertifiedBeaconBlock>>,
+    genesis_block: Verified<CertifiedBeaconBlock>,
     genesis_state: BeaconState,
     config_hash: GenesisConfigHash,
     validator_set: ValidatorSet,
@@ -68,7 +72,7 @@ impl Fixture {
         };
         let genesis_state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &network, &[]);
-        let genesis_block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        let genesis_block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
         let validator_set = ValidatorSet::new(
             (0..4)
                 .map(|i| ValidatorInfo {
@@ -144,14 +148,18 @@ impl Fixture {
     }
 
     /// The genesis beacon block every host here starts from.
-    pub fn genesis_block(&self) -> Arc<Verified<CertifiedBeaconBlock>> {
-        Arc::clone(&self.genesis_block)
+    pub fn genesis_block(&self) -> Verified<CertifiedBeaconBlock> {
+        self.genesis_block.clone()
     }
 
     /// How every host here builds its replicas and its fold.
     pub fn replica_config(&self) -> ReplicaConfig {
+        self.replica_config_verifying(Arc::new(BlsVerifier))
+    }
+
+    fn replica_config_verifying(&self, verifier: Arc<dyn Verifier>) -> ReplicaConfig {
         ReplicaConfig {
-            verifier: Arc::new(BlsVerifier),
+            verifier,
             derivation: Arc::new(StubVmStatics),
             code: Arc::new(AllCodeRuns),
             beacon_network: NetworkDefinition::simulator(),
@@ -239,7 +247,7 @@ impl Fixture {
     /// storage holding `history`'s blocks and states.
     pub fn host_over_history(
         &self,
-        history: Vec<(Arc<Verified<CertifiedBeaconBlock>>, BeaconState)>,
+        history: Vec<(Verified<CertifiedBeaconBlock>, BeaconState)>,
         now: LocalTimestamp,
     ) -> (Host, Receiver<HostEvent>) {
         let (event_tx, events) = unbounded();
@@ -249,16 +257,17 @@ impl Fixture {
         }
         let registry = Arc::new(HandlerRegistry::new(BTreeSet::new()));
         let host = NodeHost::new(
-            self.replica_config(),
+            &self.replica_config(),
+            HostResources {
+                beacon_storage,
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network: SimNetworkAdapter::new(registry),
+                dispatch: SyncDispatch::new(),
+                beacon_event_sender: event_tx,
+                topology_snapshot: Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
+            },
             Vec::new(),
             Vec::new(),
-            beacon_storage,
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            SimNetworkAdapter::new(registry),
-            SyncDispatch::new(),
-            BTreeMap::new(),
-            event_tx,
-            Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             NodeConfig::default(),
             now,
         );
@@ -270,7 +279,7 @@ impl Fixture {
     /// from what the store recovers with `committee[0]` attached, at `now`.
     pub fn host_resumed(
         &self,
-        history: Vec<(Arc<Verified<CertifiedBeaconBlock>>, BeaconState)>,
+        history: Vec<(Verified<CertifiedBeaconBlock>, BeaconState)>,
         storage: SimShardStorage,
         now: LocalTimestamp,
     ) -> (Host, Receiver<HostEvent>) {
@@ -282,21 +291,23 @@ impl Fixture {
         let recovered = storage.load_recovered_state(SHARD);
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
         let host = NodeHost::new(
-            self.replica_config(),
+            &self.replica_config(),
+            HostResources {
+                beacon_storage,
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network: SimNetworkAdapter::new(registry),
+                dispatch: SyncDispatch::new(),
+                beacon_event_sender: event_tx.clone(),
+                topology_snapshot: Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
+            },
             vec![HostedChain {
                 shard: SHARD,
                 storage,
                 recovered: &recovered,
                 signers: vec![self.identity(0)],
+                inbox: event_tx.into(),
             }],
             Vec::new(),
-            beacon_storage,
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            SimNetworkAdapter::new(registry),
-            SyncDispatch::new(),
-            std::iter::once((SHARD, event_tx.clone())).collect(),
-            event_tx,
-            Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             NodeConfig::default(),
             now,
         );
@@ -346,32 +357,156 @@ impl Fixture {
         state: BeaconState,
     ) -> (Host, Receiver<HostEvent>) {
         let (event_tx, events) = unbounded();
+        let host = self.host_on_inbox(
+            (storage, committed, topology),
+            network,
+            dispatch,
+            state,
+            (event_tx.clone(), event_tx.into()),
+            Arc::new(BlsVerifier),
+        );
+        (host, events)
+    }
+
+    /// A host running `SHARD` with `committee[0]` attached at genesis,
+    /// its handlers registered on `registry`, whose shard takes its inputs
+    /// on `inbox` and whose beacon loop's events go to `beacon`.
+    pub fn host_with_inbox(
+        &self,
+        registry: Arc<HandlerRegistry>,
+        beacon: Sender<HostEvent>,
+        inbox: ShardInbox,
+    ) -> Host {
+        self.host_with_inbox_verifying(registry, beacon, inbox, Arc::new(BlsVerifier))
+    }
+
+    /// [`Self::host_with_inbox`], its signatures checked by `verifier`.
+    pub fn host_with_inbox_verifying(
+        &self,
+        registry: Arc<HandlerRegistry>,
+        beacon: Sender<HostEvent>,
+        inbox: ShardInbox,
+        verifier: Arc<dyn Verifier>,
+    ) -> Host {
+        self.host_on_inbox(
+            (
+                SimShardStorage::new(shard_prefix_path(SHARD)),
+                BlockHeight::GENESIS,
+                Arc::clone(&self.topology_snapshot),
+            ),
+            SimNetworkAdapter::new(registry),
+            SyncDispatch::new(),
+            self.genesis_state.clone(),
+            (beacon, inbox),
+            verifier,
+        )
+    }
+
+    fn host_on_inbox(
+        &self,
+        (storage, committed, topology): (SimShardStorage, BlockHeight, Arc<TopologySnapshot>),
+        network: SimNetworkAdapter,
+        dispatch: SyncDispatch,
+        state: BeaconState,
+        (beacon, inbox): (Sender<HostEvent>, ShardInbox),
+        verifier: Arc<dyn Verifier>,
+    ) -> Host {
         let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
         beacon_storage.commit_beacon_block(&self.genesis_block, &Arc::new(state));
         let recovered = RecoveredState {
             committed_height: committed,
             ..RecoveredState::default()
         };
-        let host = NodeHost::new(
-            self.replica_config(),
+        NodeHost::new(
+            &self.replica_config_verifying(verifier),
+            HostResources {
+                beacon_storage,
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network,
+                dispatch,
+                beacon_event_sender: beacon,
+                topology_snapshot: Arc::new(ArcSwap::from(topology)),
+            },
             vec![HostedChain {
                 shard: SHARD,
                 storage,
                 recovered: &recovered,
                 signers: vec![self.identity(0)],
+                inbox,
             }],
             Vec::new(),
-            beacon_storage,
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            network,
-            dispatch,
-            std::iter::once((SHARD, event_tx.clone())).collect(),
-            event_tx,
-            Arc::new(ArcSwap::from(topology)),
             NodeConfig::default(),
             LocalTimestamp::ZERO,
-        );
-        (host, events)
+        )
+    }
+}
+
+/// A [`BlsVerifier`] that counts the signature checks it runs.
+#[derive(Debug, Default)]
+pub struct CountingVerifier {
+    checks: AtomicUsize,
+}
+
+impl CountingVerifier {
+    pub fn checked(&self) -> usize {
+        self.checks.load(Ordering::SeqCst)
+    }
+
+    fn tick(&self) {
+        self.checks.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Verifier for CountingVerifier {
+    fn verify(&self, key: &ConsensusPublicKey, message: &[u8], sig: &ConsensusSignature) -> bool {
+        self.tick();
+        BlsVerifier.verify(key, message, sig)
+    }
+
+    fn aggregate(&self, sigs: &[ConsensusSignature]) -> Result<AggregateSignature, AggregateError> {
+        BlsVerifier.aggregate(sigs)
+    }
+
+    fn aggregate_verified(
+        &self,
+        sigs: &[VerifiedSignature],
+    ) -> Result<AggregateSignature, AggregateError> {
+        BlsVerifier.aggregate_verified(sigs)
+    }
+
+    fn verify_aggregate_same_message(
+        &self,
+        message: &[u8],
+        agg: &AggregateSignature,
+        keys: &[ConsensusPublicKey],
+    ) -> bool {
+        self.tick();
+        BlsVerifier.verify_aggregate_same_message(message, agg, keys)
+    }
+
+    fn verify_aggregate_different_messages(
+        &self,
+        messages: &[&[u8]],
+        agg: &AggregateSignature,
+        keys: &[ConsensusPublicKey],
+    ) -> bool {
+        self.tick();
+        BlsVerifier.verify_aggregate_different_messages(messages, agg, keys)
+    }
+
+    fn verify_each(
+        &self,
+        messages: &[&[u8]],
+        sigs: &[ConsensusSignature],
+        keys: &[ConsensusPublicKey],
+    ) -> bool {
+        self.tick();
+        BlsVerifier.verify_each(messages, sigs, keys)
+    }
+
+    fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
+        self.tick();
+        BlsVerifier.verify_vrf(key, message, proof)
     }
 }
 

@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
+use hyperscale_core::{Action, CrossShardExecutionRequest, ExecutionAction, TickBatchOutcome};
 use hyperscale_engine::tick_select::terms_of;
 use hyperscale_engine::{AllCodeRuns, ExecutedTx, PROTOCOL_RESOURCE};
 use hyperscale_execution::action_handlers::{
@@ -496,11 +496,8 @@ impl ExecutionSim {
             self.height,
             self.height.inner() * BLOCK_INTERVAL_MS,
             ValidatorId::new(0),
-            txs.into_iter().map(Arc::new).collect(),
-            certificates
-                .into_iter()
-                .map(|fw| Arc::new(Verifiable::from(fw)))
-                .collect(),
+            txs,
+            certificates.into_iter().map(Verifiable::from).collect(),
         );
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
         let committee_anchor = self.committee_anchor();
@@ -580,7 +577,7 @@ impl ExecutionSim {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
+                provisions: Arc::new(Capped::from_array([Verifiable::from(bundle)])),
                 abandonment_records,
                 state_claims,
                 tick_manifest: Arc::new(Capped::empty()),
@@ -637,13 +634,13 @@ impl ExecutionSim {
     fn absorb(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::ExecuteTransactions {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
                     tick,
                     fates,
                     requests,
                     included,
                     ..
-                } => {
+                }) => {
                     let release_at = match self.schedule {
                         Schedule::Eager => self.height,
                         Schedule::Lagged(n) => BlockHeight::new(
@@ -872,7 +869,7 @@ impl ExecutionSim {
         let verified = Verified::new_unchecked_for_test(finalization);
         self.coord
             .finalization_store()
-            .insert(tick_id, Arc::new(Verifiable::from(verified)));
+            .insert(tick_id, Verifiable::from(verified));
     }
 
     /// The ticks a proposal would carry certificates for, in the order it
@@ -918,13 +915,13 @@ impl ExecutionSim {
     pub fn certify_votable(&mut self) -> Vec<Finalization> {
         let mut certified = Vec::new();
         for action in self.coord.emit_vote_actions(&self.topology) {
-            let Action::SignAndSendExecutionVote {
+            let Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                 vote_anchor_ts,
                 tick_id,
                 global_receipt_root,
                 tx_outcomes,
                 ..
-            } = action
+            }) = action
             else {
                 continue;
             };
@@ -1018,7 +1015,7 @@ impl ExecutionSim {
                     self.local_shard,
                     header.height(),
                     header.parent_qc().weighted_timestamp(),
-                    block.transactions().iter().map(|tx| tx.as_unverified()),
+                    block.transactions().iter().map(Verifiable::as_unverified),
                     MemberSections {
                         certificates: block.certificates(),
                         records: block.abandonment_records(),
@@ -1145,7 +1142,7 @@ fn stub_execute(
     trie: &ShardTrie,
     local_shard: ShardId,
     tx_hash: TxHash,
-    tx: &Arc<Verified<Transaction>>,
+    tx: &Verified<Transaction>,
     abortable: bool,
     spend: Option<(SubstateKey, u128)>,
 ) -> ExecutedTx {
@@ -1277,7 +1274,7 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> Finalization {
     Finalization::new(
         *tick_id,
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::new(receipts.to_vec()).expect("a list written out in a test"),
     )
 }

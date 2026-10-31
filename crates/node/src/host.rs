@@ -3,25 +3,24 @@
 //! `NodeHost` bundles `Arc<ProcessIo>` (process-scoped resources) plus
 //! one [`ShardLoop`] per hosted shard. It owns the event-routing seam:
 //! [`NodeHost::step`] dispatches `HostEvent::Shard` to the targeted
-//! `ShardLoop::step` and `HostEvent::Process` to cross-shard handlers
-//! (transaction submission fan-out, fetch tick) that need access to
-//! every hosted shard.
+//! `ShardLoop::step` and `HostEvent::Beacon` to the host's beacon loop.
 //!
 //! Two runners drive a `NodeHost`, each built via [`NodeHost::new`].
 //! Production decomposes it with [`NodeHost::into_parts`] and runs each
 //! [`ShardLoop`] (and the host's beacon loop) on its own pinned thread via
 //! [`ShardLoop::run_step`]; simulation keeps the whole host and drives it
-//! single-threaded over a global event queue through [`NodeHost::step`],
-//! which fans a `HostEvent::Process` out across every hosted shard.
-//! Both paths share `ShardLoop::step` for dispatch and the same
+//! single-threaded over a global event queue through [`NodeHost::step`].
+//! Both route a client submission through
+//! [`ProcessIo::submit_transaction`] into the loops' channels. Both paths share `ShardLoop::step` for dispatch and the same
 //! `clear_scratch` / `take_output` scratch lifecycle, so the two drivers
 //! cannot drift.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
+use hyperscale_beacon::BeaconFold;
 use hyperscale_beacon::coordinator::LocalChainAnchors;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{CodeAvailability, Executor};
@@ -32,16 +31,15 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, Derivation, Epoch, LocalTimestamp, ShardId, Signer,
-    TransactionStatus, TxHash, ValidatorId, Verified,
+    Transaction, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 
 use crate::NodeStateMachine;
-use crate::beacon::{BeaconCandidateCache, BeaconProposalCache};
-use crate::beacon_loop::{BeaconLoop, resume_fold};
+use crate::beacon::{BeaconCandidateCache, BeaconLoop, BeaconProposalCache, resume_fold};
 use crate::config::NodeConfig;
-use crate::event::Registration;
+use crate::event::{HostEvent, Registration, ShardInbox, StepOutput};
 use crate::process::{ProcessIo, register_shard_request_handlers};
-use crate::replica::{ReplicaConfig, build_replica};
+use crate::replica::ReplicaConfig;
 use crate::shard::boundary_pins::BoundaryPins;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
@@ -51,15 +49,15 @@ use crate::shard::crossing_index::ChainCrossings;
 use crate::shard::mempool::MempoolState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::{
-    DispatchHandles, FetchTicker, HostEvent, HostedRecords, ProcessScopedInput,
-    ShardDispatchHandles, ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
+    DispatchHandles, FetchTicker, HostedRecords, ShardDispatchHandles, ShardIo, ShardLoop,
+    SharedTopologySnapshot,
 };
 
 /// Output of [`NodeHost::into_parts`].
 ///
 /// The shared process-scoped resources, the per-shard drivers keyed by
 /// hosted shard id, and the host's beacon loop.
-pub(crate) type NodeHostParts<S, N, D> = (
+pub type NodeHostParts<S, N, D> = (
     Arc<ProcessIo<S, N, D>>,
     BTreeMap<ShardId, ShardLoop<S, N, D>>,
     BeaconLoop<S, N, D>,
@@ -68,9 +66,8 @@ pub(crate) type NodeHostParts<S, N, D> = (
 /// The deterministic product of one shard's genesis ceremony, returned by
 /// [`NodeHost::build_shard_genesis`].
 ///
-/// The caller commits `certified` itself: production steps `BlockCommitted`
-/// inline, while simulation schedules it only after wiring the network, so
-/// the shared ceremony stops short of the commit.
+/// The caller commits `certified` itself, which lets the simulation
+/// schedule the commit only after wiring the network.
 pub struct ShardGenesis {
     /// The genesis block built and persisted into the shard's replica.
     pub block: Block,
@@ -120,6 +117,23 @@ where
     config: NodeConfig,
 }
 
+/// The process-scoped resources a [`NodeHost`] is built over.
+pub struct HostResources<N, D> {
+    /// The host's beacon chain store; it holds at least the genesis pair.
+    pub beacon_storage: Arc<dyn BeaconStorage>,
+    /// The engine every hosted replica executes through.
+    pub executor: Arc<Executor>,
+    /// The network the host sends through and registers its handlers on.
+    pub network: N,
+    /// The pool the host's actions are dispatched onto.
+    pub dispatch: D,
+    /// The beacon loop's channel: beacon gossip, what the replicas report,
+    /// and the outcomes of its own dispatched actions and fetches.
+    pub beacon_event_sender: Sender<HostEvent>,
+    /// The topology snapshot the host publishes for off-thread readers.
+    pub topology_snapshot: SharedTopologySnapshot,
+}
+
 /// One chain a host runs: the shard, its opened store and the state it
 /// recovered, and the validators its replica signs for.
 pub struct HostedChain<'a, S> {
@@ -132,6 +146,8 @@ pub struct HostedChain<'a, S> {
     pub recovered: &'a RecoveredState,
     /// `(validator, signer)` per validator attached to the replica.
     pub signers: Vec<(ValidatorId, Arc<dyn Signer>)>,
+    /// The lanes the chain's loop drains.
+    pub inbox: ShardInbox,
 }
 
 impl<S, N, D> NodeHost<S, N, D>
@@ -144,167 +160,70 @@ where
     /// startup and a beacon participant for each of `identities`.
     ///
     /// The beacon loop and its fold are built first, from beacon storage,
-    /// with `now` as their clock. Each startup chain then registers with
-    /// the fold, and its replica is built with no signer from the schedule
-    /// the registration hands back, so a chain anchored below the fold's
-    /// floor widens the schedule before its first event. Each of the
-    /// chain's signers then attaches as the loop's first step.
-    ///
-    /// `beacon_event_sender` is the beacon loop's channel: beacon gossip,
-    /// what the replicas report, and the outcomes of its own dispatched
-    /// actions and fetches.
+    /// with `now` as their clock, and the host-wide gossip and notification
+    /// handlers are registered. Each startup chain is then added as a
+    /// runtime one is ([`Self::add_shard`]): it registers with the fold, so
+    /// a chain anchored below the fold's floor widens the schedule before
+    /// its first event, and its loop is wired in with its signers attached.
     ///
     /// # Panics
     ///
-    /// Panics if `shard_event_senders` names a shard other than `chains`',
-    /// or if beacon storage holds no committed block.
-    // `config: NodeConfig` is taken by value: every caller hands over a fresh
-    // config and we destructure sub-configs via `.clone()`, so a `&NodeConfig`
-    // would just force the body to clone each subfield.
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)] // every process-scoped resource threads through one constructor
+    /// Panics if beacon storage holds no committed block, or if two of
+    /// `chains` are for one shard.
     pub fn new(
-        replica_config: ReplicaConfig,
+        replica_config: &ReplicaConfig,
+        resources: HostResources<N, D>,
         chains: Vec<HostedChain<'_, S>>,
         identities: Vec<(ValidatorId, Arc<dyn Signer>)>,
-        beacon_storage: Arc<dyn BeaconStorage>,
-        executor: Arc<Executor>,
-        network: N,
-        dispatch: D,
-        shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>>,
-        beacon_event_sender: Sender<HostEvent>,
-        topology_snapshot: SharedTopologySnapshot,
         config: NodeConfig,
         now: LocalTimestamp,
     ) -> Self {
-        assert!(
-            shard_event_senders.keys().copied().eq(chains
-                .iter()
-                .map(|chain| chain.shard)
-                .collect::<BTreeSet<_>>()),
-            "shard_event_senders must have exactly one entry per startup chain"
-        );
         let fold = resume_fold(
-            beacon_storage.as_ref(),
+            resources.beacon_storage.as_ref(),
             Arc::clone(&replica_config.verifier),
             replica_config.beacon_network.clone(),
             replica_config.beacon_config_hash,
             now,
         );
-        let network = Arc::new(network);
-
-        reseed_code(&executor, &chains, beacon_storage.as_ref());
-
-        // The stores this host has open, shared with the engine so a
-        // record its caches dropped — or a restart never seated — is read
-        // back from disk rather than asked of a peer that would answer
-        // with what is already on this node's own disk. Filled once the
-        // startup chains' stores are wired below.
-        let per_shard = Arc::new(ArcSwap::from_pointee(HashMap::new()));
-        executor.install_store(Arc::new(HostedRecords::new(
-            Arc::clone(&per_shard),
-            Arc::clone(&beacon_storage),
-        )));
-        let dispatch_handles = Arc::new(DispatchHandles {
-            executor,
-            network: Arc::clone(&network),
-            beacon_proposal_cache: Arc::new(BeaconProposalCache::new(
-                replica_config.beacon_network.clone(),
-                Arc::clone(&beacon_storage) as Arc<dyn BeaconChainReader>,
-            )),
-            beacon_candidate_cache: Arc::new(BeaconCandidateCache::new()),
-            beacon_storage: Arc::clone(&beacon_storage),
-            per_shard: Arc::clone(&per_shard),
-        });
-        let process = Arc::new(ProcessIo::new(
-            network,
-            Arc::clone(&replica_config.verifier),
-            dispatch,
-            shard_event_senders.clone(),
-            beacon_event_sender,
-            topology_snapshot,
-            (
-                fold.state().current_epoch,
-                Arc::new(fold.schedule().clone()),
-            ),
-            dispatch_handles,
-            beacon_storage,
-        ));
+        reseed_code(
+            &resources.executor,
+            &chains,
+            resources.beacon_storage.as_ref(),
+        );
+        let process = build_process(replica_config, resources, &fold);
 
         let mut beacon = BeaconLoop::new(Arc::clone(&process), fold, &config);
         for (validator, signer) in identities {
             beacon.add_participant(validator, signer);
         }
 
-        let mut per_shard_dispatch: HashMap<ShardId, ShardDispatchHandles<S>> = HashMap::new();
-        let mut shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = BTreeMap::new();
-        let mut built = Vec::new();
-        for chain in chains {
-            let sender = shard_event_senders[&chain.shard].clone();
-            let registration = beacon.register(
-                chain.shard,
-                chain_anchors(chain.recovered),
-                chain.recovered.committed_height,
-                sender.clone(),
-            );
-            let replica = build_replica(
-                &replica_config,
-                chain.shard,
-                chain.recovered,
-                (Arc::clone(&registration.schedule), registration.epoch),
-                chain.storage.jmt_height(),
-            );
-            let (io, handles) = build_shard_io(
-                chain.shard,
-                &replica,
-                chain.storage,
-                &process.topology_snapshot,
-                &config,
-                &registration,
-            );
-            per_shard_dispatch.insert(chain.shard, handles);
-            built.push((
-                chain.shard,
-                sender,
-                io,
-                replica,
-                chain.signers,
-                registration,
-            ));
-        }
-        // Attaching a startup signer dispatches what it owes at once, which
-        // reads its shard's dispatch handles.
-        per_shard.store(Arc::new(per_shard_dispatch));
-        for (shard, sender, io, replica, signers, registration) in built {
-            let shard_loop = assemble_loop(&process, sender, io, replica, signers, &registration);
-            shards.insert(shard, shard_loop);
-        }
-
-        Self {
-            shards,
+        let mut host = Self {
+            shards: BTreeMap::new(),
             beacon,
             process,
             now,
             config,
+        };
+        host.register_gossip_handlers();
+        host.register_notification_handlers();
+        for chain in chains {
+            host.add_shard(replica_config, chain);
         }
+        host
     }
 
-    /// Begin hosting `chain` at runtime: register it with the beacon loop,
+    /// Begin hosting `chain`: register it with the beacon loop,
     /// build its replica from the schedule the registration hands back,
     /// and wire its `ShardLoop` in with `chain`'s signers attached (see
     /// [`attach_shard`]).
     ///
-    /// Events for the shard may queue on the channel from the moment
-    /// the sender is installed; they're processed once the loop steps.
+    /// Events for the shard may queue on its inbox from the moment the
+    /// inbox is installed; they're processed once the loop steps.
     ///
     /// # Panics
     ///
     /// Panics if the host already serves `chain`'s shard.
-    pub fn add_shard(
-        &mut self,
-        config: &ReplicaConfig,
-        chain: HostedChain<'_, S>,
-        sender: Sender<HostEvent>,
-    ) {
+    pub fn add_shard(&mut self, config: &ReplicaConfig, chain: HostedChain<'_, S>) {
         let shard = chain.shard;
         assert!(
             !self.shards.contains_key(&shard),
@@ -314,17 +233,16 @@ where
             shard,
             chain_anchors(chain.recovered),
             chain.recovered.committed_height,
-            sender.clone(),
+            chain.inbox.internal().clone(),
         );
-        let mut shard_loop = attach_shard(
+        let shard_loop = attach_shard(
             &self.process,
             &self.config,
             config,
             &registration,
             chain,
-            sender,
+            self.now,
         );
-        shard_loop.set_time(self.now);
         self.shards.insert(shard, shard_loop);
     }
 
@@ -355,10 +273,13 @@ where
 
     /// Stop hosting `shard`: close every signer's gate, deregister its
     /// chain from the beacon loop, exclude it from the network's hosted
-    /// set, drop its request handlers, event sender, and dispatch handles,
-    /// and return its `ShardLoop` for the caller to drain or drop. Inbound
-    /// traffic for the shard is rejected from the moment the maps swap;
-    /// events already queued die with the channel receiver.
+    /// set, and drop its request handlers, event sender, and dispatch
+    /// handles. Inbound traffic for the shard is rejected from the moment
+    /// the maps swap; events already queued die with the channel receiver.
+    ///
+    /// Returns its `ShardLoop` for the caller to drop or take the store
+    /// from. Work the loop dispatches after this runs over the loop's own
+    /// stores, unsigned: its signers' gates are closed.
     ///
     /// Returns `None` if the shard isn't hosted.
     pub fn remove_shard(&mut self, shard: ShardId) -> Option<ShardLoop<S, N, D>> {
@@ -589,21 +510,20 @@ where
                     sl.step(input);
                 }
             }
-            HostEvent::Process(input) => self.step_process_input(input),
             HostEvent::Beacon(input) => self.beacon.dispatch_event(input),
         }
 
         self.drain_pending_output()
     }
 
-    /// Dispatch a process-scoped input. Companion to [`Self::step`];
-    /// one arm per [`ProcessScopedInput`] variant.
-    fn step_process_input(&mut self, input: ProcessScopedInput) {
-        match input {
-            ProcessScopedInput::SubmitTransaction { tx } => {
-                self.handle_submit_transaction(&tx);
-            }
-        }
+    /// Route a locally submitted transaction through
+    /// [`ProcessIo::submit_transaction`], the one submission path every
+    /// runner takes. The routed inputs land on the hosted shards' and the
+    /// beacon loop's channels, which the runner drains as it does any
+    /// other event.
+    #[must_use]
+    pub fn submit_transaction(&self, tx: &Transaction) -> bool {
+        self.process.submit_transaction(tx)
     }
 
     /// Drain accumulated step outputs (statuses, timer ops, action
@@ -654,6 +574,62 @@ where
     }
 }
 
+/// The process-scoped half of a host built over `resources`, publishing
+/// the schedule `fold` resumed.
+fn build_process<S, N, D>(
+    replica_config: &ReplicaConfig,
+    resources: HostResources<N, D>,
+    fold: &BeaconFold,
+) -> Arc<ProcessIo<S, N, D>>
+where
+    S: ShardStorage,
+    N: Network,
+    D: Dispatch,
+{
+    let HostResources {
+        beacon_storage,
+        executor,
+        network,
+        dispatch,
+        beacon_event_sender,
+        topology_snapshot,
+    } = resources;
+    let network = Arc::new(network);
+    // The stores this host has open, shared with the engine so a record
+    // its caches dropped — or a restart never seated — is read back from
+    // disk rather than asked of a peer that would answer with what is
+    // already on this node's own disk. Filled as each chain is wired.
+    let per_shard = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+    executor.install_store(Arc::new(HostedRecords::new(
+        Arc::clone(&per_shard),
+        Arc::clone(&beacon_storage),
+    )));
+    let dispatch_handles = Arc::new(DispatchHandles {
+        executor,
+        network: Arc::clone(&network),
+        beacon_proposal_cache: Arc::new(BeaconProposalCache::new(
+            replica_config.beacon_network.clone(),
+            Arc::clone(&beacon_storage) as Arc<dyn BeaconChainReader>,
+        )),
+        beacon_candidate_cache: Arc::new(BeaconCandidateCache::new()),
+        beacon_storage: Arc::clone(&beacon_storage),
+        per_shard,
+    });
+    Arc::new(ProcessIo::new(
+        network,
+        Arc::clone(&replica_config.verifier),
+        dispatch,
+        beacon_event_sender,
+        topology_snapshot,
+        (
+            fold.state().current_epoch,
+            Arc::clone(fold.shared_schedule()),
+        ),
+        dispatch_handles,
+        beacon_storage,
+    ))
+}
+
 /// Reseed published code from each store's package index — the boot half
 /// of commit-time absorption, so a restarted host executes calls to
 /// packages published before the restart — and foreign code the node
@@ -682,8 +658,8 @@ pub fn chain_anchors(recovered: &RecoveredState) -> LocalChainAnchors {
     }
 }
 
-/// Assemble a shard's loop over its built `io` and `replica`, and attach
-/// each of `signers` as its first step.
+/// Assemble a shard's loop over its built `io` and `replica` with its clock
+/// at `now`, and attach each of `signers` as its first step.
 fn assemble_loop<S, N, D>(
     process: &Arc<ProcessIo<S, N, D>>,
     event_tx: Sender<HostEvent>,
@@ -691,6 +667,7 @@ fn assemble_loop<S, N, D>(
     replica: NodeStateMachine,
     signers: Vec<(ValidatorId, Arc<dyn Signer>)>,
     registration: &Registration,
+    now: LocalTimestamp,
 ) -> ShardLoop<S, N, D>
 where
     S: ShardStorage,
@@ -705,7 +682,7 @@ where
         io,
         replica,
         signers: BTreeMap::new(),
-        now: LocalTimestamp::ZERO,
+        now,
         fetch_tick: FetchTicker::default(),
         pending_timer_ops: Vec::new(),
         emitted_statuses: Vec::new(),
@@ -720,12 +697,13 @@ where
     shard_loop
 }
 
-/// Wire a runtime-joined chain into the process-scoped maps and build its
-/// `ShardLoop`.
+/// Wire a chain into the process-scoped maps and build its `ShardLoop`
+/// with its clock at `now`: the one path every chain a host runs takes,
+/// at startup or at runtime.
 ///
 /// The chain is already registered with the beacon loop, and its replica
 /// is built here from the schedule `registration` handed back. Installs
-/// the event sender, builds the `ShardIo` + dispatch handles, grows the
+/// the shard's inbox, builds the `ShardIo` + dispatch handles, grows the
 /// network hosted sets, registers the shard's request handlers, and
 /// attaches `chain`'s signers. Returns the loop for the caller to drive —
 /// `NodeHost::add_shard` keeps it in the host's map (the sim step path);
@@ -736,7 +714,7 @@ pub fn attach_shard<S, N, D>(
     replica_config: &ReplicaConfig,
     registration: &Registration,
     chain: HostedChain<'_, S>,
-    sender: Sender<HostEvent>,
+    now: LocalTimestamp,
 ) -> ShardLoop<S, N, D>
 where
     S: ShardStorage,
@@ -748,15 +726,17 @@ where
         storage,
         recovered,
         signers,
+        inbox,
     } = chain;
-    let replica = build_replica(
+    let replica = NodeStateMachine::new(
         replica_config,
         shard,
         recovered,
         (Arc::clone(&registration.schedule), registration.epoch),
         storage.jmt_height(),
     );
-    process.insert_shard_sender(shard, sender.clone());
+    let sender = inbox.internal().clone();
+    process.insert_shard_sender(shard, inbox);
     let (io, handles) = build_shard_io(
         shard,
         &replica,
@@ -768,7 +748,7 @@ where
     process.dispatch_handles.insert_shard(shard, handles);
     process.network.subscribe_shard(shard);
 
-    let shard_loop = assemble_loop(process, sender, io, replica, signers, registration);
+    let shard_loop = assemble_loop(process, sender, io, replica, signers, registration, now);
     register_shard_request_handlers(process, &shard_loop.io, shard);
     process.release_parked_submissions();
     shard_loop
@@ -792,8 +772,7 @@ where
 }
 
 /// Build one shard's `ShardIo` plus its dispatch-handle entry from the
-/// shard's replica and opened storage. Shared by host construction and
-/// runtime shard addition so both paths produce identically wired shards.
+/// shard's replica and opened storage.
 fn build_shard_io<S: ShardStorage>(
     shard: ShardId,
     replica: &NodeStateMachine,
@@ -870,8 +849,6 @@ fn build_shard_io<S: ShardStorage>(
     let handles = ShardDispatchHandles {
         storage: Arc::clone(&storage),
         pending_chain: Arc::clone(&pending_chain),
-        tick_chain: Arc::clone(&tick_chain),
-        prepared_commits: block_commit.prepared_commits_handle(),
     };
     let mut io = ShardIo {
         storage,

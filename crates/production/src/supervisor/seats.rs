@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crossbeam::channel::Sender;
-use hyperscale_node::reshape::orchestrator::ReshapeRequest;
-use hyperscale_node::shard::HostEvent;
-use hyperscale_node::startup::Replaced;
+use hyperscale_node::event::ShardInbox;
+use hyperscale_node::reshape::ReshapeRequest;
+use hyperscale_node::seating::Replaced;
 use hyperscale_storage::RecoveredState;
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{Block, ShardId, ValidatorId};
@@ -31,7 +31,7 @@ pub struct Registering {
     pub recovered: RecoveredState,
     pub genesis: Option<Block>,
     pub channels: ShardChannels,
-    pub sender: Sender<HostEvent>,
+    pub sender: ShardInbox,
 }
 
 /// A torn down shard's thread, joined by whichever comes first: its
@@ -407,23 +407,6 @@ impl SeatTable {
             && !self.awaiting_anchor.contains_key(&shard)
     }
 
-    /// The validators `shard`'s running loop carries, if a re-seat may
-    /// rebuild it: it runs here, and no rebuild or join is pending on it.
-    pub fn reseatable(&self, shard: ShardId) -> Option<Vec<ValidatorId>> {
-        if self.rebuilding.contains_key(&shard) || self.bootstrapping.contains_key(&shard) {
-            return None;
-        }
-        let thread = self.shards.get(&shard)?;
-        Some(
-            thread
-                .validator_ids
-                .iter()
-                .copied()
-                .map(ValidatorId::new)
-                .collect(),
-        )
-    }
-
     pub fn is_running(&self, shard: ShardId) -> bool {
         self.shards.contains_key(&shard)
     }
@@ -448,13 +431,6 @@ impl SeatTable {
     /// Every running shard, in shard order.
     pub fn running(&self) -> impl Iterator<Item = ShardId> + '_ {
         self.shards.keys().copied()
-    }
-
-    /// Every running loop, in shard order.
-    pub fn running_mut(&mut self) -> impl Iterator<Item = (ShardId, &mut ShardThread)> {
-        self.shards
-            .iter_mut()
-            .map(|(&shard, thread)| (shard, thread))
     }
 
     /// Take every running loop and every draining thread, for shutdown.
@@ -497,7 +473,7 @@ mod tests {
     use std::sync::Arc;
 
     use crossbeam::channel::unbounded;
-    use hyperscale_node::reshape::orchestrator::ReshapeRequest;
+    use hyperscale_node::reshape::{ReshapeRequest, Ticket};
     use hyperscale_storage::RecoveredState;
     use hyperscale_storage_rocksdb::RocksDbShardStorage;
     use hyperscale_types::test_utils::TestCommittee;
@@ -612,7 +588,13 @@ mod tests {
         assert_eq!(running.join(SHARD, &first, || false), JoinStep::OnRunning);
 
         let mut held = SeatTable::default();
-        held.hold_prep(SHARD, ReshapeRequest::OpenStore { shard: SHARD });
+        held.hold_prep(
+            SHARD,
+            ReshapeRequest::OpenStore {
+                shard: SHARD,
+                ticket: Ticket::new(0),
+            },
+        );
         assert_eq!(
             held.join(SHARD, &first, || false),
             JoinStep::Superseded,
@@ -637,7 +619,13 @@ mod tests {
 
         let mut table = SeatTable::default();
         assert!(table.vacant(SHARD));
-        table.hold_prep(SHARD, ReshapeRequest::OpenStore { shard: SHARD });
+        table.hold_prep(
+            SHARD,
+            ReshapeRequest::OpenStore {
+                shard: SHARD,
+                ticket: Ticket::new(0),
+            },
+        );
         assert!(table.vacant(SHARD));
 
         table.sync(SHARD, &vnodes);
@@ -673,11 +661,6 @@ mod tests {
             !table.holds_store_dir(SHARD),
             "a running loop holds no prep"
         );
-        assert_eq!(
-            table.reseatable(SHARD),
-            None,
-            "a rebuilding shard is not re-seated",
-        );
 
         let departing = table.tear_down(SHARD).expect("running");
         assert_eq!(departing.validator_ids, [0]);
@@ -685,7 +668,13 @@ mod tests {
         assert!(!table.is_running(SHARD));
         assert!(table.is_draining(SHARD));
         assert!(table.holds_store_dir(SHARD));
-        table.hold_prep(SHARD, ReshapeRequest::OpenStore { shard: SHARD });
+        table.hold_prep(
+            SHARD,
+            ReshapeRequest::OpenStore {
+                shard: SHARD,
+                ticket: Ticket::new(0),
+            },
+        );
         assert!(table.ready_preps().is_empty(), "the drain holds the prep");
         table.join(SHARD, &vnodes, || false);
 

@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
-/// can hold their own owner without deep-cloning the per-tx `Arc` array.
+/// can hold their own owner without copying the per-tx array.
 ///
 /// Elements are wrapped in [`Verifiable`] so a locally-built block (whose
 /// txs were admission-validated through `MempoolCoordinator`) preserves
@@ -30,7 +30,7 @@ use crate::{
 /// construction; wire-decoded blocks land at `Verifiable::Unverified`
 /// because HBOR decode is a transparent passthrough into that variant.
 /// Same rationale as [`SharedCertificates`].
-pub type SharedTransactions = Arc<Capped<Vec<Arc<Verifiable<Transaction>>>, MAX_TXS_PER_BLOCK>>;
+pub type SharedTransactions = Arc<Capped<Vec<Verifiable<Transaction>>, MAX_TXS_PER_BLOCK>>;
 
 /// Derive every transaction of a committed `block` through this node's
 /// `derivation`, so the routed facts its handlers read are there to
@@ -71,10 +71,10 @@ pub fn derive_block_transactions(block: &Block, derivation: &dyn Derivation) {
 /// [`BlockHeader::parent_qc`](crate::BlockHeader) which carries
 /// `Verifiable<QuorumCertificate>` for the same reason.
 pub type SharedCertificates =
-    Arc<Capped<Vec<Arc<Verifiable<Finalization>>>, MAX_FINALIZED_TX_PER_BLOCK>>;
+    Arc<Capped<Vec<Verifiable<Finalization>>, MAX_FINALIZED_TX_PER_BLOCK>>;
 
 /// Shared provision list — same rationale as [`SharedCertificates`].
-pub type SharedProvisions = Arc<Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>>;
+pub type SharedProvisions = Arc<Capped<Vec<Verifiable<Provisions>>, MAX_PROVISIONS_PER_BLOCK>>;
 
 /// What a shard charged across the ticks `certificates` settle, in
 /// quanta.
@@ -90,7 +90,7 @@ pub type SharedProvisions = Arc<Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PRO
 /// inflate transactions its committee admitted and priced, rather than a
 /// figure its own engine reported.
 #[must_use]
-pub fn fees_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) -> u128 {
+pub fn fees_over_certificates(certificates: &[Verifiable<Finalization>]) -> u128 {
     certificates.iter().fold(0u128, |sum, tick| {
         sum.saturating_add(tick.as_unverified().charged())
     })
@@ -211,25 +211,22 @@ pub struct TerminalRef {
     pub height: BlockHeight,
 }
 
-// Manual PartialEq - compare transaction/certificate content, not Arc pointers.
+// Manual PartialEq - compare transaction/certificate content.
 // Provisions are excluded from equality: the header's body root already
 // commits to them, and a Live and Sealed form of the same block should compare
 // equal for content purposes.
 impl PartialEq for Block {
     fn eq(&self, other: &Self) -> bool {
-        fn tx_lists_equal(
-            a: &[Arc<Verifiable<Transaction>>],
-            b: &[Arc<Verifiable<Transaction>>],
-        ) -> bool {
+        fn tx_lists_equal(a: &[Verifiable<Transaction>], b: &[Verifiable<Transaction>]) -> bool {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.hash() == y.hash())
         }
         fn cert_lists_equal(
-            a: &[Arc<Verifiable<Finalization>>],
-            b: &[Arc<Verifiable<Finalization>>],
+            a: &[Verifiable<Finalization>],
+            b: &[Verifiable<Finalization>],
         ) -> bool {
             // Compare by inner FW content; the `Verifiable` marker is
             // irrelevant to whether two blocks are content-equal.
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| ***x == ***y)
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| **x == **y)
         }
 
         self.header() == other.header()
@@ -542,7 +539,7 @@ impl Block {
     /// verification marker survives across the block boundary; consumers
     /// peek `.verified()` to skip re-verification when the marker is live.
     #[must_use]
-    pub fn provisions(&self) -> &[Arc<Verifiable<Provisions>>] {
+    pub fn provisions(&self) -> &[Verifiable<Provisions>] {
         match self {
             Self::Live { provisions, .. } => provisions,
             Self::Sealed { .. } => &[],

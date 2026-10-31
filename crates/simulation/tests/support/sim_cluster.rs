@@ -20,7 +20,6 @@ use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
     ChainMentions, ClaimsSection, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership,
     chain_mentions, claims_sections, declines_naming, reads_record, record_wait, records_naming,
@@ -882,11 +881,8 @@ impl SimCluster {
     /// delayed. A client routes to the committee the beacon names, and
     /// so does this.
     fn submit_at(&mut self, host: NodeIndex, tx: &Transaction) {
-        self.runner.schedule_initial_event(
-            host,
-            Duration::ZERO,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: underived(tx) }),
-        );
+        self.runner
+            .schedule_submission(host, Duration::ZERO, underived(tx));
     }
 
     /// The lowest-indexed host that is up: what the harness reads a
@@ -915,8 +911,8 @@ impl SimCluster {
 /// cache hit. A host derives what it admits, and on a miss fetches and
 /// keeps the records it lacks, which its own replay of the commit reads
 /// back after a restart.
-fn underived(tx: &Transaction) -> Arc<Transaction> {
-    Arc::new(Transaction::new(tx.body().clone()))
+fn underived(tx: &Transaction) -> Transaction {
+    Transaction::new(tx.body().clone())
 }
 
 /// A portable `0..host_count` host index as the sim's [`NodeIndex`].
@@ -941,22 +937,18 @@ impl Cluster for SimCluster {
         self.runner.staged_validators()
     }
 
-    fn submit(&mut self, tx: Arc<Transaction>) {
+    fn submit(&mut self, tx: Transaction) {
         let host = self.host_for_tx(&tx).unwrap_or(0);
         self.submit_at(host, &tx);
     }
 
-    fn submit_after(&mut self, delay: Duration, tx: Arc<Transaction>) -> bool {
+    fn submit_after(&mut self, delay: Duration, tx: Transaction) -> bool {
         let host = self.host_for_tx(&tx).unwrap_or(0);
-        self.runner.schedule_initial_event(
-            host,
-            delay,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: underived(&tx) }),
-        );
+        self.runner.schedule_submission(host, delay, underived(&tx));
         true
     }
 
-    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
+    fn submit_to(&mut self, shard: ShardId, tx: Transaction) {
         let host = self
             .live_committee_hosts(shard)
             .first()
@@ -1481,7 +1473,7 @@ impl FaultableCluster for SimCluster {
         (host < self.runner.num_hosts()).then_some(host as usize)
     }
 
-    fn submit_at_host(&mut self, host: usize, tx: Arc<Transaction>) {
+    fn submit_at_host(&mut self, host: usize, tx: Transaction) {
         self.submit_at(host_index(host), &tx);
     }
 

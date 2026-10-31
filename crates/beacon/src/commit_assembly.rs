@@ -132,9 +132,8 @@ impl CommitAssembler {
             .is_some_and(|p| p.awaiting.contains(&validator))
     }
 
-    /// A fetched proposal for `validator` has been resolved into the pool
-    /// (verified + admitted, or dropped on verify failure). Clears the
-    /// await; once `epoch`'s stash has no outstanding fetches, re-decodes
+    /// A fetched proposal for `validator` has been verified and admitted
+    /// to the pool. Clears the await; once `epoch`'s stash has no outstanding fetches, re-decodes
     /// against the now-extended pool and either yields
     /// [`AssemblyDecision::Assemble`] or drops the stash
     /// ([`AssemblyDecision::Idle`] — the node catches up via peer
@@ -231,7 +230,7 @@ impl CommitAssembler {
             };
             match pool.get(validator) {
                 Some(pooled) if pooled.pc_element_hash(epoch) == *element => {
-                    committed.push((validator, pooled.as_ref().clone()));
+                    committed.push((validator, pooled));
                 }
                 Some(_) => {
                     warn!(
@@ -255,8 +254,6 @@ impl CommitAssembler {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use hyperscale_types::{
         AggregateSignature, PcQc2, PcQc3, PcSignerLengths, PcXpProof, SignerBitfield, SpcView,
         VrfProof,
@@ -268,10 +265,8 @@ mod tests {
         (0..n).map(ValidatorId::new).collect()
     }
 
-    fn proposal(seed: u8) -> Arc<Verified<BeaconProposal>> {
-        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
-            VrfProof::new([seed; 96]),
-        )))
+    fn proposal(seed: u8) -> Verified<BeaconProposal> {
+        Verified::new_unchecked_for_test(BeaconProposal::vrf_only(VrfProof::new([seed; 96])))
     }
 
     fn element(seed: u8, epoch: Epoch) -> PcValueElement {

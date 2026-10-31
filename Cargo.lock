@@ -2317,6 +2317,7 @@ dependencies = [
  "hyperscale-metrics",
  "hyperscale-network",
  "hyperscale-network-iroh",
+ "hyperscale-node",
  "hyperscale-types",
  "iroh",
  "iroh-relay",

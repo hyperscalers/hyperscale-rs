@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_node::SharedTopologySnapshot;
-use hyperscale_node::bootstrap::history::HistoryOutcome;
 use hyperscale_node::bootstrap::{
-    BootstrapOutcome, BootstrapRequest, ShardBootstrap, StateRangeOutcome, StoreResponder,
+    BootstrapOutcome, BootstrapRequest, HistoryOutcome, ShardBootstrap, StateRangeOutcome,
+    StoreResponder,
 };
-use hyperscale_node::startup::record_fork_anchor;
+use hyperscale_node::seating::record_fork_anchor;
 use hyperscale_storage::{RecoveredState, ShardStorage, history_floor};
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::{BlockHeight, Request, ShardId};

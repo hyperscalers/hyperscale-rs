@@ -128,7 +128,7 @@ pub struct TickTxInput<'a> {
     /// What names the member, and what its receipt is keyed by.
     pub tx_hash: TxHash,
     /// The transaction to execute.
-    pub transaction: &'a Arc<Verified<Transaction>>,
+    pub transaction: &'a Verified<Transaction>,
     /// Verified provision entry lists, one per source shard contribution.
     /// Empty for a single-shard member.
     pub provisions: &'a [Arc<Vec<SubstateEntry>>],

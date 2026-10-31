@@ -159,7 +159,7 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
     };
     let block = Block::Live {
         header,
-        transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx))])),
+        transactions: Arc::new(Capped::from_array([(Verifiable::from(tx))])),
         certificates,
         provisions,
         abandonment_records,
@@ -347,7 +347,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             shard_id: parent,
             ..header.into_parts()
         }),
-        transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx.clone()))])),
+        transactions: Arc::new(Capped::from_array([(Verifiable::from(tx.clone()))])),
         certificates,
         provisions,
         abandonment_records,
@@ -463,7 +463,7 @@ fn on_chain(
             Capped::new(
                 transactions
                     .iter()
-                    .map(|tx| Arc::new(Verifiable::from(tx.clone())))
+                    .map(|tx| Verifiable::from(tx.clone()))
                     .collect(),
             )
             .expect("a list written out in a test"),
@@ -632,7 +632,7 @@ fn a_split_child_recomposes_the_parents_fee_holds() {
         };
         let block = Block::Live {
             header,
-            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx.clone()))])),
+            transactions: Arc::new(Capped::from_array([(Verifiable::from(tx.clone()))])),
             certificates,
             provisions,
             abandonment_records,
@@ -808,7 +808,7 @@ fn a_till_a_pending_member_took_is_not_taken_again_below_its_verdict() {
     let provisions = world.provisioned(&store);
     let base = Arc::new(store);
     let chain = TickChain::new(Arc::clone(&base));
-    let mut naming = Naming::over(&world, [&**first, &**second]);
+    let mut naming = Naming::over(&world, [&*first, &*second]);
     let mut settling = StateWrites::default();
 
     assert_eq!(naming.name(1, &first), vec![first.hash()]);
@@ -1095,10 +1095,10 @@ impl Window {
         let tree = root
             .build_presenting(vec![self.meta.clone()], Vec::new())
             .expect("the intent declares no hole");
-        let seal = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
+        let seal = Verified::<Transaction>::from_persisted(Transaction::new(
             self.client
                 .sign_tree(&tree, &[&Self::key(founder)], Self::terms()),
-        )));
+        ));
         seal.try_derived(self.executor.derivation().as_ref())
             .expect("the seal derives");
         let single = ShardTrie::single();
@@ -1134,7 +1134,7 @@ impl Window {
 
     /// `redeemer` handing `amount` of the protocol resource to the window
     /// and banking what it pays out, the sponsor paying the fee.
-    fn redeem(&self, redeemer: u8, amount: u128) -> Arc<Verified<Transaction>> {
+    fn redeem(&self, redeemer: u8, amount: u128) -> Verified<Transaction> {
         let chain = self.client.records();
         let composed = Composed::new(&chain, std::slice::from_ref(&self.meta), &ProtocolHasher);
         let from = Self::account(redeemer);
@@ -1150,9 +1150,10 @@ impl Window {
         let sponsor = Self::key(self.sponsor);
         tree.root.attested_by =
             Capped::new(vec![principal_of(&sponsor), from]).expect("two attesters");
-        let tx = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
-            self.client
-                .sign_tree(&tree, &[&sponsor, &Self::key(redeemer)], Self::terms()),
+        let tx = Verified::<Transaction>::from_persisted(Transaction::new(self.client.sign_tree(
+            &tree,
+            &[&sponsor, &Self::key(redeemer)],
+            Self::terms(),
         )));
         tx.try_derived(self.executor.derivation().as_ref())
             .expect("a sponsored redemption derives");
@@ -1208,7 +1209,7 @@ impl Window {
         chain: &TickChain<MapDb>,
         provisions: &[Arc<Vec<SubstateEntry>>],
         below: u64,
-        tx: &Arc<Verified<Transaction>>,
+        tx: &Verified<Transaction>,
     ) -> (ExecutedTx, StateWrites) {
         chain.prune_persisted(BlockHeight::new(below), BlockHeight::GENESIS);
         let view = chain.view_at(BlockHeight::new(below));

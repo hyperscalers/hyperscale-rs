@@ -33,5 +33,5 @@ pub mod state;
 pub mod verification;
 pub mod vote_equivocation_observations;
 
-pub use fold::{Adopted, BeaconFold, ChainRegistration, HostedChain};
-pub use participant::{BeaconParticipant, ParticipantStep};
+pub use fold::{Adopted, BeaconFold, CandidateKeys, ChainRegistration, HostedChain};
+pub use participant::{BeaconParticipant, ParticipantStep, ProposalAdmission};

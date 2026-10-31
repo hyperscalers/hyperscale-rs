@@ -39,7 +39,7 @@ impl ShardChainWriter for RocksDbShardStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
-        finalizations: &[Arc<Verifiable<Finalization>>],
+        finalizations: &[Verifiable<Finalization>],
         chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {

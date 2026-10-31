@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use hyperscale_core::Action;
+use hyperscale_core::{Action, ConsensusAction};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, BlockVote, ConsensusPublicKey, ConsensusSignature, Round,
     ShardId, ShardVoteEquivocation, TopologySnapshot, ValidatorId, Verified,
@@ -418,18 +418,20 @@ impl VoteKeeper {
             "Triggering batch vote verification (quorum possible)"
         );
 
-        vec![Action::VerifyAndBuildQuorumCertificate {
-            block_hash,
-            shard_id: local_shard,
-            height,
-            round,
-            parent_block_hash,
-            parent_weighted_timestamp,
-            votes_to_verify,
-            verified_votes,
-            total_votes: total_power,
-            binding: vote_set.binding(),
-        }]
+        vec![Action::Consensus(
+            ConsensusAction::VerifyAndBuildQuorumCertificate {
+                block_hash,
+                shard_id: local_shard,
+                height,
+                round,
+                parent_block_hash,
+                parent_weighted_timestamp,
+                votes_to_verify,
+                verified_votes,
+                total_votes: total_power,
+                binding: vote_set.binding(),
+            },
+        )]
     }
 
     /// Whether the QC a batch taken under `binding` formed for
@@ -968,12 +970,12 @@ mod tests {
             ));
         }
         let [
-            Action::VerifyAndBuildQuorumCertificate {
+            Action::Consensus(ConsensusAction::VerifyAndBuildQuorumCertificate {
                 votes_to_verify,
                 verified_votes,
                 total_votes,
                 ..
-            },
+            }),
         ] = batches.as_slice()
         else {
             panic!("one batch at the fresh quorum, got {batches:?}");

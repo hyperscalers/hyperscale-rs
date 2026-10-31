@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
+use hyperscale_core::{
+    ActionContext, ConsensusAction, HeaderCommittee, PreparedBlock, ProtocolEvent, StateRootCheck,
+};
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{
     CommittedSets, ManifestInputs, ManifestKind, contentions, end_lines, licensed_lines,
@@ -87,7 +89,7 @@ pub struct QcVerificationResult {
 /// Returns an empty `verified_votes` vec on success and the full verified
 /// set on failure so the caller can accumulate across rounds.
 ///
-/// Called from the dispatch layer via `Action::VerifyAndBuildQuorumCertificate`;
+/// Called from the dispatch layer via `ConsensusAction::VerifyAndBuildQuorumCertificate`;
 /// the split helpers exist for focused unit testing of each phase.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
@@ -247,12 +249,12 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     is_fallback: bool,
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
-    transactions: &Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
-    certificates: Capped<Vec<Arc<Verifiable<Finalization>>>, MAX_FINALIZED_TX_PER_BLOCK>,
+    transactions: &Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK>,
+    certificates: Capped<Vec<Verifiable<Finalization>>, MAX_FINALIZED_TX_PER_BLOCK>,
     local_shard: ShardId,
     chain_origin: WeightedTimestamp,
     topology_snapshot: &TopologySnapshot,
-    provisions: Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>,
+    provisions: Capped<Vec<Verifiable<Provisions>>, MAX_PROVISIONS_PER_BLOCK>,
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
     state_claims: Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK>,
     parent_settled_frontier: BlockHeight,
@@ -419,7 +421,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // block's own transactions, so every reader of the root — the
     // proposer's voters, a replica committing on the certificate alone,
     // a split child following the block — derives the same set.
-    let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &***tx));
+    let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &**tx));
     // The drain is the member rows standing after the block: the rows
     // the lines were named over, folded once more with the block as
     // carried, which leaves what the commit's own fold leaves. Read
@@ -454,7 +456,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // Lift each `Verified<Transaction>` into `Verifiable` so block
     // construction and per-root compute calls see the form that
     // `Block.transactions` carries.
-    let transactions = transactions.map(|tx| Arc::new(Verifiable::from((**tx).clone())));
+    let transactions = transactions.map(|tx| Verifiable::from(tx.clone()));
 
     let receipts: Vec<StoredReceipt> = certificates
         .iter()
@@ -534,7 +536,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     let load = parent_load.unwrap_or(ShardLoad::ZERO).advance(
         fees_over_certificates(&certificates),
         local_work_over(
-            transactions.iter().map(|tx| &***tx),
+            transactions.iter().map(|tx| &**tx),
             topology_snapshot.shard_trie(),
             local_shard,
         ),
@@ -622,7 +624,7 @@ pub(crate) struct Naming<'a> {
     /// The committee the block is classified under.
     pub(crate) committee: &'a TopologySnapshot,
     /// The finalizations the block carries.
-    pub(crate) certificates: &'a [Arc<Verifiable<Finalization>>],
+    pub(crate) certificates: &'a [Verifiable<Finalization>],
     /// The boundary records the block carries.
     pub(crate) records: &'a [AbandonmentRecord],
     /// The state claims the block carries.
@@ -658,12 +660,12 @@ impl Naming<'_> {
     ///
     /// If a transaction is not routed, or declares more accesses than a
     /// member holds: selection offers neither.
-    pub(crate) fn over(&self, transactions: &[Arc<Verified<Transaction>>]) -> Named {
+    pub(crate) fn over(&self, transactions: &[Verified<Transaction>]) -> Named {
         let pending = MemberInputs::deriving(
             self.shard,
             self.height,
             self.anchor,
-            transactions.iter().map(|tx| &***tx),
+            transactions.iter().map(|tx| &**tx),
             MemberSections {
                 certificates: self.certificates,
                 records: self.records,
@@ -673,7 +675,7 @@ impl Naming<'_> {
             derived_terms(
                 self.committee,
                 self.shard,
-                transactions.iter().map(|tx| &***tx),
+                transactions.iter().map(|tx| &**tx),
             ),
         );
         let mut rows = self.parent.clone();
@@ -737,7 +739,7 @@ impl Naming<'_> {
     /// no heavier than the drop left. A dropped transaction stays pooled.
     pub(crate) fn within_terms_budget(
         &self,
-        transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+        transactions: &mut Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK>,
     ) -> Named {
         let named = self.over(transactions);
         let dropped = named.past_terms_budget(transactions, self.committee);
@@ -756,7 +758,7 @@ impl Named {
     /// that reach no further than this shard.
     fn past_terms_budget(
         &self,
-        transactions: &[Arc<Verified<Transaction>>],
+        transactions: &[Verified<Transaction>],
         committee: &TopologySnapshot,
     ) -> BTreeSet<TxHash> {
         let named: BTreeMap<TxHash, bool> = self
@@ -867,7 +869,7 @@ fn commit_windows_for(
     resolved
 }
 
-fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>], derivation: &dyn Derivation) {
+fn absorb_finalized_cells(ticks: &[Verifiable<Finalization>], derivation: &dyn Derivation) {
     let receipts: Vec<Arc<ConsensusReceipt>> = ticks
         .iter()
         .flat_map(|fw| fw.settling_receipts())
@@ -935,20 +937,18 @@ where
     })
 }
 
-/// Handle the shard-owned delegated [`Action`] variants.
+/// Run shard consensus work.
 ///
 /// Outcomes flow through `ctx.notify` (state-machine inputs) and
-/// `ctx.commit_prepared` (prepared blocks for the `io_loop`'s chain). Variants
-/// owned by other coordinator crates hit `unreachable!()` — the caller
-/// (node's dispatcher) routes by variant prefix.
-#[allow(clippy::too_many_lines)] // single dispatch over shard-owned Action variants
-pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
+/// `ctx.commit_prepared` (prepared blocks for the `io_loop`'s chain).
+#[allow(clippy::too_many_lines)] // single dispatch over ConsensusAction variants
+pub fn handle_action<S, N>(action: ConsensusAction, ctx: &ActionContext<'_, S, N>)
 where
     S: ShardStorage,
     N: Network,
 {
     match action {
-        Action::VerifyAndBuildQuorumCertificate {
+        ConsensusAction::VerifyAndBuildQuorumCertificate {
             block_hash,
             shard_id,
             height,
@@ -983,7 +983,7 @@ where
             });
         }
 
-        Action::VerifyQcSignature {
+        ConsensusAction::VerifyQcSignature {
             qc,
             public_keys,
             quorum_threshold,
@@ -1011,11 +1011,12 @@ where
             ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { subject, result });
         }
 
-        Action::VerifyRemoteHeaderQc {
+        ConsensusAction::VerifyRemoteHeaderQc {
             certified_header,
-            sender,
+            source,
             committee_public_keys,
             quorum_threshold,
+            committee,
         } => {
             let start = Stopwatch::start();
             let qc_ctx = QcContext {
@@ -1047,24 +1048,19 @@ where
             if matches!(*result, Err(CertifiedHeaderVerifyError::Qc(_))) {
                 record_signature_verification_failure("remote_header_qc");
             }
-            // A gossiped copy of the header travels on only once its
-            // certificate holds; a false one is its sender's to answer for.
             ctx.network.settle(
                 VerdictKey::from_digest(certified_header.copy_digest()),
-                if result.is_ok() {
-                    Verdict::Accept
-                } else {
-                    Verdict::Reject
-                },
+                remote_header_verdict(&result, committee),
             );
             ctx.notify_protocol(ProtocolEvent::RemoteHeaderQcVerified {
                 certified_header,
-                sender,
+                source,
                 result,
+                committee,
             });
         }
 
-        Action::VerifyShardForkProof { proof, committees } => {
+        ConsensusAction::VerifyShardForkProof { proof, committees } => {
             let start = Stopwatch::start();
             let verified = proof
                 .verify_resolved(ctx.verifier, ctx.topology_snapshot.network(), &committees)
@@ -1079,7 +1075,7 @@ where
             ctx.notify_protocol(ProtocolEvent::ShardForkProofVerified { proof, verified });
         }
 
-        Action::VerifyBodyRoot {
+        ConsensusAction::VerifyBodyRoot {
             block,
             validity_anchor,
         } => {
@@ -1096,7 +1092,7 @@ where
             ));
         }
 
-        Action::VerifyProvisionTxRoots {
+        ConsensusAction::VerifyProvisionTxRoots {
             block_hash,
             expected,
             transactions,
@@ -1122,7 +1118,7 @@ where
             ));
         }
 
-        Action::VerifyResolutions {
+        ConsensusAction::VerifyResolutions {
             block_hash,
             entries,
             windows,
@@ -1203,7 +1199,7 @@ where
             });
         }
 
-        Action::VerifyBeaconWitnessRoot {
+        ConsensusAction::VerifyBeaconWitnessRoot {
             block_hash,
             expected_root,
             expected_leaf_count,
@@ -1269,29 +1265,30 @@ where
             ));
         }
 
-        Action::VerifyStateRoot {
-            block_hash,
-            transactions,
-            parent_block_hash,
-            parent_state_root,
-            parent_block_height,
-            expected_root,
-            finalizations,
-            creations,
-            block_height,
-            claimed_split_child_roots,
-            split_child_roots_required,
-            terminal_settled_txs_required,
-            claimed_terminal_settled_txs,
-            parent_weighted_timestamp,
-            settled_txs_window_floor,
-            parent_sweep_frontier,
-            claimed_sweep_frontier,
-            frontier,
-            members,
-            parent_judgement,
-            state_claims,
-        } => {
+        ConsensusAction::VerifyStateRoot(check) => {
+            let StateRootCheck {
+                block_hash,
+                transactions,
+                parent_block_hash,
+                parent_state_root,
+                parent_block_height,
+                expected_root,
+                finalizations,
+                creations,
+                block_height,
+                claimed_split_child_roots,
+                split_child_roots_required,
+                terminal_settled_txs_required,
+                claimed_terminal_settled_txs,
+                parent_weighted_timestamp,
+                settled_txs_window_floor,
+                parent_sweep_frontier,
+                claimed_sweep_frontier,
+                frontier,
+                members,
+                parent_judgement,
+                state_claims,
+            } = *check;
             let start = Stopwatch::start();
             let view = ctx
                 .pending_chain
@@ -1490,7 +1487,7 @@ where
             });
         }
 
-        Action::BuildProposal {
+        ConsensusAction::BuildProposal {
             shard_id,
             chain_origin,
             proposer,
@@ -1762,7 +1759,7 @@ where
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
-        Action::BroadcastBlockHeader {
+        ConsensusAction::BroadcastBlockHeader {
             header,
             manifest,
             recipients,
@@ -1797,7 +1794,7 @@ where
             ctx.network.notify(&recipients, &gossip);
         }
 
-        Action::SignAndBroadcastBlockVote {
+        ConsensusAction::SignAndBroadcastBlockVote {
             block_hash,
             parent_block_hash,
             height,
@@ -1842,7 +1839,7 @@ where
             ctx.notify_protocol(ProtocolEvent::VerifiedBlockVoteReceived { vote: verified });
         }
 
-        Action::SignAndBroadcastTimeout {
+        ConsensusAction::SignAndBroadcastTimeout {
             round,
             high_qc,
             high_tc,
@@ -1879,7 +1876,7 @@ where
             ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived { timeout: verified });
         }
 
-        Action::SignAndBroadcastQcAnnouncement {
+        ConsensusAction::SignAndBroadcastQcAnnouncement {
             qc,
             recipients,
             signer: _,
@@ -1905,7 +1902,7 @@ where
             ctx.network.notify(&recipients, &announcement);
         }
 
-        Action::SignAndBroadcastReadySignal {
+        ConsensusAction::SignAndBroadcastReadySignal {
             shard,
             wt_window_start,
             wt_window_end,
@@ -1942,7 +1939,7 @@ where
             }
         }
 
-        Action::VerifyTimeout {
+        ConsensusAction::VerifyTimeout {
             timeout,
             voter_public_key,
         } => {
@@ -1961,7 +1958,7 @@ where
             }
         }
 
-        Action::BroadcastCertifiedBlockHeader { certified_header } => {
+        ConsensusAction::BroadcastCertifiedBlockHeader { certified_header } => {
             let Some(signing) = &ctx.signing else {
                 tracing::error!("certified header gossip dispatched without a signer; skipping");
                 return;
@@ -1982,16 +1979,14 @@ where
                 return;
             };
             let gossip = CertifiedBlockHeaderGossip {
-                certified_header: Arc::new(Verifiable::<CertifiedBlockHeader>::from(
-                    certified_header,
-                )),
+                certified_header: Verifiable::<CertifiedBlockHeader>::from(certified_header),
                 sender: signing.me,
                 sender_signature: sig,
             };
             ctx.network.broadcast_global(&gossip);
         }
 
-        Action::BroadcastShardForkProof { proof } => {
+        ConsensusAction::BroadcastShardForkProof { proof } => {
             // Self-authenticating: gossip the proof unsigned; every recipient
             // re-verifies it against its own topology.
             let gossip = ShardForkProofGossip {
@@ -1999,8 +1994,25 @@ where
             };
             ctx.network.broadcast_global(&gossip);
         }
+    }
+}
 
-        _ => unreachable!("hyperscale_shard::handle_action called with non-shard action"),
+/// The verdict a remote header's check settles for every gossiped copy of
+/// it. A copy travels on only once its certificate holds, and a false one
+/// is its sender's to answer for. A certificate that fails under a guessed
+/// committee is neither: this host cannot judge it until the header's
+/// parent names the committee, and the check it reruns then settles the
+/// copy for good. Settling it [`Verdict::Ignore`] drops the copies waiting
+/// now and leaves nothing remembered, so a copy arriving later waits on
+/// that rerun instead of being refused on arrival.
+const fn remote_header_verdict(
+    result: &Result<Verified<CertifiedBlockHeader>, CertifiedHeaderVerifyError>,
+    committee: HeaderCommittee,
+) -> Verdict {
+    match (result, committee) {
+        (Ok(_), _) => Verdict::Accept,
+        (Err(CertifiedHeaderVerifyError::Qc(_)), HeaderCommittee::Guessed) => Verdict::Ignore,
+        (Err(_), _) => Verdict::Reject,
     }
 }
 
@@ -2114,7 +2126,7 @@ mod tests {
         let determined = Finalization::new(
             *stating.tick_id(),
             TickHalf::Determined,
-            stating.local_ec().cloned().map(Arc::new),
+            stating.local_ec().cloned(),
             Capped::from_array([receipt]),
         );
 
@@ -2124,7 +2136,7 @@ mod tests {
             let receipts = fw.settling_receipts();
             let leaves = derive_leaves(ShardId::ROOT, &snapshot, &receipts, &[], &sources);
             let offered = Offered::default();
-            absorb_finalized_cells(&[Arc::new(Verifiable::from(fw.clone()))], &offered);
+            absorb_finalized_cells(&[Verifiable::from(fw.clone())], &offered);
             let offered = offered
                 .0
                 .into_inner()
@@ -2176,14 +2188,14 @@ mod tests {
         fn get_beacon_block_by_epoch(
             &self,
             _epoch: Epoch,
-        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+        ) -> Option<Verified<CertifiedBeaconBlock>> {
             None
         }
 
         fn get_beacon_block_by_hash(
             &self,
             _hash: BeaconBlockHash,
-        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+        ) -> Option<Verified<CertifiedBeaconBlock>> {
             None
         }
 
@@ -2191,9 +2203,7 @@ mod tests {
             self.0.keys().copied().max()
         }
 
-        fn latest_committed(
-            &self,
-        ) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)> {
+        fn latest_committed(&self) -> Option<(Verified<CertifiedBeaconBlock>, Arc<BeaconState>)> {
             None
         }
     }
@@ -2767,7 +2777,7 @@ mod tests {
     // ─── root verifiers ─────────────────────────────────────────────────
 
     /// A block carrying `txs` whose header commits them.
-    fn block_carrying(txs: &[Arc<Verifiable<Transaction>>]) -> Block {
+    fn block_carrying(txs: &[Verifiable<Transaction>]) -> Block {
         let draft = |header| Block::Live {
             header,
             transactions: Arc::new(
@@ -2814,7 +2824,7 @@ mod tests {
             WeightedTimestamp::from_millis(1_000),
         );
         install_stub_protocol_statics();
-        let expired = block_carrying(&[Arc::new(Verifiable::from(stub_transaction(
+        let expired = block_carrying(&[(Verifiable::from(stub_transaction(
             test_principal(1),
             &[test_prefix(1)],
             1_000,
@@ -2831,7 +2841,7 @@ mod tests {
 
         // The anchor inside the range — verification passes.
         let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
-        let valid = block_carrying(&[Arc::new(Verifiable::from(stub_transaction(
+        let valid = block_carrying(&[(Verifiable::from(stub_transaction(
             test_principal(2),
             &[test_prefix(2)],
             1_000,
@@ -2855,7 +2865,7 @@ mod tests {
             anchor.plus(Duration::from_mins(10)),
         );
         install_stub_protocol_statics();
-        let block = block_carrying(&[Arc::new(Verifiable::from(stub_transaction(
+        let block = block_carrying(&[(Verifiable::from(stub_transaction(
             test_principal(3),
             &[test_prefix(3)],
             1_000,
@@ -2868,6 +2878,106 @@ mod tests {
         assert!(
             block.header().body_root().verify(&ctx).is_err(),
             "malformed range must reject even when the body root matches"
+        );
+    }
+
+    fn remote_header(height: u64) -> CertifiedBlockHeader {
+        use hyperscale_types::{AggregateSignature, SignerBitfield};
+
+        let shard = ShardId::leaf(1, 1);
+        let height = BlockHeight::new(height);
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height,
+            ..Default::default()
+        });
+        let qc = QuorumCertificate::new(
+            header.hash(),
+            shard,
+            height,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        CertifiedBlockHeader::new(header, qc)
+    }
+
+    /// A header across an epoch cut whose parent this host does not hold is
+    /// checked first under the committee its own anchor guesses, and fails
+    /// there however honest it is. That failure drops the copy waiting on
+    /// it without holding it against the forwarder, and remembers nothing:
+    /// a copy with the same bytes arriving meanwhile waits on the check
+    /// rerun under the parent's committee, which settles it Accept.
+    #[test]
+    fn a_header_failing_under_a_guessed_committee_waits_for_the_rerun() {
+        use hyperscale_network::deferred::{Deferred, Waiting};
+        use hyperscale_types::QcVerifyError;
+
+        let header = remote_header(6);
+        let key = VerdictKey::from_digest(header.copy_digest());
+        let mut waiting = Waiting::default();
+
+        assert!(matches!(
+            waiting.defer(&[key], "first copy"),
+            Deferred::Waits(_)
+        ));
+        let guessed = remote_header_verdict(
+            &Err(CertifiedHeaderVerifyError::Qc(
+                QcVerifyError::InvalidSignature,
+            )),
+            HeaderCommittee::Guessed,
+        );
+        assert_eq!(
+            waiting.settle(key, guessed),
+            vec![("first copy", Verdict::Ignore)],
+            "a failure under a guess is not the forwarder's fault",
+        );
+
+        assert!(
+            matches!(waiting.defer(&[key], "second copy"), Deferred::Waits(_)),
+            "a copy with the same bytes is not refused on arrival",
+        );
+        let rerun = remote_header_verdict(
+            &Ok(Verified::new_unchecked_for_test(header)),
+            HeaderCommittee::Resolved,
+        );
+        assert_eq!(
+            waiting.settle(key, rerun),
+            vec![("second copy", Verdict::Accept)],
+        );
+    }
+
+    /// A forged certificate under the committee the header's parent names
+    /// is the forwarder's to answer for, and a copy of it arriving later is
+    /// refused on arrival.
+    #[test]
+    fn a_forged_header_under_a_resolved_committee_rejects() {
+        use hyperscale_network::deferred::{Deferred, Waiting};
+        use hyperscale_types::QcVerifyError;
+
+        let header = remote_header(7);
+        let key = VerdictKey::from_digest(header.copy_digest());
+        let mut waiting = Waiting::default();
+
+        assert!(matches!(
+            waiting.defer(&[key], "forged"),
+            Deferred::Waits(_)
+        ));
+        let verdict = remote_header_verdict(
+            &Err(CertifiedHeaderVerifyError::Qc(
+                QcVerifyError::InvalidSignature,
+            )),
+            HeaderCommittee::Resolved,
+        );
+        assert_eq!(
+            waiting.settle(key, verdict),
+            vec![("forged", Verdict::Reject)]
+        );
+        assert_eq!(
+            waiting.defer(&[key], "copy"),
+            Deferred::Settled("copy", Verdict::Reject)
         );
     }
 }

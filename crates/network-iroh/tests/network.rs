@@ -12,7 +12,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::fault::HostId;
 use hyperscale_network::{
-    HandlerRegistry, Network, RequestError, ResponseVerdict, Verdict, VerdictKey,
+    HandlerRegistry, Network, Provenance, RequestError, ResponseVerdict, Verdict, VerdictKey,
 };
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::testing::burn_processor_time;
@@ -332,14 +332,14 @@ async fn a_notification_reaches_the_validator_it_names() {
     let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
     host1
         .network
-        .register_notification_handler(move |ping: Ping| {
+        .register_notification_handler(move |ping: Ping, _: Provenance| {
             let _ = remote_tx.send(ping);
             Verdict::Accept
         });
     let (local_tx, mut local_rx) = mpsc::unbounded_channel();
     host0
         .network
-        .register_notification_handler(move |ping: Ping| {
+        .register_notification_handler(move |ping: Ping, _: Provenance| {
             let _ = local_tx.send(ping);
             Verdict::Accept
         });
@@ -434,10 +434,12 @@ async fn a_consensus_notification_overtakes_queued_bulk_responses() {
 
     let notified_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let seen = Arc::clone(&notified_at);
-    host0.network.register_notification_handler(move |_: Ping| {
-        seen.lock().unwrap().get_or_insert_with(Instant::now);
-        Verdict::Accept
-    });
+    host0
+        .network
+        .register_notification_handler(move |_: Ping, _: Provenance| {
+            seen.lock().unwrap().get_or_insert_with(Instant::now);
+            Verdict::Accept
+        });
 
     // Host 0 asks for several at once; each response is queued on its own
     // stream towards host 0.
@@ -544,7 +546,7 @@ async fn a_partitioned_peer_gets_neither_notification_nor_request() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     host1
         .network
-        .register_notification_handler(move |ping: Ping| {
+        .register_notification_handler(move |ping: Ping, _: Provenance| {
             let _ = tx.send(ping);
             Verdict::Accept
         });
@@ -576,7 +578,21 @@ async fn a_partitioned_peer_gets_neither_notification_nor_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_responder_that_answers_with_garbage_is_seldom_asked() {
-    let fixtures = TestFixtures::new(21, 4);
+    a_garbage_responder_is_seldom_asked(21, false).await;
+}
+
+/// An answer whose verdict waits on a check counts against its responder
+/// once the check finds it false, as one rejected at once does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_responder_whose_deferred_answers_are_found_false_is_seldom_asked() {
+    a_garbage_responder_is_seldom_asked(23, true).await;
+}
+
+/// One of three responders answers every request falsely; the asker
+/// refuses each such answer, at once or, with `deferred`, through a check
+/// that settles after the callback returns.
+async fn a_garbage_responder_is_seldom_asked(seed: u64, deferred: bool) {
+    let fixtures = TestFixtures::new(seed, 4);
     let asker = host(&fixtures, &[0], &[], Vec::new()).await;
     // Each responder, and how many requests it served.
     let mut responders = Vec::new();
@@ -620,20 +636,31 @@ async fn a_responder_that_answers_with_garbage_is_seldom_asked() {
                 Echo(n),
                 None,
                 Box::new(move |outcome: Result<Echoed, RequestError>| {
-                    let good = matches!(outcome, Ok(Echoed(m)) if m == n);
-                    let _ = tx.send(good);
-                    if good {
-                        ResponseVerdict::Accept
-                    } else {
-                        ResponseVerdict::Reject
+                    let answer = match outcome {
+                        Ok(Echoed(m)) => Some(m),
+                        Err(_) => None,
+                    };
+                    let _ = tx.send(answer);
+                    match answer {
+                        Some(m) if deferred => ResponseVerdict::defer(VerdictKey::of(&(n, m))),
+                        Some(m) if m == n => ResponseVerdict::Accept,
+                        _ => ResponseVerdict::Reject,
                     }
                 }),
             );
-            let good = timeout(BUDGET, rx.recv())
+            let answer = timeout(BUDGET, rx.recv())
                 .await
                 .expect("the request resolves")
                 .expect("the callback runs");
-            if good {
+            if deferred && let Some(m) = answer {
+                let verdict = if m == n {
+                    Verdict::Accept
+                } else {
+                    Verdict::Reject
+                };
+                asker.network.settle(VerdictKey::of(&(n, m)), verdict);
+            }
+            if answer == Some(n) {
                 break;
             }
         }
@@ -684,7 +711,7 @@ async fn a_peer_whose_notifications_are_rejected_is_cooled_down() {
     let counted = Arc::clone(&handled);
     receiver
         .network
-        .register_notification_handler(move |_: Header| {
+        .register_notification_handler(move |_: Header, _: Provenance| {
             counted.fetch_add(1, Ordering::SeqCst);
             Verdict::Reject
         });
@@ -714,7 +741,7 @@ async fn a_host_that_is_behind_still_hears_a_peer_whose_notifications_it_ignores
     let counted = Arc::clone(&handled);
     receiver
         .network
-        .register_notification_handler(move |_: Header| {
+        .register_notification_handler(move |_: Header, _: Provenance| {
             counted.fetch_add(1, Ordering::SeqCst);
             Verdict::Ignore
         });
@@ -741,7 +768,7 @@ async fn a_peer_whose_notifications_fail_their_deferred_check_is_cooled_down() {
     let handle = Handle::current();
     receiver
         .network
-        .register_notification_handler(move |header: Header| {
+        .register_notification_handler(move |header: Header, _: Provenance| {
             let key = VerdictKey::of(&header);
             let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
             handle.spawn(async move {

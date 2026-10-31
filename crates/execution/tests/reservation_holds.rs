@@ -11,7 +11,6 @@
 //! receipt without writes granted none.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::ExecutedTx;
@@ -119,7 +118,7 @@ impl Derivation for ReservingStatics {
 
 /// A transaction distinguished only by `seed`; its declaration is fixed
 /// by [`ReservingStatics`].
-fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
+fn reserving_transaction(seed: u8) -> Verified<Transaction> {
     let vm = StubTree {
         terms: Terms {
             fee_payer: PrincipalAddr::new([0xAA; 31]),
@@ -140,18 +139,18 @@ fn reserving_transaction(seed: u8) -> Arc<Verified<Transaction>> {
     let tx = Transaction::new(vm);
     tx.try_derived(&ReservingStatics)
         .expect("the fixture declaration is fixed");
-    Arc::new(Verified::<Transaction>::from_persisted(tx))
+    Verified::<Transaction>::from_persisted(tx)
 }
 
 /// A request for `tx` as a whole shape reaching a counterpart: a member
 /// whose verdict that counterpart can still discard, so its declared
 /// cells are held against it.
-fn request_for(tx: &Arc<Verified<Transaction>>) -> CrossShardExecutionRequest {
+fn request_for(tx: &Verified<Transaction>) -> CrossShardExecutionRequest {
     let (local, counterpart) = ShardId::ROOT.children();
     CrossShardExecutionRequest {
         prices: PriceTable::GENESIS,
         tx_hash: tx.hash(),
-        transaction: Arc::clone(tx),
+        transaction: tx.clone(),
         provisions: Vec::new(),
         clock: WeightedTimestamp::from_millis(1_000),
         member: Member::of(

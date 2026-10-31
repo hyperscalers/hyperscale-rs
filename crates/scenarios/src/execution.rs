@@ -10,7 +10,6 @@
 //! aborts, ordering, and committed state roots.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::ProtocolHasher;
@@ -981,7 +980,7 @@ pub fn sealed_rounds_settle_on_the_seed_they_committed_to<C: Cluster>(c: &mut C)
         validity_around(c.now()),
     );
     let sealed = seal.hash();
-    c.submit(Arc::new(seal));
+    c.submit(seal);
     let status = await_tx_terminal(c, sealed, epochs(16));
     assert!(
         matches!(
@@ -1017,7 +1016,7 @@ pub fn sealed_rounds_settle_on_the_seed_they_committed_to<C: Cluster>(c: &mut C)
         validity_around(c.now()),
     );
     let closed = close.hash();
-    c.submit(Arc::new(close));
+    c.submit(close);
     let status = await_tx_terminal(c, closed, epochs(16));
     assert!(
         matches!(
@@ -1044,7 +1043,7 @@ pub fn sealed_rounds_settle_on_the_seed_they_committed_to<C: Cluster>(c: &mut C)
         validity_around(c.now()),
     );
     let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    c.submit(tx);
 
     let status = await_tx_terminal(c, hash, epochs(16));
     assert!(
@@ -2789,7 +2788,7 @@ pub fn a_late_settled_nullifier_still_refuses_its_intent<C: RestartableCluster>(
         .map(|(composer, from)| {
             let tx = build_composed_tx(composer, from, &requester_key, &request, REQUEST, window);
             let hash = tx.hash();
-            c.submit(Arc::new(tx));
+            c.submit(tx);
             hash
         })
         .collect();
@@ -2848,7 +2847,7 @@ pub fn a_late_settled_nullifier_still_refuses_its_intent<C: RestartableCluster>(
         window,
     );
     let third_hash = third.hash();
-    c.submit(Arc::new(third));
+    c.submit(third);
     let third_verdict = await_tx_terminal(c, third_hash, epochs(4));
     assert_eq!(
         third_verdict, None,

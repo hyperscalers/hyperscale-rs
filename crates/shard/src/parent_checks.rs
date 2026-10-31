@@ -13,7 +13,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
 
 use hyperscale_engine::tick_select::{crossings_consumed, member_of};
 use hyperscale_hbor::Capped;
@@ -50,7 +49,7 @@ pub struct AtParent<'a> {
     pub transactions: &'a SharedTransactions,
     /// The block's finalizations, whose settling receipts a record it
     /// takes back is returned beside.
-    pub finalizations: &'a [Arc<Verifiable<Finalization>>],
+    pub finalizations: &'a [Verifiable<Finalization>],
 }
 
 /// Why the parent state refuses a block.
@@ -216,7 +215,7 @@ pub(crate) fn within_the_cap(
     anchor: WeightedTimestamp,
     parent: &(impl Substates + ?Sized),
     claims: Vec<StateClaim>,
-    transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+    transactions: &mut Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK>,
 ) -> (Vec<StateClaim>, usize, usize) {
     let under = shard_prefix_path(local);
     let owed = owed_credits(&claims, &StateWrites::default(), parent);
@@ -714,7 +713,7 @@ mod tests {
         fence: ReadFence,
         state_claims: Vec<StateClaim>,
         transactions: SharedTransactions,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
     }
 
     impl Block {
@@ -1597,7 +1596,7 @@ mod tests {
         );
 
         let mut block = Block::empty(ShardId::ROOT);
-        block.transactions = Arc::new(Capped::from_array([Arc::new(Verifiable::from(over))]));
+        block.transactions = Arc::new(Capped::from_array([Verifiable::from(over)]));
         assert_eq!(
             block.judged(&parent),
             Err(ParentRefusal::UncoveredPayer(vault))
@@ -1683,13 +1682,8 @@ mod tests {
         let carrying = |txs: &[Transaction]| {
             let mut block = Block::empty(ShardId::ROOT);
             block.transactions = Arc::new(
-                Capped::new(
-                    txs.iter()
-                        .cloned()
-                        .map(|tx| Arc::new(Verifiable::from(tx)))
-                        .collect(),
-                )
-                .expect("a few transactions"),
+                Capped::new(txs.iter().cloned().map(Verifiable::from).collect())
+                    .expect("a few transactions"),
             );
             block
         };
@@ -1706,7 +1700,7 @@ mod tests {
     fn a_block_its_payer_cannot_cover_is_refused() {
         let (tx, vault) = paid(301);
         let mut block = Block::empty(ShardId::ROOT);
-        block.transactions = Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx))]));
+        block.transactions = Arc::new(Capped::from_array([Verifiable::from(tx)]));
         assert_eq!(
             block.judged(&funded(vault, 1_000, 700)),
             Err(ParentRefusal::UncoveredPayer(vault))

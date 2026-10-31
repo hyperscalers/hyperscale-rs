@@ -195,7 +195,7 @@ impl CommitProof {
 
     /// The shard this proof is on.
     #[must_use]
-    pub const fn shard(&self) -> ShardId {
+    pub fn shard(&self) -> ShardId {
         self.certified.shard_id()
     }
 

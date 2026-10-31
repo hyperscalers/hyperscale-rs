@@ -23,7 +23,7 @@
 use std::borrow::Borrow;
 use std::sync::Arc;
 
-use hyperscale_core::Action;
+use hyperscale_core::{BeaconAction, FoldAction};
 use hyperscale_types::{
     BeaconBlockHash, BeaconProposal, BeaconState, BlockHash, BlockHeight, CandidateBeaconBlock,
     CandidateBeaconBlockVerifyError, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
@@ -243,14 +243,70 @@ impl LocalChainAnchors {
     };
 }
 
+/// What a [`BeaconCoordinator`] handler emits: its fold's actions and its
+/// participant's, in the order they arose.
+#[derive(Debug, Clone)]
+pub enum CoordinatorAction {
+    /// An action the fold emitted.
+    Fold(FoldAction),
+    /// An action the participant emitted.
+    Participant(BeaconAction),
+}
+
+impl CoordinatorAction {
+    /// The action type name for telemetry: the emitter's own name for it.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Fold(action) => action.type_name(),
+            Self::Participant(action) => action.type_name(),
+        }
+    }
+
+    /// The action, if the fold emitted it.
+    #[must_use]
+    pub const fn fold(&self) -> Option<&FoldAction> {
+        match self {
+            Self::Fold(action) => Some(action),
+            Self::Participant(_) => None,
+        }
+    }
+
+    /// The action, if the participant emitted it.
+    #[must_use]
+    pub const fn participant(&self) -> Option<&BeaconAction> {
+        match self {
+            Self::Participant(action) => Some(action),
+            Self::Fold(_) => None,
+        }
+    }
+}
+
+impl From<FoldAction> for CoordinatorAction {
+    fn from(action: FoldAction) -> Self {
+        Self::Fold(action)
+    }
+}
+
+impl From<BeaconAction> for CoordinatorAction {
+    fn from(action: BeaconAction) -> Self {
+        Self::Participant(action)
+    }
+}
+
+/// `actions`, as a coordinator emits them.
+fn lift<A: Into<CoordinatorAction>>(actions: Vec<A>) -> Vec<CoordinatorAction> {
+    actions.into_iter().map(Into::into).collect()
+}
+
 /// One identity's beacon-chain coordinator: a [`BeaconFold`] and the
 /// identity's [`BeaconParticipant`], driven together.
 ///
 /// Synchronous event-driven FSM. Mirrors `ShardCoordinator`'s public
-/// shape: handlers take `&mut self` and return `Vec<Action>`. A block a
-/// participant handler certifies is adopted into the fold before the
-/// handler returns, and the participant then settles the epoch it
-/// decided.
+/// shape: handlers take `&mut self` and return
+/// `Vec<CoordinatorAction>`. A block a participant handler certifies is
+/// adopted into the fold before the handler returns, and the participant
+/// then settles the epoch it decided.
 pub struct BeaconCoordinator {
     fold: BeaconFold,
     participant: BeaconParticipant,
@@ -285,7 +341,7 @@ impl BeaconCoordinator {
     #[allow(clippy::too_many_arguments)] // identity + storage state both threaded explicitly
     pub fn new(
         verifier: Arc<dyn Verifier>,
-        latest_block: Arc<Verified<CertifiedBeaconBlock>>,
+        latest_block: Verified<CertifiedBeaconBlock>,
         history: Vec<BeaconState>,
         me: ValidatorId,
         local_shard: ShardId,
@@ -319,16 +375,16 @@ impl BeaconCoordinator {
     fn drive<S: Into<ParticipantStep>>(
         &mut self,
         handler: impl FnOnce(&mut BeaconParticipant, &BeaconFold) -> S,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         let step: ParticipantStep = handler(&mut self.participant, &self.fold).into();
-        let mut actions = step.actions;
+        let mut actions = lift(step.actions);
         if let Some(block) = step.certified {
             actions.extend(self.adopt(block));
         }
         actions
     }
 
-    fn adopt(&mut self, block: Arc<Verified<CertifiedBeaconBlock>>) -> Vec<Action> {
+    fn adopt(&mut self, block: Verified<CertifiedBeaconBlock>) -> Vec<CoordinatorAction> {
         self.fold
             .adopt(block)
             .map_or_else(Vec::new, |adopted| self.settle(adopted))
@@ -337,11 +393,11 @@ impl BeaconCoordinator {
     /// Follow an adoption through: the committee flag the fold's witness
     /// duty reads, the terminal witness re-drive, and the participant's
     /// half of the epoch it settled.
-    fn settle(&mut self, adopted: Adopted) -> Vec<Action> {
-        let mut actions = adopted.actions;
+    fn settle(&mut self, adopted: Adopted) -> Vec<CoordinatorAction> {
+        let mut actions = lift(adopted.actions);
         let on_committee = self.participant.is_on_committee(&self.fold);
-        actions.extend(self.fold.set_host_on_committee(on_committee));
-        actions.extend(self.fold.redrive_terminal_witness_fetches());
+        actions.extend(lift(self.fold.set_host_on_committee(on_committee)));
+        actions.extend(lift(self.fold.redrive_terminal_witness_fetches()));
         let effects = adopted.effects;
         actions.extend(self.drive(|p, fold| p.on_adopted(fold, &effects)));
         actions
@@ -379,27 +435,25 @@ impl BeaconCoordinator {
     /// the header completes.
     pub fn on_local_block_committed(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
-    ) -> Vec<Action> {
-        let mut actions = match self.local_chain {
+        certified_header: &Verified<CertifiedBlockHeader>,
+    ) -> Vec<CoordinatorAction> {
+        let mut actions = lift(match self.local_chain {
             Some(token) => self.fold.on_local_block_committed(token, certified_header),
             None => self.fold.on_source_header(certified_header),
-        };
+        });
         actions.extend(self.drive(BeaconParticipant::on_source_header));
         actions
     }
 
-    /// Schedule the first `BeaconCommitteeStart` timer so the upcoming
-    /// epoch's SPC instance bootstraps. Subsequent epochs self-arm on
-    /// adoption; this only covers the resume gap from a
-    /// freshly-constructed or just-loaded coordinator.
+    /// Arm the participant's startup timers — see
+    /// [`BeaconParticipant::on_startup`].
     #[must_use]
-    pub fn on_startup(&self) -> Vec<Action> {
-        self.fold.on_startup()
+    pub fn on_startup(&self) -> Vec<CoordinatorAction> {
+        lift(BeaconParticipant::on_startup(&self.fold))
     }
 
     /// `TimerId::BeaconRatifyTrigger` fired.
-    pub fn on_beacon_ratify_timer(&mut self) -> Vec<Action> {
+    pub fn on_beacon_ratify_timer(&mut self) -> Vec<CoordinatorAction> {
         self.drive(BeaconParticipant::on_beacon_ratify_timer)
     }
 
@@ -409,7 +463,7 @@ impl BeaconCoordinator {
         epoch: Epoch,
         view: SpcView,
         vote: PcVote1,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, _| p.on_pc_vote1_received(epoch, view, vote))
     }
 
@@ -419,7 +473,7 @@ impl BeaconCoordinator {
         epoch: Epoch,
         view: SpcView,
         vote: Box<PcVote2>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, _| p.on_pc_vote2_received(epoch, view, vote))
     }
 
@@ -429,7 +483,7 @@ impl BeaconCoordinator {
         epoch: Epoch,
         view: SpcView,
         vote: Box<PcVote3>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, _| p.on_pc_vote3_received(epoch, view, vote))
     }
 
@@ -439,7 +493,7 @@ impl BeaconCoordinator {
         epoch: Epoch,
         from: ValidatorId,
         proposal: Arc<Verifiable<SpcProposalObject>>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, _| p.on_spc_new_view_received(epoch, from, proposal))
     }
 
@@ -449,7 +503,7 @@ impl BeaconCoordinator {
         epoch: Epoch,
         from: ValidatorId,
         msg: Arc<Verifiable<SpcNewCommitMsg>>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, _| p.on_spc_new_commit_received(epoch, from, msg))
     }
 
@@ -458,7 +512,7 @@ impl BeaconCoordinator {
         &mut self,
         epoch: Epoch,
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, _| p.on_unverified_spc_empty_view_received(epoch, msg))
     }
 
@@ -468,73 +522,73 @@ impl BeaconCoordinator {
         &mut self,
         epoch: Epoch,
         msg: Box<Verified<SpcEmptyViewMsg>>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_verified_spc_empty_view_received(fold, epoch, msg))
     }
 
-    /// Result of an [`Action::VerifySpcNewView`] dispatch.
+    /// Result of an [`hyperscale_core::ParticipantAction::VerifySpcNewView`] dispatch.
     pub fn on_spc_new_view_verified(
         &mut self,
         epoch: Epoch,
         from: ValidatorId,
         view: SpcView,
         result: Result<Verified<SpcProposalObject>, SpcProposalObjectVerifyError>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_spc_new_view_verified(fold, epoch, from, view, result))
     }
 
-    /// Result of an [`Action::VerifySpcNewCommit`] dispatch.
+    /// Result of an [`hyperscale_core::ParticipantAction::VerifySpcNewCommit`] dispatch.
     pub fn on_spc_new_commit_verified(
         &mut self,
         epoch: Epoch,
         from: ValidatorId,
         view: SpcView,
         result: Result<Verified<SpcNewCommitMsg>, SpcNewCommitMsgVerifyError>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_spc_new_commit_verified(fold, epoch, from, view, result))
     }
 
-    /// Result of an [`Action::VerifySpcEmptyView`] dispatch.
+    /// Result of an [`hyperscale_core::ParticipantAction::VerifySpcEmptyView`] dispatch.
     pub fn on_spc_empty_view_verified(
         &mut self,
         epoch: Epoch,
         from: ValidatorId,
         view: SpcView,
         result: Result<Verified<SpcEmptyViewMsg>, SpcEmptyViewMsgVerifyError>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_spc_empty_view_verified(fold, epoch, from, view, result))
     }
 
-    /// Result of an [`Action::VerifyPcVote1`] dispatch.
+    /// Result of an [`hyperscale_core::ParticipantAction::VerifyPcVote1`] dispatch.
     pub fn on_pc_vote1_verified(
         &mut self,
         epoch: Epoch,
         view: SpcView,
         signer: ValidatorId,
         result: Result<Verified<PcVote1>, PcVote1VerifyError>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_pc_vote1_verified(fold, epoch, view, signer, result))
     }
 
-    /// Result of an [`Action::VerifyPcVote2`] dispatch.
+    /// Result of an [`hyperscale_core::ParticipantAction::VerifyPcVote2`] dispatch.
     pub fn on_pc_vote2_verified(
         &mut self,
         epoch: Epoch,
         view: SpcView,
         signer: ValidatorId,
         result: Result<Verified<PcVote2>, PcVote2VerifyError>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_pc_vote2_verified(fold, epoch, view, signer, result))
     }
 
-    /// Result of an [`Action::VerifyPcVote3`] dispatch.
+    /// Result of an [`hyperscale_core::ParticipantAction::VerifyPcVote3`] dispatch.
     pub fn on_pc_vote3_verified(
         &mut self,
         epoch: Epoch,
         view: SpcView,
         signer: ValidatorId,
         result: Result<Verified<PcVote3>, PcVote3VerifyError>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_pc_vote3_verified(fold, epoch, view, signer, result))
     }
 
@@ -544,7 +598,7 @@ impl BeaconCoordinator {
         epoch: Epoch,
         view: SpcView,
         vote: Verified<PcVote1>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_verified_pc_vote1_received(fold, epoch, view, vote))
     }
 
@@ -554,7 +608,7 @@ impl BeaconCoordinator {
         epoch: Epoch,
         view: SpcView,
         vote: Box<Verified<PcVote2>>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_verified_pc_vote2_received(fold, epoch, view, vote))
     }
 
@@ -564,12 +618,12 @@ impl BeaconCoordinator {
         epoch: Epoch,
         view: SpcView,
         vote: Box<Verified<PcVote3>>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_verified_pc_vote3_received(fold, epoch, view, vote))
     }
 
     /// `TimerId::BeaconSpcView` fired.
-    pub fn on_beacon_spc_view_timer(&mut self) -> Vec<Action> {
+    pub fn on_beacon_spc_view_timer(&mut self) -> Vec<CoordinatorAction> {
         self.drive(BeaconParticipant::on_beacon_spc_view_timer)
     }
 
@@ -578,9 +632,9 @@ impl BeaconCoordinator {
         &mut self,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<Verified<BeaconProposal>>,
-    ) -> Vec<Action> {
-        self.drive(|p, fold| p.on_beacon_proposal_received(fold, from, epoch, proposal))
+        proposal: Verified<BeaconProposal>,
+    ) -> Vec<CoordinatorAction> {
+        self.drive(|p, fold| p.on_beacon_proposal_received(fold, from, epoch, proposal).1)
     }
 
     /// Buffer a verified shard fork proof for the next proposal.
@@ -602,7 +656,7 @@ impl BeaconCoordinator {
     }
 
     /// `TimerId::BeaconCommitteeStart` fired.
-    pub fn on_beacon_committee_start_timer(&mut self) -> Vec<Action> {
+    pub fn on_beacon_committee_start_timer(&mut self) -> Vec<CoordinatorAction> {
         self.drive(BeaconParticipant::on_beacon_committee_start_timer)
     }
 
@@ -612,8 +666,8 @@ impl BeaconCoordinator {
     /// the proposals awaiting it are released.
     pub fn on_commit_proven_source_header(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
-    ) -> Vec<Action> {
+        certified_header: &Verified<CertifiedBlockHeader>,
+    ) -> Vec<CoordinatorAction> {
         if !self
             .fold
             .admit_proven_for(certified_header, [&self.participant])
@@ -624,7 +678,7 @@ impl BeaconCoordinator {
     }
 
     /// `TimerId::BeaconSpcInputDwell` fired.
-    pub fn on_spc_input_dwell_timer(&mut self) -> Vec<Action> {
+    pub fn on_spc_input_dwell_timer(&mut self) -> Vec<CoordinatorAction> {
         self.drive(BeaconParticipant::on_spc_input_dwell_timer)
     }
 
@@ -632,9 +686,9 @@ impl BeaconCoordinator {
     /// [`BeaconFold::on_beacon_block_received`].
     pub fn on_beacon_block_received(
         &mut self,
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
-    ) -> Vec<Action> {
-        self.fold.on_beacon_block_received(block)
+        block: Verifiable<CertifiedBeaconBlock>,
+    ) -> Vec<CoordinatorAction> {
+        lift(self.fold.on_beacon_block_received(block))
     }
 
     /// Apply a beacon block delivered by the runner's gap-fill sync.
@@ -647,9 +701,9 @@ impl BeaconCoordinator {
     /// binding) is not bypassed.
     pub fn on_beacon_block_sync_ready_to_apply(
         &mut self,
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
-    ) -> Vec<Action> {
-        self.fold.on_beacon_block_received(block)
+        block: Verifiable<CertifiedBeaconBlock>,
+    ) -> Vec<CoordinatorAction> {
+        lift(self.fold.on_beacon_block_received(block))
     }
 
     /// A peer's [`RatifyVote`] arrived via gossip.
@@ -658,7 +712,7 @@ impl BeaconCoordinator {
     pub fn on_unverified_ratify_vote_received(
         &mut self,
         vote: Arc<Verifiable<RatifyVote>>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_unverified_ratify_vote_received(fold, vote))
     }
 
@@ -666,11 +720,11 @@ impl BeaconCoordinator {
     pub fn on_verified_ratify_vote_received(
         &mut self,
         vote: Arc<Verified<RatifyVote>>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_verified_ratify_vote_received(fold, vote))
     }
 
-    /// A previously-dispatched [`Action::VerifyBeaconBlock`] has
+    /// A previously-dispatched [`FoldAction::VerifyBeaconBlock`] has
     /// returned — see [`BeaconFold::on_beacon_block_verified`].
     ///
     /// # Panics
@@ -678,14 +732,14 @@ impl BeaconCoordinator {
     /// Panics when the verified block competes with the adopted tip.
     pub fn on_beacon_block_verified(
         &mut self,
-        result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
-    ) -> Vec<Action> {
+        result: Result<Verified<CertifiedBeaconBlock>, CertifiedBeaconBlockVerifyError>,
+    ) -> Vec<CoordinatorAction> {
         self.fold
             .on_beacon_block_verified(result)
             .map_or_else(Vec::new, |adopted| self.settle(adopted))
     }
 
-    /// A previously-dispatched [`Action::VerifyRatifyVote`] has
+    /// A previously-dispatched [`hyperscale_core::ParticipantAction::VerifyRatifyVote`] has
     /// returned.
     pub fn on_ratify_vote_verified(
         &mut self,
@@ -695,7 +749,7 @@ impl BeaconCoordinator {
         phase: RatifyPhase,
         signer: ValidatorId,
         result: Result<Verified<RatifyVote>, RatifyVoteVerifyError>,
-    ) -> Vec<Action> {
+    ) -> Vec<CoordinatorAction> {
         let key = (anchor, epoch, round, phase, signer);
         self.drive(|p, fold| p.on_ratify_vote_verified(fold, key, result))
     }
@@ -709,9 +763,10 @@ impl BeaconCoordinator {
         lo: LeafIndex,
         payloads: Vec<ShardWitnessPayload>,
         range_proof: Vec<Hash>,
-    ) -> Option<Vec<Action>> {
+    ) -> Option<Vec<CoordinatorAction>> {
         self.fold
             .on_shard_witnesses_received(shard_id, anchor, lo, payloads, range_proof)
+            .map(lift)
     }
 
     /// Record a verified remote source-shard header, fetch its witness
@@ -719,9 +774,9 @@ impl BeaconCoordinator {
     /// completes.
     pub fn on_verified_source_header(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
-    ) -> Vec<Action> {
-        let mut actions = self.fold.on_source_header(certified_header);
+        certified_header: &Verified<CertifiedBlockHeader>,
+    ) -> Vec<CoordinatorAction> {
+        let mut actions = lift(self.fold.on_source_header(certified_header));
         actions.extend(self.drive(BeaconParticipant::on_source_header));
         actions
     }
@@ -735,8 +790,8 @@ impl BeaconCoordinator {
     /// block above it.
     pub fn on_certified_local_header(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
-    ) -> Vec<Action> {
+        certified_header: &Verified<CertifiedBlockHeader>,
+    ) -> Vec<CoordinatorAction> {
         if let Some(token) = self.local_chain {
             self.fold.on_certified_local_header(token, certified_header);
         }
@@ -746,27 +801,35 @@ impl BeaconCoordinator {
     /// A peer's candidate block arrived via gossip.
     pub fn on_beacon_candidate_received(
         &mut self,
-        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
-    ) -> Vec<Action> {
+        candidate: Verifiable<CandidateBeaconBlock>,
+    ) -> Vec<CoordinatorAction> {
         self.drive(|p, fold| p.on_beacon_candidate_received(fold, candidate))
     }
 
-    /// A previously-dispatched [`Action::VerifyBeaconCandidate`] has
+    /// A previously-dispatched [`hyperscale_core::ParticipantAction::VerifyBeaconCandidate`] has
     /// returned.
     pub fn on_beacon_candidate_verified(
         &mut self,
-        result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
-    ) -> Vec<Action> {
-        self.drive(|p, fold| p.on_beacon_candidate_verified(fold, result))
+        block_hash: BeaconBlockHash,
+        result: Result<Verified<CandidateBeaconBlock>, CandidateBeaconBlockVerifyError>,
+    ) -> Vec<CoordinatorAction> {
+        self.drive(|p, fold| p.on_beacon_candidate_verified(fold, block_hash, result))
     }
 
-    /// A fetched beacon proposal arrived.
+    /// A fetched beacon proposal arrived. One that fails VRF
+    /// verification resolves nothing.
     pub fn on_beacon_proposal_fetched(
         &mut self,
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Arc<Verifiable<BeaconProposal>>,
-    ) -> Vec<Action> {
+        proposal: Verifiable<BeaconProposal>,
+    ) -> Vec<CoordinatorAction> {
+        let Some(proposal) = self
+            .fold
+            .verify_fetched_proposal(epoch, validator, proposal)
+        else {
+            return Vec::new();
+        };
         self.drive(|p, fold| p.on_beacon_proposal_fetched(fold, epoch, validator, proposal))
     }
 
@@ -792,7 +855,7 @@ impl BeaconCoordinator {
     }
 
     #[must_use]
-    pub const fn latest_block(&self) -> &Arc<Verified<CertifiedBeaconBlock>> {
+    pub const fn latest_block(&self) -> &Verified<CertifiedBeaconBlock> {
         &self.fold.latest_block
     }
 
@@ -819,7 +882,7 @@ impl BeaconCoordinator {
     }
 
     #[must_use]
-    pub const fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
+    pub fn current_topology_snapshot(&self) -> &Arc<TopologySnapshot> {
         self.fold.current_topology_snapshot()
     }
 
@@ -829,7 +892,7 @@ impl BeaconCoordinator {
     /// head ([`TopologySchedule::head`]) through it, so no consensus-layer type
     /// crosses into their verification paths.
     #[must_use]
-    pub const fn topology_schedule(&self) -> &TopologySchedule {
+    pub fn topology_schedule(&self) -> &TopologySchedule {
         &self.fold.topology_schedule
     }
 
@@ -864,8 +927,8 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_core::{
-        BeaconFetchIds, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange,
-        TimerId,
+        BeaconBlockCheck, BeaconFetchIds, KeepDelta, ObserveDelta, ParticipantAction,
+        ParticipationChange, TimerId,
     };
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
@@ -886,25 +949,25 @@ mod tests {
     };
 
     use super::*;
-    use crate::participant::MAX_INPUT_DWELL_REARMS;
+    use crate::participant::{MAX_INPUT_DWELL_REARMS, ProposalAdmission};
     use crate::shard_source::ChunkFetchId;
     use crate::{boundary, rules};
 
     /// Reach the participant's and the fold's internals the way the
     /// coordinator's own handlers do.
     impl BeaconCoordinator {
-        fn bootstrap_spc_for_next_epoch(&mut self) -> Vec<Action> {
+        fn bootstrap_spc_for_next_epoch(&mut self) -> Vec<CoordinatorAction> {
             self.drive(BeaconParticipant::bootstrap_spc_for_next_epoch)
         }
 
         fn bootstrap_spc_with_committee(
             &mut self,
             committee: Vec<(ValidatorId, ConsensusPublicKey)>,
-        ) -> Vec<Action> {
+        ) -> Vec<CoordinatorAction> {
             self.drive(|p, fold| p.bootstrap_spc_with_committee(fold, committee))
         }
 
-        fn try_propose(&mut self) -> Vec<Action> {
+        fn try_propose(&mut self) -> Vec<CoordinatorAction> {
             self.drive(BeaconParticipant::try_propose)
         }
 
@@ -914,7 +977,7 @@ mod tests {
             output: &PcVector,
             cert: Verified<SpcCert>,
             recipients: &[ValidatorId],
-        ) -> Vec<Action> {
+        ) -> Vec<CoordinatorAction> {
             self.drive(|p, fold| p.on_spc_output_high(fold, epoch, output, cert, recipients))
         }
 
@@ -942,8 +1005,8 @@ mod tests {
             self.fold.next_epoch_boundary()
         }
 
-        fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<Action> {
-            self.fold.fetch_witness_chunk(shard)
+        fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<CoordinatorAction> {
+            lift(self.fold.fetch_witness_chunk(shard))
         }
 
         fn prune_folded_evidence(&mut self) {
@@ -961,7 +1024,7 @@ mod tests {
 
         /// Commit the local chain's next block, whose own anchor is
         /// `block_anchor`.
-        fn commit_local(&mut self, block_anchor: WeightedTimestamp) -> Vec<Action> {
+        fn commit_local(&mut self, block_anchor: WeightedTimestamp) -> Vec<CoordinatorAction> {
             let token = self.local_chain.expect("a local chain");
             let height = self.fold.hosted[&token].height.inner() + 1;
             let header = boundary_block_header(
@@ -1006,7 +1069,7 @@ mod tests {
     /// on an empty store: build genesis state, hash the config, wrap
     /// the genesis block.
     fn genesis_trio() -> (
-        Arc<Verified<CertifiedBeaconBlock>>,
+        Verified<CertifiedBeaconBlock>,
         BeaconState,
         GenesisConfigHash,
     ) {
@@ -1014,7 +1077,7 @@ mod tests {
         let state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator(), &[]);
         let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
-        (Arc::new(block), state, config_hash)
+        (block, state, config_hash)
     }
 
     fn new_coord(me: ValidatorId) -> BeaconCoordinator {
@@ -1065,7 +1128,7 @@ mod tests {
         state_root: StateRoot,
         root: BeaconWitnessRoot,
         leaf_count: u64,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         let parent_qc = QuorumCertificate::new(
             BlockHash::ZERO,
             shard,
@@ -1098,9 +1161,7 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
         );
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            header, qc,
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
     }
 
     /// A boundary header carrying a synthetic (witnessless) accumulator
@@ -1112,7 +1173,7 @@ mod tests {
         pred_wt: u64,
         state_root: StateRoot,
         leaf_count: u64,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         boundary_block_header_with_root(
             shard,
             height,
@@ -1139,7 +1200,7 @@ mod tests {
         state_root: StateRoot,
         leaf_count: u64,
     ) -> (
-        Arc<Verified<CertifiedBlockHeader>>,
+        Verified<CertifiedBlockHeader>,
         Vec<ShardWitnessPayload>,
         Vec<Hash>,
     ) {
@@ -1173,7 +1234,7 @@ mod tests {
         parent_hash: BlockHash,
         parent_wt: u64,
         leaf_count: u64,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         let parent_qc = QuorumCertificate::new(
             parent_hash,
             shard,
@@ -1207,9 +1268,7 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_wt),
         );
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            header, qc,
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
     }
 
     /// A structural QC naming `block_hash` at weighted timestamp `wt`.
@@ -1479,14 +1538,17 @@ mod tests {
         ));
     }
 
-    /// A gossiped candidate whose `shard_contributions` deviate from
-    /// the canonical projection is dropped before verification is
-    /// dispatched, so honest pool members never prevote a Byzantine
-    /// assembler's variant. The canonical projection of the same
-    /// content dispatches verification normally.
-    #[test]
-    fn malformed_candidate_drops_before_verification_dispatch() {
-        let mut coord = fresh_coord();
+    /// A candidate at `coord`'s pending epoch over one committed boundary
+    /// proposal, built by `contributions` from that boundary's canonical
+    /// contribution: passing it through yields the canonical candidate,
+    /// dropping it a malformed one.
+    fn boundary_candidate(
+        coord: &mut BeaconCoordinator,
+        contributions: impl FnOnce(
+            ShardId,
+            ShardEpochContribution,
+        ) -> BTreeMap<ShardId, ShardEpochContribution>,
+    ) -> Verifiable<CandidateBeaconBlock> {
         let shard = ShardId::leaf(1, 0);
         coord
             .fold
@@ -1506,9 +1568,9 @@ mod tests {
         let epoch = coord.fold.state.current_epoch.next();
         let prev = coord.fold.latest_block.block_hash();
 
-        // The cert content is irrelevant here — the contributions gate
-        // runs before any crypto dispatch — but `SpcCert` has no
-        // structural placeholder, so build a real one.
+        // The cert content is irrelevant to the gates before crypto
+        // dispatch, but `SpcCert` has no structural placeholder, so build
+        // a real one.
         let n = coord.fold.state.committee.len();
         let keys: Vec<_> = (0..n as u64).map(keypair).collect();
         let cert_signers: Vec<_> = coord
@@ -1528,21 +1590,31 @@ mod tests {
             &signer_positions,
             &PcVector::empty(),
         );
-        let candidate_with = |contribs: BTreeMap<ShardId, ShardEpochContribution>| {
-            Arc::new(Verifiable::from(CandidateBeaconBlock::new(
-                BeaconBlock::new_with_contributions(
-                    epoch,
-                    prev,
-                    Capped::new(committed.clone()).expect("a list written out in a test"),
-                    Capped::new(contribs).expect("a map written out in a test"),
-                ),
-                Box::new(cert.clone()),
-            )))
-        };
+        Verifiable::from(CandidateBeaconBlock::new(
+            BeaconBlock::new_with_contributions(
+                epoch,
+                prev,
+                Capped::new(committed).expect("a list written out in a test"),
+                Capped::new(contributions(shard, contribution))
+                    .expect("a map written out in a test"),
+            ),
+            Box::new(cert),
+        ))
+    }
+
+    /// A gossiped candidate whose `shard_contributions` deviate from
+    /// the canonical projection is dropped before verification is
+    /// dispatched, so honest pool members never prevote a Byzantine
+    /// assembler's variant. The canonical projection of the same
+    /// content dispatches verification normally.
+    #[test]
+    fn malformed_candidate_drops_before_verification_dispatch() {
+        let mut coord = fresh_coord();
 
         // Omits the committed shard's contribution — dropped, nothing
         // dispatched, no prevotable value held.
-        let actions = coord.on_beacon_candidate_received(candidate_with(BTreeMap::new()));
+        let malformed = boundary_candidate(&mut coord, |_, _| BTreeMap::new());
+        let actions = coord.on_beacon_candidate_received(malformed);
         assert!(
             actions.is_empty(),
             "malformed candidate must not dispatch verification: {actions:?}",
@@ -1551,12 +1623,54 @@ mod tests {
 
         // The canonical projection dispatches verification — the drop
         // above is the contributions gate, not an earlier check.
-        let actions = coord.on_beacon_candidate_received(candidate_with(
-            std::iter::once((shard, contribution)).collect(),
-        ));
+        let canonical = boundary_candidate(&mut coord, |shard, contribution| {
+            std::iter::once((shard, contribution)).collect()
+        });
+        let actions = coord.on_beacon_candidate_received(canonical);
         assert!(
-            matches!(actions.as_slice(), [Action::VerifyBeaconCandidate { .. }]),
+            matches!(
+                actions.as_slice(),
+                [CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::VerifyBeaconCandidate { .. }
+                ))]
+            ),
             "canonical candidate dispatches verification: {actions:?}",
+        );
+    }
+
+    /// A copy of a candidate whose check fails frees its block hash: the
+    /// hash leaves the cert out, so a forged-cert copy that kept the slot
+    /// would keep the honest copy from ever being checked.
+    #[test]
+    fn a_candidate_failing_its_check_lets_another_copy_be_checked() {
+        let mut coord = fresh_coord();
+        let candidate = boundary_candidate(&mut coord, |shard, contribution| {
+            std::iter::once((shard, contribution)).collect()
+        });
+        let block_hash = candidate.block_hash();
+        let actions = coord.on_beacon_candidate_received(candidate.clone());
+        assert!(matches!(
+            actions.as_slice(),
+            [CoordinatorAction::Participant(BeaconAction::Participant(
+                ParticipantAction::VerifyBeaconCandidate { .. }
+            ))]
+        ));
+
+        let actions = coord.on_beacon_candidate_verified(
+            block_hash,
+            Err(CandidateBeaconBlockVerifyError::BadCert),
+        );
+        assert!(actions.is_empty());
+
+        let actions = coord.on_beacon_candidate_received(candidate);
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::VerifyBeaconCandidate { .. }
+                ))]
+            ),
+            "a second copy is checked after the first failed: {actions:?}",
         );
     }
 
@@ -1566,7 +1680,10 @@ mod tests {
     /// `CoordinatorSim`) perform; lets tests assert the
     /// synchronous-equivalent outcome without manually threading
     /// results back to the coordinator.
-    fn complete_verifications(coord: &mut BeaconCoordinator, actions: Vec<Action>) -> Vec<Action> {
+    fn complete_verifications(
+        coord: &mut BeaconCoordinator,
+        actions: Vec<CoordinatorAction>,
+    ) -> Vec<CoordinatorAction> {
         use hyperscale_types::{
             CandidateVerifyContext, CertifiedBeaconBlockVerifyContext, RatifyVerifyContext,
         };
@@ -1575,13 +1692,13 @@ mod tests {
         let mut out = Vec::new();
         for action in actions {
             match action {
-                Action::VerifyBeaconBlock {
+                CoordinatorAction::Fold(FoldAction::VerifyBeaconBlock(BeaconBlockCheck {
                     block,
                     committee,
                     active_pool,
                     equivocation_signers,
-                } => {
-                    let result = Arc::unwrap_or_clone(block)
+                })) => {
+                    let result = block
                         .upgrade(&CertifiedBeaconBlockVerifyContext {
                             verifier: &BlsVerifier,
                             network: &net,
@@ -1589,29 +1706,32 @@ mod tests {
                             active_pool: &active_pool,
                             equivocation_signers: &equivocation_signers,
                         })
-                        .map(Arc::new)
                         .map_err(|(_, e)| e);
                     let post = coord.on_beacon_block_verified(result);
                     out.extend(complete_verifications(coord, post));
                 }
-                Action::VerifyBeaconCandidate {
-                    candidate,
-                    committee,
-                    equivocation_signers,
-                } => {
-                    let result = Arc::unwrap_or_clone(candidate)
+                CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::VerifyBeaconCandidate {
+                        candidate,
+                        committee,
+                        equivocation_signers,
+                    },
+                )) => {
+                    let block_hash = candidate.block_hash();
+                    let result = candidate
                         .upgrade(&CandidateVerifyContext {
                             verifier: &BlsVerifier,
                             network: &net,
                             committee: &committee,
                             equivocation_signers: &equivocation_signers,
                         })
-                        .map(Arc::new)
                         .map_err(|(_, e)| e);
-                    let post = coord.on_beacon_candidate_verified(result);
+                    let post = coord.on_beacon_candidate_verified(block_hash, result);
                     out.extend(complete_verifications(coord, post));
                 }
-                Action::VerifyRatifyVote { vote, signers } => {
+                CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::VerifyRatifyVote { vote, signers },
+                )) => {
                     let anchor = vote.anchor_hash();
                     let epoch = vote.epoch();
                     let round = vote.round();
@@ -1648,7 +1768,7 @@ mod tests {
         let block_hash = block.block_hash();
         let coord = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
-            Arc::clone(&block),
+            block,
             vec![state],
             ValidatorId::new(0),
             ShardId::ROOT,
@@ -1704,7 +1824,7 @@ mod tests {
         );
         let _coord = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
-            Arc::new(mismatched_block),
+            mismatched_block,
             vec![state],
             ValidatorId::new(0),
             ShardId::ROOT,
@@ -1764,17 +1884,24 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastRatifyVote { .. })),
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote { .. })
+                )),
             "an early fire must not vote; got {actions:?}",
         );
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::SetTimer {
-                    id: TimerId::BeaconRatifyTrigger,
-                    ..
-                }
-            )),
+            actions
+                .iter()
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::SetTimer {
+                        id: TimerId::BeaconRatifyTrigger,
+                        ..
+                    }
+                )),
             "an early fire must re-arm — a dead timer chain kills the \
              validator's skip machinery; got {actions:?}",
         );
@@ -1782,21 +1909,24 @@ mod tests {
         coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms));
         let actions = coord.on_beacon_ratify_timer();
         assert!(
-            actions.iter().any(|a| matches!(
+            actions.iter().filter_map(CoordinatorAction::participant).any(|a| matches!(
                 a,
-                Action::SignAndBroadcastRatifyVote { epoch, phase: RatifyPhase::Prevote, block_hash, .. }
+                BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote { epoch, phase: RatifyPhase::Prevote, block_hash, .. })
                     if epoch.inner() == 1 && *block_hash == skip_hash
             )),
             "a fire past the deadline must prevote the skip hash; got {actions:?}",
         );
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::SetTimer {
-                    id: TimerId::BeaconRatifyTrigger,
-                    ..
-                }
-            )),
+            actions
+                .iter()
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::SetTimer {
+                        id: TimerId::BeaconRatifyTrigger,
+                        ..
+                    }
+                )),
             "the timer must re-arm for the next round; got {actions:?}",
         );
         assert_eq!(coord.participant.ratify.round(), RatifyRound::INITIAL);
@@ -1813,13 +1943,16 @@ mod tests {
         let actions = coord.on_beacon_ratify_timer();
         assert_eq!(coord.participant.ratify.round(), RatifyRound::INITIAL);
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::SetTimer {
-                    id: TimerId::BeaconRatifyTrigger,
-                    duration,
-                } if *duration == Duration::from_millis(1)
-            )),
+            actions
+                .iter()
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::SetTimer {
+                        id: TimerId::BeaconRatifyTrigger,
+                        duration,
+                    } if *duration == Duration::from_millis(1)
+                )),
             "an early round fire must re-arm at the boundary; got {actions:?}",
         );
 
@@ -1832,9 +1965,9 @@ mod tests {
         let _ = coord.on_beacon_ratify_timer();
         assert_eq!(coord.participant.ratify.round(), RatifyRound::new(2));
         assert!(
-            actions.iter().any(|a| matches!(
+            actions.iter().filter_map(CoordinatorAction::participant).any(|a| matches!(
                 a,
-                Action::SignAndBroadcastRatifyVote { round, phase: RatifyPhase::Prevote, block_hash, .. }
+                BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote { round, phase: RatifyPhase::Prevote, block_hash, .. })
                     if *round == RatifyRound::new(2) && *block_hash == skip_hash
             )),
             "a round timeout must re-prevote in the new round; got {actions:?}",
@@ -1855,10 +1988,11 @@ mod tests {
             .try_into()
             .expect("SKIP_TIMEOUT fits in u64 millis");
         let pending = coord.current_state().current_epoch.next();
-        let asks = |actions: &[Action]| {
+        let asks = |actions: &[CoordinatorAction]| {
             actions
                 .iter()
-                .any(|a| matches!(a, Action::StartBeaconBlockSync { target } if *target == pending))
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(a, BeaconAction::StartBeaconBlockSync { target } if *target == pending))
         };
 
         coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms - 1));
@@ -1963,7 +2097,12 @@ mod tests {
             vote,
         );
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], Action::VerifyPcVote1 { .. }));
+        assert!(matches!(
+            actions[0].participant(),
+            Some(BeaconAction::Participant(
+                ParticipantAction::VerifyPcVote1 { .. }
+            ))
+        ));
         assert_eq!(coord.verifications_in_flight(), 1);
     }
 
@@ -1983,7 +2122,13 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::BuildAndBroadcastBeaconProposal { .. })),
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::Participant(
+                        ParticipantAction::BuildAndBroadcastBeaconProposal { .. }
+                    )
+                )),
             "expected BuildAndBroadcastBeaconProposal in {actions:?}",
         );
     }
@@ -2043,7 +2188,12 @@ mod tests {
         // First vote dispatches one verification.
         let first = coord.on_unverified_ratify_vote_received(vote(0));
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0], Action::VerifyRatifyVote { .. }));
+        assert!(matches!(
+            first[0].participant(),
+            Some(BeaconAction::Participant(
+                ParticipantAction::VerifyRatifyVote { .. }
+            ))
+        ));
         assert_eq!(coord.verifications_in_flight(), 1);
 
         // Same tuple, different signature — deduped before dispatch.
@@ -2093,7 +2243,12 @@ mod tests {
         )));
         let redispatched = coord.on_unverified_ratify_vote_received(retry);
         assert_eq!(redispatched.len(), 1);
-        assert!(matches!(redispatched[0], Action::VerifyRatifyVote { .. }));
+        assert!(matches!(
+            redispatched[0].participant(),
+            Some(BeaconAction::Participant(
+                ParticipantAction::VerifyRatifyVote { .. }
+            ))
+        ));
     }
 
     #[test]
@@ -2114,11 +2269,24 @@ mod tests {
         assert_eq!(spc_view_first, spc_view_second);
     }
 
-    fn sample_proposal(seed: u8) -> Arc<Verified<BeaconProposal>> {
+    /// What `coord`'s participant makes of `from`'s proposal for the
+    /// in-flight epoch.
+    fn judge(
+        coord: &mut BeaconCoordinator,
+        from: ValidatorId,
+        proposal: Verified<BeaconProposal>,
+    ) -> (ProposalAdmission, Vec<BeaconAction>) {
+        coord.participant.on_beacon_proposal_received(
+            &coord.fold,
+            from,
+            Epoch::GENESIS.next(),
+            proposal,
+        )
+    }
+
+    fn sample_proposal(seed: u8) -> Verified<BeaconProposal> {
         use hyperscale_types::VrfProof;
-        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
-            VrfProof::new([seed; 96]),
-        )))
+        Verified::new_unchecked_for_test(BeaconProposal::vrf_only(VrfProof::new([seed; 96])))
     }
 
     #[test]
@@ -2148,7 +2316,11 @@ mod tests {
         coord.bootstrap_spc_for_next_epoch();
 
         let actions = coord.try_propose();
-        let [Action::BuildAndBroadcastBeaconProposal { fork_proofs, .. }] = actions.as_slice()
+        let [
+            CoordinatorAction::Participant(BeaconAction::Participant(
+                ParticipantAction::BuildAndBroadcastBeaconProposal { fork_proofs, .. },
+            )),
+        ] = actions.as_slice()
         else {
             panic!("expected BuildAndBroadcastBeaconProposal, got {actions:?}");
         };
@@ -2173,17 +2345,22 @@ mod tests {
         let proof = shard_fork_proof(&committee, ShardId::ROOT, BlockHeight::new(5));
         let fork_proofs: BTreeMap<ShardId, ShardForkProof> =
             std::iter::once((ShardId::ROOT, proof)).collect();
-        let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+        let proposal = Verified::new_unchecked_for_test(BeaconProposal::new(
             BTreeMap::new(),
             Vec::new(),
             fork_proofs,
             Vec::new(),
             VrfProof::ZERO,
-        )));
+        ));
 
-        let actions = coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal);
+        let (admission, actions) = judge(&mut coord, from, proposal);
         assert!(actions.is_empty());
         assert!(!coord.participant.proposal_pool.contains(from));
+        assert_eq!(
+            admission,
+            ProposalAdmission::Abstained,
+            "a QC judged against this member's schedule refutes nothing",
+        );
     }
 
     /// A fork proof keyed under a shard other than its own is inadmissible
@@ -2221,7 +2398,7 @@ mod tests {
         };
         let state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator(), &[]);
-        let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
         let mut coord = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
             block,
@@ -2238,13 +2415,13 @@ mod tests {
         let proposal = |key: ShardId| {
             let fork_proofs: BTreeMap<ShardId, ShardForkProof> =
                 std::iter::once((key, proof.clone())).collect();
-            Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+            Verified::new_unchecked_for_test(BeaconProposal::new(
                 BTreeMap::new(),
                 Vec::new(),
                 fork_proofs,
                 Vec::new(),
                 VrfProof::ZERO,
-            )))
+            ))
         };
 
         // Control: keyed under its own shard, the proposal pools.
@@ -2254,7 +2431,7 @@ mod tests {
         // Re-keyed under a foreign shard: dropped.
         let mut coord2 = {
             let state = build_genesis_beacon_state(&config);
-            let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+            let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
             BeaconCoordinator::new(
                 Arc::new(BlsVerifier),
                 block,
@@ -2266,12 +2443,54 @@ mod tests {
                 config_hash,
             )
         };
-        coord2.on_beacon_proposal_received(
-            from,
-            Epoch::GENESIS.next(),
-            proposal(ShardId::leaf(1, 0)),
-        );
+        let (admission, _) = judge(&mut coord2, from, proposal(ShardId::leaf(1, 0)));
         assert!(!coord2.participant.proposal_pool.contains(from));
+        assert_eq!(
+            admission,
+            ProposalAdmission::Refuted,
+            "the proposal's own framing is false",
+        );
+    }
+
+    /// A proposal whose equivocation evidence fails under the accused's
+    /// registered key is refuted: no honest proposer carries it. Evidence
+    /// naming a validator this fold has not registered is not judged.
+    #[test]
+    fn forged_equivocation_evidence_refutes_a_proposal() {
+        use hyperscale_types::{
+            ConsensusSignature, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, SpcView,
+            VrfProof,
+        };
+
+        let accusing = |validator: ValidatorId| {
+            Verified::new_unchecked_for_test(BeaconProposal::new(
+                BTreeMap::new(),
+                vec![PcVoteEquivocation {
+                    validator,
+                    epoch: Epoch::GENESIS.next(),
+                    view: SpcView::new(0),
+                    round: PcVoteRound::Vote1,
+                    value_a: PcVector::new([PcValueElement::new([0xAA; 32])]),
+                    sig_a: ConsensusSignature::ZERO,
+                    value_b: PcVector::new([PcValueElement::new([0xBB; 32])]),
+                    sig_b: ConsensusSignature::ZERO,
+                }],
+                BTreeMap::new(),
+                Vec::new(),
+                VrfProof::ZERO,
+            ))
+        };
+        let from = ValidatorId::new(1);
+
+        let mut coord = fresh_coord();
+        let (admission, _) = judge(&mut coord, from, accusing(ValidatorId::new(2)));
+        assert_eq!(admission, ProposalAdmission::Refuted);
+        assert!(!coord.participant.proposal_pool.contains(from));
+
+        let mut coord = fresh_coord();
+        let (admission, _) = judge(&mut coord, from, accusing(ValidatorId::new(999)));
+        assert_eq!(admission, ProposalAdmission::Abstained);
+        assert!(!coord.participant.proposal_pool.contains(from));
     }
 
     /// A coordinator at genesis whose root committee holds `pubkeys` in
@@ -2301,7 +2520,7 @@ mod tests {
         };
         let state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator(), &[]);
-        let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        let block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
         BeaconCoordinator::new(
             Arc::new(BlsVerifier),
             block,
@@ -2376,10 +2595,7 @@ mod tests {
             .into_inner()
         };
         let certified = |header: &BlockHeader, qc: &QuorumCertificate| {
-            Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-                header.clone(),
-                qc.clone(),
-            )))
+            Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header.clone(), qc.clone()))
         };
 
         // `B` anchors short of the cut and is certified past it; `C`
@@ -2395,12 +2611,12 @@ mod tests {
         let d_qc = qc_over(&d, cut + 3);
 
         let from = ValidatorId::new(1);
-        let proposal = Arc::new(Verified::new_unchecked_for_test(proposal_with_boundary(
-            shard,
-            b_qc.clone(),
-        )));
+        let proposal =
+            Verified::new_unchecked_for_test(proposal_with_boundary(shard, b_qc.clone()));
         let mut actions = coord.on_certified_local_header(&certified(&a, &a_qc));
-        actions.extend(coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal));
+        let (admission, received) = judge(&mut coord, from, proposal);
+        assert_eq!(admission, ProposalAdmission::Abstained);
+        actions.extend(lift(received));
         actions.extend(coord.on_certified_local_header(&certified(&b, &b_qc)));
         actions.extend(coord.on_certified_local_header(&certified(&c, &c_qc)));
         assert!(
@@ -2416,13 +2632,16 @@ mod tests {
             "the block that commits the dating child releases the proposal into the pool",
         );
         assert!(
-            !actions.iter().any(|action| matches!(
-                action,
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(_)),
-                    ..
-                })
-            )),
+            !actions
+                .iter()
+                .filter_map(CoordinatorAction::fold)
+                .any(|action| matches!(
+                    action,
+                    FoldAction::Fetch {
+                        ids: BeaconFetchIds::Witnesses(_),
+                        ..
+                    }
+                )),
             "certification fetches no witness chunk: {actions:?}",
         );
     }
@@ -2435,7 +2654,6 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one certified chain built and walked end to end
     fn a_commit_proof_one_participant_asked_for_releases_its_awaiting_proposal() {
-        use hyperscale_core::ProtocolEvent;
         use hyperscale_types::test_utils::TestCommittee;
         use hyperscale_types::{BlockVote, ProposerTimestamp};
 
@@ -2489,10 +2707,7 @@ mod tests {
             .into_inner()
         };
         let certified = |header: &BlockHeader, qc: &QuorumCertificate| {
-            Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-                header.clone(),
-                qc.clone(),
-            )))
+            Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header.clone(), qc.clone()))
         };
 
         // `B` anchors short of the cut and is certified past it; `C`
@@ -2508,10 +2723,8 @@ mod tests {
         let d_qc = qc_over(&d, cut + 3);
 
         let from = ValidatorId::new(1);
-        let proposal = Arc::new(Verified::new_unchecked_for_test(proposal_with_boundary(
-            shard,
-            b_qc.clone(),
-        )));
+        let proposal =
+            Verified::new_unchecked_for_test(proposal_with_boundary(shard, b_qc.clone()));
         let mut actions = coord.on_certified_local_header(&certified(&a, &a_qc));
         actions.extend(coord.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal));
         actions.extend(coord.on_certified_local_header(&certified(&b, &b_qc)));
@@ -2522,11 +2735,11 @@ mod tests {
         );
         let asked: Vec<(ShardId, BlockHeight)> = actions
             .iter()
-            .filter_map(|action| match action {
-                Action::Continuation(ProtocolEvent::CommitProofNeeded {
+            .filter_map(|action| match action.participant()? {
+                BeaconAction::AskCommitProof {
                     source_shard,
                     block_height,
-                }) => Some((*source_shard, *block_height)),
+                } => Some((*source_shard, *block_height)),
                 _ => None,
             })
             .collect();
@@ -2585,13 +2798,13 @@ mod tests {
         let proposal = || {
             let fork_proofs: BTreeMap<ShardId, ShardForkProof> =
                 std::iter::once((ShardId::ROOT, proof.clone())).collect();
-            Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+            Verified::new_unchecked_for_test(BeaconProposal::new(
                 BTreeMap::new(),
                 Vec::new(),
                 fork_proofs,
                 Vec::new(),
                 VrfProof::ZERO,
-            )))
+            ))
         };
         // The root's split has applied: its children hold the lookahead
         // and the root is in its last window.
@@ -2666,14 +2879,16 @@ mod tests {
         let actions = coord.try_propose();
         let in_flight = Epoch::GENESIS.next();
         let [
-            Action::BuildAndBroadcastBeaconProposal {
-                epoch,
-                boundary_qcs,
-                equivocations,
-                fork_proofs,
-                vote_equivocations: _,
-                recipients,
-            },
+            CoordinatorAction::Participant(BeaconAction::Participant(
+                ParticipantAction::BuildAndBroadcastBeaconProposal {
+                    epoch,
+                    boundary_qcs,
+                    equivocations,
+                    fork_proofs,
+                    vote_equivocations: _,
+                    recipients,
+                },
+            )),
         ] = actions.as_slice()
         else {
             panic!("expected BuildAndBroadcastBeaconProposal, got {actions:?}");
@@ -2713,11 +2928,13 @@ mod tests {
         assert!(coord.try_propose().is_empty());
     }
 
-    fn proposal_equivocations(actions: &[Action]) -> &[PcVoteEquivocation] {
+    fn proposal_equivocations(actions: &[CoordinatorAction]) -> &[PcVoteEquivocation] {
         match actions {
-            [Action::BuildAndBroadcastBeaconProposal { equivocations, .. }] => {
-                equivocations.as_slice()
-            }
+            [
+                CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::BuildAndBroadcastBeaconProposal { equivocations, .. },
+                )),
+            ] => equivocations.as_slice(),
             other => panic!("expected single BuildAndBroadcastBeaconProposal, got {other:?}"),
         }
     }
@@ -2827,7 +3044,15 @@ mod tests {
             admitted += 1;
             if actions
                 .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastPcVote1 { .. }))
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| {
+                    matches!(
+                        a,
+                        BeaconAction::Participant(
+                            ParticipantAction::SignAndBroadcastPcVote1 { .. }
+                        )
+                    )
+                })
             {
                 fed_at = Some(admitted);
                 break;
@@ -2855,13 +3080,16 @@ mod tests {
         let mut coord = fresh_coord();
         let actions = coord.bootstrap_spc_for_next_epoch();
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::SetTimer {
-                    id: TimerId::BeaconSpcInputDwell,
-                    ..
-                }
-            )),
+            actions
+                .iter()
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::SetTimer {
+                        id: TimerId::BeaconSpcInputDwell,
+                        ..
+                    }
+                )),
             "bootstrap arms the proposal-collection dwell",
         );
         let me = coord.me();
@@ -2874,13 +3102,16 @@ mod tests {
         for _ in 0..MAX_INPUT_DWELL_REARMS {
             let actions = coord.on_spc_input_dwell_timer();
             assert!(
-                actions.iter().any(|a| matches!(
-                    a,
-                    Action::SetTimer {
-                        id: TimerId::BeaconSpcInputDwell,
-                        ..
-                    }
-                )),
+                actions
+                    .iter()
+                    .filter_map(CoordinatorAction::participant)
+                    .any(|a| matches!(
+                        a,
+                        BeaconAction::SetTimer {
+                            id: TimerId::BeaconSpcInputDwell,
+                            ..
+                        }
+                    )),
                 "incomplete coverage re-arms the dwell: {actions:?}",
             );
             assert!(!coord.participant.spc.view_one_input_fed());
@@ -2891,7 +3122,11 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::SignAndBroadcastPcVote1 { .. })),
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::Participant(ParticipantAction::SignAndBroadcastPcVote1 { .. })
+                )),
             "expected SignAndBroadcastPcVote1 in {actions:?}",
         );
         assert!(coord.participant.spc.view_one_input_fed());
@@ -2923,12 +3158,12 @@ mod tests {
         let actions = coord.on_spc_input_dwell_timer();
         let asks: Vec<(ValidatorId, Option<ValidatorId>)> = actions
             .iter()
-            .filter_map(|action| match action {
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::Beacon(BeaconFetchIds::Proposals(ids)),
+            .filter_map(|action| match action.participant()? {
+                BeaconAction::Fetch {
+                    ids: BeaconFetchIds::Proposals(ids),
                     preferred,
                     ..
-                }) => Some((ids[0].1, *preferred)),
+                } => Some((ids[0].1, *preferred)),
                 _ => None,
             })
             .collect();
@@ -3021,7 +3256,7 @@ mod tests {
         coord: &BeaconCoordinator,
         epoch: Epoch,
         prev_hash: BeaconBlockHash,
-    ) -> Arc<Verifiable<CertifiedBeaconBlock>> {
+    ) -> Verifiable<CertifiedBeaconBlock> {
         let n = coord.fold.state.committee.len();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -3045,13 +3280,13 @@ mod tests {
         );
         let block = BeaconBlock::new(epoch, prev_hash, Capped::empty());
         let ratify = ratify_cert_for_block(coord, &block);
-        Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
+        Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
             BeaconCert::Normal {
                 spc: Box::new(cert),
                 ratify,
             },
-        )))
+        ))
     }
 
     /// Like `valid_block_at`, but carrying one committed proposal (a
@@ -3064,7 +3299,7 @@ mod tests {
         coord: &BeaconCoordinator,
         epoch: Epoch,
         prev_hash: BeaconBlockHash,
-    ) -> Arc<Verifiable<CertifiedBeaconBlock>> {
+    ) -> Verifiable<CertifiedBeaconBlock> {
         let n = coord.fold.state.committee.len();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -3101,13 +3336,13 @@ mod tests {
             Capped::from_array([(committee[0].0, proposal)]),
         );
         let ratify = ratify_cert_for_block(coord, &block);
-        Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
+        Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
             BeaconCert::Normal {
                 spc: Box::new(cert),
                 ratify,
             },
-        )))
+        ))
     }
 
     #[test]
@@ -3117,9 +3352,7 @@ mod tests {
         // tip's perspective. `on_beacon_block_received` should drop it
         // before even inspecting the cert.
         let _prev = coord.fold.latest_block.block_hash();
-        let block = Arc::new(Verifiable::from(CertifiedBeaconBlock::genesis(
-            GenesisConfigHash::ZERO,
-        )));
+        let block = Verifiable::from(CertifiedBeaconBlock::genesis(GenesisConfigHash::ZERO));
         let actions = coord.on_beacon_block_received(block);
         assert!(actions.is_empty());
         assert_eq!(coord.fold.state.current_epoch, Epoch::GENESIS);
@@ -3136,7 +3369,8 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::StartBeaconBlockSync { target } if target == Epoch::new(5)
+            CoordinatorAction::Fold(FoldAction::StartBeaconBlockSync { target })
+                if target == Epoch::new(5)
         ));
         assert_eq!(coord.fold.state.current_epoch, Epoch::GENESIS);
     }
@@ -3177,7 +3411,7 @@ mod tests {
     /// deadline passed, one verified precommit for the skip hash per
     /// pool member, cert assembly, adoption. Returns the broadcast
     /// skip block.
-    fn adopt_skip_block(coord: &mut BeaconCoordinator) -> Arc<Verified<CertifiedBeaconBlock>> {
+    fn adopt_skip_block(coord: &mut BeaconCoordinator) -> Verified<CertifiedBeaconBlock> {
         pass_skip_deadline(coord);
         let skip_hash = coord.participant.ratify.skip_block_hash();
         let mut adopted = None;
@@ -3191,7 +3425,10 @@ mod tests {
             );
             let actions = coord.on_verified_ratify_vote_received(vote);
             for action in actions {
-                if let Action::BroadcastBeaconBlock { block } = action {
+                if let CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::BroadcastBeaconBlock { block },
+                )) = action
+                {
                     adopted = Some(block);
                 }
             }
@@ -3213,7 +3450,7 @@ mod tests {
         coord_a.set_now(LocalTimestamp::from_millis(2 * ed));
         let genesis_tip = coord_a.fold.latest_block.block_hash();
         let normal = valid_nonempty_block_at(&coord_a, Epoch::new(1), genesis_tip);
-        let dispatched = coord_a.on_beacon_block_received(Arc::clone(&normal));
+        let dispatched = coord_a.on_beacon_block_received(normal);
         let _ = complete_verifications(&mut coord_a, dispatched);
         assert_eq!(coord_a.current_epoch(), Epoch::new(1));
 
@@ -3232,14 +3469,13 @@ mod tests {
         // Contact: the skip block reaches A. Its cert is dispatched for
         // verification against the pool that governed epoch 1, and the
         // verified competitor halts the replica.
-        let competitor = Arc::new(Verifiable::from(
-            Arc::unwrap_or_clone(skip_block).into_inner(),
-        ));
+        let competitor = Verifiable::from(skip_block.into_inner());
         let dispatched = coord_a.on_beacon_block_received(competitor);
         assert!(
-            dispatched
-                .iter()
-                .any(|a| matches!(a, Action::VerifyBeaconBlock { .. })),
+            dispatched.iter().any(|a| matches!(
+                a,
+                CoordinatorAction::Fold(FoldAction::VerifyBeaconBlock(..))
+            )),
             "a tip competitor must be verified, not silently dropped",
         );
         let _ = complete_verifications(&mut coord_a, dispatched);
@@ -3260,11 +3496,10 @@ mod tests {
         assert_eq!(coord.current_epoch(), Epoch::new(1));
 
         let dispatched = coord.on_beacon_block_received(normal);
-        assert!(
-            dispatched
-                .iter()
-                .any(|a| matches!(a, Action::VerifyBeaconBlock { .. })),
-        );
+        assert!(dispatched.iter().any(|a| matches!(
+            a,
+            CoordinatorAction::Fold(FoldAction::VerifyBeaconBlock(..))
+        )),);
         let _ = complete_verifications(&mut coord, dispatched);
     }
 
@@ -3321,27 +3556,33 @@ mod tests {
         let prev = coord.fold.latest_block.block_hash();
         let block = valid_block_at(&coord, Epoch::new(1), prev);
         let block_hash = block.block_hash();
-        let dispatched = coord.on_beacon_block_received(Arc::clone(&block));
+        let dispatched = coord.on_beacon_block_received(block);
 
         // Cert verification is offloaded — the immediate handler emits
         // exactly one `VerifyBeaconBlock` action.
-        let [Action::VerifyBeaconBlock { .. }] = dispatched.as_slice() else {
+        let [CoordinatorAction::Fold(FoldAction::VerifyBeaconBlock(..))] = dispatched.as_slice()
+        else {
             panic!("expected single VerifyBeaconBlock, got {dispatched:?}");
         };
         assert!(coord.fold.verification.is_block_in_flight(block_hash));
 
         let actions = complete_verifications(&mut coord, dispatched);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                CoordinatorAction::Fold(FoldAction::CommitBeaconBlock { .. })
+            )),
             "expected CommitBeaconBlock in {actions:?}",
         );
         // Adoption skips re-broadcast — peer is disseminating.
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::BroadcastBeaconBlock { .. })),
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::Participant(ParticipantAction::BroadcastBeaconBlock { .. })
+                )),
             "adoption path should not re-broadcast",
         );
         assert_eq!(coord.fold.state.current_epoch, Epoch::new(1));
@@ -3366,7 +3607,7 @@ mod tests {
         // `fresh_coord` is at now = 0, before any epoch boundary.
         let prev = coord.fold.latest_block.block_hash();
         let block = valid_block_at(&coord, Epoch::new(1), prev);
-        let dispatched = coord.on_beacon_block_received(Arc::clone(&block));
+        let dispatched = coord.on_beacon_block_received(block);
         let actions = complete_verifications(&mut coord, dispatched);
 
         assert_eq!(coord.fold.state.current_epoch, Epoch::new(1));
@@ -3375,13 +3616,16 @@ mod tests {
             "caught up to wall-clock: must not bootstrap the next epoch's SPC early",
         );
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::SetTimer {
-                    id: TimerId::BeaconCommitteeStart,
-                    ..
-                }
-            )),
+            actions
+                .iter()
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::SetTimer {
+                        id: TimerId::BeaconCommitteeStart,
+                        ..
+                    }
+                )),
             "must arm BeaconCommitteeStart for the boundary, got {actions:?}",
         );
 
@@ -3401,13 +3645,14 @@ mod tests {
         let block = valid_block_at(&observer, Epoch::new(1), prev);
         let block_hash = block.block_hash();
 
-        let dispatched = observer.on_beacon_block_received(Arc::clone(&block));
+        let dispatched = observer.on_beacon_block_received(block);
         let actions = complete_verifications(&mut observer, dispatched);
         // Off-committee observers still advance state via apply_epoch.
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                CoordinatorAction::Fold(FoldAction::CommitBeaconBlock { .. })
+            )),
             "expected CommitBeaconBlock in {actions:?}",
         );
         assert_eq!(observer.current_epoch(), Epoch::new(1));
@@ -3429,12 +3674,13 @@ mod tests {
             let prev = observer.fold.latest_block.block_hash();
             let block = valid_block_at(&observer, Epoch::new(epoch), prev);
             let block_hash = block.block_hash();
-            let dispatched = observer.on_beacon_block_received(Arc::clone(&block));
+            let dispatched = observer.on_beacon_block_received(block);
             let actions = complete_verifications(&mut observer, dispatched);
             assert!(
-                actions
-                    .iter()
-                    .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+                actions.iter().any(|a| matches!(
+                    a,
+                    CoordinatorAction::Fold(FoldAction::CommitBeaconBlock { .. })
+                )),
                 "epoch {epoch}: expected CommitBeaconBlock in {actions:?}",
             );
             assert_eq!(observer.current_epoch(), Epoch::new(epoch));
@@ -3546,10 +3792,10 @@ mod tests {
                 .shard_source
                 .is_pending_fetch(shard, anchor, 0, 2)
         );
-        let abandoned = actions.iter().any(|a| {
+        let abandoned = actions.iter().filter_map(CoordinatorAction::fold).any(|a| {
             matches!(
                 a,
-                Action::AbandonFetch(FetchIds::Beacon(BeaconFetchIds::Witnesses(ids)))
+                FoldAction::AbandonFetch(BeaconFetchIds::Witnesses(ids))
                     if ids.contains(&(shard, height, anchor, LeafIndex::new(0), LeafIndex::new(2)))
             )
         });
@@ -3622,24 +3868,27 @@ mod tests {
         // The divergent position can't be reconstructed locally, so the
         // node fetches it rather than adopting a fork: no commit, tip
         // unmoved, and a BeaconProposal fetch for the divergent proposer.
-        let kinds: Vec<&str> = actions.iter().map(Action::type_name).collect();
+        let kinds: Vec<&str> = actions.iter().map(CoordinatorAction::type_name).collect();
         assert!(
             !kinds.contains(&"CommitBeaconBlock"),
             "must not adopt a block omitting a committed position, got {kinds:?}",
         );
         assert_eq!(coord.fold.state.current_epoch, Epoch::GENESIS);
-        let fetches_divergent = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::Beacon(BeaconFetchIds::Proposals(wanted)),
-                    ..
-                })
-                    if wanted
-                        .iter()
-                        .any(|(_, validator)| *validator == committee[divergent_pos])
-            )
-        });
+        let fetches_divergent = actions
+            .iter()
+            .filter_map(CoordinatorAction::participant)
+            .any(|a| {
+                matches!(
+                    a,
+                    BeaconAction::Fetch {
+                        ids: BeaconFetchIds::Proposals(wanted),
+                        ..
+                    }
+                        if wanted
+                            .iter()
+                            .any(|(_, validator)| *validator == committee[divergent_pos])
+                )
+            });
         assert!(
             fetches_divergent,
             "expected a BeaconProposal fetch for the divergent proposer, got {kinds:?}",
@@ -3699,7 +3948,7 @@ mod tests {
         // The SPC cert authenticates the content only: OutputHigh
         // produces the candidate broadcast plus the local prevote for
         // its hash — commitment waits for the pool.
-        let kinds: Vec<&str> = actions.iter().map(Action::type_name).collect();
+        let kinds: Vec<&str> = actions.iter().map(CoordinatorAction::type_name).collect();
         assert!(
             !kinds.contains(&"CommitBeaconBlock"),
             "nothing commits before the ratify cert, got {kinds:?}",
@@ -3714,9 +3963,9 @@ mod tests {
             .candidate()
             .expect("the assembled candidate's hash feeds the tracker");
         assert!(
-            actions.iter().any(|a| matches!(
+            actions.iter().filter_map(CoordinatorAction::participant).any(|a| matches!(
                 a,
-                Action::SignAndBroadcastRatifyVote { phase: RatifyPhase::Prevote, block_hash, .. }
+                BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote { phase: RatifyPhase::Prevote, block_hash, .. })
                     if *block_hash == candidate_hash
             )),
             "expected a prevote for the candidate's hash in {actions:?}",
@@ -3779,7 +4028,7 @@ mod tests {
             .candidate()
             .expect("candidate held");
 
-        let mut emitted: Vec<Action> = Vec::new();
+        let mut emitted: Vec<CoordinatorAction> = Vec::new();
         for i in 0..u64::try_from(n).unwrap() {
             let vote = signed_ratify_vote(
                 &coord,
@@ -3797,7 +4046,7 @@ mod tests {
             coord.fold.latest_block.cert(),
             BeaconCert::Normal { .. }
         ));
-        let kinds: Vec<&str> = emitted.iter().map(Action::type_name).collect();
+        let kinds: Vec<&str> = emitted.iter().map(CoordinatorAction::type_name).collect();
         assert!(
             kinds.contains(&"CommitBeaconBlock") && kinds.contains(&"BroadcastBeaconBlock"),
             "expected commit + broadcast after ratification, got {kinds:?}",
@@ -3837,7 +4086,11 @@ mod tests {
             coord
                 .on_unverified_ratify_vote_received(wire)
                 .iter()
-                .any(|a| matches!(a, Action::VerifyRatifyVote { .. })),
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::Participant(ParticipantAction::VerifyRatifyVote { .. })
+                )),
             "a pre-deadline vote must still be delegated for verification",
         );
     }
@@ -3896,10 +4149,13 @@ mod tests {
         )));
         let actions = coord.on_unverified_ratify_vote_received(future_epoch);
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::StartBeaconBlockSync { target, .. } if *target == Epoch::new(98)
-            )),
+            actions
+                .iter()
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::StartBeaconBlockSync { target, .. } if *target == Epoch::new(98)
+                )),
             "a vote ratifying a future epoch reveals missing beacon blocks \
              and must trigger gap-fill sync toward its anchor epoch; got {actions:?}",
         );
@@ -3983,7 +4239,12 @@ mod tests {
         let dispatched = coord.on_unverified_ratify_vote_received(vote);
         // Synchronous validation passes (signer in pool, anchor + epoch
         // match) — so a verify action is dispatched.
-        let [Action::VerifyRatifyVote { .. }] = dispatched.as_slice() else {
+        let [
+            CoordinatorAction::Participant(BeaconAction::Participant(
+                ParticipantAction::VerifyRatifyVote { .. },
+            )),
+        ] = dispatched.as_slice()
+        else {
             panic!("expected single VerifyRatifyVote, got {dispatched:?}");
         };
         let actions = complete_verifications(&mut coord, dispatched);
@@ -4082,7 +4343,7 @@ mod tests {
                 )
             })
             .collect();
-        let mut emitted: Vec<Action> = Vec::new();
+        let mut emitted: Vec<CoordinatorAction> = Vec::new();
         for vote in votes {
             let dispatched = coord.on_unverified_ratify_vote_received(vote);
             emitted.extend(complete_verifications(&mut coord, dispatched));
@@ -4102,14 +4363,19 @@ mod tests {
         assert!(
             emitted
                 .iter()
-                .any(|a| matches!(a, Action::BroadcastBeaconBlock { .. })),
+                .filter_map(CoordinatorAction::participant)
+                .any(|a| matches!(
+                    a,
+                    BeaconAction::Participant(ParticipantAction::BroadcastBeaconBlock { .. })
+                )),
             "expected BroadcastBeaconBlock in {emitted:?}",
         );
         // Commit emitted alongside.
         assert!(
-            emitted
-                .iter()
-                .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+            emitted.iter().any(|a| matches!(
+                a,
+                CoordinatorAction::Fold(FoldAction::CommitBeaconBlock { .. })
+            )),
             "expected CommitBeaconBlock in {emitted:?}",
         );
         // Ratification restarted for the new pending epoch.
@@ -4213,7 +4479,7 @@ mod tests {
     ) -> (
         Vec<ShardWitnessPayload>,
         Vec<Hash>,
-        Arc<Verified<CertifiedBlockHeader>>,
+        Verified<CertifiedBlockHeader>,
     ) {
         let payloads: Vec<ShardWitnessPayload> = (lo..hi)
             .map(|i| ShardWitnessPayload::StakeDeposit {
@@ -4254,9 +4520,8 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1_000),
         );
-        let certified_header = Arc::new(Verified::new_unchecked_for_test(
-            CertifiedBlockHeader::new(header, qc),
-        ));
+        let certified_header =
+            Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc));
         (payloads, range_proof, certified_header)
     }
 
@@ -4292,11 +4557,11 @@ mod tests {
 
         let (lo, hi) = actions
             .iter()
-            .find_map(|a| match a {
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(runs)),
+            .find_map(|a| match a.fold()? {
+                FoldAction::Fetch {
+                    ids: BeaconFetchIds::Witnesses(runs),
                     ..
-                }) => runs.first().map(|(_, _, _, lo, hi)| (*lo, *hi)),
+                } => runs.first().map(|(_, _, _, lo, hi)| (*lo, *hi)),
                 _ => None,
             })
             .expect("expected a ShardWitnesses fetch");
@@ -4333,10 +4598,10 @@ mod tests {
         assert!(
             asked.iter().any(|action| matches!(
                 action,
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(runs)),
+                FoldAction::Fetch {
+                    ids: BeaconFetchIds::Witnesses(runs),
                     ..
-                }) if runs.iter().any(|run| run.0 == shard)
+                } if runs.iter().any(|run| run.0 == shard)
             )),
             "joining the committee asks for the held crossing's chunk: {asked:?}",
         );
@@ -4361,12 +4626,12 @@ mod tests {
         let d = linked_block_header(shard, 7, c.block_hash(), 300_001, 3);
         coord.on_verified_source_header(&b);
         coord.on_verified_source_header(&c);
-        let asked = |actions: &[Action]| {
-            actions.iter().find_map(|a| match a {
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(runs)),
+        let asked = |actions: &[CoordinatorAction]| {
+            actions.iter().find_map(|a| match a.fold()? {
+                FoldAction::Fetch {
+                    ids: BeaconFetchIds::Witnesses(runs),
                     ..
-                }) => runs.first().copied(),
+                } => runs.first().copied(),
                 _ => None,
             })
         };
@@ -4400,7 +4665,7 @@ mod tests {
         coord
             .fold
             .shard_source
-            .on_verified_source_header(Arc::clone(&header));
+            .on_verified_source_header(header.clone());
 
         let actions = coord.on_shard_witnesses_received(
             shard,
@@ -4444,7 +4709,7 @@ mod tests {
         coord
             .fold
             .shard_source
-            .on_verified_source_header(Arc::clone(&header));
+            .on_verified_source_header(header.clone());
 
         let actions = coord.on_shard_witnesses_received(
             shard,
@@ -4481,14 +4746,14 @@ mod tests {
             boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
         let c = linked_block_header(shard, 6, b.block_hash(), 301_000, 3);
         let d = linked_block_header(shard, 7, c.block_hash(), 301_000, 3);
-        let asked = |actions: &[Action]| {
-            actions.iter().any(|a| {
+        let asked = |actions: &[CoordinatorAction]| {
+            actions.iter().filter_map(CoordinatorAction::fold).any(|a| {
                 matches!(
                     a,
-                    Action::Fetch(FetchRequest::Ask {
-                        ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(_)),
+                    FoldAction::Fetch {
+                        ids: BeaconFetchIds::Witnesses(_),
                         ..
-                    })
+                    }
                 )
             })
         };
@@ -4530,7 +4795,7 @@ mod tests {
         coord
             .fold
             .shard_source
-            .on_verified_source_header(Arc::clone(&header));
+            .on_verified_source_header(header.clone());
 
         payloads[0] = ShardWitnessPayload::StakeDeposit {
             pool_id: test_pool(999),
@@ -4557,7 +4822,7 @@ mod tests {
         observer
             .fold
             .shard_source
-            .on_verified_source_header(Arc::clone(&header));
+            .on_verified_source_header(header.clone());
 
         let actions = observer.on_shard_witnesses_received(
             shard,
@@ -4814,9 +5079,7 @@ mod tests {
         assert_eq!(published(&genesis, 2), Err(Unpublished));
 
         let tip = valid_block_at(&genesis, Epoch::new(3), genesis.latest_block().block_hash());
-        let tip = Arc::new(Verified::new_unchecked_for_test(
-            tip.as_unverified().clone(),
-        ));
+        let tip = Verified::new_unchecked_for_test(tip.as_unverified().clone());
         let (_, _, config_hash) = genesis_trio();
         let resumed = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
@@ -5163,10 +5426,15 @@ mod tests {
     }
 
     /// Count the adoptions `actions` record.
-    fn commits(actions: &[Action]) -> usize {
+    fn commits(actions: &[CoordinatorAction]) -> usize {
         actions
             .iter()
-            .filter(|action| matches!(action, Action::CommitBeaconBlock { .. }))
+            .filter(|action| {
+                matches!(
+                    action,
+                    CoordinatorAction::Fold(FoldAction::CommitBeaconBlock { .. })
+                )
+            })
             .count()
     }
 
@@ -5197,8 +5465,10 @@ mod tests {
         assert_eq!(commits(&emitted), 1, "the certifying participant adopts");
         let block = emitted
             .iter()
-            .find_map(|action| match action {
-                Action::BroadcastBeaconBlock { block } => Some(Arc::clone(block)),
+            .find_map(|action| match action.participant()? {
+                BeaconAction::Participant(ParticipantAction::BroadcastBeaconBlock { block }) => {
+                    Some(block.clone())
+                }
                 _ => None,
             })
             .expect("the certified block is broadcast");
@@ -5206,12 +5476,12 @@ mod tests {
         assert_eq!(epoch, block.epoch());
         assert!(
             certifier
-                .on_beacon_block_verified(Ok(Arc::clone(&block)))
+                .on_beacon_block_verified(Ok(block.clone()))
                 .is_empty(),
             "the gossiped copy adopts nothing",
         );
         assert!(
-            certifier.fold.adopt(Arc::clone(&block)).is_none(),
+            certifier.fold.adopt(block.clone()).is_none(),
             "nor does the fold itself on a second copy",
         );
         assert_eq!(certifier.current_epoch(), epoch);
@@ -5279,7 +5549,7 @@ mod tests {
         let first = boundary_block_header(ShardId::ROOT, 4, 1_000, StateRoot::ZERO, 0);
         let second = boundary_block_header(ShardId::ROOT, 4, 1_000, StateRoot::ZERO, 0);
         assert_eq!(first.block_hash(), second.block_hash());
-        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!first.same_body(&second));
 
         assert!(coord.on_certified_local_header(&first).is_empty());
         assert!(coord.on_certified_local_header(&second).is_empty());
@@ -5288,10 +5558,7 @@ mod tests {
             .shard_source
             .header(ShardId::ROOT, BlockHeight::new(4))
             .expect("held");
-        assert!(
-            Arc::ptr_eq(held, &first),
-            "the second report records nothing"
-        );
+        assert!(held.same_body(&first), "the second report records nothing");
     }
 
     /// Reloading the states an evicted window was projected from brings
@@ -5491,7 +5758,7 @@ mod tests {
             .ratify
             .candidate()
             .expect("candidate held");
-        let mut actions: Vec<Action> = Vec::new();
+        let mut actions: Vec<CoordinatorAction> = Vec::new();
         for i in 0..u64::try_from(n).unwrap() {
             let vote = signed_ratify_vote(
                 &coord,
@@ -5503,9 +5770,10 @@ mod tests {
             actions.extend(coord.on_verified_ratify_vote_received(vote));
         }
 
-        let topology_changed: Vec<&Action> = actions
+        let topology_changed: Vec<&FoldAction> = actions
             .iter()
-            .filter(|a| matches!(a, Action::TopologyChanged { .. }))
+            .filter_map(CoordinatorAction::fold)
+            .filter(|a| matches!(a, FoldAction::TopologyChanged { .. }))
             .collect();
         assert_eq!(
             topology_changed.len(),

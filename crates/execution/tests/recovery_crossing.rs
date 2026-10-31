@@ -22,7 +22,7 @@ use hyperscale_storage::{MemberIndex, MemberInputs, MemberSections, RowState, Ti
 use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
 use hyperscale_types::{
     BlockHeight, Deadline, Epoch, EpochWindows, Finalization, Joins, Settlement, StatedTerms,
-    TickId, TickLine, Transaction, TxHash,
+    TickId, TickLine, Transaction, TxHash, Verifiable,
 };
 
 /// The prefix every transaction here writes a counter under.
@@ -215,7 +215,7 @@ fn rows_of(sim: &ExecutionSim) -> MemberIndex {
                 SHARD,
                 header.height(),
                 header.parent_qc().weighted_timestamp(),
-                block.transactions().iter().map(|tx| tx.as_unverified()),
+                block.transactions().iter().map(Verifiable::as_unverified),
                 MemberSections {
                     certificates: block.certificates(),
                     records: block.abandonment_records(),

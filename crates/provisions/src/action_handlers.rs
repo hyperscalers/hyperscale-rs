@@ -8,9 +8,8 @@
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
-use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, ProtocolEvent, ProvisionsRequest};
+use hyperscale_core::{ActionContext, ProtocolEvent, ProvisionAction, ProvisionsRequest};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_metrics::{record_fetch_response_refused, record_signature_verification_latency};
 use hyperscale_network::Network;
@@ -18,7 +17,7 @@ use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedSto
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
     BlockHeight, Provisions, ProvisionsContext, ProvisionsSenderMessage, ShardId, Stopwatch,
-    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, signed_bytes,
+    ValidatorId, Verified, Verify, WeightedTimestamp, signed_bytes,
 };
 use tracing::warn;
 
@@ -26,7 +25,7 @@ use crate::build::build_provisions;
 use crate::crossing_push::push_crossing_readings;
 
 /// One outbound provision batch destined for a single target shard.
-pub(crate) type ProvisionBatch = (Arc<Provisions>, Vec<ValidatorId>);
+pub(crate) type ProvisionBatch = (Provisions, Vec<ValidatorId>);
 
 /// Build per-target-shard provision batches for the cross-shard broadcast.
 ///
@@ -71,21 +70,18 @@ where
     batches
 }
 
-/// Handle the provisions-owned delegated [`Action`] variants.
-///
-/// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
-/// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
-pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
+/// Run provision work. Outcomes flow through `ctx.notify`.
+pub fn handle_action<S, N>(action: ProvisionAction, ctx: &ActionContext<'_, S, N>)
 where
     S: ShardStorage,
     N: Network,
 {
     match action {
-        Action::VerifyProvisions { provisions, anchor } => {
+        ProvisionAction::VerifyProvisions { provisions, anchor } => {
             let merkle_start = Stopwatch::start();
             let ctx_verify = ProvisionsContext { anchor };
             let result = match provisions.verify(&ctx_verify) {
-                Ok(verified) => Ok(Arc::new(verified)),
+                Ok(verified) => Ok(verified),
                 Err(err) => {
                     warn!(
                         source_shard = provisions.source_shard().inner(),
@@ -101,7 +97,7 @@ where
                     // failure here is a responder that answered with values
                     // its own chain never held.
                     record_fetch_response_refused("provision", "unproven_entries");
-                    Err((Arc::new(provisions), err))
+                    Err((provisions, err))
                 }
             };
             record_signature_verification_latency(
@@ -110,7 +106,7 @@ where
             );
             ctx.notify_protocol(ProtocolEvent::StateProvisionsVerified { result, anchor });
         }
-        Action::FetchAndBroadcastProvisions {
+        ProvisionAction::FetchAndBroadcastProvisions {
             block_hash,
             requests,
             source_shard,
@@ -149,10 +145,8 @@ where
                 // own merkle-proof predicate by construction; wrap as
                 // `Verified` so the local-dispatch fast path can let a
                 // target-shard replica on this host admit without
-                // re-running `Action::VerifyProvisions`.
-                let verified = Arc::new(Verified::<Provisions>::from_local(Arc::unwrap_or_clone(
-                    provisions,
-                )));
+                // re-running `ProvisionAction::VerifyProvisions`.
+                let verified = Verified::<Provisions>::from_local(provisions);
 
                 let msg = signed_bytes(
                     &ProvisionsSenderMessage::new(&verified),
@@ -170,25 +164,20 @@ where
                 // either hit RocksDB regen (post-persist) or trigger a
                 // fetch retry (pre-persist) — recoverable both ways.
                 ctx.notify_protocol(ProtocolEvent::OutboundProvisionBroadcast {
-                    provisions: Arc::clone(&verified),
+                    provisions: verified.clone(),
                     target_shard: verified.target_shard(),
                 });
 
-                let notification = ProvisionsNotification::new(
-                    Arc::new(Verifiable::from((*verified).clone())),
-                    validator_id,
-                    sig,
-                );
+                let notification = ProvisionsNotification::new(verified, validator_id, sig);
                 ctx.network.notify(&recipients, &notification);
             }
         }
-        Action::PushCrossingReadings {
+        ProvisionAction::PushCrossingReadings {
             block_hash,
             anchor,
             targets,
             shard_recipients,
             signer: _,
         } => push_crossing_readings(ctx, block_hash, anchor, &targets, &shard_recipients),
-        _ => unreachable!("hyperscale_provisions::handle_action called with non-provisions action"),
     }
 }

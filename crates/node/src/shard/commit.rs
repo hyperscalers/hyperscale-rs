@@ -6,13 +6,15 @@
 //!
 //! 1. **Accumulate** — dedup against already-pending and already-persisted
 //!    blocks; record the immediate-notify decision based on persistence lag.
-//! 2. **Flush** — once per `feed_event`, drain the backlog into one closure
-//!    that runs on the execution pool: prune stale prepared commits, sort by
-//!    height (parents before children), call `commit_prepared_blocks` once,
-//!    then emit deferred `BlockCommitted` events and a final `BlockPersisted`.
+//! 2. **Flush** — at the tail of each action drain, sort the backlog by
+//!    height (parents before children), take the contiguous run whose
+//!    prepared commits are in hand, prune stale prepared commits, and hand
+//!    the run to one task on the I/O pool, which writes each block in height
+//!    order with one fsync for the batch, then emits deferred
+//!    `BlockCommitted` events and a final `BlockFlushed` input.
 //!
-//! The coordinator does not feed events to the state machine; the `io_loop`
-//! drives that based on the [`AccumulateDecision`] returned from
+//! The coordinator does not feed events to the state machine; the shard's
+//! loop drives that based on the [`AccumulateDecision`] returned from
 //! [`BlockCommitCoordinator::accumulate`].
 
 use std::collections::{HashMap, VecDeque};
@@ -35,10 +37,11 @@ use hyperscale_types::{
 };
 use tracing::debug;
 
-use crate::shard::{HostEvent, push_protocol_event};
+use crate::event::{HostEvent, ShardScopedInput};
+use crate::shard::{push_protocol_event, push_shard_input};
 
 /// Handle to the assembled `Verified<CertifiedBlock>` that the
-/// `io_loop` forwards to `BlockCommitted`. Cloned `Arc` to the commit
+/// shard's loop forwards to `BlockCommitted`. Cloned `Arc` to the commit
 /// just enqueued in the pending backlog.
 pub type NotifyHandle = Arc<Verified<CertifiedBlock>>;
 
@@ -228,7 +231,7 @@ where
         pending.parent_block_height,
     );
 
-    let finalizations: Vec<Arc<Verifiable<Finalization>>> = block.certificates().to_vec();
+    let finalizations: Vec<Verifiable<Finalization>> = block.certificates().to_vec();
     // The view is freshly anchored — nothing has read through it, so
     // there is no execution cache to carry.
     let anchored = view.snapshot();
@@ -409,7 +412,7 @@ pub enum AccumulateDecision {
         handle: NotifyHandle,
         /// The accepted block's committee anchor, for its `BlockCommitted`.
         committee_anchor: WeightedTimestamp,
-        /// True if the `io_loop` should fire `BlockCommitted` immediately.
+        /// True if the loop should fire `BlockCommitted` immediately.
         /// False under persistence backpressure: the flush closure fires
         /// the event after the disk write completes instead.
         notify_now: bool,
@@ -456,9 +459,18 @@ struct BoundaryTrigger {
     last: Option<BoundaryMemo>,
 }
 
+/// One block a flush hands to the store: the commit, its prepared write,
+/// and the epoch boundary to pin before that write lands, if the block
+/// adjudicates its parent as one.
+struct ReadyCommit {
+    commit: PendingCommit,
+    prepared: PreparedCommit,
+    pin_before: Option<BlockHeight>,
+}
+
 pub struct BlockCommitCoordinator {
-    /// Shard this coordinator persists for. Stamped onto emitted
-    /// `BlockPersisted` events.
+    /// Shard this coordinator persists for. Stamped onto the inputs a
+    /// flush sends back.
     shard: ShardId,
 
     /// Epoch-boundary pin trigger; `None` leaves boundary pinning off.
@@ -475,7 +487,7 @@ pub struct BlockCommitCoordinator {
     pending: Vec<PendingCommit>,
 
     /// Highest block height durably persisted to `RocksDB`. Updated by
-    /// [`mark_persisted`](Self::mark_persisted) when `BlockPersisted`
+    /// [`mark_persisted`](Self::mark_persisted) when `BlockFlushed`
     /// arrives. Drives backpressure: if consensus runs too far ahead,
     /// `BlockCommitted` is deferred until the disk write completes.
     persisted_height: BlockHeight,
@@ -483,7 +495,7 @@ pub struct BlockCommitCoordinator {
     /// Highest block height handed to the store by [`flush`](Self::flush),
     /// advanced synchronously as each batch spawns. Unlike
     /// [`persisted_height`](Self::persisted_height), which lags behind the
-    /// `BlockPersisted` round-trip, this reflects the store's actual write
+    /// `BlockFlushed` round-trip, this reflects the store's actual write
     /// frontier — the gate that keeps successive flush batches height
     /// contiguous reads it so a later block never writes over an
     /// unmaterialized parent version. [`commit_in_flight`](Self::commit_in_flight)
@@ -494,8 +506,8 @@ pub struct BlockCommitCoordinator {
     /// Set while an async commit task is running on the I/O pool. Bouncing
     /// this prevents spawning a second task (the I/O pool does not
     /// guarantee FIFO ordering across separate `spawn()` calls). The task
-    /// clears the flag before sending its final event so the resulting
-    /// `feed_event` → `flush` drains any backlog.
+    /// clears the flag before sending its final event so the flush that
+    /// event's handling triggers drains any backlog.
     commit_in_flight: Arc<AtomicBool>,
 
     /// Pending QC-only commits waiting for the in-flight JMT-prep slot.
@@ -655,7 +667,7 @@ impl BlockCommitCoordinator {
 
     /// Whether the store's write frontier has reached `height`: the block
     /// is persisted, or a flush has handed it to the store and its
-    /// `BlockPersisted` has not come back yet.
+    /// `BlockFlushed` has not come back yet.
     pub(crate) fn is_written(&self, height: BlockHeight) -> bool {
         height <= self.flushed_height.max(self.persisted_height)
     }
@@ -715,7 +727,7 @@ impl BlockCommitCoordinator {
 
         // Skip blocks at or below the store's write frontier: persisted by
         // the sync path, or handed to the store by an earlier flush whose
-        // `BlockPersisted` has not come back yet. A flush empties
+        // `BlockFlushed` has not come back yet. A flush empties
         // `pending`, so `pending` alone cannot dedup a block a second
         // commit path reaches after it.
         if self.is_written(height) {
@@ -793,16 +805,15 @@ impl BlockCommitCoordinator {
     /// ordering: the I/O pool does not guarantee FIFO across separate
     /// `spawn()` calls.
     ///
-    /// Deferred `BlockCommitted` and `BlockPersisted` events return to
+    /// Deferred `BlockCommitted` events and `BlockFlushed` return to
     /// the pinned thread via `event_tx`; see `ProcessIo::shard_event_senders`
     /// for the off-thread → pinned-thread routing convention.
-    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub(crate) fn flush<D: Dispatch>(&mut self, event_tx: &Sender<HostEvent>, dispatch: &D) {
         if self.pending.is_empty() {
             return;
         }
 
-        // Defer if a previous async commit is still running on the exec pool.
+        // Defer if a previous async commit is still running on the I/O pool.
         if self.commit_in_flight.load(Ordering::Acquire) {
             return;
         }
@@ -811,11 +822,10 @@ impl BlockCommitCoordinator {
 
         // Sort by height to ensure parent blocks are flushed before children.
         // Cascading commits (e.g. QC formation during BlockCommitted processing)
-        // can push child blocks into pending before their parent
-        // (because the parent's push happens after feed_event returns). Without
+        // can push a child block into pending before its parent. Without
         // sorting, the child block (which may lack a PreparedCommit) would defer
-        // and block the ready parent, causing a deadlock where BlockPersisted
-        // never fires and sync_awaiting_persistence_height is never satisfied.
+        // and block the ready parent, causing a deadlock where BlockFlushed
+        // never fires.
         commits.sort_by_key(|c| c.certified.block().height().inner());
 
         // Blocks the sync path persisted under us need no write. Their
@@ -827,7 +837,7 @@ impl BlockCommitCoordinator {
         // skips a hop. Fired here in height order, ahead of everything
         // the flush below will send.
         let persisted = self.persisted_height.inner();
-        let (already_persisted, remaining): (Vec<_>, Vec<_>) = std::mem::take(&mut commits)
+        let (already_persisted, commits): (Vec<_>, Vec<_>) = commits
             .into_iter()
             .partition(|c| c.certified.block().height().inner() <= persisted);
         for commit in already_persisted {
@@ -842,128 +852,25 @@ impl BlockCommitCoordinator {
                 );
             }
         }
-        commits = remaining;
         if commits.is_empty() {
             return;
         }
 
-        // Release persists strictly height contiguous from the persisted
-        // tip: a block flushes only when every height below it is durable
-        // or ahead of it in this batch with its prep in hand. Commit
-        // *order* is height ordered, but the two commit variants accept at
-        // different latencies — a `CommitBlock` lands inline while a
-        // `CommitBlockByQcOnly` round-trips the prep pool — so arrival
-        // order at this queue can invert around a sync/live junction (a
-        // recovery committee committing over a sync-admitted suffix). An
-        // out-of-order persist would write a block's tree over a parent
-        // version the store does not hold yet, holing the version chain.
-        // Deferral also covers a block still awaiting the PreparedCommit
-        // that `VerifyStateRoot` produces asynchronously.
-        let mut ready_commits: Vec<PendingCommit> = Vec::with_capacity(commits.len());
-        let mut prepared_map: Vec<PreparedCommit> = Vec::with_capacity(commits.len());
-        {
-            let mut cache = self.prepared_commits.lock().unwrap();
-            let mut deferring = false;
-            // Gate from the store's write frontier, not the `BlockPersisted`
-            // round-trip: a block just handed to the store isn't yet marked
-            // persisted but its tree version is materializing, so a
-            // contiguous successor is safe to follow it. Take the max so a
-            // sync path that persisted directly still advances the gate.
-            let mut next_expected = self.flushed_height.max(self.persisted_height).next();
-            for commit in commits {
-                if !deferring {
-                    let height = commit.certified.block().height();
-                    if height == next_expected
-                        && let Some(prepared) = cache
-                            .remove(&commit.certified.block().hash())
-                            .map(|(_, p)| p)
-                    {
-                        prepared_map.push(prepared);
-                        ready_commits.push(commit);
-                        next_expected = next_expected.next();
-                        continue;
-                    }
-                    // First gap — a missing height whose commit hasn't
-                    // arrived, or a block awaiting its prep. Defer it and
-                    // every later block to preserve the contiguity.
-                    deferring = true;
-                    tracing::debug!(
-                        shard = self.shard.inner(),
-                        height = height.inner(),
-                        expected = next_expected.inner(),
-                        flushed = self.flushed_height.inner(),
-                        persisted = self.persisted_height.inner(),
-                        "Deferring block commit — height gap or awaiting PreparedCommit"
-                    );
-                }
-                self.pending.push(commit);
-            }
-
-            // Only entries for blocks at or below `persisted_height` are
-            // safe to drop: `accumulate` skips those heights, so their prep
-            // can never be flushed again. A prep above it may belong to a
-            // block still queued behind an earlier deferral — `VerifyStateRoot`
-            // can cache it out of order, ahead of the block that gates the
-            // flush — and `CommitBlock` never regenerates one, so evicting it
-            // early would wedge the commit pipeline at that height.
-            let persisted = self.persisted_height;
-            let before = cache.len();
-            cache.retain(|_, (h, _)| *h > persisted);
-            let pruned = before - cache.len();
-            if pruned > 0 {
-                tracing::debug!(pruned, "Pruned stale prepared_commits entries");
-            }
-        }
-
-        if ready_commits.is_empty() {
+        let mut ready = self.take_ready_run(commits);
+        let Some(last) = ready.last() else {
             return;
-        }
+        };
 
-        // The gate built `ready_commits` as a contiguous run above the
-        // write frontier, so its last height is the store's new frontier.
+        // The gate built `ready` as a contiguous run above the write
+        // frontier, so its last height is the store's new frontier.
         // Advancing here — before the spawn, under `commit_in_flight` —
         // keeps the next batch's gate reading a frontier that this batch's
         // writes will have reached by the time it runs.
-        if let Some(last) = ready_commits.last() {
-            self.flushed_height = last.certified.block().height();
-        }
+        self.flushed_height = last.commit.certified.block().height();
 
-        // Use the actual notification decision recorded at accumulation time,
-        // not a re-derived value that could disagree due to persisted_height drift.
-        let already_notified: Vec<bool> =
-            ready_commits.iter().map(|c| c.committed_notified).collect();
+        self.adjudicate_boundaries(&mut ready);
 
-        // Adjudicate epoch-boundary crossings: each block's `parent_qc`
-        // carries the canonical weighted timestamp for its parent, so a
-        // commit decides whether the PREVIOUS block was its shard's
-        // crossing, or the terminal a terminating shard records instead.
-        // The pin runs before this block's storage write, while state is
-        // exactly the boundary block's.
-        let mut pin_before: Vec<Option<BlockHeight>> = vec![None; ready_commits.len()];
         let pin_hook = self.boundary.as_ref().map(|t| Arc::clone(&t.pin));
-        if let Some(trigger) = self.boundary.as_mut() {
-            for (i, commit) in ready_commits.iter().enumerate() {
-                let block = commit.certified.block();
-                let parent_qc = block.header().parent_qc();
-                if let Some(last) = trigger.last
-                    && parent_qc.block_hash() == last.hash
-                    && (last.terminal
-                        || trigger
-                            .windows
-                            .is_crossing(last.parent_qc_wt, parent_qc.weighted_timestamp()))
-                {
-                    pin_before[i] = Some(last.height);
-                }
-                trigger.last = Some(BoundaryMemo {
-                    hash: block.hash(),
-                    height: block.height(),
-                    parent_qc_wt: parent_qc.weighted_timestamp(),
-                    terminal: block.header().settled_txs_root().is_some(),
-                });
-            }
-        }
-
-        let commits = ready_commits;
         let event_tx = event_tx.clone();
         let in_flight = Arc::clone(&self.commit_in_flight);
         let shard = self.shard;
@@ -971,45 +878,41 @@ impl BlockCommitCoordinator {
         self.commit_in_flight.store(true, Ordering::Release);
 
         dispatch.spawn(DispatchPool::Io, move || {
-            let heights: Vec<BlockHeight> = commits
-                .iter()
-                .map(|c| c.certified.block().height())
-                .collect();
-
-            // Wrap commits in Option so we can take() them for deferred notifications.
-            let mut commit_slots: Vec<Option<PendingCommit>> =
-                commits.into_iter().map(Some).collect();
+            // `ready` is non-empty (checked above) and sorted ascending.
+            let max_persisted = ready
+                .last()
+                .expect("ready is non-empty after the early return")
+                .commit
+                .certified
+                .block()
+                .height();
 
             // Invoke each closure in height order. Defer fsync for all
             // but the last; the final `FlushNow` covers the entire WAL
             // batch in one sync.
-            let total = prepared_map.len();
-            for (i, prepared) in prepared_map.into_iter().enumerate() {
+            let total = ready.len();
+            let mut written = Vec::with_capacity(total);
+            for (i, entry) in ready.into_iter().enumerate() {
                 // Pin the parent's epoch-boundary state before this
                 // block's write lands on top of it.
-                if let (Some(boundary_height), Some(pin)) = (pin_before[i], pin_hook.as_ref()) {
+                if let (Some(boundary_height), Some(pin)) = (entry.pin_before, pin_hook.as_ref()) {
                     pin(boundary_height);
                 }
-                let commit = commit_slots[i].as_ref().unwrap();
                 let hint = if i + 1 == total {
                     SyncHint::FlushNow
                 } else {
                     SyncHint::DeferFsync
                 };
-                let _root = prepared(hint, &commit.certified, &commit.witness);
+                let _root = (entry.prepared)(hint, &entry.commit.certified, &entry.commit.witness);
+                written.push(entry.commit);
             }
 
-            // `heights` is non-empty (commits was checked above) and sorted
-            // ascending (parallel to the height-sorted commits Vec).
-            let max_persisted = *heights
-                .last()
-                .expect("heights is non-empty after the early return");
-
             // Send deferred BlockCommitted events for blocks that weren't notified
-            // at accumulation time (due to persistence backpressure).
-            for (i, _) in heights.iter().enumerate() {
-                if !already_notified[i] {
-                    let commit = commit_slots[i].take().unwrap();
+            // at accumulation time (due to persistence backpressure). Use the
+            // decision recorded at accumulation time, not a re-derived value
+            // that could disagree due to persisted_height drift.
+            for commit in written {
+                if !commit.committed_notified {
                     push_protocol_event(
                         &event_tx,
                         shard,
@@ -1021,22 +924,131 @@ impl BlockCommitCoordinator {
                 }
             }
 
-            // Clear the in-flight flag before sending BlockPersisted. The
+            // Clear the in-flight flag before sending BlockFlushed. The
             // channel send synchronizes-with recv on the main thread, so
-            // the flag is guaranteed visible when the resulting feed_event
-            // calls flush to drain any backlog.
+            // the flag is guaranteed visible when the flush that input's
+            // handling triggers drains any backlog.
             in_flight.store(false, Ordering::Release);
 
-            push_protocol_event(
+            push_shard_input(
                 &event_tx,
                 shard,
-                ProtocolEvent::BlockPersisted {
+                ShardScopedInput::BlockFlushed {
                     height: max_persisted,
-                    substate_bytes: 0,
-                    standing_answers: None,
                 },
             );
         });
+    }
+
+    /// Take the height-sorted `commits` that can be written now, with their
+    /// prepared commits, and queue the rest back onto `pending`.
+    ///
+    /// Release persists strictly height contiguous from the persisted
+    /// tip: a block flushes only when every height below it is durable
+    /// or ahead of it in this batch with its prep in hand. Commit
+    /// *order* is height ordered, but the two commit variants accept at
+    /// different latencies — a `CommitBlock` lands inline while a
+    /// `CommitBlockByQcOnly` round-trips the prep pool — so arrival
+    /// order at this queue can invert around a sync/live junction (a
+    /// recovery committee committing over a sync-admitted suffix). An
+    /// out-of-order persist would write a block's tree over a parent
+    /// version the store does not hold yet, holing the version chain.
+    /// Deferral also covers a block still awaiting the `PreparedCommit`
+    /// that `VerifyStateRoot` produces asynchronously.
+    ///
+    /// The prepared-commit cache stays locked from the first take to the
+    /// prune, so no prep lands between the gate and the prune.
+    fn take_ready_run(&mut self, commits: Vec<PendingCommit>) -> Vec<ReadyCommit> {
+        let mut ready = Vec::with_capacity(commits.len());
+        let mut cache = self.prepared_commits.lock().unwrap();
+        let mut deferring = false;
+        // Gate from the store's write frontier, not the `BlockFlushed`
+        // round-trip: a block just handed to the store isn't yet marked
+        // persisted but its tree version is materializing, so a
+        // contiguous successor is safe to follow it. Take the max so a
+        // sync path that persisted directly still advances the gate.
+        let mut next_expected = self.flushed_height.max(self.persisted_height).next();
+        for commit in commits {
+            if !deferring {
+                let height = commit.certified.block().height();
+                if height == next_expected
+                    && let Some(prepared) = cache
+                        .remove(&commit.certified.block().hash())
+                        .map(|(_, p)| p)
+                {
+                    ready.push(ReadyCommit {
+                        commit,
+                        prepared,
+                        pin_before: None,
+                    });
+                    next_expected = next_expected.next();
+                    continue;
+                }
+                // First gap — a missing height whose commit hasn't
+                // arrived, or a block awaiting its prep. Defer it and
+                // every later block to preserve the contiguity.
+                deferring = true;
+                tracing::debug!(
+                    shard = self.shard.inner(),
+                    height = height.inner(),
+                    expected = next_expected.inner(),
+                    flushed = self.flushed_height.inner(),
+                    persisted = self.persisted_height.inner(),
+                    "Deferring block commit — height gap or awaiting PreparedCommit"
+                );
+            }
+            self.pending.push(commit);
+        }
+
+        // Only entries for blocks at or below `persisted_height` are
+        // safe to drop: `accumulate` skips those heights, so their prep
+        // can never be flushed again. A prep above it may belong to a
+        // block still queued behind an earlier deferral — `VerifyStateRoot`
+        // can cache it out of order, ahead of the block that gates the
+        // flush — and `CommitBlock` never regenerates one, so evicting it
+        // early would wedge the commit pipeline at that height.
+        let persisted = self.persisted_height;
+        let before = cache.len();
+        cache.retain(|_, (h, _)| *h > persisted);
+        let pruned = before - cache.len();
+        drop(cache);
+        if pruned > 0 {
+            tracing::debug!(pruned, "Pruned stale prepared_commits entries");
+        }
+        ready
+    }
+
+    /// Adjudicate the epoch-boundary crossings `ready` makes, setting
+    /// each entry's `pin_before`.
+    ///
+    /// Each block's `parent_qc` carries the canonical weighted timestamp
+    /// for its parent, so a commit decides whether the PREVIOUS block was
+    /// its shard's crossing, or the terminal a terminating shard records
+    /// instead. The pin runs before this block's storage write, while
+    /// state is exactly the boundary block's.
+    fn adjudicate_boundaries(&mut self, ready: &mut [ReadyCommit]) {
+        let Some(trigger) = self.boundary.as_mut() else {
+            return;
+        };
+        for entry in ready {
+            let block = entry.commit.certified.block();
+            let parent_qc = block.header().parent_qc();
+            if let Some(last) = trigger.last
+                && parent_qc.block_hash() == last.hash
+                && (last.terminal
+                    || trigger
+                        .windows
+                        .is_crossing(last.parent_qc_wt, parent_qc.weighted_timestamp()))
+            {
+                entry.pin_before = Some(last.height);
+            }
+            trigger.last = Some(BoundaryMemo {
+                hash: block.hash(),
+                height: block.height(),
+                parent_qc_wt: parent_qc.weighted_timestamp(),
+                terminal: block.header().settled_txs_root().is_some(),
+            });
+        }
     }
 }
 
@@ -1064,7 +1076,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::shard::ShardScopedInput;
 
     /// Shared sink the test closures record their (height, tag) commit
     /// against. Threaded through `make_commit` so the test can assert on
@@ -1131,11 +1142,11 @@ mod tests {
                 __qc.weighted_timestamp(),
             )
         };
-        let _ = committee; // committee unused here but kept for future signing-required tests
-        // SAFETY: synthetic test fixture, no real signature.
+        let _ = committee;
+        // Synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(qc);
         let certified = CertifiedBlock::new_unchecked(block, qc);
-        // SAFETY: synthetic test fixture; block-commit-coordinator tests
+        // Synthetic test fixture; block-commit-coordinator tests
         // don't exercise the `Verified<CertifiedBlock>` predicate.
         let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             certified,
@@ -1180,24 +1191,27 @@ mod tests {
         TAG_GEN.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn drain_protocol_events(rx: &Receiver<HostEvent>) -> Vec<ProtocolEvent> {
+    fn drain_inputs(rx: &Receiver<HostEvent>) -> Vec<ShardScopedInput> {
         let mut out = Vec::new();
-        while let Ok(HostEvent::Shard(_, ShardScopedInput::Protocol(event))) = rx.try_recv() {
-            out.push(*event);
+        while let Ok(HostEvent::Shard(_, input)) = rx.try_recv() {
+            out.push(input);
         }
         out
     }
 
-    fn count_committed(events: &[ProtocolEvent]) -> usize {
-        events
+    fn count_committed(inputs: &[ShardScopedInput]) -> usize {
+        inputs
             .iter()
-            .filter(|e| matches!(e, ProtocolEvent::BlockCommitted { .. }))
+            .filter(|input| {
+                matches!(input, ShardScopedInput::Protocol(event)
+                    if matches!(**event, ProtocolEvent::BlockCommitted { .. }))
+            })
             .count()
     }
 
-    fn last_persisted_height(events: &[ProtocolEvent]) -> Option<BlockHeight> {
-        events.iter().rev().find_map(|e| match e {
-            ProtocolEvent::BlockPersisted { height, .. } => Some(*height),
+    fn last_flushed_height(inputs: &[ShardScopedInput]) -> Option<BlockHeight> {
+        inputs.iter().rev().find_map(|input| match input {
+            ShardScopedInput::BlockFlushed { height } => Some(*height),
             _ => None,
         })
     }
@@ -1591,7 +1605,7 @@ mod tests {
         );
 
         // Fanned out, the held commit holds nothing back.
-        let events = drain_protocol_events(&rx);
+        let events = drain_inputs(&rx);
         assert_eq!(count_committed(&events), 1, "events: {events:?}");
         coord.note_broadcast(BlockHeight::new(max_lag + 1));
         coord.note_broadcast(BlockHeight::new(max_lag + 2));
@@ -1702,10 +1716,10 @@ mod tests {
         coord.flush(&tx, &dispatch);
 
         assert_eq!(committed_heights(&sink), vec![1, 2, 3]);
-        // No deferred BlockCommitted (all immediate); BlockPersisted at top.
-        let events = drain_protocol_events(&rx);
+        // No deferred BlockCommitted (all immediate); BlockFlushed at top.
+        let events = drain_inputs(&rx);
         assert_eq!(count_committed(&events), 0);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(3)));
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(3)));
     }
 
     #[test]
@@ -1749,11 +1763,11 @@ mod tests {
             vec![841],
             "the gate drains only the contiguous prefix, holding 843 behind the 842 gap",
         );
-        let _ = drain_protocol_events(&rx);
+        let _ = drain_inputs(&rx);
 
         // The last predecessor arrives; the gate releases 842 and the held
         // 843 in one contiguous batch — driven by the store write frontier,
-        // not the `BlockPersisted` round-trip (never fired in this test).
+        // not the `BlockFlushed` round-trip (never handled in this test).
         enqueue(
             &mut coord,
             &committee,
@@ -1767,8 +1781,8 @@ mod tests {
             vec![841, 842, 843],
             "the late predecessor releases the held commit in height order",
         );
-        let events = drain_protocol_events(&rx);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(843)));
+        let events = drain_inputs(&rx);
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(843)));
     }
 
     #[test]
@@ -1799,8 +1813,8 @@ mod tests {
         coord.flush(&tx, &dispatch);
 
         assert_eq!(committed_heights(&sink), vec![2]);
-        let events = drain_protocol_events(&rx);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(2)));
+        let events = drain_inputs(&rx);
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(2)));
     }
 
     /// A commit whose notification was deferred and whose height the
@@ -1829,7 +1843,7 @@ mod tests {
             Arc::clone(&sink),
         );
         assert!(
-            drain_protocol_events(&rx).is_empty(),
+            drain_inputs(&rx).is_empty(),
             "the notification was deferred, so nothing has fired yet"
         );
 
@@ -1841,7 +1855,7 @@ mod tests {
             committed_heights(&sink).is_empty(),
             "the write is what sync made unnecessary"
         );
-        let events = drain_protocol_events(&rx);
+        let events = drain_inputs(&rx);
         assert_eq!(
             count_committed(&events),
             1,
@@ -1870,9 +1884,9 @@ mod tests {
 
         assert!(committed_heights(&sink).is_empty());
         assert_eq!(coord.pending_len(), 1, "block must remain pending");
-        // No spawned write means no BlockPersisted should have fired.
-        let events = drain_protocol_events(&rx);
-        assert!(last_persisted_height(&events).is_none());
+        // No spawned write means no BlockFlushed should have fired.
+        let events = drain_inputs(&rx);
+        assert!(last_flushed_height(&events).is_none());
     }
 
     #[test]
@@ -1920,8 +1934,8 @@ mod tests {
         assert!(pending_heights.contains(&2));
         assert!(pending_heights.contains(&3));
 
-        let events = drain_protocol_events(&rx);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(1)));
+        let events = drain_inputs(&rx);
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(1)));
     }
 
     #[test]
@@ -1946,12 +1960,9 @@ mod tests {
 
         coord.flush(&tx, &dispatch);
 
-        let events = drain_protocol_events(&rx);
+        let events = drain_inputs(&rx);
         assert_eq!(count_committed(&events), 2, "events: {events:?}");
-        assert_eq!(
-            last_persisted_height(&events),
-            Some(BlockHeight::new(total))
-        );
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(total)));
     }
 
     #[test]
@@ -2115,9 +2126,9 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let hash = block.hash();
-        // SAFETY: synthetic test fixture, no real signature.
+        // Synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(linked_qc(hash, 0));
-        // SAFETY: synthetic test fixture; trigger tests don't exercise
+        // Synthetic test fixture; trigger tests don't exercise
         // the `Verified<CertifiedBlock>` predicate.
         let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             CertifiedBlock::new_unchecked(block, qc),
@@ -2430,7 +2441,7 @@ mod tests {
         swept_from: SweepFrontier,
         swept_to: SweepFrontier,
         removals: &[SubstateKey],
-        certificates: &[Arc<Verifiable<Finalization>>],
+        certificates: &[Verifiable<Finalization>],
     ) -> Result<QcOnlyPrep, Box<QcOnlyDivergence>> {
         let windows = EpochWindows::new(0, 1_000_000);
         let store = Arc::new(storage.clone());
@@ -2698,7 +2709,7 @@ mod tests {
             }
             writes
         };
-        let settling = Arc::new(Verifiable::from(Finalization::new(
+        let settling = Verifiable::from(Finalization::new(
             TickId::new(ShardId::ROOT, BlockHeight::new(1)),
             TickHalf::Determined,
             None,
@@ -2711,7 +2722,7 @@ mod tests {
                     events: Capped::empty(),
                 }),
             )]),
-        )));
+        ));
         let swept_to =
             SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS));
         assert_eq!(

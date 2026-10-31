@@ -4,7 +4,7 @@
 //! deterministic simulator. The [`Executor`] does NOT own storage: the
 //! runner owns it and passes a snapshot per call.
 //!
-//! State machines emit `Action::ExecuteTransactions`; the runner drives
+//! State machines emit `ExecutionAction::ExecuteTransactions`; the runner drives
 //! the executor over the tick's batch, which projects the
 //! [`CachedOutput`] into the local shard's [`ExecutedTx`] via
 //! [`project_to_shard`].
@@ -52,6 +52,6 @@ pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, ExecutionMode};
 pub use output::ExecutedTx;
 pub use preview::{
     DeclaredReads, FetchedCells, FetchedEntries, Holds, PreviewGrants, PreviewInputs,
-    PreviewOutcome, PreviewReport, ResourceChange,
+    PreviewOutcome, PreviewReport, ResourceChange, UnprovenInterval,
 };
 pub use receipt::{CachedOutput, project_to_shard};

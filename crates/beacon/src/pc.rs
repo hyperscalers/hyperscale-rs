@@ -57,7 +57,7 @@ pub enum PcEffect {
 ///
 /// Peer votes flow in as `Vote*Verified` carrying `Verified<PcVoteN>`
 /// — the marker is produced by the verify dispatch through the crypto pool
-/// (`Action::VerifyPcVote{1,2,3}` → `ProtocolEvent::PcVote{1,2,3}Verified`)
+/// (`ParticipantAction::VerifyPcVote{1,2,3}` → `ProtocolEvent::PcVote{1,2,3}Verified`)
 /// and threaded through the coordinator into the FSM. There is no
 /// `*Received` admission path; the type system forbids passing an
 /// unverified vote into `handle`.

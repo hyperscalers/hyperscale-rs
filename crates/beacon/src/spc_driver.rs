@@ -8,7 +8,7 @@
 //! the FSM.
 //!
 //! It does **not** lift effects to actions or touch sibling sub-machines:
-//! ingress methods return mature [`Action`]s (the verify dispatch);
+//! ingress methods return mature [`BeaconAction`]s (the verify dispatch);
 //! instance-driving methods return [`SpcEffect`]s for the coordinator to
 //! lift (the coordinator stamps `epoch`/`recipients` and routes the
 //! decided output into commit assembly + the equivocation pool). The
@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::Action;
+use hyperscale_core::{BeaconAction, ParticipantAction};
 use hyperscale_types::{
     ConsensusPublicKey, Epoch, MIN_BEACON_COMMITTEE_SIZE, PcQc3, PcVector, PcVote1,
     PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound,
@@ -182,7 +182,7 @@ impl SpcDriver {
         view: SpcView,
         vote: PcVote1,
         skip_quorum: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<BeaconAction> {
         let validator = vote.validator();
         let Some(committee) = self.admission_ctx(epoch, validator, view, "PcVote", skip_quorum)
         else {
@@ -194,12 +194,14 @@ impl SpcDriver {
         {
             return Vec::new();
         }
-        vec![Action::VerifyPcVote1 {
-            epoch,
-            view,
-            vote: Verifiable::from(vote),
-            committee,
-        }]
+        vec![BeaconAction::Participant(
+            ParticipantAction::VerifyPcVote1 {
+                epoch,
+                view,
+                vote: Verifiable::from(vote),
+                committee,
+            },
+        )]
     }
 
     /// A peer's round-2 PC vote arrived.
@@ -209,7 +211,7 @@ impl SpcDriver {
         view: SpcView,
         vote: Box<PcVote2>,
         skip_quorum: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<BeaconAction> {
         let validator = vote.validator();
         let Some(committee) = self.admission_ctx(epoch, validator, view, "PcVote", skip_quorum)
         else {
@@ -221,12 +223,14 @@ impl SpcDriver {
         {
             return Vec::new();
         }
-        vec![Action::VerifyPcVote2 {
-            epoch,
-            view,
-            vote: Box::new(Verifiable::from(*vote)),
-            committee,
-        }]
+        vec![BeaconAction::Participant(
+            ParticipantAction::VerifyPcVote2 {
+                epoch,
+                view,
+                vote: Box::new(Verifiable::from(*vote)),
+                committee,
+            },
+        )]
     }
 
     /// A peer's round-3 PC vote arrived.
@@ -236,7 +240,7 @@ impl SpcDriver {
         view: SpcView,
         vote: Box<PcVote3>,
         skip_quorum: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<BeaconAction> {
         let validator = vote.validator();
         let Some(committee) = self.admission_ctx(epoch, validator, view, "PcVote", skip_quorum)
         else {
@@ -248,12 +252,14 @@ impl SpcDriver {
         {
             return Vec::new();
         }
-        vec![Action::VerifyPcVote3 {
-            epoch,
-            view,
-            vote: Box::new(Verifiable::from(*vote)),
-            committee,
-        }]
+        vec![BeaconAction::Participant(
+            ParticipantAction::VerifyPcVote3 {
+                epoch,
+                view,
+                vote: Box::new(Verifiable::from(*vote)),
+                committee,
+            },
+        )]
     }
 
     /// A peer's SPC `new-view` arrived. Gate, mark the slot in-flight, and
@@ -264,7 +270,7 @@ impl SpcDriver {
         from: ValidatorId,
         proposal: Arc<Verifiable<SpcProposalObject>>,
         skip_quorum: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<BeaconAction> {
         let view = proposal.view;
         let Some(committee) = self.admission_ctx(epoch, from, view, "NewView", skip_quorum) else {
             return Vec::new();
@@ -275,12 +281,14 @@ impl SpcDriver {
         {
             return Vec::new();
         }
-        vec![Action::VerifySpcNewView {
-            epoch,
-            from,
-            proposal: Box::new(Arc::unwrap_or_clone(proposal)),
-            committee,
-        }]
+        vec![BeaconAction::Participant(
+            ParticipantAction::VerifySpcNewView {
+                epoch,
+                from,
+                proposal: Box::new(Arc::unwrap_or_clone(proposal)),
+                committee,
+            },
+        )]
     }
 
     /// A peer's SPC `new-commit` arrived. Gate, mark the slot in-flight,
@@ -291,7 +299,7 @@ impl SpcDriver {
         from: ValidatorId,
         msg: Arc<Verifiable<SpcNewCommitMsg>>,
         skip_quorum: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<BeaconAction> {
         let view = msg.view;
         let Some(committee) = self.admission_ctx(epoch, from, view, "NewCommit", skip_quorum)
         else {
@@ -303,12 +311,14 @@ impl SpcDriver {
         {
             return Vec::new();
         }
-        vec![Action::VerifySpcNewCommit {
-            epoch,
-            from,
-            msg: Box::new(Arc::unwrap_or_clone(msg)),
-            committee,
-        }]
+        vec![BeaconAction::Participant(
+            ParticipantAction::VerifySpcNewCommit {
+                epoch,
+                from,
+                msg: Box::new(Arc::unwrap_or_clone(msg)),
+                committee,
+            },
+        )]
     }
 
     /// A peer's SPC `empty-view` attestation arrived. Gate, mark the slot
@@ -319,7 +329,7 @@ impl SpcDriver {
         epoch: Epoch,
         msg: Arc<Verifiable<SpcEmptyViewMsg>>,
         skip_quorum: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<BeaconAction> {
         let signer = msg.signer;
         let view = msg.view;
         let Some(committee) = self.admission_ctx(epoch, signer, view, "EmptyView", skip_quorum)
@@ -332,15 +342,17 @@ impl SpcDriver {
         {
             return Vec::new();
         }
-        vec![Action::VerifySpcEmptyView {
-            epoch,
-            msg: Box::new(Arc::unwrap_or_clone(msg)),
-            committee,
-        }]
+        vec![BeaconAction::Participant(
+            ParticipantAction::VerifySpcEmptyView {
+                epoch,
+                msg: Box::new(Arc::unwrap_or_clone(msg)),
+                committee,
+            },
+        )]
     }
 
     /// A locally-signed empty-view attestation arrived via the
-    /// `Action::SignAndBroadcastEmptyView` self-loopback path. The
+    /// `ParticipantAction::SignAndBroadcastEmptyView` self-loopback path. The
     /// signing-key holder produced the signature over a verified high
     /// triple, so the message is verified by construction — feed it
     /// directly into the FSM without the verify round-trip.
@@ -360,7 +372,7 @@ impl SpcDriver {
         self.dispatch(signer, SpcEvent::EmptyViewVerified(msg), skip_quorum)
     }
 
-    /// Result of an [`Action::VerifySpcNewView`] dispatch. The view rode
+    /// Result of an [`ParticipantAction::VerifySpcNewView`] dispatch. The view rode
     /// back from the unverified payload so the slot clears on both arms.
     pub(crate) fn on_spc_new_view_verified(
         &mut self,
@@ -401,7 +413,7 @@ impl SpcDriver {
         )
     }
 
-    /// Result of an [`Action::VerifySpcNewCommit`] dispatch.
+    /// Result of an [`ParticipantAction::VerifySpcNewCommit`] dispatch.
     pub(crate) fn on_spc_new_commit_verified(
         &mut self,
         epoch: Epoch,
@@ -442,7 +454,7 @@ impl SpcDriver {
         )
     }
 
-    /// Result of an [`Action::VerifySpcEmptyView`] dispatch.
+    /// Result of an [`ParticipantAction::VerifySpcEmptyView`] dispatch.
     pub(crate) fn on_spc_empty_view_verified(
         &mut self,
         epoch: Epoch,
@@ -477,7 +489,7 @@ impl SpcDriver {
         )
     }
 
-    /// Result of an [`Action::VerifyPcVote1`] dispatch. Clears the slot,
+    /// Result of an [`ParticipantAction::VerifyPcVote1`] dispatch. Clears the slot,
     /// routes the verified vote into the FSM, drops on verify failure.
     pub(crate) fn on_pc_vote1_verified(
         &mut self,
@@ -515,7 +527,7 @@ impl SpcDriver {
         )
     }
 
-    /// Result of an [`Action::VerifyPcVote2`] dispatch.
+    /// Result of an [`ParticipantAction::VerifyPcVote2`] dispatch.
     pub(crate) fn on_pc_vote2_verified(
         &mut self,
         epoch: Epoch,
@@ -552,7 +564,7 @@ impl SpcDriver {
         )
     }
 
-    /// Result of an [`Action::VerifyPcVote3`] dispatch.
+    /// Result of an [`ParticipantAction::VerifyPcVote3`] dispatch.
     pub(crate) fn on_pc_vote3_verified(
         &mut self,
         epoch: Epoch,
@@ -793,7 +805,7 @@ mod tests {
     use super::*;
 
     /// Epoch the test instance is bootstrapped at; the admission gate
-    /// echoes it back on every dispatched `Action`.
+    /// echoes it back on every dispatched `ParticipantAction`.
     const EPOCH: u64 = 7;
 
     /// Deterministic BLS key for validator index `i`.
@@ -843,20 +855,20 @@ mod tests {
 
     /// Assert `actions` is exactly one `VerifyPcVote1` carrying the
     /// instance epoch, the expected `view`, and the full committee.
-    fn assert_dispatches(actions: &[Action], view: u32) {
+    fn assert_dispatches(actions: &[BeaconAction], view: u32) {
         assert_eq!(actions.len(), 1, "expected exactly one verify dispatch");
         match &actions[0] {
-            Action::VerifyPcVote1 {
+            BeaconAction::Participant(ParticipantAction::VerifyPcVote1 {
                 epoch,
                 view: v,
                 committee,
                 ..
-            } => {
+            }) => {
                 assert_eq!(epoch.inner(), EPOCH);
                 assert_eq!(v.inner(), view);
                 assert_eq!(committee.len(), MIN_BEACON_COMMITTEE_SIZE);
             }
-            _ => panic!("expected Action::VerifyPcVote1"),
+            _ => panic!("expected ParticipantAction::VerifyPcVote1"),
         }
     }
 

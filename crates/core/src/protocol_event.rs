@@ -16,20 +16,20 @@ use hyperscale_types::{
     Anchor, AnswerAdditions, AnswerDelta, BeaconBlockHash, BeaconProposal, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
     CandidateBeaconBlockVerifyError, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
-    CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, CheckOutcome, Epoch,
-    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationVerifyError, Hash, LeafIndex, MerkleInclusionProof, PcVote1, PcVote1VerifyError,
-    PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provisions, ProvisionsVerifyError,
-    QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError,
-    ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
-    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StandingAnswers, StateClaim,
-    StoredReceipt, SubstateKey, TickId, Timeout, TopologySchedule, Transaction, TxHash, TxOutcome,
-    TxResolution, ValidatorId, VerdictCells, Verifiable, VerificationKind, Verified,
-    WeightedTimestamp,
+    CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, CheckOutcome,
+    CheckedStateProof, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
+    Finalization, FinalizationVerifyError, Hash, HeaderSource, LeafIndex, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provisions,
+    ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
+    RatifyVoteVerifyError, ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
+    ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    StandingAnswers, StateClaim, StoredReceipt, TickId, Timeout, TopologySchedule, Transaction,
+    TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells, Verifiable, VerificationKind,
+    Verified, WeightedTimestamp,
 };
 
-use crate::action::{CrossShardExecutionRequest, QcSubject};
+use crate::action::{CrossShardExecutionRequest, HeaderCommittee, QcSubject};
 
 /// What one tick's batch produced.
 #[derive(Debug, Clone)]
@@ -118,14 +118,12 @@ pub enum ProtocolEvent {
     /// Received a committed block header from a remote shard whose QC
     /// still needs to be checked. Produced by gossip and sync paths —
     /// wire decode always lands the wrapper in `Verifiable::Unverified`.
-    ///
-    /// The `sender` field is the authenticated sender identity — `IoLoop`
-    /// verified the sender's signature before admitting this event.
     UnverifiedRemoteHeaderReceived {
         /// Header + QC bundle from the remote shard.
-        certified_header: Arc<CertifiedBlockHeader>,
-        /// Authenticated sender identity (signature-verified by `IoLoop`).
-        sender: ValidatorId,
+        certified_header: CertifiedBlockHeader,
+        /// Where the copy came from: a gossip sender whose signature
+        /// `IoLoop` verified before admitting this event, or a fetch.
+        source: HeaderSource,
     },
 
     /// Every peer a remote-header range fetch from `source_shard` reached
@@ -143,11 +141,11 @@ pub enum ProtocolEvent {
     /// holds — produced only by the local-dispatch fast path when a
     /// colocated proposer's broadcast carries `Verifiable::Verified`.
     /// The recipient skips both the envelope signature check and
-    /// `Action::VerifyRemoteHeaderQc`, admitting the header directly.
+    /// `ConsensusAction::VerifyRemoteHeaderQc`, admitting the header directly.
     VerifiedRemoteHeaderReceived {
         /// Header + QC bundle, sealed via
         /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
         /// Authenticated sender identity (the local proposer).
         sender: ValidatorId,
     },
@@ -245,7 +243,7 @@ pub enum ProtocolEvent {
     /// headers carry, never from the event itself.
     LocalBlockCertified {
         /// The certified block's header and its certifying QC.
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
     },
 
     /// A block has been committed by consensus (QC formed, 2f+1 agreement).
@@ -322,10 +320,10 @@ pub enum ProtocolEvent {
         /// The header whose QC was checked. A failed header is parked
         /// from this copy, which outlives the pending entry it was
         /// dispatched from.
-        certified_header: Arc<CertifiedBlockHeader>,
-        /// Sender of the candidate header — needed by the coordinator to
+        certified_header: CertifiedBlockHeader,
+        /// Source of the candidate header — needed by the coordinator to
         /// remove the failed candidate from its pending map on error.
-        sender: ValidatorId,
+        source: HeaderSource,
         /// Verified composite on success (full predicate: QC verified +
         /// linkage check, BFT-transitive header trust via the source
         /// committee — see
@@ -333,6 +331,10 @@ pub enum ProtocolEvent {
         /// QC-level signature/quorum failure or QC↔header linkage
         /// mismatch on error.
         result: Box<Result<Verified<CertifiedBlockHeader>, CertifiedHeaderVerifyError>>,
+        /// The committee the check ran against, as the request named it:
+        /// a failure under a guessed one waits for the header's parent
+        /// whatever the coordinator holds by the time the result lands.
+        committee: HeaderCommittee,
     },
 
     /// A remote committed block header has been fully verified (QC + structural checks).
@@ -343,7 +345,7 @@ pub enum ProtocolEvent {
     RemoteHeaderAdmitted {
         /// The fully-verified certified header — predicate established by
         /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
     },
 
     /// A remote header's commit proof is held: the `RemoteHeaderCoordinator`
@@ -362,7 +364,7 @@ pub enum ProtocolEvent {
     /// committee can certify a sibling that never commits.
     RemoteHeaderCommitted {
         /// The commit-proven certified header.
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
     },
 
     /// A shard committee's fork was assembled locally from two
@@ -447,7 +449,7 @@ pub enum ProtocolEvent {
         /// Hash of the constructed block, cached for callers.
         block_hash: BlockHash,
         /// Finalizations included in the block (carry certs + receipts + ECs).
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
         /// Net substate byte total change from the build's JMT
         /// computation. Feeds the coordinator's count frontier for
         /// reshape-trigger derivation.
@@ -459,7 +461,7 @@ pub enum ProtocolEvent {
         /// crossings, which the build held to the cap.
         additions: AnswerAdditions,
         /// Provisions included in the block.
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        provisions: Vec<Verifiable<Provisions>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -474,7 +476,7 @@ pub enum ProtocolEvent {
     /// because they originate from a single `FetchAndBroadcastProvisions` action.
     UnverifiedProvisionsReceived {
         /// Provisions batch received from a source shard.
-        provisions: Arc<Provisions>,
+        provisions: Provisions,
     },
 
     /// A producer's pushed record readings, past ingress: routed to a
@@ -492,13 +494,13 @@ pub enum ProtocolEvent {
     /// produced only by the local-dispatch fast path when a source-shard
     /// replica on the same host emits a notification carrying
     /// `Verifiable::Verified`. The recipient skips
-    /// [`Action::VerifyProvisions`] and admits directly.
+    /// [`ProvisionAction::VerifyProvisions`] and admits directly.
     ///
-    /// [`Action::VerifyProvisions`]: crate::Action::VerifyProvisions
+    /// [`ProvisionAction::VerifyProvisions`]: crate::ProvisionAction::VerifyProvisions
     VerifiedProvisionsReceived {
         /// Verified provisions batch sealed via
         /// [`Verified::<Provisions>::from_local`].
-        provisions: Arc<Verified<Provisions>>,
+        provisions: Verified<Provisions>,
     },
 
     /// Batch-level provision verification completed.
@@ -510,7 +512,7 @@ pub enum ProtocolEvent {
     StateProvisionsVerified {
         /// Verified provisions on success; the raw bundle paired with
         /// its error on failure.
-        result: Result<Arc<Verified<Provisions>>, (Arc<Provisions>, ProvisionsVerifyError)>,
+        result: Result<Verified<Provisions>, (Provisions, ProvisionsVerifyError)>,
         /// The source anchor whose `state_root` the merkle proof was
         /// checked against.
         anchor: Anchor,
@@ -524,7 +526,7 @@ pub enum ProtocolEvent {
     /// deterministic across validators.
     ProvisionsAdmitted {
         /// Verified provisions batch.
-        provisions: Arc<Verifiable<Provisions>>,
+        provisions: Verifiable<Provisions>,
         /// BFT-authenticated weighted timestamp of the source shard's committing QC.
         source_block_ts: WeightedTimestamp,
     },
@@ -537,20 +539,9 @@ pub enum ProtocolEvent {
         /// Provisions batch we just broadcast. Wrapped as `Verified` —
         /// the emitter built the bundle from a local JMT view so the
         /// merkle-proof predicate holds by construction.
-        provisions: Arc<Verified<Provisions>>,
+        provisions: Verified<Provisions>,
         /// Shard the batch was broadcast to.
         target_shard: ShardId,
-    },
-
-    /// An execution certificate from a remote shard — for a tick that
-    /// depended on state provisions from *this* shard — has been verified.
-    /// The tracker uses `tx_outcomes` to drain pending transactions from
-    /// outbound batches; `Executed` and `Aborted` are both terminal.
-    OutboundEcObserved {
-        /// Shard whose EC was observed.
-        target_shard: ShardId,
-        /// Per-tx outcomes from the EC, used to drain matching outbound entries.
-        tx_outcomes: Vec<TxOutcome>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -622,7 +613,7 @@ pub enum ProtocolEvent {
         /// Tick whose EC was aggregated.
         tick_id: TickId,
         /// The newly aggregated execution certificate.
-        certificate: Arc<Verified<ExecutionCertificate>>,
+        certificate: Verified<ExecutionCertificate>,
     },
 
     /// Execution certificates delivered by peer broadcast (post sender-sig
@@ -642,8 +633,8 @@ pub enum ProtocolEvent {
         /// Verified certificate on success; the raw certificate plus
         /// the reason it failed otherwise.
         result: Result<
-            Arc<Verified<ExecutionCertificate>>,
-            (Arc<ExecutionCertificate>, ExecutionCertificateVerifyError),
+            Verified<ExecutionCertificate>,
+            (ExecutionCertificate, ExecutionCertificateVerifyError),
         >,
     },
 
@@ -655,11 +646,11 @@ pub enum ProtocolEvent {
     FinalizationVerified {
         /// Verified tick on success; the raw tick plus the reason it
         /// failed otherwise.
-        result: Result<Arc<Verified<Finalization>>, (Arc<Finalization>, FinalizationVerifyError)>,
+        result: Result<Verified<Finalization>, (Finalization, FinalizationVerifyError)>,
     },
 
     /// A legs half was built from the yes receipts staged at a committed
-    /// tip, answering `Action::BuildLegsHalf`.
+    /// tip, answering `ExecutionAction::BuildLegsHalf`.
     ///
     /// Routed to `ExecutionCoordinator::on_legs_half_built`, which records
     /// the names it carries and offers it in place of the half held.
@@ -679,7 +670,7 @@ pub enum ProtocolEvent {
     /// fan-out (cross-shard ACK observation, vote-action re-scan).
     ExecutionCertificateAdmitted {
         /// The admitted execution certificate.
-        certificate: Arc<Verified<ExecutionCertificate>>,
+        certificate: Verified<ExecutionCertificate>,
     },
 
     /// Finalizations delivered from a peer in response to a fetch request.
@@ -691,7 +682,7 @@ pub enum ProtocolEvent {
         /// Finalizations returned by the peer. Wire-decoded entries
         /// land `Unverified`; a `Verifiable::Verified` entry
         /// short-circuits verify dispatch at the coordinator.
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
     },
 
     /// Finalizations were just admitted to the canonical execution store.
@@ -711,7 +702,7 @@ pub enum ProtocolEvent {
         /// entry is in the `Verifiable::Verified` variant by virtue of
         /// the typed gates the emitter went through (`finalize`'s
         /// `seal`, or `admit_finalization`'s `Verify::verify`).
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -722,7 +713,7 @@ pub enum ProtocolEvent {
     /// for whatever it admits.
     TransactionValidated {
         /// The validated transaction.
-        tx: Arc<Verified<Transaction>>,
+        tx: Verified<Transaction>,
         /// `true` if this validator submitted the tx (don't gossip back to client).
         submitted_locally: bool,
     },
@@ -736,7 +727,7 @@ pub enum ProtocolEvent {
     /// signature-valid txs reach this event.
     TransactionsReceived {
         /// Transactions returned by the peer.
-        transactions: Vec<Arc<Verified<Transaction>>>,
+        transactions: Vec<Verified<Transaction>>,
     },
 
     /// One or more transactions were just admitted to the canonical mempool.
@@ -754,7 +745,7 @@ pub enum ProtocolEvent {
     /// the canonical-store admission story is uniform across payloads.
     TransactionsAdmitted {
         /// Transactions newly admitted to mempool on this admission call.
-        txs: Vec<Arc<Verified<Transaction>>>,
+        txs: Vec<Verified<Transaction>>,
     },
 
     /// The execution coordinator settled what a core's certificates
@@ -807,20 +798,7 @@ pub enum ProtocolEvent {
     BeaconBlockSyncReadyToApply {
         /// The fetched block, wrapped `Unverified` — the coordinator
         /// dispatches cert verification before adopting.
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
-    },
-
-    /// The `io_loop`'s [`RemoteHeaderSync`] state machine caught
-    /// `source_shard`'s certified header chain up to `height`.
-    /// `RemoteHeaderCoordinator` uses this to clear any "syncing" flag for
-    /// that shard and resume normal per-gap behaviour.
-    ///
-    /// [`RemoteHeaderSync`]: ../../node/io_loop/sync/remote_header/type.RemoteHeaderSync.html
-    RemoteHeaderSyncComplete {
-        /// Source shard whose chain caught up.
-        source_shard: ShardId,
-        /// Height the sync caught up to.
-        height: BlockHeight,
+        block: Verifiable<CertifiedBeaconBlock>,
     },
 
     /// A cross-shard consumer is parked on a source block whose height sits
@@ -843,12 +821,9 @@ pub enum ProtocolEvent {
     /// a block it proposes; nothing reads an answer off a fetch, since
     /// the answer is the chain's once a block carries the proof.
     FetchedStateProofVerified {
-        /// The state the proof was checked against.
-        anchor: Anchor,
-        /// The keys the proof was asked about.
-        keys: Vec<SubstateKey>,
-        /// The proof as fetched.
-        proof: MerkleInclusionProof,
+        /// The proof as fetched, with what it says of each key asked
+        /// under the anchor's root.
+        proof: CheckedStateProof,
         /// The record values the server proved present, each held to
         /// the proof.
         values: Vec<ServedValue>,
@@ -860,12 +835,11 @@ pub enum ProtocolEvent {
     /// coordinator keeps what is worth a block's bytes to offer; nothing
     /// reads a verdict off a fetch.
     FetchedVerdictProofVerified {
-        /// The state the proof was checked against.
-        anchor: Anchor,
         /// The questions the proof was asked about, each as its cells.
         questions: Vec<VerdictCells>,
-        /// The proof as fetched, over every cell of `questions`.
-        proof: MerkleInclusionProof,
+        /// The proof as fetched, with what it says of every cell of
+        /// `questions` under the anchor's root.
+        proof: CheckedStateProof,
     },
 
     /// A settled-set fetch verified a past-terminal shard's complete
@@ -922,10 +896,10 @@ pub enum ProtocolEvent {
     /// Round-1 PC vote received whose verification predicate already
     /// holds — produced only by the local sign-and-emit handler (or by
     /// a colocated peer's local-dispatch fast path). The recipient
-    /// skips [`Action::VerifyPcVote1`] and feeds the typed handle
+    /// skips [`ParticipantAction::VerifyPcVote1`] and feeds the typed handle
     /// straight into the SPC sub-machine.
     ///
-    /// [`Action::VerifyPcVote1`]: crate::Action::VerifyPcVote1
+    /// [`ParticipantAction::VerifyPcVote1`]: crate::ParticipantAction::VerifyPcVote1
     VerifiedPcVote1Received {
         /// Epoch whose SPC instance the vote was signed for.
         epoch: Epoch,
@@ -937,9 +911,9 @@ pub enum ProtocolEvent {
     },
 
     /// Round-2 PC vote received whose verification predicate already
-    /// holds. Skips [`Action::VerifyPcVote2`].
+    /// holds. Skips [`ParticipantAction::VerifyPcVote2`].
     ///
-    /// [`Action::VerifyPcVote2`]: crate::Action::VerifyPcVote2
+    /// [`ParticipantAction::VerifyPcVote2`]: crate::ParticipantAction::VerifyPcVote2
     VerifiedPcVote2Received {
         /// Epoch whose SPC instance the vote was signed for.
         epoch: Epoch,
@@ -951,9 +925,9 @@ pub enum ProtocolEvent {
     },
 
     /// Round-3 PC vote received whose verification predicate already
-    /// holds. Skips [`Action::VerifyPcVote3`].
+    /// holds. Skips [`ParticipantAction::VerifyPcVote3`].
     ///
-    /// [`Action::VerifyPcVote3`]: crate::Action::VerifyPcVote3
+    /// [`ParticipantAction::VerifyPcVote3`]: crate::ParticipantAction::VerifyPcVote3
     VerifiedPcVote3Received {
         /// Epoch whose SPC instance the vote was signed for.
         epoch: Epoch,
@@ -1002,10 +976,10 @@ pub enum ProtocolEvent {
 
     /// SPC `empty-view` attestation whose verification predicate
     /// already holds — produced only by the local sign-and-emit
-    /// handler. The coordinator skips [`Action::VerifySpcEmptyView`]
+    /// handler. The coordinator skips [`ParticipantAction::VerifySpcEmptyView`]
     /// and feeds the typed handle straight into the SPC sub-machine.
     ///
-    /// [`Action::VerifySpcEmptyView`]: crate::Action::VerifySpcEmptyView
+    /// [`ParticipantAction::VerifySpcEmptyView`]: crate::ParticipantAction::VerifySpcEmptyView
     VerifiedSpcEmptyViewReceived {
         /// Epoch whose SPC instance the message was signed for.
         epoch: Epoch,
@@ -1019,14 +993,14 @@ pub enum ProtocolEvent {
     /// the `Verified` marker.
     BeaconBlockReceived {
         /// Received certified block.
-        block: Arc<Verifiable<CertifiedBeaconBlock>>,
+        block: Verifiable<CertifiedBeaconBlock>,
     },
 
-    /// A `BeaconProposal` arrived. `IoLoop` has already authenticated
-    /// the sender. A wire decode lands the wrapper unverified and the
-    /// VRF reveal is checked before admission; the local
-    /// `Action::BuildAndBroadcastBeaconProposal` loopback and a
-    /// colocated sender both keep the marker, and admit directly.
+    /// A `BeaconProposal` arrived, its sender authenticated and its VRF
+    /// reveal checked: the wire handler checks a peer's reveal under the
+    /// sender's key before pushing the event, and the local
+    /// `ParticipantAction::BuildAndBroadcastBeaconProposal` loopback and a colocated
+    /// sender hand over what their signing checked.
     BeaconProposalReceived {
         /// Authenticated sender id.
         from: ValidatorId,
@@ -1036,7 +1010,7 @@ pub enum ProtocolEvent {
         /// Received proposal, sealed via
         /// [`BeaconProposalDraft::sign`](hyperscale_types::BeaconProposalDraft::sign)
         /// when its producer held the signing key.
-        proposal: Arc<Verifiable<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     },
 
     /// A [`RatifyVote`] arrived over the wire. Wire decode lands the
@@ -1048,13 +1022,13 @@ pub enum ProtocolEvent {
     },
 
     /// A locally-signed [`RatifyVote`] arrived via the
-    /// [`Action::SignAndBroadcastRatifyVote`] self-loopback path. The
+    /// [`ParticipantAction::SignAndBroadcastRatifyVote`] self-loopback path. The
     /// signing validator produced the signature, so the vote is verified
     /// by construction — coordinator skips
-    /// [`Action::VerifyRatifyVote`] and pools it directly.
+    /// [`ParticipantAction::VerifyRatifyVote`] and pools it directly.
     ///
-    /// [`Action::SignAndBroadcastRatifyVote`]: crate::Action::SignAndBroadcastRatifyVote
-    /// [`Action::VerifyRatifyVote`]: crate::Action::VerifyRatifyVote
+    /// [`ParticipantAction::SignAndBroadcastRatifyVote`]: crate::ParticipantAction::SignAndBroadcastRatifyVote
+    /// [`ParticipantAction::VerifyRatifyVote`]: crate::ParticipantAction::VerifyRatifyVote
     VerifiedRatifyVoteReceived {
         /// Verified vote, sealed via
         /// [`Verified::<RatifyVote>::sign_local`].
@@ -1067,18 +1041,23 @@ pub enum ProtocolEvent {
     /// tracker directly and never takes this path.
     BeaconCandidateReceived {
         /// Received candidate.
-        candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+        candidate: Verifiable<CandidateBeaconBlock>,
     },
 
-    /// Result of an [`Action::VerifyBeaconCandidate`] dispatch. The
+    /// Result of an [`ParticipantAction::VerifyBeaconCandidate`] dispatch. The
     /// verified handle rides back on success so the coordinator can
     /// route it into the ratification tracker without stashing during
     /// the verify round-trip.
     ///
-    /// [`Action::VerifyBeaconCandidate`]: crate::Action::VerifyBeaconCandidate
+    /// [`ParticipantAction::VerifyBeaconCandidate`]: crate::ParticipantAction::VerifyBeaconCandidate
     BeaconCandidateVerified {
+        /// The checked candidate's block hash, on both arms, so a failed
+        /// check frees the slot it held. The hash leaves the SPC cert
+        /// out, so a copy pairing a real block with a forged cert would
+        /// otherwise keep the honest copy from being checked.
+        block_hash: BeaconBlockHash,
         /// Verified candidate on success; the typed error otherwise.
-        result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
+        result: Result<Verified<CandidateBeaconBlock>, CandidateBeaconBlockVerifyError>,
     },
 
     /// A shard-witness chunk landed. The beacon fold recomputes the
@@ -1100,31 +1079,31 @@ pub enum ProtocolEvent {
     /// Result of a beacon-proposal fetch dispatch — carries a
     /// proposal the peer returned. A responder that didn't hold the
     /// proposal yields no event: the fetch binding releases the slot for
-    /// retry against another peer instead. Wire decode lands the wrapper
-    /// as `Verifiable::Unverified`; locally-dispatched serves preserve the
-    /// `Verified` marker.
-    ///
+    /// retry against another peer instead. The fetch's response boundary
+    /// checks the returned proposal's VRF reveal under the requested
+    /// validator's key and asks another peer for one that fails, so only
+    /// a checked proposal arrives.
     BeaconProposalFetched {
         /// Epoch the fetched proposal targets.
         epoch: Epoch,
         /// Validator whose proposal was requested.
         validator: ValidatorId,
         /// The returned proposal.
-        proposal: Arc<Verifiable<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     },
 
-    /// Result of an [`Action::VerifyBeaconBlock`](crate::Action::VerifyBeaconBlock) dispatch. The
+    /// Result of a [`FoldAction::VerifyBeaconBlock`](crate::FoldAction::VerifyBeaconBlock) dispatch. The
     /// verified handle rides back on success so the coordinator can
     /// route it into adoption without stashing during the verify
     /// round-trip.
     BeaconBlockVerified {
         /// Verified block on success; the typed error otherwise.
-        result: Result<Arc<Verified<CertifiedBeaconBlock>>, CertifiedBeaconBlockVerifyError>,
+        result: Result<Verified<CertifiedBeaconBlock>, CertifiedBeaconBlockVerifyError>,
     },
 
-    /// Result of an [`Action::VerifyRatifyVote`] dispatch.
+    /// Result of an [`ParticipantAction::VerifyRatifyVote`] dispatch.
     ///
-    /// [`Action::VerifyRatifyVote`]: crate::Action::VerifyRatifyVote
+    /// [`ParticipantAction::VerifyRatifyVote`]: crate::ParticipantAction::VerifyRatifyVote
     RatifyVoteVerified {
         /// Vote anchor, extracted from the unverified payload at
         /// dispatch time. Carried with the epoch, round, phase, and
@@ -1144,7 +1123,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<RatifyVote>, RatifyVoteVerifyError>,
     },
 
-    /// Result of an [`Action::VerifyPcVote1`](crate::Action::VerifyPcVote1) dispatch. The verified
+    /// Result of an [`ParticipantAction::VerifyPcVote1`](crate::ParticipantAction::VerifyPcVote1) dispatch. The verified
     /// handle rides back so the coordinator can route it into the right
     /// view's inner PC sub-machine without stashing.
     PcVote1Verified {
@@ -1161,7 +1140,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<PcVote1>, PcVote1VerifyError>,
     },
 
-    /// Result of an [`Action::VerifyPcVote2`](crate::Action::VerifyPcVote2) dispatch.
+    /// Result of an [`ParticipantAction::VerifyPcVote2`](crate::ParticipantAction::VerifyPcVote2) dispatch.
     PcVote2Verified {
         /// Epoch the inner PC instance belongs to.
         epoch: Epoch,
@@ -1173,7 +1152,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<PcVote2>, PcVote2VerifyError>,
     },
 
-    /// Result of an [`Action::VerifyPcVote3`](crate::Action::VerifyPcVote3) dispatch.
+    /// Result of an [`ParticipantAction::VerifyPcVote3`](crate::ParticipantAction::VerifyPcVote3) dispatch.
     PcVote3Verified {
         /// Epoch the inner PC instance belongs to.
         epoch: Epoch,
@@ -1185,7 +1164,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<PcVote3>, PcVote3VerifyError>,
     },
 
-    /// Result of an [`Action::VerifySpcNewView`](crate::Action::VerifySpcNewView) dispatch.
+    /// Result of an [`ParticipantAction::VerifySpcNewView`](crate::ParticipantAction::VerifySpcNewView) dispatch.
     SpcNewViewVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
@@ -1201,7 +1180,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<SpcProposalObject>, SpcProposalObjectVerifyError>,
     },
 
-    /// Result of an [`Action::VerifySpcNewCommit`](crate::Action::VerifySpcNewCommit) dispatch.
+    /// Result of an [`ParticipantAction::VerifySpcNewCommit`](crate::ParticipantAction::VerifySpcNewCommit) dispatch.
     SpcNewCommitVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
@@ -1216,7 +1195,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<SpcNewCommitMsg>, SpcNewCommitMsgVerifyError>,
     },
 
-    /// Result of an [`Action::VerifySpcEmptyView`](crate::Action::VerifySpcEmptyView) dispatch.
+    /// Result of an [`ParticipantAction::VerifySpcEmptyView`](crate::ParticipantAction::VerifySpcEmptyView) dispatch.
     SpcEmptyViewVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,

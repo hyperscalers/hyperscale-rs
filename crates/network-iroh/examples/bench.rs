@@ -39,7 +39,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 use hyperscale_network::fault::HostId;
 use hyperscale_network::{
-    HandlerRegistry, Network, RequestError, ResponseVerdict, Verdict, VerdictKey,
+    HandlerRegistry, Network, Provenance, RequestError, ResponseVerdict, Verdict, VerdictKey,
 };
 use hyperscale_network_iroh::test_utils::TestFixtures as IrohFixtures;
 use hyperscale_network_iroh::testing::{
@@ -690,7 +690,7 @@ fn vote_on_headers(hosts: &[Host], recipients: fn(&Header, u32) -> Vec<Validator
         let network = Arc::clone(&host.network);
         let index = u32::try_from(index).expect("a cluster fits in u32");
         host.network
-            .register_notification_handler(move |header: Header| {
+            .register_notification_handler(move |header: Header, _: Provenance| {
                 let vote = Vote {
                     seq: header.seq,
                     voter: u64::from(index),
@@ -712,7 +712,7 @@ async fn notify(hosts: Vec<Host>, peers: u32) {
     let outstanding = Arc::clone(&sent);
     hosts[0]
         .network
-        .register_notification_handler(move |vote: Vote| {
+        .register_notification_handler(move |vote: Vote, _: Provenance| {
             if vote.voter != 1 {
                 return Verdict::Accept;
             }
@@ -969,10 +969,11 @@ async fn committee(hosts: Vec<Host>, size: u32) {
     let votes = Arc::new(AtomicU64::new(0));
     for host in &hosts {
         let votes = Arc::clone(&votes);
-        host.network.register_notification_handler(move |_: Vote| {
-            votes.fetch_add(1, Ordering::Relaxed);
-            Verdict::Accept
-        });
+        host.network
+            .register_notification_handler(move |_: Vote, _: Provenance| {
+                votes.fetch_add(1, Ordering::Relaxed);
+                Verdict::Accept
+            });
     }
 
     let idle_start = (Instant::now(), cpu_time());
@@ -1331,7 +1332,7 @@ async fn refused_flood(rate: u32, refusal: Refusal, watch: Duration) {
 
     let judged = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&judged);
-    receiver_network.register_gossip_handler(move |_: Committed, _: ShardId| {
+    receiver_network.register_gossip_handler(move |_: Committed, _: ShardId, _: Provenance| {
         counted.fetch_add(1, Ordering::Relaxed);
         match refusal {
             Refusal::Reject => Verdict::Reject,
@@ -1409,7 +1410,7 @@ async fn notify_flood(rate: u32, judged: Judged, watch: Duration) {
 
     let proposer = fixtures.validator_key_map()[&vid(1)];
     let check = Arc::clone(&counted);
-    receiver_network.register_notification_handler(move |header: SignedHeader| {
+    receiver_network.register_notification_handler(move |header: SignedHeader, _: Provenance| {
         if check.verify(&proposer, &header.body, &header.signature) {
             return Verdict::Accept;
         }
@@ -1499,7 +1500,7 @@ async fn shadow_flood(rate: u32, watch: Duration) {
     let false_copies = Arc::new(AtomicU64::new(0));
     let honest_copies = Arc::new(AtomicU64::new(0));
     let (judged_false, judged_honest) = (Arc::clone(&false_copies), Arc::clone(&honest_copies));
-    receiver_network.register_gossip_handler(move |copy: HeaderCopy, _: ShardId| {
+    receiver_network.register_gossip_handler(move |copy: HeaderCopy, _: ShardId, _: Provenance| {
         if copy.forged {
             judged_false.fetch_add(1, Ordering::Relaxed);
             Verdict::Reject
@@ -1708,7 +1709,7 @@ async fn forged_flood(rate: u32, checked: Checked, watch: Duration) {
     let counted = Arc::clone(&checks);
     let network = Arc::clone(&receiver_network);
     let handle = Handle::current();
-    receiver_network.register_gossip_handler(move |item: Committed, _: ShardId| {
+    receiver_network.register_gossip_handler(move |item: Committed, _: ShardId, _: Provenance| {
         let key = VerdictKey::of(&item);
         let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
         handle.spawn(async move {
@@ -1726,7 +1727,8 @@ async fn forged_flood(rate: u32, checked: Checked, watch: Duration) {
     follower_network.register_host_gossip_handler(move |_: Committed| {
         counted.fetch_add(1, Ordering::Relaxed);
     });
-    follower_network.register_gossip_handler(|_: Committed, _: ShardId| Verdict::Accept);
+    follower_network
+        .register_gossip_handler(|_: Committed, _: ShardId, _: Provenance| Verdict::Accept);
 
     let mut tick = interval(Duration::from_secs(1) / rate);
     let start = (Instant::now(), cpu_time());
@@ -1778,7 +1780,7 @@ async fn certificate_flood(rate: u32, checks: Checks, watch: Duration) {
     let counted = Arc::clone(&certificates);
     let network = Arc::clone(&receiver_network);
     let handle = Handle::current();
-    receiver_network.register_gossip_handler(move |item: Committed, _: ShardId| {
+    receiver_network.register_gossip_handler(move |item: Committed, _: ShardId, _: Provenance| {
         let signature = VerdictKey::of(&item);
         let certificate = VerdictKey::of(&(item.seq, 1u8));
         let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
@@ -1799,7 +1801,8 @@ async fn certificate_flood(rate: u32, checks: Checks, watch: Duration) {
     follower_network.register_host_gossip_handler(move |_: Committed| {
         counted.fetch_add(1, Ordering::Relaxed);
     });
-    follower_network.register_gossip_handler(|_: Committed, _: ShardId| Verdict::Accept);
+    follower_network
+        .register_gossip_handler(|_: Committed, _: ShardId, _: Provenance| Verdict::Accept);
 
     let mut tick = interval(Duration::from_secs(1) / rate);
     let start = (Instant::now(), cpu_time());

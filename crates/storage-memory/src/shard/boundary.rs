@@ -295,9 +295,7 @@ impl BoundaryStore for SimShardStorage {
                 .insert(witnesses.base.inner() + offset as u64, payload);
         }
         if let Some(boundary) = witnesses.boundary {
-            consensus
-                .boundary_headers
-                .insert(height, Arc::new(boundary));
+            consensus.boundary_headers.insert(height, boundary);
         }
         drop(consensus);
         // The store now holds exactly the boundary's state, as one that
@@ -955,12 +953,8 @@ mod tests {
                 ..Default::default()
             }),
             transactions: Arc::new(
-                Capped::new(
-                    txs.into_iter()
-                        .map(|tx| Arc::new(Verifiable::from(tx)))
-                        .collect(),
-                )
-                .expect("a block written out in a test"),
+                Capped::new(txs.into_iter().map(Verifiable::from).collect())
+                    .expect("a block written out in a test"),
             ),
             certificates,
             provisions: Arc::new(Capped::empty()),

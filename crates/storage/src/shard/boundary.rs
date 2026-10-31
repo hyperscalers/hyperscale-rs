@@ -328,11 +328,16 @@ pub trait BoundaryStore {
     /// block. Pins accumulate until [`Self::trim_boundaries`] evicts
     /// them. Idempotent per height.
     ///
+    /// Callers pin the height the store stands at. A backend that
+    /// captures its live state checks that under the lock its commits
+    /// take, and refuses a height the store has moved past rather than
+    /// label a later block's state with it.
+    ///
     /// # Errors
     ///
-    /// Returns a description of the failure (e.g. checkpoint I/O). A
-    /// failed pin degrades serving, never correctness — callers log and
-    /// continue.
+    /// Returns a description of the failure (e.g. checkpoint I/O, or a
+    /// store no longer at `height`). A failed pin degrades serving,
+    /// never correctness — callers log and continue.
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String>;
 
     /// Evict every pin `retention` does not keep. A failed eviction

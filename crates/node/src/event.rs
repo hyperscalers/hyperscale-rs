@@ -1,13 +1,12 @@
-//! Inputs to the I/O loop, partitioned by routing scope.
+//! Inputs to a host's loops, partitioned by routing scope, and what a step
+//! hands back to the runner: its timer operations and output.
 //!
 //! [`HostEvent`] is the envelope the runner pushes into the event
-//! channel. It is a typed sum over the three drivers a
+//! channel. It is a typed sum over the two drivers a
 //! [`NodeHost`](crate::host::NodeHost) routes to:
 //!
 //! - [`HostEvent::Beacon`] carries a [`BeaconScopedInput`] routed to the
 //!   host's beacon loop.
-//! - [`HostEvent::Process`] carries a [`ProcessScopedInput`] with no
-//!   shard tag — inputs that fan out across every hosted shard.
 //! - [`HostEvent::Shard`] carries a [`ShardScopedInput`] tagged with
 //!   the hosted-shard id it routes to. Every shard-coherent input
 //!   (gossip, sync, fetch results, signature-verified headers, protocol
@@ -22,17 +21,23 @@ use std::time::Duration;
 use crossbeam::channel::Sender;
 use hyperscale_beacon::ChainRegistration;
 use hyperscale_beacon::coordinator::LocalChainAnchors;
-use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
-use hyperscale_network::RequestError;
+use hyperscale_core::{
+    BeaconFetchIds, CommitSource, FetchIds, ParticipationChange, ProtocolEvent, TimerId,
+};
+use hyperscale_network::{PeerId, RequestError};
+use hyperscale_types::network::gossip::MAX_GOSSIP_TX_BATCH;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock,
     CertifiedBlock, CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature,
-    ElidedCertifiedBlock, Epoch, Hash, HeaderFetchCount, ShardForkProof, ShardId,
-    ShardVoteEquivocation, Signer, TopologySchedule, Transaction, TxHash, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp,
+    ElidedCertifiedBlock, Epoch, Hash, HeaderFetchCount, MAX_UNSETTLED_PER_BLOCK,
+    MAX_UNSETTLED_TXS, ShardForkProof, ShardId, ShardVoteEquivocation, Signer, TopologySchedule,
+    Transaction, TransactionStatus, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 
+pub use crate::network_lane::{
+    NetworkInput, NetworkLane, NetworkLaneReceiver, Offer, network_lane,
+};
 use crate::shard::commit::QcOnlyDivergence;
 use crate::shard::mempool::DeferredTransaction;
 
@@ -126,14 +131,14 @@ pub(crate) const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind
 /// the shard at dispatch time and stamp every result.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
 pub enum ShardScopedInput {
-    /// Pass-through to state machine. `NodeHost` extracts the `ProtocolEvent`
+    /// Pass-through to state machine. The shard's loop extracts the `ProtocolEvent`
     /// and feeds it to the envelope's shard's replica. Boxed because
     /// `ProtocolEvent` dwarfs every other variant and would inflate the
     /// event queue otherwise.
     Protocol(Box<ProtocolEvent>),
 
     /// A block proposal off the wire, its proposer's signature checked at
-    /// intake. `NodeHost` feeds its header to the replica and holds it for
+    /// intake. The loop feeds its header to the replica and holds it for
     /// serving once the replica admits it.
     ProposalReceived {
         /// The proposal as its proposer signed it.
@@ -141,7 +146,7 @@ pub enum ShardScopedInput {
     },
 
     /// A block proposal fetched by hash, its proposer's signature not yet
-    /// checked. `NodeHost` checks it, then takes it as
+    /// checked. The loop checks it, then takes it as
     /// [`Self::ProposalReceived`].
     ProposalFetched {
         /// The proposal the peer answered with.
@@ -154,27 +159,27 @@ pub enum ShardScopedInput {
     /// on `TimerId::FetchTick`; the runner's timer driver fires the timer
     /// into this shard's input channel.
     ///
-    /// [`TimerOp::Set`]: crate::shard::TimerOp::Set
-    /// [`TimerOp::Cancel`]: crate::shard::TimerOp::Cancel
+    /// [`TimerOp::Set`]: crate::event::TimerOp::Set
+    /// [`TimerOp::Cancel`]: crate::event::TimerOp::Cancel
     FetchTick,
 
-    /// Raw gossip-delivered transaction. `NodeHost` queues it for async
+    /// Raw gossip-delivered transaction. The loop queues it for async
     /// validation; the validated form is surfaced as
     /// `ProtocolEvent::TransactionValidated`.
     TransactionGossipReceived {
         /// The transaction.
-        tx: Arc<Transaction>,
+        tx: Transaction,
     },
 
     /// Raw batch delivered by the transaction fetch protocol's response
-    /// callback. `NodeHost` drives the fetch-FSM drain for every
+    /// callback. The loop drives the fetch-FSM drain for every
     /// delivered hash (so invalid-signature payloads don't pin
     /// in-flight slots) and dispatches the batch for async validation;
     /// the validated subset surfaces as
     /// `ProtocolEvent::TransactionsReceived`.
     TransactionsFetched {
         /// Transactions returned by the peer.
-        batch: Vec<Arc<Transaction>>,
+        batch: Vec<Transaction>,
     },
 
     /// Envelopes a derivation could not resolve, each beside what it
@@ -203,7 +208,7 @@ pub enum ShardScopedInput {
     /// `locally_submitted` — that's the source shard's role.
     AdmitTransaction {
         /// The locally-submitted transaction.
-        tx: Arc<Transaction>,
+        tx: Transaction,
     },
 
     /// Locally-submitted tx delivered to the source shard (first hosted
@@ -215,7 +220,7 @@ pub enum ShardScopedInput {
     /// may include destinations this node doesn't host.
     AdmitAndGossipTransaction {
         /// The locally-submitted transaction.
-        tx: Arc<Transaction>,
+        tx: Transaction,
         /// Every shard the tx touches (declared reads ∪ writes). Gossip
         /// goes to each — even non-hosted ones — over the destination
         /// shard's topic.
@@ -228,14 +233,14 @@ pub enum ShardScopedInput {
     /// takes no `locally_submitted` ownership.
     GossipTransaction {
         /// The locally-submitted transaction.
-        tx: Arc<Transaction>,
+        tx: Transaction,
         /// Every shard the tx touches (declared reads ∪ writes). Gossip
         /// goes to each over the destination shard's topic.
         touched_shards: Vec<ShardId>,
     },
 
     /// Sync block response received from network callback. Carries the
-    /// elided wire shape; the `NodeHost` rehydrates to a full `CertifiedBlock`
+    /// elided wire shape; the loop rehydrates to a full `CertifiedBlock`
     /// by looking up omitted bodies in the local mempool / cert cache /
     /// provision store before handing off to the sync state machine.
     BlockSyncResponseReceived {
@@ -264,7 +269,7 @@ pub enum ShardScopedInput {
     },
 
     /// Sync block passed structural validation off-thread (Merkle roots,
-    /// QC binding, per-tick shape). The pinned-thread `NodeHost` re-enters
+    /// QC binding, per-tick shape). The loop's pinned thread re-enters
     /// the post-validation delivery path on receipt.
     SyncBlockValidated {
         /// Height of the validated block.
@@ -312,17 +317,11 @@ pub enum ShardScopedInput {
     },
 
     /// Response to a one-shot commit-proof fetch: the certified-header run
-    /// starting at the wanted height. Headers feed the same
-    /// QC-verification path gossip-arrived headers take; the commit-proof
-    /// walk does the rest. Transport failures push nothing — the
-    /// coordinator's commit sweep re-issues the fetch.
+    /// starting at the wanted height, screened against the range asked.
+    /// Headers feed the same QC-verification path gossip-arrived headers
+    /// take; the commit-proof walk does the rest. Transport failures push
+    /// nothing — the coordinator's commit sweep re-issues the fetch.
     CommitProofResponseReceived {
-        /// Source shard the fetch targeted.
-        source_shard: ShardId,
-        /// First height of the requested range — the wanted height.
-        from_height: BlockHeight,
-        /// Number of heights the request covered.
-        count: HeaderFetchCount,
         /// Headers the responder returned.
         headers: Vec<CertifiedBlockHeader>,
     },
@@ -345,15 +344,15 @@ pub enum ShardScopedInput {
     /// itself rides the accompanying `ProtocolEvent`.
     FetchFulfilled(FetchIds),
 
-    /// Transaction validated by the validation pipeline. The `NodeHost`
+    /// Transaction validated by the validation pipeline. The loop
     /// resolves `submitted_locally` from its `locally_submitted` set
     /// before forwarding as `ProtocolEvent::TransactionValidated`.
     TransactionValidated {
         /// Validated transaction ready for the mempool.
-        tx: Arc<Verified<Transaction>>,
+        tx: Verified<Transaction>,
     },
 
-    /// Transactions that failed validation — sent back so the `NodeHost` can
+    /// Transactions that failed validation — sent back so the loop can
     /// remove their hashes from `pending_validation` and `locally_submitted`.
     TransactionValidationsFailed {
         /// Hashes of transactions that failed validation.
@@ -364,11 +363,8 @@ pub enum ShardScopedInput {
     /// (sender committee check + public key resolution) but still needs
     /// batched signature verification.
     CommittedBlockGossipReceived {
-        /// Header carried in the gossip envelope. Wrapped as `Verifiable`
-        /// so a colocated proposer's local-dispatched broadcast can ride
-        /// `Verifiable::Verified` through to the flush step, which then
-        /// fast-paths the verified arm past the sender-signature batch.
-        certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
+        /// Header carried in a peer's gossip envelope.
+        certified_header: Verifiable<CertifiedBlockHeader>,
         /// Sender validator id.
         sender: ValidatorId,
         /// Sender's public key, resolved from topology.
@@ -434,12 +430,20 @@ pub enum ShardScopedInput {
         /// Hash of the committing block.
         block_hash: BlockHash,
     },
+
+    /// A commit flush on the I/O pool wrote every block through
+    /// `height`. The loop advances its commit pipeline and reads what
+    /// the replica's `ProtocolEvent::BlockPersisted` carries off the
+    /// store, so only the loop builds that event.
+    BlockFlushed {
+        /// The highest height the flush wrote.
+        height: BlockHeight,
+    },
 }
 
 impl ShardScopedInput {
     /// Priority for ordering events at the same simulation timestamp.
     #[must_use]
-    #[allow(clippy::match_same_arms)] // explicit per-variant arms document intent
     pub(crate) fn priority(&self) -> EventPriority {
         match self {
             Self::Protocol(event) => match event.as_ref() {
@@ -469,8 +473,8 @@ impl ShardScopedInput {
             | Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
             | Self::RecordsArrived { .. }
-            | Self::RecordsWanted { .. } => EventPriority::Network,
-            Self::CommittedBlockGossipReceived { .. }
+            | Self::RecordsWanted { .. }
+            | Self::CommittedBlockGossipReceived { .. }
             | Self::ShardForkProofGossipReceived { .. } => EventPriority::Network,
             Self::AdmitTransaction { .. }
             | Self::AdmitAndGossipTransaction { .. }
@@ -492,7 +496,8 @@ impl ShardScopedInput {
             | Self::TransactionValidationsFailed { .. }
             | Self::QcOnlyCommitPrepared { .. }
             | Self::QcOnlyCommitDiverged { .. }
-            | Self::QcOnlyCommitWrittenPast { .. } => EventPriority::Internal,
+            | Self::QcOnlyCommitWrittenPast { .. }
+            | Self::BlockFlushed { .. } => EventPriority::Internal,
         }
     }
 
@@ -500,40 +505,11 @@ impl ShardScopedInput {
     /// derive; `Protocol` delegates to the inner `ProtocolEvent::type_name`
     /// so protocol telemetry is attributable per inner variant.
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Self::Protocol(event) => event.type_name(),
             other => other.into(),
         }
-    }
-}
-
-/// Inputs that aren't anchored to a particular hosted shard.
-///
-/// `SubmitTransaction` is the only entry — the runner fans it across
-/// every hosted shard the transaction touches.
-#[derive(Debug, Clone, strum::IntoStaticStr)]
-pub enum ProcessScopedInput {
-    /// Client submitted a transaction.
-    SubmitTransaction {
-        /// Transaction submitted by the local client; will be validated then gossiped.
-        tx: Arc<Transaction>,
-    },
-}
-
-impl ProcessScopedInput {
-    /// Priority for ordering events at the same simulation timestamp.
-    #[must_use]
-    pub(crate) const fn priority(&self) -> EventPriority {
-        match self {
-            Self::SubmitTransaction { .. } => EventPriority::Client,
-        }
-    }
-
-    /// Telemetry label.
-    #[must_use]
-    pub fn type_name(&self) -> &'static str {
-        self.into()
     }
 }
 
@@ -577,22 +553,22 @@ pub enum BeaconInput {
     /// The replica committed the block this certified header heads.
     LocalCommit {
         /// The committed block's certified header.
-        header: Arc<Verified<CertifiedBlockHeader>>,
+        header: Verified<CertifiedBlockHeader>,
     },
     /// The replica certified this header, ahead of its commit.
     CertifiedHeader {
         /// The replica's own certified header.
-        header: Arc<Verified<CertifiedBlockHeader>>,
+        header: Verified<CertifiedBlockHeader>,
     },
     /// The replica admitted a remote source header.
     SourceHeader {
         /// The admitted header.
-        header: Arc<Verified<CertifiedBlockHeader>>,
+        header: Verified<CertifiedBlockHeader>,
     },
     /// The replica proved a remote source header's commit.
     CommitProven {
         /// The proven header.
-        header: Arc<Verified<CertifiedBlockHeader>>,
+        header: Verified<CertifiedBlockHeader>,
     },
     /// A shard fork is proven, for the next beacon proposal.
     ForkProof(Box<ShardForkProof>),
@@ -625,11 +601,11 @@ pub struct Registration {
     /// The token every later input from the loop carries.
     pub token: ChainRegistration,
     /// The fold's schedule, widened for the chain.
-    pub schedule: Arc<TopologySchedule>,
+    pub(crate) schedule: Arc<TopologySchedule>,
     /// The epoch the fold folded the schedule at.
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
     /// The beacon chain's config.
-    pub chain_config: BeaconChainConfig,
+    pub(crate) chain_config: BeaconChainConfig,
 }
 
 /// Where a runtime registration's [`Registration`] goes.
@@ -643,7 +619,7 @@ impl std::fmt::Debug for RegistrationReply {
 }
 
 /// Inputs routed to the host's beacon loop
-/// ([`BeaconLoop`](crate::beacon_loop::BeaconLoop)).
+/// ([`BeaconLoop`](crate::beacon::BeaconLoop)).
 ///
 /// Gossiped beacon blocks and votes arrive as [`Self::Protocol`]; the
 /// outcomes of the loop's own dispatched actions return as
@@ -682,7 +658,7 @@ pub enum BeaconScopedInput {
         /// Epoch of the block being synced.
         epoch: Epoch,
         /// The fetched block, or `None` if the peer didn't have it.
-        block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
+        block: Option<Verifiable<CertifiedBeaconBlock>>,
     },
 
     /// A beacon-block sync fetch failed at the transport layer.
@@ -695,16 +671,19 @@ pub enum BeaconScopedInput {
 
     /// A fetch attempt for these ids failed or was refused; retry at
     /// once the first time since the tick, and on the tick after that.
-    FetchFailed(FetchIds),
+    FetchFailed(BeaconFetchIds),
     /// A fetch request for these ids never reached a peer; retry on the
     /// tick.
-    FetchUnroutable(FetchIds),
+    FetchUnroutable(BeaconFetchIds),
+    /// A fetch for these ids was answered whole at its response boundary;
+    /// they retire.
+    FetchFulfilled(BeaconFetchIds),
     /// A fetch for `ids` was answered with `event`. The ids retire once
     /// the loop takes what the answer carries, and are released as
     /// failed when its fold refuses a witness run.
     Answered {
         /// The ids the answered request asked for.
-        ids: FetchIds,
+        ids: BeaconFetchIds,
         /// What the answer carries. Boxed for the reason
         /// [`Self::Protocol`] is.
         event: Box<ProtocolEvent>,
@@ -742,6 +721,9 @@ pub enum BeaconScopedInput {
     PackagesInstalled {
         /// The installed packages, by content address.
         packages: Vec<Hash>,
+        /// The packages the install was to read from a store this host
+        /// serves and found in none, to be asked of a peer.
+        unheld: Vec<Hash>,
     },
 
     /// What the replica of the chain `chain` names reported.
@@ -801,6 +783,7 @@ impl BeaconScopedInput {
             | Self::BeaconBlockSyncFetchFailed { .. }
             | Self::FetchFailed(_)
             | Self::FetchUnroutable(_)
+            | Self::FetchFulfilled(_)
             | Self::InstanceRecordsFetched { .. }
             | Self::PackageArtifactsFetched { .. }
             | Self::PackagesInstalled { .. }
@@ -816,7 +799,7 @@ impl BeaconScopedInput {
     /// Telemetry label. `Protocol` delegates to the inner
     /// [`ProtocolEvent::type_name`]; the rest use their variant names.
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub(crate) fn type_name(&self) -> &'static str {
         match self {
             Self::Protocol(event)
             | Self::Continuation { event, .. }
@@ -827,21 +810,91 @@ impl BeaconScopedInput {
     }
 }
 
-/// An input plus the driver the I/O loop's `step()` routes it to.
+/// Inbound network inputs one hosted shard's network lane holds before it
+/// refuses more.
 ///
-/// The shard variant carries the hosted-shard tag inline; the process and
-/// beacon variants have no tag — the process fan is host-wide, and a host runs
-/// one beacon loop.
+/// Per-transaction gossip is the lane's most numerous item, and a chain
+/// holds at most [`MAX_UNSETTLED_TXS`] transactions in flight: a backlog
+/// deeper than that is more than the replica could take in before it
+/// drains. Several full gossip batches fit.
+pub const NETWORK_LANE_CAPACITY: usize = MAX_UNSETTLED_PER_BLOCK;
+
+const _: () = assert!(NETWORK_LANE_CAPACITY as u64 == MAX_UNSETTLED_TXS);
+
+const _: () = assert!(NETWORK_LANE_CAPACITY >= 4 * MAX_GOSSIP_TX_BATCH);
+
+/// The two lanes into one hosted shard's driver.
+///
+/// The network lane takes what peers send unbidden (gossip and
+/// notifications) and is bounded: a push that finds it full, or that
+/// would take its peer past its share of it, is refused, never queued, so
+/// a stalled driver cannot make peer traffic pile up without bound and
+/// no one peer can keep it full. `internal` takes everything the host
+/// itself produced (the loop's own continuations, off-thread results, the
+/// answers to its own fetches, the beacon loop's reports, RPC
+/// submissions) and is never bounded: each item there is owed to a state
+/// machine that is waiting on it. The driver drains both, keeping each
+/// lane's own order.
+#[derive(Debug, Clone)]
+pub struct ShardInbox {
+    internal: Sender<HostEvent>,
+    /// `None` when peers' inputs share the internal lane's channel.
+    network: Option<NetworkLane>,
+}
+
+impl ShardInbox {
+    /// An inbox over its two lanes.
+    #[must_use]
+    pub const fn new(internal: Sender<HostEvent>, network: NetworkLane) -> Self {
+        Self {
+            internal,
+            network: Some(network),
+        }
+    }
+
+    /// The lane for the host's own continuations and answers.
+    #[must_use]
+    pub const fn internal(&self) -> &Sender<HostEvent> {
+        &self.internal
+    }
+
+    /// Offer `event`, sent by `peer`, to the lane for inputs peers send
+    /// unbidden. An inbox whose lanes share one channel takes it there.
+    #[must_use]
+    pub fn offer(&self, event: HostEvent, peer: PeerId) -> Offer {
+        if let Some(lane) = &self.network {
+            return lane.offer(event, peer);
+        }
+        let _ = self.internal.send(event);
+        Offer::Taken
+    }
+}
+
+/// Both lanes on one channel: one driver draining a single receiver in
+/// the order it was pushed, as the simulation harness does. An unbounded
+/// channel never refuses a push, so neither the lane's bound nor any
+/// peer's share of it applies.
+impl From<Sender<HostEvent>> for ShardInbox {
+    fn from(sender: Sender<HostEvent>) -> Self {
+        Self {
+            internal: sender,
+            network: None,
+        }
+    }
+}
+
+/// An input plus the driver the host's `step()` routes it to.
+///
+/// The shard variant carries the hosted-shard tag inline; the beacon variant
+/// has none, since a host runs one beacon loop.
 #[derive(Debug, Clone)]
 pub enum HostEvent {
     /// Routed to the hosted shard identified by [`ShardId`]: its replica
     /// for state-machine events, its loop for shard-scoped pipeline
     /// fixups.
     Shard(ShardId, ShardScopedInput),
-    /// Process-scoped — not anchored to a single shard.
-    Process(ProcessScopedInput),
     /// Beacon-scoped — routed to the host's
-    /// [`BeaconLoop`](crate::beacon_loop::BeaconLoop). Carries a
+    /// [`BeaconLoop`](crate::beacon::BeaconLoop). Carries a
     /// [`BeaconScopedInput`]: beacon traffic, what the replicas report,
     /// and the loop's own continuations and fetch answers.
     Beacon(BeaconScopedInput),
@@ -852,12 +905,6 @@ impl HostEvent {
     #[must_use]
     pub const fn shard(shard: ShardId, input: ShardScopedInput) -> Self {
         Self::Shard(shard, input)
-    }
-
-    /// Construct a process-scoped envelope.
-    #[must_use]
-    pub const fn process(input: ProcessScopedInput) -> Self {
-        Self::Process(input)
     }
 
     /// Construct a shard-scoped `Protocol` envelope for `event`.
@@ -875,7 +922,7 @@ impl HostEvent {
 
     /// Construct the beacon loop's fetch tick.
     #[must_use]
-    pub const fn beacon_fetch_tick() -> Self {
+    pub(crate) const fn beacon_fetch_tick() -> Self {
         Self::Beacon(BeaconScopedInput::FetchTick)
     }
 
@@ -884,7 +931,6 @@ impl HostEvent {
     pub fn priority(&self) -> EventPriority {
         match self {
             Self::Shard(_, input) => input.priority(),
-            Self::Process(input) => input.priority(),
             Self::Beacon(input) => input.priority(),
         }
     }
@@ -894,8 +940,136 @@ impl HostEvent {
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::Shard(_, input) => input.type_name(),
-            Self::Process(input) => input.type_name(),
             Self::Beacon(input) => input.type_name(),
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// TimerOp — buffered timer operations for the runner
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Whose timer a [`TimerOp`] names, and so whom its fire reaches.
+///
+/// Each beacon participant arms the same [`TimerId`]s against its own
+/// deadlines, so a participant's timer is its own and its fire reaches it
+/// alone. A shard loop's timers, its replica's and its fetch tick, are the
+/// loop's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TimerOwner {
+    /// A hosted shard's loop: its replica's timers and its fetch tick.
+    Loop(ShardId),
+    /// One attached identity's beacon participation on the host's beacon
+    /// loop.
+    Participant(Attachment),
+    /// The host's beacon loop itself: its fetch tick.
+    Beacon,
+}
+
+/// A timer operation buffered by a loop driver for the runner to process.
+///
+/// The runner's timer driver keys handles by `(TimerOwner, TimerId)`, and
+/// the firing path ([`timer_event`]) addresses the envelope to the owner.
+#[derive(Debug, Clone)]
+pub enum TimerOp {
+    /// Set a timer to fire after `duration`.
+    Set {
+        /// Whose timer this is.
+        owner: TimerOwner,
+        /// Logical timer identifier (state-machine-side).
+        id: TimerId,
+        /// How long until the timer should fire.
+        duration: Duration,
+    },
+    /// Cancel a previously set timer.
+    Cancel {
+        /// Whose timer this is.
+        owner: TimerOwner,
+        /// Logical timer identifier to cancel.
+        id: TimerId,
+    },
+}
+
+/// Translate a fired [`TimerId`] back into the [`HostEvent`] the runner
+/// pushes onto its event channel.
+///
+/// The envelope is addressed to the timer's owner: a loop's timer to its
+/// shard, a participant's to that participant alone, and the beacon loop's
+/// fetch tick to the beacon loop.
+#[must_use]
+pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
+    let event = match id {
+        TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
+        TimerId::Cleanup => ProtocolEvent::CleanupTimer,
+        TimerId::ProposalPace => ProtocolEvent::ProposalPaceTimer,
+        TimerId::ProposalFetch => ProtocolEvent::ProposalFetchTimer,
+        TimerId::FetchTick => {
+            return match owner {
+                TimerOwner::Loop(shard) => HostEvent::shard(shard, ShardScopedInput::FetchTick),
+                TimerOwner::Participant(_) | TimerOwner::Beacon => HostEvent::beacon_fetch_tick(),
+            };
+        }
+        TimerId::BeaconCommitteeStart => ProtocolEvent::BeaconCommitteeStartTimer,
+        TimerId::BeaconRatifyTrigger => ProtocolEvent::BeaconRatifyTimer,
+        TimerId::BeaconSpcView => ProtocolEvent::BeaconSpcViewTimer,
+        TimerId::BeaconSpcInputDwell => ProtocolEvent::BeaconSpcInputDwellTimer,
+    };
+    match owner {
+        TimerOwner::Loop(shard) => HostEvent::protocol(shard, event),
+        TimerOwner::Participant(participant) => {
+            HostEvent::Beacon(BeaconScopedInput::ParticipantTimer {
+                participant,
+                event: Box::new(event),
+            })
+        }
+        TimerOwner::Beacon => HostEvent::beacon(event),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// StepOutput — returned to the caller after processing an event
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Output from processing a single event via `NodeHost::step()`.
+///
+/// Aggregates the per-step scratch from every hosted shard touched by
+/// the event: emitted transaction statuses, timer operations, action
+/// counts. Sync/fetch I/O and block-commit dispatch happen internally
+/// via the `Network` and `Dispatch` traits — the runner only processes
+/// emitted transaction statuses and timer operations.
+#[derive(Default)]
+pub struct StepOutput {
+    /// Transaction status notifications emitted during this step.
+    pub(crate) emitted_statuses: Vec<(TxHash, TransactionStatus)>,
+    /// Number of actions generated by the state machine during this step.
+    pub actions_generated: usize,
+    /// Timer operations (set/cancel) to be processed by the runner.
+    pub timer_ops: Vec<TimerOp>,
+    /// Placement deltas emitted via [`BeaconAction::ReconfigureParticipation`](hyperscale_core::BeaconAction::ReconfigureParticipation)
+    /// during this step. The runner reconfigures physical shard
+    /// membership from these — they are requests to the process layer,
+    /// not state-machine state.
+    pub participation_changes: Vec<ParticipationChange>,
+    /// Validators the loop attached to its replica during this step.
+    pub attached: Vec<ValidatorId>,
+    /// Shards whose store needs a height beneath every serving peer's
+    /// chain floor. Block sync can never carry such a store forward; the
+    /// runner rebuilds it at the shard's attested anchor.
+    pub reseats: Vec<ShardId>,
+}
+
+impl StepOutput {
+    /// Fold another step's output into this one. The whole-host driver
+    /// ([`NodeHost::step`](crate::host::NodeHost::step)) uses this to
+    /// aggregate the per-driver outputs of every shard and the beacon loop a
+    /// single event touched.
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.emitted_statuses.extend(other.emitted_statuses);
+        self.actions_generated += other.actions_generated;
+        self.timer_ops.extend(other.timer_ops);
+        self.participation_changes
+            .extend(other.participation_changes);
+        self.attached.extend(other.attached);
+        self.reseats.extend(other.reseats);
     }
 }

@@ -29,8 +29,8 @@
 use hyperscale_types::network::request::GetWitnessHistoryRequest;
 use hyperscale_types::network::response::GetWitnessHistoryResponse;
 use hyperscale_types::{
-    BeaconWitnessRoot, BlockHeader, Hash, QuorumCertificate, ShardAnchor, ShardWitnessPayload,
-    compute_merkle_root,
+    BeaconWitnessRoot, BlockHeader, Hash, MAX_WITNESSES_PER_FETCH, QuorumCertificate, ShardAnchor,
+    ShardWitnessPayload, compute_merkle_root,
 };
 
 use super::BootstrapOutcome;
@@ -46,7 +46,7 @@ enum SyncState {
 }
 
 /// Witness-history assembly state for one shard bootstrap.
-pub(crate) struct WitnessHistorySync {
+pub struct WitnessHistorySync {
     anchor: ShardAnchor,
     /// The beacon's QC for the anchor, when a crossing attested one. It
     /// is the QC this assembly hands on, and a served one is ignored.
@@ -155,6 +155,11 @@ impl WitnessHistorySync {
             if assembled == window_len {
                 return BootstrapOutcome::Rejected("continuation past the header's window");
             }
+            // A server pages its window a full limit at a time, so a page
+            // short of it that claims more is a drip no proof catches.
+            if chunk.payloads.len() < (self.limit as usize).min(MAX_WITNESSES_PER_FETCH) {
+                return BootstrapOutcome::Rejected("continuation on a page short of its limit");
+            }
         } else if assembled < window_len {
             return BootstrapOutcome::Rejected("final page leaves the window short");
         }
@@ -245,7 +250,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::bootstrap::witness_history_serve::serve_witness_history_request;
+    use crate::serve_witness_history_request;
 
     const HEIGHT: u64 = 1;
 
@@ -351,6 +356,29 @@ mod tests {
         assert!(recovered.latest_qc.is_none());
         assert_eq!(recovered.anchor_qc, Some(qc));
         assert_eq!(recovered.beacon_witness_leaf_hashes, expected);
+    }
+
+    /// A page short of the limit asked that claims more is a drip and is
+    /// rejected, keeping the prefix; the next honest page completes it.
+    #[test]
+    fn a_short_page_claiming_more_is_rejected() {
+        let leaves: Vec<_> = (1u64..=5).map(stake_deposit).collect();
+        let (peer, anchor) = replica(&leaves);
+
+        let mut sync = WitnessHistorySync::new(anchor, None, 4);
+        let mut request = sync.next_request().expect("idle");
+        // A server answering one leaf where four were asked.
+        request.limit = 1;
+        let response = serve_witness_history_request(&peer, &request);
+        assert!(response.history.as_ref().is_some_and(|chunk| chunk.more));
+        assert_eq!(
+            sync.on_response(&response),
+            BootstrapOutcome::Rejected("continuation on a page short of its limit")
+        );
+
+        drive(&mut sync, &peer);
+        assert!(sync.is_complete());
+        assert_eq!(sync.take_parts().2, leaves);
     }
 
     #[test]

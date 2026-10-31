@@ -50,7 +50,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
+    Action, CrossShardExecutionRequest, ExecutionAction, FetchIds, FetchRequest, ProtocolEvent,
+    ProvisionAction, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Member, abandoned_never};
 use hyperscale_engine::tick_select::{
@@ -70,15 +71,15 @@ use hyperscale_storage::{
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CarriedClaims, CertifiedBlock,
-    CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
-    EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome,
-    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
-    Hash, Joins, MerkleInclusionProof, Mode, Movement, ProvenAnchors, Provisions,
-    REATTESTATION_STEP, ScheduleLookup, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim,
-    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
-    WeightedTimestamp, derive_block_transactions, tick_leader,
+    CheckedStateProof, CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation,
+    DiscardCause, EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError,
+    ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
+    GlobalReceiptRoot, Hash, Joins, Mode, Movement, ProvenAnchors, Provisions, REATTESTATION_STEP,
+    ScheduleLookup, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim, StateWrites,
+    StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
+    VerdictCells, VerdictQuestion, Verifiable, Verified, WeightedTimestamp,
+    derive_block_transactions, tick_leader,
 };
 use tracing::instrument;
 
@@ -110,7 +111,7 @@ use crate::vote_tracker::VoteTracker;
 /// is one more place that answer can drift from the member's.
 #[derive(Clone)]
 struct CommittedMember {
-    tx: Arc<Verifiable<Transaction>>,
+    tx: Verifiable<Transaction>,
     member: Member,
 }
 
@@ -120,7 +121,7 @@ struct CommittedMember {
 fn committed_members(
     classification: &TopologySnapshot,
     local_shard: ShardId,
-    transactions: &[Arc<Verifiable<Transaction>>],
+    transactions: &[Verifiable<Transaction>],
 ) -> Vec<CommittedMember> {
     let trie = classification.shard_trie();
     // A transaction this node could not route takes no part here. Where
@@ -129,10 +130,10 @@ fn committed_members(
     // certified block is committed by every replica alike — including
     // one that has never been where those records are seated. The commit
     // asks for them; nothing is booked on a shape nobody derived.
-    let routed: Vec<Arc<Verifiable<Transaction>>> = transactions
+    let routed: Vec<Verifiable<Transaction>> = transactions
         .iter()
         .filter(|tx| tx.as_unverified().is_routed())
-        .map(Arc::clone)
+        .cloned()
         .collect();
     assign_participants(classification, &routed)
         .into_iter()
@@ -845,16 +846,18 @@ impl ExecutionCoordinator {
             };
             let (recipients, local_recipient) =
                 self.addressed(vec![tick_leader(tick_id, &committee)]);
-            actions.push(Action::SignAndSendExecutionVote {
-                block_hash: tick.block_hash(),
-                vote_anchor_ts,
-                tick_id: *tick_id,
-                global_receipt_root,
-                tx_outcomes,
-                recipients,
-                local_recipient,
-                signer,
-            });
+            actions.push(Action::Execution(
+                ExecutionAction::SignAndSendExecutionVote {
+                    block_hash: tick.block_hash(),
+                    vote_anchor_ts,
+                    tick_id: *tick_id,
+                    global_receipt_root,
+                    tx_outcomes,
+                    recipients,
+                    local_recipient,
+                    signer,
+                },
+            ));
         }
         actions
     }
@@ -1077,7 +1080,7 @@ impl ExecutionCoordinator {
         &mut self,
         classification: &TopologySnapshot,
         block: &CommittingBlock,
-        transactions: &[Arc<Verifiable<Transaction>>],
+        transactions: &[Verifiable<Transaction>],
     ) {
         let local_shard = self.local_shard;
         let members = committed_members(classification, local_shard, transactions);
@@ -1114,9 +1117,9 @@ impl ExecutionCoordinator {
             // BFT-transitive trust that gates the containing block. Honest
             // live-consensus blocks already carry `Verified` entries (the
             // `.into_verified()` arm short-circuits without re-validating).
-            let verified: Arc<Verified<Transaction>> = match (*tx).clone().into_verified() {
-                Ok(v) => Arc::new(v),
-                Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
+            let verified: Verified<Transaction> = match tx.into_verified() {
+                Ok(v) => v,
+                Err(raw) => Verified::<Transaction>::from_persisted(raw),
             };
             self.candidates.register(
                 verified,
@@ -1829,16 +1832,18 @@ impl ExecutionCoordinator {
             );
             let (recipients, local_recipient) = self.addressed(vec![leader]);
             for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
-                actions.push(Action::SignAndSendExecutionVote {
-                    block_hash: completion.block_hash,
-                    vote_anchor_ts: completion.vote_anchor_ts,
-                    tick_id: completion.tick_id,
-                    global_receipt_root: completion.global_receipt_root,
-                    tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: recipients.clone(),
-                    local_recipient,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::SignAndSendExecutionVote {
+                        block_hash: completion.block_hash,
+                        vote_anchor_ts: completion.vote_anchor_ts,
+                        tick_id: completion.tick_id,
+                        global_receipt_root: completion.global_receipt_root,
+                        tx_outcomes: (*tx_outcomes).clone(),
+                        recipients: recipients.clone(),
+                        local_recipient,
+                        signer,
+                    },
+                ));
             }
         }
         actions
@@ -1856,9 +1861,9 @@ impl ExecutionCoordinator {
     /// clone. Wire-decoded blocks land at `Unverified`; the
     /// [`Verified::<Provisions>::from_committed_block`] gate then carries
     /// the BFT-transitive trust source via a re-wrap (one body clone).
-    fn apply_committed_provisions(&mut self, batches: &[Arc<Verifiable<Provisions>>]) {
+    fn apply_committed_provisions(&mut self, batches: &[Verifiable<Provisions>]) {
         // Sort for deterministic iteration (logs, action vector order).
-        let mut ordered: Vec<&Arc<Verifiable<Provisions>>> = batches.iter().collect();
+        let mut ordered: Vec<&Verifiable<Provisions>> = batches.iter().collect();
         ordered.sort_by_key(|b| b.hash());
 
         for provisions in &ordered {
@@ -2063,12 +2068,14 @@ impl ExecutionCoordinator {
         Some(
             held.and_then(|certificate| {
                 let signer = self.envelope_signer(topology_schedule, &certificate)?;
-                Some(Action::BroadcastExecutionCertificate {
-                    shard: self.local_shard,
-                    certificate,
-                    recipients: vec![vote.validator()],
-                    signer,
-                })
+                Some(Action::Execution(
+                    ExecutionAction::BroadcastExecutionCertificate {
+                        shard: self.local_shard,
+                        certificate,
+                        recipients: vec![vote.validator()],
+                        signer,
+                    },
+                ))
             })
             .into_iter()
             .collect(),
@@ -2098,11 +2105,13 @@ impl ExecutionCoordinator {
             vote_count = votes.len(),
             "Dispatching execution vote provisions verification"
         );
-        vec![Action::VerifyAndAggregateExecutionVotes {
-            tick_id,
-            block_hash,
-            votes,
-        }]
+        vec![Action::Execution(
+            ExecutionAction::VerifyAndAggregateExecutionVotes {
+                tick_id,
+                block_hash,
+                votes,
+            },
+        )]
     }
 
     /// Handle a verified execution vote (own vote or already-verified).
@@ -2238,12 +2247,14 @@ impl ExecutionCoordinator {
 
         // tx_outcomes are extracted from votes by the aggregation handler
         // (all quorum votes carry identical outcomes).
-        let mut actions = vec![Action::AggregateExecutionCertificate {
-            tick_id,
-            global_receipt_root,
-            votes,
-            committee,
-        }];
+        let mut actions = vec![Action::Execution(
+            ExecutionAction::AggregateExecutionCertificate {
+                tick_id,
+                global_receipt_root,
+                votes,
+                committee,
+            },
+        )];
         if !ec_tx_hashes.is_empty() {
             actions.push(Action::RecordTxEcCreated {
                 tx_hashes: ec_tx_hashes,
@@ -2263,7 +2274,7 @@ impl ExecutionCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
         tick_id: &TickId,
-        certificate: &Arc<Verified<ExecutionCertificate>>,
+        certificate: &Verified<ExecutionCertificate>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         // EC broadcast is routing — who should receive it now — so recipients
@@ -2292,7 +2303,7 @@ impl ExecutionCoordinator {
 
         // Hold the cert until the containing block commits, for late
         // voters.
-        self.exec_certs.insert(Arc::clone(certificate));
+        self.exec_certs.insert(certificate.clone());
         self.ticks.clear_vote_retry(tick_id);
 
         // Broadcast EC to all local peers (they don't aggregate — they need it).
@@ -2301,12 +2312,14 @@ impl ExecutionCoordinator {
         if let Some(signer) = envelope_signer
             && !local_peers.is_empty()
         {
-            actions.push(Action::BroadcastExecutionCertificate {
-                shard: self.local_shard,
-                certificate: Arc::clone(certificate),
-                recipients: local_peers,
-                signer,
-            });
+            actions.push(Action::Execution(
+                ExecutionAction::BroadcastExecutionCertificate {
+                    shard: self.local_shard,
+                    certificate: certificate.clone(),
+                    recipients: local_peers,
+                    signer,
+                },
+            ));
         }
 
         // Broadcast each target shard its own projection. Track the
@@ -2319,20 +2332,21 @@ impl ExecutionCoordinator {
             let Some(projected) = certificate.project_to(txs) else {
                 continue;
             };
-            let projected = Arc::new(projected);
             self.outbound_certs.on_broadcast(
-                Arc::clone(&projected),
+                projected.clone(),
                 *target_shard,
                 recipients.clone(),
                 self.committed_ts,
             );
             if let Some(signer) = envelope_signer {
-                actions.push(Action::BroadcastExecutionCertificate {
-                    shard: *target_shard,
-                    certificate: projected,
-                    recipients,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::BroadcastExecutionCertificate {
+                        shard: *target_shard,
+                        certificate: projected,
+                        recipients,
+                        signer,
+                    },
+                ));
             }
         }
 
@@ -2467,10 +2481,12 @@ impl ExecutionCoordinator {
         }
 
         match self.gate(topology_schedule, &cert) {
-            Ok(keys) => vec![Action::VerifyExecutionCertificateSignature {
-                public_keys: keys.unwrap_or_default(),
-                certificate: cert,
-            }],
+            Ok(keys) => vec![Action::Execution(
+                ExecutionAction::VerifyExecutionCertificateSignature {
+                    public_keys: keys.unwrap_or_default(),
+                    certificate: cert,
+                },
+            )],
             Err(Gate::BeaconBehind) => {
                 self.parked
                     .park(Waiting::Beacon, Parked::Certificate(Box::new(cert)));
@@ -2489,8 +2505,8 @@ impl ExecutionCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
         result: Result<
-            Arc<Verified<ExecutionCertificate>>,
-            (Arc<ExecutionCertificate>, ExecutionCertificateVerifyError),
+            Verified<ExecutionCertificate>,
+            (ExecutionCertificate, ExecutionCertificateVerifyError),
         >,
     ) -> Vec<Action> {
         // Release the in-flight slot regardless of outcome — a failed
@@ -2499,7 +2515,7 @@ impl ExecutionCoordinator {
         // rather than a real signature mismatch). Subsequent arrivals
         // with a different aggregation hash to a different `wire_hash`
         // and aren't gated by this slot.
-        let ec_arc = match result {
+        let ec = match result {
             Ok(verified) => {
                 self.pending_verifications.remove(&verified.wire_hash());
                 verified
@@ -2523,22 +2539,20 @@ impl ExecutionCoordinator {
         // dispatch this verification, so `None` here means that epoch aged
         // out of the schedule in the interim (the beacon advanced past
         // retention) — the EC is stale, so abandon it.
-        let Some(committee) = attesting_committee(
-            topology_schedule,
-            ec_arc.shard_id(),
-            ec_arc.vote_anchor_ts(),
-        ) else {
+        let Some(committee) =
+            attesting_committee(topology_schedule, ec.shard_id(), ec.vote_anchor_ts())
+        else {
             tracing::warn!(
-                shard = ec_arc.shard_id().inner(),
-                tick = %ec_arc.tick_id(),
+                shard = ec.shard_id().inner(),
+                tick = %ec.tick_id(),
                 "Discarding execution certificate — epoch evicted from schedule before verification completed"
             );
             return vec![];
         };
-        if !ec_has_shard_quorum_power(committee, &ec_arc) {
+        if !ec_has_shard_quorum_power(committee, &ec) {
             tracing::warn!(
-                shard = ec_arc.shard_id().inner(),
-                tick = %ec_arc.tick_id(),
+                shard = ec.shard_id().inner(),
+                tick = %ec.tick_id(),
                 "Discarding sub-quorum execution certificate"
             );
             return vec![];
@@ -2549,14 +2563,14 @@ impl ExecutionCoordinator {
         // committee, and if it now sits in the band it names a height the
         // recovered chain commits anew, whose tick it must not stand for.
         if topology_schedule.recovery_orphaned(
-            ec_arc.shard_id(),
-            ec_arc.vote_anchor_ts(),
-            ec_arc.block_height(),
+            ec.shard_id(),
+            ec.vote_anchor_ts(),
+            ec.block_height(),
         ) {
             tracing::warn!(
-                shard = ec_arc.shard_id().inner(),
-                tick = %ec_arc.tick_id(),
-                height = ec_arc.block_height().inner(),
+                shard = ec.shard_id().inner(),
+                tick = %ec.tick_id(),
+                height = ec.block_height().inner(),
                 "Discarding verified EC anchored below a recovery's bridge above its frontier"
             );
             return vec![];
@@ -2564,7 +2578,7 @@ impl ExecutionCoordinator {
 
         let mut actions = vec![Action::Continuation(
             ProtocolEvent::ExecutionCertificateAdmitted {
-                certificate: Arc::clone(&ec_arc),
+                certificate: ec.clone(),
             },
         )];
 
@@ -2576,16 +2590,16 @@ impl ExecutionCoordinator {
         // cannot settle the tick here, so the vote retry that recovers
         // the complete copy keeps running, and the store keeps its slot
         // for the copy that can serve this shard's own peers.
-        if ec_arc.shard_id() == self.local_shard && ec_arc.is_complete() {
-            self.ticks.mark_ec_dispatched(*ec_arc.tick_id());
+        if ec.shard_id() == self.local_shard && ec.is_complete() {
+            self.ticks.mark_ec_dispatched(*ec.tick_id());
             // The certificate ends this voter's retries and its own tally:
             // a later vote for the tick is answered with the certificate.
-            self.ticks.clear_vote_retry(ec_arc.tick_id());
-            self.ticks.remove_tracker(ec_arc.tick_id());
-            self.exec_certs.insert(Arc::clone(&ec_arc));
+            self.ticks.clear_vote_retry(ec.tick_id());
+            self.ticks.remove_tracker(ec.tick_id());
+            self.exec_certs.insert(ec.clone());
         }
 
-        actions.extend(self.handle_attestation(&ec_arc));
+        actions.extend(self.handle_attestation(&ec));
         actions
     }
 
@@ -2622,28 +2636,20 @@ impl ExecutionCoordinator {
     }
 
     /// Keep a fetched proof for a block this validator proposes.
-    pub fn on_proof_fetched(
-        &mut self,
-        anchor: Anchor,
-        keys: &[SubstateKey],
-        proof: &MerkleInclusionProof,
-        values: &[ServedValue],
-    ) {
-        self.counterparts
-            .on_proof_fetched(anchor, keys, proof, values);
+    pub fn on_proof_fetched(&mut self, proof: &CheckedStateProof, values: &[ServedValue]) {
+        self.counterparts.take_fetched_proof(proof, values);
     }
 
-    /// Take a proof fetched for verdict questions at `anchor`, each
-    /// question as its cells, and hold what a hearing row would take.
+    /// Take a proof fetched for verdict questions, each question as its
+    /// cells, and hold what a hearing row would take.
     pub fn on_verdict_proof_fetched(
         &mut self,
-        anchor: Anchor,
         questions: &[VerdictCells],
-        proof: &MerkleInclusionProof,
+        proof: &CheckedStateProof,
         windows: EpochWindows,
     ) {
         self.counterparts
-            .on_verdict_proof_fetched(anchor, questions, proof, windows);
+            .on_verdict_proof_fetched(questions, proof, windows);
     }
 
     /// What this validator holds to offer in a block it proposes,
@@ -2956,16 +2962,18 @@ impl ExecutionCoordinator {
             let (recipients, local_recipient) =
                 self.addressed(vec![tick_leader(&tick_id, &committee)]);
             for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
-                actions.push(Action::SignAndSendExecutionVote {
-                    block_hash,
-                    vote_anchor_ts,
-                    tick_id,
-                    global_receipt_root,
-                    tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: recipients.clone(),
-                    local_recipient,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::SignAndSendExecutionVote {
+                        block_hash,
+                        vote_anchor_ts,
+                        tick_id,
+                        global_receipt_root,
+                        tx_outcomes: (*tx_outcomes).clone(),
+                        recipients: recipients.clone(),
+                        local_recipient,
+                        signer,
+                    },
+                ));
             }
         }
         actions
@@ -3021,7 +3029,7 @@ impl ExecutionCoordinator {
         );
     }
 
-    /// Lift fired retries to `Action::SignAndSendExecutionVote`s.
+    /// Lift fired retries to `ExecutionAction::SignAndSendExecutionVote`s.
     fn lift_vote_retries(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -3078,16 +3086,18 @@ impl ExecutionCoordinator {
                 .collect();
             let (recipients, local_recipient) = self.addressed(recipients);
             for signer in signers {
-                actions.push(Action::SignAndSendExecutionVote {
-                    block_hash,
-                    vote_anchor_ts,
-                    tick_id,
-                    global_receipt_root,
-                    tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: recipients.clone(),
-                    local_recipient,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::SignAndSendExecutionVote {
+                        block_hash,
+                        vote_anchor_ts,
+                        tick_id,
+                        global_receipt_root,
+                        tx_outcomes: (*tx_outcomes).clone(),
+                        recipients: recipients.clone(),
+                        local_recipient,
+                        signer,
+                    },
+                ));
             }
         }
         actions
@@ -3317,12 +3327,14 @@ impl ExecutionCoordinator {
         // deterministic across validators.
         for directive in self.outbound_certs.on_block_committed(self.committed_ts) {
             if let Some(signer) = self.envelope_signer(topology_schedule, &directive.certificate) {
-                actions.push(Action::BroadcastExecutionCertificate {
-                    shard: directive.target_shard,
-                    certificate: directive.certificate,
-                    recipients: directive.recipients,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::BroadcastExecutionCertificate {
+                        shard: directive.target_shard,
+                        certificate: directive.certificate,
+                        recipients: directive.recipients,
+                        signer,
+                    },
+                ));
             }
         }
 
@@ -3440,15 +3452,17 @@ impl ExecutionCoordinator {
             if let Some((requests, shard_recipients)) =
                 build_provision_requests(anchored, transactions, &self.signers, local_shard)
             {
-                actions.push(Action::FetchAndBroadcastProvisions {
-                    block_hash,
-                    requests,
-                    source_shard: local_shard,
-                    block_height: height,
-                    source_block_ts: header.parent_qc().weighted_timestamp(),
-                    shard_recipients,
-                    signer: proposer,
-                });
+                actions.push(Action::Provisions(
+                    ProvisionAction::FetchAndBroadcastProvisions {
+                        block_hash,
+                        requests,
+                        source_shard: local_shard,
+                        block_height: height,
+                        source_block_ts: header.parent_qc().weighted_timestamp(),
+                        shard_recipients,
+                        signer: proposer,
+                    },
+                ));
             }
             if let Some((parent_hash, anchor, mut targets)) = pending_push {
                 // The records still standing whose consumers have not
@@ -3469,13 +3483,13 @@ impl ExecutionCoordinator {
                     .keys()
                     .map(|&target| (target, anchored.committee_for_shard(target).to_vec()))
                     .collect();
-                actions.push(Action::PushCrossingReadings {
+                actions.push(Action::Provisions(ProvisionAction::PushCrossingReadings {
                     block_hash: parent_hash,
                     anchor,
                     targets,
                     shard_recipients,
                     signer: proposer,
-                });
+                }));
             }
         }
         // Every live block is pushed for, whether or not it wrote a
@@ -4215,14 +4229,14 @@ impl ExecutionCoordinator {
             .filter(|(_, height, _)| *height == tick.tick)
             .map(|(_, _, resolution)| resolution.clone())
             .collect();
-        vec![Action::ExecuteTransactions {
+        vec![Action::Execution(ExecutionAction::ExecuteTransactions {
             tick: tick.tick,
             fates,
             tick_ts: tick.tick_ts,
             env: tick.env,
             requests: tick.requests,
             included: tick.included,
-        }]
+        })]
     }
 
     /// Replay buffered certificates for transactions that have just
@@ -4266,7 +4280,7 @@ impl ExecutionCoordinator {
     /// buffered (or kept buffered) via `pending_routing` until their
     /// block commits; routed `tx_hashes` are cleared from the pending
     /// set, dropping the EC entirely once fully routed.
-    fn handle_attestation(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
+    fn handle_attestation(&mut self, ec: &Verified<ExecutionCertificate>) -> Vec<Action> {
         let mut actions = Vec::new();
         self.counterparts.on_certificate(ec, self.committed_ts);
         if ec.shard_id() != self.local_shard {
@@ -4291,7 +4305,7 @@ impl ExecutionCoordinator {
             if tick.adopt_later_certificate(ec) {
                 actions.extend(self.reanchor_finalizations(tick_id, ec));
             } else {
-                tick.add_execution_certificate(Arc::clone(ec));
+                tick.add_execution_certificate(ec.clone());
             }
             actions.extend(self.finalize(tick_id));
         }
@@ -4314,7 +4328,7 @@ impl ExecutionCoordinator {
     fn reanchor_finalizations(
         &self,
         tick_id: &TickId,
-        local: &Arc<Verified<ExecutionCertificate>>,
+        local: &Verified<ExecutionCertificate>,
     ) -> Vec<Action> {
         let mut finalizations = Vec::new();
         for held in self.finalized.of_tick(tick_id) {
@@ -4326,10 +4340,10 @@ impl ExecutionCoordinator {
                 anchor = local.vote_anchor_ts().as_millis(),
                 "Re-anchoring a held finalization on a later certificate"
             );
-            let reanchored: Arc<Verifiable<Finalization>> =
-                Arc::new(Verified::<Finalization>::seal(reanchored).into());
+            let reanchored: Verifiable<Finalization> =
+                Verified::<Finalization>::seal(reanchored).into();
             self.finalized.remove(&held.receipt_hash());
-            self.finalized.insert(*tick_id, Arc::clone(&reanchored));
+            self.finalized.insert(*tick_id, reanchored.clone());
             finalizations.push(reanchored);
         }
         if finalizations.is_empty() {
@@ -4394,12 +4408,12 @@ impl ExecutionCoordinator {
                 continue;
             }
             self.legs_asked.insert(*tick, tip);
-            actions.push(Action::BuildLegsHalf {
+            actions.push(Action::Execution(ExecutionAction::BuildLegsHalf {
                 tick: *tick,
                 names: names.clone(),
                 tip,
                 tip_height,
-            });
+            }));
         }
         actions
     }
@@ -4434,9 +4448,8 @@ impl ExecutionCoordinator {
             return Vec::new();
         };
         self.legs_offered.insert(tick, names);
-        let half: Arc<Verifiable<Finalization>> =
-            Arc::new(Verified::<Finalization>::seal(half).into());
-        self.finalized.insert(tick, Arc::clone(&half));
+        let half: Verifiable<Finalization> = Verified::<Finalization>::seal(half).into();
+        self.finalized.insert(tick, half.clone());
         vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
             finalizations: vec![half],
         })]
@@ -4459,13 +4472,12 @@ impl ExecutionCoordinator {
         let stating = tick.take_stating_finalization();
 
         // Local-finalization gate produces `Verified<Finalization>`; lift
-        // into the `Block::Live.certificates` transport shape once so the
-        // store, the admission event, and any downstream `PendingBlock`
-        // entry share the same `Arc` without further per-consumer cloning.
+        // into the `Block::Live.certificates` transport shape, whose
+        // clones the store, the admission event and any downstream
+        // `PendingBlock` entry share.
         let mut actions = Vec::new();
         for half in determined.into_iter().chain(stating) {
-            let finalized_arc = Arc::new(Verified::<Finalization>::seal(half).into());
-            actions.extend(self.emit_finalized(finalized_arc));
+            actions.extend(self.emit_finalized(Verified::<Finalization>::seal(half).into()));
         }
 
         if self
@@ -4487,11 +4499,11 @@ impl ExecutionCoordinator {
     /// Record a freshly built finalization and emit its admission event,
     /// which covers both the shard consensus subscriber and the `io_loop`
     /// serving cache.
-    fn emit_finalized(&self, finalized_arc: Arc<Verifiable<Finalization>>) -> Vec<Action> {
+    fn emit_finalized(&self, finalized: Verifiable<Finalization>) -> Vec<Action> {
         self.finalized
-            .insert(*finalized_arc.tick_id(), Arc::clone(&finalized_arc));
+            .insert(*finalized.tick_id(), finalized.clone());
         vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
-            finalizations: vec![finalized_arc],
+            finalizations: vec![finalized],
         })]
     }
 
@@ -4520,7 +4532,7 @@ impl ExecutionCoordinator {
     ///
     /// Runs [`Self::gate`] over the certificate it carries, if any, and
     /// dispatches signature verification to the crypto pool via
-    /// [`Action::VerifyFinalization`]. The matching
+    /// [`ExecutionAction::VerifyFinalization`]. The matching
     /// [`ProtocolEvent::FinalizationVerified`] feeds
     /// [`Self::on_finalization_verified`], which emits
     /// `Continuation(FinalizationsAdmitted)` only when the certificate
@@ -4537,16 +4549,20 @@ impl ExecutionCoordinator {
     pub fn admit_finalization(
         &mut self,
         topology_schedule: &TopologySchedule,
-        tick: Arc<Verifiable<Finalization>>,
+        tick: Verifiable<Finalization>,
     ) -> Vec<Action> {
         // Already-finalized short-circuit — a second fetch arrival for a
         // finalization we've already admitted is wasted verification work.
+        // The fetch that carried it is still owed a release: its ids stay
+        // in flight until a verdict, and none follows from here.
         if self.finalized.get(&tick.receipt_hash()).is_some() {
             tracing::debug!(
                 tick = %tick.tick_id(),
                 "Finalization already in canonical store — skipping verification"
             );
-            return Vec::new();
+            return vec![Action::AbandonFetch(FetchIds::Finalizations(vec![
+                tick.receipt_hash(),
+            ]))];
         }
         // A legs half carries no certificate to verify: what holds it is
         // the receipts it names, each recomputing to its named hash, which
@@ -4557,10 +4573,10 @@ impl ExecutionCoordinator {
             ]))];
         }
         match self.gate(topology_schedule, &tick) {
-            Ok(public_keys) => vec![Action::VerifyFinalization {
+            Ok(public_keys) => vec![Action::Execution(ExecutionAction::VerifyFinalization {
                 finalization: tick,
                 public_keys,
-            }],
+            })],
             Err(Gate::InFlight) => Vec::new(),
             Err(Gate::BeaconBehind) => {
                 self.parked.park(Waiting::Beacon, Parked::Fetched(tick));
@@ -4600,12 +4616,12 @@ impl ExecutionCoordinator {
         effects
     }
 
-    /// Handle the result of [`Action::VerifyFinalization`]. Emits the
+    /// Handle the result of [`ExecutionAction::VerifyFinalization`]. Emits the
     /// admission continuation only when every EC's signature passed.
     #[must_use]
     pub fn on_finalization_verified(
         &mut self,
-        result: Result<Arc<Verified<Finalization>>, (Arc<Finalization>, FinalizationVerifyError)>,
+        result: Result<Verified<Finalization>, (Finalization, FinalizationVerifyError)>,
     ) -> Vec<Action> {
         // Release the in-flight slot regardless of outcome — future
         // arrivals can dispatch again.
@@ -4628,12 +4644,8 @@ impl ExecutionCoordinator {
                 ]))];
             }
         };
-        // Lift the verification result into the `Block::Live.certificates`
-        // transport shape exactly once so the admission event and any
-        // downstream pending-block storage share the same `Arc`.
-        let tick = Arc::new((*tick).clone().into());
         vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
-            finalizations: vec![tick],
+            finalizations: vec![tick.into()],
         })]
     }
 
@@ -4676,16 +4688,13 @@ impl ExecutionCoordinator {
     /// Order is all this offers: which of them a block may carry is
     /// admission's, read off the committed rows.
     #[must_use]
-    pub fn get_finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
+    pub fn get_finalizations(&self) -> Vec<Verifiable<Finalization>> {
         self.finalized.all()
     }
 
-    /// Get a finalization by its identity (returns `Arc` for sharing).
+    /// Get a finalization by its identity.
     #[must_use]
-    pub fn get_finalization(
-        &self,
-        hash: &FinalizationHash,
-    ) -> Option<Arc<Verifiable<Finalization>>> {
+    pub fn get_finalization(&self, hash: &FinalizationHash) -> Option<Verifiable<Finalization>> {
         self.finalized.get(hash)
     }
 
@@ -4704,10 +4713,7 @@ impl ExecutionCoordinator {
     /// committed, ticks are persisted to storage and should be fetched
     /// from there.
     #[must_use]
-    pub fn get_finalization_for_tx(
-        &self,
-        tx_hash: TxHash,
-    ) -> Option<Arc<Verifiable<Finalization>>> {
+    pub fn get_finalization_for_tx(&self, tx_hash: TxHash) -> Option<Verifiable<Finalization>> {
         self.finalized.get_for_tx(tx_hash)
     }
 
@@ -5025,13 +5031,13 @@ mod tests {
         BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
         Crossings, Deadline, Epoch, EpochSeed, EpochWindows, ExecutionCertificateContext,
         ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash, Hash, Inclusion, LocalKey,
-        MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
-        PriceTable, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryBinding,
-        RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot, Settlement, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt,
-        SubstateKey, TerminalEvidence, TickHalf, TransactionDecision, TxResolution, UnsettledTx,
-        ValidatorInfo, ValidatorSet, Verify, VoteCount, Window, compute_global_receipt_root,
-        receipt_hash_of, signed_bytes,
+        MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof,
+        NetworkDefinition, PriceTable, QuorumCertificate, RETENTION_HORIZON, Randomness,
+        RecoveryBinding, RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot, Settlement,
+        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated,
+        StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TransactionDecision, TxResolution,
+        UnsettledTx, ValidatorInfo, ValidatorSet, Verify, VoteCount, Window,
+        compute_global_receipt_root, receipt_hash_of, signed_bytes,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, CrossingId, Hash32, IntentHash, Kind, ProtocolHasher, Terms,
@@ -5156,7 +5162,7 @@ mod tests {
     fn tick_holding(
         tick_id: TickId,
         tick_ts: WeightedTimestamp,
-        txs: Vec<(Arc<Verified<Transaction>>, BTreeSet<ShardId>)>,
+        txs: Vec<(Verified<Transaction>, BTreeSet<ShardId>)>,
     ) -> TickState {
         let mut state = TickState::new(
             tick_id,
@@ -5175,8 +5181,8 @@ mod tests {
     }
 
     /// Lift a test transaction into the verified form a tick holds.
-    fn verified_arc(tx: &Arc<Transaction>) -> Arc<Verified<Transaction>> {
-        Arc::new(Verified::new_unchecked_for_test((**tx).clone()))
+    fn verified_tx(tx: &Transaction) -> Verified<Transaction> {
+        Verified::new_unchecked_for_test(tx.clone())
     }
 
     /// Three of four signers: the quorum the admission gate holds a
@@ -5242,7 +5248,7 @@ mod tests {
         height: BlockHeight,
         timestamp_ms: u64,
         proposer: ValidatorId,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<Transaction>,
     ) -> Block {
         helpers_make_live_block(
             ShardId::ROOT,
@@ -5259,7 +5265,7 @@ mod tests {
         height: BlockHeight,
         timestamp_ms: u64,
         proposer: ValidatorId,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<Transaction>,
     ) -> Block {
         helpers_make_live_block(shard, height, timestamp_ms, proposer, transactions, vec![])
     }
@@ -5275,12 +5281,7 @@ mod tests {
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
 
         // Block committed with transaction
         let actions = state
@@ -5290,11 +5291,10 @@ mod tests {
         // Should request execution (single-shard path) and set up tick tracking
         assert!(!actions.is_empty());
         // First action should be ExecuteTransactions
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::ExecuteTransactions { .. }))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+        )));
 
         // TickState should be set up for this tick.
         let tick_id = state.ticks.tick_assignment(tx_hash);
@@ -5327,20 +5327,16 @@ mod tests {
 
         let tx = test_transaction_running(1, &[package]);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let actions = state
             .commit_block_carrying(&topology_schedule, &certify(block), Naming::Composed)
             .actions;
 
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::ExecuteTransactions { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "a tick running unfetched code must not dispatch"
         );
         assert!(
@@ -5373,7 +5369,9 @@ mod tests {
         let dispatched: Vec<&TxHash> = released
             .iter()
             .filter_map(|action| match action {
-                Action::ExecuteTransactions { requests, .. } => Some(requests),
+                Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. }) => {
+                    Some(requests)
+                }
                 _ => None,
             })
             .flatten()
@@ -5406,21 +5404,24 @@ mod tests {
                     BlockHeight::new(1),
                     1000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![tx],
                 )),
                 Naming::Composed,
             )
             .actions;
-        let Some(Action::ExecuteTransactions {
+        let Some(Action::Execution(ExecutionAction::ExecuteTransactions {
             tick,
             tick_ts,
             env,
             requests,
             included,
             ..
-        }) = actions
-            .into_iter()
-            .find(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        })) = actions.into_iter().find(|action| {
+            matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )
+        })
         else {
             panic!("a tick running code this node holds must dispatch");
         };
@@ -5449,11 +5450,11 @@ mod tests {
         let dispatched: Vec<TxHash> = again
             .iter()
             .filter_map(|action| match action {
-                Action::ExecuteTransactions {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
                     tick: dispatched_tick,
                     requests,
                     ..
-                } if *dispatched_tick == tick => Some(requests),
+                }) if *dispatched_tick == tick => Some(requests),
                 _ => None,
             })
             .flatten()
@@ -5479,20 +5480,16 @@ mod tests {
         let topology_schedule = make_test_topology();
 
         let tx = test_transaction_running(1, &[Hash::from_bytes(b"code this node holds")]);
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let actions = state
             .commit_block_carrying(&topology_schedule, &certify(block), Naming::Composed)
             .actions;
 
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::ExecuteTransactions { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "only the code a member runs can hold its tick"
         );
     }
@@ -5537,12 +5534,7 @@ mod tests {
         let mut state = make_test_state();
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1_000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]);
         state.commit_block_carrying(&schedule, &test_certify(block, 1_000), Naming::Composed);
 
         let tick_id = state
@@ -5610,12 +5602,7 @@ mod tests {
         let mut state = make_test_state();
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            5_000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 5_000, ValidatorId::new(0), vec![tx]);
         // The commit folds under the window it is classified in; only the
         // vote's routing reads the schedule afterwards.
         state.commit_block_carrying(&resolved, &test_certify(block, 5_000), Naming::Composed);
@@ -5646,9 +5633,10 @@ mod tests {
         // Once the schedule carries its epoch the vote must still be there.
         let recovered = state.emit_vote_actions(&resolved);
         assert!(
-            recovered
-                .iter()
-                .any(|a| matches!(a, Action::SignAndSendExecutionVote { .. })),
+            recovered.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+            )),
             "the tick must still vote once its committee resolves, got {recovered:?}",
         );
     }
@@ -5664,7 +5652,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
 
         // Commit the block as validator 0 to discover the tick_id.
@@ -5685,7 +5673,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
         let mut state_leader = make_test_state_for(leader);
         state_leader.commit_block_carrying(&topo_leader, &certify(block_leader), Naming::Composed);
@@ -5697,12 +5685,7 @@ mod tests {
         // A non-leader should NOT have a VoteTracker.
         let non_leader_id = *committee.iter().find(|&&v| v != leader).unwrap();
         let topo_non = make_topology();
-        let block_non = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block_non = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let mut state_non = make_test_state_for(non_leader_id);
         state_non.commit_block_carrying(&topo_non, &certify(block_non), Naming::Composed);
         assert!(
@@ -5720,7 +5703,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
         let mut state = make_test_state();
         state.commit_block_carrying(&topo, &certify(block), Naming::Composed);
@@ -5736,12 +5719,7 @@ mod tests {
         // If we're the leader, this test doesn't apply — find a non-leader topology.
         let non_leader_id = committee.iter().find(|&&v| v != leader).unwrap();
         let topo_non = make_topology();
-        let block_non = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block_non = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let mut state_non = make_test_state_for(*non_leader_id);
         state_non.commit_block_carrying(&topo_non, &certify(block_non), Naming::Composed);
 
@@ -5841,12 +5819,12 @@ mod tests {
         // Elapsed == VOTE_RETRY_TIMEOUT, so should emit retry.
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::SignAndSendExecutionVote {
+            Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                 recipients,
                 local_recipient,
                 tick_id: wid,
                 ..
-            } => {
+            }) => {
                 assert_eq!(wid, &tick_id);
                 assert_eq!(
                     (recipients, *local_recipient),
@@ -5867,7 +5845,9 @@ mod tests {
         state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
         let next = state.check_vote_retry_timeouts(&topo);
         assert_eq!(next.len(), 1);
-        if let Action::SignAndSendExecutionVote { recipients, .. } = &next[0] {
+        if let Action::Execution(ExecutionAction::SignAndSendExecutionVote { recipients, .. }) =
+            &next[0]
+        {
             assert_eq!(
                 recipients, &others,
                 "the second fire addresses the committee"
@@ -5903,7 +5883,7 @@ mod tests {
         let retries = |actions: &[Action]| {
             actions
                 .iter()
-                .filter(|a| matches!(a, Action::SignAndSendExecutionVote { tick_id: t, .. } if *t == tick_id))
+                .filter(|a| matches!(a, Action::Execution(ExecutionAction::SignAndSendExecutionVote { tick_id: t, .. }) if *t == tick_id))
                 .count()
         };
 
@@ -5957,7 +5937,7 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        state.on_certificate_verified(&topo, Ok(Arc::new(Verified::new_unchecked_for_test(cert))));
+        state.on_certificate_verified(&topo, Ok(Verified::new_unchecked_for_test(cert)));
 
         // Advance time past the retry deadline; if the retry had survived,
         // this would fire a SignAndSendExecutionVote action.
@@ -5989,11 +5969,11 @@ mod tests {
         let tick_id = ready_tick_at(&mut state, &schedule, height, 1_000);
         let sent_to = |actions: &[Action]| {
             actions.iter().find_map(|a| match a {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     recipients,
                     local_recipient,
                     ..
-                } => Some((recipients.clone(), *local_recipient)),
+                }) => Some((recipients.clone(), *local_recipient)),
                 _ => None,
             })
         };
@@ -6029,7 +6009,7 @@ mod tests {
         state.on_certificate_aggregated(
             &schedule,
             &tick_id,
-            &Arc::new(Verified::new_unchecked_for_test(cert)),
+            &Verified::new_unchecked_for_test(cert),
         );
         state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
         assert_eq!(
@@ -6088,15 +6068,18 @@ mod tests {
         }
         assert!(state.ticks.contains_tracker(&tick_id));
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate { .. })
+            )),
             "two of four is short of quorum"
         );
         let own = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, me));
         assert!(
-            own.iter()
-                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            own.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate { .. })
+            )),
             "{own:?}"
         );
     }
@@ -6179,22 +6162,22 @@ mod tests {
         let mut aggregated = 0usize;
         while let Some(action) = pending.pop() {
             match action {
-                Action::VerifyAndAggregateExecutionVotes {
+                Action::Execution(ExecutionAction::VerifyAndAggregateExecutionVotes {
                     tick_id,
                     block_hash,
                     votes,
-                } => {
+                }) => {
                     let verified =
                         Verified::<ExecutionVote>::verify_batch(&BlsVerifier, &net, votes);
                     pending
                         .extend(state.on_votes_verified(schedule, tick_id, block_hash, verified));
                 }
-                Action::AggregateExecutionCertificate {
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate {
                     tick_id,
                     global_receipt_root,
                     votes,
                     committee,
-                } => {
+                }) => {
                     aggregated += 1;
                     let certificate = Verified::<ExecutionCertificate>::aggregate(
                         &BlsVerifier,
@@ -6225,7 +6208,7 @@ mod tests {
         let height = BlockHeight::new(1);
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(height, 1_000, ValidatorId::new(0), vec![Arc::new(tx)]);
+        let block = make_live_block(height, 1_000, ValidatorId::new(0), vec![tx]);
         state.commit_block_carrying(schedule, &test_certify(block, 1_000), Naming::Composed);
         let tick_id = state
             .ticks
@@ -6245,11 +6228,11 @@ mod tests {
         let (anchor, outcomes) = cast
             .iter()
             .find_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     vote_anchor_ts,
                     tx_outcomes,
                     ..
-                } => Some((*vote_anchor_ts, tx_outcomes.clone())),
+                }) => Some((*vote_anchor_ts, tx_outcomes.clone())),
                 _ => None,
             })
             .expect("the tick's vote is cast");
@@ -6352,10 +6335,8 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        let _ = state.on_certificate_verified(
-            &schedule,
-            Ok(Arc::new(Verified::new_unchecked_for_test(cert))),
-        );
+        let _ =
+            state.on_certificate_verified(&schedule, Ok(Verified::new_unchecked_for_test(cert)));
         assert!(!state.ticks.contains_tracker(&tick_id));
 
         let late = *committee.iter().find(|v| **v != leader).expect("a peer");
@@ -6363,14 +6344,15 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BroadcastExecutionCertificate { recipients, .. } if recipients == &vec![late]
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate { recipients, .. }) if recipients == &vec![late]
             )),
             "{actions:?}"
         );
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate { .. })
+            )),
             "{actions:?}"
         );
         assert!(!state.ticks.contains_tracker(&tick_id));
@@ -6428,19 +6410,17 @@ mod tests {
         )
         .project_to(&HashSet::from([kept]))
         .expect("the tick carries it");
-        state.on_certificate_verified(
-            &topo,
-            Ok(Arc::new(Verified::new_unchecked_for_test(projection))),
-        );
+        state.on_certificate_verified(&topo, Ok(Verified::new_unchecked_for_test(projection)));
 
         assert!(!state.ticks.is_ec_dispatched(&tick_id));
         assert!(state.exec_certs.get(&tick_id).is_none());
         state.committed_ts = WeightedTimestamp::from_millis(5_000).plus(VOTE_RETRY_TIMEOUT);
         let actions = state.check_vote_retry_timeouts(&topo);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SignAndSendExecutionVote { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+            )),
             "the retry still fires: {actions:?}"
         );
     }
@@ -6456,7 +6436,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(5);
@@ -6479,12 +6459,7 @@ mod tests {
         let tx = test_transaction(1);
         let topo = make_topology();
         let committee = topo.head().committee_for_shard(ShardId::ROOT).to_vec();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let mut state = make_test_state();
         state.commit_block_carrying(&topo, &certify(block), Naming::Composed);
         let tick_id = state
@@ -6494,15 +6469,15 @@ mod tests {
             .map(|(id, _)| *id)
             .expect("the block seats a tick");
 
-        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let certificate = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )));
-        state.exec_certs.insert(Arc::clone(&certificate));
+        ));
+        state.exec_certs.insert(certificate);
         state.ticks.mark_ec_dispatched(tick_id);
 
         let voter = committee[1];
@@ -6519,7 +6494,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BroadcastExecutionCertificate { certificate: sent, recipients, .. }
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate { certificate: sent, recipients, .. })
                     if recipients == &vec![voter] && sent.tick_id() == &tick_id
             )),
             "the late voter is sent the certificate: {actions:?}"
@@ -6540,7 +6515,7 @@ mod tests {
         let mut signers = SignerBitfield::new(4);
         signers.set(0); // single signer — well below 2f+1 = 3
         let covered_tx = TxHash::from(Hash::from_bytes(b"covered by the refused cert"));
-        let cert = Arc::new(ExecutionCertificate::new(
+        let cert = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
@@ -6552,9 +6527,9 @@ mod tests {
             )]),
             AggregateSignature::ZERO,
             signers,
-        ));
+        );
 
-        let verified = Arc::new(Verified::new_unchecked_for_test((*cert).clone()));
+        let verified = Verified::new_unchecked_for_test(cert);
         let actions = state.on_certificate_verified(&topo, Ok(verified));
         assert!(
             !actions.iter().any(|a| matches!(
@@ -6580,7 +6555,7 @@ mod tests {
     #[test]
     fn a_certificate_verified_after_its_shards_recovery_folds_is_refused_in_its_band() {
         let at = |height: u64| {
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            Verified::new_unchecked_for_test(ExecutionCertificate::new(
                 TickId::new(ShardId::ROOT, BlockHeight::new(height)),
                 WeightedTimestamp::ZERO,
                 GlobalReceiptRoot::ZERO,
@@ -6590,7 +6565,7 @@ mod tests {
                 )]),
                 AggregateSignature::ZERO,
                 quorum_signers(),
-            )))
+            ))
         };
         let admitted = |actions: &[Action]| {
             actions.iter().any(|action| {
@@ -6646,24 +6621,24 @@ mod tests {
             .emit_vote_actions(&schedule)
             .into_iter()
             .find_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     vote_anchor_ts,
                     global_receipt_root,
                     tx_outcomes,
                     ..
-                } => Some((vote_anchor_ts, global_receipt_root, tx_outcomes)),
+                }) => Some((vote_anchor_ts, global_receipt_root, tx_outcomes)),
                 _ => None,
             })
             .expect("the new tick is voted");
         let certificate = |anchor, root, outcomes: Vec<TxOutcome>| {
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            Verified::new_unchecked_for_test(ExecutionCertificate::new(
                 tick_id,
                 anchor,
                 root,
                 Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 quorum_signers(),
-            )))
+            ))
         };
 
         let orphan = certificate(
@@ -6700,7 +6675,7 @@ mod tests {
         signers.set(1);
         signers.set(2);
         let covered_tx = TxHash::from(Hash::from_bytes(b"covered by the refused cert"));
-        let cert = Arc::new(ExecutionCertificate::new(
+        let cert = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
@@ -6712,7 +6687,7 @@ mod tests {
             )]),
             AggregateSignature::ZERO,
             signers,
-        ));
+        );
 
         let actions = state.on_certificate_verified(
             &topo,
@@ -6747,8 +6722,8 @@ mod tests {
         );
         assert!(!state.counterparts.heard_certificate(remote, tx_hash));
 
-        let actions = state
-            .on_certificate_verified(&topo, Ok(Arc::new(Verified::new_unchecked_for_test(cert))));
+        let actions =
+            state.on_certificate_verified(&topo, Ok(Verified::new_unchecked_for_test(cert)));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -6787,7 +6762,7 @@ mod tests {
         let topo = make_test_topology();
 
         let mut state = make_test_state();
-        let tx = Arc::new(test_transaction(3));
+        let tx = test_transaction(3);
         let participating: BTreeSet<ShardId> =
             [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
         state.ticks.insert_tick(
@@ -6795,7 +6770,7 @@ mod tests {
             tick_holding(
                 tick_id,
                 WeightedTimestamp::ZERO,
-                vec![(verified_arc(&tx), participating)],
+                vec![(verified_tx(&tx), participating)],
             ),
         );
 
@@ -6812,13 +6787,18 @@ mod tests {
         let actions = state.on_certificate_aggregated(
             &topo,
             &tick_id,
-            &Arc::new(Verified::new_unchecked_for_test(cert)),
+            &Verified::new_unchecked_for_test(cert),
         );
 
         // Should have: BroadcastEC(local) + BroadcastEC(remote shard 1)
         let broadcast_actions: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, Action::BroadcastExecutionCertificate { .. }))
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::Execution(ExecutionAction::BroadcastExecutionCertificate { .. })
+                )
+            })
             .collect();
 
         assert!(
@@ -6829,14 +6809,18 @@ mod tests {
 
         // One should be for the local shard (shard 0).
         let has_local = broadcast_actions.iter().any(|a| match a {
-            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardId::ROOT,
+            Action::Execution(ExecutionAction::BroadcastExecutionCertificate { shard, .. }) => {
+                *shard == ShardId::ROOT
+            }
             _ => false,
         });
         assert!(has_local, "Should include local shard broadcast");
 
         // One should be for the remote shard (shard 1).
         let has_remote = broadcast_actions.iter().any(|a| match a {
-            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardId::leaf(1, 1),
+            Action::Execution(ExecutionAction::BroadcastExecutionCertificate { shard, .. }) => {
+                *shard == ShardId::leaf(1, 1)
+            }
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
@@ -6864,16 +6848,16 @@ mod tests {
             validators,
         )));
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let tx = Arc::new(test_transaction(3));
+        let tx = test_transaction(3);
         let outcomes = vec![TxOutcome::new(tx.hash(), ExecutionOutcome::Aborted)];
-        let cert = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let cert = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             compute_global_receipt_root(&outcomes),
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )));
+        ));
         let broadcast_signers = |signers: [u64; 2]| {
             let mut state = signed_by(
                 ExecutionCoordinator::new(ShardId::ROOT, Arc::new(TestCode::default())),
@@ -6886,14 +6870,17 @@ mod tests {
                 tick_holding(
                     tick_id,
                     WeightedTimestamp::ZERO,
-                    vec![(verified_arc(&tx), participating)],
+                    vec![(verified_tx(&tx), participating)],
                 ),
             );
             state
                 .on_certificate_aggregated(&topo, &tick_id, &cert)
                 .into_iter()
                 .filter_map(|a| match a {
-                    Action::BroadcastExecutionCertificate { signer, .. } => Some(signer),
+                    Action::Execution(ExecutionAction::BroadcastExecutionCertificate {
+                        signer,
+                        ..
+                    }) => Some(signer),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -6953,13 +6940,15 @@ mod tests {
         let actions = state.on_certificate_aggregated(
             &topo,
             &tick_id,
-            &Arc::new(Verified::new_unchecked_for_test(cert)),
+            &Verified::new_unchecked_for_test(cert),
         );
 
         let broadcasts: Vec<ShardId> = actions
             .iter()
             .filter_map(|action| match action {
-                Action::BroadcastExecutionCertificate { shard, .. } => Some(*shard),
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate {
+                    shard, ..
+                }) => Some(*shard),
                 _ => None,
             })
             .collect();
@@ -6979,8 +6968,8 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let shared = Arc::new(test_transaction(3));
-        let ours = Arc::new(test_transaction(4));
+        let shared = test_transaction(3);
+        let ours = test_transaction(4);
         state.ticks.insert_tick(
             tick_id,
             tick_holding(
@@ -6988,13 +6977,10 @@ mod tests {
                 WeightedTimestamp::ZERO,
                 vec![
                     (
-                        verified_arc(&shared),
+                        verified_tx(&shared),
                         [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect(),
                     ),
-                    (
-                        verified_arc(&ours),
-                        std::iter::once(ShardId::ROOT).collect(),
-                    ),
+                    (verified_tx(&ours), std::iter::once(ShardId::ROOT).collect()),
                 ],
             ),
         );
@@ -7015,16 +7001,18 @@ mod tests {
         let actions = state.on_certificate_aggregated(
             &topo,
             &tick_id,
-            &Arc::new(Verified::new_unchecked_for_test(cert)),
+            &Verified::new_unchecked_for_test(cert),
         );
 
-        let sent = |target: ShardId| -> Arc<Verified<ExecutionCertificate>> {
+        let sent = |target: ShardId| -> Verified<ExecutionCertificate> {
             actions
                 .iter()
                 .find_map(|a| match a {
-                    Action::BroadcastExecutionCertificate {
-                        shard, certificate, ..
-                    } if *shard == target => Some(Arc::clone(certificate)),
+                    Action::Execution(ExecutionAction::BroadcastExecutionCertificate {
+                        shard,
+                        certificate,
+                        ..
+                    }) if *shard == target => Some(certificate.clone()),
                     _ => None,
                 })
                 .expect("a broadcast for the target shard")
@@ -7067,28 +7055,29 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let _fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], Action::VerifyFinalization { .. }));
+        assert!(matches!(
+            actions[0],
+            Action::Execution(ExecutionAction::VerifyFinalization { .. })
+        ));
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
@@ -7107,20 +7096,20 @@ mod tests {
     fn on_finalization_verified_drops_invalid() {
         let mut state = make_test_state();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        ));
-        let tick = Arc::new(Finalization::new(
+        );
+        let tick = Finalization::new(
             tick_id,
             TickHalf::Determined,
             Some(ec),
             Capped::from_array([]),
-        ));
+        );
         let fw_hash = tick.receipt_hash();
         let actions = state.on_finalization_verified(Err((
             tick,
@@ -7158,26 +7147,24 @@ mod tests {
         // (2f+1=3 needed).
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let fw_hash = tick.receipt_hash();
 
-        let actions = state.admit_finalization(&topo, Arc::clone(&tick));
+        let actions = state.admit_finalization(&topo, tick.clone());
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -7213,26 +7200,24 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             TickId::new(ShardId::leaf(8, 99), BlockHeight::new(1)),
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let fw_hash = tick.receipt_hash();
 
-        let actions = state.admit_finalization(&topo, Arc::clone(&tick));
+        let actions = state.admit_finalization(&topo, tick.clone());
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -7257,20 +7242,20 @@ mod tests {
     fn on_finalization_verified_admits_valid() {
         let mut state = make_test_state();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        ));
-        let tick = Arc::new(Verified::new_unchecked_for_test(Finalization::new(
+        );
+        let tick = Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
             TickHalf::Determined,
             Some(ec),
             Capped::from_array([]),
-        )));
+        ));
         let actions = state.on_finalization_verified(Ok(tick));
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -7305,7 +7290,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(matches!(
             first[0],
-            Action::VerifyExecutionCertificateSignature { .. }
+            Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
         ));
 
         // Same bytes mid-flight — must drop without dispatching another
@@ -7352,7 +7337,9 @@ mod tests {
             assert!(
                 matches!(
                     suffix.as_slice(),
-                    [Action::VerifyExecutionCertificateSignature { .. }]
+                    [Action::Execution(
+                        ExecutionAction::VerifyExecutionCertificateSignature { .. }
+                    )]
                 ),
                 "pending {pending}: an EC within the frontier dispatches, got {suffix:?}"
             );
@@ -7459,9 +7446,12 @@ mod tests {
             )
         };
         let dispatched = |actions: &[Action]| {
-            actions
-                .iter()
-                .any(|action| matches!(action, Action::VerifyExecutionCertificateSignature { .. }))
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+                )
+            })
         };
 
         // The proof first, retired as every commit retires the mirror.
@@ -7806,9 +7796,10 @@ mod tests {
         state.proven_anchors().record(proven);
         let actions = state.on_committed_remote_header(&topo, proven);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "the committed event must replay the deferred EC, got {actions:?}"
         );
     }
@@ -7847,9 +7838,10 @@ mod tests {
 
         let actions = state.on_execution_certificate(&topo, make_cert(covered).into());
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "a set-covered EC must dispatch without a commit proof, got {actions:?}"
         );
 
@@ -7895,9 +7887,10 @@ mod tests {
             },
         );
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "the set must replay the parked EC into dispatch, got {actions:?}"
         );
     }
@@ -7971,7 +7964,9 @@ mod tests {
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(matches!(
             actions.as_slice(),
-            [Action::VerifyExecutionCertificateSignature { .. }]
+            [Action::Execution(
+                ExecutionAction::VerifyExecutionCertificateSignature { .. }
+            )]
         ));
     }
 
@@ -8003,7 +7998,7 @@ mod tests {
         let _ = state.on_certificate_verified(
             &topo,
             Err((
-                Arc::new(cert.clone()),
+                cert.clone(),
                 ExecutionCertificateVerifyError::BadAggregatedSignature,
             )),
         );
@@ -8011,7 +8006,7 @@ mod tests {
         assert_eq!(again.len(), 1);
         assert!(matches!(
             again[0],
-            Action::VerifyExecutionCertificateSignature { .. }
+            Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
         ));
     }
 
@@ -8038,7 +8033,7 @@ mod tests {
         );
         state
             .exec_certs
-            .insert(Arc::new(Verified::new_unchecked_for_test(cert.clone())));
+            .insert(Verified::new_unchecked_for_test(cert.clone()));
 
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
@@ -8085,13 +8080,13 @@ mod tests {
         assert_ne!(cached.wire_hash(), incoming.wire_hash());
         state
             .exec_certs
-            .insert(Arc::new(Verified::new_unchecked_for_test(cached)));
+            .insert(Verified::new_unchecked_for_test(cached));
 
         let actions = state.on_execution_certificate(&topo, incoming.into());
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::VerifyExecutionCertificateSignature { .. }
+            Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
         ));
     }
 
@@ -8107,35 +8102,36 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let _fw_hash = tick.receipt_hash();
 
-        let first = state.admit_finalization(&topo, Arc::clone(&tick));
+        let first = state.admit_finalization(&topo, tick.clone());
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0], Action::VerifyFinalization { .. }));
+        assert!(matches!(
+            first[0],
+            Action::Execution(ExecutionAction::VerifyFinalization { .. })
+        ));
 
         let second = state.admit_finalization(&topo, tick);
         assert!(second.is_empty());
     }
 
     /// A `Finalization` already in the canonical store short-circuits
-    /// before any verify dispatch.
+    /// before any verify dispatch, and releases the fetch that carried it.
     #[test]
     fn admit_finalization_skips_when_already_finalized() {
         let topo = make_test_topology();
@@ -8146,14 +8142,14 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
+        );
         let raw_finalization = Finalization::new(
             tick_id,
             TickHalf::Determined,
@@ -8161,13 +8157,20 @@ mod tests {
             Capped::from_array([]),
         );
         let verifiable_finalization =
-            Arc::new(Verified::new_unchecked_for_test(raw_finalization.clone()).into());
+            Verified::new_unchecked_for_test(raw_finalization.clone()).into();
         // Seed the canonical store directly (mirrors what `finalize`
         // does on the local-aggregation path).
         state.finalized.insert(tick_id, verifiable_finalization);
 
-        let actions = state.admit_finalization(&topo, Arc::new(Verifiable::from(raw_finalization)));
-        assert!(actions.is_empty());
+        let receipt_hash = raw_finalization.receipt_hash();
+        let actions = state.admit_finalization(&topo, Verifiable::from(raw_finalization));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::AbandonFetch(FetchIds::Finalizations(ids))] if ids == &[receipt_hash]
+            ),
+            "only the carrying fetch is released: {actions:?}"
+        );
     }
 
     /// A `Finalization` delivered by `admit_finalization` (the fetch
@@ -8182,23 +8185,21 @@ mod tests {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
 
         let tick_id = TickId::new(ShardId::leaf(1, 0), BlockHeight::new(1));
-        let bogus_ec = Arc::new(ExecutionCertificate::new(
+        let bogus_ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(1_000_000),
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::empty(), // no signers — far below 2f+1
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(bogus_ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(bogus_ec),
+            Capped::from_array([]),
+        )
+        .into();
         let fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
@@ -8258,9 +8259,10 @@ mod tests {
         state.on_committed_remote_header(&topo, proven);
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "must dispatch signature verification even when no local tracker matches"
         );
         // Nothing lands in the early-arrival buffer until verification passes.
@@ -8399,9 +8401,10 @@ mod tests {
         let public_keys = actions
             .iter()
             .find_map(|a| match a {
-                Action::VerifyExecutionCertificateSignature { public_keys, .. } => {
-                    Some(public_keys)
-                }
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature {
+                    public_keys,
+                    ..
+                }) => Some(public_keys),
                 _ => None,
             })
             .expect("on_execution_certificate dispatches a signature verification");
@@ -8435,7 +8438,7 @@ mod tests {
             BlockHeight::new(1),
             ED,
             ValidatorId::new(4),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         coord.commit_block_carrying(&schedule, &test_certify(block, ED), Naming::Composed);
         let tick_id = coord
@@ -8465,7 +8468,10 @@ mod tests {
         let committee = actions
             .iter()
             .find_map(|a| match a {
-                Action::AggregateExecutionCertificate { committee, .. } => Some(committee),
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate {
+                    committee,
+                    ..
+                }) => Some(committee),
                 _ => None,
             })
             .expect("vote quorum dispatches certificate aggregation");
@@ -8516,7 +8522,7 @@ mod tests {
             BlockHeight::new(1),
             1,
             ValidatorId::new(4),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         coord.commit_block_carrying(&schedule, &test_certify(block, 1), Naming::Composed);
         let tick_id = coord
@@ -8543,7 +8549,10 @@ mod tests {
         let committee = actions
             .iter()
             .find_map(|a| match a {
-                Action::AggregateExecutionCertificate { committee, .. } => Some(committee),
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate {
+                    committee,
+                    ..
+                }) => Some(committee),
                 _ => None,
             })
             .expect("vote quorum dispatches certificate aggregation");
@@ -8577,18 +8586,20 @@ mod tests {
 
         let actions = coord.on_execution_certificate(&behind, Verifiable::from(cert));
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "an EC whose epoch the beacon hasn't reached must buffer, not dispatch",
         );
 
         let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
         let drained = coord.on_beacon_block_persisted(&caught_up).actions;
         assert!(
-            drained
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            drained.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "draining on catch-up must dispatch the buffered EC's verification",
         );
     }
@@ -8610,39 +8621,39 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(5 * ED), // epoch 5, past the head
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let _fw_hash = tick.receipt_hash();
 
-        let actions = coord.admit_finalization(&behind, Arc::clone(&tick));
+        let actions = coord.admit_finalization(&behind, tick);
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyFinalization { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyFinalization { .. })
+            )),
             "a finalization whose EC epoch the beacon hasn't reached must buffer, not dispatch",
         );
 
         let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
         let drained = coord.on_beacon_block_persisted(&caught_up).actions;
         assert!(
-            drained
-                .iter()
-                .any(|a| matches!(a, Action::VerifyFinalization { .. })),
+            drained.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyFinalization { .. })
+            )),
             "draining on catch-up must dispatch the buffered tick's verification",
         );
     }
@@ -8662,13 +8673,13 @@ mod tests {
     /// [`make_ready_local_tick`] at a chosen tick height.
     fn make_ready_local_tick_at(height: BlockHeight, tx_seeds: &[u8]) -> (TickId, TickState) {
         let tick_id = TickId::new(ShardId::ROOT, height);
-        let txs: Vec<(Arc<Verified<Transaction>>, BTreeSet<ShardId>)> = tx_seeds
+        let txs: Vec<(Verified<Transaction>, BTreeSet<ShardId>)> = tx_seeds
             .iter()
             .map(|s| {
                 let mut participating = BTreeSet::new();
                 participating.insert(ShardId::ROOT);
                 (
-                    Arc::new(Verified::new_unchecked_for_test(test_transaction(*s))),
+                    (Verified::new_unchecked_for_test(test_transaction(*s))),
                     participating,
                 )
             })
@@ -8699,14 +8710,14 @@ mod tests {
         // The tick votes, and the local EC over that vote lands; same
         // tick_id flips `local_ec_emitted` to true.
         let (anchor, root, tx_outcomes) = tick.build_vote_data().expect("every member came back");
-        let local_ec = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let local_ec = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             anchor,
             root,
             Capped::new(tx_outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )));
+        ));
         tick.add_execution_certificate(local_ec);
         assert!(
             tick.determined_ready(),
@@ -8757,9 +8768,8 @@ mod tests {
         }
         let hold = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
             let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
-            let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(
-                u8::try_from(height).unwrap(),
-            )));
+            let tx =
+                Verified::new_unchecked_for_test(test_transaction(u8::try_from(height).unwrap()));
             state.ticks.insert_tick(
                 tick_id,
                 tick_holding(
@@ -8867,7 +8877,7 @@ mod tests {
     ) -> TickId {
         let tx = test_transaction(u8::try_from(height.inner()).unwrap());
         let tx_hash = tx.hash();
-        let block = make_live_block(height, anchor_ms, ValidatorId::new(0), vec![Arc::new(tx)]);
+        let block = make_live_block(height, anchor_ms, ValidatorId::new(0), vec![tx]);
         state.commit_block_carrying(schedule, &test_certify(block, anchor_ms), Naming::Composed);
         let tick_id = state
             .ticks
@@ -8901,9 +8911,10 @@ mod tests {
                 ready_tick_at(&mut state, &schedule, height, anchor_ms);
                 let actions = state.emit_vote_actions(&schedule);
                 assert!(
-                    !actions
-                        .iter()
-                        .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
+                    !actions.iter().any(|action| matches!(
+                        action,
+                        Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+                    )),
                     "{me:?} signs the tick at {height:?}: {actions:?}",
                 );
             }
@@ -8926,21 +8937,24 @@ mod tests {
                     BlockHeight::new(1),
                     1000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![tx],
                 )),
                 Naming::Composed,
             )
             .actions;
-        let Some(Action::ExecuteTransactions {
+        let Some(Action::Execution(ExecutionAction::ExecuteTransactions {
             tick,
             tick_ts,
             env,
             requests,
             included,
             ..
-        }) = actions
-            .into_iter()
-            .find(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        })) = actions.into_iter().find(|action| {
+            matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )
+        })
         else {
             panic!("a tick running code this node holds must dispatch");
         };
@@ -8949,9 +8963,10 @@ mod tests {
             state.on_execution_batch_unavailable(tick, tick_ts, env, requests, included, package);
         let written = state.on_block_persisted(&bridged, BlockHeight::new(1));
         assert!(
-            !written
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !written.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "a write dispatches a tick below the bridge again: {written:?}",
         );
         let again = state
@@ -8969,7 +8984,7 @@ mod tests {
         assert!(
             !again.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { tick: dispatched, .. } if *dispatched == tick
+                Action::Execution(ExecutionAction::ExecuteTransactions { tick: dispatched, .. }) if *dispatched == tick
             )),
             "a tick below the bridge is dispatched again: {again:?}",
         );
@@ -9001,15 +9016,16 @@ mod tests {
                     BlockHeight::new(2),
                     2000,
                     ValidatorId::new(0),
-                    vec![Arc::new(test_transaction_running(1, &[package]))],
+                    vec![(test_transaction_running(1, &[package]))],
                 )),
                 Naming::Composed,
             )
             .actions;
         assert!(
-            !queued
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !queued.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "tick 2 waits for height 1 to be written: {queued:?}",
         );
         let ran = state.on_block_persisted(
@@ -9017,8 +9033,10 @@ mod tests {
             BlockHeight::new(1),
         );
         assert!(
-            !ran.iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !ran.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "a write after the fold dispatches a tick below the bridge: {ran:?}",
         );
     }
@@ -9036,11 +9054,11 @@ mod tests {
             .revote_stalled_ticks(schedule)
             .iter()
             .filter_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     tick_id: voted,
                     vote_anchor_ts,
                     ..
-                } if *voted == tick_id => Some(vote_anchor_ts.as_millis()),
+                }) if *voted == tick_id => Some(vote_anchor_ts.as_millis()),
                 _ => None,
             })
             .collect()
@@ -9123,7 +9141,7 @@ mod tests {
         outcome: ExecutionOutcome,
     ) -> (TickId, GlobalReceiptRoot, Vec<TxOutcome>) {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(7)));
+        let tx = Verified::new_unchecked_for_test(test_transaction(7));
         let tx_hash = tx.hash();
         let mut tick = tick_holding(
             tick_id,
@@ -9148,15 +9166,15 @@ mod tests {
         anchor_ms: u64,
         root: GlobalReceiptRoot,
         outcomes: Vec<TxOutcome>,
-    ) -> Arc<Verified<ExecutionCertificate>> {
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+    ) -> Verified<ExecutionCertificate> {
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(anchor_ms),
             root,
             Capped::new(outcomes).expect("one outcome"),
             AggregateSignature::ZERO,
             quorum_signers(),
-        )))
+        ))
     }
 
     /// A tick owing nothing but its stating half re-signs its vote at
@@ -9346,11 +9364,11 @@ mod tests {
             .emit_vote_actions(&schedule)
             .into_iter()
             .find_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     global_receipt_root,
                     tx_outcomes,
                     ..
-                } => Some((global_receipt_root, tx_outcomes)),
+                }) => Some((global_receipt_root, tx_outcomes)),
                 _ => None,
             })
             .expect("the tick casts its own vote");
@@ -9366,14 +9384,14 @@ mod tests {
             for signer in 0..3 {
                 signers.set(signer);
             }
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            Verified::new_unchecked_for_test(ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::from_millis(anchor_ms),
                 global_receipt_root,
                 Capped::new(tx_outcomes.clone()).expect("one outcome"),
                 AggregateSignature::ZERO,
                 signers,
-            )))
+            ))
         };
         let local_anchor = |state: &ExecutionCoordinator| {
             let held = state.finalized.of_tick(&tick_id);
@@ -9404,9 +9422,10 @@ mod tests {
         );
         let answered = state.on_execution_vote(&schedule, revote.into());
         assert!(
-            !answered
-                .iter()
-                .any(|a| matches!(a, Action::BroadcastExecutionCertificate { .. })),
+            !answered.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate { .. })
+            )),
             "a re-attestation is not answered with the lapsing certificate: {answered:?}",
         );
         assert_eq!(
@@ -9445,7 +9464,7 @@ mod tests {
     fn the_fold_offers_every_half_it_holds() {
         let mut state = make_test_state();
         let owed_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let owed_tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(7)));
+        let owed_tx = Verified::new_unchecked_for_test(test_transaction(7));
         // Executed, its certificate still owed.
         state.ticks.insert_tick(
             owed_id,
@@ -9843,7 +9862,7 @@ mod tests {
             BlockHeight::new(1),
             500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let actions = state
             .commit_block_carrying(&sched, &certify(block), Naming::Composed)
@@ -9851,7 +9870,7 @@ mod tests {
         let env = actions
             .iter()
             .find_map(|action| match action {
-                Action::ExecuteTransactions { env, .. } => Some(env),
+                Action::Execution(ExecutionAction::ExecuteTransactions { env, .. }) => Some(env),
                 _ => None,
             })
             .expect("the commit dispatches its tick");
@@ -9909,12 +9928,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -9977,12 +9991,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -10028,7 +10037,7 @@ mod tests {
                     BlockHeight::new(1),
                     1_000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![tx],
                 ),
                 1_000,
             ),
@@ -10091,16 +10100,11 @@ mod tests {
         let schedule = make_test_topology();
         let held = test_transaction(2);
         let held_hash = held.hash();
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
+        let finalization: Verifiable<Finalization> =
             helpers_make_finalization(BlockHeight::new(2), held_hash, TransactionDecision::Accept)
-                .into(),
-        );
+                .into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(3),
@@ -10154,7 +10158,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(named_tx.clone()), Arc::new(unnamed_tx.clone())],
+            vec![named_tx.clone(), unnamed_tx.clone()],
         );
         let lines = vec![TickLine::Member {
             staged: 0,
@@ -10218,7 +10222,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         )
         .into_sealed();
         let effects = state.commit_block_carrying(
@@ -10249,10 +10253,10 @@ mod tests {
         );
         assert!(
             state.pending_ticks.is_empty()
-                && !effects
-                    .actions
-                    .iter()
-                    .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+                && !effects.actions.iter().any(|action| matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
             "the dispatch drops the replaced tick from the queue",
         );
         let crossing = test_certify(
@@ -10295,7 +10299,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(held_tx.clone())],
+            vec![held_tx.clone()],
         )
         .into_sealed();
         state.commit_block_carrying(
@@ -10307,7 +10311,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -10315,9 +10319,12 @@ mod tests {
             Naming::Manifest,
         );
         let executes = |actions: &[Action]| {
-            actions
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. }))
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )
+            })
         };
         assert!(
             !executes(&effects.actions),
@@ -10338,8 +10345,8 @@ mod tests {
             },
             Some(vec![1]),
         );
-        let finalization: Arc<Verifiable<Finalization>> =
-            Arc::new(make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), writes).into());
+        let finalization: Verifiable<Finalization> =
+            make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), writes).into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(4),
@@ -10363,7 +10370,7 @@ mod tests {
         let dispatched = effects
             .actions
             .iter()
-            .position(|action| matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3)));
+            .position(|action| matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3)));
         assert!(restored.is_some(), "the settled half's writes are seated");
         assert!(dispatched.is_some(), "and tick 3 then runs");
         assert!(
@@ -10378,7 +10385,7 @@ mod tests {
         leg: TxHash,
         outcome: ExecutionOutcome,
         writes: StateWrites,
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         half_leaving(TickHalf::Legs, vec![(leg, outcome, writes)])
     }
 
@@ -10388,7 +10395,7 @@ mod tests {
     fn half_leaving(
         half: TickHalf,
         members: Vec<(TxHash, ExecutionOutcome, StateWrites)>,
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
         let outcomes = members
             .iter()
@@ -10427,9 +10434,9 @@ mod tests {
         let half = if half == TickHalf::Legs {
             Finalization::accepting(tick_id, receipts)
         } else {
-            Finalization::new(tick_id, half, Some(Arc::new(certificate)), receipts)
+            Finalization::new(tick_id, half, Some(certificate), receipts)
         };
-        Arc::new(half.into())
+        half.into()
     }
 
     /// The legs half of tick 2 at `ROOT` over a certificate attesting
@@ -10438,7 +10445,7 @@ mod tests {
     fn legs_naming(
         members: Vec<(TxHash, ExecutionOutcome, StateWrites)>,
         named: &[TxHash],
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         let whole = half_leaving(TickHalf::Legs, members);
         let receipts: Vec<StoredReceipt> = whole
             .receipts()
@@ -10446,14 +10453,12 @@ mod tests {
             .filter(|receipt| named.contains(&receipt.tx_hash))
             .cloned()
             .collect();
-        Arc::new(
-            whole
-                .as_unverified()
-                .clone()
-                .naming(&named.iter().copied().collect())
-                .with_receipts(Capped::new(receipts).expect("a list written out in a test"))
-                .into(),
-        )
+        whole
+            .as_unverified()
+            .clone()
+            .naming(&named.iter().copied().collect())
+            .with_receipts(Capped::new(receipts).expect("a list written out in a test"))
+            .into()
     }
 
     /// The line naming `tx` a member settling on its own tick's
@@ -10523,7 +10528,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            txs.iter().map(|&tx| Arc::new(tx.clone())).collect(),
+            txs.iter().map(|&tx| tx.clone()).collect(),
         )
         .into_sealed();
         state.commit_block_carrying(
@@ -10598,7 +10603,7 @@ mod tests {
     }
 
     /// A block at `height` on `ROOT` carrying `finalization`.
-    fn settling(height: u64, finalization: Arc<Verifiable<Finalization>>) -> CertifiedBlock {
+    fn settling(height: u64, finalization: Verifiable<Finalization>) -> CertifiedBlock {
         let now_ms = height * 1_000;
         test_certify(
             helpers_make_live_block(
@@ -10643,7 +10648,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         state.commit_block_carrying(
             &schedule,
@@ -10652,7 +10657,7 @@ mod tests {
         );
         let runs_tick_3 = |actions: &[Action]| {
             actions.iter().position(|action| {
-                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+                matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3))
             })
         };
         assert_eq!(
@@ -10661,10 +10666,9 @@ mod tests {
             "the block below tick 3 being written does not release it",
         );
 
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         let effects =
             state.commit_block_carrying(&schedule, &settling(4, determined), Naming::Manifest);
         assert_eq!(
@@ -10730,7 +10734,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         state.commit_block_carrying(
             &schedule,
@@ -10738,14 +10742,13 @@ mod tests {
             Naming::Manifest,
         );
         let _ = state.on_block_persisted(&schedule, BlockHeight::new(3));
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         state.commit_block_carrying(&schedule, &settling(4, determined), Naming::Manifest);
         let runs_tick_3 = |actions: &[Action]| {
             actions.iter().any(|action| {
-                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+                matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3))
             })
         };
         let members = || {
@@ -10809,7 +10812,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         state.commit_block_carrying(
             schedule,
@@ -10817,10 +10820,9 @@ mod tests {
             Naming::Manifest,
         );
         let _ = state.on_block_persisted(schedule, BlockHeight::new(3));
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         state.commit_block_carrying(schedule, &settling(4, determined), Naming::Manifest);
         state
     }
@@ -10866,10 +10868,9 @@ mod tests {
     fn stating_of(
         outcomes: Vec<TxOutcome>,
         receipts: Vec<StoredReceipt>,
-    ) -> Arc<Verifiable<Finalization>> {
-        let half: Arc<Verifiable<Finalization>> = Arc::new(
-            stating_half_on(ShardId::ROOT, BlockHeight::new(2), outcomes, receipts).into(),
-        );
+    ) -> Verifiable<Finalization> {
+        let half: Verifiable<Finalization> =
+            stating_half_on(ShardId::ROOT, BlockHeight::new(2), outcomes, receipts).into();
         assert_eq!(half.validate_against_certificates(), Ok(()));
         half
     }
@@ -10877,7 +10878,7 @@ mod tests {
     /// Whether `actions` dispatch tick 3.
     fn runs_tick_3(actions: &[Action]) -> bool {
         actions.iter().any(|action| {
-            matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+            matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3))
         })
     }
 
@@ -11076,7 +11077,9 @@ mod tests {
             actions
                 .iter()
                 .filter_map(|action| match action {
-                    Action::ExecuteTransactions { tick, .. } => Some(tick.inner()),
+                    Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) => {
+                        Some(tick.inner())
+                    }
                     _ => None,
                 })
                 .collect()
@@ -11087,7 +11090,7 @@ mod tests {
                 BlockHeight::new(height),
                 height * 1_000,
                 ValidatorId::new(0),
-                vec![Arc::new(tx.clone())],
+                vec![tx.clone()],
             );
             let block = naming(&test_certify(block, height * 1_000), vec![alone(&tx)]);
             state
@@ -11152,17 +11155,16 @@ mod tests {
         let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
         let leg = test_transaction(3).hash();
         let mut state = holding_a_leg(&schedule, &held_tx, leg, BTreeMap::new());
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         state.commit_block_carrying(&schedule, &settling(3, determined), Naming::Manifest);
         state.on_block_persisted(&schedule, BlockHeight::new(3));
         let later = make_live_block(
             BlockHeight::new(4),
             4_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -11172,7 +11174,7 @@ mod tests {
         assert!(
             effects.actions.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(4)
+                Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(4)
             )),
             "tick 4 runs with the leg still owed",
         );
@@ -11240,7 +11242,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(abandoned.clone()), Arc::new(mate.clone())],
+            vec![abandoned.clone(), mate.clone()],
         );
         state.commit_block_carrying(
             &schedule,
@@ -11322,7 +11324,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
         let resumed = make_live_block(BlockHeight::new(3), resumed_ms, ValidatorId::new(0), vec![]);
         let aborting = TickLine::Member {
@@ -11391,10 +11393,9 @@ mod tests {
             "the tick seated from the line carries the abort until it settles",
         );
 
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+        let finalization: Verifiable<Finalization> =
             helpers_make_finalization(BlockHeight::new(3), tx.hash(), TransactionDecision::Aborted)
-                .into(),
-        );
+                .into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(5),
@@ -11486,12 +11487,8 @@ mod tests {
         let held = test_transaction(1);
         let held_hash = held.hash();
         let held_deadline = Deadline::of_transaction(&held);
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
         let above = make_live_block(BlockHeight::new(3), 3_000, ValidatorId::new(0), vec![]);
         // The committing block names its own transaction, ready at once.
         let committing = Verified::<CertifiedBlock>::from_persisted(naming(
@@ -11545,9 +11542,10 @@ mod tests {
             .on_committed_state_restored(&schedule, &StubVmStatics)
             .actions;
         assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "nothing is dispatched at a height whose baseline the store has retired",
         );
         assert_eq!(
@@ -11582,7 +11580,7 @@ mod tests {
                     BlockHeight::new(2),
                     2_000,
                     ValidatorId::new(0),
-                    vec![Arc::new(settled.clone())],
+                    vec![settled.clone()],
                 ),
                 2_000,
             ),
@@ -11590,10 +11588,9 @@ mod tests {
         ));
         // The tick at height 2 settles at height 4, one block above where
         // composition resumes.
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+        let finalization: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), settled_hash, StateWrites::default())
-                .into(),
-        );
+                .into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(4),
@@ -11646,7 +11643,10 @@ mod tests {
         assert!(
             actions[..restored.expect("seated")]
                 .iter()
-                .all(|action| !matches!(action, Action::ExecuteTransactions { .. })),
+                .all(|action| !matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
             "and seated before anything the replay composes reads a baseline",
         );
     }
@@ -11668,12 +11668,8 @@ mod tests {
         let held = test_transaction(1);
         let held_hash = held.hash();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
 
         // The replica that was seated when the block committed.
         let mut seated = make_test_state();
@@ -11929,12 +11925,8 @@ mod tests {
         let held = test_transaction(1);
         let held_hash = held.hash();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
 
         // A replica that never went down: its tick at height 2 takes the
         // transaction and holds it until a finalization resolves it.
@@ -11994,7 +11986,7 @@ mod tests {
         );
         assert!(
             actions.iter().any(
-                |action| matches!(action, Action::ExecuteTransactions { requests, .. }
+                |action| matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. })
                     if requests.iter().any(|r| r.tx_hash == held_hash))
             ),
             "and runs it, because the tick that holds it is the tick that ran it",
@@ -12013,7 +12005,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(2))],
+            vec![(test_transaction(2))],
         );
         live.commit_block_carrying(
             &schedule,
@@ -12045,12 +12037,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -12080,7 +12067,7 @@ mod tests {
             .ticks
             .get_tick_mut(&tick_id)
             .expect("the tick is still tracked")
-            .add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            .add_execution_certificate(Verified::new_unchecked_for_test(
                 ExecutionCertificate::new(
                     tick_id,
                     WeightedTimestamp::from_millis(1_000),
@@ -12094,7 +12081,7 @@ mod tests {
                     AggregateSignature::ZERO,
                     SignerBitfield::new(4),
                 ),
-            )));
+            ));
         state.scan_votable_ticks(&schedule);
     }
 
@@ -12139,7 +12126,7 @@ mod tests {
             BlockHeight::new(1),
             500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -12161,7 +12148,7 @@ mod tests {
             BlockHeight::new(2),
             1_500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(2))],
+            vec![(test_transaction(2))],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -12210,9 +12197,8 @@ mod tests {
     /// terminal leaves — and it is what the drain alone does not cover.
     #[test]
     fn a_terminated_chain_composes_no_further_tick() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
         // BASELINE: the same commit on a live chain composes a tick.
@@ -12314,7 +12300,7 @@ mod tests {
             BlockHeight::new(2),
             50_500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         assert!(!schedule.past_terminal(ShardId::ROOT, WeightedTimestamp::from_millis(50_500)));
         let effects = state.commit_block_carrying(
@@ -12373,7 +12359,7 @@ mod tests {
                     BlockHeight::new(height),
                     ms,
                     ValidatorId::new(0),
-                    vec![Arc::new(test_transaction(seed))],
+                    vec![(test_transaction(seed))],
                 ),
                 ms,
             )
@@ -12405,7 +12391,7 @@ mod tests {
             BlockHeight::new(4),
             1_800,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let mut restarted = restarted_over(vec![replayable(past, 1_800)], 4, 1_500);
 
@@ -12434,7 +12420,7 @@ mod tests {
             BlockHeight::new(5),
             1_800,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let effects =
             seated.commit_block_carrying(&schedule, &test_certify(first, 1_800), Naming::Composed);
@@ -12451,9 +12437,8 @@ mod tests {
     fn commit_block_reports_a_reclaim_as_the_abort_and_releases_it() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         state.counterparts.ledger.register_committed(
             test_committed(),
@@ -12496,9 +12481,8 @@ mod tests {
     fn an_undispatched_member_joins_on_the_shards_holding_its_keyspace() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
@@ -12552,9 +12536,8 @@ mod tests {
     fn a_record_covering_a_leg_seats_nothing() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let past_deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
@@ -12570,7 +12553,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .release_resolved(&[Arc::new(Verifiable::from(make_leg_finalization(
+            .release_resolved(&[(Verifiable::from(make_leg_finalization(
                 BlockHeight::new(1),
                 tx_hash,
             )))]);
@@ -12627,9 +12610,8 @@ mod tests {
     /// certificates never combined is abandoned all the same.
     #[test]
     fn a_cores_certificate_is_no_verdict_of_a_leg() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         for outcome in [
             ExecutionOutcome::Failed,
@@ -12682,7 +12664,7 @@ mod tests {
     /// fixes how many shards the core spans, and so whether its
     /// committed cell is ever asked about.
     fn leg_state(
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
         classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
@@ -12880,9 +12862,8 @@ mod tests {
     #[test]
     fn a_core_member_asks_the_siblings_it_waits_on() {
         let schedule = two_shard_core_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let figures = UnsettledTx::for_transaction(
             &transaction,
@@ -12957,7 +12938,7 @@ mod tests {
 
     /// A leg entry on `HOME` whose core consumer's claim sits on `PEER`,
     /// with the committed clock at the deadline.
-    fn claimed_leg_state(transaction: &Arc<Verifiable<Transaction>>) -> ExecutionCoordinator {
+    fn claimed_leg_state(transaction: &Verifiable<Transaction>) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state.counterparts.ledger.register_committed(
             test_committed(),
@@ -13037,9 +13018,8 @@ mod tests {
         producer: ShardId,
         consumer: ShardId,
     ) -> (SubstateKey, SubstateKey, CrossingCell) {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let validity_end = transaction.validity_range().end_timestamp_exclusive;
         let id = CrossingId {
             producer: committed_tx_cell_key(producer, transaction.hash(), validity_end).owner,
@@ -13085,7 +13065,7 @@ mod tests {
     /// Whether a commit dispatched any member.
     fn dispatched(actions: &[Action]) -> bool {
         actions.iter().any(|action| {
-            matches!(action, Action::ExecuteTransactions { requests, .. } if !requests.is_empty())
+            matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. }) if !requests.is_empty())
         })
     }
 
@@ -13112,9 +13092,8 @@ mod tests {
         let validity_end_ms = 400_000;
         let (record_key, claim, cell) = owned_record();
         if owed_here {
-            let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-                Verified::new_unchecked_for_test(straddling_transaction(1)),
-            ));
+            let transaction: Verifiable<Transaction> =
+                Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
             state.counterparts.ledger.register_committed(
                 test_committed(),
                 &PriceTable::GENESIS,
@@ -13159,7 +13138,7 @@ mod tests {
             vec![bundle.naming([(claim, id), (decline, id)])],
         );
         actions.iter().find_map(|action| match action {
-            Action::ExecuteTransactions { requests, .. } => {
+            Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. }) => {
                 requests.first().map(|request| request.member.clone())
             }
             _ => None,
@@ -13238,9 +13217,8 @@ mod tests {
     fn a_record_beside_another_transactions_entry_is_still_asked_about() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let second: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let second: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let (record_key, claim, issued) = owned_record();
         let first = CrossingCell {
             tx: TxHash::from(Hash::from_bytes(b"the first transaction")),
@@ -13296,7 +13274,9 @@ mod tests {
             "and asks a fresh header of neither answer: {opened:?}",
         );
 
-        state.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
+        let checked = CheckedStateProof::check(anchor, vec![claim, decline], proof)
+            .expect("the proof reads under its anchor");
+        state.on_proof_fetched(&checked, &[]);
         assert!(
             state
                 .offers(&CarriedClaims::default())
@@ -13353,7 +13333,7 @@ mod tests {
         shard: ShardId,
         height: u64,
         ts_ms: u64,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<Transaction>,
         claims: Vec<StateClaim>,
     ) -> CertifiedBlock {
         let Block::Live {
@@ -13412,9 +13392,8 @@ mod tests {
     #[test]
     fn a_never_in_a_discarded_suffix_takes_nothing_back() {
         let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let mut state = leg_state(&transaction, &leg_classified());
         let (record_key, _, cell) = owned_record();
@@ -13456,19 +13435,18 @@ mod tests {
     #[test]
     fn a_reclaim_is_untouched_by_a_discard_of_the_tick_at_its_height() {
         let schedule = two_shard_topology();
-        let leg: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let leg: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let mut state = leg_state(&leg, &leg_classified());
         let (record_key, _, cell) = owned_record();
         hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
 
-        let beside = Arc::new(straddling_transaction(2));
+        let beside = straddling_transaction(2);
         let returning = block_reading(
             HOME,
             2,
             past_the_horizon(),
-            vec![Arc::clone(&beside)],
+            vec![beside],
             taking_back(record_key, &cell, 2),
         );
         let actions = state
@@ -13567,7 +13545,7 @@ mod tests {
             vec![returned_at_the_root(1)],
         );
         let tx = test_transaction(1);
-        let next = block_reading(ShardId::ROOT, 2, 2_000, vec![Arc::new(tx.clone())], vec![]);
+        let next = block_reading(ShardId::ROOT, 2, 2_000, vec![tx.clone()], vec![]);
         let restored = |dispatch_from: u64| {
             let recovered = RecoveredState {
                 committed_height: BlockHeight::new(1),
@@ -13607,7 +13585,12 @@ mod tests {
                 state.on_block_persisted(&schedule, BlockHeight::new(1)),
             ]
             .concat();
-            actions.retain(|action| matches!(action, Action::ExecuteTransactions { .. }));
+            actions.retain(|action| {
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )
+            });
             (state, actions)
         };
         for (replica, (mut state, before)) in [
@@ -13616,9 +13599,10 @@ mod tests {
             ("restored the reclaiming block unrun", restored(2)),
         ] {
             assert!(
-                !before
-                    .iter()
-                    .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+                !before.iter().any(|action| matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
                 "{replica}: the reclaiming block dispatches nothing: {before:?}",
             );
             assert!(
@@ -13630,16 +13614,14 @@ mod tests {
                 .actions;
             actions.extend(state.on_block_persisted(&schedule, BlockHeight::new(2)));
             let dispatched = actions.iter().find_map(|action| match action {
-                Action::ExecuteTransactions { tick, requests, .. }
-                    if *tick == BlockHeight::new(2) =>
-                {
-                    Some(
-                        requests
-                            .iter()
-                            .map(|request| request.tx_hash)
-                            .collect::<Vec<_>>(),
-                    )
-                }
+                Action::Execution(ExecutionAction::ExecuteTransactions {
+                    tick, requests, ..
+                }) if *tick == BlockHeight::new(2) => Some(
+                    requests
+                        .iter()
+                        .map(|request| request.tx_hash)
+                        .collect::<Vec<_>>(),
+                ),
                 _ => None,
             });
             assert_eq!(
@@ -13658,13 +13640,12 @@ mod tests {
     #[test]
     fn a_pending_leg_past_its_dead_core_runs_and_is_taken_back() {
         let schedule = two_shard_topology();
-        let leg: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let leg: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = leg.hash();
         let mut state = leg_state(&leg, &leg_classified());
         state.candidates.register(
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
             BTreeSet::from([HOME, PEER]),
             WeightedTimestamp::ZERO,
             PriceTable::GENESIS,
@@ -13691,7 +13672,7 @@ mod tests {
         assert!(
             actions.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { requests, .. }
+                Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. })
                     if requests.iter().any(|request| request.tx_hash == tx_hash)
             )),
             "the next block naming it runs it: {actions:?}",
@@ -13898,7 +13879,7 @@ mod tests {
         // The candidate the want is filed for, which is what keeps the
         // want standing across the commits the tests make.
         state.candidates.register_member(
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
             Member::whole(HOME),
             now,
             PriceTable::GENESIS,
@@ -14350,9 +14331,10 @@ mod tests {
             "the reading is the one the fold judges the answer's deletion on",
         );
         assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "and no member is composed for it",
         );
     }
@@ -14360,14 +14342,13 @@ mod tests {
     /// A leg entry on `HOME` whose core consumer's claim sits on `PEER`,
     /// with the transaction, its figures and the claim key beside it.
     fn consumer_claim_fixture() -> (
-        Arc<Verifiable<Transaction>>,
+        Verifiable<Transaction>,
         UnsettledTx,
         SubstateKey,
         ExecutionCoordinator,
     ) {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
@@ -14446,7 +14427,7 @@ mod tests {
         assert!(
             !folded.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { requests, .. }
+                Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. })
                     if requests.iter().any(|request| request.tx_hash == tx_hash)
             )),
             "no member is composed for it",
@@ -14477,12 +14458,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -14520,12 +14496,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -14559,12 +14530,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -14997,21 +14963,19 @@ mod tests {
         let (local, partner) = (HOME, PEER);
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         let tick_id = TickId::new(local, BlockHeight::new(1));
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(seed)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                    seed,
-                ))),
+                (Verified::new_unchecked_for_test(straddling_transaction(seed))),
                 [local, partner].into_iter().collect(),
             )],
         );
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
@@ -15020,7 +14984,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
         state.counterparts.ledger.register_committed(
@@ -15093,21 +15057,19 @@ mod tests {
     ) -> (ExecutionCoordinator, TickId, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(two_sided_transaction(seed)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![(
-                Arc::new(Verified::new_unchecked_for_test(two_sided_transaction(
-                    seed,
-                ))),
+                (Verified::new_unchecked_for_test(two_sided_transaction(seed))),
                 [HOME, UPPER, LOWER].into_iter().collect(),
             )],
         );
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
@@ -15116,7 +15078,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
         state.counterparts.ledger.register_committed(
@@ -15376,15 +15338,13 @@ mod tests {
         let (mut state, tick_id, tx_hash) = state_stranded_on(&sched, 1);
         state
             .exec_certs
-            .insert(Arc::new(Verified::new_unchecked_for_test(
-                ExecutionCertificate::new(
-                    tick_id,
-                    WeightedTimestamp::ZERO,
-                    GlobalReceiptRoot::ZERO,
-                    Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
-                    AggregateSignature::ZERO,
-                    quorum_signers(),
-                ),
+            .insert(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::ZERO,
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
+                AggregateSignature::ZERO,
+                quorum_signers(),
             )));
 
         state.release_tick(tick_id, Some(tx_hash));
@@ -15417,15 +15377,15 @@ mod tests {
 
     /// [`PEER`]'s certificate settling `tx_hash` against this shard's:
     /// a success that awaited [`HOME`] for it.
-    fn peer_settles(tx_hash: TxHash) -> Arc<Verified<ExecutionCertificate>> {
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+    fn peer_settles(tx_hash: TxHash) -> Verified<ExecutionCertificate> {
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             TickId::new(PEER, BlockHeight::new(1)),
             WeightedTimestamp::from_millis(1_000),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"peer")),
             Capped::from_array([TxOutcome::new(tx_hash, succeeded()).awaiting([HOME])]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )))
+        ))
     }
 
     /// A state whose tick at height 1 holds `T`, a transaction whose
@@ -15436,25 +15396,22 @@ mod tests {
     fn state_holding_a_shared_verdict(seed: u8) -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let shared: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(seed)),
+        let shared: Verifiable<Transaction> = Verifiable::from(Verified::new_unchecked_for_test(
+            straddling_transaction(seed),
         ));
-        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(seed + 1)),
-        ));
+        let alone: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(test_transaction(seed + 1)));
         let (t, x) = (shared.hash(), alone.hash());
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![
                 (
-                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                        seed,
-                    ))),
+                    (Verified::new_unchecked_for_test(straddling_transaction(seed))),
                     BTreeSet::from([HOME, PEER]),
                 ),
                 (
-                    Arc::new(Verified::new_unchecked_for_test(test_transaction(seed + 1))),
+                    (Verified::new_unchecked_for_test(test_transaction(seed + 1))),
                     BTreeSet::from([HOME]),
                 ),
             ],
@@ -15502,7 +15459,7 @@ mod tests {
         anchor_ms: u64,
         near: TxHash,
         far: TxHash,
-    ) -> Arc<Verified<ExecutionCertificate>> {
+    ) -> Verified<ExecutionCertificate> {
         use hyperscale_types::compute_global_receipt_root;
         let outcomes = [(near, 1), (far, 2)].map(|(tx_hash, seed)| {
             TxOutcome::new(tx_hash, succeeded())
@@ -15510,14 +15467,14 @@ mod tests {
                 .awaiting([PEER])
                 .as_role(Role::Whole)
         });
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(anchor_ms),
             compute_global_receipt_root(&outcomes),
             Capped::from_array(outcomes),
             AggregateSignature::ZERO,
             quorum_signers(),
-        )))
+        ))
     }
 
     /// Cast `tick`'s own vote and feed it the certificate of that vote,
@@ -15527,7 +15484,7 @@ mod tests {
         let (anchor, root, outcomes) = tick
             .build_vote_data()
             .expect("every member of the fixture's tick came back");
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
                 anchor,
@@ -15536,7 +15493,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
     }
 
     /// [`state_holding_two_legs`] before this shard's own certificate
@@ -15544,11 +15501,7 @@ mod tests {
     fn state_running_two_legs() -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let shared = |seed: u8| {
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                seed,
-            )))
-        };
+        let shared = |seed: u8| Verified::new_unchecked_for_test(straddling_transaction(seed));
         let (near, far) = (shared(1).hash(), shared(2).hash());
         let mut tick = tick_holding(
             tick_id,
@@ -15573,7 +15526,7 @@ mod tests {
     fn commit_stating(
         state: &mut ExecutionCoordinator,
         tick_id: TickId,
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         let stating = announced(&state.finalize(&tick_id))
             .into_iter()
             .find(|fw| fw.half() == TickHalf::Stated)
@@ -15583,7 +15536,7 @@ mod tests {
     }
 
     /// The transactions each finalization states a yes for.
-    fn stated_by(finalizations: &[Arc<Verifiable<Finalization>>]) -> Vec<Vec<TxHash>> {
+    fn stated_by(finalizations: &[Verifiable<Finalization>]) -> Vec<Vec<TxHash>> {
         finalizations
             .iter()
             .map(|fw| fw.stated_outcomes().map(TxOutcome::tx_hash).collect())
@@ -15591,7 +15544,7 @@ mod tests {
     }
 
     /// The stating halves the store holds for a proposer.
-    fn held_stating(state: &ExecutionCoordinator) -> Vec<Arc<Verifiable<Finalization>>> {
+    fn held_stating(state: &ExecutionCoordinator) -> Vec<Verifiable<Finalization>> {
         state
             .get_finalizations()
             .into_iter()
@@ -15717,11 +15670,7 @@ mod tests {
     fn seated_awaiting_its_batch(seeds: &[u8]) -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let shared = |seed: u8| {
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                seed,
-            )))
-        };
+        let shared = |seed: u8| Verified::new_unchecked_for_test(straddling_transaction(seed));
         let tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
@@ -15785,7 +15734,7 @@ mod tests {
     fn stating_announced_at_the_next_commit(
         state: &mut ExecutionCoordinator,
         schedule: &TopologySchedule,
-    ) -> Vec<Arc<Verifiable<Finalization>>> {
+    ) -> Vec<Verifiable<Finalization>> {
         let block = make_live_block_on_shard(
             HOME,
             BlockHeight::new(2),
@@ -15818,9 +15767,10 @@ mod tests {
             &[(near, succeeded()), (far, succeeded())],
         );
         assert!(
-            !scanned
-                .iter()
-                .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
+            !scanned.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+            )),
             "a certified tick is sent no vote: {scanned:?}",
         );
         assert_eq!(
@@ -15849,11 +15799,7 @@ mod tests {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let local = |seed: u8| {
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                seed,
-            )))
-        };
+        let local = |seed: u8| Verified::new_unchecked_for_test(straddling_transaction(seed));
         let tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
@@ -15872,14 +15818,14 @@ mod tests {
                 .as_role(Role::Whole)
         });
         let root = compute_global_receipt_root(&outcomes);
-        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let certificate = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             root,
             Capped::from_array(outcomes),
             AggregateSignature::ZERO,
             quorum_signers(),
-        )));
+        ));
         let _ = state.on_certificate_verified(&schedule, Ok(certificate));
 
         assert!(state.finalized.is_empty(), "no receipt is held yet");
@@ -15898,7 +15844,7 @@ mod tests {
             },
         );
         assert_eq!(state.voted_receipt_root(&tick_id), Some(root));
-        let determined: Vec<Arc<Verifiable<Finalization>>> = announced(&actions)
+        let determined: Vec<Verifiable<Finalization>> = announced(&actions)
             .into_iter()
             .filter(|fw| fw.is_determined())
             .collect();
@@ -15935,11 +15881,10 @@ mod tests {
         let (mut state, tick_id, near, far) = seated_awaiting_its_batch(&[1]);
         certified_by_its_shard(&mut state, &schedule, tick_id, (near, far));
         let scanned = batch_returned(&mut state, &schedule, tick_id, &[(near, succeeded())]);
-        assert!(
-            !scanned
-                .iter()
-                .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
-        );
+        assert!(!scanned.iter().any(|action| matches!(
+            action,
+            Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+        )),);
         assert_eq!(
             state.voted_receipt_root(&tick_id),
             None,
@@ -16013,13 +15958,13 @@ mod tests {
         tick_id: TickId,
         names: &[TxHash],
         (hash, height): (BlockHash, BlockHeight),
-    ) -> Vec<Arc<Verifiable<Finalization>>> {
+    ) -> Vec<Verifiable<Finalization>> {
         let accepting = BTreeMap::from([(tick_id, names.iter().copied().collect())]);
         let mut built = Vec::new();
         for action in state.offer_accepting(hash, height, &accepting) {
-            let Action::BuildLegsHalf {
+            let Action::Execution(ExecutionAction::BuildLegsHalf {
                 tick, names, tip, ..
-            } = action
+            }) = action
             else {
                 continue;
             };
@@ -16034,7 +15979,7 @@ mod tests {
     }
 
     /// The members each finalization `actions` announce names, in order.
-    fn announced(actions: &[Action]) -> Vec<Arc<Verifiable<Finalization>>> {
+    fn announced(actions: &[Action]) -> Vec<Verifiable<Finalization>> {
         actions
             .iter()
             .filter_map(|action| match action {
@@ -16047,7 +15992,7 @@ mod tests {
             .collect()
     }
 
-    fn names_of(finalizations: &[Arc<Verifiable<Finalization>>]) -> Vec<Vec<TxHash>> {
+    fn names_of(finalizations: &[Verifiable<Finalization>]) -> Vec<Vec<TxHash>> {
         finalizations
             .iter()
             .map(|fw| fw.tx_hashes().collect())
@@ -16106,7 +16051,9 @@ mod tests {
             actions
                 .iter()
                 .filter_map(|action| match action {
-                    Action::BuildLegsHalf { tick, tip, .. } => Some((*tick, *tip)),
+                    Action::Execution(ExecutionAction::BuildLegsHalf { tick, tip, .. }) => {
+                        Some((*tick, *tip))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -16254,9 +16201,8 @@ mod tests {
     #[test]
     fn a_release_through_an_abandoned_sibling_keeps_the_member_a_counterpart_can_settle() {
         let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(1);
-        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(2)),
-        ));
+        let alone: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(test_transaction(2)));
         assert_eq!(alone.hash(), x);
         state
             .counterparts
@@ -16323,7 +16269,7 @@ mod tests {
     /// the block that commits it at [`test_committed`] states it:
     /// reaching `reach`, at the genesis prices, answering `crossings`.
     fn aborting(
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
         classified: &Classified,
         reach: &[ShardId],
         crossings: Crossings,
@@ -16395,9 +16341,8 @@ mod tests {
     /// build.
     #[test]
     fn an_abort_named_past_the_abandon_window_is_seated() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let x = transaction.hash();
         let sched = two_shard_topology();
         let trie = sched.head().shard_trie().clone();
@@ -16496,9 +16441,8 @@ mod tests {
     /// successors.
     #[test]
     fn an_abort_after_its_reach_reshaped_names_the_committing_placement() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let x = transaction.hash();
         let (left, right) = PEER.children();
         let reshaped = ShardTrie::from_leaves([HOME, left, right]);
@@ -16528,9 +16472,9 @@ mod tests {
     fn a_record_before_the_commit_leaves_the_abort_its_nevers() {
         let schedule = two_shard_topology();
         let trie = schedule.head().shard_trie().clone();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
-        ));
+        );
         let x = transaction.hash();
         let classified = peer_fed_core_classified();
         let never = never_of(&transaction);
@@ -16641,7 +16585,7 @@ mod tests {
     /// has taken, frozen as `classified`.
     fn core_state(
         shard: ShardId,
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
         classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), shard);
@@ -16656,7 +16600,7 @@ mod tests {
     /// The one `Never` [`HOME`] writes for `transaction` under
     /// [`peer_fed_core_classified`]: the crossing the leg on [`PEER`]
     /// hands the core.
-    fn never_of(transaction: &Arc<Verifiable<Transaction>>) -> (SubstateKey, Vec<u8>) {
+    fn never_of(transaction: &Verifiable<Transaction>) -> (SubstateKey, Vec<u8>) {
         let classified = peer_fed_core_classified();
         let edges: Vec<_> = classified.refusable_consumed(HOME).collect();
         assert_eq!(edges.len(), 1, "the fixture hands the core one crossing");
@@ -16671,7 +16615,7 @@ mod tests {
     }
 
     /// The deadline of `transaction` as committed at [`test_committed`].
-    fn deadline_of(transaction: &Arc<Verifiable<Transaction>>) -> WeightedTimestamp {
+    fn deadline_of(transaction: &Verifiable<Transaction>) -> WeightedTimestamp {
         UnsettledTx::for_transaction(
             transaction,
             test_committed(),
@@ -16691,9 +16635,9 @@ mod tests {
     #[test]
     fn an_uncertified_abandonment_answers_on_the_shard_holding_the_decline() {
         let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let deadline = deadline_of(&transaction);
         let never = never_of(&transaction);
@@ -16740,9 +16684,9 @@ mod tests {
     #[test]
     fn a_discarded_abandonment_is_composed_again() {
         let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let deadline = deadline_of(&transaction);
         let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
@@ -16808,9 +16752,8 @@ mod tests {
         // Paying from this shard, so the charge is settled here and a
         // receipt carrying the charge alone is told from one carrying a
         // `Never` beside it.
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let deadline = deadline_of(&transaction);
         let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
@@ -16827,7 +16770,7 @@ mod tests {
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
                 vec![(
-                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                    (Verified::new_unchecked_for_test(straddling_transaction(1))),
                     BTreeSet::from([HOME, PEER]),
                 )],
             ),
@@ -17095,19 +17038,15 @@ mod tests {
         );
         state
             .exec_certs
-            .insert(Arc::new(Verified::new_unchecked_for_test(
-                certificate.clone(),
-            )));
+            .insert(Verified::new_unchecked_for_test(certificate.clone()));
         for half in [TickHalf::Determined, TickHalf::Legs] {
             state.finalized.insert(
                 tick_id,
-                Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                    Finalization::new(
-                        tick_id,
-                        half,
-                        Some(Arc::new(certificate.clone())),
-                        Capped::from_array([]),
-                    ),
+                Verifiable::from(Verified::new_unchecked_for_test(Finalization::new(
+                    tick_id,
+                    half,
+                    Some(certificate.clone()),
+                    Capped::from_array([]),
                 ))),
             );
         }
@@ -17156,13 +17095,11 @@ mod tests {
         );
         state.finalized.insert(
             tick_id,
-            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                Finalization::new(
-                    tick_id,
-                    TickHalf::Legs,
-                    Some(Arc::new(taken_before)),
-                    Capped::from_array([]),
-                ),
+            Verifiable::from(Verified::new_unchecked_for_test(Finalization::new(
+                tick_id,
+                TickHalf::Legs,
+                Some(taken_before),
+                Capped::from_array([]),
             ))),
         );
         assert_eq!(
@@ -17272,9 +17209,8 @@ mod tests {
 
         // A second member of the same tick, reaching only into keyspace
         // nobody has left — so its own counterpart is still live.
-        let sibling: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(2)),
-        ));
+        let sibling: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(test_transaction(2)));
         let sibling_hash = sibling.hash();
         state.ticks.assign_tx(sibling_hash, tick_id);
         state.counterparts.ledger.register_committed(
@@ -17384,7 +17320,7 @@ mod tests {
     fn state_abandoning(
         topology_schedule: &TopologySchedule,
         local: ShardId,
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         state.committed_ts = WeightedTimestamp::from_millis(1500);
@@ -17412,9 +17348,8 @@ mod tests {
             &[],
             &[(PEER, Some(Epoch::new(0)))],
         ));
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(7)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(7)));
         let tx_hash = transaction.hash();
         let mut state = state_abandoning(&stamped, HOME, &transaction);
         state
@@ -17481,12 +17416,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -17592,12 +17522,12 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     signer,
                     recipients,
                     local_recipient,
                     ..
-                } => Some((*signer, recipients.clone(), *local_recipient)),
+                }) => Some((*signer, recipients.clone(), *local_recipient)),
                 _ => None,
             })
             .collect()
@@ -17712,7 +17642,9 @@ mod tests {
                 .actions
                 .iter()
                 .filter_map(|a| match a {
-                    Action::PushCrossingReadings { signer, .. } => Some(*signer),
+                    Action::Provisions(ProvisionAction::PushCrossingReadings {
+                        signer, ..
+                    }) => Some(*signer),
                     _ => None,
                 })
                 .collect();
@@ -17730,13 +17662,13 @@ mod tests {
         actions
             .iter()
             .filter_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     tick_id: voted,
                     vote_anchor_ts,
                     recipients,
                     signer,
                     ..
-                } if *voted == tick_id => {
+                }) if *voted == tick_id => {
                     assert_eq!(recipients.len(), 1, "the first send goes to the leader");
                     Some((*signer, vote_anchor_ts.as_millis()))
                 }
@@ -17789,16 +17721,14 @@ mod tests {
             state.detach_signer(ValidatorId::new(0));
             let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
             let shared = BTreeSet::from([ShardId::ROOT, ShardId::leaf(1, 1)]);
-            let txs: Vec<Arc<Verified<Transaction>>> = [7, 8]
+            let txs: Vec<Verified<Transaction>> = [7, 8]
                 .into_iter()
-                .map(|seed| Arc::new(Verified::new_unchecked_for_test(test_transaction(seed))))
+                .map(|seed| Verified::new_unchecked_for_test(test_transaction(seed)))
                 .collect();
             let mut tick = tick_holding(
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
-                txs.iter()
-                    .map(|tx| (Arc::clone(tx), shared.clone()))
-                    .collect(),
+                txs.iter().map(|tx| (tx.clone(), shared.clone())).collect(),
             );
             for tx in &txs {
                 tick.record_execution_result(tx.hash(), ExecutionOutcome::Failed);

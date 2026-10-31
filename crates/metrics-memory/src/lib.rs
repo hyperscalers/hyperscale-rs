@@ -535,6 +535,20 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("eager_proposals", Some(reason), 1);
     }
 
+    fn record_network_input_refused(&self, shard: u64, kind: &str) {
+        self.inc("network_inputs_refused", None, 1);
+        self.inc(
+            "network_inputs_refused",
+            Some(&format!("{shard}:{kind}")),
+            1,
+        );
+    }
+
+    fn record_network_input_over_share(&self, shard: u64) {
+        self.inc("network_inputs_over_share", None, 1);
+        self.inc("network_inputs_over_share", Some(&shard.to_string()), 1);
+    }
+
     fn record_crossing_push_dropped(&self, reason: &str) {
         self.inc("crossing_pushes_dropped", None, 1);
         self.inc("crossing_pushes_dropped", Some(reason), 1);

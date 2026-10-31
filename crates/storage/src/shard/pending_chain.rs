@@ -343,14 +343,11 @@ where
 
     /// Certified header at `height`. Header-only view of
     /// [`Self::certified_block`] — pending entry first, base store fallback.
-    pub fn certified_header(
-        &self,
-        height: BlockHeight,
-    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    pub fn certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
         if let Some(certified) = self.pending_certified_at(height) {
-            return Some(Arc::new(certified.certified_header()));
+            return Some(certified.certified_header());
         }
-        self.base.get_certified_header(height).map(Arc::new)
+        self.base.get_certified_header(height)
     }
 
     /// Certified-but-uncommitted header at `height`, if any — the certified
@@ -365,9 +362,9 @@ where
     pub fn certified_uncommitted_header(
         &self,
         height: BlockHeight,
-    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    ) -> Option<Verified<CertifiedBlockHeader>> {
         self.pending_certified_uncommitted_at(height)
-            .map(|certified| Arc::new(certified.certified_header()))
+            .map(|certified| certified.certified_header())
     }
 
     /// Whether the block at `height` carries `tx`, or `None` when no
@@ -483,7 +480,7 @@ where
     /// `None` where the block itself is absent or any of the
     /// finalizations its manifest names is: the settled fold derives its
     /// set from these, so a short read is a hole and not a shorter block.
-    fn attestations_at(&self, height: BlockHeight) -> Option<Vec<Arc<Verifiable<Finalization>>>> {
+    fn attestations_at(&self, height: BlockHeight) -> Option<Vec<Verifiable<Finalization>>> {
         if let Some(certified) = self
             .pending_certified_at(height)
             .or_else(|| self.pending_certified_uncommitted_at(height))
@@ -500,8 +497,7 @@ where
         let metadata = self.base.get_block_metadata(height)?;
         let ids = metadata.manifest().cert_ids();
         let stored = self.base.get_certificates_batch(ids);
-        (stored.len() == ids.len())
-            .then(|| stored.into_iter().map(|fw| Arc::new(fw.into())).collect())
+        (stored.len() == ids.len()).then(|| stored.into_iter().map(Verifiable::from).collect())
     }
 
     /// The settled-transaction root a terminating boundary header
@@ -523,7 +519,7 @@ where
     pub fn terminal_settled_txs_root(
         &self,
         window: &TerminalWindow,
-        own_certificates: &[Arc<Verifiable<Finalization>>],
+        own_certificates: &[Verifiable<Finalization>],
     ) -> Result<SettledTxsRoot, WindowCoverage> {
         let (settled, coverage) = self.settled_txs_in_window(
             window.local_shard,
@@ -1531,7 +1527,7 @@ mod tests {
     }
 
     impl ShardChainReader for StubStore {
-        fn provisions_at(&self, _height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+        fn provisions_at(&self, _height: BlockHeight) -> Vec<Verifiable<Provisions>> {
             Vec::new()
         }
 
@@ -2186,8 +2182,8 @@ mod tests {
 
     /// The tick's certificate, settling one leg that ran: what reaches
     /// beyond this shard, and so what puts it in the settled set.
-    fn ec_for(tick: &TickId) -> Arc<ExecutionCertificate> {
-        Arc::new(ExecutionCertificate::new(
+    fn ec_for(tick: &TickId) -> ExecutionCertificate {
+        ExecutionCertificate::new(
             *tick,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
@@ -2200,7 +2196,7 @@ mod tests {
             .as_role(Role::Leg)]),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     /// A `BlockForSync` at `height` whose QC carries `wt_ms` and whose
@@ -2217,7 +2213,7 @@ mod tests {
         else {
             unreachable!("make_test_block returns a Live block")
         };
-        let certs = vec![Arc::new(
+        let certs = vec![
             Finalization::new(
                 *settles,
                 TickHalf::Determined,
@@ -2225,7 +2221,7 @@ mod tests {
                 Capped::from_array([]),
             )
             .into(),
-        )];
+        ];
         let block = Block::Live {
             header,
             transactions,
@@ -2362,9 +2358,9 @@ mod tests {
         else {
             unreachable!("make_test_block returns a Live block")
         };
-        let txs: Vec<Arc<Verifiable<Transaction>>> = seeds
+        let txs: Vec<Verifiable<Transaction>> = seeds
             .iter()
-            .map(|&seed| Arc::new(Verifiable::from(test_transaction(seed))))
+            .map(|&seed| Verifiable::from(test_transaction(seed)))
             .collect();
         let block = Block::Live {
             header,

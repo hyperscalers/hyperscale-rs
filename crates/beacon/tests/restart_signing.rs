@@ -10,9 +10,9 @@
 use std::sync::{Arc, Mutex};
 
 use hyperscale_beacon::action_handlers::handle_action;
-use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors};
+use hyperscale_beacon::coordinator::{BeaconCoordinator, CoordinatorAction, LocalChainAnchors};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_core::{Action, BeaconActionContext, Gate, ProtocolEvent};
+use hyperscale_core::{BeaconAction, BeaconActionContext, Gate, ParticipantAction, ProtocolEvent};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::{
     Answerers, GossipHandler, Network, NotificationHandler, RequestError, RequestHandler,
@@ -102,7 +102,7 @@ impl Member {
 
     /// Run `action` through the handlers over `storage`, keeping the
     /// events it feeds back.
-    fn run(&self, storage: &SimBeaconStorage, action: Action) {
+    fn run(&self, storage: &SimBeaconStorage, action: ParticipantAction) {
         let sink = Arc::clone(&self.events);
         let notify: Arc<dyn Fn(ProtocolEvent) + Send + Sync> =
             Arc::new(move |event| sink.lock().expect("events lock").push(event));
@@ -150,7 +150,7 @@ impl Member {
         let me = self.committee.validator_id(0);
         let mut coordinator = BeaconCoordinator::new(
             Arc::new(BlsVerifier),
-            Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash)),
+            Verified::<CertifiedBeaconBlock>::genesis(config_hash),
             vec![build_genesis_beacon_state(&config)],
             me,
             ShardId::ROOT,
@@ -166,13 +166,13 @@ impl Member {
 
     /// Run the signing actions among `actions` through the handlers over
     /// `storage`.
-    fn sign(&self, storage: &SimBeaconStorage, actions: Vec<Action>) {
+    fn sign(&self, storage: &SimBeaconStorage, actions: Vec<CoordinatorAction>) {
         for action in actions {
-            if matches!(
-                action,
-                Action::SignAndBroadcastRatifyVote { .. }
-                    | Action::BuildAndBroadcastBeaconProposal { .. }
-            ) {
+            if let CoordinatorAction::Participant(BeaconAction::Participant(
+                action @ (ParticipantAction::SignAndBroadcastRatifyVote { .. }
+                | ParticipantAction::BuildAndBroadcastBeaconProposal { .. }),
+            )) = action
+            {
                 self.run(storage, action);
             }
         }
@@ -201,7 +201,7 @@ impl Member {
             .iter()
             .filter_map(|event| match event {
                 ProtocolEvent::BeaconProposalReceived { proposal, .. } => {
-                    Some(proposal.as_unverified().vote_equivocations().len())
+                    Some(proposal.vote_equivocations().len())
                 }
                 _ => None,
             })
@@ -255,7 +255,7 @@ impl Member {
             gate: &Gate::new(),
         };
         handle_action(
-            Action::SignAndBroadcastPcVote1 {
+            ParticipantAction::SignAndBroadcastPcVote1 {
                 epoch: Epoch::new(3),
                 view: SpcView::new(1),
                 v_in: v_in.clone(),
@@ -395,11 +395,16 @@ fn a_rebuilt_participant_does_not_sign_a_second_proposal_for_its_epoch() {
     assert!(coordinator.observe_vote_equivocation(vote_equivocation()));
     let actions = coordinator.on_beacon_committee_start_timer();
     assert!(
-        actions.iter().any(|action| matches!(
-            action,
-            Action::BuildAndBroadcastBeaconProposal { vote_equivocations, .. }
-                if vote_equivocations.len() == 1
-        )),
+        actions
+            .iter()
+            .filter_map(CoordinatorAction::participant)
+            .any(|action| matches!(
+                action,
+                BeaconAction::Participant(ParticipantAction::BuildAndBroadcastBeaconProposal {
+                    vote_equivocations,
+                    ..
+                }) if vote_equivocations.len() == 1
+            )),
         "the rebuilt participant builds a different body",
     );
     after.sign(&storage, actions);

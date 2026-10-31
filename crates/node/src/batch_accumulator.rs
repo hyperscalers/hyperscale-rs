@@ -2,7 +2,7 @@
 //!
 //! [`BatchAccumulator`] collects items until either a maximum count or a time
 //! window is reached, at which point the caller flushes the batch. Deadlines are
-//! tracked as `LocalTimestamp` (the `io_loop`'s monotonic local clock) so both
+//! tracked as `LocalTimestamp` (the loop's local clock) so both
 //! production and simulation use the same paths.
 
 use std::time::Duration;

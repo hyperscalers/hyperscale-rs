@@ -7,7 +7,6 @@
 //! ancestor's content, and so read one input.
 
 use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
 
 use hyperscale_engine::tick_select::{
     CommittedSets, Judged, ManifestBudget, SiblingViews, Unlicensed, accepting, ends_stand,
@@ -209,7 +208,7 @@ pub fn ends_licensed(
 pub fn legs_licensed(
     parent: &MemberIndex,
     pending: &MemberInputs,
-    certificates: &[Arc<Verifiable<Finalization>>],
+    certificates: &[Verifiable<Finalization>],
     views: &SiblingViews,
 ) -> Result<(), Withheld> {
     let legs: Vec<TxHash> = certificates
@@ -233,8 +232,8 @@ pub fn legs_licensed(
 /// among them it cut, which no other replica holds and which voters
 /// fetch.
 pub struct OfferedLegs {
-    pub offered: Vec<Arc<Verifiable<Finalization>>>,
-    pub cut: Vec<Arc<Verifiable<Finalization>>>,
+    pub offered: Vec<Verifiable<Finalization>>,
+    pub cut: Vec<Verifiable<Finalization>>,
 }
 
 /// `finalizations` as a proposer offers them in a block over `parent`'s
@@ -244,7 +243,7 @@ pub struct OfferedLegs {
 /// name this replica cannot judge is cut too: a voter lacking what it
 /// turns on would defer the block.
 pub fn legs_that_stand(
-    finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    finalizations: Vec<Verifiable<Finalization>>,
     parent: &MemberIndex,
     pending: &MemberInputs,
     views: &SiblingViews,
@@ -268,8 +267,8 @@ pub fn legs_that_stand(
             if kept.is_empty() {
                 return None;
             }
-            let narrowed = Arc::new(Verifiable::from(fw.as_unverified().clone().naming(&kept)));
-            cut.push(Arc::clone(&narrowed));
+            let narrowed = Verifiable::from(fw.as_unverified().clone().naming(&kept));
+            cut.push(narrowed.clone());
             Some(narrowed)
         })
         .collect();

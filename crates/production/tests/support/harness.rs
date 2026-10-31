@@ -618,9 +618,9 @@ impl Harness {
             .map(|(_, state)| state)
     }
 
-    /// Submit a transaction into host `idx`'s process — the production
-    /// analog of the sim's `ProcessScopedInput::SubmitTransaction`. The
-    /// process computes the touched-shard fanout and admits onto every
+    /// Submit a transaction into host `idx`'s process through
+    /// `ProcessIo::submit_transaction`, the path the sim's submissions
+    /// take too. The process computes the touched-shard fanout and admits onto every
     /// hosted shard's mempool, gossiping any it doesn't host. Returns
     /// `false` when the host is down or shutting down. Submit through a host
     /// that runs the transaction's source shard so it admits directly
@@ -633,7 +633,7 @@ impl Harness {
     pub fn submit_transaction(&self, idx: usize, tx: &Transaction) -> bool {
         self.hosts[idx]
             .handle()
-            .is_some_and(|handle| handle.submit(Arc::new(Transaction::new(tx.body().clone()))))
+            .is_some_and(|handle| handle.submit(Transaction::new(tx.body().clone())))
     }
 
     /// The status host `idx`'s process recorded for `hash`, with the

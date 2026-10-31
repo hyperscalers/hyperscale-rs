@@ -48,8 +48,8 @@ use hyperscale_types::test_utils::{finalization_of, make_finalization};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
     ConsensusReceipt, DiscardCause, ExecutionOutcome, Finalization, FinalizationHash,
-    FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Role, Round, ShardId, StateWrites,
-    StoredReceipt, SweepFrontier, SyncHint, TickHalf, TickId, TickLine, TickManifest,
+    FrontierInputs, GlobalReceiptHash, Hash, Provisions, QuorumCertificate, Role, Round, ShardId,
+    StateWrites, StoredReceipt, SweepFrontier, SyncHint, TickHalf, TickId, TickLine, TickManifest,
     TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, WeightedTimestamp,
     WitnessSources,
 };
@@ -465,7 +465,7 @@ fn test_empty_state_on_fresh_database() {
 
 /// Append a `Finalization` to a block in place. Because `Block` is an enum,
 /// this replaces the whole value via `std::mem::replace`.
-fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
+fn push_finalization(block: &mut Block, fw: Verifiable<Finalization>) {
     let taken = std::mem::replace(
         block,
         Block::Sealed {
@@ -576,10 +576,7 @@ fn a_settling_claim_folds_its_removals() {
 
 /// A finalization whose single receipt carries `writes`. Its placeholder
 /// EC refuses nothing, so the whole set settles.
-fn finalization_with_writes(
-    height: BlockHeight,
-    writes: StateWrites,
-) -> Arc<Verifiable<Finalization>> {
+fn finalization_with_writes(height: BlockHeight, writes: StateWrites) -> Verifiable<Finalization> {
     let tick_id = TickId::new(ShardId::ROOT, height);
     let receipt = StoredReceipt {
         tx_hash: TxHash::from(Hash::from_bytes(&height.inner().to_le_bytes())),
@@ -590,12 +587,12 @@ fn finalization_with_writes(
             events: Capped::empty(),
         }),
     };
-    Arc::new(Verifiable::from(Finalization::new(
+    Verifiable::from(Finalization::new(
         tick_id,
         TickHalf::Determined,
         Some(placeholder_local_ec(ShardId::ROOT, height)),
         Capped::from_array([receipt]),
-    )))
+    ))
 }
 
 /// A prepared block's priors come from the pending chain it was prepared
@@ -728,7 +725,7 @@ fn test_commit_block_stores_certificates() {
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight::new(1));
-    let fw_certificates = Arc::new(Capped::from_array([Arc::new(cert.into())]));
+    let fw_certificates = Arc::new(Capped::from_array([cert.into()]));
     let block = match block {
         Block::Live {
             header,
@@ -963,7 +960,7 @@ fn test_ec_survives_reopen() {
     let finalization = Finalization::new(
         tick_id,
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::from_array([]),
     );
     let id = finalization.receipt_hash();
@@ -971,7 +968,7 @@ fn test_ec_survives_reopen() {
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
         let mut block = make_test_block(BlockHeight::new(1));
-        push_finalization(&mut block, Arc::new(finalization.into()));
+        push_finalization(&mut block, finalization.into());
         commit_settled_at(
             &storage,
             &make_test_certified(block),
@@ -1005,11 +1002,9 @@ fn a_historically_imported_block_reads_back_with_its_receipts() {
     let mut block = make_test_block(height);
     push_finalization(
         &mut block,
-        Arc::new(
-            make_finalization(height, receipt.tx_hash, TransactionDecision::Accept)
-                .with_receipts(Capped::from_array([receipt.clone()]))
-                .into(),
-        ),
+        make_finalization(height, receipt.tx_hash, TransactionDecision::Accept)
+            .with_receipts(Capped::from_array([receipt.clone()]))
+            .into(),
     );
     storage.import_historical_block(&make_test_certified(block));
 
@@ -1056,11 +1051,9 @@ fn block_settling_receipt(
     let mut block = make_test_block(height);
     push_finalization(
         &mut block,
-        Arc::new(
-            finalization_of(height, vec![outcome])
-                .with_receipts(Capped::from_array([receipt]))
-                .into(),
-        ),
+        finalization_of(height, vec![outcome])
+            .with_receipts(Capped::from_array([receipt]))
+            .into(),
     );
     block
 }
@@ -1143,12 +1136,12 @@ fn a_stray_column_family_is_dropped_on_open() {
     let finalization = Finalization::new(
         *ec.tick_id(),
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::from_array([]),
     );
     let id = finalization.receipt_hash();
     let mut block = make_test_block(BlockHeight::new(1));
-    push_finalization(&mut block, Arc::new(finalization.into()));
+    push_finalization(&mut block, finalization.into());
     commit_settled_at(
         &storage,
         &make_test_certified(block),
@@ -1371,7 +1364,7 @@ fn a_committed_bundle_survives_a_reopen() {
             .load_recovered_state(ShardId::ROOT)
             .retained_provisions
             .iter()
-            .map(|bundle| bundle.hash())
+            .map(Provisions::hash)
             .collect::<Vec<_>>(),
         vec![hash],
     );

@@ -10,19 +10,17 @@
 //! and settles through the host's prepared stores.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::IrohNetwork;
-use hyperscale_node::reshape::adopt::adopt_prepared_store;
-use hyperscale_node::reshape::observer::ready_notification;
-use hyperscale_node::reshape::orchestrator::{
-    AdoptKind, FetchKind, FetchedKind, OverRunning, ReshapeEvent, ReshapeOrchestrator,
-    ReshapeRequest, seed_gate,
+use hyperscale_node::bootstrap::EngineBootstrap;
+use hyperscale_node::reshape::{
+    AdoptKind, DerivedGenesis, FetchKind, FetchedKind, OverRunning, ReshapeCompletion,
+    ReshapeEvent, ReshapeOrchestrator, ReshapeRequest, ReshapeView, Seating, Ticket,
+    adopt_prepared_store, block_verdict, headers_verdict, ready_notification, seed_gate,
 };
-use hyperscale_node::reshape::prepared::{ReshapeCompletion, Seating};
-use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
-use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::{serve_local_certified_headers, serve_state_range_request};
 use hyperscale_storage::{
     BoundaryStore, ImportProgress, RecoveredState, ShardChainReader, WitnessSeed,
@@ -33,13 +31,14 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Anchor, Block, BlockHeight, ChainOrigin, FrontierInputs, ReshapeSeat, ShardAnchor, ShardId,
-    Signer, SubstateKey, SubstateLeaf, ValidatorId,
+    Block, BlockHeight, FrontierInputs, ReshapeSeat, ShardAnchor, ShardId, Signer, SubstateKey,
+    SubstateLeaf, ValidatorId,
 };
+use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use super::{ProdProcessIo, ShardSupervisor, SupervisorEvent};
+use super::{ProdProcessIo, ShardSupervisor, StorageFactory, SupervisorEvent};
 use crate::runner::wall_clock_local;
 
 impl ShardSupervisor {
@@ -72,7 +71,7 @@ impl ShardSupervisor {
         }
         // A store no live duty owns any more is dropped, releasing its
         // directory. A relinquished seat goes to the join now; a dropped
-        // duty's shard is joined by the next `reconcile_joins`.
+        // duty's shard is joined by the next `reconcile_seats`.
         let released = self
             .reshape_stores
             .release(|shard| self.reshape.is_seating(shard));
@@ -82,10 +81,17 @@ impl ShardSupervisor {
     }
 
     /// Re-dispatch any reshape store-prep held behind an ordinary join whose
-    /// open has now landed, or a teardown whose thread has joined — its
-    /// `bootstrapping` or `draining` entry cleared — so the duty opens the
-    /// store now that nothing else holds the directory.
+    /// open has now landed, a teardown whose thread has joined — its
+    /// `bootstrapping` or `draining` entry cleared — or an earlier prep of
+    /// the same shard that has landed, so the duty opens the store now that
+    /// nothing else holds the directory.
     pub(super) fn resume_pending_reshape_prep(&mut self) {
+        for request in self
+            .reshape_stores
+            .ready_preps(|shard, ticket| self.reshape.awaits(shard, ticket))
+        {
+            self.dispatch_reshape(request);
+        }
         for shard in self.seats.ready_preps() {
             let Some(request) = self.seats.take_prep(shard) else {
                 continue;
@@ -128,34 +134,39 @@ impl ShardSupervisor {
             }
             return;
         }
+        // A prep of a shard whose earlier prep is still off the loop waits
+        // for that one to land, and an admitted prep closes the store an
+        // earlier duty prepared, before either wipes the directory.
+        let Some(request) = self.reshape_stores.prep(request) else {
+            return;
+        };
         match request {
-            ReshapeRequest::OpenStore { shard } => self.reshape_open_store(shard),
+            ReshapeRequest::OpenStore { shard, ticket } => self.reshape_open_store(shard, ticket),
             ReshapeRequest::SeedFromParent {
                 parent,
                 child,
                 through,
-            } => {
-                // The clone replaces the child's directory wholesale, so a
-                // store an observer prepared there before it relinquished
-                // the seat to this parent half is closed first.
-                self.reshape_stores.remove(child);
-                self.reshape_seed_from_parent(parent, child, through);
-            }
+                ticket,
+            } => self.reshape_seed_from_parent(parent, child, through, ticket),
             ReshapeRequest::Fetch { duty, from, kind } => self.reshape_fetch(duty, from, kind),
             ReshapeRequest::StageChunk {
                 shard,
                 progress,
                 leaves,
-            } => self.reshape_stage(shard, progress, leaves),
-            ReshapeRequest::FinalizeImport { shard, height } => {
-                self.reshape_finalize(shard, height);
-            }
+                ticket,
+            } => self.reshape_stage(shard, progress, leaves, ticket),
+            ReshapeRequest::FinalizeImport {
+                shard,
+                height,
+                ticket,
+            } => self.reshape_finalize(shard, height, ticket),
             ReshapeRequest::ApplyFollow {
                 shard,
                 block,
                 creations,
                 frontier,
-            } => self.reshape_apply(shard, block, creations, frontier),
+                ticket,
+            } => self.reshape_apply(shard, block, creations, frontier, ticket),
             ReshapeRequest::BroadcastReady {
                 validator,
                 child,
@@ -165,41 +176,32 @@ impl ShardSupervisor {
             ReshapeRequest::Adopt {
                 shard,
                 kind,
-                origin,
                 genesis,
-                predecessors,
-            } => self.reshape_adopt(shard, kind, origin, genesis, predecessors),
+                ticket,
+            } => self.reshape_adopt(shard, kind, *genesis, ticket),
             ReshapeRequest::Seat { shard } => self.reshape_seat(shard),
         }
     }
 
     /// Open (wiping any stale directory) a reshape duty's store off the
     /// loop, replicating the engine bootstrap into the fresh store, and
-    /// answer with [`ReshapeCompletion::Opened`]. A failed open logs and
-    /// strands the duty.
-    fn reshape_open_store(&self, shard: ShardId) {
+    /// answer with [`ReshapeCompletion::Opened`]. A failed open logs,
+    /// strands the duty, and answers [`ReshapeCompletion::Failed`].
+    fn reshape_open_store(&self, shard: ShardId, ticket: Ticket) {
         let factory = Arc::clone(&self.storage_factory);
         let engine_bootstrap = self.engine_bootstrap.clone();
         let dir = (self.storage_dir)(shard);
         let events = self.events_tx.clone();
-        self.tokio_handle.spawn_blocking(move || {
-            let outcome = (|| -> Result<(Arc<RocksDbShardStorage>, RecoveredState), String> {
-                if dir.exists() {
-                    std::fs::remove_dir_all(&dir)
-                        .map_err(|e| format!("stale reshape store wipe: {e}"))?;
-                }
-                let storage = factory(&dir, shard)?;
-                // The directory was just wiped, so the store is fresh: it must
-                // carry the engine bootstrap on its substate side before the
-                // duty's child-span or merged-union import, or the seated shard
-                // would lack the global engine nodes (the transaction tracker,
-                // the consensus manager) every transaction reads.
-                engine_bootstrap.replicate_into(storage.as_ref());
-                let recovered = storage.load_recovered_state(shard);
-                Ok((storage, recovered))
-            })();
-            send_opened(&events, shard, outcome);
-        });
+        spawn_store_job(
+            &self.tokio_handle,
+            &self.events_tx,
+            shard,
+            ticket,
+            move || {
+                let outcome = open_fresh_store(&dir, shard, &factory, &engine_bootstrap);
+                send_opened(&events, shard, ticket, outcome);
+            },
+        );
     }
 
     /// Seed a parent half's `child` store by checkpoint-cloning the host's own
@@ -210,7 +212,13 @@ impl ShardSupervisor {
     /// task, so no store read runs on the loop. The checkpoint hard-links, so
     /// the clone shares the engine bootstrap and the parent's substates
     /// without copying.
-    fn reshape_seed_from_parent(&self, parent: ShardId, child: ShardId, through: BlockHeight) {
+    fn reshape_seed_from_parent(
+        &self,
+        parent: ShardId,
+        child: ShardId,
+        through: BlockHeight,
+        ticket: Ticket,
+    ) {
         let events = self.events_tx.clone();
         let parent_storage = self
             .storages
@@ -219,33 +227,43 @@ impl ShardSupervisor {
             .get(&parent)
             .cloned();
         let Some(parent_storage) = parent_storage else {
-            if let Some(event) = seed_gate(None, child, through) {
+            if let Some(event) = seed_gate(None, child, through, ticket) {
                 let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Event(event)));
             }
             return;
         };
         let factory = Arc::clone(&self.storage_factory);
         let dir = (self.storage_dir)(child);
-        self.tokio_handle.spawn_blocking(move || {
-            if let Some(event) = seed_gate(Some(parent_storage.committed_height()), child, through)
-            {
-                let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Event(event)));
-                return;
-            }
-            let outcome = (|| -> Result<(Arc<RocksDbShardStorage>, RecoveredState), String> {
-                if dir.exists() {
-                    std::fs::remove_dir_all(&dir)
-                        .map_err(|e| format!("stale child store wipe: {e}"))?;
+        spawn_store_job(
+            &self.tokio_handle,
+            &self.events_tx,
+            child,
+            ticket,
+            move || {
+                if let Some(event) = seed_gate(
+                    Some(parent_storage.committed_height()),
+                    child,
+                    through,
+                    ticket,
+                ) {
+                    let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Event(event)));
+                    return;
                 }
-                parent_storage
-                    .checkpoint_into(&dir)
-                    .map_err(|e| format!("child checkpoint: {e}"))?;
-                let storage = factory(&dir, child)?;
-                let recovered = storage.load_recovered_state(child);
-                Ok((storage, recovered))
-            })();
-            send_opened(&events, child, outcome);
-        });
+                let outcome = (|| -> Result<(Arc<RocksDbShardStorage>, RecoveredState), String> {
+                    if dir.exists() {
+                        std::fs::remove_dir_all(&dir)
+                            .map_err(|e| format!("stale child store wipe: {e}"))?;
+                    }
+                    parent_storage
+                        .checkpoint_into(&dir)
+                        .map_err(|e| format!("child checkpoint: {e}"))?;
+                    let storage = factory(&dir, child)?;
+                    let recovered = storage.load_recovered_state(child);
+                    Ok((storage, recovered))
+                })();
+                send_opened(&events, child, ticket, outcome);
+            },
+        );
     }
 
     /// Issue one reshape fetch against `from`'s committee, answering with
@@ -420,8 +438,14 @@ impl ShardSupervisor {
     /// the loop, answering with [`ReshapeEvent::Staged`] — or handing the
     /// chunk back via [`ReshapeEvent::StageFailed`] so the duty re-stages it
     /// instead of waiting forever on an ack that will never come.
-    fn reshape_stage(&self, shard: ShardId, progress: ImportProgress, leaves: Vec<SubstateLeaf>) {
-        let Some(storage) = self.reshape_stores.storage(shard).map(Arc::clone) else {
+    fn reshape_stage(
+        &mut self,
+        shard: ShardId,
+        progress: ImportProgress,
+        leaves: Vec<SubstateLeaf>,
+        ticket: Ticket,
+    ) {
+        let Some(storage) = self.reshape_stores.lease(shard, ticket).map(Arc::clone) else {
             warn!(shard = ?shard, "Reshape stage for an unopened store; re-queued");
             send_event(
                 &self.events_tx,
@@ -429,65 +453,115 @@ impl ShardSupervisor {
                     shard,
                     progress,
                     leaves,
+                    ticket,
                 },
             );
             return;
         };
         let events = self.events_tx.clone();
-        self.tokio_handle.spawn_blocking(move || {
-            match storage.stage_import_chunk(&progress, &leaves) {
-                Ok(()) => send_event(&events, ReshapeEvent::Staged { shard }),
-                Err(error) => {
-                    warn!(shard = ?shard, %error, "Reshape chunk staging failed; re-queued");
-                    send_event(
-                        &events,
-                        ReshapeEvent::StageFailed {
-                            shard,
-                            progress,
-                            leaves,
-                        },
-                    );
+        spawn_store_job(
+            &self.tokio_handle,
+            &self.events_tx,
+            shard,
+            ticket,
+            move || {
+                let staged = storage.stage_import_chunk(&progress, &leaves);
+                // The handle closes before the completion frees the directory.
+                drop(storage);
+                match staged {
+                    Ok(()) => send_event(&events, ReshapeEvent::Staged { shard, ticket }),
+                    Err(error) => {
+                        warn!(shard = ?shard, %error, "Reshape chunk staging failed; re-queued");
+                        send_event(
+                            &events,
+                            ReshapeEvent::StageFailed {
+                                shard,
+                                progress,
+                                leaves,
+                                ticket,
+                            },
+                        );
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 
     /// Build a reshape duty's boundary state from its staged chunks off
-    /// the loop, answering with [`ReshapeEvent::Imported`].
-    fn reshape_finalize(&self, shard: ShardId, height: BlockHeight) {
-        let Some(storage) = self.reshape_stores.storage(shard).map(Arc::clone) else {
+    /// the loop, answering with [`ReshapeEvent::Imported`], or with
+    /// [`ReshapeCompletion::Failed`] when the import fails.
+    fn reshape_finalize(&mut self, shard: ShardId, height: BlockHeight, ticket: Ticket) {
+        let Some(storage) = self.reshape_stores.lease(shard, ticket).map(Arc::clone) else {
             warn!(shard = ?shard, "Reshape finalize for an unopened store; dropped");
             return;
         };
         let events = self.events_tx.clone();
-        self.tokio_handle.spawn_blocking(move || {
-            match storage.finalize_boundary_import(height, WitnessSeed::default()) {
-                Ok(root) => send_event(&events, ReshapeEvent::Imported { shard, root }),
-                Err(error) => warn!(shard = ?shard, %error, "Reshape boundary import failed"),
-            }
-        });
+        spawn_store_job(
+            &self.tokio_handle,
+            &self.events_tx,
+            shard,
+            ticket,
+            move || {
+                let imported = storage.finalize_boundary_import(height, WitnessSeed::default());
+                drop(storage);
+                match imported {
+                    Ok(root) => send_event(
+                        &events,
+                        ReshapeEvent::Imported {
+                            shard,
+                            root,
+                            ticket,
+                        },
+                    ),
+                    Err(error) => {
+                        warn!(shard = ?shard, %error, "Reshape boundary import failed");
+                        send_failed(&events, shard, ticket);
+                    }
+                }
+            },
+        );
     }
 
     /// Apply a followed parent block's writes into a reshape duty's store
-    /// off the loop, answering with [`ReshapeEvent::Applied`].
+    /// off the loop, answering with [`ReshapeEvent::Applied`], or with
+    /// [`ReshapeCompletion::Failed`] when the application fails.
     fn reshape_apply(
-        &self,
+        &mut self,
         shard: ShardId,
         block: Arc<Block>,
         creations: Vec<(SubstateKey, Vec<u8>)>,
         frontier: FrontierInputs,
+        ticket: Ticket,
     ) {
-        let Some(storage) = self.reshape_stores.storage(shard).map(Arc::clone) else {
+        let Some(storage) = self.reshape_stores.lease(shard, ticket).map(Arc::clone) else {
             warn!(shard = ?shard, "Reshape follow apply for an unopened store; dropped");
             return;
         };
         let events = self.events_tx.clone();
-        self.tokio_handle.spawn_blocking(move || {
-            match storage.follow_block_writes(&block, &creations, &frontier) {
-                Ok(root) => send_event(&events, ReshapeEvent::Applied { shard, root }),
-                Err(error) => warn!(shard = ?shard, %error, "Reshape follow apply failed"),
-            }
-        });
+        spawn_store_job(
+            &self.tokio_handle,
+            &self.events_tx,
+            shard,
+            ticket,
+            move || {
+                let applied = storage.follow_block_writes(&block, &creations, &frontier);
+                drop(storage);
+                match applied {
+                    Ok(root) => send_event(
+                        &events,
+                        ReshapeEvent::Applied {
+                            shard,
+                            root,
+                            ticket,
+                        },
+                    ),
+                    Err(error) => {
+                        warn!(shard = ?shard, %error, "Reshape follow apply failed");
+                        send_failed(&events, shard, ticket);
+                    }
+                }
+            },
+        );
     }
 
     /// Sign `validator`'s ready signal attesting the sync of `child`,
@@ -516,41 +590,44 @@ impl ShardSupervisor {
     /// Adopt a reshape duty's derived genesis off the loop via the shared
     /// [`adopt_prepared_store`] gate, answering with
     /// [`ReshapeCompletion::Adopted`], which carries the genesis back for the
-    /// seat; a gate failure logs and strands the duty (the seat never fires).
+    /// seat; a gate failure logs, strands the duty (the seat never fires),
+    /// and answers [`ReshapeCompletion::Failed`].
     fn reshape_adopt(
-        &self,
+        &mut self,
         shard: ShardId,
         kind: AdoptKind,
-        origin: ChainOrigin,
-        genesis: Box<Block>,
-        predecessors: Vec<Anchor>,
+        genesis: DerivedGenesis,
+        ticket: Ticket,
     ) {
-        let Some(storage) = self.reshape_stores.storage(shard).map(Arc::clone) else {
+        let Some(storage) = self.reshape_stores.lease(shard, ticket).map(Arc::clone) else {
             warn!(shard = ?shard, "Reshape adopt for an unopened store; dropped");
             return;
         };
         let events = self.events_tx.clone();
-        self.tokio_handle.spawn_blocking(move || {
-            match adopt_prepared_store(
-                storage.as_ref(),
-                shard,
-                kind,
-                origin,
-                &genesis,
-                predecessors,
-            ) {
-                Ok(recovered) => {
-                    let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Adopted {
-                        shard,
-                        genesis,
-                        recovered,
-                    }));
+        spawn_store_job(
+            &self.tokio_handle,
+            &self.events_tx,
+            shard,
+            ticket,
+            move || {
+                let adopted = adopt_prepared_store(storage.as_ref(), shard, kind, &genesis);
+                drop(storage);
+                match adopted {
+                    Ok(recovered) => {
+                        let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Adopted {
+                            shard,
+                            genesis: Box::new(genesis.block),
+                            recovered,
+                            ticket,
+                        }));
+                    }
+                    Err(error) => {
+                        warn!(shard = ?shard, error, "Reshape adoption failed; duty stranded");
+                        send_failed(&events, shard, ticket);
+                    }
                 }
-                Err(error) => {
-                    warn!(shard = ?shard, error, "Reshape adoption failed; duty stranded");
-                }
-            }
-        });
+            },
+        );
     }
 
     /// Seat a prepared reshape duty: install its derived genesis and start
@@ -596,11 +673,16 @@ impl ShardSupervisor {
         &mut self,
         completion: ReshapeCompletion<Arc<RocksDbShardStorage>>,
     ) {
-        let Some(event) = self.reshape_stores.settle(completion) else {
+        let Some(event) = self.reshape_stores.settle(completion, |shard, ticket| {
+            self.reshape.awaits(shard, ticket)
+        }) else {
+            // A completion no duty takes may still have freed a directory a
+            // held prep waits on.
+            self.resume_pending_reshape_prep();
             return;
         };
         let unavailable = match event {
-            ReshapeEvent::SeedUnavailable { child } => Some(child),
+            ReshapeEvent::SeedUnavailable { child, .. } => Some(child),
             _ => None,
         };
         self.reshape_step(vec![event]);
@@ -614,7 +696,7 @@ impl ShardSupervisor {
     /// until this host's topology carries one. A store the duty prepared is
     /// dropped first, releasing its directory to the join, which wipes what
     /// the duty left there. With no local member placed on the child yet, the
-    /// reshape tick's [`Self::reconcile_joins`] joins it once one is.
+    /// reshape tick's [`Self::reconcile_seats`] joins it once one is.
     fn hand_over_to_join(&mut self, child: ShardId) {
         if !self.reshape.relinquished(child) {
             return;
@@ -669,11 +751,34 @@ fn send_event(events: &mpsc::UnboundedSender<SupervisorEvent>, event: ReshapeEve
     let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Event(event)));
 }
 
+/// Wipe `dir` and open a fresh store for `shard` there, carrying the engine
+/// bootstrap, with the state it recovers.
+fn open_fresh_store(
+    dir: &Path,
+    shard: ShardId,
+    factory: &StorageFactory,
+    engine_bootstrap: &EngineBootstrap,
+) -> Result<(Arc<RocksDbShardStorage>, RecoveredState), String> {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir).map_err(|e| format!("stale reshape store wipe: {e}"))?;
+    }
+    let storage = factory(dir, shard)?;
+    // The directory was just wiped, so the store is fresh: it must carry the
+    // engine bootstrap on its substate side before the duty's child-span or
+    // merged-union import, or the seated shard would lack the global engine
+    // nodes (the transaction tracker, the consensus manager) every
+    // transaction reads.
+    engine_bootstrap.replicate_into(storage.as_ref());
+    let recovered = storage.load_recovered_state(shard);
+    Ok((storage, recovered))
+}
+
 /// Send a landed store open or seed back to the supervisor loop; a failed one
-/// logs and sends nothing, stranding the duty.
+/// logs, strands the duty, and frees the shard's directory for the next prep.
 fn send_opened(
     events: &mpsc::UnboundedSender<SupervisorEvent>,
     shard: ShardId,
+    ticket: Ticket,
     outcome: Result<(Arc<RocksDbShardStorage>, RecoveredState), String>,
 ) {
     match outcome {
@@ -683,10 +788,43 @@ fn send_opened(
                 shard,
                 storage,
                 recovered,
+                ticket,
             }));
         }
-        Err(error) => warn!(shard = ?shard, error, "Reshape store open failed; duty stranded"),
+        Err(error) => {
+            warn!(shard = ?shard, error, "Reshape store open failed; duty stranded");
+            send_failed(events, shard, ticket);
+        }
     }
+}
+
+/// Run the reshape store prep or store job `ticket` names off the loop. One
+/// that panics answers [`ReshapeCompletion::Failed`] once its unwinding has
+/// dropped everything it held, so its hold on `shard`'s directory ends.
+fn spawn_store_job(
+    tokio_handle: &TokioHandle,
+    events: &mpsc::UnboundedSender<SupervisorEvent>,
+    shard: ShardId,
+    ticket: Ticket,
+    job: impl FnOnce() + Send + 'static,
+) {
+    let job = tokio_handle.spawn_blocking(job);
+    let events = events.clone();
+    tokio_handle.spawn(async move {
+        if let Err(error) = job.await {
+            warn!(shard = ?shard, %error, "Reshape store job did not finish; duty stranded");
+            send_failed(&events, shard, ticket);
+        }
+    });
+}
+
+/// Send a failed reshape store prep or store job back to the supervisor
+/// loop, releasing its hold on `shard`'s directory.
+fn send_failed(events: &mpsc::UnboundedSender<SupervisorEvent>, shard: ShardId, ticket: Ticket) {
+    let _ = events.send(SupervisorEvent::Reshape(ReshapeCompletion::Failed {
+        shard,
+        ticket,
+    }));
 }
 
 /// Whether a reshape duty staffed by one of the host's `owned` validators owns
@@ -772,11 +910,18 @@ fn headers_answer(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    use hyperscale_engine::GenesisConfig;
     use hyperscale_hbor::Capped;
     use hyperscale_network::{RequestError, ResponseVerdict};
-    use hyperscale_node::reshape::orchestrator::{FetchedKind, ReshapeEvent};
+    use hyperscale_node::bootstrap::EngineBootstrap;
+    use hyperscale_node::reshape::{
+        FetchedKind, PreparedStores, ReshapeCompletion, ReshapeEvent, ReshapeRequest, Ticket,
+    };
     use hyperscale_storage::test_helpers::make_test_block;
+    use hyperscale_storage_rocksdb::RocksDbShardStorage;
     use hyperscale_types::network::request::{
         BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
     };
@@ -784,10 +929,17 @@ mod tests {
     use hyperscale_types::test_utils::{TestCommittee, signed_child_block};
     use hyperscale_types::{
         Block, BlockHeight, CertifiedBlockHeader, ElidedCertifiedBlock, Inventory, Round, ShardId,
-        ValidatorId, WeightedTimestamp,
+        ValidatorId, WeightedTimestamp, shard_prefix_path,
     };
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
 
-    use super::{ReshapeSeat, block_answer, headers_answer, host_reshape_owns};
+    use super::{
+        ReshapeSeat, StorageFactory, SupervisorEvent, block_answer, headers_answer,
+        host_reshape_owns, open_fresh_store, spawn_store_job,
+    };
 
     /// Two blocks of one parent chain above height 1, their QCs signed by
     /// `committee`.
@@ -968,5 +1120,225 @@ mod tests {
             child,
             |v| *v == HOST,
         ));
+    }
+
+    /// Two opens of one shard's directory, the earlier still off the loop
+    /// when the later is issued: the later waits until the earlier lands,
+    /// and the earlier's store, which no duty awaits by then, is closed
+    /// before the later wipes the directory. The store left prepared is
+    /// the later one, which the orchestrator awaits.
+    #[test]
+    fn a_second_open_of_a_shard_never_wipes_under_a_live_store() {
+        let dir = TempDir::new().expect("tempdir");
+        let shard = ShardId::leaf(1, 0);
+        let (factory, bootstrap) = (rocksdb_factory(), bare_bootstrap());
+        let open = || open_fresh_store(dir.path(), shard, &factory, &bootstrap).expect("open");
+        let (earlier, later) = (Ticket::new(3), Ticket::new(4));
+        let awaits = |awaited, ticket| awaited == shard && ticket == later;
+        let mut stores = PreparedStores::new();
+
+        let first = stores
+            .prep(ReshapeRequest::OpenStore {
+                shard,
+                ticket: earlier,
+            })
+            .expect("nothing else prepares the shard");
+        assert!(matches!(first, ReshapeRequest::OpenStore { .. }));
+        let (storage, recovered) = open();
+        let live = Arc::downgrade(&storage);
+        assert!(
+            stores
+                .prep(ReshapeRequest::OpenStore {
+                    shard,
+                    ticket: later,
+                })
+                .is_none(),
+            "the later open waits while the earlier holds the directory",
+        );
+        assert!(stores.ready_preps(awaits).is_empty());
+
+        let stale = stores.settle(
+            ReshapeCompletion::Opened {
+                shard,
+                storage,
+                recovered,
+                ticket: earlier,
+            },
+            awaits,
+        );
+        assert!(stale.is_none(), "no duty awaits the earlier open");
+        assert!(live.upgrade().is_none(), "the earlier store is closed");
+
+        let ready = stores.ready_preps(awaits);
+        let [request] = ready.as_slice() else {
+            panic!("the later open is released once the earlier lands: {ready:?}");
+        };
+        assert!(stores.prep(request.clone()).is_some());
+        let (storage, recovered) = open();
+        let opened = Arc::downgrade(&storage);
+        let event = stores.settle(
+            ReshapeCompletion::Opened {
+                shard,
+                storage,
+                recovered,
+                ticket: later,
+            },
+            awaits,
+        );
+        assert!(matches!(event, Some(ReshapeEvent::Opened { ticket, .. }) if ticket == later));
+        let kept = stores.storage(shard).expect("the later store is prepared");
+        assert!(Arc::ptr_eq(kept, &opened.upgrade().expect("held")));
+    }
+
+    /// A store's job holds its own handle past the store leaving the map.
+    /// A reopen of the shard issued meanwhile waits until the job ends,
+    /// whose handle closes before its completion settles, so the reopen
+    /// never wipes the directory under the job.
+    #[test]
+    fn a_reopen_never_wipes_under_a_running_job() {
+        let dir = TempDir::new().expect("tempdir");
+        let shard = ShardId::leaf(1, 0);
+        let (factory, bootstrap) = (rocksdb_factory(), bare_bootstrap());
+        let open = || open_fresh_store(dir.path(), shard, &factory, &bootstrap).expect("open");
+        let (first, stage, reopen) = (Ticket::new(3), Ticket::new(4), Ticket::new(5));
+        let awaits = |awaited, ticket| awaited == shard && (ticket == first || ticket == reopen);
+        let mut stores = PreparedStores::new();
+
+        assert!(
+            stores
+                .prep(ReshapeRequest::OpenStore {
+                    shard,
+                    ticket: first,
+                })
+                .is_some()
+        );
+        let (storage, recovered) = open();
+        let opened = ReshapeCompletion::Opened {
+            shard,
+            storage,
+            recovered,
+            ticket: first,
+        };
+        assert!(stores.settle(opened, awaits).is_some());
+
+        let job = Arc::clone(stores.lease(shard, stage).expect("the store is prepared"));
+        assert_eq!(
+            stores.release(|_| false),
+            vec![shard],
+            "the duty is dropped"
+        );
+        let live = Arc::downgrade(&job);
+        assert!(live.upgrade().is_some(), "the job still holds the store");
+        assert!(
+            stores
+                .prep(ReshapeRequest::OpenStore {
+                    shard,
+                    ticket: reopen,
+                })
+                .is_none(),
+            "the reopen waits while the job holds the directory",
+        );
+        assert!(stores.ready_preps(awaits).is_empty());
+
+        drop(job);
+        let staged = ReshapeEvent::Staged {
+            shard,
+            ticket: stage,
+        };
+        let _ = stores.settle(ReshapeCompletion::Event(staged), awaits);
+        let ready = stores.ready_preps(awaits);
+        let [request] = ready.as_slice() else {
+            panic!("the reopen is released once the job ends: {ready:?}");
+        };
+        assert!(stores.prep(request.clone()).is_some());
+        assert!(live.upgrade().is_none(), "no handle outlives the job");
+        let (storage, recovered) = open();
+        let reopened = ReshapeCompletion::Opened {
+            shard,
+            storage,
+            recovered,
+            ticket: reopen,
+        };
+        assert!(stores.settle(reopened, awaits).is_some());
+    }
+
+    /// A store job that panics still answers, once its unwinding has closed
+    /// the handle it held, so its hold on the shard's directory ends and a
+    /// prep waiting behind it is released.
+    #[test]
+    fn a_panicking_store_job_still_ends_its_hold() {
+        let runtime = Runtime::new().expect("runtime");
+        let (events, mut answers) = mpsc::unbounded_channel();
+        let dir = TempDir::new().expect("tempdir");
+        let shard = ShardId::leaf(1, 0);
+        let (open, apply, reopen) = (Ticket::new(3), Ticket::new(4), Ticket::new(5));
+        let awaits = |awaited, ticket| awaited == shard && (ticket == open || ticket == reopen);
+        let mut stores = PreparedStores::new();
+        assert!(
+            stores
+                .prep(ReshapeRequest::OpenStore {
+                    shard,
+                    ticket: open
+                })
+                .is_some()
+        );
+        let (storage, recovered) =
+            open_fresh_store(dir.path(), shard, &rocksdb_factory(), &bare_bootstrap())
+                .expect("open");
+        let opened = ReshapeCompletion::Opened {
+            shard,
+            storage,
+            recovered,
+            ticket: open,
+        };
+        assert!(stores.settle(opened, awaits).is_some());
+
+        let job = Arc::clone(stores.lease(shard, apply).expect("the store is prepared"));
+        let live = Arc::downgrade(&job);
+        spawn_store_job(runtime.handle(), &events, shard, apply, move || {
+            let _held = job;
+            panic!("a store job panics");
+        });
+        assert_eq!(stores.release(|_| false), vec![shard]);
+        assert!(
+            stores
+                .prep(ReshapeRequest::OpenStore {
+                    shard,
+                    ticket: reopen
+                })
+                .is_none()
+        );
+
+        let answer = runtime
+            .block_on(async { timeout(Duration::from_secs(10), answers.recv()).await })
+            .expect("the panicking job answers")
+            .expect("the channel is open");
+        let SupervisorEvent::Reshape(failed) = answer else {
+            panic!("a store job answers with a reshape completion");
+        };
+        assert!(
+            matches!(failed, ReshapeCompletion::Failed { shard: s, ticket } if s == shard && ticket == apply)
+        );
+        assert!(live.upgrade().is_none(), "the unwinding closed the handle");
+        assert!(stores.settle(failed, awaits).is_none());
+        assert_eq!(
+            stores.ready_preps(awaits).len(),
+            1,
+            "the reopen is released"
+        );
+    }
+
+    fn rocksdb_factory() -> StorageFactory {
+        Arc::new(|dir, shard| {
+            RocksDbShardStorage::open(dir, shard_prefix_path(shard))
+                .map(Arc::new)
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn bare_bootstrap() -> EngineBootstrap {
+        EngineBootstrap {
+            config: GenesisConfig::default(),
+        }
     }
 }

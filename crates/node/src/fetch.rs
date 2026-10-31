@@ -8,12 +8,14 @@
 //!   request. The concrete impls live with their subsystem state
 //!   (`shard/{consensus,cross_shard,mempool}`, `beacon`); the `ProtocolEvent`
 //!   → in-flight-drain mapping lives outside the binding, in
-//!   `io_loop::drive_fetch_admission`.
+//!   `ShardLoop::drive_fetch_admission`.
 //! - [`ScopedAnswer`] is the contract for a binding whose request names one
 //!   scope and whose answer is checked against it; [`dispatch_scoped`] is
 //!   the one response boundary those bindings share.
-//! - [`partition_solicited`] is the shared response-boundary filter every
-//!   bag-of-ids binding's admit handler runs.
+//! - [`SolicitedAnswer`] is the contract for a binding whose request is a
+//!   bag of ids and whose answer a bag of items; [`dispatch_solicited`] is
+//!   the response boundary those share, filtering through
+//!   [`partition_solicited`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
@@ -30,7 +32,8 @@ use hyperscale_types::network::Request;
 use hyperscale_types::{MessageClass, ShardId, Stopwatch, ValidatorId};
 use tracing::{debug, trace, warn};
 
-use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
+use crate::event::{HostEvent, ShardScopedInput};
+use crate::shard::{ShardIo, push_shard_input};
 
 /// Tunables for a [`Fetch`] instance.
 #[derive(Debug, Clone)]
@@ -39,13 +42,14 @@ pub struct FetchConfig {
     pub(crate) max_in_flight: usize,
     /// Maximum ids in a single chunked request.
     pub(crate) max_ids_per_request: usize,
-    /// Maximum chunks emitted from a single `Tick`.
-    pub(crate) parallel_chunks_per_tick: usize,
+    /// Maximum chunks one dispatch emits — one input's worth of sends,
+    /// whichever input freed the room.
+    pub(crate) chunks_per_dispatch: usize,
 }
 
 impl FetchConfig {
     /// A fetch schedule with its limits: ids in flight across every
-    /// entry, ids per request, and requests a tick may emit.
+    /// entry, ids per request, and requests one dispatch may emit.
     ///
     /// # Panics
     ///
@@ -54,16 +58,16 @@ impl FetchConfig {
     pub fn new(
         max_in_flight: usize,
         max_ids_per_request: usize,
-        parallel_chunks_per_tick: usize,
+        chunks_per_dispatch: usize,
     ) -> Self {
         assert!(
-            max_in_flight > 0 && max_ids_per_request > 0 && parallel_chunks_per_tick > 0,
+            max_in_flight > 0 && max_ids_per_request > 0 && chunks_per_dispatch > 0,
             "fetch limits must be positive",
         );
         Self {
             max_in_flight,
             max_ids_per_request,
-            parallel_chunks_per_tick,
+            chunks_per_dispatch,
         }
     }
 }
@@ -73,7 +77,7 @@ impl Default for FetchConfig {
         Self {
             max_in_flight: 400,
             max_ids_per_request: 50,
-            parallel_chunks_per_tick: 8,
+            chunks_per_dispatch: 8,
         }
     }
 }
@@ -107,7 +111,7 @@ pub enum FetchInput<Id> {
         ids: Vec<Id>,
     },
     /// Payload for `ids` landed via fetch response, gossip, or local
-    /// production. Fed by `io_loop::drive_fetch_admission` on canonical
+    /// production. Fed by `ShardLoop::drive_fetch_admission` on canonical
     /// admission `ProtocolEvent`s. Records `record_fetch_completed` per
     /// id removed.
     Admitted {
@@ -115,7 +119,7 @@ pub enum FetchInput<Id> {
         ids: Vec<Id>,
     },
     /// Consumer coordinator dropped its expectation for `ids`. Fed by
-    /// `io_loop`'s `Action::AbandonFetch` dispatcher. Records
+    /// the loop's `Action::AbandonFetch` dispatcher. Records
     /// `record_fetch_abandoned` per id removed — distinct from `Admitted`
     /// so the two populations are observable separately.
     Abandoned {
@@ -128,7 +132,8 @@ pub enum FetchInput<Id> {
         /// Ids in the chunk.
         ids: Vec<Id>,
     },
-    /// Drive pending fetches: emit chunks up to per-tick and global caps.
+    /// Drive pending fetches: emit chunks up to the per-dispatch and
+    /// global caps.
     /// Every id's inline retry is restored first.
     Tick,
 }
@@ -198,8 +203,7 @@ struct Entry {
     /// `None` while the entry is awaiting dispatch. Wall-clock-derived
     /// because this is observability-only: an alert on
     /// `oldest_in_flight_age_ms` fires when admission stops happening,
-    /// catching novel pin scenarios the existing per-drop notifications
-    /// haven't been wired for yet.
+    /// catching an id pinned in flight by a path that releases nothing.
     dispatched_at: Option<Stopwatch>,
     /// Who the in-flight attempt asked, or who the next one asks. A
     /// failure flips it, so the local seats and the committee's other
@@ -327,8 +331,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// Age in milliseconds of the longest-running in-flight entry, or
     /// `0` if nothing is in flight. Surfaced through `ShardIo::fetch_metrics`
     /// so an alert on `> N` catches admission paths that silently dropped
-    /// without notifying the FSM — the symptom that motivated the
-    /// provision-fetch robustness work in the first place.
+    /// without notifying the FSM.
     #[must_use]
     pub(crate) fn oldest_in_flight_age_ms(&self) -> u64 {
         let oldest = self
@@ -512,7 +515,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         'outer: for route in group_order {
             let ids = groups.remove(&route).expect("route just collected");
             for chunk in ids.chunks(self.config.max_ids_per_request) {
-                if chunks_emitted >= self.config.parallel_chunks_per_tick {
+                if chunks_emitted >= self.config.chunks_per_dispatch {
                     break 'outer;
                 }
                 let dispatched_at = Stopwatch::start();
@@ -540,12 +543,18 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
 ///
 /// Each fetch payload (transactions, provisions, headers, …) gets one impl —
 /// living with its subsystem state in `shard/{consensus,cross_shard,mempool}`
-/// or `beacon` — that owns the `Id` type and the [`FetchIds`] arm it rides
-/// in. Which `Fetch<Id>` instance backs it and the wire shape of its
-/// requests are [`FetchedBy`], per loop that drives it.
+/// or `beacon` — that owns the `Id` type and the arm of its loop's id
+/// family it rides in: [`FetchIds`] for a shard loop's,
+/// [`BeaconFetchIds`](hyperscale_core::BeaconFetchIds) for the beacon
+/// loop's. Which `Fetch<Id>` instance
+/// backs it and the wire shape of its requests are [`FetchedBy`], per
+/// loop that drives it.
 pub trait FetchBinding: 'static {
     /// Id used to address payloads of this kind.
     type Id: Clone + Ord + Hash + std::fmt::Debug + Send + Sync + 'static;
+
+    /// The id family of the loop that drives this binding.
+    type Ids: Send + 'static;
 
     /// Stable identifier for this binding — used in dispatch tracing.
     const NAME: &'static str;
@@ -555,10 +564,10 @@ pub trait FetchBinding: 'static {
     /// to `true`; bag-of-hashes fetches leave it `false`.
     const PER_ID: bool = false;
 
-    /// The [`FetchIds`] arm that carries this binding's ids — how a
+    /// The [`Self::Ids`] arm that carries this binding's ids — how a
     /// response boundary names the ids it failed or fulfilled, and the
     /// inverse of the one dispatcher that routes a batch back here.
-    fn ids(ids: Vec<Self::Id>) -> FetchIds;
+    fn ids(ids: Vec<Self::Id>) -> Self::Ids;
 }
 
 /// A loop that owns fetch state: the shard loop's [`ShardIo`] or the
@@ -569,7 +578,7 @@ pub trait FetchOwner {
 }
 
 /// A binding as the fetch-state owner `O` drives it.
-pub trait FetchedBy<O: FetchOwner>: FetchBinding {
+pub trait FetchedBy<O: FetchOwner>: FetchBinding<Ids = <O::Reply as FetchReply>::Ids> {
     /// Locate this binding's `Fetch<Id>` instance inside `O`.
     fn fetch_mut(owner: &mut O) -> &mut Fetch<Self::Id>;
 
@@ -584,17 +593,21 @@ pub trait FetchedBy<O: FetchOwner>: FetchBinding {
 /// failure releases what it asked for and an answer reaches what wanted
 /// it.
 pub trait FetchReply: Clone + Send + 'static {
+    /// The id family of the loop this reply reaches.
+    type Ids;
+
     /// Release `ids` after a request that failed with `error`: on the
     /// tick when it never reached a peer, at once otherwise.
-    fn failed(&self, ids: FetchIds, error: &RequestError);
+    fn failed(&self, ids: Self::Ids, error: &RequestError);
 
-    /// Release `ids` for retry after an answer that was refused.
-    fn refused(&self, ids: FetchIds);
+    /// Release `ids` for retry after an answer that did not settle them:
+    /// one refused, or one that left them out.
+    fn refused(&self, ids: Self::Ids);
 
     /// Retire `ids` and hand over the event their answer carries. The
     /// ids are released first, so the freed capacity is available if
     /// handling the event re-drives the fetch.
-    fn answered(&self, ids: FetchIds, event: ProtocolEvent);
+    fn answered(&self, ids: Self::Ids, event: ProtocolEvent);
 }
 
 /// A shard loop's reply handle: its event channel, with the hosted shard
@@ -608,8 +621,15 @@ pub struct ShardReply {
 }
 
 impl FetchReply for ShardReply {
+    type Ids = FetchIds;
+
     fn failed(&self, ids: FetchIds, error: &RequestError) {
-        push_shard_input(&self.sender, self.shard, failed_chunk(error, ids));
+        let release = if defers_to_the_tick(error) {
+            ShardScopedInput::FetchUnroutable(ids)
+        } else {
+            ShardScopedInput::FetchFailed(ids)
+        };
+        push_shard_input(&self.sender, self.shard, release);
     }
 
     fn refused(&self, ids: FetchIds) {
@@ -617,12 +637,22 @@ impl FetchReply for ShardReply {
     }
 
     fn answered(&self, ids: FetchIds, event: ProtocolEvent) {
-        push_shard_input(
-            &self.sender,
-            self.shard,
-            ShardScopedInput::FetchFulfilled(ids),
-        );
-        push_protocol_event(&self.sender, self.shard, event);
+        self.hand_over(Some(ids), vec![ShardScopedInput::Protocol(Box::new(event))]);
+    }
+}
+
+impl HandsOver<ShardScopedInput> for ShardReply {
+    fn hand_over(&self, fulfilled: Option<FetchIds>, inputs: Vec<ShardScopedInput>) {
+        if let Some(ids) = fulfilled {
+            push_shard_input(
+                &self.sender,
+                self.shard,
+                ShardScopedInput::FetchFulfilled(ids),
+            );
+        }
+        for input in inputs {
+            push_shard_input(&self.sender, self.shard, input);
+        }
     }
 }
 
@@ -722,21 +752,11 @@ pub const fn defers_to_the_tick(error: &RequestError) -> bool {
     )
 }
 
-/// The release for a chunk of `ids` whose request failed with `error`:
-/// on the tick when it never reached a peer, at once otherwise.
-pub const fn failed_chunk(error: &RequestError, ids: FetchIds) -> ShardScopedInput {
-    if defers_to_the_tick(error) {
-        ShardScopedInput::FetchUnroutable(ids)
-    } else {
-        ShardScopedInput::FetchFailed(ids)
-    }
-}
-
 /// Issue one request per scope in `ids` and route each answer through
 /// [`ScopedAnswer::answer`] to `reply`. A transport error releases the
 /// ids without rejecting the response — the network already recorded
 /// it — while an answer that is not an answer counts as a refusal.
-pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply>(
+pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply<Ids = B::Ids>>(
     ids: Vec<B::Id>,
     route: Route,
     network: &N,
@@ -756,13 +776,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply>(
             Box::new(move |result| {
                 let response = match result {
                     Ok(response) => response,
-                    Err(error) => {
-                        if matches!(error, RequestError::PeerError(_)) {
-                            record_fetch_response_refused(B::NAME, "unusable_answer");
-                        }
-                        reply.failed(B::ids(requested), &error);
-                        return ResponseVerdict::Accept;
-                    }
+                    Err(error) => return transport_failed::<B, R>(requested, &error, &reply),
                 };
                 match B::answer(scope, keys, response) {
                     Ok(event) => {
@@ -785,6 +799,141 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply>(
                 }
             }),
         );
+    }
+}
+
+/// Release `requested` after a request that failed with `error`. The
+/// network has already recorded the failure against its peer, so the
+/// response is not rejected again here.
+pub fn transport_failed<B: FetchBinding, R: FetchReply<Ids = B::Ids>>(
+    requested: Vec<B::Id>,
+    error: &RequestError,
+    reply: &R,
+) -> ResponseVerdict {
+    if matches!(error, RequestError::PeerError(_)) {
+        record_fetch_response_refused(B::NAME, "unusable_answer");
+    }
+    reply.failed(B::ids(requested), error);
+    ResponseVerdict::Accept
+}
+
+// ─── Solicited answers ─────────────────────────────────────────────────
+
+/// When a kept answer lets go of the ids it answers for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settles {
+    /// The response boundary is the whole check, so a kept item retires
+    /// its ids as it lands.
+    OnAnswer,
+    /// The asker finishes the check after the answer lands, against a
+    /// header or a committee it may not hold yet, so the ids stay in
+    /// flight until its verdict: an admission, or an abandon or failure
+    /// naming them. Retiring them at the answer would let the asker's own
+    /// re-ask fetch the answer again while the first copy is still being
+    /// checked, and leave nothing to ask again when the check fails.
+    OnVerdict,
+}
+
+/// A binding whose request names a bag of ids and whose answer is a bag
+/// of items, each answering for the ids it names. [`dispatch_solicited`]
+/// is the one response boundary these share, with one rule: a kept item
+/// reaches the asker, a requested id nothing answered releases for retry
+/// at no cost to the peer, since a peer trims its answer to a budget or
+/// does not hold the item, and only an item answering for nothing asked
+/// rejects the response.
+pub trait SolicitedAnswer: FetchBinding {
+    /// The wire request one chunk's ids ride in.
+    type Request: Request + Clone + 'static;
+    /// One item of an answer.
+    type Item: Send + 'static;
+    /// What kept items reach the asking loop as.
+    type Input: Send + 'static;
+    /// When a kept item's ids release.
+    const SETTLES: Settles;
+
+    /// One request for `ids`.
+    fn request(ids: &[Self::Id]) -> Self::Request;
+
+    /// The items an answer carries. One that carries nothing the asker
+    /// can use is left out, which reads as the peer not holding it.
+    fn items(response: <Self::Request as Request>::Response) -> Vec<Self::Item>;
+
+    /// The ids `item` answers for. An item that answers for none asked
+    /// is unsolicited.
+    fn answers_for(item: &Self::Item) -> impl IntoIterator<Item = Self::Id> + use<Self>;
+
+    /// What the kept items reach the asker as, in order.
+    fn deliver(kept: Vec<Self::Item>) -> Vec<Self::Input>;
+}
+
+/// A reply that hands a binding's own loop input to the loop that asked:
+/// what a [`SolicitedAnswer`]'s kept items reach it as.
+pub trait HandsOver<Input>: FetchReply {
+    /// Retire `fulfilled`, when given, then hand over `inputs` in order.
+    fn hand_over(&self, fulfilled: Option<Self::Ids>, inputs: Vec<Input>);
+}
+
+/// Issue one request for `ids` and route its answer to `reply` under the
+/// [`SolicitedAnswer`] rule.
+pub fn dispatch_solicited<B, N, R>(ids: Vec<B::Id>, route: Route, network: &N, reply: &R)
+where
+    B: SolicitedAnswer,
+    N: Network,
+    R: HandsOver<B::Input> + FetchReply<Ids = B::Ids>,
+{
+    let request = B::request(&ids);
+    let reply = reply.clone();
+    route.request(
+        network,
+        request,
+        Box::new(move |result| settle_solicited::<B, R>(ids, result, &reply)),
+    );
+}
+
+/// The response boundary of [`dispatch_solicited`]: release and hand over
+/// what `result` answers for `requested`, and say what it says of the peer.
+pub fn settle_solicited<B, R>(
+    requested: Vec<B::Id>,
+    result: Result<<B::Request as Request>::Response, RequestError>,
+    reply: &R,
+) -> ResponseVerdict
+where
+    B: SolicitedAnswer,
+    R: HandsOver<B::Input> + FetchReply<Ids = B::Ids>,
+{
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => return transport_failed::<B, R>(requested, &error, reply),
+    };
+    let split = partition_solicited(B::items(response), &requested, B::answers_for);
+    if !split.kept.is_empty() {
+        let fulfilled = match B::SETTLES {
+            Settles::OnAnswer => {
+                let missing: HashSet<&B::Id> = split.missing.iter().collect();
+                let kept: Vec<B::Id> = requested
+                    .iter()
+                    .filter(|id| !missing.contains(id))
+                    .cloned()
+                    .collect();
+                Some(B::ids(kept))
+            }
+            Settles::OnVerdict => None,
+        };
+        reply.hand_over(fulfilled, B::deliver(split.kept));
+    }
+    if !split.missing.is_empty() {
+        reply.refused(B::ids(split.missing));
+    }
+    if split.unsolicited > 0 {
+        warn!(
+            binding = B::NAME,
+            unsolicited = split.unsolicited,
+            "Dropping fetched items nobody asked for"
+        );
+        record_fetch_response_refused(B::NAME, "unsolicited");
+        ResponseVerdict::Reject
+    } else {
+        ResponseVerdict::Accept
     }
 }
 
@@ -834,7 +983,7 @@ impl Release {
 pub enum Intent {
     /// Add the ids to the pending set, to be asked of `shard`'s
     /// committee. No `Send` goes out here — chunks fan out under the
-    /// per-tick cap.
+    /// per-dispatch cap.
     Ask {
         /// Shard whose committee answers.
         shard: ShardId,
@@ -1019,7 +1168,7 @@ mod tests {
         FetchConfig {
             max_in_flight: 100,
             max_ids_per_request: 2,
-            parallel_chunks_per_tick: 4,
+            chunks_per_dispatch: 4,
         }
     }
 
@@ -1395,8 +1544,11 @@ mod tests {
         assert!(!p.has_pending());
     }
 
+    /// A re-ask restates the route of an id already in flight without
+    /// sending it again: the attempt out is unaffected, and the id's next
+    /// attempt goes where the latest ask said.
     #[test]
-    fn duplicate_request_keeps_existing_preferred() {
+    fn a_re_ask_restates_the_route_of_an_id_in_flight() {
         let mut p = Fetch::<TxHash>::new("test", config());
         let first = p.handle(FetchInput::Request {
             ids: vec![tx(1)],
@@ -1404,11 +1556,7 @@ mod tests {
             preferred: Some(vid(1)),
             class: None,
         });
-        // First request marks tx(1) in_flight under vid(1) and emits its Send.
         assert_eq!(first.len(), 1);
-        // Second Request adds tx(2) under vid(2); tx(1) keeps its original
-        // `preferred` because it's already in_flight and the entry is
-        // preserved by `or_insert_with`.
         let second = p.handle(FetchInput::Request {
             ids: vec![tx(1), tx(2)],
             shard: SHARD,
@@ -1418,7 +1566,17 @@ mod tests {
         assert_eq!(second.len(), 1);
         let FetchOutput::Send { route, ids } = &second[0];
         assert_eq!(route.preferred, Some(vid(2)));
-        assert_eq!(ids, &vec![tx(2)]);
+        assert_eq!(ids, &vec![tx(2)], "the id in flight is not sent again");
+
+        let retry = p.handle(FetchInput::Failed { ids: vec![tx(1)] });
+        assert_eq!(retry.len(), 1);
+        let FetchOutput::Send { route, ids } = &retry[0];
+        assert_eq!(ids, &vec![tx(1)]);
+        assert_eq!(
+            route.preferred,
+            Some(vid(2)),
+            "the retry goes where the latest ask said"
+        );
     }
 
     #[test]
@@ -1428,7 +1586,7 @@ mod tests {
             FetchConfig {
                 max_in_flight: 100,
                 max_ids_per_request: 50,
-                parallel_chunks_per_tick: 8,
+                chunks_per_dispatch: 8,
             },
         );
         let out = p.handle(FetchInput::Request {
@@ -1452,7 +1610,7 @@ mod tests {
             FetchConfig {
                 max_in_flight: 1,
                 max_ids_per_request: 10,
-                parallel_chunks_per_tick: 4,
+                chunks_per_dispatch: 4,
             },
         );
         let out = p.handle(FetchInput::Request {
@@ -1479,7 +1637,7 @@ mod tests {
             FetchConfig {
                 max_in_flight: 3,
                 max_ids_per_request: 10,
-                parallel_chunks_per_tick: 4,
+                chunks_per_dispatch: 4,
             },
         );
         p.handle(FetchInput::Request {
@@ -1503,11 +1661,11 @@ mod partition_tests {
 
     use super::*;
 
-    fn tx_arc(seed: u8) -> Arc<Transaction> {
-        Arc::new(test_transaction(seed))
+    fn tx_arc(seed: u8) -> Transaction {
+        test_transaction(seed)
     }
 
-    fn tx_hash(tx: &Arc<Transaction>) -> [TxHash; 1] {
+    fn tx_hash(tx: &Transaction) -> [TxHash; 1] {
         [tx.hash()]
     }
 
@@ -1525,11 +1683,8 @@ mod partition_tests {
         let extra = tx_arc(99);
         let other_requested = tx_arc(2).hash();
 
-        let split = partition_solicited(
-            vec![Arc::clone(&asked), Arc::clone(&extra)],
-            &[asked_hash, other_requested],
-            tx_hash,
-        );
+        let split =
+            partition_solicited(vec![asked, extra], &[asked_hash, other_requested], tx_hash);
         assert_eq!(split.kept.len(), 1);
         assert_eq!(split.kept[0].hash(), asked_hash);
         assert_eq!(split.unsolicited, 1);
@@ -1540,11 +1695,7 @@ mod partition_tests {
     fn partition_full_delivery_yields_no_missing_no_unsolicited() {
         let a = tx_arc(1);
         let b = tx_arc(2);
-        let split = partition_solicited(
-            vec![Arc::clone(&a), Arc::clone(&b)],
-            &[a.hash(), b.hash()],
-            tx_hash,
-        );
+        let split = partition_solicited(vec![a.clone(), b.clone()], &[a.hash(), b.hash()], tx_hash);
         assert_eq!(split.kept.len(), 2);
         assert!(split.missing.is_empty());
         assert_eq!(split.unsolicited, 0);
@@ -1646,11 +1797,7 @@ mod partition_tests {
             )]),
         ));
         let asked_hash = asked.hash();
-        let split = partition_solicited(
-            vec![Arc::clone(&asked), Arc::clone(&extra)],
-            &[asked_hash],
-            |p| [p.hash()],
-        );
+        let split = partition_solicited(vec![asked, extra], &[asked_hash], |p| [p.hash()]);
         assert_eq!(split.kept.len(), 1);
         assert_eq!(split.kept[0].hash(), asked_hash);
         assert_eq!(split.unsolicited, 1);

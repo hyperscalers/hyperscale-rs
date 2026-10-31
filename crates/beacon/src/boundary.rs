@@ -679,11 +679,11 @@ mod tests {
     }
 
     /// `header` as a tracker holds it, under a stand-in certificate.
-    fn held(header: &BlockHeader) -> Arc<Verified<CertifiedBlockHeader>> {
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+    fn held(header: &BlockHeader) -> Verified<CertifiedBlockHeader> {
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
             header.clone(),
             unsigned_qc(header, 0),
-        )))
+        ))
     }
 
     /// A tracker that followed `headers` in order.
@@ -796,9 +796,9 @@ mod tests {
         let qc = signed_qc(&committee_a, &boundary, ED + 2);
 
         let mut shard_source = ShardSourceTracker::new();
-        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(parent, boundary.parent_qc().clone()),
-        )));
+        ));
 
         assert!(
             boundary_qc_authentic(
@@ -851,18 +851,18 @@ mod tests {
         let parent_slot = (SHARD, BlockHeight::new(9));
 
         let mut shard_source = ShardSourceTracker::new();
-        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(boundary.clone(), qc.clone()),
-        )));
+        ));
         let proposal = proposing(&qc);
         assert!(
             awaited_boundaries(&proposal, &shard_source).contains(&parent_slot),
             "the missing parent is asked for",
         );
 
-        shard_source.admit_proven_boundary(Arc::new(Verified::new_unchecked_for_test(
+        shard_source.admit_proven_boundary(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(parent, boundary.parent_qc().clone()),
-        )));
+        ));
         assert!(!awaited_boundaries(&proposal, &shard_source).contains(&parent_slot));
         assert!(
             boundary_qc_authentic(
@@ -1079,12 +1079,12 @@ mod tests {
             WeightedTimestamp::from_millis(ED - 50),
         );
         let mut shard_source = ShardSourceTracker::new();
-        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(block.clone(), committed_qc.clone()),
-        )));
-        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+        ));
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(child, child_qc),
-        )));
+        ));
         shard_source.observe_crossing(SHARD, EpochWindows::new(0, ED));
         assert!(shard_source.commit_established(SHARD, &block));
         assert!(

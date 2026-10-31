@@ -11,7 +11,8 @@ mod common;
 use std::sync::Arc;
 
 use common::{ByzantineBehaviour, CoordinatorSim, Crossing};
-use hyperscale_core::Action;
+use hyperscale_beacon::coordinator::CoordinatorAction;
+use hyperscale_core::{BeaconAction, FoldAction, ParticipantAction};
 use hyperscale_hbor::Capped;
 use hyperscale_types::test_utils::test_pool;
 use hyperscale_types::{
@@ -314,7 +315,7 @@ fn adoption_path_advances_non_participating_replica() {
     let mut sim_a = CoordinatorSim::new(4, seed);
     sim_a.kick_off();
     sim_a.run_until_committed(1, MAX_STEPS);
-    let peer_block = Arc::clone(&sim_a.commits[0][0].block);
+    let peer_block = sim_a.commits[0][0].block.clone();
     let expected_state = sim_a.commits[0][0].state.clone();
 
     // Sim B: byte-identical setup so the genesis state and committee
@@ -325,15 +326,20 @@ fn adoption_path_advances_non_participating_replica() {
     assert!(sim_b.commits[0].is_empty());
     let actions = sim_b.deliver_block_to(0, &peer_block);
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+        actions.iter().any(|a| matches!(
+            a,
+            CoordinatorAction::Fold(FoldAction::CommitBeaconBlock { .. })
+        )),
         "expected CommitBeaconBlock in {actions:?}",
     );
     assert!(
         !actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastBeaconBlock { .. })),
+            .filter_map(CoordinatorAction::participant)
+            .any(|a| matches!(
+                a,
+                BeaconAction::Participant(ParticipantAction::BroadcastBeaconBlock { .. })
+            )),
         "adoption path must not re-broadcast: {actions:?}",
     );
     assert_eq!(sim_b.commits[0].len(), 1);
@@ -800,7 +806,7 @@ fn consecutive_skips_advance_chain() {
 /// `PcVector` carries a non-`ZERO` element at validator 0's position
 /// because the ⌈2M/3⌉+1 quorum's input vectors agree. Replica 1's
 /// commit-assembly decode finds the proposal missing, the coordinator
-/// emits `Action::FetchBeaconProposal`, the sim routes the fetch to
+/// emits a `BeaconAction::Fetch` for it, the sim routes the fetch to
 /// a peer who has the proposal pooled, and replica 1 admits it +
 /// finishes assembly + commits the same block hash as everyone else.
 #[test]
@@ -1267,9 +1273,10 @@ fn partition_stalls_committee_side_then_skip_settles() {
     sim.clear_block_partition();
     let actions = sim.deliver_block_to(0, &skip.block);
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+        actions.iter().any(|a| matches!(
+            a,
+            CoordinatorAction::Fold(FoldAction::CommitBeaconBlock { .. })
+        )),
         "the healed replica must adopt the skip block; got {actions:?}",
     );
     assert_eq!(
@@ -1454,13 +1461,13 @@ fn a_candidate_ahead_of_the_tip_is_prevoted_once_its_parent_is_adopted() {
         sim.commits[late].is_empty(),
         "the late member adopted a block"
     );
-    let parent = Arc::clone(&sim.commits[0][0].block);
+    let parent = sim.commits[0][0].block.clone();
     let candidate = sim
         .broadcast_candidate(Epoch::new(2))
         .expect("the connected side broadcast its epoch 2 candidate");
 
-    let early = sim.coordinators[late]
-        .on_beacon_candidate_received(Arc::new(Verifiable::from((*candidate).clone())));
+    let early =
+        sim.coordinators[late].on_beacon_candidate_received(Verifiable::from((*candidate).clone()));
     assert!(
         early.is_empty(),
         "a candidate ahead of the tip dispatched work: {early:?}"
@@ -1468,15 +1475,18 @@ fn a_candidate_ahead_of_the_tip_is_prevoted_once_its_parent_is_adopted() {
 
     let actions = sim.deliver_block_to(late, &parent);
     assert!(
-        actions.iter().any(|action| matches!(
-            action,
-            Action::SignAndBroadcastRatifyVote {
-                epoch,
-                phase: RatifyPhase::Prevote,
-                block_hash,
-                ..
-            } if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
-        )),
+        actions
+            .iter()
+            .filter_map(CoordinatorAction::participant)
+            .any(|action| matches!(
+                action,
+                BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote {
+                    epoch,
+                    phase: RatifyPhase::Prevote,
+                    block_hash,
+                    ..
+                }) if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
+            )),
         "the late member never prevoted the candidate it held: {actions:?}",
     );
 }
@@ -1510,7 +1520,7 @@ fn candidates_further_ahead_give_way_to_a_nearer_one() {
         sim.commits[late].is_empty(),
         "the late member adopted a block"
     );
-    let parent = Arc::clone(&sim.commits[0][0].block);
+    let parent = sim.commits[0][0].block.clone();
     let candidate = sim
         .broadcast_candidate(Epoch::new(2))
         .expect("the connected side broadcast its epoch 2 candidate");
@@ -1521,23 +1531,25 @@ fn candidates_further_ahead_give_way_to_a_nearer_one() {
             BeaconBlockHash::ZERO,
             ValidatorId::new(proposer),
         );
-        let actions = sim.coordinators[late].on_beacon_candidate_received(Arc::new(forged.into()));
+        let actions = sim.coordinators[late].on_beacon_candidate_received(forged.into());
         assert!(actions.is_empty(), "a forged candidate dispatched work");
     }
-    sim.coordinators[late]
-        .on_beacon_candidate_received(Arc::new(Verifiable::from((*candidate).clone())));
+    sim.coordinators[late].on_beacon_candidate_received(Verifiable::from((*candidate).clone()));
 
     let actions = sim.deliver_block_to(late, &parent);
     assert!(
-        actions.iter().any(|action| matches!(
-            action,
-            Action::SignAndBroadcastRatifyVote {
-                epoch,
-                phase: RatifyPhase::Prevote,
-                block_hash,
-                ..
-            } if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
-        )),
+        actions
+            .iter()
+            .filter_map(CoordinatorAction::participant)
+            .any(|action| matches!(
+                action,
+                BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote {
+                    epoch,
+                    phase: RatifyPhase::Prevote,
+                    block_hash,
+                    ..
+                }) if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
+            )),
         "the late member never prevoted the candidate the forged ones crowded out: {actions:?}",
     );
 }
@@ -1573,31 +1585,34 @@ fn a_candidate_several_blocks_ahead_of_the_tip_is_prevoted_once_its_parent_is_ad
         sim.commits[late].is_empty(),
         "the late member adopted a block"
     );
-    let grandparent = Arc::clone(&sim.commits[0][0].block);
-    let parent = Arc::clone(&sim.commits[0][1].block);
+    let grandparent = sim.commits[0][0].block.clone();
+    let parent = sim.commits[0][1].block.clone();
     let candidate = sim
         .broadcast_candidate(Epoch::new(3))
         .expect("the connected side broadcast its epoch 3 candidate");
 
-    let early = sim.coordinators[late]
-        .on_beacon_candidate_received(Arc::new(Verifiable::from((*candidate).clone())));
+    let early =
+        sim.coordinators[late].on_beacon_candidate_received(Verifiable::from((*candidate).clone()));
     assert!(
         early.is_empty(),
         "a candidate ahead of the tip dispatched work: {early:?}"
     );
 
-    let prevotes_candidate = |actions: &[Action]| {
-        actions.iter().any(|action| {
-            matches!(
-                action,
-                Action::SignAndBroadcastRatifyVote {
-                    epoch,
-                    phase: RatifyPhase::Prevote,
-                    block_hash,
-                    ..
-                } if *epoch == Epoch::new(3) && *block_hash == candidate.block_hash()
-            )
-        })
+    let prevotes_candidate = |actions: &[CoordinatorAction]| {
+        actions
+            .iter()
+            .filter_map(CoordinatorAction::participant)
+            .any(|action| {
+                matches!(
+                    action,
+                    BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote {
+                        epoch,
+                        phase: RatifyPhase::Prevote,
+                        block_hash,
+                        ..
+                    }) if *epoch == Epoch::new(3) && *block_hash == candidate.block_hash()
+                )
+            })
     };
     let actions = sim.deliver_block_to(late, &grandparent);
     assert!(

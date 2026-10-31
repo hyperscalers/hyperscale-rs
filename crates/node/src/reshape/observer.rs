@@ -39,14 +39,16 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    Anchor, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin,
-    CommitProof, LocalTimestamp, MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate,
-    ReadySignal, ShardAnchor, ShardId, Signer, StateRoot, ValidatorId, Verifier, WeightedTimestamp,
-    ready_signal_window, shard_prefix_path,
+    Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, CommitProof, LocalTimestamp,
+    MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate, ReadySignal, ShardAnchor,
+    ShardId, Signer, StateRoot, ValidatorId, Verifier, WeightedTimestamp, ready_signal_window,
+    shard_prefix_path,
 };
 
-use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
-use crate::bootstrap::{BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT};
+use crate::bootstrap::{
+    BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT, SnapSync, StateRangeOutcome,
+};
+use crate::reshape::genesis::DerivedGenesis;
 use crate::reshape::view::CommitteeLookup;
 
 /// The self-signed ready signal a reshape seat holder broadcasts to the
@@ -112,12 +114,7 @@ enum Phase {
 /// Sequencing state for one observer's pending-child bootstrap.
 pub struct ObserverBootstrap {
     anchor: ShardAnchor,
-    child: ShardId,
     phase: Phase,
-    /// Total value bytes across the chunks handed to the driver for
-    /// staging — the child half's substate byte total, seeding the
-    /// byte frontier the child chain starts from.
-    imported_substate_bytes: u64,
 }
 
 impl ObserverBootstrap {
@@ -137,7 +134,6 @@ impl ObserverBootstrap {
         );
         Self {
             anchor,
-            child,
             phase: Phase::State(Box::new(SnapSync::spanning(
                 anchor,
                 shard_prefix_path(parent),
@@ -145,7 +141,6 @@ impl ObserverBootstrap {
                 SPLIT_BITS,
                 STATE_CHUNK_LIMIT,
             ))),
-            imported_substate_bytes: 0,
         }
     }
 
@@ -153,12 +148,6 @@ impl ObserverBootstrap {
     #[must_use]
     pub const fn anchor(&self) -> ShardAnchor {
         self.anchor
-    }
-
-    /// The pending child whose span this bootstrap assembles.
-    #[must_use]
-    pub const fn child(&self) -> ShardId {
-        self.child
     }
 
     /// Every request the current phase wants in flight. Empty while
@@ -189,11 +178,10 @@ impl ObserverBootstrap {
             return StateRangeOutcome::Rejected("state response outside the state phase");
         };
         let outcome = snap.on_response(sub_range, response);
-        if let StateRangeOutcome::Staged { .. } = &outcome {
-            self.imported_substate_bytes = snap.staged_bytes();
-            if snap.is_complete() {
-                self.phase = Phase::FinalizeReady;
-            }
+        if let StateRangeOutcome::Staged { .. } = &outcome
+            && snap.is_complete()
+        {
+            self.phase = Phase::FinalizeReady;
         }
         outcome
     }
@@ -217,32 +205,13 @@ impl ObserverBootstrap {
         Some(self.anchor.height)
     }
 
-    /// Record the imported child-subtree root and complete.
-    ///
-    /// # Panics
-    ///
-    /// Panics unless the finalize was taken via [`Self::take_finalize`].
+    /// Record the imported child-subtree root and complete. A root arriving
+    /// before the finalize was taken via [`Self::take_finalize`], or after
+    /// the import completed, is a stale completion, and changes nothing.
     pub fn on_imported(&mut self, root: StateRoot) {
-        assert!(
-            matches!(self.phase, Phase::Finalizing),
-            "on_imported outside the finalize phase",
-        );
-        self.phase = Phase::Complete(root);
-    }
-
-    /// Whether the bootstrap is still assembling state — the only
-    /// phase that depends on serving peers retaining the targeted
-    /// boundary pin, and the last at which restarting against a newer
-    /// anchor is sound (nothing has been imported into the store yet).
-    #[must_use]
-    pub const fn is_assembling_state(&self) -> bool {
-        matches!(self.phase, Phase::State(_))
-    }
-
-    /// Whether the child span is imported.
-    #[must_use]
-    pub const fn is_complete(&self) -> bool {
-        matches!(self.phase, Phase::Complete(_))
+        if matches!(self.phase, Phase::Finalizing) {
+            self.phase = Phase::Complete(root);
+        }
     }
 
     /// The imported child-subtree root — the parent tree's node at the
@@ -253,13 +222,6 @@ impl ObserverBootstrap {
             Phase::Complete(root) => Some(root),
             _ => None,
         }
-    }
-
-    /// The imported substate byte total of the child half — the byte
-    /// frontier the child chain starts from. Accrues per staged chunk.
-    #[must_use]
-    pub const fn imported_substate_bytes(&self) -> u64 {
-        self.imported_substate_bytes
     }
 }
 
@@ -418,19 +380,6 @@ fn check_two_chain(
     TwoChainCheck::Verified
 }
 
-/// A child genesis derived locally from the parent's terminal block.
-#[derive(Debug, Clone)]
-pub struct DerivedGenesis {
-    /// The genesis block the child adopts.
-    pub block: Block,
-    /// The chain origin it starts from.
-    pub origin: ChainOrigin,
-    /// The parent terminal this child succeeds, carried off the same
-    /// header the genesis derives from. `None` when that header carries
-    /// no terminal settled root.
-    pub predecessor: Option<Anchor>,
-}
-
 /// Derive `child`'s genesis from the parent's terminal header.
 ///
 /// Thin over [`Block::split_child_genesis_from_terminal`], which is the
@@ -440,7 +389,7 @@ fn derive_child_genesis(child: ShardId, terminal: &BlockHeader) -> Option<Derive
     Some(DerivedGenesis {
         block,
         origin,
-        predecessor: terminal.as_terminal_anchor(),
+        predecessors: terminal.as_terminal_anchor().into_iter().collect(),
     })
 }
 
@@ -647,8 +596,9 @@ impl ObserverTail {
     /// a coast block past the cut, empty by rule, so it moves no state. But
     /// the adopt reads the child's substate byte total at the genesis
     /// height, which is `terminal + 1`, so that version has to exist. A
-    /// recognizing tail writes nothing, and needs the successor anyway: its
-    /// `parent_qc` is the only canonical source of the genesis clock.
+    /// recognizing tail writes nothing, and walks past the terminal anyway:
+    /// the certificate a sighting carries is the successor's `parent_qc`,
+    /// and the commit proof forms at or above the successor.
     ///
     /// A following tail applies only proven blocks, so a sighting it
     /// returns is of a terminal proven committed, certified canonically by
@@ -1007,7 +957,9 @@ impl ObserverTail {
     }
 
     /// Record the applied root, checking it against the header's
-    /// `split_child_roots` slot when the block carried the pair.
+    /// `split_child_roots` slot when the block carried the pair. A root
+    /// arriving with no application taken via [`Self::take_apply`] is a
+    /// stale completion, and changes nothing.
     ///
     /// # Errors
     ///
@@ -1015,20 +967,14 @@ impl ObserverTail {
     /// followed header — the store has diverged from the parent's child
     /// subtree and the duty must fail closed (the flip falls back to a
     /// fresh snap-sync).
-    ///
-    /// # Panics
-    ///
-    /// Panics unless an application was taken via [`Self::take_apply`].
     pub fn on_applied(&mut self, root: StateRoot) -> Result<(), String> {
-        assert!(
-            self.apply_in_flight,
-            "on_applied outside a taken application"
-        );
+        if !self.apply_in_flight {
+            return Ok(());
+        }
         self.apply_in_flight = false;
-        let pending = self
-            .proven
-            .pop_front()
-            .expect("a taken application is the oldest proven block");
+        let Some(pending) = self.proven.pop_front() else {
+            return Ok(());
+        };
         if let Some(expected) = pending.expected_root
             && expected != root
         {
@@ -1067,7 +1013,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::bootstrap::state_range_serve::serve_state_range_request;
+    use crate::serve_state_range_request;
 
     const ENTRIES: u8 = 12;
 
@@ -1090,8 +1036,7 @@ mod tests {
         let store = SimShardStorage::new(shard_prefix_path(child));
         let mut bootstrap = ObserverBootstrap::new(ShardId::ROOT, anchor, child);
         for _ in 0..1_000 {
-            if bootstrap.is_complete() {
-                let root = bootstrap.imported_root().expect("complete");
+            if let Some(root) = bootstrap.imported_root() {
                 return (store, root);
             }
             for request in bootstrap.next_requests() {
@@ -1151,6 +1096,7 @@ mod tests {
         let mut counts = Vec::new();
         for child in children {
             let mut bootstrap = ObserverBootstrap::new(ShardId::ROOT, anchor, child);
+            let mut staged_bytes = 0;
             for _ in 0..1_000 {
                 if bootstrap.take_finalize().is_some() {
                     break;
@@ -1158,11 +1104,15 @@ mod tests {
                 for request in bootstrap.next_requests() {
                     if let BootstrapRequest::StateRange(id, request) = request {
                         let response = serve_state_range_request(&serving, &request);
-                        bootstrap.on_state_range(id, &response);
+                        if let StateRangeOutcome::Staged { progress, .. } =
+                            bootstrap.on_state_range(id, &response)
+                        {
+                            staged_bytes = staged_bytes.max(progress.staged_bytes);
+                        }
                     }
                 }
             }
-            counts.push(bootstrap.imported_substate_bytes());
+            counts.push(staged_bytes);
         }
         let parent_bytes = serving
             .substate_bytes_at_version(anchor.height.inner())

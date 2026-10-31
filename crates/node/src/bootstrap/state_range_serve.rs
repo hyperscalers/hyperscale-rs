@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use hyperscale_hbor::{Bytes, Capped};
+use hyperscale_hbor::Bytes;
 use hyperscale_jmt::{Blake3Hasher, Tree, TreeReader};
-use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{ShardStorage, Substates};
 use hyperscale_types::network::request::GetStateRangeRequest;
 use hyperscale_types::network::response::{
@@ -13,12 +12,20 @@ use hyperscale_types::network::response::{
 use hyperscale_types::{MAX_CELL_VALUE_LEN, MerkleInclusionProof, SubstateKey, SubstateLeaf};
 use tracing::warn;
 
+use crate::serve::Answer;
+
 type Jmt = Tree<Blake3Hasher, 1>;
 
-/// Soft byte budget for one chunk's raw pairs. Enumeration stops past it
-/// and signals continuation, keeping a maximally-adversarial range
-/// (every leaf a max-size substate) inside transport frames.
-const SOFT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Byte budget for one chunk's leaves past its first, each weighed as
+/// its value and its key. A chunk stops short of the leaf that would
+/// pass it and signals continuation, keeping a maximally-adversarial
+/// range (every leaf a max-size substate) inside transport frames.
+pub const RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// What one leaf weighs against [`RESPONSE_BYTES`].
+pub const fn leaf_weight(value_len: usize) -> usize {
+    value_len + 32
+}
 
 /// Serve an inbound snap-sync state range request from a pinned epoch
 /// boundary.
@@ -54,37 +61,34 @@ pub fn serve_state_range_request<S: ShardStorage>(
     if start > end {
         return unavailable;
     }
-    let limit = (req.limit as usize).clamp(1, MAX_LEAVES_PER_STATE_RANGE);
+    let mut leaves = Answer::<SubstateLeaf, MAX_LEAVES_PER_STATE_RANGE>::of(req.limit as usize)
+        .within(RESPONSE_BYTES);
 
-    let Ok(mut range) = Jmt::collect_range(&boundary, &root_key, &start, &end, limit) else {
+    let Ok(mut range) = Jmt::collect_range(&boundary, &root_key, &start, &end, leaves.limit())
+    else {
         return unavailable;
     };
 
     // Resolve raw values under the byte budget; stopping early shortens
     // the chunk and signals continuation.
-    let mut wire_leaves: Vec<SubstateLeaf> = Vec::with_capacity(range.leaves.len());
-    let mut budget = SOFT_RESPONSE_BYTES;
     for (leaf_key, _) in &range.leaves {
         let key = SubstateKey::from_bytes(*leaf_key).expect("a stored leaf key names an address");
         let Some(value) = boundary.cell(key) else {
             warn!(height = version, "state range: leaf value missing");
             return unavailable;
         };
-        budget = budget.saturating_sub(value.len() + 32);
-        if value.len() > MAX_CELL_VALUE_LEN {
+        let weight = leaf_weight(value.len());
+        let Ok(value) = Bytes::<MAX_CELL_VALUE_LEN>::new(value) else {
             warn!(height = version, "state range: oversized substate value");
             return unavailable;
-        }
-        wire_leaves.push(SubstateLeaf {
-            key,
-            value: Bytes::new(value).expect("a list under the cap its source already met"),
-        });
-        if budget == 0 {
+        };
+        if leaves.offer(SubstateLeaf { key, value }, weight).is_break() {
             break;
         }
     }
-    if wire_leaves.len() < range.leaves.len() {
-        range.leaves.truncate(wire_leaves.len());
+    let leaves = leaves.finish();
+    if leaves.len() < range.leaves.len() {
+        range.leaves.truncate(leaves.len());
         range.more = true;
     }
 
@@ -92,12 +96,6 @@ pub fn serve_state_range_request<S: ShardStorage>(
         return unavailable;
     };
 
-    // A chunk past the cap is one this answer cannot express, and the
-    // proof beside it covers the whole run.
-    let Ok(leaves) = Capped::new(wire_leaves) else {
-        return unavailable;
-    };
-    record_fetch_response_sent("state_range", leaves.len());
     GetStateRangeResponse {
         chunk: Some(StateRangeChunk {
             leaves,

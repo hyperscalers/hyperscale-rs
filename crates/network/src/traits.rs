@@ -66,14 +66,55 @@ pub enum RequestError {
     Shutdown,
 }
 
+/// Who handed a gossip or notification handler its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// This host sent it and delivered it to its own handlers: the value is
+    /// the one the host passed to its own broadcast or notify, never bytes
+    /// another party wrote.
+    Local,
+    /// A peer sent it over the network: the peer that handed it to this
+    /// host, which for gossip is the last hop and not the author.
+    Peer(PeerId),
+}
+
+/// A peer, keyed as its transport keys what that peer may cost this host.
+///
+/// A limit a handler applies per peer so binds the party the transport
+/// charges for it. Two copies from one peer carry the same id; what the
+/// number means is the transport's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PeerId(u64);
+
+impl PeerId {
+    /// The peer the transport keys by `key`.
+    #[must_use]
+    pub const fn new(key: u64) -> Self {
+        Self(key)
+    }
+}
+
+impl Provenance {
+    /// `check`'s verdict on a peer's message. A message this host sent
+    /// itself is taken unchecked: what an ingress check establishes about a
+    /// sender, that it signed what it claims and carries what it proves,
+    /// this host knows of its own messages already.
+    pub fn check(self, check: impl FnOnce() -> Verdict) -> Verdict {
+        match self {
+            Self::Local => Verdict::Accept,
+            Self::Peer(_) => check(),
+        }
+    }
+}
+
 /// What a handler made of an inbound message.
 ///
 /// Returned by [`GossipHandler::on_message`] and
 /// [`NotificationHandler::on_notification`] to tell the network layer
 /// whether a gossip message may travel on, and whose fault it is when a
 /// message is refused. A transport that charges senders for refused traffic
-/// charges [`Self::Reject`] as the sender's fault and [`Self::Ignore`] as no
-/// one's.
+/// charges [`Self::Reject`] as the sender's fault, [`Self::Ignore`] as no
+/// one's at the work of reading it, and [`Self::Busy`] not at all.
 ///
 /// A handler whose checks of the message finish only after it returns says
 /// [`Self::Defer`], naming every check the message's validity rests on, and
@@ -99,6 +140,12 @@ pub enum Verdict {
     /// sender's fault; a host that is behind refuses honest messages this
     /// way.
     Ignore,
+    /// This host has no room for the message: the queue its input would
+    /// join is full. Dropped and not forwarded, and charged to no one,
+    /// since all it says is that this host is behind on its own work, and
+    /// a long stall here would otherwise run honest peers into a cooldown
+    /// for traffic this host never looked at.
+    Busy,
     /// The message is being checked, and the checks it names settle the
     /// verdict through [`Network::settle`].
     Defer(Deferral),
@@ -189,12 +236,31 @@ impl VerdictKey {
 /// was unusable to the app (peer returned `None`/empty, scope mismatch,
 /// partial response, malformed payload). This deprioritizes the peer for
 /// future selection without any extra plumbing from the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A callback whose check of the answer finishes only after it returns
+/// says [`Self::Defer`], naming every check the answer rests on, as a
+/// gossip handler defers its [`Verdict`]. Each check settles its part
+/// through [`Network::settle`], and the peer is scored once they have: as
+/// for `Reject` when one finds its part false, and not at all when every
+/// part holds, when one could not be judged, or when none settles within
+/// [`DEFER_TIMEOUT`](crate::deferred::DEFER_TIMEOUT).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseVerdict {
     /// Response was usable — record success.
     Accept,
     /// Response was unusable — penalize the serving peer.
     Reject,
+    /// The answer is being checked, and the checks it names settle the
+    /// verdict through [`Network::settle`].
+    Defer(Deferral),
+}
+
+impl ResponseVerdict {
+    /// Defer to the check that settles the item `key` names.
+    #[must_use]
+    pub fn defer(key: VerdictKey) -> Self {
+        Self::Defer(Deferral(vec![key]))
+    }
 }
 
 /// Typed handler for a single gossip message type.
@@ -214,18 +280,18 @@ pub enum ResponseVerdict {
 pub trait GossipHandler<M: GossipMessage>: Send + Sync + 'static {
     /// Process a decoded gossip message for `shard`; return whether to
     /// forward it.
-    fn on_message(&self, message: M, shard: ShardId) -> Verdict;
+    fn on_message(&self, message: M, shard: ShardId, provenance: Provenance) -> Verdict;
 }
 
-/// Blanket impl: any `Fn(M, ShardId) -> Verdict` can serve as
+/// Blanket impl: any `Fn(M, ShardId, Provenance) -> Verdict` can serve as
 /// a typed gossip handler.
 impl<M, F> GossipHandler<M> for F
 where
     M: GossipMessage,
-    F: Fn(M, ShardId) -> Verdict + Send + Sync + 'static,
+    F: Fn(M, ShardId, Provenance) -> Verdict + Send + Sync + 'static,
 {
-    fn on_message(&self, message: M, shard: ShardId) -> Verdict {
-        (self)(message, shard)
+    fn on_message(&self, message: M, shard: ShardId, provenance: Provenance) -> Verdict {
+        (self)(message, shard, provenance)
     }
 }
 
@@ -236,18 +302,18 @@ where
 /// says whether the sender is to blame for the message.
 pub trait NotificationHandler<M: NetworkMessage>: Send + Sync + 'static {
     /// Process a decoded notification.
-    fn on_notification(&self, message: M) -> Verdict;
+    fn on_notification(&self, message: M, provenance: Provenance) -> Verdict;
 }
 
-/// Blanket impl: any `Fn(M) -> Verdict` can serve as a typed notification
-/// handler.
+/// Blanket impl: any `Fn(M, Provenance) -> Verdict` can serve as a typed
+/// notification handler.
 impl<M, F> NotificationHandler<M> for F
 where
     M: NetworkMessage,
-    F: Fn(M) -> Verdict + Send + Sync + 'static,
+    F: Fn(M, Provenance) -> Verdict + Send + Sync + 'static,
 {
-    fn on_notification(&self, message: M) -> Verdict {
-        (self)(message)
+    fn on_notification(&self, message: M, provenance: Provenance) -> Verdict {
+        (self)(message, provenance)
     }
 }
 
@@ -388,8 +454,10 @@ pub trait Network: Send + Sync + 'static {
     /// holds up, [`Verdict::Reject`] when it is false, [`Verdict::Ignore`]
     /// when this host could not finish judging it; a deferral here is taken
     /// as [`Verdict::Ignore`]. A check runs on every copy, wherever it came
-    /// from, and may run before any handler defers on it; settling an item
-    /// no handler deferred is harmless.
+    /// from, and may run before any handler or response callback defers on
+    /// it; settling an item nothing deferred is harmless. One settlement
+    /// serves gossip and answers alike: a copy that came both ways is one
+    /// item.
     ///
     /// Default is a no-op, for a backend that does not wait for deferred
     /// verdicts.
@@ -415,8 +483,9 @@ pub trait Network: Send + Sync + 'static {
     /// callback returns a [`ResponseVerdict`] so app-level rejections (peer
     /// returned `None`/empty/wrong-scope) feed back into the same peer-health
     /// tracker that timeouts use, deprioritizing the serving peer for future
-    /// selection. Verdict is ignored on the `Err` path (the network already
-    /// recorded the failure).
+    /// selection, or defers it to a check that settles later. Verdict is
+    /// ignored on the `Err` path (the network already recorded the failure)
+    /// and for an answer this host's own seat gave.
     ///
     /// `class_override` lets the caller demote (or, in principle, promote)
     /// the message class on a per-call basis. `None` uses the wire type's
@@ -526,11 +595,12 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
-        let handler = move |_msg: TestMsg, _shard: ShardId| -> Verdict {
+        let handler = move |_msg: TestMsg, _shard: ShardId, _provenance: Provenance| -> Verdict {
             counter_clone.fetch_add(1, Ordering::SeqCst);
             Verdict::Accept
         };
-        let verdict = handler.on_message(TestMsg(42), ShardId::ROOT);
+        let verdict =
+            handler.on_message(TestMsg(42), ShardId::ROOT, Provenance::Peer(PeerId::new(1)));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(verdict, Verdict::Accept);
     }

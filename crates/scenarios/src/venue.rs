@@ -17,7 +17,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::slice;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
@@ -383,7 +382,7 @@ fn all_accepted<C: Cluster>(c: &mut C, txs: Vec<Transaction>, context: &str) {
         .into_iter()
         .map(|tx| {
             let hash = tx.hash();
-            c.submit(Arc::new(tx));
+            c.submit(tx);
             hash
         })
         .collect();
@@ -418,7 +417,7 @@ const APPLIED_WITHIN_BLOCKS: u64 = 8;
 /// Submit `tx` and hold the run to its acceptance.
 pub fn accepted<C: Cluster>(c: &mut C, tx: Transaction, context: &str) {
     let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    c.submit(tx);
     let status = await_tx_terminal(c, hash, epochs(12));
     assert!(
         matches!(
@@ -616,13 +615,20 @@ pub fn a_swap_by_a_caller_on_the_venues_shard_runs_whole<C: Cluster>(c: &mut C, 
     let worlds = venue_worlds(c, &venue, [caller]);
     let mut charges = Charges::default();
 
-    let status = terminal(c, &mut charges, swap, budget);
+    let hash = charges.submit(c, swap);
+    let status = await_tx_terminal(c, hash, budget);
     assert!(
         matches!(
             status,
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
         "a swap on the venue's own shard must accept; status = {status:?}",
+    );
+    // The status is reported once consensus commits the deciding block;
+    // the stores this reads catch up when that block is persisted.
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(VENUE_SHARD, hash).1.is_some()),
+        "the block deciding the swap must reach the venue shard's stored chain",
     );
     assert!(
         held(c, caller.address(), venue.unit) > 0,

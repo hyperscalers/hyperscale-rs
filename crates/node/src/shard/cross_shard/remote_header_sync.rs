@@ -1,28 +1,81 @@
-//! Remote-header sync I/O glue.
+//! Remote-header sync: the binding for the generic [`Sync`] state machine
+//! and the I/O glue that drives it.
 //!
-//! Bridges `Sync<RemoteHeaderSyncBinding>`'s scheduling to the network
-//! and to the existing `RemoteHeaderReceived` ingestion path. The FSM
-//! tracks heights only; the step layer owns wire shape (range fetches),
+//! [`RemoteHeaderSyncBinding`] declares per-binding type info: per-shard
+//! scope (`Scope = ShardId`) and no payload-private state
+//! (`State = ()`).
+//!
+//! The glue bridges `Sync<RemoteHeaderSyncBinding>`'s scheduling to the
+//! network and to the existing `RemoteHeaderReceived` ingestion path. The
+//! FSM tracks heights only; the step layer owns wire shape (range fetches),
 //! response decoding, and feeding delivered headers into per-header QC
 //! verification.
-
-use std::sync::Arc;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{
-    record_sync_round_completed, record_sync_round_retried, record_sync_round_started,
+    record_sync_block_filtered, record_sync_round_completed, record_sync_round_retried,
+    record_sync_round_started,
 };
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetRemoteHeadersRequest;
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
-use hyperscale_types::{BlockHeight, CertifiedBlockHeader, HeaderFetchCount, ShardId, ValidatorId};
+use hyperscale_types::{
+    BlockHeight, CertifiedBlockHeader, HeaderFetchCount, HeaderSource, ShardId,
+};
 
-use super::remote_header::{RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
-use crate::event::classify_fetch_error;
-use crate::shard::{FetchFailureKind, ShardLoop, ShardScopedInput, push_shard_input};
-use crate::sync::SyncOutput;
+use crate::event::{FetchFailureKind, ShardScopedInput, classify_fetch_error};
+use crate::shard::{ShardLoop, push_shard_input};
+use crate::sync::{Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
+
+/// Default upper bound on heights packed into a single range fetch.
+/// Matches `MAX_REMOTE_HEADERS_PER_REQUEST` so the responder never has to
+/// short-cap on `count` alone.
+pub const DEFAULT_MAX_HEADERS_PER_FETCH: u64 = 64;
+
+/// Default per-shard window. How far ahead of `committed` the FSM queues
+/// fetches. Bounded so the heap can't grow without bound when `target`
+/// jumps far ahead.
+pub const DEFAULT_SYNC_WINDOW_SIZE: u64 = 256;
+
+/// Default cap on concurrent in-flight range fetches per shard.
+/// Source-shard committee responsiveness is the bottleneck, not local
+/// resources, so the limit is per-shard.
+pub const DEFAULT_MAX_CONCURRENT_FETCHES_PER_SHARD: usize = 4;
+
+/// Type alias: remote-header sync is `Sync<RemoteHeaderSyncBinding>`.
+pub type RemoteHeaderSync = Sync<RemoteHeaderSyncBinding>;
+
+/// Type alias for remote-header sync inputs.
+pub type RemoteHeaderSyncInput = SyncInput<RemoteHeaderSyncBinding>;
+
+/// Type alias for remote-header sync outputs.
+pub type RemoteHeaderSyncOutput = SyncOutput<RemoteHeaderSyncBinding>;
+
+/// Marker type implementing [`SyncBinding`] for remote-header sync.
+pub struct RemoteHeaderSyncBinding;
+
+impl SyncBinding for RemoteHeaderSyncBinding {
+    type Scope = ShardId;
+    type Key = BlockHeight;
+    type State = ();
+    const NAME: &'static str = "remote_header_sync";
+    /// The remote-header responder walks a contiguous height range and
+    /// stops on the first missing height, so short responses signal the
+    /// responder's tip.
+    const RESPONDER_SERVES_CONTIGUOUS_PREFIX: bool = true;
+}
+
+/// Construct a [`SyncConfig`] populated with the remote-header defaults.
+#[must_use]
+pub const fn default_config() -> SyncConfig {
+    SyncConfig {
+        max_per_request: DEFAULT_MAX_HEADERS_PER_FETCH,
+        window_size: DEFAULT_SYNC_WINDOW_SIZE,
+        max_concurrent_per_scope: DEFAULT_MAX_CONCURRENT_FETCHES_PER_SHARD,
+    }
+}
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -63,7 +116,9 @@ where
     }
 
     /// Admit `source_shard`'s scope up to the replica's contiguous verified
-    /// frontier for it, where the replica tracks the shard.
+    /// frontier for it, where the replica tracks the shard, and tell it the
+    /// highest header verified above, which no short answer can then talk
+    /// the target below.
     ///
     /// The frontier only rises while the replica tracks the shard: a shard
     /// it stops tracking loses its scope (see
@@ -81,8 +136,15 @@ where
             return;
         };
         let gap_target = coordinator.gap_sync_target(source_shard);
+        let verified_tip = coordinator.verified_tip(source_shard);
         let sync = &mut self.io.cross_shard.remote_header_sync;
         let held = sync.frontier(&source_shard);
+        if let Some(tip) = verified_tip {
+            let _ = sync.handle(RemoteHeaderSyncInput::Proven {
+                scope: source_shard,
+                height: tip,
+            });
+        }
         if held.is_some_and(|held| held >= height) {
             return;
         }
@@ -137,8 +199,7 @@ where
             });
             self.follow_remote_header_frontier(source_shard);
         }
-        let delivered_heights =
-            self.deliver_fetched_headers(source_shard, from_height, count, headers);
+        let delivered_heights = self.deliver_fetched_headers(headers);
         let outputs =
             self.io
                 .cross_shard
@@ -153,50 +214,15 @@ where
         self.process_remote_header_sync_outputs(outputs);
     }
 
-    /// Filter a header-range response to in-range, in-shard deliveries and
-    /// feed each to the existing verification path, returning the heights
-    /// that arrived. `saturating_add` prevents the `from_height + count`
-    /// overflow path when an attacker (or a future caller) supplies values
-    /// near `u64::MAX`. The shard filter rejects responses where the
-    /// responder served headers from the wrong shard — the responder gates
-    /// this too, but defending in depth on the receiver lets us surface
-    /// peer misbehavior even if a future serve change drops it.
-    fn deliver_fetched_headers(
-        &mut self,
-        source_shard: ShardId,
-        from_height: BlockHeight,
-        count: HeaderFetchCount,
-        headers: Vec<CertifiedBlockHeader>,
-    ) -> Vec<BlockHeight> {
-        let upper_bound = from_height.inner().saturating_add(count.inner());
+    /// Feed each header of a screened range response to the existing
+    /// verification path, returning the heights that arrived.
+    fn deliver_fetched_headers(&mut self, headers: Vec<CertifiedBlockHeader>) -> Vec<BlockHeight> {
         let mut delivered_heights = Vec::with_capacity(headers.len());
         for header in headers {
-            let h = header.header().height();
-            if h < from_height || h.inner() >= upper_bound {
-                tracing::warn!(
-                    source_shard = source_shard.inner(),
-                    requested_from = from_height.inner(),
-                    requested_count = count.inner(),
-                    height = h.inner(),
-                    "remote-header sync: response contained out-of-range height — discarding"
-                );
-                continue;
-            }
-            if header.shard_id() != source_shard {
-                tracing::warn!(
-                    source_shard = source_shard.inner(),
-                    response_shard = header.shard_id().inner(),
-                    height = h.inner(),
-                    "remote-header sync: response contained wrong-shard header — discarding"
-                );
-                continue;
-            }
-            delivered_heights.push(h);
-            // The `sender` field carries no meaning for fetched headers —
-            // a sentinel value avoids confusion with real validator ids.
+            delivered_heights.push(header.header().height());
             self.dispatch_event(ProtocolEvent::UnverifiedRemoteHeaderReceived {
-                certified_header: Arc::new(header),
-                sender: ValidatorId::new(u64::MAX),
+                certified_header: header,
+                source: HeaderSource::Fetched,
             });
         }
         delivered_heights
@@ -227,20 +253,8 @@ where
             request,
             None,
             Box::new(move |result: Result<GetRemoteHeadersResponse, _>| {
-                match result {
-                    Ok(resp) => {
-                        record_sync_round_completed("commit_proof");
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::CommitProofResponseReceived {
-                                source_shard,
-                                from_height,
-                                count,
-                                headers: resp.headers.into_inner(),
-                            },
-                        );
-                    }
+                let resp = match result {
+                    Ok(resp) => resp,
                     Err(err) => {
                         record_sync_round_retried("commit_proof");
                         tracing::debug!(
@@ -249,25 +263,34 @@ where
                             error = %err,
                             "commit-proof fetch failed; the commit sweep re-issues it"
                         );
+                        return ResponseVerdict::Accept;
                     }
+                };
+                let headers = resp.headers.into_inner();
+                if screen_range("commit_proof", source_shard, from_height, count, &headers).is_err()
+                {
+                    return ResponseVerdict::Reject;
                 }
+                record_sync_round_completed("commit_proof");
+                push_shard_input(
+                    &es,
+                    local_shard,
+                    ShardScopedInput::CommitProofResponseReceived { headers },
+                );
                 ResponseVerdict::Accept
             }),
         );
     }
 
-    /// A commit-proof range response arrived: feed the headers through the
-    /// shared delivery path. No FSM to notify — proof establishment is
+    /// A commit-proof range response arrived, screened at its callback:
+    /// feed the headers through the shared delivery path. No FSM to notify — proof establishment is
     /// observed by the remote-header coordinator itself (`try_prove`), and
     /// its commit sweep stops re-issuing once the height proves.
     pub(crate) fn handle_commit_proof_response_received(
         &mut self,
-        source_shard: ShardId,
-        from_height: BlockHeight,
-        count: HeaderFetchCount,
         headers: Vec<CertifiedBlockHeader>,
     ) {
-        let _ = self.deliver_fetched_headers(source_shard, from_height, count, headers);
+        let _ = self.deliver_fetched_headers(headers);
     }
 
     /// Network callback: a range fetch failed.
@@ -294,12 +317,9 @@ where
 
     // ─── Output processing ──────────────────────────────────────────────
 
-    /// Route FSM outputs: `Fetch` → network request, `Complete` →
-    /// `RemoteHeaderSyncComplete` event.
-    pub(crate) fn process_remote_header_sync_outputs(
-        &mut self,
-        outputs: Vec<RemoteHeaderSyncOutput>,
-    ) {
+    /// Route FSM outputs: `Fetch` → network request, `Complete` → a log
+    /// line.
+    pub(crate) fn process_remote_header_sync_outputs(&self, outputs: Vec<RemoteHeaderSyncOutput>) {
         let local_shard = self.shard;
         for output in outputs {
             match output {
@@ -322,37 +342,14 @@ where
                         request,
                         None,
                         Box::new(move |result: Result<GetRemoteHeadersResponse, _>| {
-                            match result {
-                                Ok(resp) => {
-                                    record_sync_round_completed("remote_header");
-                                    push_shard_input(
-                                        &es,
-                                        local_shard,
-                                        ShardScopedInput::RemoteHeadersResponseReceived {
-                                            source_shard,
-                                            from_height,
-                                            count: typed_count,
-                                            headers: resp.headers.into_inner(),
-                                            floor: resp.floor,
-                                        },
-                                    );
-                                }
-                                Err(err) => {
-                                    record_sync_round_retried("remote_header");
-                                    let kind = classify_fetch_error(&err);
-                                    push_shard_input(
-                                        &es,
-                                        local_shard,
-                                        ShardScopedInput::RemoteHeadersFetchFailed {
-                                            source_shard,
-                                            from_height,
-                                            count: typed_count,
-                                            kind,
-                                        },
-                                    );
-                                }
-                            }
-                            ResponseVerdict::Accept
+                            let (input, verdict) = remote_headers_answer(
+                                source_shard,
+                                from_height,
+                                typed_count,
+                                result,
+                            );
+                            push_shard_input(&es, local_shard, input);
+                            verdict
                         }),
                     );
                 }
@@ -365,12 +362,163 @@ where
                         height = height.inner(),
                         "remote-header sync caught up"
                     );
-                    self.dispatch_event(ProtocolEvent::RemoteHeaderSyncComplete {
-                        source_shard,
-                        height,
-                    });
                 }
             }
+        }
+    }
+}
+
+/// What a header-range fetch feeds the shard, and what it says of the
+/// peer that served it.
+///
+/// An honest responder serves a contiguous prefix of the range it was
+/// asked, from the shard it was asked about, and stops at the first
+/// height it lacks. A header outside the range or from another shard is
+/// therefore no answer: the whole response is dropped, the range retried
+/// as a failed fetch, and the peer rejected here, at the only point its
+/// answer can still be scored. An empty answer is a responder at or
+/// behind the range's start and is not rejected; it reads as the
+/// responder's tip, which the liveness probe raises past again.
+fn remote_headers_answer(
+    source_shard: ShardId,
+    from_height: BlockHeight,
+    count: HeaderFetchCount,
+    result: Result<GetRemoteHeadersResponse, RequestError>,
+) -> (ShardScopedInput, ResponseVerdict) {
+    let failed = |kind| ShardScopedInput::RemoteHeadersFetchFailed {
+        source_shard,
+        from_height,
+        count,
+        kind,
+    };
+    let resp = match result {
+        Ok(resp) => resp,
+        Err(err) => {
+            record_sync_round_retried("remote_header");
+            return (failed(classify_fetch_error(&err)), ResponseVerdict::Accept);
+        }
+    };
+    let headers = resp.headers.into_inner();
+    if screen_range("remote_header", source_shard, from_height, count, &headers).is_err() {
+        record_sync_round_retried("remote_header");
+        return (failed(FetchFailureKind::Transport), ResponseVerdict::Reject);
+    }
+    record_sync_round_completed("remote_header");
+    (
+        ShardScopedInput::RemoteHeadersResponseReceived {
+            source_shard,
+            from_height,
+            count,
+            headers,
+            floor: resp.floor,
+        },
+        ResponseVerdict::Accept,
+    )
+}
+
+/// Whether every header of a range response lies in the range asked and
+/// on the shard asked about. `saturating_add` keeps a range near
+/// `u64::MAX` from wrapping.
+fn screen_range(
+    kind: &'static str,
+    source_shard: ShardId,
+    from_height: BlockHeight,
+    count: HeaderFetchCount,
+    headers: &[CertifiedBlockHeader],
+) -> Result<(), &'static str> {
+    let upper_bound = from_height.inner().saturating_add(count.inner());
+    for header in headers {
+        let height = header.header().height();
+        let reason = if height < from_height || height.inner() >= upper_bound {
+            "out_of_range"
+        } else if header.shard_id() != source_shard {
+            "wrong_shard"
+        } else {
+            continue;
+        };
+        tracing::warn!(
+            source_shard = source_shard.inner(),
+            response_shard = header.shard_id().inner(),
+            requested_from = from_height.inner(),
+            requested_count = count.inner(),
+            height = height.inner(),
+            reason,
+            "Dropping remote-header range response"
+        );
+        record_sync_block_filtered(kind, reason);
+        return Err(reason);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_hbor::Capped;
+    use hyperscale_types::{
+        BlockHeader, BlockHeaderParts, ChainOrigin, QuorumCertificate, WeightedTimestamp,
+    };
+
+    use super::*;
+
+    const SOURCE: ShardId = ShardId::leaf(1, 1);
+
+    fn header(shard: ShardId, height: u64) -> CertifiedBlockHeader {
+        CertifiedBlockHeader::new(
+            BlockHeader::new(BlockHeaderParts {
+                shard_id: shard,
+                height: BlockHeight::new(height),
+                ..Default::default()
+            }),
+            QuorumCertificate::genesis(shard, ChainOrigin::root(WeightedTimestamp::ZERO)),
+        )
+    }
+
+    fn answer(headers: Vec<CertifiedBlockHeader>) -> (ShardScopedInput, ResponseVerdict) {
+        remote_headers_answer(
+            SOURCE,
+            BlockHeight::new(5),
+            HeaderFetchCount::new(3),
+            Ok(GetRemoteHeadersResponse::of(Capped::new(headers).unwrap())),
+        )
+    }
+
+    /// A header outside the range asked, or from another shard, is no
+    /// answer from an honest responder: the range is retried and the peer
+    /// rejected at the callback, the only place its answer is scored.
+    #[test]
+    fn a_header_off_the_range_asked_rejects_the_peer() {
+        for (headers, what) in [
+            (vec![header(SOURCE, 5), header(SOURCE, 8)], "past the range"),
+            (vec![header(SOURCE, 4)], "below the range"),
+            (vec![header(ShardId::leaf(1, 0), 5)], "another shard"),
+        ] {
+            let (input, verdict) = answer(headers);
+            assert_eq!(verdict, ResponseVerdict::Reject, "{what}");
+            assert!(
+                matches!(
+                    input,
+                    ShardScopedInput::RemoteHeadersFetchFailed {
+                        kind: FetchFailureKind::Transport,
+                        ..
+                    }
+                ),
+                "{what}: the range is asked again",
+            );
+        }
+    }
+
+    /// A contiguous prefix, empty included, is an honest answer.
+    #[test]
+    fn a_prefix_of_the_range_is_accepted() {
+        for headers in [vec![header(SOURCE, 5), header(SOURCE, 6)], Vec::new()] {
+            let count = headers.len();
+            let (input, verdict) = answer(headers);
+            assert_eq!(verdict, ResponseVerdict::Accept);
+            assert!(matches!(
+                input,
+                ShardScopedInput::RemoteHeadersResponseReceived { headers, .. }
+                    if headers.len() == count
+            ));
         }
     }
 }

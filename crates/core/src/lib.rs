@@ -6,9 +6,9 @@
 //! - [`Action`]: All possible outputs from the state machine
 //! - [`StateMachine`]: The trait that all state machines implement
 //!
-//! The I/O-loop-specific input types (`HostEvent`, `ShardScopedInput`,
-//! `ProcessScopedInput`, `FetchFailureKind`, `EventPriority`) live in
-//! `hyperscale_node::io_loop`, since they're not part of the
+//! The driver-specific input types (`HostEvent`, `ShardScopedInput`,
+//! `FetchFailureKind`, `EventPriority`) live in
+//! `hyperscale_node::event`, since they're not part of the
 //! deterministic state-machine contract.
 //!
 //! # Architecture
@@ -16,7 +16,7 @@
 //! The core is built on a two-level event model:
 //!
 //! ```text
-//! HostEvent → IoLoop (intercepts I/O events) → ProtocolEvent → StateMachine::handle() → Actions
+//! HostEvent → ShardLoop (intercepts I/O events) → ProtocolEvent → StateMachine::handle() → Actions
 //! ```
 //!
 //! The state machine is:
@@ -25,14 +25,15 @@
 //! - **Pure-ish**: Mutates self, but performs no I/O
 //!
 //! All I/O is handled by the runner (simulation or production) which:
-//! 1. Delivers shard / process inputs to the I/O loop
-//! 2. `IoLoop` intercepts I/O events (sync, fetch, validation) and forwards
+//! 1. Delivers shard inputs to the shard's loop
+//! 2. `ShardLoop` intercepts I/O events (sync, fetch, validation) and forwards
 //!    `ProtocolEvent`s to the state machine
 //! 3. Executes the returned actions
 //! 4. Converts action results back into shard / process inputs
 
 mod action;
 mod action_context;
+mod beacon_action;
 mod fetch_ids;
 mod fetch_request;
 mod gate;
@@ -41,10 +42,12 @@ mod timer;
 mod traits;
 
 pub use action::{
-    Action, ActionOwner, CrossShardExecutionRequest, KeepDelta, ObserveDelta, ParentJudgement,
-    ParticipationChange, ProvisionsRequest, QcSubject, SyncClaimId,
+    Action, ConsensusAction, CrossShardExecutionRequest, Delegated, ExecutionAction,
+    HeaderCommittee, KeepDelta, ObserveDelta, ParentJudgement, ParticipationChange,
+    ProvisionAction, ProvisionsRequest, QcSubject, StateRootCheck, SyncClaimId,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock, Signing};
+pub use beacon_action::{BeaconAction, BeaconBlockCheck, FoldAction, ParticipantAction};
 pub use fetch_ids::{BeaconFetchIds, FetchIds};
 pub use fetch_request::FetchRequest;
 pub use gate::{Gate, GateEntry};

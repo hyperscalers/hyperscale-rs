@@ -8,7 +8,6 @@
 //! not sit out the view-change timeout, which burns a round on a fallback and
 //! costs the shard ~15x its median block spacing.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_scenarios::tx::{account_routing_to, build_transfer_tx, validity_around};
@@ -126,7 +125,7 @@ fn cross_shard_load_costs_no_view_changes() {
             u128::from(nonce) + 1,
             validity_around(cluster.now()),
         );
-        cluster.submit(Arc::new(transfer));
+        cluster.submit(transfer);
         let next = cluster.runner().now() + SPACING;
         cluster.runner_mut().run_until(next);
     }

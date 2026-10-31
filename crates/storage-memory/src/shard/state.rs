@@ -327,7 +327,7 @@ pub struct ConsensusState {
     /// Certified headers held without their blocks: the anchor a
     /// snap-sync imported, kept so this store serves the next joiner's
     /// witness history as one that committed the block would.
-    pub(crate) boundary_headers: OrdMap<BlockHeight, Arc<CertifiedBlockHeader>>,
+    pub(crate) boundary_headers: OrdMap<BlockHeight, CertifiedBlockHeader>,
     /// Committed height.
     pub(crate) committed_height: BlockHeight,
     /// Committed block hash.
@@ -349,7 +349,7 @@ pub struct ConsensusState {
     /// Provision bodies keyed by their committing height and hash.
     /// Mirrors the production `provisions` CF: a stored block keeps only
     /// the hashes, so this is what a replay reads the bodies back from.
-    pub(crate) provisions: OrdMap<(BlockHeight, ProvisionHash), Arc<Provisions>>,
+    pub(crate) provisions: OrdMap<(BlockHeight, ProvisionHash), Provisions>,
     /// The origin a reshape successor's adopted store records, where
     /// recovery must reconstruct the continued height line and clock.
     /// `None` for a chain born at network genesis.
@@ -424,10 +424,8 @@ impl ConsensusState {
             }
         }
         for bundle in block.provisions() {
-            self.provisions.insert(
-                (height, bundle.hash()),
-                Arc::new(bundle.as_unverified().clone()),
-            );
+            self.provisions
+                .insert((height, bundle.hash()), bundle.as_unverified().clone());
         }
     }
 

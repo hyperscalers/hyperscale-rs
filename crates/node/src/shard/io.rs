@@ -1,11 +1,11 @@
-//! Per-shard I/O state hosted by the `NodeHost`.
+//! Per-shard I/O state, one per hosted shard.
 //!
 //! One [`ShardIo`] per hosted shard, owned by that shard's loop and its
 //! one replica. Shard-scoped state is grouped by subsystem —
-//! [`ConsensusState`], [`CrossShardState`], [`MempoolState`],
-//! [`BeaconFetchState`] — over the shard's infra (storage, pending chain,
+//! [`ConsensusState`], [`CrossShardState`], [`MempoolState`] — over the
+//! shard's infra (storage, pending chain,
 //! block-commit pipeline, request-serving caches), and none of it leaks
-//! across `NodeHost`s.
+//! across shards.
 
 use std::sync::Arc;
 
@@ -74,7 +74,8 @@ pub struct ShardIo<S: ShardStorage> {
     /// Per-tx phase-time stamps for the slow-tx finalization log.
     /// Populated from `EmitTransactionStatus` and `RecordTxEcCreated`
     /// actions emitted by this shard's replica; entries are dropped on
-    /// terminal status. Per-shard so each hosted shard logs its own
+    /// terminal status, and the cache is bounded for those that never
+    /// reach one. Per-shard so each hosted shard logs its own
     /// locally-submitted finalization latencies independently.
     pub(crate) tx_phase_times: TxPhaseTimesCache,
 
@@ -115,10 +116,9 @@ impl<S: ShardStorage> ShardIo<S> {
 
     /// Snapshot per-binding fetch counts across the transaction fetch on
     /// [`MempoolState`] and the cross-shard fetch instances on
-    /// [`CrossShardState`]. The I/O loop flattens this into the larger
-    /// `MetricsSnapshot`.
+    /// [`CrossShardState`], for the shard's metrics emission.
     #[must_use]
-    pub fn fetch_metrics(&self) -> FetchMetrics {
+    pub(crate) fn fetch_metrics(&self) -> FetchMetrics {
         let x = &self.cross_shard;
         let m = &self.mempool;
         FetchMetrics {
@@ -141,14 +141,12 @@ impl<S: ShardStorage> ShardIo<S> {
 /// Cheap aggregate of per-binding fetch counts (all payloads). Built by
 /// [`ShardIo::fetch_metrics`] from the transaction fetch on
 /// [`MempoolState`] and the cross-shard fetch instances on
-/// [`CrossShardState`]; flattened into the broader `MetricsSnapshot` by the
-/// I/O loop.
+/// [`CrossShardState`]; read by the shard's metrics emission.
 ///
 /// `_oldest_in_flight_age_ms` is `0` when nothing is in flight; otherwise
 /// the age (in milliseconds) of the longest-running in-flight entry.
 /// Alerting on this rising past tens of seconds catches admission paths
 /// that silently dropped a response without notifying the FSM.
-#[allow(missing_docs)] // flat readouts; field names are the documentation
 pub struct FetchMetrics {
     pub transaction_in_flight: usize,
     pub transaction_pending: usize,

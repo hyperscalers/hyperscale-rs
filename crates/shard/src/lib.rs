@@ -107,4 +107,4 @@ pub use config::ShardConsensusConfig;
 pub use coordinator::{ShardCoordinator, ShardMemoryStats, ShardStats, SignerPosition};
 pub use hyperscale_types::SettledTxSet;
 pub use proposal::{ProposalAsk, ProposalInputs};
-pub use verification::{ReadyStateRootVerification, committed_cells_for};
+pub use verification::committed_cells_for;

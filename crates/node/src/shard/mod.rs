@@ -10,8 +10,8 @@
 //!
 //! The top-level [`NodeHost`] composes one `ShardLoop` per hosted shard plus
 //! the shared `ProcessIo`. Cross-shard concerns (transaction submission
-//! fan-out, fetch tick, batch flush coordination) live on `NodeHost`; per-shard
-//! concerns live here. The dispatch match below is the thin router; each
+//! fan-out, batch flush coordination) live on `NodeHost`; per-shard concerns,
+//! the fetch tick among them, live here. The dispatch match below is the thin router; each
 //! subsystem's `impl ShardLoop` glue lives beside its state under
 //! [`consensus`], [`cross_shard`], and [`mempool`].
 //!
@@ -20,17 +20,17 @@
 // Per-shard state, grouped by subsystem over shared infra. Crate-internal —
 // `shard` is `pub` for its driver types (ShardLoop, HostEvent, …), but the
 // subsystem internals are not part of the crate's external API.
-pub(crate) mod boundary_pins;
-pub(crate) mod caches;
-pub(crate) mod commit;
-pub(crate) mod consensus;
-pub(crate) mod cross_shard;
-pub(crate) mod crossing_index;
-pub(crate) mod instances;
-pub(crate) mod io;
-pub(crate) mod mempool;
-pub(crate) mod phase_times;
-pub(crate) mod verify;
+pub mod boundary_pins;
+pub mod caches;
+pub mod commit;
+pub mod consensus;
+pub mod cross_shard;
+pub mod crossing_index;
+pub mod instances;
+pub mod io;
+pub mod mempool;
+pub mod phase_times;
+pub mod verify;
 
 // The driver shell: dispatch, lifecycle, metrics, the generic
 // fetch/timer plumbing, and the consensus driver glue.
@@ -41,24 +41,21 @@ pub use lifecycle::{installed_network_genesis_block, network_genesis_block};
 mod metrics;
 mod protocol_event;
 #[cfg(test)]
-pub(crate) mod test_host;
-mod timer;
+pub mod test_host;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
-pub(crate) use fetch_dispatch::FetchTicker;
+pub use fetch_dispatch::FetchTicker;
 use hyperscale_beacon::ChainRegistration;
-use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
+use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Executor, RecordStore};
-use hyperscale_network::Network;
-use hyperscale_storage::{
-    AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
-};
+use hyperscale_metrics::{record_network_input_over_share, record_network_input_refused};
+use hyperscale_network::{Network, Provenance};
+use hyperscale_storage::{AnswerFollow, BeaconStorage, PendingChain, RecoveredState, ShardStorage};
 use hyperscale_types::{
     Address, Block, CertifiedBlock, Hash, LocalTimestamp, QuorumCertificate, Round, ShardId,
     Signer, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified, shard_prefix_path,
@@ -67,20 +64,16 @@ pub use io::ShardIo;
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::beacon::{BeaconCandidateCache, BeaconProposalCache};
-use crate::event::Attachment;
-pub use crate::event::{
-    BeaconScopedInput, EventPriority, FetchFailureKind, HostEvent, ProcessScopedInput,
-    ShardScopedInput,
+use crate::event::{
+    BeaconScopedInput, HostEvent, Offer, ShardInbox, ShardScopedInput, StepOutput, TimerOp,
 };
 use crate::fetch::Release;
 use crate::process::ProcessIo;
-use crate::replica::AttachedSigner;
-use crate::shard::commit::PreparedCommitMap;
-use crate::state::NodeStateMachine;
+use crate::replica::{AttachedSigner, NodeStateMachine};
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
-/// Updated by the host when `Action::TopologyChanged` is processed.
+/// Updated by the host when `FoldAction::TopologyChanged` is processed.
 /// Handler closures call `.load()` to get the current snapshot atomically.
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 
@@ -92,11 +85,11 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 /// per dispatch, the crossbeam `Sender` clone is independent of these
 /// handles, and the key is the attached signer's the action names.
 ///
-/// Shard-scoped handles (`pending_chain`, `prepared_commits`) live in
-/// `per_shard`, keyed by the hosted shard id. Delegated handlers select
-/// the right entry from the emitting loop's shard, loading the map per
-/// dispatch so shards added or dropped at runtime are observed.
-pub(crate) struct DispatchHandles<S: ShardStorage, N> {
+/// Shard-scoped handles live in `per_shard`, keyed by the hosted shard
+/// id, for the readers that pick a shard by what they are asked: a
+/// preview by its payer's shard, a record lookup across every store. A
+/// shard loop's own delegated work runs over the handles its loop holds.
+pub struct DispatchHandles<S: ShardStorage, N> {
     pub(crate) executor: Arc<Executor>,
     pub(crate) network: Arc<N>,
     /// Process-level serve cache for beacon proposals — fed by the
@@ -125,7 +118,7 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
 /// belongs to a shard this node does not serve, the answer is the copy
 /// the record fetch persisted — which survives a restart and the cache
 /// letting the record go alike — or nothing, where it never fetched one.
-pub(crate) struct HostedRecords<S: ShardStorage> {
+pub struct HostedRecords<S: ShardStorage> {
     per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
     beacon_storage: Arc<dyn BeaconStorage>,
 }
@@ -183,11 +176,9 @@ impl<S: ShardStorage, N> DispatchHandles<S, N> {
 }
 
 /// Per-shard subset of [`DispatchHandles`]. One entry per hosted shard.
-pub(crate) struct ShardDispatchHandles<S: ShardStorage> {
+pub struct ShardDispatchHandles<S: ShardStorage> {
     pub(crate) storage: Arc<S>,
     pub(crate) pending_chain: Arc<PendingChain<S>>,
-    pub(crate) tick_chain: Arc<TickChain<S>>,
-    pub(crate) prepared_commits: Arc<Mutex<PreparedCommitMap>>,
 }
 
 impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
@@ -195,90 +186,7 @@ impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
         Self {
             storage: Arc::clone(&self.storage),
             pending_chain: Arc::clone(&self.pending_chain),
-            tick_chain: Arc::clone(&self.tick_chain),
-            prepared_commits: Arc::clone(&self.prepared_commits),
         }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// TimerOp — buffered timer operations for the runner
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Whose timer a [`TimerOp`] names, and so whom its fire reaches.
-///
-/// Each beacon participant arms the same [`TimerId`]s against its own
-/// deadlines, so a participant's timer is its own and its fire reaches it
-/// alone. A shard loop's timers, its replica's and its fetch tick, are the
-/// loop's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TimerOwner {
-    /// A hosted shard's loop: its replica's timers and its fetch tick.
-    Loop(ShardId),
-    /// One attached identity's beacon participation on the host's beacon
-    /// loop.
-    Participant(Attachment),
-    /// The host's beacon loop itself: its fetch tick.
-    Beacon,
-}
-
-/// A timer operation buffered by a loop driver for the runner to process.
-///
-/// The runner's timer driver keys handles by `(TimerOwner, TimerId)`, and
-/// the firing path ([`timer_event`]) addresses the envelope to the owner.
-#[derive(Debug, Clone)]
-pub enum TimerOp {
-    /// Set a timer to fire after `duration`.
-    Set {
-        /// Whose timer this is.
-        owner: TimerOwner,
-        /// Logical timer identifier (state-machine-side).
-        id: TimerId,
-        /// How long until the timer should fire.
-        duration: Duration,
-    },
-    /// Cancel a previously set timer.
-    Cancel {
-        /// Whose timer this is.
-        owner: TimerOwner,
-        /// Logical timer identifier to cancel.
-        id: TimerId,
-    },
-}
-
-/// Translate a fired [`TimerId`] back into the [`HostEvent`] the runner
-/// pushes onto its event channel.
-///
-/// The envelope is addressed to the timer's owner: a loop's timer to its
-/// shard, a participant's to that participant alone, and the beacon loop's
-/// fetch tick to the beacon loop.
-#[must_use]
-pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
-    let event = match id {
-        TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
-        TimerId::Cleanup => ProtocolEvent::CleanupTimer,
-        TimerId::ProposalPace => ProtocolEvent::ProposalPaceTimer,
-        TimerId::ProposalFetch => ProtocolEvent::ProposalFetchTimer,
-        TimerId::FetchTick => {
-            return match owner {
-                TimerOwner::Loop(shard) => HostEvent::shard(shard, ShardScopedInput::FetchTick),
-                TimerOwner::Participant(_) | TimerOwner::Beacon => HostEvent::beacon_fetch_tick(),
-            };
-        }
-        TimerId::BeaconCommitteeStart => ProtocolEvent::BeaconCommitteeStartTimer,
-        TimerId::BeaconRatifyTrigger => ProtocolEvent::BeaconRatifyTimer,
-        TimerId::BeaconSpcView => ProtocolEvent::BeaconSpcViewTimer,
-        TimerId::BeaconSpcInputDwell => ProtocolEvent::BeaconSpcInputDwellTimer,
-    };
-    match owner {
-        TimerOwner::Loop(shard) => HostEvent::protocol(shard, event),
-        TimerOwner::Participant(participant) => {
-            HostEvent::Beacon(BeaconScopedInput::ParticipantTimer {
-                participant,
-                event: Box::new(event),
-            })
-        }
-        TimerOwner::Beacon => HostEvent::beacon(event),
     }
 }
 
@@ -293,7 +201,7 @@ pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
 /// failure is silently ignored by design (the only failure mode is the
 /// receiver having been dropped at shutdown, in which case there's
 /// nothing to do).
-pub(crate) fn push_shard_input(tx: &Sender<HostEvent>, shard: ShardId, input: ShardScopedInput) {
+pub fn push_shard_input(tx: &Sender<HostEvent>, shard: ShardId, input: ShardScopedInput) {
     let _ = tx.send(HostEvent::shard(shard, input));
 }
 
@@ -301,56 +209,60 @@ pub(crate) fn push_shard_input(tx: &Sender<HostEvent>, shard: ShardId, input: Sh
 /// [`ShardScopedInput::Protocol`]) into the event channel, for `shard`'s
 /// replica.
 /// See [`push_shard_input`] for the drop-on-shutdown convention.
-pub(crate) fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event: ProtocolEvent) {
+pub fn push_protocol_event(tx: &Sender<HostEvent>, shard: ShardId, event: ProtocolEvent) {
     let _ = tx.send(HostEvent::protocol(shard, event));
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// StepOutput — returned to the caller after processing an event
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Output from processing a single event via `NodeHost::step()`.
+/// Offer an input a message brought to `shard`'s network lane.
 ///
-/// Aggregates the per-step scratch from every hosted shard touched by
-/// the event: emitted transaction statuses, timer operations, action
-/// counts. Sync/fetch I/O and block-commit dispatch happen internally
-/// via the `Network` and `Dispatch` traits — the runner only processes
-/// emitted transaction statuses and timer operations.
-#[derive(Default)]
-pub struct StepOutput {
-    /// Transaction status notifications emitted during this step.
-    pub(crate) emitted_statuses: Vec<(TxHash, TransactionStatus)>,
-    /// Number of actions generated by the state machine during this step.
-    pub actions_generated: usize,
-    /// Timer operations (set/cancel) to be processed by the runner.
-    pub timer_ops: Vec<TimerOp>,
-    /// Placement deltas emitted via [`Action::ReconfigureParticipation`]
-    /// during this step. The runner reconfigures physical shard
-    /// membership from these — they are requests to the process layer,
-    /// not state-machine state.
-    pub participation_changes: Vec<ParticipationChange>,
-    /// Validators the loop attached to its replica during this step.
-    pub attached: Vec<ValidatorId>,
-    /// Shards whose store needs a height beneath every serving peer's
-    /// chain floor. Block sync can never carry such a store forward; the
-    /// runner rebuilds it at the shard's attested anchor.
-    pub reseats: Vec<ShardId>,
+/// A refused input is dropped and counted, never queued past the lane's
+/// bound, and the handler answers the message with the offer's
+/// [`Offer::verdict`]: [`Verdict::Busy`](hyperscale_network::Verdict::Busy)
+/// when the lane is full and the sending peer within its share,
+/// [`Verdict::Ignore`](hyperscale_network::Verdict::Ignore) when the peer
+/// is past it. A closed lane takes the input as [`push_shard_input`]
+/// does. A message this host sent itself ([`Provenance::Local`]) goes on
+/// the internal lane instead: the bound is on what peers may queue here,
+/// not on what the host itself produced.
+#[must_use]
+pub fn offer_network_input(
+    inbox: &ShardInbox,
+    shard: ShardId,
+    input: ShardScopedInput,
+    provenance: Provenance,
+) -> Offer {
+    offer_network(inbox, HostEvent::shard(shard, input), provenance)
 }
 
-impl StepOutput {
-    /// Fold another step's output into this one. The whole-host driver
-    /// ([`NodeHost::step`](crate::host::NodeHost::step)) uses this to
-    /// aggregate the per-driver outputs of every shard and the beacon loop a
-    /// single event touched.
-    pub(crate) fn merge(&mut self, other: Self) {
-        self.emitted_statuses.extend(other.emitted_statuses);
-        self.actions_generated += other.actions_generated;
-        self.timer_ops.extend(other.timer_ops);
-        self.participation_changes
-            .extend(other.participation_changes);
-        self.attached.extend(other.attached);
-        self.reseats.extend(other.reseats);
+/// [`offer_network_input`] for a [`ProtocolEvent`].
+#[must_use]
+pub fn offer_network_event(
+    inbox: &ShardInbox,
+    shard: ShardId,
+    event: ProtocolEvent,
+    provenance: Provenance,
+) -> Offer {
+    offer_network(inbox, HostEvent::protocol(shard, event), provenance)
+}
+
+fn offer_network(inbox: &ShardInbox, event: HostEvent, provenance: Provenance) -> Offer {
+    let Provenance::Peer(peer) = provenance else {
+        let _ = inbox.internal().send(event);
+        return Offer::Taken;
+    };
+    let (shard, kind) = match &event {
+        HostEvent::Shard(shard, _) => (Some(*shard), event.type_name()),
+        HostEvent::Beacon(_) => (None, event.type_name()),
+    };
+    let offer = inbox.offer(event, peer);
+    if let Some(shard) = shard {
+        match offer {
+            Offer::Taken => {}
+            Offer::Full => record_network_input_refused(shard.inner(), kind),
+            Offer::OverShare => record_network_input_over_share(shard.inner()),
+        }
     }
+    offer
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -626,13 +538,16 @@ where
             ShardScopedInput::ProposalFetched { proposal } => {
                 self.handle_proposal_fetched(*proposal);
             }
+            ShardScopedInput::BlockFlushed { height } => self.handle_block_flushed(height),
             ShardScopedInput::Protocol(event) => match *event {
-                ProtocolEvent::BlockPersisted { height, .. } => self.handle_block_persisted(height),
                 persisted @ ProtocolEvent::BeaconBlockPersisted { .. } => {
                     self.handle_beacon_block_persisted(persisted);
                 }
                 restored @ ProtocolEvent::CommittedStateRestored { .. } => {
                     self.handle_committed_state_restored(restored);
+                }
+                ProtocolEvent::TransactionsReceived { transactions } => {
+                    self.handle_transactions_received(transactions);
                 }
                 other => self.handle_protocol_passthrough(other),
             },
@@ -676,18 +591,8 @@ where
             } => {
                 self.handle_remote_headers_fetch_failed(source_shard, from_height, count, kind);
             }
-            ShardScopedInput::CommitProofResponseReceived {
-                source_shard,
-                from_height,
-                count,
-                headers,
-            } => {
-                self.handle_commit_proof_response_received(
-                    source_shard,
-                    from_height,
-                    count,
-                    headers,
-                );
+            ShardScopedInput::CommitProofResponseReceived { headers } => {
+                self.handle_commit_proof_response_received(headers);
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
@@ -826,7 +731,7 @@ where
     /// the commit's genesis arm re-records that height.
     ///
     /// Returns the timer ops the genesis commit produced — chiefly the
-    /// consensus pacemaker's [`TimerId::ViewChange`] arm. The caller spawns
+    /// consensus pacemaker's [`TimerId::ViewChange`](hyperscale_core::TimerId::ViewChange) arm. The caller spawns
     /// the loop after this returns, so it must hand these back as the loop's
     /// initial timer ops; otherwise the first `run_step` clears them and the
     /// shard never arms its pacemaker.
@@ -1005,7 +910,7 @@ where
 /// step), so what "resuming from recovered state" means is written once.
 ///
 /// [`NodeHost::resume_shard_committed`]: crate::host::NodeHost::resume_shard_committed
-pub(crate) fn committed_state_restored(recovered: &RecoveredState) -> ProtocolEvent {
+pub fn committed_state_restored(recovered: &RecoveredState) -> ProtocolEvent {
     ProtocolEvent::CommittedStateRestored {
         height: recovered.committed_height,
         hash: recovered.committed_hash,
@@ -1019,7 +924,10 @@ mod tests {
     use std::sync::Arc;
 
     use crossbeam::channel::Receiver;
-    use hyperscale_core::{Action, CommitSource, Gate, ProtocolEvent, StateMachine};
+    use hyperscale_core::{
+        Action, CommitSource, ConsensusAction, ExecutionAction, Gate, HeaderCommittee,
+        ProtocolEvent, StateMachine,
+    };
     use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
     use hyperscale_network::HandlerRegistry;
     use hyperscale_network_memory::{PendingRequest, SimNetworkAdapter};
@@ -1032,14 +940,16 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-        ChainOrigin, Epoch, FrontierInputs, LocalTimestamp, ProposerTimestamp, QuorumCertificate,
-        Round, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, SignerBitfield, StateRoot,
-        SweepFrontier, TopologySchedule, ValidatorId, Verified, VotePosition, WeightedTimestamp,
+        ChainOrigin, Epoch, FrontierInputs, HeaderSource, LocalTimestamp, ProposerTimestamp,
+        QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
+        SignerBitfield, StateRoot, SweepFrontier, TopologySchedule, ValidatorId, Verified,
+        VotePosition, WeightedTimestamp,
     };
 
+    use crate::event::{BeaconScopedInput, HostEvent};
+    use crate::shard::ThreadShardLoop;
     use crate::shard::cross_shard::RemoteHeaderSyncInput;
     use crate::shard::test_host::{Fixture, Host, Loop, SHARD, loop_of};
-    use crate::shard::{BeaconScopedInput, HostEvent, ThreadShardLoop};
 
     /// A chain of empty blocks a loop commits one at a time, each
     /// prepared over the one before it.
@@ -1281,9 +1191,11 @@ mod tests {
         let asked = actions
             .iter()
             .find_map(|action| match action {
-                Action::SignAndBroadcastTimeout {
-                    signer, position, ..
-                } if *signer == joiner => Some(position.registers.last_voted_round),
+                Action::Consensus(ConsensusAction::SignAndBroadcastTimeout {
+                    signer,
+                    position,
+                    ..
+                }) if *signer == joiner => Some(position.registers.last_voted_round),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("the replica asks the joiner for a timeout: {actions:?}"));
@@ -1380,7 +1292,7 @@ mod tests {
 
     /// A timeout `signer` signs at `round`, its position advanced to it.
     fn timeout_at(signer: ValidatorId, round: u64) -> Action {
-        Action::SignAndBroadcastTimeout {
+        Action::Consensus(ConsensusAction::SignAndBroadcastTimeout {
             round: Round::new(round),
             high_qc: QuorumCertificate::genesis(SHARD, ChainOrigin::root(WeightedTimestamp::ZERO)),
             high_tc: None,
@@ -1393,7 +1305,7 @@ mod tests {
                 justification: Vec::new(),
             },
             signer,
-        }
+        })
     }
 
     /// A signature queued on the pool under one attachment of a
@@ -1599,9 +1511,10 @@ mod tests {
         );
         let certified = CertifiedBlockHeader::new(header, qc);
         loop_of(&mut host).dispatch_event(ProtocolEvent::RemoteHeaderQcVerified {
-            certified_header: Arc::new(certified.clone()),
-            sender: fix.committee.validator_id(2),
+            certified_header: certified.clone(),
+            source: HeaderSource::Gossip(fix.committee.validator_id(2)),
             result: Box::new(Ok(Verified::new_unchecked_for_test(certified))),
+            committee: HeaderCommittee::Resolved,
         });
         let fetches = remote_fetches(&host);
         assert_eq!(fetches.first(), Some(&BlockHeight::new(11)), "{fetches:?}");
@@ -1614,7 +1527,7 @@ mod tests {
     fn an_execution_vote_for_a_co_hosted_leader_is_fed_back_not_sent() {
         use hyperscale_types::{GlobalReceiptRoot, TickId};
 
-        use crate::shard::ShardScopedInput;
+        use crate::event::ShardScopedInput;
 
         let fix = Fixture::new();
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
@@ -1627,16 +1540,18 @@ mod tests {
         let _ = host.network().drain_pending_notifications();
 
         let voter = fix.committee.validator_id(0);
-        loop_of(&mut host).drain_actions(vec![Action::SignAndSendExecutionVote {
-            block_hash: BlockHash::ZERO,
-            vote_anchor_ts: WeightedTimestamp::ZERO,
-            tick_id: TickId::new(SHARD, BlockHeight::new(1)),
-            global_receipt_root: GlobalReceiptRoot::ZERO,
-            tx_outcomes: Vec::new(),
-            recipients: Vec::new(),
-            local_recipient: true,
-            signer: voter,
-        }]);
+        loop_of(&mut host).drain_actions(vec![Action::Execution(
+            ExecutionAction::SignAndSendExecutionVote {
+                block_hash: BlockHash::ZERO,
+                vote_anchor_ts: WeightedTimestamp::ZERO,
+                tick_id: TickId::new(SHARD, BlockHeight::new(1)),
+                global_receipt_root: GlobalReceiptRoot::ZERO,
+                tx_outcomes: Vec::new(),
+                recipients: Vec::new(),
+                local_recipient: true,
+                signer: voter,
+            },
+        )]);
 
         assert!(
             events.try_iter().any(|event| matches!(
@@ -1651,5 +1566,53 @@ mod tests {
         );
         assert!(host.network().drain_outbox().is_empty());
         assert!(host.network().drain_pending_notifications().is_empty());
+    }
+    /// The answer to one of the loop's own fetches reaches it on the
+    /// internal lane however full the network lane is, so the fetch it
+    /// answers is released rather than stranded behind peer traffic.
+    #[test]
+    fn a_fetch_answer_is_released_past_a_full_network_lane() {
+        use crossbeam::channel::unbounded;
+        use hyperscale_core::FetchIds;
+        use hyperscale_network::PeerId;
+
+        use crate::event::{Offer, ShardInbox, ShardScopedInput, network_lane};
+        use crate::fetch::{FetchReply, ShardReply};
+
+        let fix = Fixture::new();
+        let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
+        let (internal_tx, internal) = unbounded();
+        let (lane, _network) = network_lane(1);
+        let (beacon_tx, _beacon) = unbounded();
+        let inbox = ShardInbox::new(internal_tx, lane);
+        let mut host = fix.host_with_inbox(registry, beacon_tx, inbox.clone());
+        assert_eq!(
+            inbox.offer(
+                HostEvent::shard(SHARD, ShardScopedInput::FetchTick),
+                PeerId::new(1)
+            ),
+            Offer::Taken,
+            "the lane has room for one",
+        );
+        while internal.try_recv().is_ok() {}
+
+        let sender = loop_of(&mut host).event_sender().clone();
+        assert!(
+            sender.same_channel(inbox.internal()),
+            "the loop's own sender is its internal lane",
+        );
+        let ids = FetchIds::Transactions(Vec::new());
+        ShardReply {
+            shard: SHARD,
+            sender,
+        }
+        .answered(ids.clone(), ProtocolEvent::CleanupTimer);
+        assert!(
+            internal.try_iter().any(|event| matches!(
+                event,
+                HostEvent::Shard(_, ShardScopedInput::FetchFulfilled(fulfilled)) if fulfilled == ids
+            )),
+            "the answered fetch is released",
+        );
     }
 }

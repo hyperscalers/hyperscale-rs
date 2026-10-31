@@ -2,7 +2,6 @@
 //! shard and height that sent them.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use hyperscale_hbor::{Capped, Hbor};
 
@@ -43,7 +42,7 @@ impl Engagement {
 
     /// The set a block's provisions engage, whatever order they ride in.
     #[must_use]
-    pub fn of_provisions(batches: &[Arc<Verifiable<Provisions>>]) -> BTreeSet<Self> {
+    pub fn of_provisions(batches: &[Verifiable<Provisions>]) -> BTreeSet<Self> {
         batches
             .iter()
             .flat_map(|batch| Self::of_batch(batch))

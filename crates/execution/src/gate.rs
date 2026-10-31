@@ -6,8 +6,6 @@
 //! power, and its keys. What differs between the two arrivals is what
 //! the slot is keyed by, which is what [`Attested`] says.
 
-use std::sync::Arc;
-
 use hyperscale_types::{
     ConsensusPublicKey, ExecutionCertificate, Finalization, Hash, ScheduleLookup, TickId,
     TopologySchedule, Verifiable,
@@ -46,7 +44,7 @@ impl Attested for Verifiable<ExecutionCertificate> {
     }
 }
 
-impl Attested for Arc<Verifiable<Finalization>> {
+impl Attested for Verifiable<Finalization> {
     /// A tick can settle in more than one part, so identity is the
     /// finalization's own content.
     fn slot(&self) -> Hash {
@@ -58,7 +56,7 @@ impl Attested for Arc<Verifiable<Finalization>> {
     }
 
     fn certificate(&self) -> Option<&ExecutionCertificate> {
-        Finalization::certificate(self).map(|ec| ec.as_unverified())
+        Finalization::certificate(self).map(Verifiable::as_unverified)
     }
 }
 
@@ -143,6 +141,8 @@ pub fn gate_certificate(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::Capped;
     use hyperscale_types::{

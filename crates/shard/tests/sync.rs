@@ -2,8 +2,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use common::{HoldFilter, ShardCoordinatorSim};
 use hyperscale_types::test_utils::verified_test_transaction;
 use hyperscale_types::{
@@ -214,7 +212,7 @@ fn a_forged_parent_certificate_starts_no_sync() {
     });
     sim.deliver_header_now(receiver, &header, BlockManifest::default());
 
-    let tx = Arc::new(verified_test_transaction(0x5C));
+    let tx = verified_test_transaction(0x5C);
     let tx_hash = tx.hash();
     sim.admit_transaction(&tx);
     let before = sim.commits[3].len();

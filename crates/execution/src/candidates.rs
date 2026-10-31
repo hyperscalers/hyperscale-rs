@@ -13,7 +13,6 @@
 //! `ledger` is what ends that wait.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member};
@@ -34,7 +33,7 @@ use crate::tick_state::Membership;
 /// One committed transaction awaiting a tick.
 #[derive(Debug)]
 struct Candidate {
-    tx: Arc<Verified<Transaction>>,
+    tx: Verified<Transaction>,
     /// This shard's member of it, derived once at registration: the
     /// frozen classification, where it runs, which of its shard's legs it
     /// takes and what the transaction reaches. Every per-member question
@@ -186,7 +185,7 @@ impl TickCandidates {
     /// sees the block once and one that replays it.
     pub fn register(
         &mut self,
-        tx: Arc<Verified<Transaction>>,
+        tx: Verified<Transaction>,
         participating: BTreeSet<ShardId>,
         committed_ts: WeightedTimestamp,
         committed_prices: PriceTable,
@@ -200,7 +199,7 @@ impl TickCandidates {
     /// block that committed it.
     pub fn register_member(
         &mut self,
-        tx: Arc<Verified<Transaction>>,
+        tx: Verified<Transaction>,
         member: Member,
         committed_ts: WeightedTimestamp,
         committed_prices: PriceTable,
@@ -314,7 +313,7 @@ impl TickCandidates {
             admitted.push(Admitted {
                 request: CrossShardExecutionRequest {
                     tx_hash: *tx_hash,
-                    transaction: Arc::clone(&candidate.tx),
+                    transaction: candidate.tx.clone(),
                     provisions: if reaches_beyond {
                         provisioning.provisions_for(*tx_hash)
                     } else {
@@ -384,13 +383,11 @@ mod tests {
 
     const LOCAL: ShardId = ShardId::ROOT;
 
-    fn tx(seed: u8) -> Arc<Verified<Transaction>> {
-        Arc::new(Verified::new_unchecked_for_test(
-            test_transaction_with_prefixes(
-                &[seed, seed + 1, seed + 2],
-                &[test_prefix(seed)],
-                &[test_prefix(seed.wrapping_add(10))],
-            ),
+    fn tx(seed: u8) -> Verified<Transaction> {
+        Verified::new_unchecked_for_test(test_transaction_with_prefixes(
+            &[seed, seed + 1, seed + 2],
+            &[test_prefix(seed)],
+            &[test_prefix(seed.wrapping_add(10))],
         ))
     }
 
@@ -398,7 +395,7 @@ mod tests {
         WeightedTimestamp::from_millis(v)
     }
 
-    fn local_only(candidates: &mut TickCandidates, tx: Arc<Verified<Transaction>>) -> TxHash {
+    fn local_only(candidates: &mut TickCandidates, tx: Verified<Transaction>) -> TxHash {
         let hash = tx.hash();
         candidates.register(
             tx,
@@ -583,7 +580,7 @@ mod tests {
             );
             let mut candidates = TickCandidates::new(venue);
             candidates.register(
-                Arc::clone(&member),
+                member.clone(),
                 BTreeSet::from([home, venue]),
                 ms(1_000),
                 PriceTable::GENESIS,
@@ -636,7 +633,7 @@ mod tests {
     fn a_node_names_what_the_one_rule_admits() {
         let mut candidates = TickCandidates::new(LOCAL);
         let contender = tx(5);
-        let hash = local_only(&mut candidates, Arc::clone(&contender));
+        let hash = local_only(&mut candidates, contender.clone());
         let trie = ShardTrie::single();
 
         let named = candidates.named(

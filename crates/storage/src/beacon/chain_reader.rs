@@ -17,10 +17,7 @@ use hyperscale_types::{BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch
 /// at the read boundary.
 pub trait BeaconChainReader: Send + Sync {
     /// Block committed at `epoch`, or `None` if absent.
-    fn get_beacon_block_by_epoch(
-        &self,
-        epoch: Epoch,
-    ) -> Option<Arc<Verified<CertifiedBeaconBlock>>>;
+    fn get_beacon_block_by_epoch(&self, epoch: Epoch) -> Option<Verified<CertifiedBeaconBlock>>;
 
     /// Block whose inner header hashes to `hash`, or `None` if absent.
     ///
@@ -29,7 +26,7 @@ pub trait BeaconChainReader: Send + Sync {
     fn get_beacon_block_by_hash(
         &self,
         hash: BeaconBlockHash,
-    ) -> Option<Arc<Verified<CertifiedBeaconBlock>>>;
+    ) -> Option<Verified<CertifiedBeaconBlock>>;
 
     /// `BeaconState` committed at `epoch`, or `None` if absent.
     ///
@@ -45,7 +42,7 @@ pub trait BeaconChainReader: Send + Sync {
     /// Most-recent `(block, state)` pair. `None` before genesis is
     /// committed. Single read; the coordinator uses this on restart to
     /// resume live without walking the chain.
-    fn latest_committed(&self) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)>;
+    fn latest_committed(&self) -> Option<(Verified<CertifiedBeaconBlock>, Arc<BeaconState>)>;
 
     /// Committed states from `floor` through the latest epoch, oldest first
     /// — the boot-time topology history a host's fold resumes over, so the

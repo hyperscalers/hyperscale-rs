@@ -375,7 +375,7 @@ fn settled_reach<R: ShardChainReader + ?Sized>(
 /// still owe their transactions an outcome.
 fn rehydrate(
     certified: Verified<CertifiedBlock>,
-    provisions: Vec<Arc<Verifiable<Provisions>>>,
+    provisions: Vec<Verifiable<Provisions>>,
 ) -> Verified<CertifiedBlock> {
     let (block, qc) = certified.into_inner().into_parts();
     // Sealing keeps the header, and the header is what the hash and the

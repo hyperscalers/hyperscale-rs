@@ -422,8 +422,7 @@ mod tests {
         // still land in the dedup set even though an unassembled ancestor sits
         // between it and the walk start — otherwise a descendant could
         // re-include a transaction already present above the committed tip.
-        let tx: Arc<Verifiable<Transaction>> =
-            Arc::new(Verifiable::from(test_utils::test_transaction(7)));
+        let tx: Verifiable<Transaction> = Verifiable::from(test_utils::test_transaction(7));
         let tx_hash = tx.hash();
         let low = Block::Live {
             header: make_header(1, BlockHash::ZERO),
@@ -487,8 +486,7 @@ mod tests {
     /// uncommitted prefix.
     #[test]
     fn a_sync_admitted_ancestor_is_walked_for_its_names() {
-        let tx: Arc<Verifiable<Transaction>> =
-            Arc::new(Verifiable::from(test_utils::test_transaction(4)));
+        let tx: Verifiable<Transaction> = Verifiable::from(test_utils::test_transaction(4));
         let tx_hash = tx.hash();
         let low = Block::Live {
             header: make_header(1, BlockHash::ZERO),

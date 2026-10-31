@@ -2,7 +2,7 @@
 //! through one or more epochs and captures the committed (block,
 //! state) pair each replica produces.
 //!
-//! Adversary-free honest path: every emitted [`Action`] translates into
+//! Adversary-free honest path: every emitted [`CoordinatorAction`] translates into
 //! the equivalent inbound event on every recipient (and a self-feedback
 //! delivery for sign-and-broadcast variants, mirroring the production
 //! action handler's `notify_protocol(... from = me)` loopback). Two
@@ -16,9 +16,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use hyperscale_beacon::coordinator::BeaconCoordinator;
+use hyperscale_beacon::coordinator::{BeaconCoordinator, CoordinatorAction};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_core::{Action, BeaconFetchIds, FetchIds, FetchRequest, ProtocolEvent};
+use hyperscale_core::{
+    Action, BeaconAction, BeaconBlockCheck, BeaconFetchIds, FoldAction, ParticipantAction,
+    ProtocolEvent,
+};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_types::test_utils::test_pool;
@@ -72,11 +75,11 @@ pub struct Crossing {
     pub leaf_count: u64,
 }
 
-/// One captured commit event from a replica's `Action::CommitBeaconBlock`.
+/// One captured commit event from a replica's `FoldAction::CommitBeaconBlock`.
 #[derive(Clone)]
 pub struct CapturedCommit {
     pub epoch: Epoch,
-    pub block: Arc<Verified<CertifiedBeaconBlock>>,
+    pub block: Verified<CertifiedBeaconBlock>,
     pub state: BeaconState,
 }
 
@@ -123,13 +126,13 @@ enum SimEvent {
     BeaconProposal {
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     },
     BeaconBlock {
-        block: Arc<Verified<CertifiedBeaconBlock>>,
+        block: Verified<CertifiedBeaconBlock>,
     },
     BeaconCandidate {
-        candidate: Arc<Verified<CandidateBeaconBlock>>,
+        candidate: Verified<CandidateBeaconBlock>,
     },
     RatifyVote {
         vote: Arc<Verifiable<RatifyVote>>,
@@ -137,10 +140,10 @@ enum SimEvent {
     BeaconProposalFetched {
         epoch: Epoch,
         validator: ValidatorId,
-        proposal: Arc<Verifiable<BeaconProposal>>,
+        proposal: Verifiable<BeaconProposal>,
     },
     CommitProven {
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
     },
 }
 
@@ -153,7 +156,7 @@ pub struct CoordinatorSim {
     sks: Vec<Arc<BlsSigner>>,
     network: NetworkDefinition,
     /// Per-replica committed (block, state) tuples, ordered by capture
-    /// time. One push per `Action::CommitBeaconBlock` the replica
+    /// time. One push per `FoldAction::CommitBeaconBlock` the replica
     /// emits.
     pub commits: Vec<Vec<CapturedCommit>>,
     network_q: VecDeque<Envelope>,
@@ -201,7 +204,7 @@ pub struct CoordinatorSim {
     blocked_candidate_receivers: BTreeSet<ValidatorId>,
     /// Every candidate any replica broadcast, by block hash: what a
     /// replica holding one serves a candidate fetch from.
-    broadcast_candidates: BTreeMap<BeaconBlockHash, Arc<Verified<CandidateBeaconBlock>>>,
+    broadcast_candidates: BTreeMap<BeaconBlockHash, Verified<CandidateBeaconBlock>>,
     /// Replicas every delivered crossing skips — its block, its child,
     /// and its witness chunk — as if the shard's headers never reached
     /// them.
@@ -209,14 +212,14 @@ pub struct CoordinatorSim {
     /// Every delivered boundary block and its committed child, by
     /// `(shard, height)`: what a commit-proof ask is answered with once
     /// [`Self::serve_commit_proofs`] is on.
-    boundary_blocks: BTreeMap<(ShardId, BlockHeight), Arc<Verified<CertifiedBlockHeader>>>,
+    boundary_blocks: BTreeMap<(ShardId, BlockHeight), Verified<CertifiedBlockHeader>>,
     /// Whether a replica's commit-proof ask is answered, as the
     /// remote-header path answers it with the proven block.
     commit_proofs_served: bool,
     /// The committed chain above a crossing block — its child and the
     /// block that commits the child — held back from a replica, released
     /// in order by [`Self::release_withheld_crossing_children`].
-    withheld_crossing_children: Vec<(usize, Arc<Verified<CertifiedBlockHeader>>)>,
+    withheld_crossing_children: Vec<(usize, Verified<CertifiedBlockHeader>)>,
     /// Each replica's remote-header store, in front of its coordinator for
     /// a crossing delivered by
     /// [`Self::deliver_boundary_crossing_through_remote_headers`]: the
@@ -303,13 +306,13 @@ impl CoordinatorSim {
 
         let initial_state = build_genesis_beacon_state(&config);
         let config_hash = genesis_config_hash(&config, &network, &[]);
-        let genesis_block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        let genesis_block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
 
         let coordinators: Vec<BeaconCoordinator> = (0..pool_n)
             .map(|i| {
                 BeaconCoordinator::new(
                     Arc::new(BlsVerifier),
-                    Arc::clone(&genesis_block),
+                    genesis_block.clone(),
                     vec![initial_state.clone()],
                     members[i].0,
                     ShardId::ROOT,
@@ -371,7 +374,7 @@ impl CoordinatorSim {
 
     /// The candidate some replica broadcast for `epoch`, if one did.
     #[must_use]
-    pub fn broadcast_candidate(&self, epoch: Epoch) -> Option<Arc<Verified<CandidateBeaconBlock>>> {
+    pub fn broadcast_candidate(&self, epoch: Epoch) -> Option<Verified<CandidateBeaconBlock>> {
         self.broadcast_candidates
             .values()
             .find(|candidate| candidate.epoch() == epoch)
@@ -612,7 +615,7 @@ impl CoordinatorSim {
                 let schedule = self.coordinators[idx].topology_schedule();
                 let actions = self.remote_headers[idx].on_verified_remote_header_received(
                     schedule,
-                    Arc::clone(header),
+                    header.clone(),
                     self.members[0].0,
                 );
                 self.follow_remote_headers(idx, actions);
@@ -679,7 +682,7 @@ impl CoordinatorSim {
         state_root: StateRoot,
         leaf_count: u64,
     ) -> (
-        Arc<Verified<CertifiedBlockHeader>>,
+        Verified<CertifiedBlockHeader>,
         Vec<ShardWitnessPayload>,
         Vec<Hash>,
     ) {
@@ -769,7 +772,7 @@ impl CoordinatorSim {
     fn deliver_crossing_pair(
         &mut self,
         shard: ShardId,
-        b: &Arc<Verified<CertifiedBlockHeader>>,
+        b: &Verified<CertifiedBlockHeader>,
         b_height: u64,
         canonical_qc: QuorumCertificate,
         payloads: &[ShardWitnessPayload],
@@ -804,9 +807,9 @@ impl CoordinatorSim {
             payloads.len() as u64,
         );
         self.boundary_blocks
-            .insert((shard, BlockHeight::new(b_height)), Arc::clone(b));
+            .insert((shard, BlockHeight::new(b_height)), b.clone());
         self.boundary_blocks
-            .insert((shard, BlockHeight::new(b_height + 1)), Arc::clone(&c));
+            .insert((shard, BlockHeight::new(b_height + 1)), c.clone());
         for idx in 0..self.coordinators.len() {
             if self.unsynced_boundary_replicas.contains(&idx) {
                 continue;
@@ -820,7 +823,7 @@ impl CoordinatorSim {
                 }
                 for above in [&c, &d] {
                     self.withheld_crossing_children
-                        .push((idx, Arc::clone(above)));
+                        .push((idx, (*above).clone()));
                 }
             } else {
                 for above in [&c, &d] {
@@ -850,7 +853,7 @@ impl CoordinatorSim {
     fn genuine_boundary_qc(
         &self,
         shard: ShardId,
-        b: &Arc<Verified<CertifiedBlockHeader>>,
+        b: &Verified<CertifiedBlockHeader>,
         b_wt: u64,
     ) -> QuorumCertificate {
         let header = b.header();
@@ -907,9 +910,9 @@ impl CoordinatorSim {
     pub fn deliver_block_to(
         &mut self,
         replica_idx: usize,
-        block: &Arc<Verified<CertifiedBeaconBlock>>,
-    ) -> Vec<Action> {
-        let wrapped = Arc::new(Verifiable::from((***block).clone()));
+        block: &Verified<CertifiedBeaconBlock>,
+    ) -> Vec<CoordinatorAction> {
+        let wrapped = Verifiable::from((**block).clone());
         let dispatched = self.coordinators[replica_idx].on_beacon_block_received(wrapped);
         let resolved = self.resolve_verifications(replica_idx, dispatched);
         self.absorb(replica_idx, resolved.clone());
@@ -924,10 +927,10 @@ impl CoordinatorSim {
     pub fn deliver_candidate_to(
         &mut self,
         replica_idx: usize,
-        candidate: &Arc<Verified<CandidateBeaconBlock>>,
+        candidate: &Verified<CandidateBeaconBlock>,
     ) {
-        let actions =
-            self.coordinators[replica_idx].on_beacon_candidate_verified(Ok(Arc::clone(candidate)));
+        let actions = self.coordinators[replica_idx]
+            .on_beacon_candidate_verified(candidate.block_hash(), Ok(candidate.clone()));
         self.absorb(replica_idx, actions);
     }
 
@@ -936,17 +939,21 @@ impl CoordinatorSim {
     /// matching result handler, and recursively expand. Returns the
     /// post-verification action list — caller absorbs them in one
     /// pass.
-    fn resolve_verifications(&mut self, replica_idx: usize, actions: Vec<Action>) -> Vec<Action> {
+    fn resolve_verifications(
+        &mut self,
+        replica_idx: usize,
+        actions: Vec<CoordinatorAction>,
+    ) -> Vec<CoordinatorAction> {
         let mut out = Vec::new();
         for action in actions {
             match action {
-                Action::VerifyBeaconBlock {
+                CoordinatorAction::Fold(FoldAction::VerifyBeaconBlock(BeaconBlockCheck {
                     block,
                     committee,
                     active_pool,
                     equivocation_signers,
-                } => {
-                    let result = Arc::unwrap_or_clone(block)
+                })) => {
+                    let result = block
                         .upgrade(&CertifiedBeaconBlockVerifyContext {
                             verifier: &BlsVerifier,
                             network: &self.network,
@@ -954,29 +961,33 @@ impl CoordinatorSim {
                             active_pool: &active_pool,
                             equivocation_signers: &equivocation_signers,
                         })
-                        .map(Arc::new)
                         .map_err(|(_, e)| e);
                     let post = self.coordinators[replica_idx].on_beacon_block_verified(result);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
-                Action::VerifyBeaconCandidate {
-                    candidate,
-                    committee,
-                    equivocation_signers,
-                } => {
-                    let result = Arc::unwrap_or_clone(candidate)
+                CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::VerifyBeaconCandidate {
+                        candidate,
+                        committee,
+                        equivocation_signers,
+                    },
+                )) => {
+                    let block_hash = candidate.block_hash();
+                    let result = candidate
                         .upgrade(&CandidateVerifyContext {
                             verifier: &BlsVerifier,
                             network: &self.network,
                             committee: &committee,
                             equivocation_signers: &equivocation_signers,
                         })
-                        .map(Arc::new)
                         .map_err(|(_, e)| e);
-                    let post = self.coordinators[replica_idx].on_beacon_candidate_verified(result);
+                    let post = self.coordinators[replica_idx]
+                        .on_beacon_candidate_verified(block_hash, result);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
-                Action::VerifyRatifyVote { vote, signers } => {
+                CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::VerifyRatifyVote { vote, signers },
+                )) => {
                     let anchor = vote.anchor_hash();
                     let epoch = vote.epoch();
                     let round = vote.round();
@@ -1218,7 +1229,7 @@ impl CoordinatorSim {
         self.commits.iter().map(Vec::len).collect()
     }
 
-    fn deliver(&mut self, env: Envelope) -> Vec<Action> {
+    fn deliver(&mut self, env: Envelope) -> Vec<CoordinatorAction> {
         match env.event {
             SimEvent::PcVote1 {
                 epoch, view, vote, ..
@@ -1246,11 +1257,11 @@ impl CoordinatorSim {
                 proposal,
             } => self.coordinators[env.to_idx].on_beacon_proposal_received(from, epoch, proposal),
             SimEvent::BeaconBlock { block } => {
-                let wrapped = Arc::new(Verifiable::from((**block).clone()));
+                let wrapped = Verifiable::from(block.into_inner());
                 self.coordinators[env.to_idx].on_beacon_block_received(wrapped)
             }
             SimEvent::BeaconCandidate { candidate } => {
-                let wrapped = Arc::new(Verifiable::from((**candidate).clone()));
+                let wrapped = Verifiable::from(candidate.into_inner());
                 self.coordinators[env.to_idx].on_beacon_candidate_received(wrapped)
             }
             SimEvent::RatifyVote { vote } => {
@@ -1273,24 +1284,75 @@ impl CoordinatorSim {
     /// envelopes (and captured commits). Unhandled action variants
     /// panic — keeping the sim honest about which beacon actions it
     /// models.
-    fn absorb(&mut self, emitter_idx: usize, actions: Vec<Action>) {
+    fn absorb(&mut self, emitter_idx: usize, actions: Vec<CoordinatorAction>) {
         let me = self.members[emitter_idx].0;
         for action in actions {
             self.absorb_one(emitter_idx, me, action);
         }
     }
 
-    #[allow(clippy::too_many_lines)] // single dispatch over beacon-emitted Action variants
-    fn absorb_one(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
+    fn absorb_one(&mut self, emitter_idx: usize, me: ValidatorId, action: CoordinatorAction) {
         match action {
-            Action::BuildAndBroadcastBeaconProposal {
+            CoordinatorAction::Fold(action) => self.absorb_fold(emitter_idx, action),
+            CoordinatorAction::Participant(action) => {
+                self.absorb_participant(emitter_idx, me, action);
+            }
+        }
+    }
+
+    fn absorb_fold(&mut self, emitter_idx: usize, action: FoldAction) {
+        match action {
+            FoldAction::CommitBeaconBlock { block, state } => {
+                self.commits[emitter_idx].push(CapturedCommit {
+                    epoch: block.epoch(),
+                    block,
+                    state: *state,
+                });
+            }
+            FoldAction::VerifyBeaconBlock(BeaconBlockCheck {
+                block,
+                committee,
+                active_pool,
+                equivocation_signers,
+            }) => {
+                // Production runs this on the consensus crypto pool; the
+                // sim collapses the round-trip to a synchronous inline
+                // verify + result-feedback so verification timing doesn't
+                // reshape envelope-delivery ordering.
+                let result = block
+                    .upgrade(&CertifiedBeaconBlockVerifyContext {
+                        verifier: &BlsVerifier,
+                        network: &self.network,
+                        committee: &committee,
+                        active_pool: &active_pool,
+                        equivocation_signers: &equivocation_signers,
+                    })
+                    .map_err(|(_, e)| e);
+                let post = self.coordinators[emitter_idx].on_beacon_block_verified(result);
+                self.absorb(emitter_idx, post);
+            }
+            FoldAction::Fetch { .. }
+            | FoldAction::AbandonFetch(_)
+            | FoldAction::TopologyChanged { .. }
+            | FoldAction::StartBeaconBlockSync { .. } => {
+                // The sim hands each replica its witness chunks itself;
+                // topology and block catch-up sync are runner concerns
+                // the sim doesn't model.
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // single dispatch over BeaconAction variants
+    fn absorb_participant(&mut self, emitter_idx: usize, me: ValidatorId, action: BeaconAction) {
+        match action {
+            BeaconAction::Participant(ParticipantAction::BuildAndBroadcastBeaconProposal {
                 epoch,
                 boundary_qcs,
                 mut equivocations,
                 fork_proofs,
                 mut vote_equivocations,
                 recipients,
-            } => {
+            }) => {
                 // Splice in any test-scheduled equivocations for this epoch
                 // before the proposal's VRF reveal is signed. Consumed
                 // on first fire so only one replica's broadcast picks
@@ -1303,7 +1365,7 @@ impl CoordinatorSim {
                 }
                 let sk = self.sks[emitter_idx].as_ref();
                 let vrf_proof = beacon_reveal_sign(sk, &self.network, epoch).expect("sign");
-                let redated_copy = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                let redated_copy = Verified::new_unchecked_for_test(BeaconProposal::new(
                     boundary_qcs
                         .iter()
                         .map(|(shard, qc)| (*shard, qc.as_ref().map(redated)))
@@ -1312,14 +1374,14 @@ impl CoordinatorSim {
                     fork_proofs.clone(),
                     vote_equivocations.clone(),
                     vrf_proof,
-                )));
-                let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                ));
+                let proposal = Verified::new_unchecked_for_test(BeaconProposal::new(
                     boundary_qcs,
                     equivocations,
                     fork_proofs,
                     vote_equivocations,
                     vrf_proof,
-                )));
+                ));
                 for rcpt in &recipients {
                     if self.blocked_proposal_pairs.remove(&(me, *rcpt)) {
                         // Single-shot test filter: simulate a dropped
@@ -1337,7 +1399,7 @@ impl CoordinatorSim {
                         event: SimEvent::BeaconProposal {
                             from: me,
                             epoch,
-                            proposal: Arc::clone(handed),
+                            proposal: handed.clone(),
                         },
                     });
                 }
@@ -1360,14 +1422,13 @@ impl CoordinatorSim {
                 ) {
                     self.byzantine[emitter_idx] = None;
                     self.byzantine_fires[emitter_idx] += 1;
-                    let conflicting =
-                        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
-                            BTreeMap::new(),
-                            Vec::new(),
-                            BTreeMap::new(),
-                            Vec::new(),
-                            vrf_proof,
-                        )));
+                    let conflicting = Verified::new_unchecked_for_test(BeaconProposal::new(
+                        BTreeMap::new(),
+                        Vec::new(),
+                        BTreeMap::new(),
+                        Vec::new(),
+                        vrf_proof,
+                    ));
                     for rcpt in &recipients {
                         let to_idx = self.idx_of(*rcpt);
                         self.network_q.push_back(Envelope {
@@ -1375,7 +1436,7 @@ impl CoordinatorSim {
                             event: SimEvent::BeaconProposal {
                                 from: me,
                                 epoch,
-                                proposal: Arc::clone(&conflicting),
+                                proposal: conflicting.clone(),
                             },
                         });
                     }
@@ -1389,12 +1450,12 @@ impl CoordinatorSim {
                     });
                 }
             }
-            Action::SignAndBroadcastPcVote1 {
+            BeaconAction::Participant(ParticipantAction::SignAndBroadcastPcVote1 {
                 epoch,
                 view,
                 v_in,
                 recipients,
-            } => {
+            }) => {
                 let pc_ctx = PcScope { epoch, view };
                 let vote = sign_vote1(
                     self.sks[emitter_idx].as_ref(),
@@ -1435,12 +1496,12 @@ impl CoordinatorSim {
                     );
                 }
             }
-            Action::SignAndBroadcastPcVote2 {
+            BeaconAction::Participant(ParticipantAction::SignAndBroadcastPcVote2 {
                 epoch,
                 view,
                 qc1,
                 recipients,
-            } => {
+            }) => {
                 let pc_ctx = PcScope { epoch, view };
                 let vote = sign_vote2(
                     self.sks[emitter_idx].as_ref(),
@@ -1452,12 +1513,12 @@ impl CoordinatorSim {
                 .expect("sign");
                 self.queue_pc_vote2(emitter_idx, me, &recipients, epoch, view, Box::new(vote));
             }
-            Action::SignAndBroadcastPcVote3 {
+            BeaconAction::Participant(ParticipantAction::SignAndBroadcastPcVote3 {
                 epoch,
                 view,
                 qc2,
                 recipients,
-            } => {
+            }) => {
                 let pc_ctx = PcScope { epoch, view };
                 let vote = sign_vote3(
                     self.sks[emitter_idx].as_ref(),
@@ -1469,12 +1530,12 @@ impl CoordinatorSim {
                 .expect("sign");
                 self.queue_pc_vote3(emitter_idx, me, &recipients, epoch, view, Box::new(vote));
             }
-            Action::SignAndBroadcastEmptyView {
+            BeaconAction::Participant(ParticipantAction::SignAndBroadcastEmptyView {
                 epoch,
                 view,
                 reported,
                 recipients,
-            } => {
+            }) => {
                 let spc_ctx = epoch;
                 let verified = Verified::<SpcEmptyViewMsg>::sign_local(
                     self.sks[emitter_idx].as_ref(),
@@ -1501,11 +1562,11 @@ impl CoordinatorSim {
                     event: SimEvent::SpcEmptyView { epoch, msg },
                 });
             }
-            Action::BroadcastSpcNewView {
+            BeaconAction::Participant(ParticipantAction::BroadcastSpcNewView {
                 epoch,
                 proposal,
                 recipients,
-            } => {
+            }) => {
                 let proposal = Arc::new(Verifiable::from(*proposal));
                 for rcpt in &recipients {
                     let to_idx = self.idx_of(*rcpt);
@@ -1519,11 +1580,11 @@ impl CoordinatorSim {
                     });
                 }
             }
-            Action::BroadcastSpcNewCommit {
+            BeaconAction::Participant(ParticipantAction::BroadcastSpcNewCommit {
                 epoch,
                 msg,
                 recipients,
-            } => {
+            }) => {
                 let msg = Arc::new(Verifiable::from(*msg));
                 for rcpt in &recipients {
                     let to_idx = self.idx_of(*rcpt);
@@ -1537,7 +1598,7 @@ impl CoordinatorSim {
                     });
                 }
             }
-            Action::BroadcastBeaconBlock { block } => {
+            BeaconAction::Participant(ParticipantAction::BroadcastBeaconBlock { block }) => {
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
@@ -1549,15 +1610,17 @@ impl CoordinatorSim {
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::BeaconBlock {
-                            block: Arc::clone(&block),
+                            block: block.clone(),
                         },
                     });
                 }
             }
-            Action::BroadcastBeaconCandidate { candidate } => {
+            BeaconAction::Participant(ParticipantAction::BroadcastBeaconCandidate {
+                candidate,
+            }) => {
                 self.broadcast_candidates
                     .entry(candidate.block_hash())
-                    .or_insert_with(|| Arc::clone(&candidate));
+                    .or_insert_with(|| candidate.clone());
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
@@ -1571,19 +1634,19 @@ impl CoordinatorSim {
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::BeaconCandidate {
-                            candidate: Arc::clone(&candidate),
+                            candidate: candidate.clone(),
                         },
                     });
                 }
             }
-            Action::SignAndBroadcastRatifyVote {
+            BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote {
                 anchor,
                 epoch,
                 round,
                 phase,
                 block_hash,
                 proof,
-            } => {
+            }) => {
                 let sk = self.sks[emitter_idx].as_ref();
                 let signer = self.members[emitter_idx].0;
                 let verified = Verified::<RatifyVote>::sign_local(
@@ -1627,54 +1690,25 @@ impl CoordinatorSim {
                     }
                 }
             }
-            Action::CommitBeaconBlock { block, state } => {
-                self.commits[emitter_idx].push(CapturedCommit {
-                    epoch: block.epoch(),
-                    block,
-                    state: *state,
-                });
-            }
-            Action::VerifyBeaconBlock {
-                block,
-                committee,
-                active_pool,
-                equivocation_signers,
-            } => {
-                // Production runs this on the consensus crypto pool; the
-                // sim collapses the round-trip to a synchronous inline
-                // verify + result-feedback so verification timing doesn't
-                // reshape envelope-delivery ordering.
-                let result = Arc::unwrap_or_clone(block)
-                    .upgrade(&CertifiedBeaconBlockVerifyContext {
-                        verifier: &BlsVerifier,
-                        network: &self.network,
-                        committee: &committee,
-                        active_pool: &active_pool,
-                        equivocation_signers: &equivocation_signers,
-                    })
-                    .map(Arc::new)
-                    .map_err(|(_, e)| e);
-                let post = self.coordinators[emitter_idx].on_beacon_block_verified(result);
-                self.absorb(emitter_idx, post);
-            }
-            Action::VerifyBeaconCandidate {
+            BeaconAction::Participant(ParticipantAction::VerifyBeaconCandidate {
                 candidate,
                 committee,
                 equivocation_signers,
-            } => {
-                let result = Arc::unwrap_or_clone(candidate)
+            }) => {
+                let block_hash = candidate.block_hash();
+                let result = candidate
                     .upgrade(&CandidateVerifyContext {
                         verifier: &BlsVerifier,
                         network: &self.network,
                         committee: &committee,
                         equivocation_signers: &equivocation_signers,
                     })
-                    .map(Arc::new)
                     .map_err(|(_, e)| e);
-                let post = self.coordinators[emitter_idx].on_beacon_candidate_verified(result);
+                let post =
+                    self.coordinators[emitter_idx].on_beacon_candidate_verified(block_hash, result);
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifyRatifyVote { vote, signers } => {
+            BeaconAction::Participant(ParticipantAction::VerifyRatifyVote { vote, signers }) => {
                 let anchor = vote.anchor_hash();
                 let epoch = vote.epoch();
                 let round = vote.round();
@@ -1691,12 +1725,12 @@ impl CoordinatorSim {
                     .on_ratify_vote_verified(anchor, epoch, round, phase, signer, result);
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifyPcVote1 {
+            BeaconAction::Participant(ParticipantAction::VerifyPcVote1 {
                 epoch,
                 view,
                 vote,
                 committee,
-            } => {
+            }) => {
                 let pc_ctx = PcScope { epoch, view };
                 let signer = vote.validator();
                 let result = vote.upgrade(&PcVoteVerifyContext {
@@ -1713,12 +1747,12 @@ impl CoordinatorSim {
                 );
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifyPcVote2 {
+            BeaconAction::Participant(ParticipantAction::VerifyPcVote2 {
                 epoch,
                 view,
                 vote,
                 committee,
-            } => {
+            }) => {
                 let pc_ctx = PcScope { epoch, view };
                 let signer = vote.validator();
                 let result = (*vote).upgrade(&PcVoteVerifyContext {
@@ -1735,12 +1769,12 @@ impl CoordinatorSim {
                 );
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifyPcVote3 {
+            BeaconAction::Participant(ParticipantAction::VerifyPcVote3 {
                 epoch,
                 view,
                 vote,
                 committee,
-            } => {
+            }) => {
                 let pc_ctx = PcScope { epoch, view };
                 let signer = vote.validator();
                 let result = (*vote).upgrade(&PcVoteVerifyContext {
@@ -1757,12 +1791,12 @@ impl CoordinatorSim {
                 );
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifySpcNewView {
+            BeaconAction::Participant(ParticipantAction::VerifySpcNewView {
                 epoch,
                 from,
                 proposal,
                 committee,
-            } => {
+            }) => {
                 let spc_ctx = epoch;
                 let view = proposal.view;
                 let result = (*proposal).upgrade(&SpcVerifyContext {
@@ -1779,12 +1813,12 @@ impl CoordinatorSim {
                 );
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifySpcNewCommit {
+            BeaconAction::Participant(ParticipantAction::VerifySpcNewCommit {
                 epoch,
                 from,
                 msg,
                 committee,
-            } => {
+            }) => {
                 let spc_ctx = epoch;
                 let view = msg.view;
                 let result = (*msg).upgrade(&SpcVerifyContext {
@@ -1801,11 +1835,11 @@ impl CoordinatorSim {
                 );
                 self.absorb(emitter_idx, post);
             }
-            Action::VerifySpcEmptyView {
+            BeaconAction::Participant(ParticipantAction::VerifySpcEmptyView {
                 epoch,
                 msg,
                 committee,
-            } => {
+            }) => {
                 let spc_ctx = epoch;
                 let from = msg.signer;
                 let view = msg.view;
@@ -1823,11 +1857,11 @@ impl CoordinatorSim {
                 );
                 self.absorb(emitter_idx, post);
             }
-            Action::Fetch(FetchRequest::Ask {
-                ids: FetchIds::Beacon(BeaconFetchIds::Proposals(ref wanted)),
+            BeaconAction::Fetch {
+                ids: BeaconFetchIds::Proposals(ref wanted),
                 preferred,
                 ..
-            }) if wanted.len() == 1 => {
+            } if wanted.len() == 1 => {
                 let (epoch, validator) = wanted[0];
                 // Walk every other coordinator (with `preferred` first if
                 // set) and look up the proposal directly in its
@@ -1849,8 +1883,7 @@ impl CoordinatorSim {
                     if pool.epoch() != epoch {
                         return None;
                     }
-                    pool.get(validator)
-                        .map(|verified| Arc::new(Verifiable::from((*verified).clone())))
+                    pool.get(validator).map(Verifiable::from)
                 });
                 if let Some(proposal) = proposal {
                     self.loopback_q.push_back(Envelope {
@@ -1863,10 +1896,10 @@ impl CoordinatorSim {
                     });
                 }
             }
-            Action::Continuation(ProtocolEvent::CommitProofNeeded {
+            BeaconAction::AskCommitProof {
                 source_shard,
                 block_height,
-            }) => {
+            } => {
                 if self.remote_headers_followed {
                     let schedule = self.coordinators[emitter_idx].topology_schedule();
                     let answer = self.remote_headers[emitter_idx].request_commit_proof(
@@ -1881,16 +1914,16 @@ impl CoordinatorSim {
                     self.loopback_q.push_back(Envelope {
                         to_idx: emitter_idx,
                         event: SimEvent::CommitProven {
-                            certified_header: Arc::clone(block),
+                            certified_header: block.clone(),
                         },
                     });
                 }
             }
-            Action::Fetch(FetchRequest::Ask {
-                ids: FetchIds::Beacon(BeaconFetchIds::Candidates(ref wanted)),
+            BeaconAction::Fetch {
+                ids: BeaconFetchIds::Candidates(ref wanted),
                 preferred,
                 ..
-            }) if wanted.len() == 1 => {
+            } if wanted.len() == 1 => {
                 let (_, block_hash) = wanted[0];
                 // Served by a replica that holds the candidate, the
                 // preferred prevoter first; an unanswered ask queues
@@ -1909,27 +1942,22 @@ impl CoordinatorSim {
                     self.loopback_q.push_back(Envelope {
                         to_idx: emitter_idx,
                         event: SimEvent::BeaconCandidate {
-                            candidate: Arc::clone(candidate),
+                            candidate: candidate.clone(),
                         },
                     });
                 }
             }
-            Action::Fetch(_)
-            | Action::AbandonFetch(_)
-            | Action::SetTimer { .. }
-            | Action::CancelTimer { .. }
-            | Action::TopologyChanged { .. }
-            | Action::ReconfigureParticipation(_)
-            | Action::StartBeaconBlockSync { .. } => {
+            BeaconAction::Fetch { .. }
+            | BeaconAction::AbandonFetch(_)
+            | BeaconAction::SetTimer { .. }
+            | BeaconAction::CancelTimer { .. }
+            | BeaconAction::ReconfigureParticipation(_)
+            | BeaconAction::StartBeaconBlockSync { .. } => {
                 // Other Fetch/Abandon variants don't surface from the
-                // beacon coordinator under this sim; timers, topology,
+                // beacon participant under this sim; timers,
                 // participation, and block catch-up sync are runner
                 // concerns the sim doesn't model.
             }
-            other => panic!(
-                "CoordinatorSim received unmodelled action variant: {}",
-                other.type_name(),
-            ),
         }
     }
 
@@ -2050,7 +2078,7 @@ fn make_source_header_with_parent_qc(
     state_root: StateRoot,
     witness_root: BeaconWitnessRoot,
     leaf_count: u64,
-) -> Arc<Verified<CertifiedBlockHeader>> {
+) -> Verified<CertifiedBlockHeader> {
     make_source_header_in_round(
         shard,
         height,
@@ -2073,7 +2101,7 @@ fn make_source_header_in_round(
     state_root: StateRoot,
     witness_root: BeaconWitnessRoot,
     leaf_count: u64,
-) -> Arc<Verified<CertifiedBlockHeader>> {
+) -> Verified<CertifiedBlockHeader> {
     let parent_hash = parent_qc.block_hash();
     let parent_wt = parent_qc.weighted_timestamp();
     let header = BlockHeader::new(BlockHeaderParts {
@@ -2098,9 +2126,7 @@ fn make_source_header_in_round(
         AggregateSignature::ZERO,
         parent_wt,
     );
-    Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-        header, qc,
-    )))
+    Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
 }
 
 /// Build a verified source-shard `CertifiedBlockHeader` whose `parent_qc`
@@ -2117,7 +2143,7 @@ fn make_linked_source_header(
     state_root: StateRoot,
     witness_root: BeaconWitnessRoot,
     leaf_count: u64,
-) -> Arc<Verified<CertifiedBlockHeader>> {
+) -> Verified<CertifiedBlockHeader> {
     let parent_qc = QuorumCertificate::new(
         parent_hash,
         shard,
@@ -2143,7 +2169,7 @@ fn make_linked_source_header(
 /// chain's shape and verifies no signature.
 fn placeholder_qc(
     shard: ShardId,
-    block: &Arc<Verified<CertifiedBlockHeader>>,
+    block: &Verified<CertifiedBlockHeader>,
     wt: u64,
 ) -> QuorumCertificate {
     QuorumCertificate::new(

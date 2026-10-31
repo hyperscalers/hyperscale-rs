@@ -14,7 +14,6 @@ mod fetch;
 mod finalization_serve;
 mod local_provision_serve;
 mod provision_serve;
-mod remote_header;
 mod remote_header_serve;
 mod remote_header_sync;
 mod settled_txs_serve;
@@ -30,9 +29,9 @@ use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
 use hyperscale_types::LocalTimestamp;
 pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
-pub use remote_header::RemoteHeaderSyncInput;
-use remote_header::{RemoteHeaderSync, RemoteHeaderSyncOutput};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
+pub use remote_header_sync::RemoteHeaderSyncInput;
+use remote_header_sync::{RemoteHeaderSync, RemoteHeaderSyncOutput};
 pub use settled_txs_serve::{SettledTxsCache, serve_settled_txs_request};
 pub use state_proof_serve::{serve_cells_request, serve_state_proof_request};
 
@@ -69,7 +68,7 @@ pub struct CrossShardState {
 const STATE_PROOF_FETCH: FetchConfig = FetchConfig {
     max_in_flight: 256,
     max_ids_per_request: 64,
-    parallel_chunks_per_tick: 2,
+    chunks_per_dispatch: 2,
 };
 
 /// How many verdict questions one request carries: each expands to
@@ -90,7 +89,7 @@ const VERDICT_REQUESTS_IN_FLIGHT: usize = 4;
 const VERDICT_PROOF_FETCH: FetchConfig = FetchConfig {
     max_in_flight: VERDICT_REQUESTS_IN_FLIGHT * VERDICT_QUESTIONS_PER_REQUEST,
     max_ids_per_request: VERDICT_QUESTIONS_PER_REQUEST,
-    parallel_chunks_per_tick: VERDICT_REQUESTS_IN_FLIGHT,
+    chunks_per_dispatch: VERDICT_REQUESTS_IN_FLIGHT,
 };
 
 const _: () = assert!(VERDICT_QUESTIONS_PER_REQUEST == MAX_VERDICT_ASKS_PER_SIBLING);
@@ -100,14 +99,14 @@ impl CrossShardState {
     #[must_use]
     pub(crate) fn new(config: &NodeConfig) -> Self {
         Self {
-            remote_header_sync: RemoteHeaderSync::new(remote_header::default_config()),
+            remote_header_sync: RemoteHeaderSync::new(remote_header_sync::default_config()),
             provision: ProvisionFetch::new("provision", config.provision_fetch.clone()),
             finalization: FinalizationFetch::new(
                 "finalization",
                 FetchConfig {
                     max_in_flight: 8,
                     max_ids_per_request: 4,
-                    parallel_chunks_per_tick: 1,
+                    chunks_per_dispatch: 1,
                 },
             ),
             local_provision: LocalProvisionFetch::new(
@@ -115,7 +114,7 @@ impl CrossShardState {
                 FetchConfig {
                     max_in_flight: 64,
                     max_ids_per_request: 16,
-                    parallel_chunks_per_tick: 2,
+                    chunks_per_dispatch: 2,
                 },
             ),
             state_proof: StateProofFetch::new("state_proof", STATE_PROOF_FETCH),
@@ -125,7 +124,7 @@ impl CrossShardState {
                 FetchConfig {
                     max_in_flight: 8,
                     max_ids_per_request: 8,
-                    parallel_chunks_per_tick: 2,
+                    chunks_per_dispatch: 2,
                 },
             ),
         }

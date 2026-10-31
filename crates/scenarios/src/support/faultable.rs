@@ -120,7 +120,7 @@ pub trait FaultableCluster: Cluster {
 
     /// Submit `tx` at `host` itself, whatever it serves, as a client
     /// talking to its own node does.
-    fn submit_at_host(&mut self, host: usize, tx: Arc<Transaction>);
+    fn submit_at_host(&mut self, host: usize, tx: Transaction);
 
     /// The hosts whose vnode sits in `shard`'s live committee — the copy
     /// currently seated, not a terminated chain lingering on old hosts.

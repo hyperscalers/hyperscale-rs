@@ -13,7 +13,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
@@ -390,7 +389,7 @@ impl World {
 /// charged once.
 #[derive(Default)]
 pub struct Charges {
-    owed: BTreeMap<TxHash, Arc<Transaction>>,
+    owed: BTreeMap<TxHash, Transaction>,
     /// Transactions a chain has been seen to carry the burn of. A burn
     /// never uncommits, so the walk that found it is not repeated.
     burned: RefCell<BTreeSet<TxHash>>,
@@ -398,15 +397,14 @@ pub struct Charges {
 
 impl Charges {
     /// Record `tx` without submitting it.
-    pub fn record(&mut self, tx: &Arc<Transaction>) -> TxHash {
+    pub fn record(&mut self, tx: &Transaction) -> TxHash {
         let hash = tx.hash();
-        self.owed.insert(hash, Arc::clone(tx));
+        self.owed.insert(hash, tx.clone());
         hash
     }
 
     /// Record `tx` and submit it.
     pub fn submit<C: Cluster + ?Sized>(&mut self, c: &mut C, tx: Transaction) -> TxHash {
-        let tx = Arc::new(tx);
         let hash = self.record(&tx);
         c.submit(tx);
         hash
@@ -419,12 +417,11 @@ impl Charges {
         &mut self,
         c: &mut C,
         shard: ShardId,
-        tx: Transaction,
+        tx: &Transaction,
     ) -> TxHash {
-        let tx = Arc::new(tx);
-        let hash = self.record(&tx);
+        let hash = self.record(tx);
         for host in c.committee_hosts(shard) {
-            c.submit_at_host(host, Arc::clone(&tx));
+            c.submit_at_host(host, tx.clone());
         }
         hash
     }
@@ -453,7 +450,7 @@ impl Charges {
     /// The envelope recorded under `hash`, for a scenario that has to
     /// offer the same signed transaction again.
     #[must_use]
-    pub fn recorded(&self, hash: TxHash) -> Option<&Arc<Transaction>> {
+    pub fn recorded(&self, hash: TxHash) -> Option<&Transaction> {
         self.owed.get(&hash)
     }
 
@@ -578,6 +575,7 @@ fn covering_chains(payer: Address) -> impl Iterator<Item = ShardId> {
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
 
     use hyperscale_engine::{ExecutionMode, Executor};
     use hyperscale_types::{
@@ -599,11 +597,11 @@ mod tests {
     }
 
     impl Cluster for Nowhere {
-        fn submit(&mut self, _: Arc<Transaction>) {
+        fn submit(&mut self, _: Transaction) {
             unreachable!()
         }
 
-        fn submit_to(&mut self, _: ShardId, _: Arc<Transaction>) {
+        fn submit_to(&mut self, _: ShardId, _: Transaction) {
             unreachable!()
         }
 
@@ -719,13 +717,13 @@ mod tests {
     /// A recorded transfer, derived.
     fn recorded() -> (Charges, TxHash) {
         let (payer, from) = sender(0);
-        let tx = Arc::new(build_transfer_tx(
+        let tx = build_transfer_tx(
             &payer,
             from,
             recipient(0),
             1,
             validity_around(Duration::ZERO),
-        ));
+        );
         tx.try_derived(Executor::new(ExecutionMode::Serial).derivation().as_ref())
             .expect("a transfer derives on a fresh engine");
         let mut charges = Charges::default();

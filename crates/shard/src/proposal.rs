@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_core::Action;
+use hyperscale_core::{Action, ConsensusAction};
 use hyperscale_engine::tick_select::{ManifestInputs, terms_of};
 use hyperscale_metrics::record_retirements_spent;
 use hyperscale_storage::{
@@ -41,7 +41,7 @@ use tracing::debug;
 use crate::admission::{
     Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, Section, StateClaimsFold, StateClaimsSection, TransactionsFold,
-    TransactionsSection, admit_each, predated_at, unwrapped,
+    TransactionsSection, admit_each, predated_at,
 };
 use crate::carried::CommittedCarried;
 use crate::chain_view::ChainView;
@@ -123,11 +123,11 @@ impl ProposalAsk<'_> {
 #[derive(Debug, Default)]
 pub struct ProposalInputs {
     /// The pool's ready set, in hash order.
-    pub ready_txs: Vec<Arc<Verified<Transaction>>>,
+    pub ready_txs: Vec<Verified<Transaction>>,
     /// Finalizations execution holds ready to commit.
-    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    pub finalizations: Vec<Verifiable<Finalization>>,
     /// Provision bundles queued from remote shards.
-    pub provisions: Vec<Arc<Verifiable<Provisions>>>,
+    pub provisions: Vec<Verifiable<Provisions>>,
     /// What departed counterparts left of this chain's business.
     pub abandonment_records: Vec<AbandonmentRecord>,
     /// Proofs of counterparts' cells this validator's fetches answered.
@@ -205,9 +205,9 @@ impl ProposalKind {
 /// the chain. Empty for a block that exists only to advance the chain.
 #[derive(Debug, Default)]
 pub struct ProposalPayload {
-    pub(crate) transactions: Vec<Arc<Verified<Transaction>>>,
-    pub(crate) finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
+    pub(crate) transactions: Vec<Verified<Transaction>>,
+    pub(crate) finalizations: Vec<Verifiable<Finalization>>,
+    pub(crate) provisions: Vec<Verifiable<Provisions>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
     /// The crossings whose ends share this shard, and those whose record
@@ -223,7 +223,7 @@ pub struct ProposalPayload {
     /// The legs halves among `finalizations` this proposer cut to the
     /// names that stand at the block's anchor: no other replica holds
     /// them, so they are handed to the node that serves them.
-    pub(crate) cut_legs: Vec<Arc<Verifiable<Finalization>>>,
+    pub(crate) cut_legs: Vec<Verifiable<Finalization>>,
 }
 
 impl ProposalPayload {
@@ -370,12 +370,12 @@ pub fn select_transactions(
     ctx: &Committed<'_>,
     prefilter: Prefilter<'_>,
     fold: &mut TransactionsFold<'_>,
-    ready_txs: &[Arc<Verified<Transaction>>],
-) -> Vec<Arc<Verified<Transaction>>> {
+    ready_txs: &[Verified<Transaction>],
+) -> Vec<Verified<Transaction>> {
     let before = ready_txs.len();
     let mut expired = 0;
     let mut predates = 0;
-    let candidates: Vec<Arc<Verified<Transaction>>> = ready_txs
+    let candidates: Vec<Verified<Transaction>> = ready_txs
         .iter()
         .filter(|tx| {
             let h = tx.hash();
@@ -457,9 +457,9 @@ pub fn select_transactions(
 pub fn select_finalizations(
     ctx: &Committed<'_>,
     fold: &mut FinalizationsFold,
-    finalizations: Vec<Arc<Verifiable<Finalization>>>,
-) -> Vec<Arc<Verifiable<Finalization>>> {
-    admit_each::<FinalizationsSection, _>(ctx, fold, finalizations, unwrapped).0
+    finalizations: Vec<Verifiable<Finalization>>,
+) -> Vec<Verifiable<Finalization>> {
+    admit_each::<FinalizationsSection, _>(ctx, fold, finalizations, Verifiable::as_unverified).0
 }
 
 /// Select the boundary records for inclusion: each trimmed to the names
@@ -682,7 +682,7 @@ pub fn select_claims(
     retirement_claims: &[BoundaryOffer],
     capped: &[ShardId],
     local_crossings: Vec<CrossingId>,
-    finalizations: &[Arc<Verifiable<Finalization>>],
+    finalizations: &[Verifiable<Finalization>],
 ) -> (Vec<StateClaim>, ParentReads) {
     let mut lists = AnchorLists::default();
     let (taken_back, rest) = spend_the_reserve(ctx, fold, boundary_claims, capped, &mut lists);
@@ -922,7 +922,7 @@ const RETIREMENT_BYTES: usize = MAX_STATE_CLAIMS_BYTES / 3;
 const RETIREMENT_PLACES: usize = MAX_STATE_CLAIMS_PER_BLOCK / 4;
 
 /// The transactions whose rows `finalizations` delete.
-fn deleted_by(finalizations: &[Arc<Verifiable<Finalization>>]) -> BTreeSet<TxHash> {
+fn deleted_by(finalizations: &[Verifiable<Finalization>]) -> BTreeSet<TxHash> {
     finalizations
         .iter()
         .flat_map(|fw| SettledHalf::of(fw.as_unverified()).deleted)
@@ -1435,9 +1435,9 @@ fn trim_parent_reads((places, spent): (usize, usize), mut offered: ParentReads) 
 pub fn select_provisions(
     ctx: &Committed<'_>,
     fold: &mut ProvisionsFold,
-    provisions: Vec<Arc<Verifiable<Provisions>>>,
-) -> Vec<Arc<Verifiable<Provisions>>> {
-    admit_each::<ProvisionsSection, _>(ctx, fold, provisions, unwrapped).0
+    provisions: Vec<Verifiable<Provisions>>,
+) -> Vec<Verifiable<Provisions>> {
+    admit_each::<ProvisionsSection, _>(ctx, fold, provisions, Verifiable::as_unverified).0
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1539,7 +1539,7 @@ pub fn assemble_build_action(
     // form; HBOR encoding is byte-identical between the raw and
     // verified shapes, but the field type is raw.
     let parent_qc_raw = parent_qc.into_inner();
-    let action = Action::BuildProposal {
+    let action = Action::Consensus(ConsensusAction::BuildProposal {
         shard_id: local_shard,
         chain_origin: chain.chain_origin().cut(),
         proposer: me,
@@ -1579,7 +1579,7 @@ pub fn assemble_build_action(
         manifest,
         timeout_cert,
         standing_answers,
-    };
+    });
 
     BuildActionPlan {
         action,
@@ -1774,12 +1774,12 @@ mod tests {
             Against::schedule(TopologySnapshot::clone(stamped.head()), stamped.clone());
         against.anchor = inside;
         against.local_shard = SURVIVOR;
-        let resolving = Arc::new(Verifiable::from(make_finalization_on(
+        let resolving = Verifiable::from(make_finalization_on(
             SURVIVOR,
             BlockHeight::new(1),
             stranded().tx_hash,
             TransactionDecision::Accept,
-        )));
+        ));
         against.holding_settled(from_ref(&resolving));
         let ctx = against.ctx();
         let none = FinalizationsFold::from(&ctx);
@@ -1814,19 +1814,17 @@ mod tests {
     #[test]
     fn select_finalizations_offers_one_verdict_per_transaction() {
         let tx_hash = TxHash::from(Hash::from_bytes(b"contested"));
-        let settled: Arc<Verifiable<Finalization>> = Arc::new(
-            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into(),
-        );
-        let abandoned: Arc<Verifiable<Finalization>> = Arc::new(
-            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into(),
-        );
+        let settled: Verifiable<Finalization> =
+            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into();
+        let abandoned: Verifiable<Finalization> =
+            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into();
         assert_ne!(settled.tick_id(), abandoned.tick_id());
 
         let mut against = finalizations_against(CommitDedupIndex::new());
-        against.holding_settled(&[Arc::clone(&settled), Arc::clone(&abandoned)]);
+        against.holding_settled(&[settled.clone(), abandoned.clone()]);
         let ctx = against.ctx();
         let mut fold = FinalizationsFold::from(&ctx);
-        let selected = select_finalizations(&ctx, &mut fold, vec![Arc::clone(&settled), abandoned]);
+        let selected = select_finalizations(&ctx, &mut fold, vec![settled.clone(), abandoned]);
         assert_eq!(selected.len(), 1, "the second verdict is dropped");
         assert_eq!(selected[0].tick_id(), settled.tick_id());
         assert_eq!(fold.tx_count, 1);
@@ -1846,15 +1844,15 @@ mod tests {
     #[test]
     fn select_finalizations_drops_a_committed_offer_that_decided_nothing() {
         let tx_hash = TxHash::from(Hash::from_bytes(b"retired"));
-        let committed: Arc<Verifiable<Finalization>> =
-            Arc::new(make_leg_finalization(BlockHeight::new(1), tx_hash).into());
+        let committed: Verifiable<Finalization> =
+            make_leg_finalization(BlockHeight::new(1), tx_hash).into();
         assert_eq!(
             committed.deciding_tx_hashes().count(),
             0,
             "the fixture has to decide nothing, or it tests the ordinary path",
         );
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(&[Arc::clone(&committed)], WeightedTimestamp::ZERO);
+        dedup_index.register_committed_certs(from_ref(&committed), WeightedTimestamp::ZERO);
 
         let against = finalizations_against(dedup_index);
         let ctx = against.ctx();
@@ -1872,15 +1870,13 @@ mod tests {
     #[test]
     fn select_finalizations_drops_what_the_retention_window_resolved() {
         let tx_hash = TxHash::from(Hash::from_bytes(b"already resolved"));
-        let committed: Arc<Verifiable<Finalization>> = Arc::new(
-            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into(),
-        );
+        let committed: Verifiable<Finalization> =
+            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into();
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(from_ref(&committed), WeightedTimestamp::ZERO);
 
-        let abandoned: Arc<Verifiable<Finalization>> = Arc::new(
-            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into(),
-        );
+        let abandoned: Verifiable<Finalization> =
+            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into();
         let against = finalizations_against(dedup_index);
         let ctx = against.ctx();
         let mut fold = FinalizationsFold::from(&ctx);
@@ -1987,14 +1983,14 @@ mod tests {
         WeightedTimestamp::from_millis(ms)
     }
 
-    fn tx_with_range(seed: u8, range: TimestampRange) -> Arc<Verified<Transaction>> {
+    fn tx_with_range(seed: u8, range: TimestampRange) -> Verified<Transaction> {
         install_stub_protocol_statics();
-        Arc::new(Verified::<Transaction>::from_persisted(stub_transaction(
+        Verified::<Transaction>::from_persisted(stub_transaction(
             test_principal(seed),
             &[test_prefix(seed)],
             1_000,
             range,
-        )))
+        ))
     }
 
     fn empty_dedup_index() -> CommitDedupIndex {
@@ -2194,10 +2190,8 @@ mod tests {
         install_stub_protocol_statics();
         let anchor = ts(1_000);
         let range = TimestampRange::new(ts(500), anchor.plus(Duration::from_mins(1)));
-        let binding = |seed: u32, bound: usize| -> Arc<Verified<Transaction>> {
-            Arc::new(Verified::<Transaction>::from_persisted(
-                stub_transaction_binding(seed, bound, range),
-            ))
+        let binding = |seed: u32, bound: usize| -> Verified<Transaction> {
+            Verified::<Transaction>::from_persisted(stub_transaction_binding(seed, bound, range))
         };
         // Fill the cap, then offer one that cannot fit followed by one
         // that can. Skipping rather than stopping is what keeps a large
@@ -2213,7 +2207,7 @@ mod tests {
         let provisions = ProvisionsFold::default();
         let mut fold = TransactionsFold::beside(&provisions);
         fold.sweepable = MAX_SWEEPABLE_CREATED_PER_BLOCK - full * cells - (cells / 2);
-        let mut txs: Vec<Arc<Verified<Transaction>>> = (0..full)
+        let mut txs: Vec<Verified<Transaction>> = (0..full)
             .map(|i| {
                 binding(
                     u32::try_from(i).expect("fewer than u32 transactions"),
@@ -4006,22 +4000,20 @@ mod tests {
         let claim = proven_claim(SIBLING, 3, &leaves, &leaves).hearing([settled, standing]);
         let against =
             hearing_at_the_parent([stated_row(settled, None), stated_row(standing, None)]);
-        let settling: Arc<Verifiable<Finalization>> = Arc::new(
-            finalization_of(
-                BlockHeight::new(1),
-                vec![
-                    TxOutcome::new(
-                        settled,
-                        ExecutionOutcome::Succeeded {
-                            receipt_hash: GlobalReceiptHash::ZERO,
-                        },
-                    )
-                    .charging(0),
-                ],
-            )
-            .into(),
-        );
-        let select = |finalizations: &[Arc<Verifiable<Finalization>>]| {
+        let settling: Verifiable<Finalization> = finalization_of(
+            BlockHeight::new(1),
+            vec![
+                TxOutcome::new(
+                    settled,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .charging(0),
+            ],
+        )
+        .into();
+        let select = |finalizations: &[Verifiable<Finalization>]| {
             select_claims(
                 &against.ctx(),
                 &mut StateClaimsFold::default(),
@@ -5552,7 +5544,7 @@ mod tests {
         width: usize,
         reaches: bool,
         range: TimestampRange,
-    ) -> Arc<Verified<Transaction>> {
+    ) -> Verified<Transaction> {
         install_stub_protocol_statics();
         let payer = (0u8..=255)
             .map(test_principal)
@@ -5564,7 +5556,7 @@ mod tests {
         }
         let tx = stub_transaction(payer, &owners, u128::MAX >> 1, range);
         assert_eq!(committee.is_single_shard_transaction(&tx), !reaches);
-        Arc::new(Verified::<Transaction>::from_persisted(tx))
+        Verified::<Transaction>::from_persisted(tx)
     }
 
     /// A transaction reaching beyond the shard is charged the entry its
@@ -5588,11 +5580,11 @@ mod tests {
         );
         let local = declaring(committee, 9_001, 1_300, false, range);
 
-        let mut txs: Vec<Arc<Verified<Transaction>>> = (0..=fitting)
+        let mut txs: Vec<Verified<Transaction>> = (0..=fitting)
             .map(|nth| wide(u32::try_from(nth).expect("fewer than u32 transactions")))
             .collect();
-        let past = Arc::clone(&txs[fitting]);
-        txs.extend([Arc::clone(&narrow), Arc::clone(&local)]);
+        let past = txs[fitting].clone();
+        txs.extend([narrow.clone(), local.clone()]);
 
         let provisions = ProvisionsFold::default();
         let selected = select_transactions(
@@ -5643,7 +5635,7 @@ mod tests {
                 precut: &refuses_precut(),
             },
             &mut TransactionsFold::beside(&provisions),
-            &[reaching, Arc::clone(&local), Arc::clone(&behind)],
+            &[reaching, local.clone(), behind.clone()],
         );
         assert_eq!(
             selected.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
@@ -5652,7 +5644,7 @@ mod tests {
         let err = admit_all::<TransactionsSection<'_>>(
             &against.ctx(),
             &mut TransactionsFold::beside(&provisions),
-            [&**local],
+            [&*local],
         )
         .expect_err("a voter refuses the block that carries it");
         assert!(err.contains("declares more accesses"), "{err}");

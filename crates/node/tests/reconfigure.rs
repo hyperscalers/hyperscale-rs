@@ -18,8 +18,8 @@ use hyperscale_hbor::Capped;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::{HandlerRegistry, Verdict};
 use hyperscale_network_memory::SimNetworkAdapter;
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput, ShardScopedInput};
-use hyperscale_node::{HostedChain, NodeConfig, NodeHost, ReplicaConfig};
+use hyperscale_node::event::{HostEvent, ShardScopedInput};
+use hyperscale_node::{HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
@@ -43,7 +43,7 @@ const SHARD_B: ShardId = ShardId::leaf(1, 1);
 /// everyone in one pool.
 struct Fixture {
     committee: TestCommittee,
-    genesis_block: Arc<Verified<CertifiedBeaconBlock>>,
+    genesis_block: Verified<CertifiedBeaconBlock>,
     genesis_state: BeaconState,
     config_hash: GenesisConfigHash,
     topology_snapshot: Arc<TopologySnapshot>,
@@ -88,7 +88,7 @@ fn fixture() -> Fixture {
     };
     let genesis_state = build_genesis_beacon_state(&config);
     let config_hash = genesis_config_hash(&config, &network, &[]);
-    let genesis_block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+    let genesis_block = Verified::<CertifiedBeaconBlock>::genesis(config_hash);
 
     let validator_set = ValidatorSet::new(
         (0..4)
@@ -151,7 +151,15 @@ impl Fixture {
             .commit_beacon_block(&self.genesis_block, &Arc::new(self.genesis_state.clone()));
         let fresh = RecoveredState::default();
         NodeHost::new(
-            self.replica_config(),
+            &self.replica_config(),
+            HostResources {
+                beacon_storage,
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network: SimNetworkAdapter::new(registry),
+                dispatch: SyncDispatch::new(),
+                beacon_event_sender: event_tx.clone(),
+                topology_snapshot: Arc::new(ArcSwap::from(topology)),
+            },
             chains
                 .iter()
                 .map(|&(shard, idx)| HostedChain {
@@ -159,19 +167,10 @@ impl Fixture {
                     storage: SimShardStorage::new(shard_prefix_path(shard)),
                     recovered: &fresh,
                     signers: vec![self.identity(idx)],
+                    inbox: event_tx.clone().into(),
                 })
                 .collect(),
             participants.iter().map(|&idx| self.identity(idx)).collect(),
-            beacon_storage,
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            SimNetworkAdapter::new(registry),
-            SyncDispatch::new(),
-            chains
-                .iter()
-                .map(|&(shard, _)| (shard, event_tx.clone()))
-                .collect(),
-            event_tx.clone(),
-            Arc::new(ArcSwap::from(topology)),
             NodeConfig::default(),
             LocalTimestamp::ZERO,
         )
@@ -200,8 +199,8 @@ impl Fixture {
                 storage: SimShardStorage::new(shard_prefix_path(shard)),
                 recovered: &RecoveredState::default(),
                 signers: vec![self.identity(idx)],
+                inbox: event_tx.into(),
             },
-            event_tx,
         );
     }
 }
@@ -222,7 +221,6 @@ fn add_and_remove_shard_at_runtime() {
         Arc::clone(&fix.topology_snapshot),
         &event_tx,
     );
-    host.register_inbound_handlers();
     // Drain anything startup produced so later assertions see only
     // reconfiguration traffic.
     while event_rx.try_recv().is_ok() {}
@@ -234,7 +232,7 @@ fn add_and_remove_shard_at_runtime() {
             .local_dispatch_request(SHARD_B, block_request())
             .is_none()
     );
-    let gossip = TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(1))]));
+    let gossip = TransactionGossip::new(Capped::from_array([(test_transaction(1))]));
     let _ = registry.local_dispatch_gossip(&gossip, Some(SHARD_B));
     assert!(
         event_rx.try_recv().is_err(),
@@ -251,7 +249,7 @@ fn add_and_remove_shard_at_runtime() {
             .is_some(),
         "request handlers for the added shard serve"
     );
-    let gossip = TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(2))]));
+    let gossip = TransactionGossip::new(Capped::from_array([(test_transaction(2))]));
     let _ = registry.local_dispatch_gossip(&gossip, Some(SHARD_B));
     let event = event_rx
         .try_recv()
@@ -271,7 +269,7 @@ fn add_and_remove_shard_at_runtime() {
             .is_none(),
         "request handlers for the dropped shard are gone"
     );
-    let gossip = TransactionGossip::new(Capped::from_array([Arc::new(test_transaction(3))]));
+    let gossip = TransactionGossip::new(Capped::from_array([(test_transaction(3))]));
     let _ = registry.local_dispatch_gossip(&gossip, Some(SHARD_B));
     assert!(
         event_rx.try_recv().is_err(),
@@ -306,14 +304,13 @@ fn a_shard_less_host_receives_beacon_gossip_with_no_route_gate() {
         Arc::clone(&fix.topology_snapshot),
         &event_tx,
     );
-    host.register_inbound_handlers();
     while event_rx.try_recv().is_ok() {}
     assert_eq!(host.hosted_shards().count(), 0);
     assert_eq!(host.participants().count(), 0);
 
     // Global scope, no source shard: with no hosted shard only the
     // host-level handler runs.
-    let gossip = BeaconBlockGossip::new(Arc::new(Verifiable::from((*fix.genesis_block).clone())));
+    let gossip = BeaconBlockGossip::new(Verifiable::from((*fix.genesis_block).clone()));
     let _ = registry.local_dispatch_gossip(&gossip, None);
     let event = event_rx
         .try_recv()
@@ -327,8 +324,9 @@ fn a_shard_less_host_receives_beacon_gossip_with_no_route_gate() {
     assert!(out.participation_changes.is_empty());
 }
 
-/// On a host that runs a shard, the per-shard beacon handler hands the
-/// block to the beacon loop and defers its verdict to the loop's check. A
+/// On a host that runs a shard, the per-shard beacon handler defers its
+/// verdict to the beacon loop's check of the copy the host-level handler
+/// hands the loop. A
 /// block the fold never checks — one at its tip — is never settled: the
 /// loop dispatches nothing for it, so the item stays deferred.
 #[test]
@@ -343,22 +341,18 @@ fn a_beacon_item_the_loop_never_checks_stays_deferred_on_a_hosted_shard_host() {
         Arc::clone(&fix.topology_snapshot),
         &event_tx,
     );
-    host.register_inbound_handlers();
     while event_rx.try_recv().is_ok() {}
 
-    let gossip = BeaconBlockGossip::new(Arc::new(Verifiable::from((*fix.genesis_block).clone())));
-    let verdict = registry.local_dispatch_gossip(&gossip, Some(SHARD_A));
+    let gossip = BeaconBlockGossip::new(Verifiable::from((*fix.genesis_block).clone()));
+    let verdict = registry.local_dispatch_gossip(&gossip, None);
     assert!(
         matches!(verdict, Some(Verdict::Defer(_))),
         "the per-shard handler defers its verdict: got {verdict:?}",
     );
     let events: Vec<HostEvent> = event_rx.try_iter().collect();
     assert!(
-        !events.is_empty()
-            && events
-                .iter()
-                .all(|event| matches!(event, HostEvent::Beacon(_))),
-        "the block goes to the beacon loop, never to a shard's loop",
+        matches!(events.as_slice(), [HostEvent::Beacon(_)]),
+        "the block goes to the beacon loop once, never to a shard's loop",
     );
     for event in events {
         let out = host.step(event);
@@ -476,25 +470,21 @@ impl Fixture {
         assert!(topology.reshape_handoff_pending(PREDECESSOR));
         let hosted = [PREDECESSOR, UNRELATED];
         let registry = Arc::new(HandlerRegistry::new(hosted.into_iter().collect()));
-        let mut host = self.host(
+        self.host(
             &[(PREDECESSOR, 0), (UNRELATED, 2)],
             &[],
             registry,
             topology,
             event_tx,
-        );
-        host.register_inbound_handlers();
-        host
+        )
     }
 }
 
 /// Submit a transaction touching only `SUCCESSOR`, returning it once the
 /// host has routed it and its channel is drained.
-fn submit_to_successor(host: &mut Host, event_rx: &Receiver<HostEvent>) -> Arc<Transaction> {
-    let tx = Arc::new(test_transaction(1));
-    let _ = host.step(HostEvent::process(ProcessScopedInput::SubmitTransaction {
-        tx: Arc::clone(&tx),
-    }));
+fn submit_to_successor(host: &Host, event_rx: &Receiver<HostEvent>) -> Transaction {
+    let tx = test_transaction(1);
+    assert!(host.submit_transaction(&tx));
     while event_rx.try_recv().is_ok() {}
     tx
 }
@@ -511,7 +501,7 @@ fn routed(event_rx: &Receiver<HostEvent>, tx: &Transaction) -> Option<(ShardId, 
             }
             _ => None,
         },
-        _ => None,
+        HostEvent::Beacon(_) => None,
     })
 }
 
@@ -522,7 +512,7 @@ fn a_submission_parked_on_a_seating_successor_is_admitted_once_it_attaches() {
     let mut host = fix.seating_host(&event_tx);
     while event_rx.try_recv().is_ok() {}
 
-    let tx = submit_to_successor(&mut host, &event_rx);
+    let tx = submit_to_successor(&host, &event_rx);
     fix.add_shard(&mut host, SUCCESSOR, 0, event_tx);
 
     let (shard, input) = routed(&event_rx, &tx).expect("the attach releases the submission");
@@ -543,7 +533,7 @@ fn a_submission_parked_on_a_seating_successor_is_gossiped_once_its_predecessor_d
     let mut host = fix.seating_host(&event_tx);
     while event_rx.try_recv().is_ok() {}
 
-    let tx = submit_to_successor(&mut host, &event_rx);
+    let tx = submit_to_successor(&host, &event_rx);
     assert!(host.remove_shard(PREDECESSOR).is_some());
 
     let (shard, input) = routed(&event_rx, &tx).expect("the detach releases the submission");
@@ -552,4 +542,73 @@ fn a_submission_parked_on_a_seating_successor_is_gossiped_once_its_predecessor_d
         "a host seating nothing gossips through what it serves"
     );
     assert!(matches!(input, ShardScopedInput::GossipTransaction { .. }));
+}
+
+/// The first stub transaction whose touched shards are exactly `shards`.
+fn touching(fix: &Fixture, shards: &[ShardId]) -> Transaction {
+    (0..=u8::MAX)
+        .map(test_transaction)
+        .find(|tx| fix.topology_snapshot.all_shards_for_transaction(tx) == shards)
+        .expect("some seed touches the shards asked for")
+}
+
+/// What `event_rx` holds, as the shard each input names and the input's
+/// label.
+fn drained(event_rx: &Receiver<HostEvent>) -> Vec<(Option<ShardId>, &'static str)> {
+    event_rx
+        .try_iter()
+        .map(|event| match &event {
+            HostEvent::Shard(shard, _) => (Some(*shard), event.type_name()),
+            HostEvent::Beacon(_) => (None, event.type_name()),
+        })
+        .collect()
+}
+
+/// A submission routes through the host into its loops' channels and
+/// nowhere else: the source shard admits and gossips, a passive co-host
+/// admits, a host touching none of it gossips through what it serves, and
+/// an envelope that derives no routing goes nowhere and reports failure.
+#[test]
+fn a_submission_routes_into_the_loops_channels() {
+    let fix = fixture();
+    let (event_tx, event_rx) = unbounded();
+    let registry = Arc::new(HandlerRegistry::new(
+        [SHARD_A, SHARD_B].into_iter().collect(),
+    ));
+    let both = fix.host(
+        &[(SHARD_A, 0), (SHARD_B, 2)],
+        &[],
+        registry,
+        Arc::clone(&fix.topology_snapshot),
+        &event_tx,
+    );
+    let _ = drained(&event_rx);
+
+    assert!(both.submit_transaction(&touching(&fix, &[SHARD_A, SHARD_B])));
+    assert_eq!(
+        drained(&event_rx),
+        vec![
+            (Some(SHARD_A), "AdmitAndGossipTransaction"),
+            (Some(SHARD_B), "AdmitTransaction"),
+        ],
+    );
+
+    let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD_A).collect()));
+    let only_a = fix.host(
+        &[(SHARD_A, 0)],
+        &[],
+        registry,
+        Arc::clone(&fix.topology_snapshot),
+        &event_tx,
+    );
+    let _ = drained(&event_rx);
+    assert!(only_a.submit_transaction(&touching(&fix, &[SHARD_B])));
+    assert_eq!(
+        drained(&event_rx),
+        vec![(Some(SHARD_A), "GossipTransaction")],
+    );
+
+    let underived = Transaction::new(test_transaction(1).body().clone());
+    assert!(!only_a.submit_transaction(&underived));
+    assert_eq!(drained(&event_rx), Vec::new());
 }

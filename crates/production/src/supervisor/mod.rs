@@ -28,11 +28,9 @@ use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_iroh::{AddVnodeError, IrohNetwork};
 use hyperscale_node::bootstrap::EngineBootstrap;
-use hyperscale_node::process::ProcessIo;
-use hyperscale_node::reshape::orchestrator::ReshapeOrchestrator;
-use hyperscale_node::reshape::prepared::{PreparedStores, ReshapeCompletion};
-use hyperscale_node::shard::{BeaconScopedInput, HostEvent};
-use hyperscale_node::{NodeConfig, Registration, TimerOp};
+use hyperscale_node::event::{BeaconScopedInput, HostEvent, Registration, TimerOp};
+use hyperscale_node::reshape::{PreparedStores, ReshapeCompletion, ReshapeOrchestrator};
+use hyperscale_node::{NodeConfig, ProcessIo};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
@@ -54,7 +52,7 @@ mod reshape;
 mod seats;
 
 use beacon::BeaconThread;
-use hyperscale_node::startup::Replaced;
+use hyperscale_node::seating::Replaced;
 use membership::CompletedBootstrap;
 use seats::{SeatTable, ShardThread};
 
@@ -475,12 +473,12 @@ impl ShardSupervisor {
     /// committed view, since a placement change often accompanies the
     /// cohort/keeper draws and boundary seedings its duties gate on.
     ///
-    /// No join or leave is issued here. [`Self::reconcile_joins`] seats
-    /// every validator
-    /// [`placed_validators`](hyperscale_node::startup::placed_validators)
-    /// places, under the rule the simulation reads, and
-    /// [`Self::reconcile_teardown`] tears a shard down once it leaves both
-    /// this host's active committee and its routing committee. The observer
+    /// No join or leave is issued here. [`Self::reconcile_seats`] carries
+    /// out the seat changes
+    /// [`reconcile`](hyperscale_node::seating::reconcile) plans, the plan
+    /// the simulation carries out too: it seats every placed validator and
+    /// tears a shard down once it leaves both this host's active committee
+    /// and its routing committee. The observer
     /// and keeper deltas drive nothing either: the orchestrator
     /// self-determines those duties from the committed projection.
     pub(crate) fn on_participation_change(&mut self, change: &ParticipationChange) {
@@ -533,7 +531,7 @@ impl ShardSupervisor {
         ShardLoopConfig {
             timer_tx: channels.timer_tx,
             timer_rx: channels.timer_rx,
-            callback_rx: channels.callback_rx,
+            inputs: channels.inputs,
             shutdown_rx: channels.shutdown_rx,
             control_rx: channels.control_rx,
             tokio_handle: self.tokio_handle.clone(),

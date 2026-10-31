@@ -1,7 +1,5 @@
 //! Finalization fetch response (intra-shard DA).
 
-use std::sync::Arc;
-
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{Finalization, MessageClass, NetworkMessage};
@@ -21,10 +19,7 @@ const MAX_FINALIZATIONS_PER_RESPONSE: usize = 10_000;
 #[derive(Debug, Clone, Hbor)]
 pub struct GetFinalizationsResponse {
     /// The requested finalizations that were found.
-    ///
-    /// `Arc`-wrapped because both the server-side cache and every
-    /// downstream consumer hold `Finalization` behind `Arc` already.
-    pub finalizations: Capped<Vec<Arc<Finalization>>, MAX_FINALIZATIONS_PER_RESPONSE>,
+    pub finalizations: Capped<Vec<Finalization>, MAX_FINALIZATIONS_PER_RESPONSE>,
 }
 
 impl GetFinalizationsResponse {
@@ -35,7 +30,7 @@ impl GetFinalizationsResponse {
     /// Panics if `finalizations.len() > MAX_FINALIZATIONS_PER_RESPONSE`.
     #[must_use]
     pub const fn new(
-        finalizations: Capped<Vec<Arc<Finalization>>, MAX_FINALIZATIONS_PER_RESPONSE>,
+        finalizations: Capped<Vec<Finalization>, MAX_FINALIZATIONS_PER_RESPONSE>,
     ) -> Self {
         Self { finalizations }
     }

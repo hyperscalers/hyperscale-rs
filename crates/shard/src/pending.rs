@@ -286,15 +286,15 @@ impl PendingBlocks {
         header: BlockHeader,
         manifest: BlockManifest,
         now: LocalTimestamp,
-        lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
+        lookup_tx: impl Fn(&TxHash) -> Option<Verifiable<Transaction>>,
+        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Verifiable<Finalization>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     ) {
         let mut pending = PendingBlock::from_manifest(header, manifest, now);
 
         // Borrow the manifest only long enough to collect locally-available
         // Arcs, releasing it before the mutable `add_*` calls below.
-        let txs: Vec<Arc<Verifiable<Transaction>>> = pending
+        let txs: Vec<Verifiable<Transaction>> = pending
             .manifest()
             .tx_hashes()
             .iter()
@@ -304,7 +304,7 @@ impl PendingBlocks {
             pending.add_transaction(tx);
         }
 
-        let finalizations: Vec<Arc<Verifiable<Finalization>>> = pending
+        let finalizations: Vec<Verifiable<Finalization>> = pending
             .manifest()
             .cert_ids()
             .iter()
@@ -314,7 +314,7 @@ impl PendingBlocks {
             pending.add_finalization(fw);
         }
 
-        let provisions: Vec<Arc<Verifiable<Provisions>>> = pending
+        let provisions: Vec<Verifiable<Provisions>> = pending
             .manifest()
             .provision_hashes()
             .iter()
@@ -373,24 +373,24 @@ impl PendingBlocks {
 
     /// Record an arrived transaction against any pending block that needs it.
     /// Returns the hashes of blocks that became complete as a result.
-    pub fn receive_transaction(&mut self, tx: &Arc<Verifiable<Transaction>>) -> Vec<BlockHash> {
+    pub fn receive_transaction(&mut self, tx: &Verifiable<Transaction>) -> Vec<BlockHash> {
         let tx_hash = tx.hash();
         self.fold_arrival(
             |pending| pending.needs_transaction(&tx_hash),
             |pending| {
-                pending.add_transaction(Arc::clone(tx));
+                pending.add_transaction(tx.clone());
             },
         )
     }
 
     /// Record an arrived finalization against any pending block that needs
     /// it. Returns the hashes of blocks that became complete as a result.
-    pub fn receive_finalization(&mut self, fw: &Arc<Verifiable<Finalization>>) -> Vec<BlockHash> {
+    pub fn receive_finalization(&mut self, fw: &Verifiable<Finalization>) -> Vec<BlockHash> {
         let hash = fw.receipt_hash();
         self.fold_arrival(
             |pending| pending.needs_finalization(&hash),
             |pending| {
-                pending.add_finalization(Arc::clone(fw));
+                pending.add_finalization(fw.clone());
             },
         )
     }
@@ -398,12 +398,12 @@ impl PendingBlocks {
     /// Record an arrived provisions batch against any pending block that
     /// needs it. Returns the hashes of blocks that became complete as a
     /// result.
-    pub fn receive_provision(&mut self, batch: &Arc<Verifiable<Provisions>>) -> Vec<BlockHash> {
+    pub fn receive_provision(&mut self, batch: &Verifiable<Provisions>) -> Vec<BlockHash> {
         let provisions_hash = batch.hash();
         self.fold_arrival(
             |pending| pending.needs_provision(&provisions_hash),
             |pending| {
-                pending.add_provision(Arc::clone(batch));
+                pending.add_provision(batch.clone());
             },
         )
     }
@@ -511,8 +511,8 @@ pub struct PendingBlock {
     /// Block contents manifest (transaction hashes, certificates, etc.)
     manifest: BlockManifest,
 
-    /// Map of transaction hash -> Arc<Verifiable<Transaction>> (for received transactions).
-    received_transactions: HashMap<TxHash, Arc<Verifiable<Transaction>>>,
+    /// Map of transaction hash -> Verifiable<Transaction> (for received transactions).
+    received_transactions: HashMap<TxHash, Verifiable<Transaction>>,
 
     /// Set of transaction hashes we're still waiting for.
     missing_transaction_hashes: BTreeSet<TxHash>,
@@ -521,14 +521,14 @@ pub struct PendingBlock {
     ///
     /// A block is complete once every finalization its manifest names has
     /// been independently finalized by this validator or fetched.
-    received_finalizations: BTreeMap<FinalizationHash, Arc<Verifiable<Finalization>>>,
+    received_finalizations: BTreeMap<FinalizationHash, Verifiable<Finalization>>,
 
     /// Identities we're still waiting for.
     missing_finalization_hashes: BTreeSet<FinalizationHash>,
 
     /// Received provisions keyed by provisions hash. `BTreeMap` so
     /// `provisions()` iteration is deterministic across validators.
-    received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>>,
+    received_provisions: BTreeMap<ProvisionHash, Verifiable<Provisions>>,
 
     /// Set of provisions hashes we're still waiting for.
     missing_provision_hashes: BTreeSet<ProvisionHash>,
@@ -604,8 +604,8 @@ impl PendingBlock {
     /// exactly or every replica rejects the broadcast.
     pub fn from_complete_block(
         block: &Block,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
+        provisions: Vec<Verifiable<Provisions>>,
         created_at: LocalTimestamp,
     ) -> Self {
         let mut provision_hashes: Vec<ProvisionHash> =
@@ -629,7 +629,7 @@ impl PendingBlock {
             terms: block.terms().clone(),
             witness_sources: block.witness_sources().as_ref().clone(),
         });
-        let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
+        let mut received_provisions: BTreeMap<ProvisionHash, Verifiable<Provisions>> =
             BTreeMap::new();
         for p in provisions {
             received_provisions.insert(p.hash(), p);
@@ -650,9 +650,7 @@ impl PendingBlock {
         };
         // Fill in all transactions
         for tx in block.transactions().iter() {
-            pending
-                .received_transactions
-                .insert(tx.hash(), Arc::clone(tx));
+            pending.received_transactions.insert(tx.hash(), tx.clone());
         }
         // Fill in all finalizations
         for fw in finalizations {
@@ -664,7 +662,7 @@ impl PendingBlock {
     /// Add a received transaction.
     ///
     /// Returns true if this transaction was needed, false if duplicate or not in this block.
-    pub fn add_transaction(&mut self, tx: Arc<Verifiable<Transaction>>) -> bool {
+    pub fn add_transaction(&mut self, tx: Verifiable<Transaction>) -> bool {
         let hash = tx.hash();
         if self.missing_transaction_hashes.remove(&hash) {
             self.received_transactions.insert(hash, tx);
@@ -678,7 +676,7 @@ impl PendingBlock {
     ///
     /// Returns true if it was needed, false if duplicate or not in this
     /// block.
-    pub fn add_finalization(&mut self, fw: Arc<Verifiable<Finalization>>) -> bool {
+    pub fn add_finalization(&mut self, fw: Verifiable<Finalization>) -> bool {
         let hash = fw.receipt_hash();
         if self.missing_finalization_hashes.remove(&hash) {
             self.received_finalizations.insert(hash, fw);
@@ -754,7 +752,7 @@ impl PendingBlock {
     /// Add a received provisions.
     ///
     /// Returns true if this provision was needed, false if duplicate or not in this block.
-    pub fn add_provision(&mut self, provisions: Arc<Verifiable<Provisions>>) -> bool {
+    pub fn add_provision(&mut self, provisions: Verifiable<Provisions>) -> bool {
         let hash = provisions.hash();
         if self.missing_provision_hashes.remove(&hash) {
             self.received_provisions.insert(hash, provisions);
@@ -780,7 +778,7 @@ impl PendingBlock {
     }
 
     /// Get all received finalizations.
-    pub fn finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
+    pub fn finalizations(&self) -> Vec<Verifiable<Finalization>> {
         self.received_finalizations.values().cloned().collect()
     }
 
@@ -801,7 +799,7 @@ impl PendingBlock {
         }
 
         // Build transactions in the ORIGINAL order from the gossip message.
-        let transactions: Vec<Arc<Verifiable<Transaction>>> = self
+        let transactions: Vec<Verifiable<Transaction>> = self
             .manifest
             .tx_hashes()
             .iter()
@@ -809,10 +807,10 @@ impl PendingBlock {
             .collect();
 
         // Pass finalizations into the block in manifest order. The
-        // upstream-verified marker on each `Arc<Verifiable<Finalization>>`
+        // upstream-verified marker on each `Verifiable<Finalization>`
         // rides through unchanged so downstream consumers (apply phase,
         // verification pipeline) can peek `.verified()` and short-circuit.
-        let certificates: Vec<Arc<Verifiable<Finalization>>> = self
+        let certificates: Vec<Verifiable<Finalization>> = self
             .manifest
             .cert_ids()
             .iter()
@@ -823,7 +821,7 @@ impl PendingBlock {
         // Attach provisions in manifest order. `received_provisions` is
         // populated as provisions arrive via gossip / local fetch,
         // and `is_complete()` gates assembly on all of them being present.
-        let provisions: Vec<Arc<Verifiable<Provisions>>> = self
+        let provisions: Vec<Verifiable<Provisions>> = self
             .manifest
             .provision_hashes()
             .iter()
@@ -1079,15 +1077,13 @@ mod tests {
     fn test_add_finalization() {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
-        let fw: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::new_unchecked_for_test(Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                None,
-                Capped::from_array([]),
-            ))
-            .into(),
-        );
+        let fw: Verifiable<Finalization> = Verified::new_unchecked_for_test(Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            None,
+            Capped::from_array([]),
+        ))
+        .into();
 
         let mut pb = PendingBlock::from_manifest(
             header,
@@ -1109,19 +1105,17 @@ mod tests {
 
     #[test]
     fn test_block_needs_transactions_and_finalizations() {
-        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let tx = Verifiable::from(test_transaction(1));
         let tx_hash = tx.hash();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
-        let fw: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::new_unchecked_for_test(Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                None,
-                Capped::from_array([]),
-            ))
-            .into(),
-        );
+        let fw: Verifiable<Finalization> = Verified::new_unchecked_for_test(Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            None,
+            Capped::from_array([]),
+        ))
+        .into();
 
         let mut pb = PendingBlock::from_manifest(
             header,
@@ -1147,14 +1141,9 @@ mod tests {
     #[test]
     fn test_from_complete_block_is_complete() {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let fw = Arc::new(Finalization::new(
-            tick_id,
-            TickHalf::Determined,
-            None,
-            Capped::from_array([]),
-        ));
-        let verified_fw = Arc::new(Verified::new_unchecked_for_test((*fw).clone()).into());
-        let wire_fw = Arc::new((*fw).clone().into());
+        let fw = Finalization::new(tick_id, TickHalf::Determined, None, Capped::from_array([]));
+        let verified_fw = Verified::new_unchecked_for_test(fw.clone()).into();
+        let wire_fw = fw.into();
 
         let block = Block::Live {
             header: make_header(BlockHeight::new(1)),
@@ -1184,11 +1173,11 @@ mod tests {
     /// the body it gathered.
     #[test]
     fn a_pending_block_assembles_its_terms() {
-        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let tx = Verifiable::from(test_transaction(1));
         let proposed = rebound(stating(
             Block::Live {
                 header: make_header(BlockHeight::new(1)),
-                transactions: Arc::new(Capped::from_array([Arc::clone(&tx)])),
+                transactions: Arc::new(Capped::from_array([tx.clone()])),
                 certificates: Arc::new(Capped::empty()),
                 provisions: Arc::new(Capped::empty()),
                 abandonment_records: Arc::new(Capped::empty()),

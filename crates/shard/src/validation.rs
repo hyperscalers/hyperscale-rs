@@ -14,8 +14,6 @@
 //!
 //! Errors are returned as human-readable strings so the caller can log a
 //! single diagnostic line at the rejection site.
-use std::sync::Arc;
-
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, DeclaredWork, LocalTimestamp, MAX_ROUND_GAP,
     MAX_TICK_STAGED_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId,
@@ -26,7 +24,7 @@ use hyperscale_types::{
 use crate::admission::{
     Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
-    TransactionsSection, admit_all, unwrapped,
+    TransactionsSection, admit_all,
 };
 use crate::tick_members::{run_by, states_entry};
 
@@ -413,19 +411,19 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     admit_all::<ProvisionsSection>(
         ctx,
         &mut provisions,
-        block.provisions().iter().map(unwrapped),
+        block.provisions().iter().map(Verifiable::as_unverified),
     )?;
     let mut transactions = TransactionsFold::beside(&provisions);
     admit_all::<TransactionsSection<'_>>(
         ctx,
         &mut transactions,
-        block.transactions().iter().map(unwrapped),
+        block.transactions().iter().map(Verifiable::as_unverified),
     )?;
     let mut finalizations = FinalizationsFold::from(ctx);
     admit_all::<FinalizationsSection>(
         ctx,
         &mut finalizations,
-        block.certificates().iter().map(unwrapped),
+        block.certificates().iter().map(Verifiable::as_unverified),
     )?;
     let mut records = RecordsFold::after(&finalizations);
     admit_all::<RecordsSection<'_>>(ctx, &mut records, block.abandonment_records())?;
@@ -602,7 +600,7 @@ fn validate_transactions_verified(block: &Block) -> Result<(), String> {
 
 /// Verify that a list of transactions is sorted by hash in strict ascending
 /// order. `section` is used in the error message for diagnostics.
-fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Result<(), String> {
+fn verify_hash_sorted(txs: &[Verifiable<Transaction>], section: &str) -> Result<(), String> {
     for window in txs.windows(2) {
         if window[0].hash() >= window[1].hash() {
             return Err(format!(
@@ -619,6 +617,7 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 #[cfg(test)]
 pub mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
@@ -894,7 +893,7 @@ pub mod tests {
         Finalization::new(
             tick_id,
             TickHalf::Stated,
-            Some(Arc::new(certificate)),
+            Some(certificate),
             Capped::new(receipts).expect("a list written out in a test"),
         )
     }
@@ -911,9 +910,9 @@ pub mod tests {
 
     /// `against` after a block at height 3 carrying `halves` commits.
     fn after_committing(mut against: Against, halves: &[&Finalization]) -> Against {
-        let certificates: Vec<Arc<Verifiable<Finalization>>> = halves
+        let certificates: Vec<Verifiable<Finalization>> = halves
             .iter()
-            .map(|fw| Arc::new(Verifiable::from((*fw).clone())))
+            .map(|fw| Verifiable::from((*fw).clone()))
             .collect();
         against.members.advance(&MemberInputs::deriving(
             ShardId::ROOT,
@@ -1185,14 +1184,14 @@ pub mod tests {
             TxHash::from(Hash::from_bytes(b"an accepted core")),
             TxHash::from(Hash::from_bytes(b"a refused core")),
         );
-        let stating = Arc::new(stating_at(
+        let stating = stating_at(
             2,
             vec![
                 core_outcome(accepted, succeeded(), 30),
                 core_outcome(refused, ExecutionOutcome::Failed, 12),
             ],
-        ));
-        let legs = Arc::new(legs_naming(&[accepted]));
+        );
+        let legs = legs_naming(&[accepted]);
         assert_eq!(legs.tx_hashes().collect::<Vec<_>>(), [accepted]);
         let fees_after = |blocks: &[&Block]| {
             blocks
@@ -1203,8 +1202,7 @@ pub mod tests {
                 )
                 .cumulative_fees
         };
-        let stating_block =
-            block_with_certificates(BlockHeight::new(3), vec![Arc::clone(&stating)]);
+        let stating_block = block_with_certificates(BlockHeight::new(3), vec![stating.clone()]);
         let legs_block = block_with_certificates(BlockHeight::new(4), vec![legs]);
         assert_eq!(
             stating_block.charged(),
@@ -1228,10 +1226,10 @@ pub mod tests {
         let row = &stated.members.members[&accepted];
         assert!(matches!(row.state, RowState::Stated { .. }));
         assert_eq!(row.share, 0, "the stating half counted it");
-        let aborting = Arc::new(stating_at(
+        let aborting = stating_at(
             9,
             vec![core_outcome(accepted, ExecutionOutcome::Aborted, row.share)],
-        ));
+        );
         let abort_block = block_with_certificates(BlockHeight::new(5), vec![aborting]);
         assert_eq!(abort_block.charged(), 0);
         assert_eq!(
@@ -1987,7 +1985,7 @@ pub mod tests {
 
     fn block_with_transactions(
         height: BlockHeight,
-        transactions: Vec<Arc<Verifiable<Transaction>>>,
+        transactions: Vec<Verifiable<Transaction>>,
     ) -> Block {
         Block::Live {
             header: header_at_height(height, 100_000),
@@ -2028,13 +2026,13 @@ pub mod tests {
         let cells = MAX_INTENTS + 1;
         let full = 3;
         let composed = |seed: u32| {
-            Arc::new(Verifiable::from(test_utils::stub_transaction_binding(
+            Verifiable::from(test_utils::stub_transaction_binding(
                 seed,
                 MAX_INTENTS - 1,
                 test_utils::test_validity_range(),
-            )))
+            ))
         };
-        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
+        let mut txs: Vec<Verifiable<Transaction>> = (0..full)
             .map(|i| composed(u32::try_from(i).expect("fewer than u32 transactions")))
             .collect();
         let against = plain();
@@ -2048,7 +2046,7 @@ pub mod tests {
         admit_all::<TransactionsSection<'_>>(
             &against.ctx(),
             &mut at_cap,
-            txs.iter().map(unwrapped),
+            txs.iter().map(Verifiable::as_unverified),
         )
         .expect("a block at the cap is admitted");
         assert_eq!(at_cap.sweepable, MAX_SWEEPABLE_CREATED_PER_BLOCK);
@@ -2057,7 +2055,7 @@ pub mod tests {
         let err = admit_all::<TransactionsSection<'_>>(
             &against.ctx(),
             &mut near_cap(),
-            txs.iter().map(unwrapped),
+            txs.iter().map(Verifiable::as_unverified),
         )
         .expect_err("past the cap is refused");
         assert!(err.contains("sweepable cells"), "{err}");
@@ -2079,7 +2077,7 @@ pub mod tests {
         let (payer_shard, recipient_shard) = ShardId::ROOT.children();
         let payer = PrincipalAddr::new([0x10; 31]);
         let recipient = Address::new([0x90; 31], AddressClass::Component);
-        let transfer = Arc::new(Verifiable::from(
+        let transfer = Verifiable::from(
             test_utils::stub_transaction(
                 payer,
                 &[payer.address(), recipient],
@@ -2093,7 +2091,7 @@ pub mod tests {
                     test_utils::leg_shape(recipient, LegRole::Outbound, &[(0, 0)]),
                 ],
             ),
-        ));
+        );
         let on = |local: ShardId| {
             let mut against = Against::window(TopologySnapshot::new(
                 NetworkDefinition::simulator(),
@@ -2105,7 +2103,7 @@ pub mod tests {
             admit_all::<TransactionsSection<'_>>(
                 &against.ctx(),
                 &mut TransactionsFold::beside(&provisions),
-                std::iter::once(&transfer).map(unwrapped),
+                std::iter::once(&transfer).map(Verifiable::as_unverified),
             )
         };
 
@@ -2967,12 +2965,9 @@ pub mod tests {
 
     /// `transactions` in hash order, as a block carries them and a ready
     /// set offers them.
-    fn in_hash_order(mut transactions: Vec<Transaction>) -> Vec<Arc<Verifiable<Transaction>>> {
+    fn in_hash_order(mut transactions: Vec<Transaction>) -> Vec<Verifiable<Transaction>> {
         transactions.sort_by_key(Transaction::hash);
-        transactions
-            .into_iter()
-            .map(|tx| Arc::new(Verifiable::from(tx)))
-            .collect()
+        transactions.into_iter().map(Verifiable::from).collect()
     }
 
     /// A voter refuses a block carrying one transaction more toward a
@@ -3002,10 +2997,10 @@ pub mod tests {
         stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD - 1);
         let toward_near = [awaiting(0x10, 0x50), awaiting(0x11, 0x51)];
         let others = [awaiting(0x12, 0x90), awaiting(0x13, 0x13)];
-        let ready: Vec<Arc<Verified<Transaction>>> =
+        let ready: Vec<Verified<Transaction>> =
             in_hash_order(toward_near.iter().chain(&others).cloned().collect())
                 .into_iter()
-                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.as_unverified().clone())))
+                .map(|tx| Verified::new_unchecked_for_test(tx.as_unverified().clone()))
                 .collect();
 
         let ctx = against.ctx();
@@ -3033,7 +3028,7 @@ pub mod tests {
 
         let carried = selected
             .iter()
-            .map(|tx| Arc::new(Verifiable::from(tx.as_ref().as_ref().clone())))
+            .map(|tx| Verifiable::from(tx.as_ref().clone()))
             .collect();
         assert_eq!(
             admit(
@@ -3771,7 +3766,7 @@ pub mod tests {
                 .charging(charged),
             ],
         );
-        let block = block_with_certificates(BlockHeight::new(1), vec![Arc::new(aborted)]);
+        let block = block_with_certificates(BlockHeight::new(1), vec![aborted]);
         assert_eq!(
             block.charged(),
             charged * 2,
@@ -3785,11 +3780,11 @@ pub mod tests {
         assert!(err.contains("cumulative fees"), "{err}");
     }
 
-    fn tx(seed: u8) -> Arc<Verifiable<Transaction>> {
-        Arc::new(Verifiable::from(test_utils::test_transaction(seed)))
+    fn tx(seed: u8) -> Verifiable<Transaction> {
+        Verifiable::from(test_utils::test_transaction(seed))
     }
 
-    fn sorted_txs(seeds: &[u8]) -> Vec<Arc<Verifiable<Transaction>>> {
+    fn sorted_txs(seeds: &[u8]) -> Vec<Verifiable<Transaction>> {
         let mut txs: Vec<_> = seeds.iter().map(|&s| tx(s)).collect();
         txs.sort_by_key(|t| t.hash());
         txs
@@ -3853,11 +3848,9 @@ pub mod tests {
     // validate_no_duplicate_certificates
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn block_with_certificates(height: BlockHeight, certificates: Vec<Arc<Finalization>>) -> Block {
-        let wrapped: Vec<Arc<Verifiable<Finalization>>> = certificates
-            .into_iter()
-            .map(|fw| Arc::new((*fw).clone().into()))
-            .collect();
+    fn block_with_certificates(height: BlockHeight, certificates: Vec<Finalization>) -> Block {
+        let wrapped: Vec<Verifiable<Finalization>> =
+            certificates.into_iter().map(Verifiable::from).collect();
         Block::Live {
             header: header_at_height(height, 100_000),
             transactions: Arc::new(Capped::empty()),
@@ -3871,24 +3864,24 @@ pub mod tests {
         }
     }
 
-    fn finalization_at(height: u64) -> Arc<Finalization> {
-        Arc::new(make_finalization(
+    fn finalization_at(height: u64) -> Finalization {
+        make_finalization(
             BlockHeight::new(height),
             TxHash::from(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
             )),
             TransactionDecision::Accept,
-        ))
+        )
     }
 
     /// A finalization over `tx_hash`, on a tick distinct from any other
     /// built at the same height — the shape a second verdict takes.
-    fn finalization_over(height: u64, tx_hash: TxHash) -> Arc<Finalization> {
-        Arc::new(make_finalization(
+    fn finalization_over(height: u64, tx_hash: TxHash) -> Finalization {
+        make_finalization(
             BlockHeight::new(height),
             tx_hash,
             TransactionDecision::Aborted,
-        ))
+        )
     }
 
     /// The shard [`after_departures`] admits as, whose ticks its blocks
@@ -3898,25 +3891,25 @@ pub mod tests {
     }
 
     /// [`finalization_at`] for a tick of [`survivor`].
-    fn survivor_finalization_at(height: u64) -> Arc<Finalization> {
-        Arc::new(make_finalization_on(
+    fn survivor_finalization_at(height: u64) -> Finalization {
+        make_finalization_on(
             survivor(),
             BlockHeight::new(height),
             TxHash::from(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
             )),
             TransactionDecision::Accept,
-        ))
+        )
     }
 
     /// [`finalization_over`] for a tick of [`survivor`].
-    fn survivor_finalization_over(height: u64, tx_hash: TxHash) -> Arc<Finalization> {
-        Arc::new(make_finalization_on(
+    fn survivor_finalization_over(height: u64, tx_hash: TxHash) -> Finalization {
+        make_finalization_on(
             survivor(),
             BlockHeight::new(height),
             tx_hash,
             TransactionDecision::Aborted,
-        ))
+        )
     }
 
     fn no_resolutions(block: &Block, dedup_index: CommitDedupIndex) -> Result<(), String> {
@@ -3944,10 +3937,9 @@ pub mod tests {
     #[test]
     fn validate_no_duplicate_resolutions_rejects_retention_dup() {
         let fw = survivor_finalization_at(1);
-        let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
+        let block = block_with_certificates(BlockHeight::new(6), vec![fw.clone()]);
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index
-            .register_committed_certs(&[Arc::new((*fw).clone().into())], WeightedTimestamp::ZERO);
+        dedup_index.register_committed_certs(&[fw.into()], WeightedTimestamp::ZERO);
         let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
@@ -3960,16 +3952,15 @@ pub mod tests {
     /// — it resolves none — so identity is the only thing that can.
     #[test]
     fn a_committed_certificate_deciding_nothing_cannot_ride_a_second_block() {
-        let fw = Arc::new(make_leg_finalization_on(
+        let fw = make_leg_finalization_on(
             survivor(),
             BlockHeight::new(1),
             TxHash::from(Hash::from_bytes(b"retired")),
-        ));
+        );
         assert_eq!(fw.deciding_tx_hashes().count(), 0);
-        let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
+        let block = block_with_certificates(BlockHeight::new(6), vec![fw.clone()]);
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index
-            .register_committed_certs(&[Arc::new((*fw).clone().into())], WeightedTimestamp::ZERO);
+        dedup_index.register_committed_certs(&[fw.into()], WeightedTimestamp::ZERO);
         let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
@@ -3989,10 +3980,7 @@ pub mod tests {
             .next()
             .expect("a tick names its members");
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(
-            &[Arc::new((*settled).clone().into())],
-            WeightedTimestamp::ZERO,
-        );
+        dedup_index.register_committed_certs(&[settled.clone().into()], WeightedTimestamp::ZERO);
 
         let abandoned = survivor_finalization_over(9, tx_hash);
         assert_ne!(abandoned.tick_id(), settled.tick_id());
@@ -4018,10 +4006,7 @@ pub mod tests {
             .next()
             .expect("a tick names its members");
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(
-            &[Arc::new((*settled).clone().into())],
-            WeightedTimestamp::ZERO,
-        );
+        dedup_index.register_committed_certs(&[settled.into()], WeightedTimestamp::ZERO);
 
         let block = block_with_verdicts(
             vec![AbandonmentRecord::new(
@@ -4050,7 +4035,7 @@ pub mod tests {
         let block = Block::Live {
             header: header_at_height(BlockHeight::new(6), 100_000),
             transactions: Arc::new(Capped::empty()),
-            certificates: Arc::new(Capped::from_array([Arc::new((*settled).clone().into())])),
+            certificates: Arc::new(Capped::from_array([settled.into()])),
             provisions: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
@@ -4166,12 +4151,12 @@ pub mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             );
-            Arc::new(Verifiable::from(Finalization::new(
+            Verifiable::from(Finalization::new(
                 tick_id,
                 half,
-                Some(Arc::new(ec)),
+                Some(ec),
                 Capped::new(receipts).expect("a list written out in a test"),
-            )))
+            ))
         };
         let certificates: Vec<_> = determined
             .iter()
@@ -4352,17 +4337,17 @@ pub mod tests {
     fn a_later_write_is_not_erased_by_an_earlier_determined_half() {
         let cell = state_key(7, 1);
         let stating = |value: u8| make_state_writes(7, 1, vec![value]);
-        let earlier = Arc::new(test_utils::make_finalization_leaving(
+        let earlier = test_utils::make_finalization_leaving(
             BlockHeight::new(4),
             TxHash::from(Hash::from_bytes(b"earlier writer")),
             stating(4),
-        ));
+        );
         let member = TxHash::from(Hash::from_bytes(b"later writer"));
-        let later = Arc::new(legs_leaving(5, member, stating(5)));
-        let carrying = |halves: &[&Arc<Finalization>]| {
+        let later = legs_leaving(5, member, stating(5));
+        let carrying = |halves: &[&Finalization]| {
             block_with_certificates(
                 BlockHeight::new(1),
-                halves.iter().copied().map(Arc::clone).collect(),
+                halves.iter().copied().cloned().collect(),
             )
         };
 
@@ -4435,7 +4420,7 @@ pub mod tests {
         let offered = |determined: &[u64], legs: &[u64]| {
             block_settling(determined, legs).certificates().to_vec()
         };
-        let halves = |selected: &[Arc<Verifiable<Finalization>>]| -> Vec<(u64, bool)> {
+        let halves = |selected: &[Verifiable<Finalization>]| -> Vec<(u64, bool)> {
             selected
                 .iter()
                 .map(|fw| (fw.tick_id().block_height().inner(), fw.is_determined()))
@@ -4451,8 +4436,12 @@ pub mod tests {
         assert_eq!(halves(&selected), [(4, true), (4, false), (6, true)]);
         let mut voter = FinalizationsFold::from(&ctx);
         assert!(
-            admit_all::<FinalizationsSection>(&ctx, &mut voter, selected.iter().map(unwrapped))
-                .is_ok()
+            admit_all::<FinalizationsSection>(
+                &ctx,
+                &mut voter,
+                selected.iter().map(Verifiable::as_unverified),
+            )
+            .is_ok()
         );
 
         // A voter owing a tick the proposer's rows did not name refuses
@@ -4467,8 +4456,12 @@ pub mod tests {
         assert_eq!(halves(&selected), [(5, false)]);
         let mut voter = FinalizationsFold::from(&ctx);
         assert!(
-            admit_all::<FinalizationsSection>(&ctx, &mut voter, selected.iter().map(unwrapped))
-                .is_err()
+            admit_all::<FinalizationsSection>(
+                &ctx,
+                &mut voter,
+                selected.iter().map(Verifiable::as_unverified),
+            )
+            .is_err()
         );
     }
 
@@ -4525,7 +4518,7 @@ pub mod tests {
         Finalization::new(
             tick_id,
             TickHalf::Determined,
-            Some(Arc::new(projected)),
+            Some(projected),
             Capped::new(receipts).expect("a list written out in a test"),
         )
     }
@@ -4610,7 +4603,7 @@ pub mod tests {
         let carrying = |kept: &[TxHash]| {
             block_with_certificates(
                 BlockHeight::new(3),
-                vec![Arc::new(determined_projected(outcomes(), kept))],
+                vec![determined_projected(outcomes(), kept)],
             )
         };
         let against = holding_alone(&[first, second]);
@@ -4692,12 +4685,7 @@ pub mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let none = Finalization::new(
-            tick_id,
-            TickHalf::Determined,
-            Some(Arc::new(empty)),
-            Capped::empty(),
-        );
+        let none = Finalization::new(tick_id, TickHalf::Determined, Some(empty), Capped::empty());
         let err = settles(&holding_alone(&[]), &none).unwrap_err();
         assert!(err.contains("settles no member of tick 2"), "{err}");
     }
@@ -5388,11 +5376,9 @@ pub mod tests {
     // validate_no_duplicate_provisions
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn block_with_provisions(height: BlockHeight, provisions: Vec<Arc<Provisions>>) -> Block {
-        let wrapped: Vec<Arc<Verifiable<Provisions>>> = provisions
-            .into_iter()
-            .map(|p| Arc::new((*p).clone().into()))
-            .collect();
+    fn block_with_provisions(height: BlockHeight, provisions: Vec<Provisions>) -> Block {
+        let wrapped: Vec<Verifiable<Provisions>> =
+            provisions.into_iter().map(Verifiable::from).collect();
         Block::Live {
             header: header_at_height(height, 100_000),
             transactions: Arc::new(Capped::empty()),
@@ -5406,16 +5392,16 @@ pub mod tests {
         }
     }
 
-    fn provisions_with_seed(seed: u8) -> Arc<Provisions> {
+    fn provisions_with_seed(seed: u8) -> Provisions {
         let tx_hash = TxHash::from(Hash::from_bytes(&[seed; 32]));
-        Arc::new(Provisions::new(
+        Provisions::new(
             ShardId::leaf(1, 0),
             ShardId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
             WeightedTimestamp::ZERO,
             MerkleInclusionProof::dummy(),
             Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-        ))
+        )
     }
 
     #[test]
@@ -5444,7 +5430,7 @@ pub mod tests {
     #[test]
     fn validate_no_duplicate_provisions_rejects_retention_dup() {
         let p = provisions_with_seed(1);
-        let block = block_with_provisions(BlockHeight::new(6), vec![Arc::clone(&p)]);
+        let block = block_with_provisions(BlockHeight::new(6), vec![p.clone()]);
         let against = plain();
         against
             .dedup
@@ -5517,13 +5503,11 @@ pub mod tests {
     // validate_transactions_verified / validate_block_for_vote verified-arm
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn verified_tx(seed: u8) -> Arc<Verifiable<Transaction>> {
-        Arc::new(Verifiable::from(test_utils::verified_test_transaction(
-            seed,
-        )))
+    fn verified_tx(seed: u8) -> Verifiable<Transaction> {
+        Verifiable::from(test_utils::verified_test_transaction(seed))
     }
 
-    fn sorted_verified_txs(seeds: &[u8]) -> Vec<Arc<Verifiable<Transaction>>> {
+    fn sorted_verified_txs(seeds: &[u8]) -> Vec<Verifiable<Transaction>> {
         let mut txs: Vec<_> = seeds.iter().map(|&s| verified_tx(s)).collect();
         txs.sort_by_key(|t| t.hash());
         txs
@@ -5596,15 +5580,15 @@ pub mod tests {
 
     /// A signed stub transaction whose derived owners are exactly
     /// `owners`, paying from `payer`, wrapped verified for block content.
-    fn stub_tx(payer: PrincipalAddr, owners: &[Address]) -> Arc<Verifiable<Transaction>> {
+    fn stub_tx(payer: PrincipalAddr, owners: &[Address]) -> Verifiable<Transaction> {
         test_utils::install_stub_protocol_statics();
         let validity = TimestampRange::new(
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(100_000),
         );
-        Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+        Verifiable::from(Verified::new_unchecked_for_test(
             test_utils::stub_transaction(payer, owners, 1_000, validity),
-        )))
+        ))
     }
 
     /// Admission at `local` under `topo`, with nothing committed.
@@ -5621,12 +5605,12 @@ pub mod tests {
     }
 
     fn block_with_tx(
-        tx: &Arc<Verifiable<Transaction>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        tx: &Verifiable<Transaction>,
+        provisions: Vec<Verifiable<Provisions>>,
     ) -> Block {
         Block::Live {
             header: header_at_height(BlockHeight::new(1), 100_000),
-            transactions: Arc::new(Capped::from_array([Arc::clone(tx)])),
+            transactions: Arc::new(Capped::from_array([tx.clone()])),
             certificates: Arc::new(Capped::empty()),
             provisions: Arc::new(Capped::new(provisions).expect("a list written out in a test")),
             witness_sources: Arc::new(WitnessSources::empty()),
@@ -5654,7 +5638,7 @@ pub mod tests {
         assert!(err.contains("payer bundle"), "{err}");
 
         // The payer's empty-entry bundle in the same block: engaged.
-        let bundle: Arc<Verifiable<Provisions>> = Arc::new(
+        let bundle: Verifiable<Provisions> =
             Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
                 ShardId::leaf(1, 1),
                 local,
@@ -5663,9 +5647,8 @@ pub mod tests {
                 MerkleInclusionProof::dummy(),
                 Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
             ))
-            .into(),
-        );
-        let paired = block_with_tx(&tx, vec![Arc::clone(&bundle)]);
+            .into();
+        let paired = block_with_tx(&tx, vec![bundle]);
         assert!(admit(&engaged(&topo, local), &paired).is_ok());
 
         // A bundle an earlier block committed, registered through that
@@ -5686,7 +5669,7 @@ pub mod tests {
         assert!(admit(&engaged_with(&topo, local, dedup), &bare).is_ok());
 
         // A bundle from the wrong source shard is not engagement evidence.
-        let wrong_source: Arc<Verifiable<Provisions>> = Arc::new(
+        let wrong_source: Verifiable<Provisions> =
             Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
                 local,
                 ShardId::leaf(1, 1),
@@ -5695,8 +5678,7 @@ pub mod tests {
                 MerkleInclusionProof::dummy(),
                 Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
             ))
-            .into(),
-        );
+            .into();
         let mispaired = block_with_tx(&tx, vec![wrong_source]);
         let err = admit(&engaged(&topo, local), &mispaired).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
@@ -5709,18 +5691,16 @@ pub mod tests {
         local: ShardId,
         height: u64,
         tx_hash: TxHash,
-    ) -> Arc<Verifiable<Provisions>> {
-        Arc::new(
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                payer,
-                local,
-                BlockHeight::new(height),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-            ))
-            .into(),
-        )
+    ) -> Verifiable<Provisions> {
+        Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+            payer,
+            local,
+            BlockHeight::new(height),
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
+        ))
+        .into()
     }
 
     /// A committed payer entry engages only while its committing anchor
@@ -5949,16 +5929,16 @@ pub mod tests {
     }
 
     /// `count` verified transactions in hash order, each its own payer's.
-    fn transactions_in_order(count: usize) -> Vec<Arc<Verifiable<Transaction>>> {
-        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..count)
+    fn transactions_in_order(count: usize) -> Vec<Verifiable<Transaction>> {
+        let mut txs: Vec<Verifiable<Transaction>> = (0..count)
             .map(|seed| {
-                Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+                Verifiable::from(Verified::new_unchecked_for_test(
                     test_utils::stub_transaction_binding(
                         u32::try_from(seed).expect("fewer than u32 transactions"),
                         0,
                         test_utils::test_validity_range(),
                     ),
-                )))
+                ))
             })
             .collect();
         txs.sort_by_key(|tx| tx.hash());
@@ -6100,7 +6080,7 @@ pub mod tests {
     /// A block of `txs` stating stub terms for each of `entries`, every
     /// entry's crossings cleared unless `crossings`, beside `lines`.
     fn carrying_terms(
-        txs: &[Arc<Verifiable<Transaction>>],
+        txs: &[Verifiable<Transaction>],
         entries: Vec<TxHash>,
         crossings: bool,
         lines: Vec<TickLine>,
@@ -6363,7 +6343,7 @@ pub mod tests {
         // bundle in hand: carried. What the ceiling covers is not this
         // chain's question, and asking it here is what would fork the
         // two verdicts across a fold.
-        let bundle: Arc<Verifiable<Provisions>> = Arc::new(
+        let bundle: Verifiable<Provisions> =
             Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
                 payer_shard,
                 local,
@@ -6372,8 +6352,7 @@ pub mod tests {
                 MerkleInclusionProof::dummy(),
                 Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
             ))
-            .into(),
-        );
+            .into();
         assert!(admit(&engaged(&topo, local), &block_with_tx(&tx, vec![bundle])).is_ok());
     }
 

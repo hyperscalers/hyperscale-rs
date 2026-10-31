@@ -26,12 +26,10 @@ use hyperscale_network_memory::{
     BandwidthReport, DeliveryDrain, FulfillmentStats, HostLayout, LinkStreams, NetworkConfig,
     NetworkTrafficAnalyzer, NodeIndex, RegionPlan, SimNetworkAdapter, SimulatedNetwork,
 };
-use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
-use hyperscale_node::reshape::prepared::PreparedStores;
-use hyperscale_node::shard::{HostEvent, StepOutput};
+use hyperscale_node::event::{HostEvent, ShardInbox, StepOutput, TimerOp, TimerOwner, timer_event};
+use hyperscale_node::reshape::{PreparedStores, ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::{
-    HostedChain, NodeConfig, NodeHost, NodeStateMachine, ReplicaConfig, ShardGenesis, TimerOp,
-    TimerOwner, timer_event,
+    HostResources, HostedChain, NodeConfig, NodeHost, NodeStateMachine, ReplicaConfig, ShardGenesis,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
@@ -41,8 +39,8 @@ use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
     BeaconChainConfig, Block, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash,
     GenesisValidators, LocalTimestamp, NetworkDefinition, PrincipalAddr, RoutingCommittees,
-    ShardId, Signer, StakePoolSeat, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
-    ValidatorInfo, ValidatorSet, Verifier, cache, shard_prefix_path,
+    ShardId, Signer, StakePoolSeat, TopologySnapshot, Transaction, TransactionStatus, TxHash,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifier, cache, shard_prefix_path,
 };
 use invariants::Invariants;
 use tracing::{debug, info, trace};
@@ -295,11 +293,6 @@ impl Hosts {
         self.0.iter().flatten()
     }
 
-    /// Every process that is up, mutably.
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut SimHost> {
-        self.0.iter_mut().flatten()
-    }
-
     /// Whether `index`'s process is up.
     fn is_up(&self, index: usize) -> bool {
         self.get(index).is_some()
@@ -403,7 +396,7 @@ pub struct SimulationRunner {
     beacon_network: NetworkDefinition,
 
     /// Placement deltas the hosts emitted via
-    /// `Action::ReconfigureParticipation`, in deterministic event
+    /// `BeaconAction::ReconfigureParticipation`, in deterministic event
     /// order. Drained by the harness via
     /// [`Self::take_participation_changes`].
     pending_participation_changes: Vec<(NodeIndex, ParticipationChange)>,
@@ -809,7 +802,11 @@ impl SimulationRunner {
                 .clone()
                 .map_or_else(SyncDispatch::new, SyncDispatch::deferred);
 
-            // One `SimShardStorage` per hosted shard on this host.
+            // One `SimShardStorage` per hosted shard on this host. A single
+            // receiver per host: both lanes of every hosted shard's inbox
+            // are clones of the same unbounded `event_tx`, so no push is
+            // ever refused, and the harness drains all shards through
+            // `event_rx` deterministically.
             let fresh = RecoveredState::default();
             let chains: Vec<HostedChain<'_, SimShardStorage>> = by_shard
                 .iter()
@@ -818,26 +815,23 @@ impl SimulationRunner {
                     storage: open_store(*shard, network_config.power_loss),
                     recovered: &fresh,
                     signers: validator_idxs.iter().copied().map(signer_of).collect(),
+                    inbox: ShardInbox::from(event_tx.clone()),
                 })
                 .collect();
-            // Single receiver per host: every hosted shard's sender is a
-            // clone of the same `event_tx`, and the harness drains all
-            // shards through `event_rx` deterministically.
-            let shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>> =
-                by_shard.keys().map(|s| (*s, event_tx.clone())).collect();
             let host = NodeHost::new(
-                replica_config,
+                &replica_config,
+                HostResources {
+                    beacon_storage,
+                    executor,
+                    network: network.create_adapter(
+                        NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
+                    ),
+                    dispatch,
+                    beacon_event_sender: event_tx.clone(),
+                    topology_snapshot: topology_arc_for_host,
+                },
                 chains,
                 identities,
-                beacon_storage,
-                executor,
-                network.create_adapter(
-                    NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
-                ),
-                dispatch,
-                shard_event_senders,
-                event_tx.clone(),
-                topology_arc_for_host,
                 network_config.node_config.clone(),
                 now,
             );
@@ -1309,14 +1303,20 @@ impl SimulationRunner {
         &mut self.network
     }
 
-    /// Schedule an initial event (e.g., to start the simulation).
-    /// Schedule an event for initial delivery. The event must be wrapped
-    /// in the appropriate [`HostEvent`] envelope: shard-scoped variants
-    /// via [`HostEvent::shard`] / [`HostEvent::protocol`],
-    /// `SubmitTransaction` via [`HostEvent::process`].
+    /// Schedule an event for delivery to `host` after `delay`, wrapped in
+    /// its [`HostEvent`] envelope: shard-scoped variants via
+    /// [`HostEvent::shard`] / [`HostEvent::protocol`].
     pub fn schedule_initial_event(&mut self, host: NodeIndex, delay: Duration, event: HostEvent) {
         let time = self.now + delay;
         self.schedule_event(host, time, event);
+    }
+
+    /// Hand `host` a client's `tx` after `delay`. The host routes it
+    /// through [`NodeHost::submit_transaction`] into its loops' channels,
+    /// and what it routes is scheduled at the same instant.
+    pub fn schedule_submission(&mut self, host: NodeIndex, delay: Duration, tx: Transaction) {
+        let time = self.now + delay;
+        self.schedule(host, time, SimEvent::Submit(tx));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1338,15 +1338,13 @@ impl SimulationRunner {
         self.run_genesis(&self.genesis_config());
     }
 
-    /// Install and commit genesis across the cluster, then wire the hosts
-    /// into the in-memory network.
+    /// Install and commit genesis across the cluster.
     ///
     /// Genesis is a single ROOT shard. Every ROOT-serving host runs the
     /// shared [`NodeHost::build_shard_genesis`] ceremony — identical config
     /// yields an identical block on each — and the certified block is
-    /// *scheduled* for commit rather than stepped inline: deferring it until
-    /// after [`NodeHost::register_inbound_handlers`] keeps genesis consensus
-    /// I/O from firing into an unwired network.
+    /// *scheduled* for commit rather than stepped inline, so genesis
+    /// consensus I/O fires only once every host's genesis is installed.
     fn run_genesis(&mut self, config: &GenesisConfig) {
         let shard = ShardId::ROOT;
         let num_hosts = NodeIndex::try_from(self.hosts.len()).expect("host count fits NodeIndex");
@@ -1373,11 +1371,6 @@ impl SimulationRunner {
         for host_index in 0..num_hosts {
             let output = self.hosts[host_index as usize].drain_pending_output();
             self.process_step_output(host_index, output);
-        }
-
-        // Wire each host into the in-memory network now that genesis is settled.
-        for host in self.hosts.iter_mut() {
-            host.register_inbound_handlers();
         }
     }
 
@@ -1749,11 +1742,15 @@ impl SimulationRunner {
                         input.extend_from_slice(&shard.depth().to_le_bytes());
                         input.extend_from_slice(&shard.path().to_le_bytes());
                     }
-                    HostEvent::Process(_) => input.push(1),
                     HostEvent::Beacon(_) => input.push(2),
                 }
                 // Type names are ASCII, so a 0xFF terminator delimits them.
                 input.extend_from_slice(event.type_name().as_bytes());
+                input.push(0xFF);
+            }
+            SimEvent::Submit(_) => {
+                input.push(1);
+                input.extend_from_slice(event.kind().as_bytes());
                 input.push(0xFF);
             }
             SimEvent::BatchDeadline => input.push(3),
@@ -1782,6 +1779,13 @@ impl SimulationRunner {
                 };
                 self.drain_host_io(host);
                 self.process_step_output(host, output);
+            }
+            SimEvent::Submit(tx) => {
+                self.wake(host);
+                if self.armed(host, |h| h.submit_transaction(&tx)).is_none() {
+                    return;
+                }
+                self.drain_host_io(host);
             }
             SimEvent::BatchDeadline => {
                 let now = self.wake(host);

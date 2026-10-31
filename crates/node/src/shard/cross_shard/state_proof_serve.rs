@@ -11,18 +11,16 @@ use std::sync::Arc;
 
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_jmt::TreeReader;
-use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{PendingChain, ShardStorage, Substates};
 use hyperscale_types::network::request::{GetCellsRequest, GetStateProofRequest};
-use hyperscale_types::network::response::{
-    GetCellsResponse, GetStateProofResponse, RangeAnswer, ServedValue,
-};
+use hyperscale_types::network::response::{GetCellsResponse, GetStateProofResponse, RangeAnswer};
 use hyperscale_types::{
     EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, SubstateKey,
     entry_leaf_key,
 };
 use hyperscale_vm_effects::CrossingLeaf;
+use tracing::warn;
 
 /// Serve an inbound state-proof query from the committed chain.
 ///
@@ -60,37 +58,45 @@ pub fn serve_state_proof_request<S: ShardStorage>(
             .open_boundary(req.height)
             .and_then(|boundary| proven(&boundary, req, |key| boundary.cell(key)))
     };
-    if answer.is_none() {
-        record_fetch_response_sent("state_proof", 0);
-    }
     answer.unwrap_or_else(GetStateProofResponse::not_found)
 }
 
 /// The proof of `req`'s keys under `tree` at the height it names, with
 /// the value `value_of` reads for each key present whose leaf is a
-/// crossing record; `None` where the tree holds no root at that height
-/// or the proof is one no asker could decode.
+/// crossing record; `None` where the tree holds no root at that height,
+/// the proof is one no asker could decode, or a record's value is wider
+/// than the answer carries.
 fn proven(
     tree: &impl TreeReader,
     req: &GetStateProofRequest,
     value_of: impl Fn(SubstateKey) -> Option<Vec<u8>>,
 ) -> Option<GetStateProofResponse> {
     let proof = generate_proof(tree, &req.keys, req.height)?;
-    record_fetch_response_sent("state_proof", req.keys.len());
-    let values: Vec<ServedValue> = req
-        .keys
-        .iter()
-        .filter_map(|&key| {
-            let bytes = value_of(key)?;
-            CrossingLeaf::read(&ProtocolHasher, key, &bytes)?;
-            Some((key, Bytes::new(bytes).ok()?))
-        })
-        .collect();
-    // One value at most per key asked, so the list sits under the
-    // request's own cap.
+    let mut values = Vec::new();
+    for &key in req.keys.iter() {
+        let Some(bytes) = value_of(key) else {
+            continue;
+        };
+        if CrossingLeaf::read(&ProtocolHasher, key, &bytes).is_none() {
+            continue;
+        }
+        // A record is held to the width a served value carries, so one
+        // past it is a store holding what no record writes. Leaving it
+        // out would answer the record as a bare presence, which is a
+        // narrower answer than the asker is owed, so none is given.
+        let Ok(bytes) = Bytes::new(bytes) else {
+            warn!(
+                height = req.height.inner(),
+                ?key,
+                "state proof: a crossing record wider than a served value; serving not_found"
+            );
+            return None;
+        };
+        values.push((key, bytes));
+    }
     Some(GetStateProofResponse::found(
         proof,
-        Capped::new(values).unwrap_or_default(),
+        Capped::new(values).expect("one value at most per key asked, under the cap the ask met"),
     ))
 }
 
@@ -110,13 +116,16 @@ fn proven(
 /// committed tip's view, so no pending descendant this node happens to
 /// hold leaks into an answer about committed state.
 ///
-/// The proof covers the point keys asked, present or absent, and the
-/// entry leaves the intervals actually returned. It does not attest that
-/// an interval is complete, and cannot: an entry commits under a digest
-/// of its owner, collection and order, so the tree's key order is not
-/// the collection's and no non-inclusion proof over it says what lies
-/// between two orders. A server may answer with a narrower collection
-/// than it holds; it cannot answer with a value nobody wrote.
+/// The proof covers the point keys asked, present or absent, the entry
+/// leaves the intervals actually returned, and the leaf of the first
+/// order of each interval that returned nothing — which proves a
+/// single-order interval empty, and for a wider one only ties the
+/// answer to the root. It does not attest that
+/// a wider interval is complete, and cannot: an entry commits under a
+/// digest of its owner, collection and order, so the tree's key order is
+/// not the collection's and no non-inclusion proof over it says what
+/// lies between two orders. A server may answer with a narrower
+/// collection than it holds; it cannot answer with a value nobody wrote.
 #[must_use]
 pub fn serve_cells_request<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
@@ -127,7 +136,6 @@ pub fn serve_cells_request<S: ShardStorage>(
     // The header is what makes the answer checkable, so an anchor this
     // node cannot produce one for is no answer at all.
     let Some(anchor) = pending_chain.certified_header(height) else {
-        record_fetch_response_sent("cells", 0);
         return GetCellsResponse::not_found();
     };
     let at = view.base().snapshot_at(height);
@@ -135,12 +143,12 @@ pub fn serve_cells_request<S: ShardStorage>(
     // What the answer would cost before any of it is spent. Nothing
     // here is signed — a preview asks before there is a transaction to
     // sign — so the caps are the asker's word, and a query wider than
-    // any declaration could be is refused rather than walked.
+    // any declaration could be is refused rather than walked. An
+    // interval costs at least the one leaf it always stands on.
     let asked = req.ranges.iter().fold(req.keys.len() as u64, |sum, range| {
-        sum.saturating_add(u64::from(range.cap))
+        sum.saturating_add(u64::from(range.cap.max(1)))
     });
     if asked > MAX_CELLS_PER_QUERY {
-        record_fetch_response_sent("cells", 0);
         return GetCellsResponse::not_found();
     }
 
@@ -158,20 +166,26 @@ pub fn serve_cells_request<S: ShardStorage>(
         // cannot express, and leaving it out would prove the key absent
         // when it is not — so the whole answer is declined instead.
         let Ok(value) = Bytes::new(value) else {
-            record_fetch_response_sent("cells", 0);
             return GetCellsResponse::not_found();
         };
         carried = carried.saturating_add(value.len());
         cells.push((*key, value));
     }
     if carried > MAX_CELLS_RESPONSE_BYTES {
-        record_fetch_response_sent("cells", 0);
         return GetCellsResponse::not_found();
     }
 
     // Every leaf the answer stands on, so one multiproof covers the
     // whole of it: the keys as asked — an absent one is proven absent —
-    // and an entry leaf per entry a range returned.
+    // an entry leaf per entry a range returned, and the leaf of the
+    // first order of an interval that came back empty. Every interval
+    // stands on a leaf, so an answer of nothing but empty intervals
+    // still carries a claim tying it to the root, where a claimless
+    // proof reconstructs none but the empty one. Of a single order that
+    // leaf proves the interval empty, the only interval whose
+    // completeness a leaf can state, an entry's leaf being keyed by a
+    // digest of its order. It takes the place of the entry the interval
+    // was charged for, so the leaves stay inside what was asked.
     let mut leaves = req.keys.to_vec();
     let mut ranges = Vec::with_capacity(req.ranges.len());
     for range in &req.ranges {
@@ -185,26 +199,28 @@ pub fn serve_cells_request<S: ShardStorage>(
         let mut entries = Vec::with_capacity(found.len());
         for (order, value) in found {
             let Ok(value) = Bytes::new(value) else {
-                record_fetch_response_sent("cells", 0);
                 return GetCellsResponse::not_found();
             };
             carried = carried.saturating_add(value.len());
             entries.push((order, value));
         }
         if carried > MAX_CELLS_RESPONSE_BYTES {
-            record_fetch_response_sent("cells", 0);
             return GetCellsResponse::not_found();
         }
-        leaves.extend(entries.iter().map(|(order, _)| {
+        let entry_leaf = |order: u128| {
             entry_leaf_key(
                 &ProtocolHasher,
                 EntryKey {
                     owner: range.owner,
                     collection: range.collection,
-                    order: *order,
+                    order,
                 },
             )
-        }));
+        };
+        leaves.extend(entries.iter().map(|(order, _)| entry_leaf(*order)));
+        if entries.is_empty() {
+            leaves.push(entry_leaf(range.lo));
+        }
         ranges.push(RangeAnswer {
             entries: Capped::new(entries)
                 .expect("no more entries than the interval's own cap admits"),
@@ -212,17 +228,13 @@ pub fn serve_cells_request<S: ShardStorage>(
     }
 
     generate_proof(view.as_ref(), &leaves, height).map_or_else(
-        || {
-            record_fetch_response_sent("cells", 0);
-            GetCellsResponse::not_found()
-        },
+        GetCellsResponse::not_found,
         |proof| {
-            record_fetch_response_sent("cells", leaves.len());
             GetCellsResponse::found(
                 Capped::new(cells).expect("no more cells than the request named"),
                 Capped::new(ranges).expect("no more intervals than the request named"),
                 proof,
-                (*anchor).clone().into_inner(),
+                anchor.into_inner(),
             )
         },
     )
@@ -289,8 +301,8 @@ mod tests {
                 provision_tx_roots: Capped::default(),
                 ..Default::default()
             });
-            let txs: Vec<Arc<Verifiable<Transaction>>> = if height == 1 {
-                vec![Arc::new(Verifiable::from(test_transaction(1)))]
+            let txs: Vec<Verifiable<Transaction>> = if height == 1 {
+                vec![(Verifiable::from(test_transaction(1)))]
             } else {
                 Vec::new()
             };
@@ -307,7 +319,7 @@ mod tests {
             };
             let mut creations = committed_tx_cells(
                 SHARD,
-                block.transactions().iter().map(|tx| tx.as_unverified()),
+                block.transactions().iter().map(Verifiable::as_unverified),
             );
             if height == 1 {
                 creations.extend(extra.iter().cloned());

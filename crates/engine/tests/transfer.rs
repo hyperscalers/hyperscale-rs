@@ -18,7 +18,7 @@ use hyperscale_engine::legs::{Classified, Member, PlanDefect};
 use hyperscale_engine::{
     Availability, ExecutedTx, ExecutionMode, Executor, FetchedCells, Holds, PROTOCOL_RESOURCE,
     PreviewGrants, PreviewInputs, PreviewOutcome, PreviewReport, ResourceChange, TickBatchContext,
-    TickEnvironment, TickTxInput, build_refusal_receipt, genesis_writes,
+    TickEnvironment, TickTxInput, UnprovenInterval, build_refusal_receipt, genesis_writes,
 };
 use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_storage::{
@@ -355,7 +355,7 @@ fn price_of(executor: &Executor, tx: &Transaction) -> u128 {
         .expect("a test transaction derives")
 }
 
-fn execute(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) -> Vec<ExecutedTx> {
+fn execute(executor: &Executor, transactions: &[Verified<Transaction>]) -> Vec<ExecutedTx> {
     execute_on(&[(alice(), 1_000), (bob(), 50)], executor, transactions)
 }
 
@@ -409,7 +409,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         let executed = execute_batch_on(
             &store,
             executor,
-            &[Arc::new(Verified::<Transaction>::from_persisted(seal))],
+            &[(Verified::<Transaction>::from_persisted(seal))],
         );
         let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
             panic!("the seal must settle: {:?}", executed[0].consensus);
@@ -425,7 +425,7 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
         let executed = execute_batch_on(
             &store,
             executor,
-            &[Arc::new(Verified::<Transaction>::from_persisted(close))],
+            &[(Verified::<Transaction>::from_persisted(close))],
         );
         let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
             panic!("the close must settle: {:?}", executed[0].consensus);
@@ -465,7 +465,7 @@ fn execute_seeded(
     executor: &Executor,
     store: &MapDb,
     env: TickEnvironment,
-    transactions: &[Arc<Verified<Transaction>>],
+    transactions: &[Verified<Transaction>],
 ) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
@@ -507,9 +507,7 @@ fn a_round_settles_on_what_its_seal_fixed() {
     let store = with_lottery(&[(alice(), 1_000), (bob(), 50)], &executor);
 
     let settle = |fee: u128| {
-        Arc::new(Verified::<Transaction>::from_persisted(
-            signed_settle_with_fee(ALICE_SEED, fee, ROUND),
-        ))
+        Verified::<Transaction>::from_persisted(signed_settle_with_fee(ALICE_SEED, fee, ROUND))
     };
     let first = settle(20);
     let second = settle(21);
@@ -582,9 +580,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
     let executor = executor(ExecutionMode::Serial);
 
     let pay = |seed: u8, from: PrincipalAddr| {
-        Arc::new(Verified::<Transaction>::from_persisted(
-            signed_transfer_with_fee(seed, from, hot, 100, 10),
-        ))
+        Verified::<Transaction>::from_persisted(signed_transfer_with_fee(seed, from, hot, 100, 10))
     };
 
     // Threaded by hand: each batch reads what the previous one committed.
@@ -643,7 +639,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
 
 /// Derive every member the way admission would, so the engine reads the
 /// routed facts off the same caches it executes against.
-fn derived_through(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) {
+fn derived_through(executor: &Executor, transactions: &[Verified<Transaction>]) {
     for tx in transactions {
         tx.try_derived(executor.derivation().as_ref())
             .expect("a fixture transaction derives");
@@ -653,7 +649,7 @@ fn derived_through(executor: &Executor, transactions: &[Arc<Verified<Transaction
 fn execute_on(
     accounts: &[(PrincipalAddr, u128)],
     executor: &Executor,
-    transactions: &[Arc<Verified<Transaction>>],
+    transactions: &[Verified<Transaction>],
 ) -> Vec<ExecutedTx> {
     execute_batch_on(&MapDb::genesis(accounts), executor, transactions)
 }
@@ -663,7 +659,7 @@ fn execute_on(
 fn execute_batch_on(
     snapshot_store: &(dyn Substates + Sync),
     executor: &Executor,
-    transactions: &[Arc<Verified<Transaction>>],
+    transactions: &[Verified<Transaction>],
 ) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
@@ -758,13 +754,9 @@ fn vault_removed(writes: &SettledWrites, owner: impl Into<Address>) -> bool {
 #[test]
 fn a_transfer_folds_to_identity_keyed_absolute_updates() {
     let executor = executor(ExecutionMode::Serial);
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
-        ALICE_SEED,
-        alice(),
-        bob(),
-        100,
-    )));
-    let executed = execute(&executor, &[Arc::clone(&tx)]);
+    let tx =
+        Verified::<Transaction>::from_persisted(signed_transfer(ALICE_SEED, alice(), bob(), 100));
+    let executed = execute(&executor, std::slice::from_ref(&tx));
     assert_eq!(executed.len(), 1);
     let ConsensusReceipt::Succeeded {
         writes: database_updates,
@@ -813,9 +805,9 @@ fn a_two_account_root_signed_through_the_client_keeps_both_attesters() {
     );
     assert_eq!(tx.body().signatures.len(), 2);
 
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(tx));
+    let tx = Verified::<Transaction>::from_persisted(tx);
     let price = price_of(&executor, &tx);
-    let executed = execute(&executor, &[Arc::clone(&tx)]);
+    let executed = execute(&executor, std::slice::from_ref(&tx));
     let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
         panic!("both sign-ins hold: {:?}", executed[0].consensus);
     };
@@ -833,20 +825,12 @@ fn a_two_account_root_signed_through_the_client_keeps_both_attesters() {
 #[test]
 fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
     let executor = executor(ExecutionMode::Serial);
-    let over = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
-        BOB_SEED,
-        bob(),
-        alice(),
-        500,
-    )));
+    let over =
+        Verified::<Transaction>::from_persisted(signed_transfer(BOB_SEED, bob(), alice(), 500));
     let price = price_of(&executor, &over);
-    let fine = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
-        ALICE_SEED,
-        alice(),
-        bob(),
-        25,
-    )));
-    let executed = execute(&executor, &[Arc::clone(&over), Arc::clone(&fine)]);
+    let fine =
+        Verified::<Transaction>::from_persisted(signed_transfer(ALICE_SEED, alice(), bob(), 25));
+    let executed = execute(&executor, &[over, fine.clone()]);
     assert_eq!(executed.len(), 2);
     // Input order is preserved: the infeasible reservation aborts its
     // own transaction only.
@@ -897,30 +881,26 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
 #[test]
 fn a_failed_charge_survives_a_later_sibling_credit() {
     let executor = executor(ExecutionMode::Serial);
-    let failed = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
-        BOB_SEED,
-        bob(),
-        alice(),
-        500,
-    )));
+    let failed =
+        Verified::<Transaction>::from_persisted(signed_transfer(BOB_SEED, bob(), alice(), 500));
     let price = price_of(&executor, &failed);
     // Receipts fold and commit hash-ascending, and only a credit landing
     // after the failure can revert its debit — so pick a transfer amount
     // whose hash does.
     let (amount, credit) = (100u128..200)
         .map(|amount| {
-            let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
+            let tx = Verified::<Transaction>::from_persisted(signed_transfer(
                 ALICE_SEED,
                 alice(),
                 bob(),
                 amount,
-            )));
+            ));
             (amount, tx)
         })
         .find(|(_, tx)| tx.hash() > failed.hash())
         .expect("some amount in range hashes after the failure");
 
-    let executed = execute(&executor, &[Arc::clone(&failed), Arc::clone(&credit)]);
+    let executed = execute(&executor, &[failed, credit]);
     assert!(matches!(executed[0].consensus, ConsensusReceipt::Failed));
     let ConsensusReceipt::Succeeded { writes, .. } = &executed[1].consensus else {
         panic!("the credit must succeed");
@@ -945,14 +925,14 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
 fn serial_and_parallel_scheduling_produce_identical_receipts() {
     let serial = executor(ExecutionMode::Serial);
     let parallel = executor(ExecutionMode::Parallel);
-    let txs: Vec<Arc<Verified<Transaction>>> = (0..4u128)
+    let txs: Vec<Verified<Transaction>> = (0..4u128)
         .map(|i| {
-            Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
+            Verified::<Transaction>::from_persisted(signed_transfer(
                 ALICE_SEED,
                 alice(),
                 bob(),
                 10 + i,
-            )))
+            ))
         })
         .collect();
     let a = execute(&serial, &txs);
@@ -974,9 +954,8 @@ fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
     let executor = executor(ExecutionMode::Serial);
     // A ceiling below the declared price is refused at admission; one
     // that bypassed it burns the ceiling — the backstop clamp working.
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(7, payer, bob(), 100, 10),
-    ));
+    let tx =
+        Verified::<Transaction>::from_persisted(signed_transfer_with_fee(7, payer, bob(), 100, 10));
     let executed = execute_on(&accounts, &executor, &[tx]);
     assert_eq!(executed.len(), 1);
     let ConsensusReceipt::Succeeded {
@@ -1006,9 +985,7 @@ fn a_call_that_never_touches_its_payers_vault_still_pays() {
     let executor = executor(ExecutionMode::Serial);
     // A ceiling below the declared price, bypassing admission, burns
     // exactly the ceiling.
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_settle_with_fee(ALICE_SEED, 10, ROUND),
-    ));
+    let tx = Verified::<Transaction>::from_persisted(signed_settle_with_fee(ALICE_SEED, 10, ROUND));
     let store = with_lottery(&[(alice(), 1_000), (bob(), 50)], &executor);
     let executed = execute_batch_on(&store, &executor, &[tx]);
     let ConsensusReceipt::Succeeded {
@@ -1042,12 +1019,20 @@ fn a_receipt_carries_only_its_own_payers_burn() {
     let accounts = [(payer_a, 1_000), (payer_b, 1_000), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
     let txs = vec![
-        Arc::new(Verified::<Transaction>::from_persisted(
-            signed_transfer_with_fee(31, payer_a, bob(), 100, 10),
-        )),
-        Arc::new(Verified::<Transaction>::from_persisted(
-            signed_transfer_with_fee(32, payer_b, bob(), 100, 10),
-        )),
+        (Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+            31,
+            payer_a,
+            bob(),
+            100,
+            10,
+        ))),
+        (Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+            32,
+            payer_b,
+            bob(),
+            100,
+            10,
+        ))),
     ];
     let executed = execute_on(&accounts, &executor, &txs);
 
@@ -1085,13 +1070,11 @@ fn shared_payer_burns_accumulate_across_a_batch() {
     const ROUNDS: [u8; 3] = [0x4D, 0x4E, 0x4F];
 
     let executor = executor(ExecutionMode::Serial);
-    let mut txs: Vec<Arc<Verified<Transaction>>> = [10u128, 11, 12]
+    let mut txs: Vec<Verified<Transaction>> = [10u128, 11, 12]
         .into_iter()
         .zip(ROUNDS)
         .map(|(fee, salt)| {
-            Arc::new(Verified::<Transaction>::from_persisted(
-                signed_settle_with_fee(ALICE_SEED, fee, salt),
-            ))
+            Verified::<Transaction>::from_persisted(signed_settle_with_fee(ALICE_SEED, fee, salt))
         })
         .collect();
     txs.sort_by_key(|tx| tx.hash());
@@ -1127,7 +1110,7 @@ fn a_missed_edge_bound_charges_its_payer_the_price() {
     let executed = execute_on(
         &accounts,
         &executor,
-        &[Arc::new(Verified::<Transaction>::from_persisted(tx))],
+        &[(Verified::<Transaction>::from_persisted(tx))],
     );
     assert_eq!(executed.len(), 1);
     assert!(
@@ -1167,8 +1150,12 @@ fn a_payer_drained_by_its_own_fee_deletes_its_vault() {
     // Exactly the transfer plus the ceiling: nothing survives the burn.
     let accounts = [(payer, 110), (bob(), 50)];
     let executor = executor(ExecutionMode::Serial);
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(11, payer, bob(), 100, 10),
+    let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+        11,
+        payer,
+        bob(),
+        100,
+        10,
     ));
     let executed = execute_on(&accounts, &executor, &[tx]);
     let ConsensusReceipt::Succeeded {
@@ -1215,7 +1202,7 @@ fn issued(classified: &Classified, local: ShardId, kind: Option<Kind>) -> Vec<Su
 fn execute_on_shard(
     executor: &Executor,
     local_shard: ShardId,
-    transactions: &[Arc<Verified<Transaction>>],
+    transactions: &[Verified<Transaction>],
 ) -> Vec<ExecutedTx> {
     let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
     let trie = ShardTrie::uniform(1);
@@ -1256,8 +1243,12 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
         "the two accounts must sit on different shards"
     );
 
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+        ALICE_SEED,
+        alice(),
+        far(),
+        100,
+        0,
     ));
     let sender_side = execute_on_shard(&executor, near_shard, std::slice::from_ref(&tx));
     let recipient_side = execute_on_shard(&executor, far_shard, &[tx]);
@@ -1269,7 +1260,7 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
 }
 
 /// A hundred from alice to `far()`, whose fee `far()` pays.
-fn transfer_paid_by_the_recipient() -> Arc<Verified<Transaction>> {
+fn transfer_paid_by_the_recipient() -> Verified<Transaction> {
     let key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
     let graph = client()
         .transfer_graph(alice(), far(), 100)
@@ -1288,9 +1279,9 @@ fn transfer_paid_by_the_recipient() -> Arc<Verified<Transaction>> {
         },
     )
     .expect("a transfer fits the tree cap");
-    Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
+    Verified::<Transaction>::from_persisted(Transaction::new(
         signing::sign(envelope, &key, &ProtocolHasher).expect("a transfer signs"),
-    )))
+    ))
 }
 
 /// A transfer whose fee payer sits on the recipient's shard never leaves
@@ -1412,8 +1403,12 @@ fn a_transfer_plans_one_leg_each_side_of_the_trie() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+        ALICE_SEED,
+        alice(),
+        far(),
+        100,
+        0,
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let divided = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
@@ -1461,8 +1456,12 @@ fn local_shares_cover_what_the_committing_shard_runs() {
         near_shard, far_shard,
         "the ends must sit apart for the shares to split"
     );
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, TRANSFER_FEE),
+    let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+        ALICE_SEED,
+        alice(),
+        far(),
+        100,
+        TRANSFER_FEE,
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let whole = tx.work();
@@ -1534,8 +1533,12 @@ fn a_transfer_executes_divided_on_the_payers_shard() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+        ALICE_SEED,
+        alice(),
+        far(),
+        100,
+        0,
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
@@ -1627,8 +1630,12 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+        ALICE_SEED,
+        alice(),
+        far(),
+        100,
+        0,
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
@@ -1757,8 +1764,12 @@ fn a_consumers_taken_read_present_retires_the_record_in_the_fold() {
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
     let far_shard = trie.shard_for_prefix(far());
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+        ALICE_SEED,
+        alice(),
+        far(),
+        100,
+        0,
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
@@ -1836,8 +1847,12 @@ fn inherited_record() -> Inherited {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let shard = trie.shard_for_prefix(alice());
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+        ALICE_SEED,
+        alice(),
+        far(),
+        100,
+        0,
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
@@ -1935,7 +1950,7 @@ fn run_alone(
     executor: &Executor,
     ctx: &TickBatchContext<'_>,
     snapshot: &(dyn Substates + Sync),
-    transaction: &Arc<Verified<Transaction>>,
+    transaction: &Verified<Transaction>,
     member: Member,
 ) -> ExecutedTx {
     let input = TickTxInput {
@@ -1960,7 +1975,7 @@ fn chain_owing_a_payment(
     executor: &Executor,
     trie: &ShardTrie,
     accounts: &[(PrincipalAddr, u128)],
-    spending: &Arc<Verified<Transaction>>,
+    spending: &Verified<Transaction>,
     height: BlockHeight,
 ) -> TickChain<MapDb> {
     let shard = trie.shard_for_prefix(spending.fee_payer());
@@ -2024,7 +2039,7 @@ struct HaltedOverASpentVault {
     executor: Executor,
     trie: ShardTrie,
     consumer: ShardId,
-    taking: Arc<Verified<Transaction>>,
+    taking: Verified<Transaction>,
     core: Member,
     arrivals: Vec<EscrowedValue>,
     crossing: CrossingId,
@@ -2048,7 +2063,7 @@ impl HaltedOverASpentVault {
 
         let taking = transfer_paid_by(ALICE_SEED, alice(), recipient, 100, payer);
         let spending = verified(signed_transfer(seeds[0], payer, creditor, 100));
-        derived_through(&executor, &[Arc::clone(&taking), Arc::clone(&spending)]);
+        derived_through(&executor, &[taking.clone(), spending.clone()]);
         let classified =
             Classified::freeze(taking.legs(), taking.fee_payer(), taking.accounts(), &trie);
         assert_eq!(classified.core(), &BTreeSet::from([consumer]));
@@ -2205,8 +2220,12 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 0),
+    let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+        ALICE_SEED,
+        alice(),
+        far(),
+        100,
+        0,
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
     let run = |local_shard: ShardId| {
@@ -2278,12 +2297,8 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
-        ALICE_SEED,
-        alice(),
-        far(),
-        100,
-    )));
+    let tx =
+        Verified::<Transaction>::from_persisted(signed_transfer(ALICE_SEED, alice(), far(), 100));
     let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
     let mut holds = ProvisionalHolds::new();
     holds
@@ -2336,7 +2351,7 @@ fn transfer_paid_by(
     to: PrincipalAddr,
     amount: u128,
     payer: PrincipalAddr,
-) -> Arc<Verified<Transaction>> {
+) -> Verified<Transaction> {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let graph = client()
         .transfer_graph(from, to, amount)
@@ -2394,14 +2409,14 @@ fn a_reservation_is_judged_before_a_batch_mates_credit_lands() {
     let crediting = transfer_paid_by(ALICE_SEED, alice(), holder, 50, far());
     // Receipts apply in canonical order, so the debits are two that fall
     // behind the credit.
-    let debiting: Vec<Arc<Verified<Transaction>>> = near_seeds[2..]
+    let debiting: Vec<Verified<Transaction>> = near_seeds[2..]
         .iter()
         .map(|seed| transfer_paid_by(holder_seed, holder, fee_payer(*seed), 60, sponsor))
         .filter(|tx| tx.hash() > crediting.hash())
         .take(2)
         .collect();
     assert_eq!(debiting.len(), 2, "two debits fall behind the credit");
-    let batch: Vec<Arc<Verified<Transaction>>> = std::iter::once(crediting.clone())
+    let batch: Vec<Verified<Transaction>> = std::iter::once(crediting.clone())
         .chain(debiting.iter().cloned())
         .collect();
     derived_through(&executor, &batch);
@@ -2486,7 +2501,7 @@ fn seeds_on(trie: &ShardTrie, shard: ShardId) -> Vec<u8> {
 }
 
 /// One member of a batch: its name, its body and what it runs as.
-type Seated<'a> = (TxHash, &'a Arc<Verified<Transaction>>, Member);
+type Seated<'a> = (TxHash, &'a Verified<Transaction>, Member);
 
 /// One batch through a tick on the sender's shard over `store`, with
 /// every cell of the far shard provisioned. Answers in the order given.
@@ -2586,14 +2601,14 @@ fn two_burns_behind_a_credit(credit_payer: PrincipalAddr) -> (Vec<ExecutedTx>, M
     ]);
 
     let crediting = transfer_paid_by(ALICE_SEED, alice(), sponsor, price, credit_payer);
-    let burning: Vec<Arc<Verified<Transaction>>> = seeds[2..]
+    let burning: Vec<Verified<Transaction>> = seeds[2..]
         .iter()
         .map(paid_by_sponsor)
         .filter(|tx| tx.hash() > crediting.hash())
         .take(2)
         .collect();
     assert_eq!(burning.len(), 2, "two burns fall behind the credit");
-    let batch: Vec<Arc<Verified<Transaction>>> = std::iter::once(crediting.clone())
+    let batch: Vec<Verified<Transaction>> = std::iter::once(crediting.clone())
         .chain(burning.iter().cloned())
         .collect();
     derived_through(&executor, &batch);
@@ -2658,8 +2673,11 @@ fn a_two_recipient_fan_out_executes() {
         account::deposit(&mut b, to, funds).expect("an account deposits");
     }
     let graph = b.build().expect("every output is consumed");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
-        client().sign(graph, &key, validity(), terms(10)),
+    let tx = Verified::<Transaction>::from_persisted(Transaction::new(client().sign(
+        graph,
+        &key,
+        validity(),
+        terms(10),
     )));
     let executed = execute_on(
         &[(alice(), 1_000), (bob(), 50), (fee_payer(7), 1_000)],
@@ -2719,10 +2737,7 @@ fn a_publish_writes_the_artifact_under_its_own_address() {
     let payer = fee_payer(7);
     let executor = executor(ExecutionMode::Serial);
     let artifact = published_artifact();
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
-        7,
-        artifact.clone(),
-    )));
+    let tx = Verified::<Transaction>::from_persisted(signed_publish(7, artifact.clone()));
     // Funded well above the burn: at the placeholder rate of one unit
     // per artifact byte, publishing the stdlib guest costs more than the
     // balances the transfer fixtures use.
@@ -2890,10 +2905,7 @@ fn a_publish_charges_no_more_than_the_ceiling_it_signed() {
 
     // The ceiling is derived from the price rather than pinned, so this
     // keeps saying the same thing as the table moves under it.
-    let priced = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
-        7,
-        artifact.clone(),
-    )));
+    let priced = Verified::<Transaction>::from_persisted(signed_publish(7, artifact.clone()));
     let price = priced
         .price_under(executor.derivation().as_ref(), &PriceTable::GENESIS)
         .expect("a publish derives");
@@ -2904,9 +2916,7 @@ fn a_publish_charges_no_more_than_the_ceiling_it_signed() {
          ceiling: price {price}"
     );
 
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_publish_under(7, artifact, ceiling),
-    ));
+    let tx = Verified::<Transaction>::from_persisted(signed_publish_under(7, artifact, ceiling));
     let executed = execute_on(&[(payer, 1_000_000)], &executor, std::slice::from_ref(&tx));
     let ConsensusReceipt::Succeeded {
         writes: database_updates,
@@ -3088,9 +3098,7 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
         "the package is unknown before its block commits"
     );
 
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
-        7, artifact,
-    )));
+    let tx = Verified::<Transaction>::from_persisted(signed_publish(7, artifact));
     let executed = execute_on(&[(payer, 1_000_000)], &executor, &[tx]);
     let ConsensusReceipt::Succeeded { .. } = &executed[0].consensus else {
         panic!("the publish must succeed: {:?}", executed[0].consensus);
@@ -3171,9 +3179,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
         "the code is unknown before its block commits"
     );
 
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
-        7, artifact,
-    )));
+    let tx = Verified::<Transaction>::from_persisted(signed_publish(7, artifact));
     let executed = execute_on(&[(payer, 1_000_000)], &executor, &[tx]);
     let ConsensusReceipt::Succeeded { .. } = &executed[0].consensus else {
         panic!("the publish must succeed: {:?}", executed[0].consensus);
@@ -3433,6 +3439,14 @@ fn a_preview_speaks_for_a_shard_a_fan_out_answered() {
     fetched
         .anchors
         .insert(ShardId::leaf(1, 0), BlockHeight::new(4));
+    // And an interval that shard answered without proving it whole.
+    let interval = UnprovenInterval {
+        owner: bob().into(),
+        collection: CollectionId([0xC0; 16]),
+        lo: 0,
+        hi: u128::MAX,
+    };
+    fetched.unproven.insert(interval);
 
     let report = executor.preview(
         &snapshot_store,
@@ -3465,6 +3479,10 @@ fn a_preview_speaks_for_a_shard_a_fan_out_answered() {
         report.anchors,
         BTreeMap::from([(ShardId::leaf(1, 0), BlockHeight::new(4))]),
     );
+    // As does every interval read on that shard's word: the verdict and
+    // the ceilings may rest on a gap the server left, and a caller that
+    // cannot see which reads those were cannot weigh them.
+    assert_eq!(report.unproven_intervals, BTreeSet::from([interval]));
 }
 
 /// A preview that read no shard's state names no anchor: there is no
@@ -3491,6 +3509,7 @@ fn a_refused_preview_names_no_anchor() {
     );
     assert!(matches!(report.outcome, PreviewOutcome::Refused { .. }));
     assert!(report.anchors.is_empty());
+    assert!(report.unproven_intervals.is_empty());
 }
 
 /// A preview reaches the kernel without deriving, and what it reports
@@ -3601,6 +3620,10 @@ fn a_preview_reports_the_resource_changes_a_transfer_would_make() {
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     assert_eq!(report.outcome, PreviewOutcome::Completed);
+    assert!(
+        report.unproven_intervals.is_empty(),
+        "a run over this node's own state rests on no server's completeness"
+    );
     assert_eq!(
         report.fee, PREVIEW_CEILING,
         "a ceiling below the price is the burn"
@@ -3643,7 +3666,7 @@ fn a_preview_agrees_with_the_tick_that_would_commit_it() {
     let executor = executor(ExecutionMode::Serial);
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
-    let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
+    let verified = Verified::<Transaction>::from_persisted(tx);
     let executed = execute_on(&accounts, &executor, &[verified]);
     let ConsensusReceipt::Succeeded {
         writes: database_updates,
@@ -3713,8 +3736,12 @@ fn a_members_fee_follows_the_table_it_carries() {
         ..PriceTable::GENESIS
     };
     let burn = |prices: PriceTable| {
-        let tx = Arc::new(Verified::<Transaction>::from_persisted(
-            signed_transfer_with_fee(ALICE_SEED, payer, bob(), 100, TRANSFER_FEE),
+        let tx = Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+            ALICE_SEED,
+            payer,
+            bob(),
+            100,
+            TRANSFER_FEE,
         ));
         derived_through(&executor, std::slice::from_ref(&tx));
         let trie = ShardTrie::single();
@@ -3943,12 +3970,8 @@ fn a_committed_cell_that_is_not_a_package_is_ignored() {
     // The other half: ordinary traffic cannot grow the cache by
     // accident, whatever it writes.
     let executor = executor(ExecutionMode::Serial);
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
-        ALICE_SEED,
-        alice(),
-        bob(),
-        100,
-    )));
+    let tx =
+        Verified::<Transaction>::from_persisted(signed_transfer(ALICE_SEED, alice(), bob(), 100));
     let executed = execute(&executor, &[tx]);
     let bogus = package_hash(&ProtocolHasher, encode_amount(900).as_ref());
     absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
@@ -3979,9 +4002,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     naming(&mut metadata, "instantiable");
     let artifact = attach_metadata(STAKING_MODULE, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
-    let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
-        7, artifact,
-    )));
+    let publish = Verified::<Transaction>::from_persisted(signed_publish(7, artifact));
     let executed = execute_on(&[(payer, 1_000_000)], &executor, &[publish]);
     let ConsensusReceipt::Succeeded { .. } = &executed[0].consensus else {
         panic!("the publish must succeed: {:?}", executed[0].consensus);
@@ -4062,7 +4083,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let executed = execute_on(
         &funded,
         &executor,
-        &[Arc::new(Verified::<Transaction>::from_persisted(call))],
+        &[(Verified::<Transaction>::from_persisted(call))],
     );
     let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
         panic!(
@@ -4094,8 +4115,12 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
 fn a_resubmit_at_a_higher_ceiling_runs_the_declaration_once() {
     let executor = executor(ExecutionMode::Serial);
     let bump = |max_fee| {
-        Arc::new(Verified::<Transaction>::from_persisted(
-            signed_transfer_with_fee(ALICE_SEED, alice(), bob(), 100, max_fee),
+        Verified::<Transaction>::from_persisted(signed_transfer_with_fee(
+            ALICE_SEED,
+            alice(),
+            bob(),
+            100,
+            max_fee,
         ))
     };
     let first = bump(TRANSFER_FEE);
@@ -4111,7 +4136,7 @@ fn a_resubmit_at_a_higher_ceiling_runs_the_declaration_once() {
     let mut store = MapDb::genesis(&accounts);
     let mut outcomes = Vec::new();
     for tx in [&first, &second] {
-        let executed = execute_batch_on(&store, &executor, &[Arc::clone(tx)]);
+        let executed = execute_batch_on(&store, &executor, std::slice::from_ref(tx));
         outcomes.push(matches!(
             executed[0].consensus,
             ConsensusReceipt::Succeeded { .. }
@@ -4152,9 +4177,8 @@ fn every_charge_carries_its_hold_release() {
     let executor = executor(ExecutionMode::Serial);
     let payer = fee_payer(7);
 
-    let completed = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_transfer_with_fee(7, payer, bob(), 100, 10),
-    ));
+    let completed =
+        Verified::<Transaction>::from_persisted(signed_transfer_with_fee(7, payer, bob(), 100, 10));
     let executed = execute_on(
         &[(payer, 1_000), (bob(), 50)],
         &executor,
@@ -4165,12 +4189,8 @@ fn every_charge_carries_its_hold_release() {
     };
     assert!(releases_hold(writes, payer, completed.hash()));
 
-    let refused = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
-        BOB_SEED,
-        bob(),
-        alice(),
-        500,
-    )));
+    let refused =
+        Verified::<Transaction>::from_persisted(signed_transfer(BOB_SEED, bob(), alice(), 500));
     let executed = execute(&executor, std::slice::from_ref(&refused));
     assert!(matches!(executed[0].consensus, ConsensusReceipt::Failed));
     let charge = executed[0]
@@ -4180,10 +4200,7 @@ fn every_charge_carries_its_hold_release() {
         .expect("a refused run settles its price apart");
     assert!(releases_hold(charge, bob(), refused.hash()));
 
-    let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
-        7,
-        published_artifact(),
-    )));
+    let publish = Verified::<Transaction>::from_persisted(signed_publish(7, published_artifact()));
     let executed = execute_on(
         &[(payer, 1_000_000)],
         &executor,
@@ -4318,8 +4335,8 @@ fn a_publish_behind_its_payers_unsettled_spend_settles_within_the_vault() {
     assert_eq!(vault_cell(&settled, payer), None, "the vault is spent");
 }
 
-fn verified(tx: Transaction) -> Arc<Verified<Transaction>> {
-    Arc::new(Verified::<Transaction>::from_persisted(tx))
+const fn verified(tx: Transaction) -> Verified<Transaction> {
+    Verified::<Transaction>::from_persisted(tx)
 }
 
 /// What a member's receipt reports it was charged.
@@ -4346,7 +4363,7 @@ fn charged_apart(executed: &ExecutedTx, payer: PrincipalAddr) -> Movement {
 impl MapDb {
     /// Fold the fee holds a block carrying `block` includes, as its
     /// commit does.
-    fn include(&mut self, executor: &Executor, block: &[Arc<Verified<Transaction>>]) {
+    fn include(&mut self, executor: &Executor, block: &[Verified<Transaction>]) {
         derived_through(executor, block);
         let fees: Vec<FeeTerms> = block.iter().map(|tx| FeeTerms::of(tx)).collect();
         let settled = with_fee_holds(
@@ -4371,8 +4388,8 @@ fn execute_under_holds(
     chain: &TickChain<MapDb>,
     below: BlockHeight,
     executor: &Executor,
-    block: &[Arc<Verified<Transaction>>],
-    members: &[Arc<Verified<Transaction>>],
+    block: &[Verified<Transaction>],
+    members: &[Verified<Transaction>],
 ) -> Vec<ExecutedTx> {
     derived_through(executor, block);
     derived_through(executor, members);
@@ -4398,8 +4415,8 @@ fn execute_under_holds(
 fn execute_first_tick(
     store: MapDb,
     executor: &Executor,
-    block: &[Arc<Verified<Transaction>>],
-    members: &[Arc<Verified<Transaction>>],
+    block: &[Verified<Transaction>],
+    members: &[Verified<Transaction>],
 ) -> Vec<ExecutedTx> {
     let chain = TickChain::new(Arc::new(store));
     execute_under_holds(&chain, BlockHeight::GENESIS, executor, block, members)
@@ -4413,7 +4430,7 @@ fn held_payer() -> PrincipalAddr {
 }
 
 /// A transfer of `amount` from the held payer to Bob under `max_fee`.
-fn held_transfer(amount: u128, max_fee: u128) -> Arc<Verified<Transaction>> {
+fn held_transfer(amount: u128, max_fee: u128) -> Verified<Transaction> {
     verified(signed_transfer_with_fee(
         HELD_SEED,
         held_payer(),
@@ -4512,7 +4529,7 @@ fn a_transfer_leaves_another_transactions_hold() {
     let executed = execute_first_tick(
         MapDb::genesis(&accounts),
         &executor,
-        &[Arc::clone(&other), Arc::clone(&within)],
+        &[other.clone(), within.clone()],
         std::slice::from_ref(&within),
     );
     let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
@@ -4531,7 +4548,7 @@ fn a_transfer_leaves_another_transactions_hold() {
     let executed = execute_first_tick(
         MapDb::genesis(&accounts),
         &executor,
-        &[Arc::clone(&other), Arc::clone(&past)],
+        &[other.clone(), past.clone()],
         std::slice::from_ref(&past),
     );
     assert!(
@@ -4621,7 +4638,7 @@ fn two_members_of_one_payer_both_burn() {
         &signed_settle_with_fee(ALICE_SEED, 1_000, ROUNDS[0]),
     );
     let ceilings = [price + 7, price + 9];
-    let draws: Vec<Arc<Verified<Transaction>>> = ROUNDS
+    let draws: Vec<Verified<Transaction>> = ROUNDS
         .into_iter()
         .zip(ceilings)
         .map(|(salt, ceiling)| verified(signed_settle_with_fee(ALICE_SEED, ceiling, salt)))
@@ -4664,16 +4681,11 @@ fn a_vault_at_zero_keeps_its_floor() {
         assert_eq!(store.cell(vault), None, "the vault holds no cell");
         let fund = verified(signed_transfer(ALICE_SEED, alice(), held_payer(), credit));
         let spend = held_transfer(credit, TRANSFER_FEE);
-        let mut block = vec![Arc::clone(&fund), Arc::clone(&spend)];
+        let mut block = vec![fund.clone(), spend.clone()];
         if block_holds_other {
-            block.push(Arc::clone(&other));
+            block.push(other.clone());
         }
-        let executed = execute_first_tick(
-            store,
-            &executor,
-            &block,
-            &[Arc::clone(&fund), Arc::clone(&spend)],
-        );
+        let executed = execute_first_tick(store, &executor, &block, &[fund, spend]);
         assert!(
             matches!(executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
             "the credit lands: {:?}",
@@ -4725,7 +4737,7 @@ fn a_refused_members_charge_is_what_the_floor_leaves() {
         let executed = execute_first_tick(
             MapDb::genesis(&[(held_payer(), funded), (bob(), 10)]),
             &executor,
-            &[Arc::clone(&other), Arc::clone(&refused)],
+            &[other.clone(), refused.clone()],
             std::slice::from_ref(&refused),
         )
         .remove(0);
@@ -4780,7 +4792,7 @@ fn a_publish_past_the_floor_is_refused() {
         execute_first_tick(
             MapDb::genesis(&[(held_payer(), funded), (bob(), 10)]),
             &executor,
-            &[Arc::clone(&other), Arc::clone(&publish)],
+            &[other.clone(), publish.clone()],
             std::slice::from_ref(&publish),
         )
         .remove(0)
@@ -4858,7 +4870,7 @@ fn what_admission_covers_execution_burns() {
         .run(&(payers_transactions, 0u128..300), |(drawn, slack)| {
             let ceilings: u128 = drawn.iter().map(|(_, room, _)| price + room).sum();
             let funded = ceilings + slack;
-            let transactions: Vec<(Arc<Verified<Transaction>>, u128, Standing)> = drawn
+            let transactions: Vec<(Verified<Transaction>, u128, Standing)> = drawn
                 .into_iter()
                 .enumerate()
                 .map(|(index, (share, room, standing))| {
@@ -4868,11 +4880,11 @@ fn what_admission_covers_execution_burns() {
                     (held_transfer(amount, ceiling), ceiling, standing)
                 })
                 .collect();
-            let of = |wanted: fn(Standing) -> bool| -> Vec<Arc<Verified<Transaction>>> {
+            let of = |wanted: fn(Standing) -> bool| -> Vec<Verified<Transaction>> {
                 transactions
                     .iter()
                     .filter(|(_, _, standing)| wanted(*standing))
-                    .map(|(tx, _, _)| Arc::clone(tx))
+                    .map(|(tx, _, _)| tx.clone())
                     .collect()
             };
             let members = of(|standing| matches!(standing, Standing::Member));
@@ -4985,8 +4997,8 @@ struct ReclaimFixture {
     near: ShardId,
     home: ShardId,
     genesis: BTreeMap<SubstateKey, Vec<u8>>,
-    paid_elsewhere: Arc<Verified<Transaction>>,
-    paid_here: Arc<Verified<Transaction>>,
+    paid_elsewhere: Verified<Transaction>,
+    paid_here: Verified<Transaction>,
     id: CrossingId,
 }
 

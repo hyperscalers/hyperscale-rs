@@ -3,7 +3,8 @@
 //! Serves `GetRemoteHeadersRequest`s from peers catching up to this shard's
 //! certified header chain. Walks local storage from `from_height` and
 //! returns up to `count` consecutive headers, capped by
-//! [`MAX_REMOTE_HEADERS_PER_REQUEST`] and the local tip. The response
+//! [`MAX_REMOTE_HEADERS_PER_REQUEST`](hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST)
+//! and the local tip. The response
 //! short-caps on the first missing height rather than failing.
 //!
 //! A split child's store starts as a checkpoint of its parent's, so below
@@ -11,20 +12,40 @@
 //! the requested shard's, and a response stops at the first header of
 //! another shard as it does at a missing height.
 
-use hyperscale_hbor::Capped;
-use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardChainReader, ShardStorage};
-use hyperscale_types::network::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
+use hyperscale_types::network::request::GetRemoteHeadersRequest;
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
-use hyperscale_types::{BlockHeight, ShardId};
+use hyperscale_types::{BlockHeight, CertifiedBlockHeader, ShardId, Verified};
+
+use crate::serve::Answer;
+
+/// The contiguous run of `req.source_shard`'s headers from
+/// `req.from_height`, as far as `lookup` holds them: at most the count
+/// asked, at most the cap, and ending at the first height missing or
+/// belonging to another shard.
+fn headers_from(
+    req: &GetRemoteHeadersRequest,
+    lookup: impl Fn(BlockHeight) -> Option<CertifiedBlockHeader>,
+) -> GetRemoteHeadersResponse {
+    let mut headers = Answer::of(usize::try_from(req.count.inner()).unwrap_or(usize::MAX));
+    for offset in 0..headers.limit() as u64 {
+        let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
+        let Some(header) = lookup(height) else {
+            break;
+        };
+        if header.shard_id() != req.source_shard || headers.offer(header, 0).is_break() {
+            break;
+        }
+    }
+    GetRemoteHeadersResponse::of(headers.finish())
+}
 
 /// Serve an inbound remote-header range request.
 ///
-/// Returns headers `[from_height, from_height + bounded_count)` in
-/// ascending height order. `bounded_count` is the requested `count` clamped
-/// by [`MAX_REMOTE_HEADERS_PER_REQUEST`]; iteration also stops on the first
-/// missing height so the response is always a contiguous prefix of the
-/// requested range.
+/// Returns headers `[from_height, from_height + count)` in ascending
+/// height order, `count` held to at least one and at most the cap;
+/// iteration also stops on the first missing height so the response is
+/// always a contiguous prefix of the requested range.
 ///
 /// Headers are read through [`PendingChain`] so heights that are
 /// shard-committed but not yet JMT-persisted are reachable too — without
@@ -54,34 +75,16 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
         return GetRemoteHeadersResponse::below_floor(floor);
     }
 
-    let bounded_count = req.count.min(MAX_REMOTE_HEADERS_PER_REQUEST);
-    let mut headers = Capped::empty();
-
-    for offset in 0..bounded_count.inner() {
-        let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
-        // Committed heights first; then the certified-but-uncommitted tip,
-        // whose header carries the committed tip's committing QC — without
-        // it a requester cannot complete a commit proof of the tip, and if
-        // this chain has stalled no later commit will ever gossip it.
-        let Some(header) = pending_chain
+    // Committed heights first; then the certified-but-uncommitted tip,
+    // whose header carries the committed tip's committing QC — without
+    // it a requester cannot complete a commit proof of the tip, and if
+    // this chain has stalled no later commit will ever gossip it.
+    headers_from(req, |height| {
+        pending_chain
             .certified_header(height)
             .or_else(|| pending_chain.certified_uncommitted_header(height))
-        else {
-            break;
-        };
-        if header.shard_id() != req.source_shard {
-            break;
-        }
-        if headers.push((**header).clone()).is_err() {
-            break;
-        }
-    }
-
-    if !headers.is_empty() {
-        record_fetch_response_sent("remote_header", headers.len());
-    }
-
-    GetRemoteHeadersResponse::of(headers)
+            .map(Verified::into_inner)
+    })
 }
 
 /// Serve a certified-header batch out of a committed chain reader alone.
@@ -107,21 +110,11 @@ pub fn serve_local_certified_headers<S: ShardChainReader>(
     if req.from_height < floor {
         return GetRemoteHeadersResponse::below_floor(floor);
     }
-    let bounded_count = req.count.min(MAX_REMOTE_HEADERS_PER_REQUEST);
-    let mut headers = Capped::empty();
-    for offset in 0..bounded_count.inner() {
-        let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
-        let Some(certified) = storage.get_certified_header(height) else {
-            break;
-        };
-        if certified.shard_id() != req.source_shard {
-            break;
-        }
-        if headers.push(certified.as_ref().clone()).is_err() {
-            break;
-        }
-    }
-    GetRemoteHeadersResponse::of(headers)
+    headers_from(req, |height| {
+        storage
+            .get_certified_header(height)
+            .map(|certified| certified.as_ref().clone())
+    })
 }
 
 #[cfg(test)]

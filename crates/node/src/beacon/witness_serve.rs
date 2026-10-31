@@ -242,9 +242,9 @@ mod tests {
             leaf_count_at_block_end,
             prune_persisted_below: None,
         };
-        // SAFETY: synthetic test fixture, no real signature.
+        // Synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(qc);
-        // SAFETY: synthetic test fixture; round-trip tests don't
+        // Synthetic test fixture; round-trip tests don't
         // exercise the `Verified<CertifiedBlock>` predicate.
         let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             CertifiedBlock::new_unchecked(block, qc),

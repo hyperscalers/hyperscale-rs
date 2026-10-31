@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{
-    Action, ActionContext, CrossShardExecutionRequest, ProtocolEvent, TickBatchOutcome,
+    ActionContext, CrossShardExecutionRequest, ExecutionAction, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
 use hyperscale_hbor::Capped;
@@ -172,21 +172,20 @@ fn granted_reservations(
         .map_or_default(|r| declared_reservations(&r.transaction.routing().declared_modes))
 }
 
-/// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
-/// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
+/// Run execution work. Outcomes flow through `ctx.notify`.
 ///
 /// # Panics
 ///
-/// Panics if the dispatcher routes a variant owned by another crate, or if
-/// the executor breaks its "one result per input transaction" contract.
-#[allow(clippy::too_many_lines)] // single dispatch over execution-owned Action variants
-pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
+/// Panics if the executor breaks its "one result per input transaction"
+/// contract.
+#[allow(clippy::too_many_lines)] // single dispatch over ExecutionAction variants
+pub fn handle_action<S, N>(action: ExecutionAction, ctx: &ActionContext<'_, S, N>)
 where
     S: ShardStorage,
     N: Network,
 {
     match action {
-        Action::AggregateExecutionCertificate {
+        ExecutionAction::AggregateExecutionCertificate {
             tick_id,
             global_receipt_root,
             votes,
@@ -201,10 +200,10 @@ where
             );
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateAggregated {
                 tick_id,
-                certificate: Arc::new(certificate),
+                certificate,
             });
         }
-        Action::VerifyAndAggregateExecutionVotes {
+        ExecutionAction::VerifyAndAggregateExecutionVotes {
             tick_id,
             block_hash,
             votes,
@@ -220,7 +219,7 @@ where
                 verified_votes,
             });
         }
-        Action::VerifyExecutionCertificateSignature {
+        ExecutionAction::VerifyExecutionCertificateSignature {
             certificate,
             public_keys,
             ..
@@ -230,13 +229,10 @@ where
                 network: ctx.topology_snapshot.network(),
                 public_keys: &public_keys,
             };
-            let result = certificate
-                .upgrade(&ctx_ec)
-                .map(Arc::new)
-                .map_err(|(raw, err)| (Arc::new(raw), err));
+            let result = certificate.upgrade(&ctx_ec);
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified { result });
         }
-        Action::VerifyFinalization {
+        ExecutionAction::VerifyFinalization {
             finalization,
             public_keys,
         } => {
@@ -245,13 +241,10 @@ where
                 network: ctx.topology_snapshot.network(),
                 public_keys: public_keys.as_deref(),
             };
-            let result = Arc::unwrap_or_clone(finalization)
-                .upgrade(&fw_ctx)
-                .map(Arc::new)
-                .map_err(|(raw, err)| (Arc::new(raw), err));
+            let result = finalization.upgrade(&fw_ctx);
             ctx.notify_protocol(ProtocolEvent::FinalizationVerified { result });
         }
-        Action::BuildLegsHalf {
+        ExecutionAction::BuildLegsHalf {
             tick,
             names,
             tip,
@@ -273,7 +266,7 @@ where
             });
             ctx.notify_protocol(ProtocolEvent::LegsHalfBuilt { tick, tip, half });
         }
-        Action::ExecuteTransactions {
+        ExecutionAction::ExecuteTransactions {
             tick,
             fates,
             tick_ts,
@@ -368,7 +361,7 @@ where
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
-        Action::SignAndSendExecutionVote {
+        ExecutionAction::SignAndSendExecutionVote {
             block_hash,
             vote_anchor_ts,
             tick_id,
@@ -416,7 +409,7 @@ where
             }
         }
 
-        Action::BroadcastExecutionCertificate {
+        ExecutionAction::BroadcastExecutionCertificate {
             shard: _,
             certificate,
             recipients,
@@ -426,7 +419,7 @@ where
                 tracing::error!("execution certificate dispatched without a signer; skipping");
                 return;
             };
-            let cert = Arc::unwrap_or_clone(certificate).into_inner();
+            let cert = certificate.into_inner();
             let msg = signed_bytes(
                 &ExecutionCertificatesSenderMessage::new(
                     cert.shard_id(),
@@ -445,7 +438,5 @@ where
                 ExecutionCertificatesNotification::new(Capped::from_array([cert]), signing.me, sig);
             ctx.network.notify(&recipients, &batch);
         }
-
-        _ => unreachable!("hyperscale_execution::handle_action called with non-execution action"),
     }
 }

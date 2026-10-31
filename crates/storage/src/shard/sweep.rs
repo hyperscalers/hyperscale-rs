@@ -828,12 +828,12 @@ pub fn colliding_committed_cell(
 pub fn without_colliding_committed_cells<const N: usize>(
     local_shard: ShardId,
     origin: WeightedTimestamp,
-    transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, N>,
+    transactions: &mut Capped<Vec<Verified<Transaction>>, N>,
     state: &(impl Substates + ?Sized),
 ) {
     let mut named: BTreeSet<SubstateKey> = BTreeSet::new();
     transactions.retain(|tx| {
-        let row = committed_here(local_shard, origin, [&***tx]);
+        let row = committed_here(local_shard, origin, [&**tx]);
         !committed_already(&row[0], &mut named, state)
     });
 }
@@ -1210,7 +1210,7 @@ mod tests {
             0,
             ValidatorId::new(0),
             Vec::new(),
-            vec![Arc::new(Verifiable::from(half))],
+            vec![Verifiable::from(half)],
         );
         let leaves = |prior: &Rows, half: ShardId| -> Vec<Option<Vec<u8>>> {
             followed_block_writes(
@@ -1432,18 +1432,18 @@ mod tests {
         let (state, parent, record, credit) = returning_at_the_parent();
         let (left, right) = ShardId::ROOT.children();
         let determined = || {
-            Arc::new(Verifiable::from(make_finalization_on(
+            Verifiable::from(make_finalization_on(
                 ShardId::ROOT,
                 BlockHeight::new(1),
                 TxHash::from(Hash::from_bytes(b"a member")),
                 TransactionDecision::Accept,
-            )))
+            ))
         };
         let legs = || {
-            Arc::new(Verifiable::from(make_leg_finalization(
+            Verifiable::from(make_leg_finalization(
                 BlockHeight::new(1),
                 TxHash::from(Hash::from_bytes(b"a leg")),
-            )))
+            ))
         };
         for halves in [
             vec![],
@@ -2243,7 +2243,7 @@ mod tests {
 
         install_stub_protocol_statics();
         let shard = ShardId::leaf(1, 1);
-        let verified = |n: u8| Arc::new(Verified::new_unchecked_for_test(test_transaction(n)));
+        let verified = |n: u8| Verified::new_unchecked_for_test(test_transaction(n));
         let (first, second) = (verified(1), verified(2));
         let key_of = |tx: &Transaction| {
             committed_tx_cell_key(
@@ -2314,7 +2314,7 @@ mod tests {
         assert_eq!(newer[0].inherited, None);
         assert_eq!(colliding_committed_cell(&newer, &holding), None);
 
-        let verified = Arc::new(Verified::new_unchecked_for_test(tx));
+        let verified = Verified::new_unchecked_for_test(tx);
         let mut listed: Capped<Vec<_>, 1> = Capped::new(vec![verified]).expect("one");
         without_colliding_committed_cells(shard, origin, &mut listed, &holding);
         assert!(listed.is_empty(), "the proposer drops it too");
@@ -2381,7 +2381,7 @@ mod tests {
             }));
             let listed: Vec<_> = picks
                 .iter()
-                .map(|seed| Arc::new(Verified::new_unchecked_for_test(test_transaction(*seed))))
+                .map(|seed| Verified::new_unchecked_for_test(test_transaction(*seed)))
                 .collect();
             let mut kept: Capped<Vec<_>, 16> = Capped::new(listed.clone()).expect("under the cap");
             without_colliding_committed_cells(shard, origin, &mut kept, &state);

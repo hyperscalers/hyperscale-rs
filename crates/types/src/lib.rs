@@ -139,7 +139,9 @@ pub use primitives::seeds::{EpochSeed, SEED_WINDOW_EPOCHS, SeedRing, SeedSource}
 pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::entry::ProvisionEntry;
 pub use provisioning::limits::{MAX_MERKLE_PROOF_LEN, MAX_STATE_ENTRIES_PER_TX};
-pub use provisioning::proof::{Inclusion, MerkleInclusionProof, StateProofError};
+pub use provisioning::proof::{
+    CheckedStateProof, Inclusion, MerkleInclusionProof, StateProofError,
+};
 pub use provisioning::provisions::{Provisions, ProvisionsContext, ProvisionsVerifyError};
 pub use provisioning::substate::{SubstateEntry, SubstateLeaf};
 pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH, absorb_committed_cells};
@@ -155,7 +157,7 @@ pub use shard::abandonment::{
 };
 pub use shard::anchor::Anchor;
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
-pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
+pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError, HeaderSource};
 pub use shard::chain_origin::ChainOrigin;
 pub use shard::commit_proof::{
     CommitProof, CommitProofVerifyError, MAX_COMMIT_PROOF_ANCESTRY, ResolvedCommittee,
@@ -271,8 +273,8 @@ pub use time::timestamp::{CommittedClock, LocalTimestamp, ProposerTimestamp, Wei
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
-    BoundaryAttestation, Formed, Reshaping, RoutingCommittees, ScheduleLookup, SplitAtBoundary,
-    Terminating, TopologySchedule, Unpublished, WindowLookup, WindowView,
+    BoundaryAttestation, Formed, Reshaping, RoutingCommittees, ScheduleLookup, SigningAnchor,
+    SplitAtBoundary, Terminating, TopologySchedule, Unpublished, WindowLookup, WindowView,
 };
 pub use topology::settled_set::{Evidence, SettledTxSet, TerminalEvidence, partner_evidence};
 pub use topology::shard_prefix::shard_prefix_path;

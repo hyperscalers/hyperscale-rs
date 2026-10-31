@@ -10,8 +10,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use common::sim::{ExecutionSim, LEFT, Schedule};
 use hyperscale_shard::admission::admit_finalization_over;
 use hyperscale_storage::{MemberIndex, MemberInputs, MemberSections, RowState};
@@ -167,7 +165,7 @@ fn the_half_execution_builds_settles_the_rows_its_manifest_folds_to() {
         sim.next_anchor(),
         std::iter::empty(),
         MemberSections {
-            certificates: &[Arc::new(Verifiable::from(half))],
+            certificates: &[Verifiable::from(half)],
             records: &[],
             claims: &[],
         },

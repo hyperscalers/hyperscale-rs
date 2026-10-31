@@ -20,7 +20,6 @@
 //! breach. Each rejection reason emits a Prometheus counter so
 //! operators can distinguish capacity from sync-state stalls.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,7 +45,7 @@ use super::state::RpcState;
 use super::types::{
     ErrorResponse, HealthResponse, NodeStatusResponse, PreviewTransactionRequest,
     PreviewTransactionResponse, ReadyResponse, SubmitTransactionRequest, SubmitTransactionResponse,
-    TransactionStatusResponse,
+    TransactionStatusResponse, UnprovenIntervalJson,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -174,6 +173,16 @@ pub async fn preview_transaction_handler(
             .iter()
             .map(|(shard, height)| (shard.to_string(), height.inner()))
             .collect(),
+        unproven_intervals: report
+            .unproven_intervals
+            .iter()
+            .map(|interval| UnprovenIntervalJson {
+                owner: hex_encode(interval.owner.to_bytes()),
+                collection: hex_encode(interval.collection.0),
+                lo: interval.lo.to_string(),
+                hi: interval.hi.to_string(),
+            })
+            .collect(),
     })
     .into_response()
 }
@@ -208,11 +217,9 @@ pub async fn submit_transaction_handler(
     if let Some(rejection) = check_validity_reach(&transaction, &hash) {
         return rejection;
     }
-    let tx_arc = Arc::new(transaction);
-
     // Compute the touched-shard fanout on this tokio worker and push
     // admit envelopes directly onto each touched shard's event channel.
-    if !state.node.submit(tx_arc) {
+    if !state.node.submit(transaction) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(SubmitTransactionResponse {
@@ -717,6 +724,7 @@ mod tests {
             BlockSyncStatus {
                 state: BlockSyncStateKind::Syncing,
                 current_height: 100u64.saturating_sub(blocks_behind),
+                frontier_height: 100u64.saturating_sub(blocks_behind),
                 target_height: Some(100),
                 blocks_behind,
                 pending_fetches: 1,

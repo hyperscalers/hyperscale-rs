@@ -18,7 +18,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{Address, Hash, LocalTimestamp, Transaction, TxHash, Unresolved};
 
-use crate::beacon_loop::custodian;
+use crate::beacon::custodian;
 use crate::event::{BeaconInput, BeaconScopedInput, HostEvent};
 use crate::shard::ShardLoop;
 use crate::shard::mempool::{DeferredTransaction, Orphaned};
@@ -147,13 +147,15 @@ where
                 }));
     }
 
-    /// Offer every envelope `arrived` releases back to validation.
+    /// Offer every envelope `arrived` releases back to validation,
+    /// through the origin it first arrived from.
     ///
     /// A record and a package release alike: each is named by an
-    /// address the wait is indexed by.
+    /// address the wait is indexed by. Queued past the dedup guard,
+    /// which the held envelope already holds.
     pub(crate) fn release_deferred(&mut self, arrived: &[Address]) {
-        for tx in self.io.mempool.deferred_records.release(arrived) {
-            self.queue_validation(tx);
+        for (tx, origin) in self.io.mempool.deferred_records.release_offers(arrived) {
+            self.queue_validation(tx, origin);
         }
     }
 

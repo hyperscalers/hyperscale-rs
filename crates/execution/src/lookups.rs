@@ -114,8 +114,8 @@ pub fn committee_public_keys_for_shard(
 /// replica pairs them identically. In block order.
 pub fn assign_participants(
     topology_snapshot: &TopologySnapshot,
-    transactions: &[Arc<Verifiable<Transaction>>],
-) -> Vec<(Arc<Verifiable<Transaction>>, BTreeSet<ShardId>)> {
+    transactions: &[Verifiable<Transaction>],
+) -> Vec<(Verifiable<Transaction>, BTreeSet<ShardId>)> {
     transactions
         .iter()
         .map(|tx| {
@@ -123,7 +123,7 @@ pub fn assign_participants(
                 .all_shards_for_transaction(tx)
                 .into_iter()
                 .collect();
-            (Arc::clone(tx), all_shards)
+            (tx.clone(), all_shards)
         })
         .collect()
 }
@@ -268,7 +268,7 @@ pub fn records_written(finalization: &Finalization) -> Vec<(TxHash, SubstateKey,
 /// trie.
 #[must_use]
 pub fn record_pushes(
-    finalizations: &[Arc<Verifiable<Finalization>>],
+    finalizations: &[Verifiable<Finalization>],
     trie: &ShardTrie,
     local: ShardId,
     claimants: impl Fn(TxHash, SubstateKey) -> BTreeSet<ShardId>,
@@ -298,7 +298,7 @@ pub fn record_pushes(
 /// Returns `None` if nothing in the block owes anyone a bundle.
 pub fn build_provision_requests(
     topology_snapshot: &TopologySnapshot,
-    transactions: &[Arc<Verifiable<Transaction>>],
+    transactions: &[Verifiable<Transaction>],
     signers: &BTreeSet<ValidatorId>,
     local_shard: ShardId,
 ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
@@ -379,7 +379,7 @@ mod tests {
                 WeightedTimestamp::from_millis(60_000),
             ),
         );
-        let unrouted = Arc::new(Verifiable::from(Transaction::new(signed.body().clone())));
+        let unrouted = Verifiable::from(Transaction::new(signed.body().clone()));
 
         assert!(
             build_provision_requests(
@@ -450,22 +450,22 @@ mod tests {
     }
 
     /// A certificate of `tick` carrying `outcomes`.
-    fn certificate(tick: TickId, outcomes: Vec<TxOutcome>) -> StdArc<ExecutionCertificate> {
-        StdArc::new(ExecutionCertificate::new(
+    fn certificate(tick: TickId, outcomes: Vec<TxOutcome>) -> ExecutionCertificate {
+        ExecutionCertificate::new(
             tick,
             WeightedTimestamp::from_millis(3),
             GlobalReceiptRoot::ZERO,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     /// A finalization of `local`'s tick at height 3 carrying `certificate`
     /// and `receipts`.
     fn finalization(
         local: ShardId,
-        certificate: StdArc<ExecutionCertificate>,
+        certificate: ExecutionCertificate,
         receipts: Vec<StoredReceipt>,
     ) -> Finalization {
         Finalization::new(
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(trie.shard_for_prefix(home.consumer), local);
         let cell = |id: CrossingId, tx: TxHash| id.cell(tx, resource, 7, 9_000, Terms::Owed);
         let finalization = |seed: u8, id: CrossingId, key: SubstateKey| {
-            StdArc::new(Verifiable::from(finalization(
+            Verifiable::from(finalization(
                 local,
                 certificate(
                     TickId::new(local, BlockHeight::new(3)),
@@ -575,7 +575,7 @@ mod tests {
                     tx(seed),
                     vec![(key, Some(cell(id, tx(seed)).to_bytes()))],
                 )],
-            )))
+            ))
         };
         let pushes = record_pushes(
             &[
@@ -608,14 +608,14 @@ mod tests {
         assert_eq!(trie.shard_for_prefix(id.consumer), owner);
         let issuer = tx(0xD3);
         let cell = id.cell(issuer, ResourceAddr::new([0xE1; 31]), 7, 9_000, Terms::Owed);
-        let finalization = StdArc::new(Verifiable::from(finalization(
+        let finalization = Verifiable::from(finalization(
             local,
             certificate(
                 TickId::new(local, BlockHeight::new(3)),
                 vec![TxOutcome::new(issuer, SUCCEEDED.clone())],
             ),
             vec![receipt(issuer, vec![(key, Some(cell.to_bytes()))])],
-        )));
+        ));
         let pushes = record_pushes(&[finalization], &trie, local, |tx_hash, record| {
             assert_eq!((tx_hash, record), (issuer, key));
             BTreeSet::from([local, owner, sibling, departed])

@@ -20,9 +20,9 @@ use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::Executor;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::reshape::orchestrator::ReshapeOrchestrator;
-use hyperscale_node::startup::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
-use hyperscale_node::{HostedChain, NodeHost, ReplicaConfig};
+use hyperscale_node::reshape::ReshapeOrchestrator;
+use hyperscale_node::seating::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
+use hyperscale_node::{HostResources, HostedChain, NodeHost, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
@@ -198,11 +198,6 @@ impl SimulationRunner {
         let dispatch = self.deferred[i]
             .clone()
             .map_or_else(SyncDispatch::new, SyncDispatch::deferred);
-        let shard_event_senders = seated
-            .chains
-            .iter()
-            .map(|chain| (chain.0, self.event_txs[i].clone()))
-            .collect();
         let chains = seated
             .chains
             .iter()
@@ -211,19 +206,21 @@ impl SimulationRunner {
                 storage: store.clone(),
                 recovered,
                 signers: signers.clone(),
+                inbox: self.event_txs[i].clone().into(),
             })
             .collect();
         let restarted = NodeHost::new(
-            config,
+            &config,
+            HostResources {
+                beacon_storage,
+                executor: Arc::clone(&executor),
+                network: self.network.create_adapter(host),
+                dispatch,
+                beacon_event_sender: self.event_txs[i].clone(),
+                topology_snapshot: Arc::new(ArcSwap::from(topology)),
+            },
             chains,
             seated.identities,
-            beacon_storage,
-            Arc::clone(&executor),
-            self.network.create_adapter(host),
-            dispatch,
-            shard_event_senders,
-            self.event_txs[i].clone(),
-            Arc::new(ArcSwap::from(topology)),
             self.node_config.clone(),
             now,
         );
@@ -234,7 +231,6 @@ impl SimulationRunner {
         self.hosts[i].set_time(now);
         let output = self.hosts[i].drain_pending_output();
         self.process_step_output(host, output);
-        self.hosts[i].register_inbound_handlers();
         for (shard, _, recovered, _) in seated.chains {
             let output = self.hosts[i].resume_shard_committed(shard, &recovered);
             self.process_step_output(host, output);

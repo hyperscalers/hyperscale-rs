@@ -359,8 +359,7 @@ impl Client {
 
     /// A signed native-resource transfer to `to` from the account
     /// `payer`'s own key derives, which is the account the intent acts
-    /// as. Paying from an account the key does not derive is
-    /// [`build_transfer_paid_by`](crate::build_transfer_paid_by)'s.
+    /// as.
     ///
     /// # Errors
     ///

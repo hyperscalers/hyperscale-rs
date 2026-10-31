@@ -3,7 +3,6 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use common::ShardCoordinatorSim;
@@ -18,7 +17,7 @@ const MAX_STEPS: usize = 5_000;
 #[test]
 fn every_committed_block_carries_admitted_txs() {
     let mut sim = ShardCoordinatorSim::new(4, 0xA1_AD);
-    let tx = Arc::new(verified_test_transaction(/* seed */ 0x11));
+    let tx = verified_test_transaction(/* seed */ 0x11);
     let tx_hash = tx.hash();
     sim.admit_transaction(&tx);
     sim.kick_off();
@@ -54,7 +53,7 @@ fn transactions_admitted_latches_proposal_on_leader() {
         ValidatorId::new(leader_idx),
         "test assumes idx {leader_idx} is the round-1 height-1 leader",
     );
-    let tx = Arc::new(verified_test_transaction(/* seed */ 0x22));
+    let tx = verified_test_transaction(/* seed */ 0x22);
     sim.admit_transaction(&tx);
     sim.run_until_committed(TARGET_COMMITS, MAX_STEPS);
 
@@ -72,14 +71,14 @@ fn transactions_admitted_latches_proposal_on_leader() {
 #[test]
 fn vote_withheld_until_tx_admission_completes_header() {
     let mut sim = ShardCoordinatorSim::new(4, 0xDA_70);
-    let tx = Arc::new(verified_test_transaction(/* seed */ 0x33));
+    let tx = verified_test_transaction(/* seed */ 0x33);
     // Admit on every replica except idx 0. The early-height leaders — idx 1
     // (height 1, round 1), idx 2 (height 2, round 2), idx 3 (height 3, round 3)
     // — all hold the tx, so the {1,2,3} quorum drives the commit while idx 0's
     // DA gate keeps it from voting.
     let honest_idxs: Vec<usize> = (1..sim.n()).collect();
     for &idx in &honest_idxs {
-        sim.admit_transaction_on(idx, Arc::clone(&tx));
+        sim.admit_transaction_on(idx, tx.clone());
     }
     sim.kick_off();
     // Idx 0's local DA gate keeps it from voting; only the honest

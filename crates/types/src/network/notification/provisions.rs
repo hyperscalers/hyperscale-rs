@@ -1,7 +1,5 @@
 //! `ProvisionsNotification` message for cross-shard provisions.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 
 use crate::{
@@ -20,7 +18,7 @@ pub struct ProvisionsNotification {
     /// Wire bytes always land in `Verifiable::Unverified`;
     /// local-dispatched sends from a colocated proposer preserve
     /// `Verifiable::Verified`.
-    pub provisions: Arc<Verifiable<Provisions>>,
+    pub provisions: Verifiable<Provisions>,
     /// The validator who sent this notification.
     pub(crate) sender: ValidatorId,
     /// Signature over the domain-separated signing message, by the sender.
@@ -31,7 +29,7 @@ impl ProvisionsNotification {
     /// Create a new signed provisions notification.
     #[must_use]
     pub fn new(
-        provisions: impl Into<Arc<Verifiable<Provisions>>>,
+        provisions: impl Into<Verifiable<Provisions>>,
         sender: ValidatorId,
         sender_signature: ConsensusSignature,
     ) -> Self {

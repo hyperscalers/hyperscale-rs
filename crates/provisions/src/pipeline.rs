@@ -69,7 +69,7 @@ pub struct DeadlineSweep {
 /// block's `weighted_timestamp` for deadline-anchored eviction.
 #[derive(Debug, Clone)]
 struct VerifiedProvision {
-    provisions: Arc<Verified<Provisions>>,
+    provisions: Verified<Provisions>,
     source_block_ts: WeightedTimestamp,
 }
 
@@ -191,24 +191,23 @@ impl ProvisionPipeline {
     }
 
     /// Insert verified provisions into the pipeline + store. Returns the
-    /// verified `Arc` the coordinator hands downstream (queue + `ProvisionsAdmitted`
+    /// verified batch the coordinator hands downstream (queue + `ProvisionsAdmitted`
     /// emit). Idempotent if the same content hash is inserted twice.
     ///
-    /// The shared [`ProvisionStore`] holds raw `Arc<Provisions>` because the
-    /// network worker thread reads it to serve wire bodies; the body clone
-    /// at the seam keeps every wire read clone-free at the cost of one
-    /// allocation per verified batch.
+    /// The shared [`ProvisionStore`] holds raw `Provisions` because the
+    /// network worker thread reads it to serve wire bodies; the raw copy
+    /// shares the verified batch's body.
     pub(crate) fn insert_verified(
         &mut self,
-        verified: Arc<Verified<Provisions>>,
+        verified: Verified<Provisions>,
         source_block_ts: WeightedTimestamp,
-    ) -> Arc<Verified<Provisions>> {
+    ) -> Verified<Provisions> {
         let hash = verified.hash();
-        self.store.insert(Arc::new((**verified).clone()));
+        self.store.insert(verified.as_ref().clone());
         self.verified.insert(
             hash,
             VerifiedProvision {
-                provisions: Arc::clone(&verified),
+                provisions: verified.clone(),
                 source_block_ts,
             },
         );
@@ -275,8 +274,8 @@ impl ProvisionPipeline {
     pub(crate) fn get_provisions_by_hash(
         &self,
         hash: ProvisionHash,
-    ) -> Option<Arc<Verified<Provisions>>> {
-        self.verified.get(&hash).map(|v| Arc::clone(&v.provisions))
+    ) -> Option<Verified<Provisions>> {
+        self.verified.get(&hash).map(|v| v.provisions.clone())
     }
 
     pub(crate) const fn store(&self) -> &Arc<ProvisionStore> {
@@ -437,10 +436,7 @@ mod tests {
         let mut pl = ProvisionPipeline::new(Arc::clone(&store));
         let provisions = make_provisions(1, ShardId::leaf(2, 1), BlockHeight::new(10));
         let hash = provisions.hash();
-        let arc = pl.insert_verified(
-            Arc::new(Verified::new_unchecked_for_test(provisions)),
-            ts(1_000),
-        );
+        let arc = pl.insert_verified(Verified::new_unchecked_for_test(provisions), ts(1_000));
         assert!(pl.has_verified(&hash));
         assert!(store.get(hash).is_some());
         assert_eq!(arc.source_shard(), ShardId::leaf(2, 1));
@@ -465,8 +461,8 @@ mod tests {
         let hash_b = p_b.hash();
         assert_ne!(hash_a, hash_b);
 
-        pl.insert_verified(Arc::new(Verified::new_unchecked_for_test(p_a)), ts(1_000));
-        pl.insert_verified(Arc::new(Verified::new_unchecked_for_test(p_b)), ts(1_000));
+        pl.insert_verified(Verified::new_unchecked_for_test(p_a), ts(1_000));
+        pl.insert_verified(Verified::new_unchecked_for_test(p_b), ts(1_000));
 
         assert!(pl.has_verified(&hash_a));
         assert!(pl.has_verified(&hash_b));
@@ -483,10 +479,7 @@ mod tests {
         let hash_v = provisions_v.hash();
         let source_ts = ts(1_000);
         let live_after = provisions_v.deadline(source_ts);
-        pl.insert_verified(
-            Arc::new(Verified::new_unchecked_for_test(provisions_v)),
-            source_ts,
-        );
+        pl.insert_verified(Verified::new_unchecked_for_test(provisions_v), source_ts);
 
         let pending = make_provisions(2, ShardId::leaf(2, 2), BlockHeight::new(5));
         let pending_hash = pending.hash();

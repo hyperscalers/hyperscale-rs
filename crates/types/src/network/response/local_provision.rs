@@ -1,7 +1,5 @@
 //! Local provisions fetch response (intra-shard DA).
 
-use std::sync::Arc;
-
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
@@ -27,10 +25,10 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct LocalProvisionEntry {
     /// The provisions batch.
-    pub provisions: Arc<Provisions>,
+    pub provisions: Provisions,
     /// The source-shard certified header at `provisions.block_height()`,
     /// if the responder still has it.
-    pub source_header: Option<Arc<CertifiedBlockHeader>>,
+    pub source_header: Option<CertifiedBlockHeader>,
 }
 
 /// Response to a local provisions fetch request.
@@ -117,7 +115,7 @@ mod tests {
         let source_shard = ShardId::leaf(1, 1);
         let target_shard = ShardId::leaf(1, 0);
         let source_height = BlockHeight::new(7);
-        let provisions = Arc::new(Provisions::new(
+        let provisions = Provisions::new(
             source_shard,
             target_shard,
             source_height,
@@ -127,7 +125,7 @@ mod tests {
                 TxHash::from(Hash::from_bytes(b"tx")),
                 Capped::empty(),
             )]),
-        ));
+        );
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: source_shard,
             height: source_height,
@@ -152,11 +150,11 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
-        let source_header = Arc::new(CertifiedBlockHeader::new(header, qc));
+        let source_header = CertifiedBlockHeader::new(header, qc);
 
         let original = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
-            provisions: Arc::clone(&provisions),
-            source_header: Some(Arc::clone(&source_header)),
+            provisions: provisions.clone(),
+            source_header: Some(source_header.clone()),
         }]));
         let bytes = hbor_to_vec(&original).unwrap();
         let decoded: GetLocalProvisionsResponse = hbor_from_slice(&bytes).unwrap();
@@ -173,7 +171,7 @@ mod tests {
 
         // Same shape with `None` header — the responder GC'd it after admit.
         let stripped = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
-            provisions: Arc::clone(&provisions),
+            provisions,
             source_header: None,
         }]));
         let bytes = hbor_to_vec(&stripped).unwrap();
