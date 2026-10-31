@@ -140,7 +140,7 @@ enum SimEvent {
         proposal: Verifiable<BeaconProposal>,
     },
     CommitProven {
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
     },
 }
 
@@ -209,14 +209,14 @@ pub struct CoordinatorSim {
     /// Every delivered boundary block and its committed child, by
     /// `(shard, height)`: what a commit-proof ask is answered with once
     /// [`Self::serve_commit_proofs`] is on.
-    boundary_blocks: BTreeMap<(ShardId, BlockHeight), Arc<Verified<CertifiedBlockHeader>>>,
+    boundary_blocks: BTreeMap<(ShardId, BlockHeight), Verified<CertifiedBlockHeader>>,
     /// Whether a replica's commit-proof ask is answered, as the
     /// remote-header path answers it with the proven block.
     commit_proofs_served: bool,
     /// The committed chain above a crossing block — its child and the
     /// block that commits the child — held back from a replica, released
     /// in order by [`Self::release_withheld_crossing_children`].
-    withheld_crossing_children: Vec<(usize, Arc<Verified<CertifiedBlockHeader>>)>,
+    withheld_crossing_children: Vec<(usize, Verified<CertifiedBlockHeader>)>,
     /// Each replica's remote-header store, in front of its coordinator for
     /// a crossing delivered by
     /// [`Self::deliver_boundary_crossing_through_remote_headers`]: the
@@ -612,7 +612,7 @@ impl CoordinatorSim {
                 let schedule = self.coordinators[idx].topology_schedule();
                 let actions = self.remote_headers[idx].on_verified_remote_header_received(
                     schedule,
-                    Arc::clone(header),
+                    header.clone(),
                     self.members[0].0,
                 );
                 self.follow_remote_headers(idx, actions);
@@ -679,7 +679,7 @@ impl CoordinatorSim {
         state_root: StateRoot,
         leaf_count: u64,
     ) -> (
-        Arc<Verified<CertifiedBlockHeader>>,
+        Verified<CertifiedBlockHeader>,
         Vec<ShardWitnessPayload>,
         Vec<Hash>,
     ) {
@@ -769,7 +769,7 @@ impl CoordinatorSim {
     fn deliver_crossing_pair(
         &mut self,
         shard: ShardId,
-        b: &Arc<Verified<CertifiedBlockHeader>>,
+        b: &Verified<CertifiedBlockHeader>,
         b_height: u64,
         canonical_qc: QuorumCertificate,
         payloads: &[ShardWitnessPayload],
@@ -804,9 +804,9 @@ impl CoordinatorSim {
             payloads.len() as u64,
         );
         self.boundary_blocks
-            .insert((shard, BlockHeight::new(b_height)), Arc::clone(b));
+            .insert((shard, BlockHeight::new(b_height)), b.clone());
         self.boundary_blocks
-            .insert((shard, BlockHeight::new(b_height + 1)), Arc::clone(&c));
+            .insert((shard, BlockHeight::new(b_height + 1)), c.clone());
         for idx in 0..self.coordinators.len() {
             if self.unsynced_boundary_replicas.contains(&idx) {
                 continue;
@@ -820,7 +820,7 @@ impl CoordinatorSim {
                 }
                 for above in [&c, &d] {
                     self.withheld_crossing_children
-                        .push((idx, Arc::clone(above)));
+                        .push((idx, (*above).clone()));
                 }
             } else {
                 for above in [&c, &d] {
@@ -850,7 +850,7 @@ impl CoordinatorSim {
     fn genuine_boundary_qc(
         &self,
         shard: ShardId,
-        b: &Arc<Verified<CertifiedBlockHeader>>,
+        b: &Verified<CertifiedBlockHeader>,
         b_wt: u64,
     ) -> QuorumCertificate {
         let header = b.header();
@@ -1879,7 +1879,7 @@ impl CoordinatorSim {
                     self.loopback_q.push_back(Envelope {
                         to_idx: emitter_idx,
                         event: SimEvent::CommitProven {
-                            certified_header: Arc::clone(block),
+                            certified_header: block.clone(),
                         },
                     });
                 }
@@ -2048,7 +2048,7 @@ fn make_source_header_with_parent_qc(
     state_root: StateRoot,
     witness_root: BeaconWitnessRoot,
     leaf_count: u64,
-) -> Arc<Verified<CertifiedBlockHeader>> {
+) -> Verified<CertifiedBlockHeader> {
     make_source_header_in_round(
         shard,
         height,
@@ -2071,7 +2071,7 @@ fn make_source_header_in_round(
     state_root: StateRoot,
     witness_root: BeaconWitnessRoot,
     leaf_count: u64,
-) -> Arc<Verified<CertifiedBlockHeader>> {
+) -> Verified<CertifiedBlockHeader> {
     let parent_hash = parent_qc.block_hash();
     let parent_wt = parent_qc.weighted_timestamp();
     let header = BlockHeader::new(BlockHeaderParts {
@@ -2096,9 +2096,7 @@ fn make_source_header_in_round(
         AggregateSignature::ZERO,
         parent_wt,
     );
-    Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-        header, qc,
-    )))
+    Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
 }
 
 /// Build a verified source-shard `CertifiedBlockHeader` whose `parent_qc`
@@ -2115,7 +2113,7 @@ fn make_linked_source_header(
     state_root: StateRoot,
     witness_root: BeaconWitnessRoot,
     leaf_count: u64,
-) -> Arc<Verified<CertifiedBlockHeader>> {
+) -> Verified<CertifiedBlockHeader> {
     let parent_qc = QuorumCertificate::new(
         parent_hash,
         shard,
@@ -2141,7 +2139,7 @@ fn make_linked_source_header(
 /// chain's shape and verifies no signature.
 fn placeholder_qc(
     shard: ShardId,
-    block: &Arc<Verified<CertifiedBlockHeader>>,
+    block: &Verified<CertifiedBlockHeader>,
     wt: u64,
 ) -> QuorumCertificate {
     QuorumCertificate::new(

@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 use std::iter;
-use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
@@ -62,9 +61,9 @@ const MAX_RETAINED_HEADERS_PER_SHARD: usize = 8;
 /// answers.
 #[derive(Debug, Clone)]
 pub struct ObservedCrossing {
-    boundary_header: Arc<Verified<CertifiedBlockHeader>>,
+    boundary_header: Verified<CertifiedBlockHeader>,
     canonical_qc: QuorumCertificate,
-    boundary_parent: Option<Arc<Verified<CertifiedBlockHeader>>>,
+    boundary_parent: Option<Verified<CertifiedBlockHeader>>,
 }
 
 impl ObservedCrossing {
@@ -138,11 +137,11 @@ pub type ChunkFetchId = (ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex);
 ///   every epoch.
 #[derive(Debug, Default)]
 pub struct ShardSourceTracker {
-    shard_headers: BTreeMap<ShardId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
+    shard_headers: BTreeMap<ShardId, BTreeMap<BlockHeight, Verified<CertifiedBlockHeader>>>,
     boundary_crossings: BTreeMap<ShardId, BTreeMap<Epoch, ObservedCrossing>>,
     witness_chunks: BTreeMap<(ShardId, BlockHash), AnchorChunk>,
     pending_fetches: BTreeMap<(ShardId, BlockHash), PendingFetch>,
-    proven_boundaries: BTreeMap<(ShardId, BlockHash), Arc<Verified<CertifiedBlockHeader>>>,
+    proven_boundaries: BTreeMap<(ShardId, BlockHash), Verified<CertifiedBlockHeader>>,
 }
 
 /// An anchor's outstanding chunk fetch. Carries the boundary block
@@ -176,10 +175,7 @@ impl ShardSourceTracker {
     /// keeps its slot, and any other block at that height is the loser.
     /// A block already held is recorded once: a second report of it
     /// keeps the copy first held.
-    pub fn on_verified_source_header(
-        &mut self,
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
-    ) {
+    pub fn on_verified_source_header(&mut self, certified_header: Verified<CertifiedBlockHeader>) {
         let header = certified_header.header();
         let shard = header.shard_id();
         let height = header.height();
@@ -200,7 +196,7 @@ impl ShardSourceTracker {
     /// is found by [`Self::verified_header_by_block_hash`], its commit is
     /// established, and the certificate it embeds over its parent is that
     /// parent's [`Self::committed_certificate`].
-    pub fn admit_proven_boundary(&mut self, certified_header: Arc<Verified<CertifiedBlockHeader>>) {
+    pub fn admit_proven_boundary(&mut self, certified_header: Verified<CertifiedBlockHeader>) {
         let key = (certified_header.shard_id(), certified_header.block_hash());
         self.proven_boundaries.insert(key, certified_header);
     }
@@ -633,7 +629,7 @@ impl ShardSourceTracker {
         &self,
         shard: ShardId,
         block_hash: BlockHash,
-    ) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
+    ) -> Option<&Verified<CertifiedBlockHeader>> {
         self.shard_headers
             .get(&shard)?
             .values()
@@ -650,7 +646,7 @@ impl ShardSourceTracker {
         &self,
         shard: ShardId,
         block_hash: BlockHash,
-    ) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
+    ) -> Option<&Verified<CertifiedBlockHeader>> {
         if let Some(crossing) = self.boundary_crossings.get(&shard).and_then(|per_shard| {
             per_shard
                 .values()
@@ -674,7 +670,7 @@ impl ShardSourceTracker {
 ///
 /// If a list written out here is past the cap its type states.
 fn window_commits(
-    headers: &BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>,
+    headers: &BTreeMap<BlockHeight, Verified<CertifiedBlockHeader>>,
     block: &BlockHeader,
 ) -> bool {
     let block_hash = block.hash();
@@ -698,8 +694,8 @@ fn window_commits(
             link_height = h.prev();
         }
         let proof = CommitProof::new(
-            (***x).clone(),
-            (***y).clone(),
+            (**x).clone(),
+            (**y).clone(),
             None,
             Capped::new(ancestry).expect("an ancestry written out in a test"),
         );
@@ -725,9 +721,9 @@ fn embedded_certificate(parent_hash: BlockHash, child: &BlockHeader) -> Option<&
 /// which `b` could not know it was — and the boundary block is `c`,
 /// beside the certificate `d` embeds over it, once `d` is held.
 fn detect_crossing(
-    b: &Arc<Verified<CertifiedBlockHeader>>,
-    c: &Arc<Verified<CertifiedBlockHeader>>,
-    d: Option<&Arc<Verified<CertifiedBlockHeader>>>,
+    b: &Verified<CertifiedBlockHeader>,
+    c: &Verified<CertifiedBlockHeader>,
+    d: Option<&Verified<CertifiedBlockHeader>>,
     windows: EpochWindows,
 ) -> Option<(Epoch, ObservedCrossing)> {
     let dating_qc = embedded_certificate(b.block_hash(), c.header())?;
@@ -739,7 +735,7 @@ fn detect_crossing(
         return Some((
             epoch,
             ObservedCrossing {
-                boundary_header: Arc::clone(b),
+                boundary_header: b.clone(),
                 canonical_qc: dating_qc.clone(),
                 boundary_parent: None,
             },
@@ -749,7 +745,7 @@ fn detect_crossing(
     Some((
         epoch,
         ObservedCrossing {
-            boundary_header: Arc::clone(c),
+            boundary_header: c.clone(),
             canonical_qc: terminal_qc.clone(),
             boundary_parent: None,
         },
@@ -764,7 +760,7 @@ impl ShardSourceTracker {
         &self,
         shard: ShardId,
         height: BlockHeight,
-    ) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
+    ) -> Option<&Verified<CertifiedBlockHeader>> {
         self.shard_headers.get(&shard)?.get(&height)
     }
 
@@ -831,7 +827,7 @@ mod tests {
         parent_hash: BlockHash,
         parent_wt: u64,
         leaf_count: u64,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         linked_header_settling(s, height, round, parent_hash, parent_wt, leaf_count, None)
     }
 
@@ -845,7 +841,7 @@ mod tests {
         parent_wt: u64,
         leaf_count: u64,
         terminal_settled_txs: Option<SettledTxsRoot>,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         let parent_qc = QuorumCertificate::new(
             parent_hash,
             s,
@@ -880,14 +876,12 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_wt),
         );
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            header, qc,
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
     }
 
     /// Record a verified header and detect any crossing it completes.
-    fn note(t: &mut ShardSourceTracker, h: &Arc<Verified<CertifiedBlockHeader>>, dur: u64) {
-        t.on_verified_source_header(Arc::clone(h));
+    fn note(t: &mut ShardSourceTracker, h: &Verified<CertifiedBlockHeader>, dur: u64) {
+        t.on_verified_source_header(h.clone());
         t.observe_crossing(h.header().shard_id(), EpochWindows::new(0, dur));
     }
 
@@ -1023,20 +1017,20 @@ mod tests {
         let sibling = linked_header(shard(0), 2, 4, BlockHash::ZERO, 950, 7);
         assert_ne!(sibling.block_hash(), b.block_hash());
 
-        t.on_verified_source_header(Arc::clone(&sibling));
-        t.on_verified_source_header(Arc::clone(&b));
+        t.on_verified_source_header(sibling.clone());
+        t.on_verified_source_header(b.clone());
         assert_eq!(
             t.header(shard(0), BlockHeight::new(2))
-                .map(|held| held.block_hash()),
+                .map(Verified::block_hash),
             Some(b.block_hash()),
             "an unproven block yields its slot",
         );
 
-        t.on_verified_source_header(Arc::clone(&c));
-        t.on_verified_source_header(Arc::clone(&sibling));
+        t.on_verified_source_header(c);
+        t.on_verified_source_header(sibling);
         assert_eq!(
             t.header(shard(0), BlockHeight::new(2))
-                .map(|held| held.block_hash()),
+                .map(Verified::block_hash),
             Some(b.block_hash()),
             "a committed block keeps its slot",
         );
@@ -1315,7 +1309,7 @@ mod tests {
         let unrelated = linked_header(shard(0), 3, 4, BlockHash::ZERO, 1_450, 7);
 
         note(&mut t, &orphan, 1_000);
-        t.admit_proven_boundary(Arc::clone(&b));
+        t.admit_proven_boundary(b.clone());
         assert!(t.commit_established(shard(0), b.header()));
         assert!(
             t.committed_certificate(shard(0), b.header()).is_none(),
@@ -1325,7 +1319,7 @@ mod tests {
         t.admit_proven_boundary(unrelated);
         assert!(t.committed_certificate(shard(0), b.header()).is_none());
 
-        t.admit_proven_boundary(Arc::clone(&committed));
+        t.admit_proven_boundary(committed.clone());
         assert_eq!(
             t.committed_certificate(shard(0), b.header()),
             Some(committed.header().parent_qc()),

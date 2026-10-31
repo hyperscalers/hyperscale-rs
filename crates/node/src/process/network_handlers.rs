@@ -132,16 +132,14 @@ where
                     // and a quorum the host certified itself rides its
                     // mark past a second check.
                     if provenance == Provenance::Local {
-                        let event = match Arc::unwrap_or_clone(gossip.certified_header)
-                            .into_verified()
-                        {
+                        let event = match gossip.certified_header.into_verified() {
                             Ok(certified_header) => ProtocolEvent::VerifiedRemoteHeaderReceived {
-                                certified_header: Arc::new(certified_header),
+                                certified_header,
                                 sender,
                             },
                             Err(certified_header) => {
                                 ProtocolEvent::UnverifiedRemoteHeaderReceived {
-                                    certified_header: Arc::new(certified_header),
+                                    certified_header,
                                     sender,
                                 }
                             }
@@ -1741,7 +1739,7 @@ mod tests {
         let qc = QuorumCertificate::genesis(source, ChainOrigin::root(WeightedTimestamp::ZERO));
         let certified = Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc));
         let gossip = CertifiedBlockHeaderGossip {
-            certified_header: Arc::new(Verifiable::from(certified)),
+            certified_header: Verifiable::from(certified),
             sender: fix.identity(1).0,
             sender_signature: ConsensusSignature::ZERO,
         };

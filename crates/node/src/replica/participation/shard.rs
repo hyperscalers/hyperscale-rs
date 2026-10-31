@@ -372,14 +372,13 @@ mod tests {
                 ..Default::default()
             });
         }
-        let certified_header =
-            Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-                block.header().clone(),
-                QuorumCertificate::genesis(
-                    ShardId::leaf(1, 1),
-                    ChainOrigin::root(WeightedTimestamp::ZERO),
-                ),
-            )));
+        let certified_header = Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+            block.header().clone(),
+            QuorumCertificate::genesis(
+                ShardId::leaf(1, 1),
+                ChainOrigin::root(WeightedTimestamp::ZERO),
+            ),
+        ));
 
         let pre_prov = node
             .provisions_coordinator()
@@ -389,7 +388,7 @@ mod tests {
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::RemoteHeaderAdmitted {
-                certified_header: Arc::clone(&certified_header),
+                certified_header: certified_header.clone(),
             },
         );
 
@@ -908,7 +907,7 @@ mod tests {
             .iter()
             .find_map(|action| match action {
                 Action::Continuation(ProtocolEvent::LocalBlockCertified { certified_header }) => {
-                    Some(Arc::clone(certified_header))
+                    Some(certified_header.clone())
                 }
                 _ => None,
             })

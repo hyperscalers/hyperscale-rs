@@ -343,14 +343,11 @@ where
 
     /// Certified header at `height`. Header-only view of
     /// [`Self::certified_block`] — pending entry first, base store fallback.
-    pub fn certified_header(
-        &self,
-        height: BlockHeight,
-    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    pub fn certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
         if let Some(certified) = self.pending_certified_at(height) {
-            return Some(Arc::new(certified.certified_header()));
+            return Some(certified.certified_header());
         }
-        self.base.get_certified_header(height).map(Arc::new)
+        self.base.get_certified_header(height)
     }
 
     /// Certified-but-uncommitted header at `height`, if any — the certified
@@ -365,9 +362,9 @@ where
     pub fn certified_uncommitted_header(
         &self,
         height: BlockHeight,
-    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    ) -> Option<Verified<CertifiedBlockHeader>> {
         self.pending_certified_uncommitted_at(height)
-            .map(|certified| Arc::new(certified.certified_header()))
+            .map(|certified| certified.certified_header())
     }
 
     /// Whether the block at `height` carries `tx`, or `None` when no

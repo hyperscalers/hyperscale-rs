@@ -364,7 +364,7 @@ pub enum ShardScopedInput {
     /// batched signature verification.
     CommittedBlockGossipReceived {
         /// Header carried in a peer's gossip envelope.
-        certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
+        certified_header: Verifiable<CertifiedBlockHeader>,
         /// Sender validator id.
         sender: ValidatorId,
         /// Sender's public key, resolved from topology.
@@ -572,22 +572,22 @@ pub enum BeaconInput {
     /// The replica committed the block this certified header heads.
     LocalCommit {
         /// The committed block's certified header.
-        header: Arc<Verified<CertifiedBlockHeader>>,
+        header: Verified<CertifiedBlockHeader>,
     },
     /// The replica certified this header, ahead of its commit.
     CertifiedHeader {
         /// The replica's own certified header.
-        header: Arc<Verified<CertifiedBlockHeader>>,
+        header: Verified<CertifiedBlockHeader>,
     },
     /// The replica admitted a remote source header.
     SourceHeader {
         /// The admitted header.
-        header: Arc<Verified<CertifiedBlockHeader>>,
+        header: Verified<CertifiedBlockHeader>,
     },
     /// The replica proved a remote source header's commit.
     CommitProven {
         /// The proven header.
-        header: Arc<Verified<CertifiedBlockHeader>>,
+        header: Verified<CertifiedBlockHeader>,
     },
     /// A shard fork is proven, for the next beacon proposal.
     ForkProof(Box<ShardForkProof>),

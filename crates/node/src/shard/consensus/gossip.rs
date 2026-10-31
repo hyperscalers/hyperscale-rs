@@ -49,7 +49,7 @@ where
     /// full.
     pub(crate) fn handle_committed_block_gossip_received(
         &mut self,
-        certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
+        certified_header: Verifiable<CertifiedBlockHeader>,
         sender: ValidatorId,
         public_key: ConsensusPublicKey,
         sender_signature: ConsensusSignature,
@@ -123,12 +123,12 @@ where
                         },
                     );
                     if valid {
-                        let raw = Arc::unwrap_or_clone(gossip.certified_header).into_unverified();
+                        let raw = gossip.certified_header.into_unverified();
                         push_protocol_event(
                             &event_tx,
                             shard,
                             ProtocolEvent::UnverifiedRemoteHeaderReceived {
-                                certified_header: Arc::new(raw),
+                                certified_header: raw,
                                 sender: gossip.sender,
                             },
                         );

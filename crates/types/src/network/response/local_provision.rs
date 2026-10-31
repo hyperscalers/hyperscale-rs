@@ -1,7 +1,5 @@
 //! Local provisions fetch response (intra-shard DA).
 
-use std::sync::Arc;
-
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
@@ -30,7 +28,7 @@ pub struct LocalProvisionEntry {
     pub provisions: Provisions,
     /// The source-shard certified header at `provisions.block_height()`,
     /// if the responder still has it.
-    pub source_header: Option<Arc<CertifiedBlockHeader>>,
+    pub source_header: Option<CertifiedBlockHeader>,
 }
 
 /// Response to a local provisions fetch request.
@@ -152,11 +150,11 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
-        let source_header = Arc::new(CertifiedBlockHeader::new(header, qc));
+        let source_header = CertifiedBlockHeader::new(header, qc);
 
         let original = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
             provisions: provisions.clone(),
-            source_header: Some(Arc::clone(&source_header)),
+            source_header: Some(source_header.clone()),
         }]));
         let bytes = hbor_to_vec(&original).unwrap();
         let decoded: GetLocalProvisionsResponse = hbor_from_slice(&bytes).unwrap();

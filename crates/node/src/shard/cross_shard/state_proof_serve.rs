@@ -234,7 +234,7 @@ pub fn serve_cells_request<S: ShardStorage>(
                 Capped::new(cells).expect("no more cells than the request named"),
                 Capped::new(ranges).expect("no more intervals than the request named"),
                 proof,
-                (*anchor).clone().into_inner(),
+                anchor.into_inner(),
             )
         },
     )

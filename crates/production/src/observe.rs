@@ -165,7 +165,7 @@ impl Observer {
     pub fn step(
         &mut self,
         adopted: Vec<(Epoch, SlotEffects)>,
-        admitted: Vec<Arc<Verified<CertifiedBlockHeader>>>,
+        admitted: Vec<Verified<CertifiedBlockHeader>>,
         state: &BeaconState,
         schedule: &TopologySchedule,
     ) {
@@ -281,11 +281,7 @@ impl HeaderRing {
     /// Summarise and keep each reported header. A header already kept for
     /// its block keeps its first summary; a different block at a kept
     /// height replaces it.
-    pub fn admit(
-        &self,
-        headers: Vec<Arc<Verified<CertifiedBlockHeader>>>,
-        schedule: &TopologySchedule,
-    ) {
+    pub fn admit(&self, headers: Vec<Verified<CertifiedBlockHeader>>, schedule: &TopologySchedule) {
         if headers.is_empty() {
             return;
         }
@@ -416,12 +412,9 @@ mod tests {
         committee: &TestCommittee,
         block: &Block,
         seats: &[usize],
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         let qc = committee.sign_qc(block.header(), seats, WeightedTimestamp::from_millis(10));
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            block.header().clone(),
-            qc,
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(block.header().clone(), qc))
     }
 
     #[test]

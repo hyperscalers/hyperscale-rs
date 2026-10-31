@@ -1,8 +1,7 @@
 //! Inbound local-provision fetch request handling.
 
-use std::sync::Arc;
-
 use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
+use hyperscale_types::Verified;
 use hyperscale_types::network::request::GetLocalProvisionsRequest;
 use hyperscale_types::network::response::{GetLocalProvisionsResponse, LocalProvisionEntry};
 
@@ -27,12 +26,11 @@ pub fn serve_local_provisions_request(
         let Some(provisions) = provision_store.get(*h) else {
             continue;
         };
-        // The buffer holds Verified handles; the wire form takes raw
-        // `Arc<CertifiedBlockHeader>`, so materialize the inner header
-        // for ship.
+        // The buffer holds Verified handles; the wire form takes the raw
+        // header.
         let source_header = verified_headers
             .get((provisions.source_shard(), provisions.block_height()))
-            .map(|v| Arc::new(v.as_ref().clone().into_inner()));
+            .map(Verified::into_inner);
         let entry = LocalProvisionEntry {
             provisions,
             source_header,

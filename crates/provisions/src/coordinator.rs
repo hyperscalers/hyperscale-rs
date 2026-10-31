@@ -511,7 +511,7 @@ impl ProvisionCoordinator {
     /// committee can certify a sibling that never commits.
     pub fn on_verified_remote_header(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         let shard = certified_header.shard_id();
         let height = certified_header.height();
@@ -558,7 +558,7 @@ impl ProvisionCoordinator {
     pub fn on_committed_remote_header(
         &mut self,
         topology_schedule: &TopologySchedule,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         let shard = certified_header.shard_id();
         let height = certified_header.height();
@@ -594,7 +594,7 @@ impl ProvisionCoordinator {
         if targets_us {
             // Store as verified (QC + commit proof already checked by the
             // remote-header coordinator).
-            self.headers.insert(key, Arc::clone(certified_header));
+            self.headers.insert(key, certified_header.clone());
         }
 
         // Join with buffered provisions waiting for this header. Drop any
@@ -722,8 +722,11 @@ impl ProvisionCoordinator {
             }
             // Admit directly via the verified path; reuses the
             // tombstone, queue, and `ProvisionsAdmitted` emission logic.
-            let header = Arc::clone(&verified_header);
-            return self.on_state_provisions_verified(Ok(provisions), Anchor::of(&header), now);
+            return self.on_state_provisions_verified(
+                Ok(provisions),
+                Anchor::of(&verified_header),
+                now,
+            );
         }
 
         // Header not yet verified — fall back to the raw buffer; the
@@ -998,7 +1001,7 @@ impl ProvisionCoordinator {
         &self,
         shard: ShardId,
         height: BlockHeight,
-    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    ) -> Option<Verified<CertifiedBlockHeader>> {
         self.headers.get((shard, height))
     }
 
@@ -1040,7 +1043,7 @@ mod tests {
     /// event (opens the header for verification and drains parked bundles).
     fn deliver_committed_header(
         coordinator: &mut ProvisionCoordinator,
-        header: &Arc<Verified<CertifiedBlockHeader>>,
+        header: &Verified<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         let mut actions = coordinator.on_verified_remote_header(header);
         actions.extend(coordinator.on_committed_remote_header(&sched(), header));
@@ -1056,7 +1059,7 @@ mod tests {
     fn make_certified_header(
         shard: ShardId,
         height: BlockHeight,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         make_certified_header_with_targets(shard, height, vec![ShardId::leaf(2, 0)])
     }
 
@@ -1068,11 +1071,11 @@ mod tests {
         height: BlockHeight,
         local_shard: ShardId,
         tx_hashes: &[TxHash],
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
-        let header_arc = make_certified_header_with_targets(shard, height, vec![local_shard]);
+    ) -> Verified<CertifiedBlockHeader> {
+        let certified = make_certified_header_with_targets(shard, height, vec![local_shard]);
         let raw: Vec<Hash> = tx_hashes.iter().map(|h| Hash::from(*h)).collect();
         let root = ProvisionTxRoot::from_raw(compute_merkle_root(&raw));
-        let (header, qc) = Arc::unwrap_or_clone(header_arc).into_inner().into_parts();
+        let (header, qc) = certified.into_inner().into_parts();
         let mut roots = header.provision_tx_roots().clone();
         roots
             .insert(local_shard, root)
@@ -1092,9 +1095,7 @@ mod tests {
             txs_in_flight: header.txs_in_flight(),
             ..Default::default()
         });
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            header, qc,
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
     }
 
     #[test]
@@ -2005,7 +2006,7 @@ mod tests {
         shard: ShardId,
         height: BlockHeight,
         provision_targets: Vec<ShardId>,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         // Each target shard gets a placeholder `provision_tx_roots` entry —
         // the commitment the expectation tracker keys on. Tests that fire
         // matching bundles overwrite the entry with a real root via
@@ -2047,9 +2048,7 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            header, qc,
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
     }
 
     /// Nominal block spacing used by tests to synthesize `weighted_timestamp_ms`

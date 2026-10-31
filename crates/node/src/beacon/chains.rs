@@ -92,18 +92,18 @@ where
         }
         match input {
             BeaconInput::LocalCommit { header } => {
-                self.pending_admitted.push(Arc::clone(&header));
+                self.pending_admitted.push(header.clone());
                 let actions = self.fold.on_local_block_committed(chain, &header);
                 self.run_fold_actions(actions);
                 self.release_awaited_proposals();
             }
             BeaconInput::CertifiedHeader { header } => {
-                self.pending_admitted.push(Arc::clone(&header));
+                self.pending_admitted.push(header.clone());
                 self.fold.on_certified_local_header(chain, &header);
                 self.release_awaited_proposals();
             }
             BeaconInput::SourceHeader { header } => {
-                self.pending_admitted.push(Arc::clone(&header));
+                self.pending_admitted.push(header.clone());
                 let actions = self.fold.on_source_header(&header);
                 self.run_fold_actions(actions);
                 self.release_awaited_proposals();

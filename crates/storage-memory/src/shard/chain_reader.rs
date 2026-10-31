@@ -43,12 +43,7 @@ impl ShardChainReader for SimShardStorage {
                 let (header, _, _, qc, _) = metadata.into_parts();
                 CertifiedBlockHeader::new(header, qc)
             })
-            .or_else(|| {
-                consensus
-                    .boundary_headers
-                    .get(&height)
-                    .map(|header| (**header).clone())
-            })
+            .or_else(|| consensus.boundary_headers.get(&height).cloned())
             .map(Verified::<CertifiedBlockHeader>::from_persisted)
     }
 

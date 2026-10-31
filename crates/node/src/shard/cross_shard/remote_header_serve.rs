@@ -15,7 +15,7 @@
 use hyperscale_storage::{PendingChain, ShardChainReader, ShardStorage};
 use hyperscale_types::network::request::GetRemoteHeadersRequest;
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
-use hyperscale_types::{BlockHeight, CertifiedBlockHeader, ShardId};
+use hyperscale_types::{BlockHeight, CertifiedBlockHeader, ShardId, Verified};
 
 use crate::serve::Answer;
 
@@ -83,7 +83,7 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
         pending_chain
             .certified_header(height)
             .or_else(|| pending_chain.certified_uncommitted_header(height))
-            .map(|header| (**header).clone())
+            .map(Verified::into_inner)
     })
 }
 

@@ -23,8 +23,6 @@
 //! wait-free for the `local_provision.request` serve path while the
 //! single state-machine writer mutates through `&self`.
 
-use std::sync::Arc;
-
 use hyperscale_types::{BlockHeight, CertifiedBlockHeader, ShardId, Verified};
 use papaya::HashMap;
 
@@ -35,7 +33,7 @@ type Key = (ShardId, BlockHeight);
 /// inbound request handlers (readers).
 #[derive(Debug, Default)]
 pub struct VerifiedHeaderBuffer {
-    headers: HashMap<Key, Arc<Verified<CertifiedBlockHeader>>>,
+    headers: HashMap<Key, Verified<CertifiedBlockHeader>>,
 }
 
 impl VerifiedHeaderBuffer {
@@ -48,13 +46,13 @@ impl VerifiedHeaderBuffer {
     }
 
     /// Insert a verified header. Overwrites any previous entry for the same key.
-    pub(crate) fn insert(&self, key: Key, header: Arc<Verified<CertifiedBlockHeader>>) {
+    pub(crate) fn insert(&self, key: Key, header: Verified<CertifiedBlockHeader>) {
         self.headers.pin().insert(key, header);
     }
 
     /// Look up a verified header by key.
     #[must_use]
-    pub fn get(&self, key: Key) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    pub fn get(&self, key: Key) -> Option<Verified<CertifiedBlockHeader>> {
         self.headers.pin().get(&key).cloned()
     }
 
@@ -77,7 +75,7 @@ impl VerifiedHeaderBuffer {
     }
 
     /// Remove and return a verified header.
-    pub(crate) fn remove(&self, key: Key) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    pub(crate) fn remove(&self, key: Key) -> Option<Verified<CertifiedBlockHeader>> {
         self.headers.pin().remove(&key).cloned()
     }
 
@@ -104,7 +102,7 @@ mod tests {
 
     use super::*;
 
-    fn make_header(shard: ShardId, height: BlockHeight) -> Arc<Verified<CertifiedBlockHeader>> {
+    fn make_header(shard: ShardId, height: BlockHeight) -> Verified<CertifiedBlockHeader> {
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: shard,
             height,
@@ -129,9 +127,7 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            header, qc,
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
     }
 
     #[test]
@@ -149,10 +145,10 @@ mod tests {
         let buf = VerifiedHeaderBuffer::new();
         let key = (ShardId::leaf(1, 1), BlockHeight::new(10));
         let header = make_header(ShardId::leaf(1, 1), BlockHeight::new(10));
-        buf.insert(key, Arc::clone(&header));
+        buf.insert(key, header.clone());
         assert_eq!(buf.len(), 1);
         let stored = buf.get(key).expect("present");
-        assert!(Arc::ptr_eq(&stored, &header));
+        assert!(stored.same_body(&header));
     }
 
     #[test]

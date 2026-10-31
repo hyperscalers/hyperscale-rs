@@ -379,7 +379,7 @@ impl BeaconCoordinator {
     /// the header completes.
     pub fn on_local_block_committed(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         let mut actions = match self.local_chain {
             Some(token) => self.fold.on_local_block_committed(token, certified_header),
@@ -612,7 +612,7 @@ impl BeaconCoordinator {
     /// the proposals awaiting it are released.
     pub fn on_commit_proven_source_header(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         if !self
             .fold
@@ -719,7 +719,7 @@ impl BeaconCoordinator {
     /// completes.
     pub fn on_verified_source_header(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         let mut actions = self.fold.on_source_header(certified_header);
         actions.extend(self.drive(BeaconParticipant::on_source_header));
@@ -735,7 +735,7 @@ impl BeaconCoordinator {
     /// block above it.
     pub fn on_certified_local_header(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         if let Some(token) = self.local_chain {
             self.fold.on_certified_local_header(token, certified_header);
@@ -1073,7 +1073,7 @@ mod tests {
         state_root: StateRoot,
         root: BeaconWitnessRoot,
         leaf_count: u64,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         let parent_qc = QuorumCertificate::new(
             BlockHash::ZERO,
             shard,
@@ -1106,9 +1106,7 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
         );
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            header, qc,
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
     }
 
     /// A boundary header carrying a synthetic (witnessless) accumulator
@@ -1120,7 +1118,7 @@ mod tests {
         pred_wt: u64,
         state_root: StateRoot,
         leaf_count: u64,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         boundary_block_header_with_root(
             shard,
             height,
@@ -1147,7 +1145,7 @@ mod tests {
         state_root: StateRoot,
         leaf_count: u64,
     ) -> (
-        Arc<Verified<CertifiedBlockHeader>>,
+        Verified<CertifiedBlockHeader>,
         Vec<ShardWitnessPayload>,
         Vec<Hash>,
     ) {
@@ -1181,7 +1179,7 @@ mod tests {
         parent_hash: BlockHash,
         parent_wt: u64,
         leaf_count: u64,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         let parent_qc = QuorumCertificate::new(
             parent_hash,
             shard,
@@ -1215,9 +1213,7 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_wt),
         );
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            header, qc,
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
     }
 
     /// A structural QC naming `block_hash` at weighted timestamp `wt`.
@@ -2486,10 +2482,7 @@ mod tests {
             .into_inner()
         };
         let certified = |header: &BlockHeader, qc: &QuorumCertificate| {
-            Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-                header.clone(),
-                qc.clone(),
-            )))
+            Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header.clone(), qc.clone()))
         };
 
         // `B` anchors short of the cut and is certified past it; `C`
@@ -2599,10 +2592,7 @@ mod tests {
             .into_inner()
         };
         let certified = |header: &BlockHeader, qc: &QuorumCertificate| {
-            Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-                header.clone(),
-                qc.clone(),
-            )))
+            Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header.clone(), qc.clone()))
         };
 
         // `B` anchors short of the cut and is certified past it; `C`
@@ -4317,7 +4307,7 @@ mod tests {
     ) -> (
         Vec<ShardWitnessPayload>,
         Vec<Hash>,
-        Arc<Verified<CertifiedBlockHeader>>,
+        Verified<CertifiedBlockHeader>,
     ) {
         let payloads: Vec<ShardWitnessPayload> = (lo..hi)
             .map(|i| ShardWitnessPayload::StakeDeposit {
@@ -4358,9 +4348,8 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1_000),
         );
-        let certified_header = Arc::new(Verified::new_unchecked_for_test(
-            CertifiedBlockHeader::new(header, qc),
-        ));
+        let certified_header =
+            Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc));
         (payloads, range_proof, certified_header)
     }
 
@@ -4504,7 +4493,7 @@ mod tests {
         coord
             .fold
             .shard_source
-            .on_verified_source_header(Arc::clone(&header));
+            .on_verified_source_header(header.clone());
 
         let actions = coord.on_shard_witnesses_received(
             shard,
@@ -4548,7 +4537,7 @@ mod tests {
         coord
             .fold
             .shard_source
-            .on_verified_source_header(Arc::clone(&header));
+            .on_verified_source_header(header.clone());
 
         let actions = coord.on_shard_witnesses_received(
             shard,
@@ -4634,7 +4623,7 @@ mod tests {
         coord
             .fold
             .shard_source
-            .on_verified_source_header(Arc::clone(&header));
+            .on_verified_source_header(header.clone());
 
         payloads[0] = ShardWitnessPayload::StakeDeposit {
             pool_id: test_pool(999),
@@ -4661,7 +4650,7 @@ mod tests {
         observer
             .fold
             .shard_source
-            .on_verified_source_header(Arc::clone(&header));
+            .on_verified_source_header(header.clone());
 
         let actions = observer.on_shard_witnesses_received(
             shard,
@@ -5381,7 +5370,7 @@ mod tests {
         let first = boundary_block_header(ShardId::ROOT, 4, 1_000, StateRoot::ZERO, 0);
         let second = boundary_block_header(ShardId::ROOT, 4, 1_000, StateRoot::ZERO, 0);
         assert_eq!(first.block_hash(), second.block_hash());
-        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!first.same_body(&second));
 
         assert!(coord.on_certified_local_header(&first).is_empty());
         assert!(coord.on_certified_local_header(&second).is_empty());
@@ -5390,10 +5379,7 @@ mod tests {
             .shard_source
             .header(ShardId::ROOT, BlockHeight::new(4))
             .expect("held");
-        assert!(
-            Arc::ptr_eq(held, &first),
-            "the second report records nothing"
-        );
+        assert!(held.same_body(&first), "the second report records nothing");
     }
 
     /// Reloading the states an evicted window was projected from brings

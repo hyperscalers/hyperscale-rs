@@ -1512,7 +1512,7 @@ mod tests {
         );
         let certified = CertifiedBlockHeader::new(header, qc);
         loop_of(&mut host).dispatch_event(ProtocolEvent::RemoteHeaderQcVerified {
-            certified_header: Arc::new(certified.clone()),
+            certified_header: certified.clone(),
             sender: fix.committee.validator_id(2),
             result: Box::new(Ok(Verified::new_unchecked_for_test(certified))),
         });

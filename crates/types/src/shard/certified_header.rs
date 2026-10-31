@@ -63,6 +63,13 @@ impl CertifiedBlockHeader {
         }))
     }
 
+    /// Whether `other` is a clone of this very header, sharing its body,
+    /// rather than an equal copy decoded or built apart from it.
+    #[must_use]
+    pub fn same_body(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     /// Header whose `hash()` matches the QC's `block_hash`.
     #[must_use]
     pub fn header(&self) -> &BlockHeader {

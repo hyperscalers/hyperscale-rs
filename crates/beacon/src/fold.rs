@@ -704,7 +704,7 @@ impl BeaconFold {
     pub fn on_local_block_committed(
         &mut self,
         token: ChainRegistration,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         if !self.hosted.contains_key(&token) {
             return Vec::new();
@@ -735,7 +735,7 @@ impl BeaconFold {
     pub fn on_certified_local_header(
         &mut self,
         token: ChainRegistration,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) {
         if self.hosted.contains_key(&token) {
             self.record_source_header(certified_header);
@@ -753,7 +753,7 @@ impl BeaconFold {
     /// [`fetch_witness_chunk`](Self::fetch_witness_chunk).
     pub fn on_source_header(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         self.record_source_header(certified_header);
         if !self.host_on_committee {
@@ -768,7 +768,7 @@ impl BeaconFold {
     /// askers' awaiting proposals want re-evaluating.
     pub fn admit_proven_for<'a>(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
         participants: impl IntoIterator<Item = &'a BeaconParticipant>,
     ) -> bool {
         let (shard, height) = (certified_header.shard_id(), certified_header.height());
@@ -779,15 +779,15 @@ impl BeaconFold {
             return false;
         }
         self.shard_source
-            .admit_proven_boundary(Arc::clone(certified_header));
+            .admit_proven_boundary(certified_header.clone());
         true
     }
 
     /// Hold `certified_header` in the shard's window and note any
     /// epoch-boundary crossing it makes visible.
-    fn record_source_header(&mut self, certified_header: &Arc<Verified<CertifiedBlockHeader>>) {
+    fn record_source_header(&mut self, certified_header: &Verified<CertifiedBlockHeader>) {
         self.shard_source
-            .on_verified_source_header(Arc::clone(certified_header));
+            .on_verified_source_header(certified_header.clone());
         self.shard_source.observe_crossing(
             certified_header.header().shard_id(),
             self.state.chain_config.epoch_windows(),

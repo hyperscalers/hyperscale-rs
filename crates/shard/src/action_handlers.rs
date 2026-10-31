@@ -1983,9 +1983,7 @@ where
                 return;
             };
             let gossip = CertifiedBlockHeaderGossip {
-                certified_header: Arc::new(Verifiable::<CertifiedBlockHeader>::from(
-                    certified_header,
-                )),
+                certified_header: Verifiable::<CertifiedBlockHeader>::from(certified_header),
                 sender: signing.me,
                 sender_signature: sig,
             };

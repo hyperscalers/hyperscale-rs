@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
-use std::sync::Arc;
 
 use hyperscale_types::{
     BlockHeight, CertifiedBlockHeader, ValidatorId, Verified, WeightedTimestamp,
@@ -53,7 +52,7 @@ pub struct ShardHeaders {
     /// Multiple senders may gossip the same header; all candidates are kept
     /// until QC verification picks the valid one. A height holds at least
     /// one candidate.
-    pending: BTreeMap<BlockHeight, BTreeMap<ValidatorId, Arc<CertifiedBlockHeader>>>,
+    pending: BTreeMap<BlockHeight, BTreeMap<ValidatorId, CertifiedBlockHeader>>,
     /// `pending` by its newest candidate's timestamp: a height is retained
     /// while any of its candidates is.
     pending_by_age: BTreeSet<(WeightedTimestamp, BlockHeight)>,
@@ -61,7 +60,7 @@ pub struct ShardHeaders {
     /// Verified committed block headers — one per height. Holds the
     /// BFT-transitive trust composite produced by
     /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
-    verified: BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>,
+    verified: BTreeMap<BlockHeight, Verified<CertifiedBlockHeader>>,
     /// The sync frontier `verified` is indexed against: heights at or
     /// below it are walked, heights above it are not. `None` walks every
     /// height. The two sides age out under different bounds, so each has
@@ -105,7 +104,7 @@ pub struct ShardHeaders {
     /// [`ShardForkProof`](hyperscale_types::ShardForkProof) once both
     /// branches are commit-proven. Empty under honest operation (an honest
     /// committee produces one chain). A height holds at least one sibling.
-    fork_siblings: BTreeMap<BlockHeight, Vec<Arc<Verified<CertifiedBlockHeader>>>>,
+    fork_siblings: BTreeMap<BlockHeight, Vec<Verified<CertifiedBlockHeader>>>,
     /// `fork_siblings` by each height's oldest sibling: the first to age
     /// out is the one a prune has to visit the height for.
     siblings_by_age: BTreeSet<(WeightedTimestamp, BlockHeight)>,
@@ -119,15 +118,15 @@ impl ShardHeaders {
     pub fn pending(
         &self,
         height: BlockHeight,
-    ) -> Option<&BTreeMap<ValidatorId, Arc<CertifiedBlockHeader>>> {
+    ) -> Option<&BTreeMap<ValidatorId, CertifiedBlockHeader>> {
         self.pending.get(&height)
     }
 
-    pub fn verified(&self, height: BlockHeight) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
+    pub fn verified(&self, height: BlockHeight) -> Option<&Verified<CertifiedBlockHeader>> {
         self.verified.get(&height)
     }
 
-    pub fn siblings(&self, height: BlockHeight) -> &[Arc<Verified<CertifiedBlockHeader>>] {
+    pub fn siblings(&self, height: BlockHeight) -> &[Verified<CertifiedBlockHeader>] {
         self.fork_siblings.get(&height).map_or(&[], Vec::as_slice)
     }
 
@@ -155,11 +154,7 @@ impl ShardHeaders {
 
     /// The timestamp `pending_by_age` holds `height` at.
     fn pending_age(&self, height: BlockHeight) -> Option<WeightedTimestamp> {
-        self.pending
-            .get(&height)?
-            .values()
-            .map(|header| retention_ts(header))
-            .max()
+        self.pending.get(&height)?.values().map(retention_ts).max()
     }
 
     /// The timestamp `siblings_by_age` holds `height` at.
@@ -176,7 +171,7 @@ impl ShardHeaders {
         &mut self,
         height: BlockHeight,
         sender: ValidatorId,
-        header: Arc<CertifiedBlockHeader>,
+        header: CertifiedBlockHeader,
     ) -> Candidate {
         let before = self.pending_age(height);
         let candidates = self.pending.entry(height).or_default();
@@ -199,7 +194,7 @@ impl ShardHeaders {
         &mut self,
         height: BlockHeight,
         sender: ValidatorId,
-    ) -> Option<Arc<CertifiedBlockHeader>> {
+    ) -> Option<CertifiedBlockHeader> {
         let before = self.pending_age(height);
         let candidates = self.pending.get_mut(&height)?;
         let removed = candidates.remove(&sender);
@@ -214,12 +209,12 @@ impl ShardHeaders {
     pub fn first_candidate(
         &self,
         height: BlockHeight,
-    ) -> Option<(ValidatorId, Arc<CertifiedBlockHeader>)> {
+    ) -> Option<(ValidatorId, CertifiedBlockHeader)> {
         self.pending
             .get(&height)?
             .iter()
             .next()
-            .map(|(sender, header)| (*sender, Arc::clone(header)))
+            .map(|(sender, header)| (*sender, header.clone()))
     }
 
     /// Drop every candidate at `height`.
@@ -252,8 +247,8 @@ impl ShardHeaders {
     /// header it displaces.
     pub fn set_verified(
         &mut self,
-        header: Arc<Verified<CertifiedBlockHeader>>,
-    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+        header: Verified<CertifiedBlockHeader>,
+    ) -> Option<Verified<CertifiedBlockHeader>> {
         let height = header.height();
         let age = retention_ts(&header);
         let displaced = self.verified.insert(height, header);
@@ -267,7 +262,7 @@ impl ShardHeaders {
 
     /// Hold `sibling` off the canonical slot at its height. False if a
     /// copy of it is already held.
-    pub fn add_sibling(&mut self, sibling: Arc<Verified<CertifiedBlockHeader>>) -> bool {
+    pub fn add_sibling(&mut self, sibling: Verified<CertifiedBlockHeader>) -> bool {
         let height = sibling.height();
         if self
             .siblings(height)
@@ -290,7 +285,7 @@ impl ShardHeaders {
         &mut self,
         height: BlockHeight,
         position: usize,
-    ) -> Arc<Verified<CertifiedBlockHeader>> {
+    ) -> Verified<CertifiedBlockHeader> {
         let before = self.siblings_age(height);
         let siblings = self
             .fork_siblings
@@ -298,7 +293,7 @@ impl ShardHeaders {
             .expect("seated sibling is held");
         let seated = siblings.swap_remove(position);
         let squatter = self
-            .set_verified(Arc::clone(&seated))
+            .set_verified(seated.clone())
             .expect("a sibling is held only beside a canonical occupant");
         self.fork_siblings.entry(height).or_default().push(squatter);
         self.reindex_siblings(height, before);
@@ -482,7 +477,7 @@ mod tests {
     use super::*;
 
     /// A header at `height` whose parent QC stamps `parent_qc_wt`.
-    fn header_at(height: BlockHeight, parent_qc_wt: u64) -> Arc<CertifiedBlockHeader> {
+    fn header_at(height: BlockHeight, parent_qc_wt: u64) -> CertifiedBlockHeader {
         let shard = ShardId::leaf(2, 1);
         let parent_qc = QuorumCertificate::new(
             BlockHash::ZERO,
@@ -511,7 +506,7 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_qc_wt),
         );
-        Arc::new(CertifiedBlockHeader::new(header, qc))
+        CertifiedBlockHeader::new(header, qc)
     }
 
     /// A pending height is held while any of its candidates is inside the
@@ -526,15 +521,15 @@ mod tests {
         let mut store = ShardHeaders::default();
 
         assert_eq!(
-            store.add_candidate(height, ValidatorId::new(1), Arc::clone(&old)),
+            store.add_candidate(height, ValidatorId::new(1), old.clone()),
             Candidate::First
         );
         assert_eq!(
-            store.add_candidate(height, ValidatorId::new(2), Arc::clone(&new)),
+            store.add_candidate(height, ValidatorId::new(2), new),
             Candidate::Queued
         );
         assert_eq!(
-            store.add_candidate(height, ValidatorId::new(2), Arc::clone(&old)),
+            store.add_candidate(height, ValidatorId::new(2), old),
             Candidate::Duplicate
         );
         store.assert_indexed();
@@ -557,11 +552,9 @@ mod tests {
         store.assert_indexed();
     }
 
-    fn verified_at(height: u64, parent_qc_wt: u64) -> Arc<Verified<CertifiedBlockHeader>> {
+    fn verified_at(height: u64, parent_qc_wt: u64) -> Verified<CertifiedBlockHeader> {
         let header = header_at(BlockHeight::new(height), parent_qc_wt);
-        Arc::new(Verified::new_unchecked_for_test(Arc::unwrap_or_clone(
-            header,
-        )))
+        Verified::new_unchecked_for_test(header)
     }
 
     fn held(store: &ShardHeaders) -> Vec<u64> {

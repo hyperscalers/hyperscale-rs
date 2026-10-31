@@ -788,7 +788,7 @@ pub enum Action {
     /// Returns `ProtocolEvent::RemoteHeaderQcVerified` when complete.
     VerifyRemoteHeaderQc {
         /// The remote header to verify.
-        certified_header: Arc<CertifiedBlockHeader>,
+        certified_header: CertifiedBlockHeader,
         /// Sender of the candidate header; threaded back through the
         /// callback so the coordinator can remove the failed candidate
         /// from its pending map on error.

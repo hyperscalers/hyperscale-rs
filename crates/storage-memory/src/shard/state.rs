@@ -327,7 +327,7 @@ pub struct ConsensusState {
     /// Certified headers held without their blocks: the anchor a
     /// snap-sync imported, kept so this store serves the next joiner's
     /// witness history as one that committed the block would.
-    pub(crate) boundary_headers: OrdMap<BlockHeight, Arc<CertifiedBlockHeader>>,
+    pub(crate) boundary_headers: OrdMap<BlockHeight, CertifiedBlockHeader>,
     /// Committed height.
     pub(crate) committed_height: BlockHeight,
     /// Committed block hash.

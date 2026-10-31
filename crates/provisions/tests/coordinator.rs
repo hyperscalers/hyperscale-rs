@@ -82,7 +82,7 @@ fn make_remote_header_targeting(
     source_shard: ShardId,
     height: BlockHeight,
     local_shard: ShardId,
-) -> Arc<Verified<CertifiedBlockHeader>> {
+) -> Verified<CertifiedBlockHeader> {
     // The expectation tracker keys on the header owing us a bundle — a
     // `provision_tx_roots` entry, and nothing else.
     let provision_tx_roots = std::collections::BTreeMap::from([(
@@ -113,9 +113,7 @@ fn make_remote_header_targeting(
         AggregateSignature::ZERO,
         WeightedTimestamp::ZERO,
     );
-    Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-        header, qc,
-    )))
+    Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
 }
 
 #[test]
@@ -220,7 +218,7 @@ fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
     let stored = coord
         .get_remote_header(remote, BlockHeight::new(5))
         .expect("present after the committed event");
-    assert!(Arc::ptr_eq(&stored, &header));
+    assert!(stored.same_body(&header));
 }
 
 #[test]

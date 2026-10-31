@@ -117,7 +117,7 @@ where
     /// step, its own or a remote shard's, for a host that summarises them
     /// ([`Self::take_admitted`]). Cleared at step entry, so a host that never
     /// drains it holds one step's worth at most.
-    pending_admitted: Vec<Arc<Verified<CertifiedBlockHeader>>>,
+    pending_admitted: Vec<Verified<CertifiedBlockHeader>>,
 
     /// Per-step scratch: each epoch adopted this step with what its fold
     /// settled, in the order the epochs folded ([`Self::take_adopted`]).
@@ -259,7 +259,7 @@ where
     /// The certified headers reported since the last step began, oldest
     /// first, emptying the scratch. The production beacon thread drains it
     /// after each step to keep its header summaries.
-    pub fn take_admitted(&mut self) -> Vec<Arc<Verified<CertifiedBlockHeader>>> {
+    pub fn take_admitted(&mut self) -> Vec<Verified<CertifiedBlockHeader>> {
         std::mem::take(&mut self.pending_admitted)
     }
 

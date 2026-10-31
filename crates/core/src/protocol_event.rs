@@ -123,7 +123,7 @@ pub enum ProtocolEvent {
     /// verified the sender's signature before admitting this event.
     UnverifiedRemoteHeaderReceived {
         /// Header + QC bundle from the remote shard.
-        certified_header: Arc<CertifiedBlockHeader>,
+        certified_header: CertifiedBlockHeader,
         /// Authenticated sender identity (signature-verified by `IoLoop`).
         sender: ValidatorId,
     },
@@ -147,7 +147,7 @@ pub enum ProtocolEvent {
     VerifiedRemoteHeaderReceived {
         /// Header + QC bundle, sealed via
         /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
         /// Authenticated sender identity (the local proposer).
         sender: ValidatorId,
     },
@@ -245,7 +245,7 @@ pub enum ProtocolEvent {
     /// headers carry, never from the event itself.
     LocalBlockCertified {
         /// The certified block's header and its certifying QC.
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
     },
 
     /// A block has been committed by consensus (QC formed, 2f+1 agreement).
@@ -322,7 +322,7 @@ pub enum ProtocolEvent {
         /// The header whose QC was checked. A failed header is parked
         /// from this copy, which outlives the pending entry it was
         /// dispatched from.
-        certified_header: Arc<CertifiedBlockHeader>,
+        certified_header: CertifiedBlockHeader,
         /// Sender of the candidate header — needed by the coordinator to
         /// remove the failed candidate from its pending map on error.
         sender: ValidatorId,
@@ -343,7 +343,7 @@ pub enum ProtocolEvent {
     RemoteHeaderAdmitted {
         /// The fully-verified certified header — predicate established by
         /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
     },
 
     /// A remote header's commit proof is held: the `RemoteHeaderCoordinator`
@@ -362,7 +362,7 @@ pub enum ProtocolEvent {
     /// committee can certify a sibling that never commits.
     RemoteHeaderCommitted {
         /// The commit-proven certified header.
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
     },
 
     /// A shard committee's fork was assembled locally from two

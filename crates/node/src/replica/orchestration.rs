@@ -9,8 +9,6 @@
 //!
 //! [`ShardParticipation`]: super::participation::ShardParticipation
 
-use std::sync::Arc;
-
 use hyperscale_core::Action;
 use hyperscale_types::{
     Anchor, CertifiedBlock, CertifiedBlockHeader, Verified, WeightedTimestamp,
@@ -98,7 +96,7 @@ impl NodeStateMachine {
             .on_block_committed(certified.block().header().parent_qc().weighted_timestamp());
 
         inputs.push(BeaconInput::LocalCommit {
-            header: Arc::new(certified.certified_header()),
+            header: certified.certified_header(),
         });
 
         let effects =
@@ -121,7 +119,7 @@ impl NodeStateMachine {
     /// once its commit proof is held.
     pub(super) fn on_remote_header_admitted(
         &mut self,
-        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: Verified<CertifiedBlockHeader>,
         inputs: &mut Vec<BeaconInput>,
     ) -> Vec<Action> {
         let actions = self
@@ -143,11 +141,11 @@ impl NodeStateMachine {
     /// pushed input, after all of them.
     pub(super) fn on_remote_header_committed(
         &mut self,
-        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+        certified_header: &Verified<CertifiedBlockHeader>,
         inputs: &mut Vec<BeaconInput>,
     ) -> Vec<Action> {
         inputs.push(BeaconInput::CommitProven {
-            header: Arc::clone(certified_header),
+            header: certified_header.clone(),
         });
         let topology_schedule = &self.schedule;
         let s = &mut self.shard;
@@ -180,6 +178,7 @@ impl NodeStateMachine {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use hyperscale_core::{ProtocolEvent, StateMachine};
     use hyperscale_hbor::Capped;

@@ -37,7 +37,7 @@ use crate::config::NodeConfig;
 /// `Verifiable::Verified` so the flush step can fast-path them past the
 /// sender-signature batch.
 pub type CertifiedHeaderVerificationItem = (
-    Arc<Verifiable<CertifiedBlockHeader>>,
+    Verifiable<CertifiedBlockHeader>,
     ValidatorId,
     ConsensusPublicKey,
     ConsensusSignature,

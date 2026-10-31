@@ -999,7 +999,7 @@ fn a_proposal_ask_goes_to_its_authors_shard() {
 
 /// The certified header of an empty `shard` block at `height`, its
 /// parent's certificate dated `anchor_ms`.
-fn header_at(shard: ShardId, height: u64, anchor_ms: u64) -> Arc<Verified<CertifiedBlockHeader>> {
+fn header_at(shard: ShardId, height: u64, anchor_ms: u64) -> Verified<CertifiedBlockHeader> {
     let block = make_live_block(
         shard,
         BlockHeight::new(height),
@@ -1009,7 +1009,7 @@ fn header_at(shard: ShardId, height: u64, anchor_ms: u64) -> Arc<Verified<Certif
         vec![],
     );
     let certified = Verified::<CertifiedBlock>::new_unchecked_for_test(certify(block, anchor_ms));
-    Arc::new(certified.certified_header())
+    certified.certified_header()
 }
 
 fn report(host: &mut Host, chain: ChainRegistration, input: BeaconInput) {
@@ -1033,7 +1033,7 @@ fn a_commit_reported_twice_keeps_the_fold_anchors_one_hop_apart() {
                 &mut host,
                 chain,
                 BeaconInput::LocalCommit {
-                    header: Arc::clone(&header),
+                    header: header.clone(),
                 },
             );
         }
@@ -1056,8 +1056,9 @@ fn a_certified_header_reported_twice_is_recorded_once() {
     let mut host = fix.host(BlockHeight::GENESIS);
     let chain = loop_of(&mut host).chain;
     let first = header_at(SHARD, 1, 10_000);
-    let second = Arc::new((*first).clone());
-    for header in [Arc::clone(&first), second] {
+    let second = header_at(SHARD, 1, 10_000);
+    assert!(!first.same_body(&second));
+    for header in [first.clone(), second] {
         report(&mut host, chain, BeaconInput::CertifiedHeader { header });
     }
     let held = host
@@ -1067,7 +1068,7 @@ fn a_certified_header_reported_twice_is_recorded_once() {
         .header(SHARD, BlockHeight::new(1))
         .expect("the certified header is recorded");
     assert!(
-        Arc::ptr_eq(held, &first),
+        held.same_body(&first),
         "a header reported twice keeps the copy first held",
     );
 }
@@ -1543,7 +1544,7 @@ fn linked_header(
     parent: BlockHash,
     parent_ms: u64,
     leaf_count: u64,
-) -> Arc<Verified<CertifiedBlockHeader>> {
+) -> Verified<CertifiedBlockHeader> {
     let qc = |block, height, parent| {
         QuorumCertificate::new(
             block,
@@ -1569,10 +1570,7 @@ fn linked_header(
         ..Default::default()
     });
     let certificate = qc(header.hash(), height, parent);
-    Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-        header,
-        certificate,
-    )))
+    Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, certificate))
 }
 
 /// Adding the host's first participant on the beacon committee raises
@@ -1682,10 +1680,7 @@ fn a_commit_proof_one_participant_asked_for_releases_its_proposal_on_the_loop() 
         .into_inner()
     };
     let certified = |header: &BlockHeader, qc: &QuorumCertificate| {
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-            header.clone(),
-            qc.clone(),
-        )))
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header.clone(), qc.clone()))
     };
 
     // `b` anchors short of the cut and is certified past it; `c`

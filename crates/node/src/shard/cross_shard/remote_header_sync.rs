@@ -11,8 +11,6 @@
 //! response decoding, and feeding delivered headers into per-header QC
 //! verification.
 
-use std::sync::Arc;
-
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{
@@ -223,7 +221,7 @@ where
             // The `sender` field carries no meaning for fetched headers —
             // a sentinel value avoids confusion with real validator ids.
             self.dispatch_event(ProtocolEvent::UnverifiedRemoteHeaderReceived {
-                certified_header: Arc::new(header),
+                certified_header: header,
                 sender: ValidatorId::new(u64::MAX),
             });
         }

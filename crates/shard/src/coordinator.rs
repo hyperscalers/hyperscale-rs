@@ -830,7 +830,7 @@ fn restored_pending_blocks(voted_blocks: &[Arc<Block>]) -> (PendingBlocks, Vec<B
 /// and the beacon reads the shard's own chain from its header as early as
 /// a remote observer could.
 fn certified_block_landed(certified: Arc<Verified<CertifiedBlock>>) -> Vec<Action> {
-    let certified_header = Arc::new(certified.certified_header());
+    let certified_header = certified.certified_header();
     vec![
         Action::AttachCertifiedUncommitted { certified },
         Action::Continuation(ProtocolEvent::LocalBlockCertified { certified_header }),
