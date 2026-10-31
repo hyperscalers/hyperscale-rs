@@ -356,9 +356,15 @@ impl Verify<&ProvisionsContext> for Provisions {
                 | StateProofError::ReadingMismatch => ProvisionsVerifyError::BadInclusion,
             })?;
 
-        for (entry, (_, inclusion)) in entries.iter().zip(&attested) {
+        // The proof answers once per key, but the target executes each
+        // transaction against its own copies, so every copy is held to
+        // that one answer.
+        for entry in self.0.transactions.iter().flat_map(|tx| tx.entries.iter()) {
+            let index = keys
+                .binary_search(&entry.key)
+                .expect("every carried key is among the deduped keys");
             let carried = entry.value.as_ref().map(|value| jmt_value_hash(value));
-            if carried != inclusion.value_hash() {
+            if carried != attested[index].1.value_hash() {
                 return Err(ProvisionsVerifyError::EntryMisstated { key: entry.key });
             }
         }
@@ -845,6 +851,60 @@ mod tests {
             );
             assert_eq!(
                 bundle.verify(&ctx),
+                Err(ProvisionsVerifyError::EntryMisstated { key }),
+            );
+        }
+
+        /// Two transactions reading one cell each carry a copy of it, and
+        /// the target executes each against its own copy. The proof
+        /// answers once per key, so a later copy that departs from the
+        /// first, in value or in presence, is a value nothing attested.
+        #[test]
+        fn verify_rejects_a_later_copy_of_a_key_that_departs_from_the_first() {
+            let items = vec![entry(1), entry(2)];
+            let (state_root, proof) = build_jmt(&items);
+            let verified_header = header_with_state_root(state_root);
+            let ctx = ProvisionsContext {
+                anchor: Anchor::of(&verified_header),
+            };
+            let (key, value) = items[0].clone();
+            let held =
+                |bytes: Vec<u8>| Some(Bytes::new(bytes).expect("a list written out in a test"));
+            let bundle = |second: Option<Vec<u8>>| {
+                Provisions::new(
+                    SOURCE,
+                    ShardId::leaf(1, 1),
+                    BlockHeight::new(1),
+                    WeightedTimestamp::ZERO,
+                    proof.clone(),
+                    Capped::from_array([
+                        ProvisionEntry::new(
+                            TxHash::from(Hash::from_bytes(b"tx1")),
+                            Capped::from_array([
+                                SubstateEntry::new(key, held(value.clone())),
+                                SubstateEntry::new(items[1].0, held(items[1].1.clone())),
+                            ]),
+                        ),
+                        ProvisionEntry::new(
+                            TxHash::from(Hash::from_bytes(b"tx2")),
+                            Capped::from_array([SubstateEntry::new(key, second.and_then(held))]),
+                        ),
+                    ]),
+                )
+            };
+
+            // Both copies agreeing clears.
+            assert!(bundle(Some(value.clone())).verify(&ctx).is_ok());
+
+            // The second copy carries a value the chain does not hold.
+            assert_eq!(
+                bundle(Some(vec![0xAA, 0xBB])).verify(&ctx),
+                Err(ProvisionsVerifyError::EntryMisstated { key }),
+            );
+
+            // The second copy claims the held cell absent.
+            assert_eq!(
+                bundle(None).verify(&ctx),
                 Err(ProvisionsVerifyError::EntryMisstated { key }),
             );
         }
