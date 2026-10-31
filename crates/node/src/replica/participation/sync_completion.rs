@@ -12,8 +12,9 @@ use hyperscale_core::{Action, FetchRequest};
 use hyperscale_shard::SettledTxSet;
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    Anchor, BlockHash, BlockHeight, CertifiedBlock, MerkleInclusionProof, QuorumCertificate,
-    ShardId, SubstateKey, TopologySchedule, VerdictCells, Verified, derive_block_transactions,
+    Anchor, BlockHash, BlockHeight, CertifiedBlock, CheckedStateProof, MerkleInclusionProof,
+    QuorumCertificate, ShardId, SubstateKey, TopologySchedule, VerdictCells, Verified,
+    derive_block_transactions,
 };
 
 use super::ShardParticipation;
@@ -79,23 +80,20 @@ impl ShardParticipation {
     /// off every proof and ignores keys it never asked.
     pub(in crate::replica) fn on_fetched_state_proof_verified(
         &mut self,
-        anchor: Anchor,
-        keys: &[SubstateKey],
-        proof: &MerkleInclusionProof,
+        proof: &CheckedStateProof,
         values: &[ServedValue],
     ) {
-        if self.shard_coordinator.precut_terminal() == Some(anchor)
-            && let Ok(inclusions) = proof.inclusions(anchor.state_root, anchor.shard, keys)
-        {
-            let presences: Vec<(SubstateKey, bool)> = inclusions
-                .into_iter()
-                .map(|(key, inclusion)| (key, inclusion.value_hash().is_some()))
+        let anchor = proof.anchor();
+        if self.shard_coordinator.precut_terminal() == Some(anchor) {
+            let presences: Vec<(SubstateKey, bool)> = proof
+                .inclusions()
+                .iter()
+                .map(|&(key, inclusion)| (key, inclusion.is_present()))
                 .collect();
             self.shard_coordinator
                 .record_precut_proof(anchor, &presences);
         }
-        self.execution_coordinator
-            .on_proof_fetched(anchor, keys, proof, values);
+        self.execution_coordinator.on_proof_fetched(proof, values);
         self.shard_coordinator.queue_ready_proposal();
     }
 

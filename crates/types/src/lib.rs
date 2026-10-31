@@ -139,7 +139,9 @@ pub use primitives::seeds::{EpochSeed, SEED_WINDOW_EPOCHS, SeedRing, SeedSource}
 pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::entry::ProvisionEntry;
 pub use provisioning::limits::{MAX_MERKLE_PROOF_LEN, MAX_STATE_ENTRIES_PER_TX};
-pub use provisioning::proof::{Inclusion, MerkleInclusionProof, StateProofError};
+pub use provisioning::proof::{
+    CheckedStateProof, Inclusion, MerkleInclusionProof, StateProofError,
+};
 pub use provisioning::provisions::{Provisions, ProvisionsContext, ProvisionsVerifyError};
 pub use provisioning::substate::{SubstateEntry, SubstateLeaf};
 pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH, absorb_committed_cells};

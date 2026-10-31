@@ -4,7 +4,7 @@ use hyperscale_hbor::{Bytes, Hbor};
 use hyperscale_jmt::{Blake3Hasher, ClaimTermination, MultiProof, ProofError, Tree, ValueHash};
 use thiserror::Error;
 
-use crate::{MAX_MERKLE_PROOF_LEN, ShardId, StateRoot, SubstateKey, shard_prefix_path};
+use crate::{Anchor, MAX_MERKLE_PROOF_LEN, ShardId, StateRoot, SubstateKey, shard_prefix_path};
 
 /// Merkle multiproof authenticating substates' presence in, or absence
 /// from, the JMT state tree.
@@ -72,6 +72,64 @@ pub enum StateProofError {
     /// A reading stated beside the proof is not what the proof says.
     #[error("state proof disagrees with the reading stated for a key")]
     ReadingMismatch,
+}
+
+/// A state proof read back against an anchor's root.
+///
+/// It reconstructs the root and claims every key asked, each with what
+/// it says of the key. Only [`Self::check`] builds one, so whoever holds
+/// it holds that reading and need not read the proof again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedStateProof {
+    anchor: Anchor,
+    keys: Vec<SubstateKey>,
+    proof: MerkleInclusionProof,
+    inclusions: Vec<(SubstateKey, Inclusion)>,
+}
+
+impl CheckedStateProof {
+    /// Read `proof` back against `anchor`'s root for `keys`.
+    ///
+    /// # Errors
+    ///
+    /// As [`MerkleInclusionProof::inclusions`] refuses the proof.
+    pub fn check(
+        anchor: Anchor,
+        keys: Vec<SubstateKey>,
+        proof: MerkleInclusionProof,
+    ) -> Result<Self, StateProofError> {
+        let inclusions = proof.inclusions(anchor.state_root, anchor.shard, &keys)?;
+        Ok(Self {
+            anchor,
+            keys,
+            proof,
+            inclusions,
+        })
+    }
+
+    /// The state the proof was read against.
+    #[must_use]
+    pub const fn anchor(&self) -> Anchor {
+        self.anchor
+    }
+
+    /// The keys the proof was asked about, in the order asked.
+    #[must_use]
+    pub fn keys(&self) -> &[SubstateKey] {
+        &self.keys
+    }
+
+    /// The proof as it arrived.
+    #[must_use]
+    pub const fn proof(&self) -> &MerkleInclusionProof {
+        &self.proof
+    }
+
+    /// Each asked key with what the proof says of it, in the order asked.
+    #[must_use]
+    pub fn inclusions(&self) -> &[(SubstateKey, Inclusion)] {
+        &self.inclusions
+    }
 }
 
 impl MerkleInclusionProof {

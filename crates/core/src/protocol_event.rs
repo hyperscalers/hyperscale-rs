@@ -16,15 +16,15 @@ use hyperscale_types::{
     Anchor, AnswerAdditions, AnswerDelta, BeaconBlockHash, BeaconProposal, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
     CandidateBeaconBlockVerifyError, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
-    CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, CheckOutcome, Epoch,
-    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationVerifyError, Hash, HeaderSource, LeafIndex, MerkleInclusionProof, PcVote1,
-    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provisions,
-    ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
-    RatifyVoteVerifyError, ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
-    ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    StandingAnswers, StateClaim, StoredReceipt, SubstateKey, TickId, Timeout, TopologySchedule,
+    CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, CheckOutcome,
+    CheckedStateProof, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
+    Finalization, FinalizationVerifyError, Hash, HeaderSource, LeafIndex, MerkleInclusionProof,
+    PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
+    Provisions, ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound,
+    RatifyVote, RatifyVoteVerifyError, ReadySignal, Round, ShardForkProof, ShardId,
+    ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcView, StandingAnswers, StateClaim, StoredReceipt, TickId, Timeout, TopologySchedule,
     Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells, Verifiable,
     VerificationKind, Verified, WeightedTimestamp,
 };
@@ -817,12 +817,9 @@ pub enum ProtocolEvent {
     /// a block it proposes; nothing reads an answer off a fetch, since
     /// the answer is the chain's once a block carries the proof.
     FetchedStateProofVerified {
-        /// The state the proof was checked against.
-        anchor: Anchor,
-        /// The keys the proof was asked about.
-        keys: Vec<SubstateKey>,
-        /// The proof as fetched.
-        proof: MerkleInclusionProof,
+        /// The proof as fetched, with what it says of each key asked
+        /// under the anchor's root.
+        proof: CheckedStateProof,
         /// The record values the server proved present, each held to
         /// the proof.
         values: Vec<ServedValue>,

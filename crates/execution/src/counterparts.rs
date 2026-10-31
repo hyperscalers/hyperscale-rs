@@ -33,15 +33,15 @@ use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::shard_prefix_path;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Address, Anchor, Block, BlockHeight,
-    BoundaryAttestation, BoundaryOffer, CarriedClaims, CounterpartMirror, Deadline, EpochWindows,
-    ExecutionCertificate, FrontierInputs, Inclusion, Issuer, LocalKey, MAX_CLAIMS_PER_BLOCK,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE,
-    MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, ProvenAnchors, RETENTION_HORIZON, ReadFrontier,
-    ReadMark, STATE_CLAIM_CELL_BYTES, SettledTxSet, ShardId, ShardTrie, StateClaim, Stated,
-    SubstateKey, TerminalEvidence, TickLine, TopologySchedule, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, VerdictCells, VerdictQuestion, Verifiable, Verified, WeightedTimestamp,
-    answer_hashes, said_at, verdict_leaf,
+    BoundaryAttestation, BoundaryOffer, CarriedClaims, CheckedStateProof, CounterpartMirror,
+    Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion, Issuer, LocalKey,
+    MAX_CLAIMS_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MAX_VALIDITY_RANGE, MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, ProvenAnchors,
+    RETENTION_HORIZON, ReadFrontier, ReadMark, STATE_CLAIM_CELL_BYTES, SettledTxSet, ShardId,
+    ShardTrie, StateClaim, Stated, SubstateKey, TerminalEvidence, TickLine, TopologySchedule,
+    TxHash, TxOutcome, TxResolution, UnsettledTx, VerdictCells, VerdictQuestion, Verifiable,
+    Verified, WeightedTimestamp, answer_hashes, said_at, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher, Terms,
@@ -3386,8 +3386,8 @@ impl Counterparts {
     /// answers, and hold the claim it proves to offer in a block this
     /// validator proposes.
     ///
-    /// The proof is walked once, under the anchor's root, and what
-    /// comes back is the reading. What the ledger asked about is what
+    /// The proof arrives read under the anchor's root, and what it says
+    /// of each key is the reading. What the ledger asked about is what
     /// is offered: the probes the proof spoke to are marked answered,
     /// so the question is not put to the same header again, and the
     /// claim is kept beside the transactions it answered for, which is
@@ -3399,13 +3399,15 @@ impl Counterparts {
     /// A record value the server proved present rides in the claim as
     /// a held reading, which is how a consumer comes to read the
     /// record's terms.
-    pub(crate) fn on_proof_fetched(
+    pub(crate) fn take_fetched_proof(
         &mut self,
-        anchor: Anchor,
-        keys: &[SubstateKey],
-        proof: &MerkleInclusionProof,
+        checked: &CheckedStateProof,
         values: &[ServedValue],
     ) {
+        let anchor = checked.anchor();
+        let keys = checked.keys();
+        let proof = checked.proof();
+        let inclusions = checked.inclusions();
         let answered: Vec<Question> = self
             .probes
             .values_mut()
@@ -3417,17 +3419,9 @@ impl Counterparts {
                 probe.question
             })
             .collect();
-        let Ok(inclusions) = proof.inclusions(anchor.state_root, anchor.shard, keys) else {
-            tracing::warn!(
-                shard = ?anchor.shard,
-                height = anchor.height.inner(),
-                "A fetched state proof does not answer for its keys"
-            );
-            return;
-        };
         // The cells asked at a boundary for an answer's deletion are
         // held apart, and are no other question's to keep.
-        let at_boundary = self.hold_boundary_readings(anchor, &inclusions, proof);
+        let at_boundary = self.hold_boundary_readings(anchor, inclusions, proof);
         // A question the proof answered is not put again, and the
         // reading that answered it is the one held to offer: what the
         // answer means is still the chain's to say, and until a block
@@ -3460,7 +3454,7 @@ impl Counterparts {
                 .filter(|key| !at_boundary.contains(key))
                 .filter(|key| wants_reading(&self.rows.awaited, &self.wanted, *key)),
         );
-        for (reading, victim) in self.answer_seats(anchor, keys, proof, &inclusions) {
+        for (reading, victim) in self.answer_seats(anchor, keys, proof, inclusions) {
             self.hold_seat_reading(&reading, victim);
         }
         if answering.is_empty() {
@@ -4336,6 +4330,22 @@ mod tests {
     };
 
     use super::*;
+
+    impl Counterparts {
+        /// Read `proof` against `anchor` for `keys` and take it, as a
+        /// fetch's answer arrives.
+        fn on_proof_fetched(
+            &mut self,
+            anchor: Anchor,
+            keys: &[SubstateKey],
+            proof: &MerkleInclusionProof,
+            values: &[ServedValue],
+        ) {
+            let checked = CheckedStateProof::check(anchor, keys.to_vec(), proof.clone())
+                .expect("a fetch's answer reads under its anchor");
+            self.take_fetched_proof(&checked, values);
+        }
+    }
 
     /// One name reaching `routes` prefixes, seeded by `seed`.
     fn name(seed: usize, routes: usize) -> UnsettledTx {

@@ -22,8 +22,9 @@ use hyperscale_types::network::response::{
 };
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    Anchor, BlockHeight, Finalization, FinalizationHash, HeaderSource, ProvisionHash, Provisions,
-    ShardId, SubstateKey, TerminalEvidence, VerdictCells, Verifiable, settled_txs_root_from_hashes,
+    Anchor, BlockHeight, CheckedStateProof, Finalization, FinalizationHash, HeaderSource,
+    ProvisionHash, Provisions, ShardId, SubstateKey, TerminalEvidence, VerdictCells, Verifiable,
+    settled_txs_root_from_hashes,
 };
 
 use crate::event::ShardScopedInput;
@@ -258,12 +259,12 @@ impl ScopedAnswer for StateProofBinding {
         response: GetStateProofResponse,
     ) -> Result<ProtocolEvent, Refusal> {
         let proof = response.proof.ok_or(Refusal::NotHeld)?;
-        let inclusions = proof
-            .inclusions(scope.state_root, scope.shard, &keys)
+        let proof = CheckedStateProof::check(scope, keys, proof)
             .map_err(|_| Refusal::Unusable("unusable_proof"))?;
         let values = response.values.into_inner();
         for (key, bytes) in &values {
-            let proven = inclusions
+            let proven = proof
+                .inclusions()
                 .iter()
                 .find(|(asked, _)| asked == key)
                 .map(|(_, inclusion)| inclusion.value_hash());
@@ -271,12 +272,7 @@ impl ScopedAnswer for StateProofBinding {
                 return Err(Refusal::Unusable("value_off_its_proof"));
             }
         }
-        Ok(ProtocolEvent::FetchedStateProofVerified {
-            anchor: scope,
-            keys,
-            proof,
-            values,
-        })
+        Ok(ProtocolEvent::FetchedStateProofVerified { proof, values })
     }
 }
 

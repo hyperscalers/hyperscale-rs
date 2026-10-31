@@ -70,14 +70,14 @@ use hyperscale_storage::{
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CarriedClaims, CertifiedBlock,
-    CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
-    EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome,
-    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
-    Hash, Joins, MerkleInclusionProof, Mode, Movement, ProvenAnchors, Provisions,
-    REATTESTATION_STEP, ScheduleLookup, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim,
-    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
+    CheckedStateProof, CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation,
+    DiscardCause, EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError,
+    ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
+    GlobalReceiptRoot, Hash, Joins, MerkleInclusionProof, Mode, Movement, ProvenAnchors,
+    Provisions, REATTESTATION_STEP, ScheduleLookup, SettledTxSet, Settlement, ShardId, ShardTrie,
+    StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxResolution, UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
     WeightedTimestamp, derive_block_transactions, tick_leader,
 };
 use tracing::instrument;
@@ -2619,15 +2619,8 @@ impl ExecutionCoordinator {
     }
 
     /// Keep a fetched proof for a block this validator proposes.
-    pub fn on_proof_fetched(
-        &mut self,
-        anchor: Anchor,
-        keys: &[SubstateKey],
-        proof: &MerkleInclusionProof,
-        values: &[ServedValue],
-    ) {
-        self.counterparts
-            .on_proof_fetched(anchor, keys, proof, values);
+    pub fn on_proof_fetched(&mut self, proof: &CheckedStateProof, values: &[ServedValue]) {
+        self.counterparts.take_fetched_proof(proof, values);
     }
 
     /// Take a proof fetched for verdict questions at `anchor`, each
@@ -13181,7 +13174,9 @@ mod tests {
             "and asks a fresh header of neither answer: {opened:?}",
         );
 
-        state.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
+        let checked = CheckedStateProof::check(anchor, vec![claim, decline], proof)
+            .expect("the proof reads under its anchor");
+        state.on_proof_fetched(&checked, &[]);
         assert!(
             state
                 .offers(&CarriedClaims::default())

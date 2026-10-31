@@ -651,14 +651,8 @@ impl StateMachine for NodeStateMachine {
                 shard,
                 SettledTxSet { txs, terminal_wt },
             ),
-            ProtocolEvent::FetchedStateProofVerified {
-                anchor,
-                keys,
-                proof,
-                values,
-            } => {
-                self.shard
-                    .on_fetched_state_proof_verified(anchor, &keys, &proof, &values);
+            ProtocolEvent::FetchedStateProofVerified { proof, values } => {
+                self.shard.on_fetched_state_proof_verified(&proof, &values);
                 Vec::new()
             }
             ProtocolEvent::FetchedVerdictProofVerified {
