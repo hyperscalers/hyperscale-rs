@@ -1210,7 +1210,7 @@ mod tests {
             0,
             ValidatorId::new(0),
             Vec::new(),
-            vec![Arc::new(Verifiable::from(half))],
+            vec![Verifiable::from(half)],
         );
         let leaves = |prior: &Rows, half: ShardId| -> Vec<Option<Vec<u8>>> {
             followed_block_writes(
@@ -1432,18 +1432,18 @@ mod tests {
         let (state, parent, record, credit) = returning_at_the_parent();
         let (left, right) = ShardId::ROOT.children();
         let determined = || {
-            Arc::new(Verifiable::from(make_finalization_on(
+            Verifiable::from(make_finalization_on(
                 ShardId::ROOT,
                 BlockHeight::new(1),
                 TxHash::from(Hash::from_bytes(b"a member")),
                 TransactionDecision::Accept,
-            )))
+            ))
         };
         let legs = || {
-            Arc::new(Verifiable::from(make_leg_finalization(
+            Verifiable::from(make_leg_finalization(
                 BlockHeight::new(1),
                 TxHash::from(Hash::from_bytes(b"a leg")),
-            )))
+            ))
         };
         for halves in [
             vec![],

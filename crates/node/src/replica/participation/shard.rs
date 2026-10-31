@@ -56,7 +56,7 @@ impl ShardParticipation {
     pub(in crate::replica) fn on_finalizations_admitted(
         &mut self,
         sched: &TopologySchedule,
-        finalizations: &[Arc<Verifiable<Finalization>>],
+        finalizations: &[Verifiable<Finalization>],
     ) -> Vec<Action> {
         let actions = self
             .shard_coordinator

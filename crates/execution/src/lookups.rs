@@ -268,7 +268,7 @@ pub fn records_written(finalization: &Finalization) -> Vec<(TxHash, SubstateKey,
 /// trie.
 #[must_use]
 pub fn record_pushes(
-    finalizations: &[Arc<Verifiable<Finalization>>],
+    finalizations: &[Verifiable<Finalization>],
     trie: &ShardTrie,
     local: ShardId,
     claimants: impl Fn(TxHash, SubstateKey) -> BTreeSet<ShardId>,
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(trie.shard_for_prefix(home.consumer), local);
         let cell = |id: CrossingId, tx: TxHash| id.cell(tx, resource, 7, 9_000, Terms::Owed);
         let finalization = |seed: u8, id: CrossingId, key: SubstateKey| {
-            StdArc::new(Verifiable::from(finalization(
+            Verifiable::from(finalization(
                 local,
                 certificate(
                     TickId::new(local, BlockHeight::new(3)),
@@ -575,7 +575,7 @@ mod tests {
                     tx(seed),
                     vec![(key, Some(cell(id, tx(seed)).to_bytes()))],
                 )],
-            )))
+            ))
         };
         let pushes = record_pushes(
             &[
@@ -608,14 +608,14 @@ mod tests {
         assert_eq!(trie.shard_for_prefix(id.consumer), owner);
         let issuer = tx(0xD3);
         let cell = id.cell(issuer, ResourceAddr::new([0xE1; 31]), 7, 9_000, Terms::Owed);
-        let finalization = StdArc::new(Verifiable::from(finalization(
+        let finalization = Verifiable::from(finalization(
             local,
             certificate(
                 TickId::new(local, BlockHeight::new(3)),
                 vec![TxOutcome::new(issuer, SUCCEEDED.clone())],
             ),
             vec![receipt(issuer, vec![(key, Some(cell.to_bytes()))])],
-        )));
+        ));
         let pushes = record_pushes(&[finalization], &trie, local, |tx_hash, record| {
             assert_eq!((tx_hash, record), (issuer, key));
             BTreeSet::from([local, owner, sibling, departed])

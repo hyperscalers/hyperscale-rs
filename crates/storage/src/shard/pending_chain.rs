@@ -480,7 +480,7 @@ where
     /// `None` where the block itself is absent or any of the
     /// finalizations its manifest names is: the settled fold derives its
     /// set from these, so a short read is a hole and not a shorter block.
-    fn attestations_at(&self, height: BlockHeight) -> Option<Vec<Arc<Verifiable<Finalization>>>> {
+    fn attestations_at(&self, height: BlockHeight) -> Option<Vec<Verifiable<Finalization>>> {
         if let Some(certified) = self
             .pending_certified_at(height)
             .or_else(|| self.pending_certified_uncommitted_at(height))
@@ -497,8 +497,7 @@ where
         let metadata = self.base.get_block_metadata(height)?;
         let ids = metadata.manifest().cert_ids();
         let stored = self.base.get_certificates_batch(ids);
-        (stored.len() == ids.len())
-            .then(|| stored.into_iter().map(|fw| Arc::new(fw.into())).collect())
+        (stored.len() == ids.len()).then(|| stored.into_iter().map(Verifiable::from).collect())
     }
 
     /// The settled-transaction root a terminating boundary header
@@ -520,7 +519,7 @@ where
     pub fn terminal_settled_txs_root(
         &self,
         window: &TerminalWindow,
-        own_certificates: &[Arc<Verifiable<Finalization>>],
+        own_certificates: &[Verifiable<Finalization>],
     ) -> Result<SettledTxsRoot, WindowCoverage> {
         let (settled, coverage) = self.settled_txs_in_window(
             window.local_shard,
@@ -2214,7 +2213,7 @@ mod tests {
         else {
             unreachable!("make_test_block returns a Live block")
         };
-        let certs = vec![Arc::new(
+        let certs = vec![
             Finalization::new(
                 *settles,
                 TickHalf::Determined,
@@ -2222,7 +2221,7 @@ mod tests {
                 Capped::from_array([]),
             )
             .into(),
-        )];
+        ];
         let block = Block::Live {
             header,
             transactions,

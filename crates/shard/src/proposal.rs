@@ -41,7 +41,7 @@ use tracing::debug;
 use crate::admission::{
     Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, Section, StateClaimsFold, StateClaimsSection, TransactionsFold,
-    TransactionsSection, admit_each, predated_at, unwrapped,
+    TransactionsSection, admit_each, predated_at,
 };
 use crate::carried::CommittedCarried;
 use crate::chain_view::ChainView;
@@ -125,7 +125,7 @@ pub struct ProposalInputs {
     /// The pool's ready set, in hash order.
     pub ready_txs: Vec<Arc<Verified<Transaction>>>,
     /// Finalizations execution holds ready to commit.
-    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    pub finalizations: Vec<Verifiable<Finalization>>,
     /// Provision bundles queued from remote shards.
     pub provisions: Vec<Verifiable<Provisions>>,
     /// What departed counterparts left of this chain's business.
@@ -206,7 +206,7 @@ impl ProposalKind {
 #[derive(Debug, Default)]
 pub struct ProposalPayload {
     pub(crate) transactions: Vec<Arc<Verified<Transaction>>>,
-    pub(crate) finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    pub(crate) finalizations: Vec<Verifiable<Finalization>>,
     pub(crate) provisions: Vec<Verifiable<Provisions>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
@@ -223,7 +223,7 @@ pub struct ProposalPayload {
     /// The legs halves among `finalizations` this proposer cut to the
     /// names that stand at the block's anchor: no other replica holds
     /// them, so they are handed to the node that serves them.
-    pub(crate) cut_legs: Vec<Arc<Verifiable<Finalization>>>,
+    pub(crate) cut_legs: Vec<Verifiable<Finalization>>,
 }
 
 impl ProposalPayload {
@@ -457,9 +457,9 @@ pub fn select_transactions(
 pub fn select_finalizations(
     ctx: &Committed<'_>,
     fold: &mut FinalizationsFold,
-    finalizations: Vec<Arc<Verifiable<Finalization>>>,
-) -> Vec<Arc<Verifiable<Finalization>>> {
-    admit_each::<FinalizationsSection, _>(ctx, fold, finalizations, unwrapped).0
+    finalizations: Vec<Verifiable<Finalization>>,
+) -> Vec<Verifiable<Finalization>> {
+    admit_each::<FinalizationsSection, _>(ctx, fold, finalizations, Verifiable::as_unverified).0
 }
 
 /// Select the boundary records for inclusion: each trimmed to the names
@@ -682,7 +682,7 @@ pub fn select_claims(
     retirement_claims: &[BoundaryOffer],
     capped: &[ShardId],
     local_crossings: Vec<CrossingId>,
-    finalizations: &[Arc<Verifiable<Finalization>>],
+    finalizations: &[Verifiable<Finalization>],
 ) -> (Vec<StateClaim>, ParentReads) {
     let mut lists = AnchorLists::default();
     let (taken_back, rest) = spend_the_reserve(ctx, fold, boundary_claims, capped, &mut lists);
@@ -922,7 +922,7 @@ const RETIREMENT_BYTES: usize = MAX_STATE_CLAIMS_BYTES / 3;
 const RETIREMENT_PLACES: usize = MAX_STATE_CLAIMS_PER_BLOCK / 4;
 
 /// The transactions whose rows `finalizations` delete.
-fn deleted_by(finalizations: &[Arc<Verifiable<Finalization>>]) -> BTreeSet<TxHash> {
+fn deleted_by(finalizations: &[Verifiable<Finalization>]) -> BTreeSet<TxHash> {
     finalizations
         .iter()
         .flat_map(|fw| SettledHalf::of(fw.as_unverified()).deleted)
@@ -1774,12 +1774,12 @@ mod tests {
             Against::schedule(TopologySnapshot::clone(stamped.head()), stamped.clone());
         against.anchor = inside;
         against.local_shard = SURVIVOR;
-        let resolving = Arc::new(Verifiable::from(make_finalization_on(
+        let resolving = Verifiable::from(make_finalization_on(
             SURVIVOR,
             BlockHeight::new(1),
             stranded().tx_hash,
             TransactionDecision::Accept,
-        )));
+        ));
         against.holding_settled(from_ref(&resolving));
         let ctx = against.ctx();
         let none = FinalizationsFold::from(&ctx);
@@ -1814,19 +1814,17 @@ mod tests {
     #[test]
     fn select_finalizations_offers_one_verdict_per_transaction() {
         let tx_hash = TxHash::from(Hash::from_bytes(b"contested"));
-        let settled: Arc<Verifiable<Finalization>> = Arc::new(
-            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into(),
-        );
-        let abandoned: Arc<Verifiable<Finalization>> = Arc::new(
-            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into(),
-        );
+        let settled: Verifiable<Finalization> =
+            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into();
+        let abandoned: Verifiable<Finalization> =
+            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into();
         assert_ne!(settled.tick_id(), abandoned.tick_id());
 
         let mut against = finalizations_against(CommitDedupIndex::new());
-        against.holding_settled(&[Arc::clone(&settled), Arc::clone(&abandoned)]);
+        against.holding_settled(&[settled.clone(), abandoned.clone()]);
         let ctx = against.ctx();
         let mut fold = FinalizationsFold::from(&ctx);
-        let selected = select_finalizations(&ctx, &mut fold, vec![Arc::clone(&settled), abandoned]);
+        let selected = select_finalizations(&ctx, &mut fold, vec![settled.clone(), abandoned]);
         assert_eq!(selected.len(), 1, "the second verdict is dropped");
         assert_eq!(selected[0].tick_id(), settled.tick_id());
         assert_eq!(fold.tx_count, 1);
@@ -1846,15 +1844,15 @@ mod tests {
     #[test]
     fn select_finalizations_drops_a_committed_offer_that_decided_nothing() {
         let tx_hash = TxHash::from(Hash::from_bytes(b"retired"));
-        let committed: Arc<Verifiable<Finalization>> =
-            Arc::new(make_leg_finalization(BlockHeight::new(1), tx_hash).into());
+        let committed: Verifiable<Finalization> =
+            make_leg_finalization(BlockHeight::new(1), tx_hash).into();
         assert_eq!(
             committed.deciding_tx_hashes().count(),
             0,
             "the fixture has to decide nothing, or it tests the ordinary path",
         );
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(&[Arc::clone(&committed)], WeightedTimestamp::ZERO);
+        dedup_index.register_committed_certs(from_ref(&committed), WeightedTimestamp::ZERO);
 
         let against = finalizations_against(dedup_index);
         let ctx = against.ctx();
@@ -1872,15 +1870,13 @@ mod tests {
     #[test]
     fn select_finalizations_drops_what_the_retention_window_resolved() {
         let tx_hash = TxHash::from(Hash::from_bytes(b"already resolved"));
-        let committed: Arc<Verifiable<Finalization>> = Arc::new(
-            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into(),
-        );
+        let committed: Verifiable<Finalization> =
+            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into();
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(from_ref(&committed), WeightedTimestamp::ZERO);
 
-        let abandoned: Arc<Verifiable<Finalization>> = Arc::new(
-            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into(),
-        );
+        let abandoned: Verifiable<Finalization> =
+            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into();
         let against = finalizations_against(dedup_index);
         let ctx = against.ctx();
         let mut fold = FinalizationsFold::from(&ctx);
@@ -4006,22 +4002,20 @@ mod tests {
         let claim = proven_claim(SIBLING, 3, &leaves, &leaves).hearing([settled, standing]);
         let against =
             hearing_at_the_parent([stated_row(settled, None), stated_row(standing, None)]);
-        let settling: Arc<Verifiable<Finalization>> = Arc::new(
-            finalization_of(
-                BlockHeight::new(1),
-                vec![
-                    TxOutcome::new(
-                        settled,
-                        ExecutionOutcome::Succeeded {
-                            receipt_hash: GlobalReceiptHash::ZERO,
-                        },
-                    )
-                    .charging(0),
-                ],
-            )
-            .into(),
-        );
-        let select = |finalizations: &[Arc<Verifiable<Finalization>>]| {
+        let settling: Verifiable<Finalization> = finalization_of(
+            BlockHeight::new(1),
+            vec![
+                TxOutcome::new(
+                    settled,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .charging(0),
+            ],
+        )
+        .into();
+        let select = |finalizations: &[Verifiable<Finalization>]| {
             select_claims(
                 &against.ctx(),
                 &mut StateClaimsFold::default(),

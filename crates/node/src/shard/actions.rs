@@ -262,7 +262,7 @@ where
                 self.io
                     .caches
                     .finalization
-                    .insert(tick.receipt_hash(), Arc::clone(tick));
+                    .insert(tick.receipt_hash(), tick.clone());
             }
         }
 
@@ -908,7 +908,7 @@ mod tests {
             [&replaced, &every_leg]
                 .map(|fw| {
                     Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
-                        finalizations: vec![Arc::new(Verifiable::from(fw.clone()))],
+                        finalizations: vec![Verifiable::from(fw.clone())],
                     })
                 })
                 .to_vec(),

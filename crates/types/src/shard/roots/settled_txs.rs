@@ -9,8 +9,6 @@
 //!
 //! [`SettledTxsRoot`]: crate::SettledTxsRoot
 
-use std::sync::Arc;
-
 use crate::shard::roots::SetRoot;
 use crate::{
     ExecutionOutcome, Finalization, Hash, SettledTxsRoot, ShardId, TxHash, TxOutcome, TypedHash,
@@ -43,7 +41,7 @@ use crate::{
 /// record of its own, not the absence of one.
 #[must_use]
 pub fn local_settled_tx_hashes<'a>(
-    certificates: impl IntoIterator<Item = &'a Arc<Verifiable<Finalization>>>,
+    certificates: impl IntoIterator<Item = &'a Verifiable<Finalization>>,
     shard: ShardId,
 ) -> Vec<TxHash> {
     certificates
@@ -102,6 +100,7 @@ pub fn settled_txs_root_from_hashes<'a>(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     use hyperscale_hbor::Capped;
 
@@ -135,13 +134,13 @@ mod tests {
         assert_eq!(forward, with_dup);
     }
 
-    fn finalization(local: ShardId, ec: ExecutionCertificate) -> Arc<Verifiable<Finalization>> {
-        Arc::new(Verifiable::from(Finalization::new(
+    fn finalization(local: ShardId, ec: ExecutionCertificate) -> Verifiable<Finalization> {
+        Verifiable::from(Finalization::new(
             TickId::new(local, BlockHeight::new(1)),
             TickHalf::Determined,
             Some(ec),
             Capped::from_array([]),
-        )))
+        ))
     }
 
     fn certificate(shard: ShardId, outcomes: Vec<TxOutcome>) -> ExecutionCertificate {
@@ -203,7 +202,7 @@ mod tests {
                 .awaiting([remote])
                 .as_role(Role::Core)
         };
-        let half = Arc::new(Verifiable::from(stating_half_on(
+        let half = Verifiable::from(stating_half_on(
             local,
             BlockHeight::new(1),
             vec![
@@ -212,7 +211,7 @@ mod tests {
                 core(yes, succeeded()),
             ],
             Vec::new(),
-        )));
+        ));
         assert_eq!(local_settled_tx_hashes([&half], local), vec![]);
     }
 
@@ -227,7 +226,7 @@ mod tests {
 
         let local = ShardId::leaf(1, 0);
         let accepting = |shard: ShardId, members: &[TxHash]| {
-            Arc::new(Verifiable::from(Finalization::accepting(
+            Verifiable::from(Finalization::accepting(
                 TickId::new(shard, BlockHeight::new(2)),
                 Capped::new(
                     members
@@ -244,7 +243,7 @@ mod tests {
                         .collect(),
                 )
                 .expect("a list written out in a test"),
-            )))
+            ))
         };
         let mut named = local_settled_tx_hashes(
             [

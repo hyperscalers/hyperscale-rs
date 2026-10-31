@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_compute_certificate_root_deterministic() {
-        let make_fw = |seed: u8| -> Arc<Verifiable<Finalization>> {
+        let make_fw = |seed: u8| -> Verifiable<Finalization> {
             let ec = ExecutionCertificate::new(
                 TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
                 WeightedTimestamp::from_millis(11),
@@ -198,15 +198,13 @@ mod tests {
                 AggregateSignature::new([0u8; 96]),
                 SignerBitfield::new(4),
             );
-            Arc::new(
-                Finalization::new(
-                    TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
-                    TickHalf::Determined,
-                    Some(ec),
-                    Capped::from_array([]),
-                )
-                .into(),
+            Finalization::new(
+                TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
+                TickHalf::Determined,
+                Some(ec),
+                Capped::from_array([]),
             )
+            .into()
         };
 
         let certs = vec![make_fw(1), make_fw(2)];
@@ -238,7 +236,7 @@ mod tests {
             Capped::from_array([]),
         );
         let expected_receipt_hash = cert.receipt_hash();
-        let fw: Arc<Verifiable<Finalization>> = Arc::new(cert.into());
+        let fw: Verifiable<Finalization> = cert.into();
 
         let root = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         // Single cert: the section root equals the cert's receipt_hash

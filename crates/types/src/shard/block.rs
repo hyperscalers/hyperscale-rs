@@ -71,7 +71,7 @@ pub fn derive_block_transactions(block: &Block, derivation: &dyn Derivation) {
 /// [`BlockHeader::parent_qc`](crate::BlockHeader) which carries
 /// `Verifiable<QuorumCertificate>` for the same reason.
 pub type SharedCertificates =
-    Arc<Capped<Vec<Arc<Verifiable<Finalization>>>, MAX_FINALIZED_TX_PER_BLOCK>>;
+    Arc<Capped<Vec<Verifiable<Finalization>>, MAX_FINALIZED_TX_PER_BLOCK>>;
 
 /// Shared provision list — same rationale as [`SharedCertificates`].
 pub type SharedProvisions = Arc<Capped<Vec<Verifiable<Provisions>>, MAX_PROVISIONS_PER_BLOCK>>;
@@ -90,7 +90,7 @@ pub type SharedProvisions = Arc<Capped<Vec<Verifiable<Provisions>>, MAX_PROVISIO
 /// inflate transactions its committee admitted and priced, rather than a
 /// figure its own engine reported.
 #[must_use]
-pub fn fees_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) -> u128 {
+pub fn fees_over_certificates(certificates: &[Verifiable<Finalization>]) -> u128 {
     certificates.iter().fold(0u128, |sum, tick| {
         sum.saturating_add(tick.as_unverified().charged())
     })
@@ -224,12 +224,12 @@ impl PartialEq for Block {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.hash() == y.hash())
         }
         fn cert_lists_equal(
-            a: &[Arc<Verifiable<Finalization>>],
-            b: &[Arc<Verifiable<Finalization>>],
+            a: &[Verifiable<Finalization>],
+            b: &[Verifiable<Finalization>],
         ) -> bool {
             // Compare by inner FW content; the `Verifiable` marker is
             // irrelevant to whether two blocks are content-equal.
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| ***x == ***y)
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| **x == **y)
         }
 
         self.header() == other.header()

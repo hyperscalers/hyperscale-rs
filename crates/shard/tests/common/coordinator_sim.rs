@@ -276,7 +276,7 @@ enum SimEvent {
         round: Round,
         block: Arc<Block>,
         block_hash: BlockHash,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
         provisions: Vec<Verifiable<Provisions>>,
         bytes_delta: i64,
         answers: AnswerDelta,

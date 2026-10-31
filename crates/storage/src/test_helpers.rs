@@ -505,7 +505,7 @@ pub fn make_test_execution_certificate(
 ///
 /// If `fw` is past the certificate cap the block's field states.
 #[must_use]
-pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
+pub fn push_certificate(block: Block, fw: Verifiable<Finalization>) -> Block {
     match block {
         Block::Live {
             header,
@@ -707,7 +707,7 @@ fn commit_empty_blocks_below(storage: &impl TestStore, target: BlockHeight) {
 
 /// A finalization at `height` whose one receipt carries `writes`, with
 /// the placeholder certificate a stored finalization needs to decode.
-fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finalization>> {
+fn settling(height: BlockHeight, writes: StateWrites) -> Verifiable<Finalization> {
     let receipt = StoredReceipt {
         tx_hash: TxHash::ZERO,
         consensus: Arc::new(ConsensusReceipt::Succeeded {
@@ -717,15 +717,13 @@ fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finaliza
             events: Capped::empty(),
         }),
     };
-    Arc::new(
-        Finalization::new(
-            TickId::new(ShardId::ROOT, height),
-            TickHalf::Determined,
-            Some(placeholder_local_ec(ShardId::ROOT, height)),
-            Capped::from_array([receipt]),
-        )
-        .into(),
+    Finalization::new(
+        TickId::new(ShardId::ROOT, height),
+        TickHalf::Determined,
+        Some(placeholder_local_ec(ShardId::ROOT, height)),
+        Capped::from_array([receipt]),
     )
+    .into()
 }
 
 /// Commit `writes` at `height` through the one commit path.
@@ -817,15 +815,13 @@ pub fn paced(height: u64, blocks: u64) -> WeightedTimestamp {
 /// If a list written out here is past the cap its type states.
 #[must_use]
 pub fn block_settling(height: BlockHeight, receipts: Vec<StoredReceipt>) -> Block {
-    let finalized = Arc::new(
-        Finalization::new(
-            TickId::new(ShardId::ROOT, height),
-            TickHalf::Determined,
-            None,
-            Capped::new(receipts).expect("a list written out in a test"),
-        )
-        .into(),
-    );
+    let finalized = Finalization::new(
+        TickId::new(ShardId::ROOT, height),
+        TickHalf::Determined,
+        None,
+        Capped::new(receipts).expect("a list written out in a test"),
+    )
+    .into();
     push_certificate(make_test_block(height), finalized)
 }
 
@@ -3975,7 +3971,7 @@ fn commit_finalizing<S: TestStore>(
     let finalization = make_finalization_leaving(BlockHeight::new(tick), tx_hash, writes);
     let block = push_certificate(
         make_test_block(BlockHeight::new(height)),
-        Arc::new(finalization.into()),
+        finalization.into(),
     );
     commit_settled_at(
         storage,
@@ -4764,11 +4760,11 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + TestStore)) {
     // lets the rebuilt block carry it on every backend.
     let resolving = push_certificate(
         make_test_block(BlockHeight::new(4)),
-        Arc::new(Verifiable::from(make_finalization(
+        Verifiable::from(make_finalization(
             BlockHeight::new(4),
             resolved.hash(),
             TransactionDecision::Aborted,
-        ))),
+        )),
     );
     commit_settled_at(
         storage,
@@ -4929,11 +4925,11 @@ pub fn test_a_settled_tick_pulls_the_replay_down(storage: &(impl ShardChainReade
     commit_settled_at(storage, &make_test_certified(owing), &[], &[], &witness);
     let settling = push_certificate(
         make_test_block(BlockHeight::new(5)),
-        Arc::new(Verifiable::from(make_finalization(
+        Verifiable::from(make_finalization(
             BlockHeight::new(3),
             settled.hash(),
             TransactionDecision::Aborted,
-        ))),
+        )),
     );
     commit_settled_at(storage, &make_test_certified(settling), &[], &[], &witness);
 
@@ -5044,11 +5040,11 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
     // The abort discharges it, and the floor lifts with it.
     let aborting = push_certificate(
         make_test_block(BlockHeight::new(4)),
-        Arc::new(Verifiable::from(make_finalization(
+        Verifiable::from(make_finalization(
             BlockHeight::new(4),
             stranded.hash(),
             TransactionDecision::Aborted,
-        ))),
+        )),
     );
     commit_settled_at(
         storage,
@@ -5102,10 +5098,7 @@ pub fn test_a_leg_entry_holds_the_floor_to_its_horizon(
     );
     let settling = push_certificate(
         make_test_block_with_anchor_wt(BlockHeight::new(2), committed_ms + 1_000),
-        Arc::new(Verifiable::from(make_leg_finalization(
-            BlockHeight::new(2),
-            leg.hash(),
-        ))),
+        Verifiable::from(make_leg_finalization(BlockHeight::new(2), leg.hash())),
     );
     commit_settled_at(
         storage,
@@ -5240,10 +5233,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
 
     let settling = push_certificate(
         make_test_block(BlockHeight::new(2)),
-        Arc::new(Verifiable::from(make_leg_finalization(
-            BlockHeight::new(2),
-            leg.hash(),
-        ))),
+        Verifiable::from(make_leg_finalization(BlockHeight::new(2), leg.hash())),
     );
     commit_settled_at(
         storage,
@@ -5265,11 +5255,11 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
 
     let deciding = push_certificate(
         make_test_block(BlockHeight::new(3)),
-        Arc::new(Verifiable::from(make_finalization(
+        Verifiable::from(make_finalization(
             BlockHeight::new(3),
             leg.hash(),
             TransactionDecision::Aborted,
-        ))),
+        )),
     );
     commit_settled_at(
         storage,
@@ -5450,7 +5440,7 @@ fn block_with_a_settled_transaction(height: BlockHeight, seed: u8) -> Block {
     );
     push_certificate(
         block,
-        Arc::new(make_finalization_leaving(height, tx_hash, StateWrites::default()).into()),
+        make_finalization_leaving(height, tx_hash, StateWrites::default()).into(),
     )
 }
 
@@ -6083,7 +6073,7 @@ fn block_settling_members(height: u64, txs: &[&Transaction]) -> Block {
         .collect();
     push_certificate(
         make_test_block(height),
-        Arc::new(finalization_of(height, outcomes).into()),
+        finalization_of(height, outcomes).into(),
     )
 }
 
@@ -6121,20 +6111,18 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
     // a block whose own row and the one below sit at or above the floor.
     let settling_second = push_certificate(
         make_test_block(BlockHeight::new(4)),
-        Arc::new(
-            make_finalization_settling(
-                BlockHeight::new(4),
-                TxOutcome::new(
-                    second.hash(),
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-                .charging(0),
-                StateWrites::default(),
+        make_finalization_settling(
+            BlockHeight::new(4),
+            TxOutcome::new(
+                second.hash(),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
             )
-            .into(),
-        ),
+            .charging(0),
+            StateWrites::default(),
+        )
+        .into(),
     );
     let settled = settling_second.certificates()[0].receipt_hash();
     let chain = [
@@ -6267,11 +6255,8 @@ pub fn test_a_stating_blocks_yes_receipts_prune_with_it<S: ShardChainReader + Te
     let stated_at = stating.receipt_hash();
     let chain = [
         make_test_block(BlockHeight::new(1)),
-        push_certificate(
-            make_test_block(BlockHeight::new(2)),
-            Arc::new(stating.into()),
-        ),
-        push_certificate(make_test_block(BlockHeight::new(3)), Arc::new(legs.into())),
+        push_certificate(make_test_block(BlockHeight::new(2)), stating.into()),
+        push_certificate(make_test_block(BlockHeight::new(3)), legs.into()),
         make_test_block(BlockHeight::new(4)),
     ];
     for block in chain {

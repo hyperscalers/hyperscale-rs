@@ -425,7 +425,7 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     admit_all::<FinalizationsSection>(
         ctx,
         &mut finalizations,
-        block.certificates().iter().map(unwrapped),
+        block.certificates().iter().map(Verifiable::as_unverified),
     )?;
     let mut records = RecordsFold::after(&finalizations);
     admit_all::<RecordsSection<'_>>(ctx, &mut records, block.abandonment_records())?;
@@ -911,9 +911,9 @@ pub mod tests {
 
     /// `against` after a block at height 3 carrying `halves` commits.
     fn after_committing(mut against: Against, halves: &[&Finalization]) -> Against {
-        let certificates: Vec<Arc<Verifiable<Finalization>>> = halves
+        let certificates: Vec<Verifiable<Finalization>> = halves
             .iter()
-            .map(|fw| Arc::new(Verifiable::from((*fw).clone())))
+            .map(|fw| Verifiable::from((*fw).clone()))
             .collect();
         against.members.advance(&MemberInputs::deriving(
             ShardId::ROOT,
@@ -1185,14 +1185,14 @@ pub mod tests {
             TxHash::from(Hash::from_bytes(b"an accepted core")),
             TxHash::from(Hash::from_bytes(b"a refused core")),
         );
-        let stating = Arc::new(stating_at(
+        let stating = stating_at(
             2,
             vec![
                 core_outcome(accepted, succeeded(), 30),
                 core_outcome(refused, ExecutionOutcome::Failed, 12),
             ],
-        ));
-        let legs = Arc::new(legs_naming(&[accepted]));
+        );
+        let legs = legs_naming(&[accepted]);
         assert_eq!(legs.tx_hashes().collect::<Vec<_>>(), [accepted]);
         let fees_after = |blocks: &[&Block]| {
             blocks
@@ -1203,8 +1203,7 @@ pub mod tests {
                 )
                 .cumulative_fees
         };
-        let stating_block =
-            block_with_certificates(BlockHeight::new(3), vec![Arc::clone(&stating)]);
+        let stating_block = block_with_certificates(BlockHeight::new(3), vec![stating.clone()]);
         let legs_block = block_with_certificates(BlockHeight::new(4), vec![legs]);
         assert_eq!(
             stating_block.charged(),
@@ -1228,10 +1227,10 @@ pub mod tests {
         let row = &stated.members.members[&accepted];
         assert!(matches!(row.state, RowState::Stated { .. }));
         assert_eq!(row.share, 0, "the stating half counted it");
-        let aborting = Arc::new(stating_at(
+        let aborting = stating_at(
             9,
             vec![core_outcome(accepted, ExecutionOutcome::Aborted, row.share)],
-        ));
+        );
         let abort_block = block_with_certificates(BlockHeight::new(5), vec![aborting]);
         assert_eq!(abort_block.charged(), 0);
         assert_eq!(
@@ -3771,7 +3770,7 @@ pub mod tests {
                 .charging(charged),
             ],
         );
-        let block = block_with_certificates(BlockHeight::new(1), vec![Arc::new(aborted)]);
+        let block = block_with_certificates(BlockHeight::new(1), vec![aborted]);
         assert_eq!(
             block.charged(),
             charged * 2,
@@ -3853,11 +3852,9 @@ pub mod tests {
     // validate_no_duplicate_certificates
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn block_with_certificates(height: BlockHeight, certificates: Vec<Arc<Finalization>>) -> Block {
-        let wrapped: Vec<Arc<Verifiable<Finalization>>> = certificates
-            .into_iter()
-            .map(|fw| Arc::new((*fw).clone().into()))
-            .collect();
+    fn block_with_certificates(height: BlockHeight, certificates: Vec<Finalization>) -> Block {
+        let wrapped: Vec<Verifiable<Finalization>> =
+            certificates.into_iter().map(Verifiable::from).collect();
         Block::Live {
             header: header_at_height(height, 100_000),
             transactions: Arc::new(Capped::empty()),
@@ -3871,24 +3868,24 @@ pub mod tests {
         }
     }
 
-    fn finalization_at(height: u64) -> Arc<Finalization> {
-        Arc::new(make_finalization(
+    fn finalization_at(height: u64) -> Finalization {
+        make_finalization(
             BlockHeight::new(height),
             TxHash::from(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
             )),
             TransactionDecision::Accept,
-        ))
+        )
     }
 
     /// A finalization over `tx_hash`, on a tick distinct from any other
     /// built at the same height — the shape a second verdict takes.
-    fn finalization_over(height: u64, tx_hash: TxHash) -> Arc<Finalization> {
-        Arc::new(make_finalization(
+    fn finalization_over(height: u64, tx_hash: TxHash) -> Finalization {
+        make_finalization(
             BlockHeight::new(height),
             tx_hash,
             TransactionDecision::Aborted,
-        ))
+        )
     }
 
     /// The shard [`after_departures`] admits as, whose ticks its blocks
@@ -3898,25 +3895,25 @@ pub mod tests {
     }
 
     /// [`finalization_at`] for a tick of [`survivor`].
-    fn survivor_finalization_at(height: u64) -> Arc<Finalization> {
-        Arc::new(make_finalization_on(
+    fn survivor_finalization_at(height: u64) -> Finalization {
+        make_finalization_on(
             survivor(),
             BlockHeight::new(height),
             TxHash::from(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
             )),
             TransactionDecision::Accept,
-        ))
+        )
     }
 
     /// [`finalization_over`] for a tick of [`survivor`].
-    fn survivor_finalization_over(height: u64, tx_hash: TxHash) -> Arc<Finalization> {
-        Arc::new(make_finalization_on(
+    fn survivor_finalization_over(height: u64, tx_hash: TxHash) -> Finalization {
+        make_finalization_on(
             survivor(),
             BlockHeight::new(height),
             tx_hash,
             TransactionDecision::Aborted,
-        ))
+        )
     }
 
     fn no_resolutions(block: &Block, dedup_index: CommitDedupIndex) -> Result<(), String> {
@@ -3944,10 +3941,9 @@ pub mod tests {
     #[test]
     fn validate_no_duplicate_resolutions_rejects_retention_dup() {
         let fw = survivor_finalization_at(1);
-        let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
+        let block = block_with_certificates(BlockHeight::new(6), vec![fw.clone()]);
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index
-            .register_committed_certs(&[Arc::new((*fw).clone().into())], WeightedTimestamp::ZERO);
+        dedup_index.register_committed_certs(&[fw.into()], WeightedTimestamp::ZERO);
         let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
@@ -3960,16 +3956,15 @@ pub mod tests {
     /// — it resolves none — so identity is the only thing that can.
     #[test]
     fn a_committed_certificate_deciding_nothing_cannot_ride_a_second_block() {
-        let fw = Arc::new(make_leg_finalization_on(
+        let fw = make_leg_finalization_on(
             survivor(),
             BlockHeight::new(1),
             TxHash::from(Hash::from_bytes(b"retired")),
-        ));
+        );
         assert_eq!(fw.deciding_tx_hashes().count(), 0);
-        let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
+        let block = block_with_certificates(BlockHeight::new(6), vec![fw.clone()]);
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index
-            .register_committed_certs(&[Arc::new((*fw).clone().into())], WeightedTimestamp::ZERO);
+        dedup_index.register_committed_certs(&[fw.into()], WeightedTimestamp::ZERO);
         let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
@@ -3989,10 +3984,7 @@ pub mod tests {
             .next()
             .expect("a tick names its members");
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(
-            &[Arc::new((*settled).clone().into())],
-            WeightedTimestamp::ZERO,
-        );
+        dedup_index.register_committed_certs(&[settled.clone().into()], WeightedTimestamp::ZERO);
 
         let abandoned = survivor_finalization_over(9, tx_hash);
         assert_ne!(abandoned.tick_id(), settled.tick_id());
@@ -4018,10 +4010,7 @@ pub mod tests {
             .next()
             .expect("a tick names its members");
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(
-            &[Arc::new((*settled).clone().into())],
-            WeightedTimestamp::ZERO,
-        );
+        dedup_index.register_committed_certs(&[settled.into()], WeightedTimestamp::ZERO);
 
         let block = block_with_verdicts(
             vec![AbandonmentRecord::new(
@@ -4050,7 +4039,7 @@ pub mod tests {
         let block = Block::Live {
             header: header_at_height(BlockHeight::new(6), 100_000),
             transactions: Arc::new(Capped::empty()),
-            certificates: Arc::new(Capped::from_array([Arc::new((*settled).clone().into())])),
+            certificates: Arc::new(Capped::from_array([settled.into()])),
             provisions: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
@@ -4166,12 +4155,12 @@ pub mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             );
-            Arc::new(Verifiable::from(Finalization::new(
+            Verifiable::from(Finalization::new(
                 tick_id,
                 half,
                 Some(ec),
                 Capped::new(receipts).expect("a list written out in a test"),
-            )))
+            ))
         };
         let certificates: Vec<_> = determined
             .iter()
@@ -4352,17 +4341,17 @@ pub mod tests {
     fn a_later_write_is_not_erased_by_an_earlier_determined_half() {
         let cell = state_key(7, 1);
         let stating = |value: u8| make_state_writes(7, 1, vec![value]);
-        let earlier = Arc::new(test_utils::make_finalization_leaving(
+        let earlier = test_utils::make_finalization_leaving(
             BlockHeight::new(4),
             TxHash::from(Hash::from_bytes(b"earlier writer")),
             stating(4),
-        ));
+        );
         let member = TxHash::from(Hash::from_bytes(b"later writer"));
-        let later = Arc::new(legs_leaving(5, member, stating(5)));
-        let carrying = |halves: &[&Arc<Finalization>]| {
+        let later = legs_leaving(5, member, stating(5));
+        let carrying = |halves: &[&Finalization]| {
             block_with_certificates(
                 BlockHeight::new(1),
-                halves.iter().copied().map(Arc::clone).collect(),
+                halves.iter().copied().cloned().collect(),
             )
         };
 
@@ -4435,7 +4424,7 @@ pub mod tests {
         let offered = |determined: &[u64], legs: &[u64]| {
             block_settling(determined, legs).certificates().to_vec()
         };
-        let halves = |selected: &[Arc<Verifiable<Finalization>>]| -> Vec<(u64, bool)> {
+        let halves = |selected: &[Verifiable<Finalization>]| -> Vec<(u64, bool)> {
             selected
                 .iter()
                 .map(|fw| (fw.tick_id().block_height().inner(), fw.is_determined()))
@@ -4451,8 +4440,12 @@ pub mod tests {
         assert_eq!(halves(&selected), [(4, true), (4, false), (6, true)]);
         let mut voter = FinalizationsFold::from(&ctx);
         assert!(
-            admit_all::<FinalizationsSection>(&ctx, &mut voter, selected.iter().map(unwrapped))
-                .is_ok()
+            admit_all::<FinalizationsSection>(
+                &ctx,
+                &mut voter,
+                selected.iter().map(Verifiable::as_unverified),
+            )
+            .is_ok()
         );
 
         // A voter owing a tick the proposer's rows did not name refuses
@@ -4467,8 +4460,12 @@ pub mod tests {
         assert_eq!(halves(&selected), [(5, false)]);
         let mut voter = FinalizationsFold::from(&ctx);
         assert!(
-            admit_all::<FinalizationsSection>(&ctx, &mut voter, selected.iter().map(unwrapped))
-                .is_err()
+            admit_all::<FinalizationsSection>(
+                &ctx,
+                &mut voter,
+                selected.iter().map(Verifiable::as_unverified),
+            )
+            .is_err()
         );
     }
 
@@ -4610,7 +4607,7 @@ pub mod tests {
         let carrying = |kept: &[TxHash]| {
             block_with_certificates(
                 BlockHeight::new(3),
-                vec![Arc::new(determined_projected(outcomes(), kept))],
+                vec![determined_projected(outcomes(), kept)],
             )
         };
         let against = holding_alone(&[first, second]);

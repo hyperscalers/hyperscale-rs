@@ -788,13 +788,7 @@ mod tests {
     /// Returns the tick plus its local receipts and certificates section
     /// roots so the caller can construct a self-consistent
     /// header.
-    fn make_tick(
-        success: bool,
-    ) -> (
-        Arc<Verifiable<Finalization>>,
-        LocalReceiptRoot,
-        CertificateRoot,
-    ) {
+    fn make_tick(success: bool) -> (Verifiable<Finalization>, LocalReceiptRoot, CertificateRoot) {
         let tx_hash = TxHash::from(Hash::from_bytes(b"tx"));
         let tick_id = TickId::new(ShardId::ROOT, HEIGHT);
         let outcome = TxOutcome::new(
@@ -828,15 +822,13 @@ mod tests {
                 ConsensusReceipt::Failed
             }),
         };
-        let fw = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([receipt.clone()]),
-            )
-            .into(),
-        );
+        let fw: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([receipt.clone()]),
+        )
+        .into();
         let lrr = Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner();
         let cr = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         (fw, lrr, cr)
@@ -1464,15 +1456,13 @@ mod tests {
             // ConsensusReceipt::Failed but EC said Succeeded — mismatch test.
             consensus: Arc::new(ConsensusReceipt::Failed),
         };
-        let fw = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([receipt.clone()]),
-            )
-            .into(),
-        );
+        let fw: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([receipt.clone()]),
+        )
+        .into();
         let h = header_with(
             &header(),
             &SectionRoots {

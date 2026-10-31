@@ -287,7 +287,7 @@ impl PendingBlocks {
         manifest: BlockManifest,
         now: LocalTimestamp,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
+        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Verifiable<Finalization>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     ) {
         let mut pending = PendingBlock::from_manifest(header, manifest, now);
@@ -304,7 +304,7 @@ impl PendingBlocks {
             pending.add_transaction(tx);
         }
 
-        let finalizations: Vec<Arc<Verifiable<Finalization>>> = pending
+        let finalizations: Vec<Verifiable<Finalization>> = pending
             .manifest()
             .cert_ids()
             .iter()
@@ -385,12 +385,12 @@ impl PendingBlocks {
 
     /// Record an arrived finalization against any pending block that needs
     /// it. Returns the hashes of blocks that became complete as a result.
-    pub fn receive_finalization(&mut self, fw: &Arc<Verifiable<Finalization>>) -> Vec<BlockHash> {
+    pub fn receive_finalization(&mut self, fw: &Verifiable<Finalization>) -> Vec<BlockHash> {
         let hash = fw.receipt_hash();
         self.fold_arrival(
             |pending| pending.needs_finalization(&hash),
             |pending| {
-                pending.add_finalization(Arc::clone(fw));
+                pending.add_finalization(fw.clone());
             },
         )
     }
@@ -521,7 +521,7 @@ pub struct PendingBlock {
     ///
     /// A block is complete once every finalization its manifest names has
     /// been independently finalized by this validator or fetched.
-    received_finalizations: BTreeMap<FinalizationHash, Arc<Verifiable<Finalization>>>,
+    received_finalizations: BTreeMap<FinalizationHash, Verifiable<Finalization>>,
 
     /// Identities we're still waiting for.
     missing_finalization_hashes: BTreeSet<FinalizationHash>,
@@ -604,7 +604,7 @@ impl PendingBlock {
     /// exactly or every replica rejects the broadcast.
     pub fn from_complete_block(
         block: &Block,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
         provisions: Vec<Verifiable<Provisions>>,
         created_at: LocalTimestamp,
     ) -> Self {
@@ -678,7 +678,7 @@ impl PendingBlock {
     ///
     /// Returns true if it was needed, false if duplicate or not in this
     /// block.
-    pub fn add_finalization(&mut self, fw: Arc<Verifiable<Finalization>>) -> bool {
+    pub fn add_finalization(&mut self, fw: Verifiable<Finalization>) -> bool {
         let hash = fw.receipt_hash();
         if self.missing_finalization_hashes.remove(&hash) {
             self.received_finalizations.insert(hash, fw);
@@ -780,7 +780,7 @@ impl PendingBlock {
     }
 
     /// Get all received finalizations.
-    pub fn finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
+    pub fn finalizations(&self) -> Vec<Verifiable<Finalization>> {
         self.received_finalizations.values().cloned().collect()
     }
 
@@ -809,10 +809,10 @@ impl PendingBlock {
             .collect();
 
         // Pass finalizations into the block in manifest order. The
-        // upstream-verified marker on each `Arc<Verifiable<Finalization>>`
+        // upstream-verified marker on each `Verifiable<Finalization>`
         // rides through unchanged so downstream consumers (apply phase,
         // verification pipeline) can peek `.verified()` and short-circuit.
-        let certificates: Vec<Arc<Verifiable<Finalization>>> = self
+        let certificates: Vec<Verifiable<Finalization>> = self
             .manifest
             .cert_ids()
             .iter()
@@ -1079,15 +1079,13 @@ mod tests {
     fn test_add_finalization() {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
-        let fw: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::new_unchecked_for_test(Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                None,
-                Capped::from_array([]),
-            ))
-            .into(),
-        );
+        let fw: Verifiable<Finalization> = Verified::new_unchecked_for_test(Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            None,
+            Capped::from_array([]),
+        ))
+        .into();
 
         let mut pb = PendingBlock::from_manifest(
             header,
@@ -1113,15 +1111,13 @@ mod tests {
         let tx_hash = tx.hash();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
-        let fw: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::new_unchecked_for_test(Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                None,
-                Capped::from_array([]),
-            ))
-            .into(),
-        );
+        let fw: Verifiable<Finalization> = Verified::new_unchecked_for_test(Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            None,
+            Capped::from_array([]),
+        ))
+        .into();
 
         let mut pb = PendingBlock::from_manifest(
             header,
@@ -1147,14 +1143,9 @@ mod tests {
     #[test]
     fn test_from_complete_block_is_complete() {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let fw = Arc::new(Finalization::new(
-            tick_id,
-            TickHalf::Determined,
-            None,
-            Capped::from_array([]),
-        ));
-        let verified_fw = Arc::new(Verified::new_unchecked_for_test((*fw).clone()).into());
-        let wire_fw = Arc::new((*fw).clone().into());
+        let fw = Finalization::new(tick_id, TickHalf::Determined, None, Capped::from_array([]));
+        let verified_fw = Verified::new_unchecked_for_test(fw.clone()).into();
+        let wire_fw = fw.into();
 
         let block = Block::Live {
             header: make_header(BlockHeight::new(1)),

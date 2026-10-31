@@ -447,7 +447,7 @@ pub enum ProtocolEvent {
         /// Hash of the constructed block, cached for callers.
         block_hash: BlockHash,
         /// Finalizations included in the block (carry certs + receipts + ECs).
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
         /// Net substate byte total change from the build's JMT
         /// computation. Feeds the coordinator's count frontier for
         /// reshape-trigger derivation.
@@ -644,7 +644,7 @@ pub enum ProtocolEvent {
     FinalizationVerified {
         /// Verified tick on success; the raw tick plus the reason it
         /// failed otherwise.
-        result: Result<Arc<Verified<Finalization>>, (Arc<Finalization>, FinalizationVerifyError)>,
+        result: Result<Verified<Finalization>, (Finalization, FinalizationVerifyError)>,
     },
 
     /// A legs half was built from the yes receipts staged at a committed
@@ -680,7 +680,7 @@ pub enum ProtocolEvent {
         /// Finalizations returned by the peer. Wire-decoded entries
         /// land `Unverified`; a `Verifiable::Verified` entry
         /// short-circuits verify dispatch at the coordinator.
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
     },
 
     /// Finalizations were just admitted to the canonical execution store.
@@ -700,7 +700,7 @@ pub enum ProtocolEvent {
         /// entry is in the `Verifiable::Verified` variant by virtue of
         /// the typed gates the emitter went through (`finalize`'s
         /// `seal`, or `admit_finalization`'s `Verify::verify`).
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -815,7 +815,7 @@ pub struct MemberInputs {
 #[derive(Debug, Clone, Copy)]
 pub struct MemberSections<'a> {
     /// Its finalizations, each settling or stating members.
-    pub certificates: &'a [Arc<Verifiable<Finalization>>],
+    pub certificates: &'a [Verifiable<Finalization>],
     /// Its abandonment records, whose names cover the rows standing for
     /// them.
     pub records: &'a [AbandonmentRecord],

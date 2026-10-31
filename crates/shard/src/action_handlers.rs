@@ -248,7 +248,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
     transactions: &Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
-    certificates: Capped<Vec<Arc<Verifiable<Finalization>>>, MAX_FINALIZED_TX_PER_BLOCK>,
+    certificates: Capped<Vec<Verifiable<Finalization>>, MAX_FINALIZED_TX_PER_BLOCK>,
     local_shard: ShardId,
     chain_origin: WeightedTimestamp,
     topology_snapshot: &TopologySnapshot,
@@ -622,7 +622,7 @@ pub(crate) struct Naming<'a> {
     /// The committee the block is classified under.
     pub(crate) committee: &'a TopologySnapshot,
     /// The finalizations the block carries.
-    pub(crate) certificates: &'a [Arc<Verifiable<Finalization>>],
+    pub(crate) certificates: &'a [Verifiable<Finalization>],
     /// The boundary records the block carries.
     pub(crate) records: &'a [AbandonmentRecord],
     /// The state claims the block carries.
@@ -867,7 +867,7 @@ fn commit_windows_for(
     resolved
 }
 
-fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>], derivation: &dyn Derivation) {
+fn absorb_finalized_cells(ticks: &[Verifiable<Finalization>], derivation: &dyn Derivation) {
     let receipts: Vec<Arc<ConsensusReceipt>> = ticks
         .iter()
         .flat_map(|fw| fw.settling_receipts())
@@ -2123,7 +2123,7 @@ mod tests {
             let receipts = fw.settling_receipts();
             let leaves = derive_leaves(ShardId::ROOT, &snapshot, &receipts, &[], &sources);
             let offered = Offered::default();
-            absorb_finalized_cells(&[Arc::new(Verifiable::from(fw.clone()))], &offered);
+            absorb_finalized_cells(&[Verifiable::from(fw.clone())], &offered);
             let offered = offered
                 .0
                 .into_inner()

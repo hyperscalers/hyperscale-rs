@@ -1651,7 +1651,7 @@ pub(crate) mod fixtures {
     pub fn hold_settled(
         members: &mut MemberIndex,
         local: ShardId,
-        certificates: &[Arc<Verifiable<Finalization>>],
+        certificates: &[Verifiable<Finalization>],
     ) {
         for fw in certificates {
             let fw = fw.as_unverified();
@@ -1727,7 +1727,7 @@ pub(crate) mod fixtures {
     impl Against {
         /// This admission holding the rows [`hold_settled`] writes for
         /// `certificates`.
-        pub fn holding_settled(&mut self, certificates: &[Arc<Verifiable<Finalization>>]) {
+        pub fn holding_settled(&mut self, certificates: &[Verifiable<Finalization>]) {
             hold_settled(&mut self.members, self.local_shard, certificates);
         }
 

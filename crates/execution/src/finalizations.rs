@@ -31,7 +31,7 @@
 //! type system around shared mutability.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{PoisonError, RwLock};
 
 use hyperscale_types::{
     BloomFilter, DEFAULT_FPR, Finalization, FinalizationHash, TickHalf, TickId, TxHash, Verifiable,
@@ -46,7 +46,7 @@ type Slot = (TickId, FinalizationHash);
 /// under one lock so a reader can never observe a transaction indexed
 /// against a finalization the map has already dropped.
 struct Inner {
-    finalizations: BTreeMap<Slot, Arc<Verifiable<Finalization>>>,
+    finalizations: BTreeMap<Slot, Verifiable<Finalization>>,
     by_tx: HashMap<TxHash, Slot>,
     by_hash: HashMap<FinalizationHash, Slot>,
 }
@@ -93,13 +93,12 @@ impl FinalizationStore {
 
     /// Record a newly-finalization under its `TickId`. Callers wrap
     /// their upstream [`Verified<Finalization>`](hyperscale_types::Verified) into
-    /// `Verifiable::Verified` before insertion so the same `Arc` can be
-    /// shared with downstream `FinalizationsAdmitted` consumers without
-    /// re-cloning. The store enforces — by virtue of its `Verifiable`
+    /// `Verifiable::Verified` before insertion, sharing its body with the
+    /// downstream `FinalizationsAdmitted` consumers. The store enforces — by virtue of its `Verifiable`
     /// argument type and the typed gates the caller went through to
     /// produce it — that every value held here is in the
     /// `Verifiable::Verified` variant.
-    pub fn insert(&self, tick_id: TickId, fw: Arc<Verifiable<Finalization>>) {
+    pub fn insert(&self, tick_id: TickId, fw: Verifiable<Finalization>) {
         debug_assert!(
             fw.verified().is_some(),
             "FinalizationStore invariant: only Verifiable::Verified entries are admitted"
@@ -168,14 +167,14 @@ impl FinalizationStore {
 
     /// Every finalization of `tick_id` held.
     #[must_use]
-    pub(crate) fn of_tick(&self, tick_id: &TickId) -> Vec<Arc<Verifiable<Finalization>>> {
+    pub(crate) fn of_tick(&self, tick_id: &TickId) -> Vec<Verifiable<Finalization>> {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .finalizations
             .range((*tick_id, FinalizationHash::ZERO)..)
             .take_while(|((tick, _), _)| tick == tick_id)
-            .map(|(_, fw)| Arc::clone(fw))
+            .map(|(_, fw)| fw.clone())
             .collect()
     }
 
@@ -199,14 +198,14 @@ impl FinalizationStore {
     /// that half from a block able to carry both. Used by the proposer
     /// to include finalizations in the next block.
     #[must_use]
-    pub(crate) fn all(&self) -> Vec<Arc<Verifiable<Finalization>>> {
-        let mut all: Vec<Arc<Verifiable<Finalization>>> = self
+    pub(crate) fn all(&self) -> Vec<Verifiable<Finalization>> {
+        let mut all: Vec<Verifiable<Finalization>> = self
             .inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .finalizations
             .values()
-            .map(Arc::clone)
+            .cloned()
             .collect();
         all.sort_by_key(|fw| {
             let within = match fw.half() {
@@ -223,10 +222,10 @@ impl FinalizationStore {
     /// manifest names, so this is the primary ingress lookup for serving
     /// finalization data.
     #[must_use]
-    pub fn get(&self, hash: &FinalizationHash) -> Option<Arc<Verifiable<Finalization>>> {
+    pub fn get(&self, hash: &FinalizationHash) -> Option<Verifiable<Finalization>> {
         let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let slot = inner.by_hash.get(hash)?;
-        inner.finalizations.get(slot).map(Arc::clone)
+        inner.finalizations.get(slot).cloned()
     }
 
     /// Tick containing `tx_hash`, if any. Used to answer terminal-state
@@ -234,10 +233,10 @@ impl FinalizationStore {
     /// Returns `None` once the finalization has been removed — callers then fall
     /// back to persisted storage.
     #[must_use]
-    pub(crate) fn get_for_tx(&self, tx_hash: TxHash) -> Option<Arc<Verifiable<Finalization>>> {
+    pub(crate) fn get_for_tx(&self, tx_hash: TxHash) -> Option<Verifiable<Finalization>> {
         let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let slot = inner.by_tx.get(&tx_hash)?;
-        inner.finalizations.get(slot).map(Arc::clone)
+        inner.finalizations.get(slot).cloned()
     }
 
     /// Whether `tx_hash` is part of any currently-tracked finalization.
@@ -332,7 +331,7 @@ mod tests {
     fn make_finalization(
         block_height: u64,
         tx_hashes: &[TxHash],
-    ) -> (TickId, Arc<Verifiable<Finalization>>) {
+    ) -> (TickId, Verifiable<Finalization>) {
         make_half(block_height, tx_hashes, TickHalf::Determined)
     }
 
@@ -340,7 +339,7 @@ mod tests {
         block_height: u64,
         tx_hashes: &[TxHash],
         half: TickHalf,
-    ) -> (TickId, Arc<Verifiable<Finalization>>) {
+    ) -> (TickId, Verifiable<Finalization>) {
         let tick_id = make_tick_id(block_height);
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
@@ -369,7 +368,7 @@ mod tests {
             Some(ec),
             Capped::from_array([]),
         ));
-        let fw = Arc::new(verified.into());
+        let fw = verified.into();
         (tick_id, fw)
     }
 

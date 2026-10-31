@@ -7,8 +7,6 @@
 //! outbound batches this shard sent it: its outcomes go straight to the
 //! outbound provision tracker.
 
-use std::sync::Arc;
-
 use hyperscale_core::{Action, TickBatchOutcome};
 use hyperscale_types::{
     BlockHeight, ExecutionCertificate, Finalization, TopologySchedule, Verifiable,
@@ -69,7 +67,7 @@ impl ShardParticipation {
     pub(in crate::replica) fn on_finalizations_received(
         &mut self,
         sched: &TopologySchedule,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for tick in finalizations {

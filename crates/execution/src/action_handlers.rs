@@ -242,10 +242,7 @@ where
                 network: ctx.topology_snapshot.network(),
                 public_keys: public_keys.as_deref(),
             };
-            let result = Arc::unwrap_or_clone(finalization)
-                .upgrade(&fw_ctx)
-                .map(Arc::new)
-                .map_err(|(raw, err)| (Arc::new(raw), err));
+            let result = finalization.upgrade(&fw_ctx);
             ctx.notify_protocol(ProtocolEvent::FinalizationVerified { result });
         }
         Action::BuildLegsHalf {

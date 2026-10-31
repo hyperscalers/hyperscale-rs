@@ -207,7 +207,7 @@ impl CommitDedupIndex {
     /// every block.
     pub(crate) fn register_committed_certs(
         &mut self,
-        finalizations: &[Arc<Verifiable<Finalization>>],
+        finalizations: &[Verifiable<Finalization>],
         anchor: WeightedTimestamp,
     ) {
         for fw in finalizations {
@@ -467,17 +467,15 @@ mod tests {
         assert!(!index.contains_finalization(&receipt_expired, before));
     }
 
-    fn make_fw(height: u64) -> Arc<Verifiable<Finalization>> {
-        Arc::new(
-            make_finalization(
-                BlockHeight::new(height),
-                TxHash::from(Hash::from_bytes(
-                    &[u8::try_from(height).unwrap_or(u8::MAX); 32],
-                )),
-                TransactionDecision::Accept,
-            )
-            .into(),
+    fn make_fw(height: u64) -> Verifiable<Finalization> {
+        make_finalization(
+            BlockHeight::new(height),
+            TxHash::from(Hash::from_bytes(
+                &[u8::try_from(height).unwrap_or(u8::MAX); 32],
+            )),
+            TransactionDecision::Accept,
         )
+        .into()
     }
 
     fn make_provisions(seed: u8) -> Provisions {
@@ -801,10 +799,7 @@ mod tests {
         let tx_hash = TxHash::from(Hash::from_bytes(b"leg"));
         let mut index = CommitDedupIndex::new();
         index.register_committed_certs(
-            &[Arc::new(Verifiable::from(make_leg_finalization(
-                BlockHeight::new(1),
-                tx_hash,
-            )))],
+            &[(Verifiable::from(make_leg_finalization(BlockHeight::new(1), tx_hash)))],
             WeightedTimestamp::ZERO,
         );
         assert!(
@@ -813,7 +808,7 @@ mod tests {
         );
 
         index.register_committed_certs(
-            &[Arc::new(Verifiable::from(make_finalization(
+            &[(Verifiable::from(make_finalization(
                 BlockHeight::new(5),
                 tx_hash,
                 TransactionDecision::Accept,

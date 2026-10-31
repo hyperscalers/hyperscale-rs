@@ -314,7 +314,7 @@ mod tests {
                 0,
                 ValidatorId::new(0),
                 Vec::new(),
-                vec![Arc::new(Verifiable::from(half))],
+                vec![Verifiable::from(half)],
             ))
         };
         let block = carrying(vec![yes_receipt, refusal_receipt.clone()]);
@@ -344,7 +344,7 @@ mod tests {
             0,
             ValidatorId::new(0),
             Vec::new(),
-            vec![Arc::new(Verifiable::from(rebuilt))],
+            vec![Verifiable::from(rebuilt)],
         ));
         assert_eq!(
             SectionRoots::of(&resealed).root(),

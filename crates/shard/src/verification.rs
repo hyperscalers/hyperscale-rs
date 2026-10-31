@@ -988,7 +988,7 @@ impl VerificationPipeline {
                 return Vec::new();
             }
         };
-        let finalizations: Vec<Arc<Verifiable<Finalization>>> =
+        let finalizations: Vec<Verifiable<Finalization>> =
             block.certificates().iter().cloned().collect();
         debug!(
             ?block_hash,
@@ -1657,7 +1657,7 @@ impl VerificationPipeline {
         let frontier = block
             .certificates()
             .iter()
-            .map(|fw| fw.as_unverified())
+            .map(Verifiable::as_unverified)
             .filter(|fw| fw.is_determined())
             .map(|fw| fw.tick_id().block_height())
             .max()
@@ -1748,7 +1748,7 @@ impl VerificationPipeline {
             None
         })?;
         let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
-        let finalizations: Vec<Arc<Verifiable<Finalization>>> =
+        let finalizations: Vec<Verifiable<Finalization>> =
             block.certificates().iter().cloned().collect();
         let creations = committed_here(
             block.header().shard_id(),
@@ -2143,14 +2143,12 @@ mod tests {
         let leg = test_transaction(4).hash();
         let settled = test_transaction(5).hash();
         let height = BlockHeight::new(3);
-        let certificates: Vec<Arc<Verifiable<Finalization>>> = vec![
-            Arc::new(make_finalization(height, alone, TransactionDecision::Accept).into()),
-            Arc::new(
-                make_finalization_awaiting(height, with_sibling, [ShardId::leaf(1, 1)]).into(),
-            ),
-            Arc::new(make_finalization(height, refused, TransactionDecision::Reject).into()),
-            Arc::new(make_leg_finalization(height, leg).into()),
-            Arc::new(make_settling_finalization(height, settled).into()),
+        let certificates: Vec<Verifiable<Finalization>> = vec![
+            make_finalization(height, alone, TransactionDecision::Accept).into(),
+            make_finalization_awaiting(height, with_sibling, [ShardId::leaf(1, 1)]).into(),
+            make_finalization(height, refused, TransactionDecision::Reject).into(),
+            make_leg_finalization(height, leg).into(),
+            make_settling_finalization(height, settled).into(),
         ];
         let block = Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
@@ -2251,12 +2249,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             );
-            Arc::new(Verifiable::from(Finalization::new(
-                tick_id,
-                half,
-                Some(ec),
-                Capped::empty(),
-            )))
+            Verifiable::from(Finalization::new(tick_id, half, Some(ec), Capped::empty()))
         };
         let certificates: Vec<_> = determined
             .iter()

@@ -100,7 +100,7 @@ pub struct StateRootCheck {
     pub expected_root: StateRoot,
     /// Finalizations whose receipts the state root covers. The thread
     /// pool merges the receipts' writes from these.
-    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    pub finalizations: Vec<Verifiable<Finalization>>,
     /// The committed markers the block writes, derived by the
     /// coordinator from its transactions and the chain's origin. They
     /// fold with the receipts' writes under the root being verified,
@@ -733,7 +733,7 @@ pub enum Action {
         /// The finalization whose certificate needs signature
         /// verification before admission. A `Verifiable::Verified`
         /// wrapper short-circuits verification.
-        finalization: Arc<Verifiable<Finalization>>,
+        finalization: Verifiable<Finalization>,
         /// The committee of its certificate, in committee order; `None`
         /// for a legs half, which carries none.
         public_keys: Option<Vec<ConsensusPublicKey>>,
@@ -899,7 +899,7 @@ pub enum Action {
         thresholds: ReshapeThresholds,
         /// Finalizations whose receipts contribute receipt-sourced
         /// witness events.
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
         /// Topology snapshot for `proposer_for` lookups in the
         /// missed-round walk.
         topology_snapshot: TopologySnapshot,
@@ -1007,7 +1007,7 @@ pub enum Action {
         /// Transactions to include in the proposal.
         transactions: Vec<Arc<Verified<Transaction>>>,
         /// Finalizations to include in the block (carries certs + receipts + ECs).
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
         /// Provisions from remote shards, included in this block.
         provisions: Vec<Verifiable<Provisions>>,
         /// What departed shards left unresolved of this chain's business

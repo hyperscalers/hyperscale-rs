@@ -231,7 +231,7 @@ where
         pending.parent_block_height,
     );
 
-    let finalizations: Vec<Arc<Verifiable<Finalization>>> = block.certificates().to_vec();
+    let finalizations: Vec<Verifiable<Finalization>> = block.certificates().to_vec();
     // The view is freshly anchored — nothing has read through it, so
     // there is no execution cache to carry.
     let anchored = view.snapshot();
@@ -2444,7 +2444,7 @@ mod tests {
         swept_from: SweepFrontier,
         swept_to: SweepFrontier,
         removals: &[SubstateKey],
-        certificates: &[Arc<Verifiable<Finalization>>],
+        certificates: &[Verifiable<Finalization>],
     ) -> Result<QcOnlyPrep, Box<QcOnlyDivergence>> {
         let windows = EpochWindows::new(0, 1_000_000);
         let store = Arc::new(storage.clone());
@@ -2712,7 +2712,7 @@ mod tests {
             }
             writes
         };
-        let settling = Arc::new(Verifiable::from(Finalization::new(
+        let settling = Verifiable::from(Finalization::new(
             TickId::new(ShardId::ROOT, BlockHeight::new(1)),
             TickHalf::Determined,
             None,
@@ -2725,7 +2725,7 @@ mod tests {
                     events: Capped::empty(),
                 }),
             )]),
-        )));
+        ));
         let swept_to =
             SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS));
         assert_eq!(

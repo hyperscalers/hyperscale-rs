@@ -50,7 +50,7 @@ pub struct AtParent<'a> {
     pub transactions: &'a SharedTransactions,
     /// The block's finalizations, whose settling receipts a record it
     /// takes back is returned beside.
-    pub finalizations: &'a [Arc<Verifiable<Finalization>>],
+    pub finalizations: &'a [Verifiable<Finalization>],
 }
 
 /// Why the parent state refuses a block.
@@ -714,7 +714,7 @@ mod tests {
         fence: ReadFence,
         state_claims: Vec<StateClaim>,
         transactions: SharedTransactions,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
     }
 
     impl Block {

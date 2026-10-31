@@ -255,7 +255,7 @@ mod tests {
         TxHash::from(Hash::from_bytes(&height.to_le_bytes()))
     }
 
-    fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
+    fn finalization(height: u64) -> Verifiable<Finalization> {
         // A leg that ran: the settled set names only what reaches beyond
         // this shard, so a single-shard fixture would be filtered out
         // before the merkle root.
@@ -277,7 +277,7 @@ mod tests {
                 SignerBitfield::new(4),
             )
         };
-        Arc::new(Verifiable::from(Finalization::new(
+        Verifiable::from(Finalization::new(
             tick,
             TickHalf::Determined,
             Some(certificate(tick)),
@@ -290,7 +290,7 @@ mod tests {
                     events: Capped::empty(),
                 }),
             )]),
-        )))
+        ))
     }
 
     fn commit_block(
@@ -298,7 +298,7 @@ mod tests {
         height: u64,
         parent: BlockHash,
         pred_wt: u64,
-        certs: &[Arc<Verifiable<Finalization>>],
+        certs: &[Verifiable<Finalization>],
     ) -> BlockHash {
         let parent_qc = QuorumCertificate::new(
             parent,

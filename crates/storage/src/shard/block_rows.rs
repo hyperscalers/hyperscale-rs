@@ -184,13 +184,13 @@ pub fn reconstruct_block(
         });
     }
 
-    let certificates: Vec<Arc<Verifiable<Finalization>>> = attestations
+    let certificates: Vec<Verifiable<Finalization>> = attestations
         .into_iter()
         .map(|attestation| {
             Finalization::reconstruct(attestation, |tx_hash, receipt_hash| {
                 rows.consensus_receipt(tx_hash, receipt_hash)
             })
-            .map(|finalization| Arc::new(finalization.into()))
+            .map(Verifiable::from)
         })
         .collect::<Option<_>>()
         .ok_or(Unbuilt::MissingReceipt)?;

@@ -1613,7 +1613,7 @@ mod tests {
             1_234_567_890,
             ValidatorId::new(0),
             vec![Arc::new(tx)],
-            vec![Arc::new(fw.into())],
+            vec![fw.into()],
         );
         certify(block, height.inner() * TEST_BLOCK_INTERVAL_MS)
     }

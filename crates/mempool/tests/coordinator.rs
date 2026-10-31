@@ -185,7 +185,7 @@ fn on_block_committed_with_finalization_tombstones_and_evicts() {
         1_000,
         ValidatorId::new(0),
         vec![Arc::new(tx.clone())],
-        vec![Arc::new(fw.into())],
+        vec![fw.into()],
     );
     coord.on_block_committed(&topology_snapshot, &certify(block, 1_000));
     coord.on_resolutions(&[(tx_hash, TxResolution::Decided(TransactionDecision::Accept))]);

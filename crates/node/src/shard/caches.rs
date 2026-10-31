@@ -36,7 +36,7 @@ pub struct SharedCaches {
     /// Finalizations, keyed by `FinalizationHash`. Populated by the loop's
     /// `Continuation(FinalizationsAdmitted)` interception; queried by the
     /// inbound finalization handler.
-    pub(crate) finalization: Arc<BoundedCache<FinalizationHash, Arc<Verifiable<Finalization>>>>,
+    pub(crate) finalization: Arc<BoundedCache<FinalizationHash, Verifiable<Finalization>>>,
     /// Outbound + local provision store, owned by the
     /// [`ProvisionCoordinator`]. Cloned here so handlers (block, block-topup,
     /// local-provision, cross-shard provision) can read it without going

@@ -89,10 +89,8 @@ type ElidedTransactions =
     Capped<Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>, MAX_TXS_PER_BLOCK>;
 
 /// One row per finalization, on the same terms as [`ElidedTransactions`].
-type ElidedCertificates = Capped<
-    Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)>,
-    MAX_FINALIZED_TX_PER_BLOCK,
->;
+type ElidedCertificates =
+    Capped<Vec<(FinalizationHash, Option<Verifiable<Finalization>>)>, MAX_FINALIZED_TX_PER_BLOCK>;
 
 /// One row per provision, on the same terms as [`ElidedTransactions`].
 pub type ElidedProvisionBodies =
@@ -185,7 +183,7 @@ impl ElidedCertifiedBlock {
 
     /// Per-certificate `(tick id, optional body)` pairs; body is `None` when elided.
     #[must_use]
-    pub fn certificates(&self) -> &Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)> {
+    pub fn certificates(&self) -> &Vec<(FinalizationHash, Option<Verifiable<Finalization>>)> {
         &self.certificates
     }
 
@@ -232,7 +230,7 @@ impl ElidedCertifiedBlock {
             let body = if finalization_is_held(inventory.cert_have.as_ref(), fw) {
                 None
             } else {
-                Some(Arc::clone(fw))
+                Some(fw.clone())
             };
             (id, body)
         });
@@ -348,7 +346,7 @@ impl ElidedCertifiedBlock {
     ) -> Result<CertifiedBlock, RehydrateError>
     where
         FTx: FnMut(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        FCert: FnMut(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
+        FCert: FnMut(&FinalizationHash) -> Option<Verifiable<Finalization>>,
         FProv: FnMut(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     {
         // Header + QC are always inline, so the pairing can be checked
@@ -609,7 +607,7 @@ mod tests {
         Block::Live {
             header,
             transactions,
-            certificates: Arc::new(Capped::from_array([Arc::new(fw)])),
+            certificates: Arc::new(Capped::from_array([fw])),
             provisions,
             abandonment_records,
             state_claims,
@@ -1054,7 +1052,7 @@ mod tests {
             &hbor_to_vec(&Vec::<(TxHash, Option<Arc<Transaction>>)>::new()).unwrap(),
         );
         buf.extend_from_slice(
-            &hbor_to_vec(&Vec::<(FinalizationHash, Option<Arc<Finalization>>)>::new()).unwrap(),
+            &hbor_to_vec(&Vec::<(FinalizationHash, Option<Finalization>)>::new()).unwrap(),
         );
         // ElidedProvisions::Live(oversized) — discriminant 0, then the claim.
         buf.push(0);

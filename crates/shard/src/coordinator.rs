@@ -811,7 +811,7 @@ fn restored_pending_blocks(voted_blocks: &[Arc<Block>]) -> (PendingBlocks, Vec<B
         recovered_blocks.push(block.header().hash());
         let mut pending = PendingBlock::from_complete_block(
             block,
-            block.certificates().iter().map(Arc::clone).collect(),
+            block.certificates().to_vec(),
             block.provisions().to_vec(),
             LocalTimestamp::ZERO,
         );
@@ -4317,7 +4317,7 @@ impl ShardCoordinator {
         header: &BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
+        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Verifiable<Finalization>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provisions>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
@@ -6750,7 +6750,7 @@ impl ShardCoordinator {
         round: Round,
         block: &Block,
         block_hash: BlockHash,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
         provisions: Vec<Verifiable<Provisions>>,
         bytes_delta: i64,
         answers: AnswerDelta,
@@ -8320,18 +8320,18 @@ impl ShardCoordinator {
         // per-EC signature predicate via the source committee's signature over
         // the body root, so the ticks can be
         // admitted to the canonical store on receipt.
-        let synced_finalizations: Vec<Arc<Verifiable<Finalization>>> = block
+        let synced_finalizations: Vec<Verifiable<Finalization>> = block
             .certificates()
             .iter()
             .map(|fw| {
-                // Reuse a live marker when present (local dispatch) by keeping the
-                // existing `Arc`; otherwise mint via the committed-block gate.
+                // Reuse a live marker when present (local dispatch);
+                // otherwise mint via the committed-block gate.
                 if fw.is_verified() {
-                    Arc::clone(fw)
+                    fw.clone()
                 } else {
                     let verified =
                         Verified::<Finalization>::from_committed_block(fw.as_unverified().clone());
-                    Arc::new(verified.into())
+                    verified.into()
                 }
             })
             .collect();
@@ -9592,7 +9592,7 @@ impl ShardCoordinator {
     pub fn on_finalizations_admitted(
         &mut self,
         topology_schedule: &TopologySchedule,
-        ticks: &[Arc<Verifiable<Finalization>>],
+        ticks: &[Verifiable<Finalization>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for fw in ticks {
@@ -11451,10 +11451,7 @@ mod tests {
                 .iter()
                 .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.clone())))
                 .collect(),
-            finalizations: finalizations
-                .into_iter()
-                .map(|fw| Arc::new(Verifiable::from(fw)))
-                .collect(),
+            finalizations: finalizations.into_iter().map(Verifiable::from).collect(),
             provisions: Vec::new(),
             abandonment_records: Vec::new(),
             state_claims: Vec::new(),
@@ -11999,9 +11996,7 @@ mod tests {
                 &departed,
                 &frame,
                 Some(|_: &ProposalAsk<'_>| ProposalInputs {
-                    finalizations: vec![Arc::new(Verifiable::from(all_legs_beside_the_sibling(
-                        &pair,
-                    )))],
+                    finalizations: vec![Verifiable::from(all_legs_beside_the_sibling(&pair))],
                     ..ProposalInputs::default()
                 }),
             )
@@ -13065,10 +13060,7 @@ mod tests {
                     &schedule,
                     &frame,
                     Some(|_: &ProposalAsk<'_>| ProposalInputs {
-                        finalizations: finalizations
-                            .into_iter()
-                            .map(|fw| Arc::new(Verifiable::from(fw)))
-                            .collect(),
+                        finalizations: finalizations.into_iter().map(Verifiable::from).collect(),
                         verdict_claims: vec![claim.clone()],
                         ..ProposalInputs::default()
                     }),

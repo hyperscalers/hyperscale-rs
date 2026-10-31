@@ -8,8 +8,6 @@
 //! `FetchBinding` trait, and the [`ScopedAnswer`] and [`SolicitedAnswer`]
 //! response boundaries live in [`crate::fetch`].
 
-use std::sync::Arc;
-
 use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_hbor::Capped;
 use hyperscale_network::Network;
@@ -168,7 +166,7 @@ impl<S: ShardStorage> FetchedBy<ShardIo<S>> for FinalizationBinding {
 /// a pending block's re-ask does not fetch the parked copy again.
 impl SolicitedAnswer for FinalizationBinding {
     type Request = GetFinalizationsRequest;
-    type Item = Arc<Finalization>;
+    type Item = Finalization;
     type Input = ShardScopedInput;
 
     const SETTLES: Settles = Settles::OnVerdict;
@@ -179,22 +177,19 @@ impl SolicitedAnswer for FinalizationBinding {
         )
     }
 
-    fn items(response: GetFinalizationsResponse) -> Vec<Arc<Finalization>> {
+    fn items(response: GetFinalizationsResponse) -> Vec<Finalization> {
         response.finalizations.into_inner()
     }
 
     fn answers_for(
-        finalization: &Arc<Finalization>,
+        finalization: &Finalization,
     ) -> impl IntoIterator<Item = FinalizationHash> + use<> {
         [finalization.receipt_hash()]
     }
 
-    fn deliver(kept: Vec<Arc<Finalization>>) -> Vec<ShardScopedInput> {
-        // Refcount is 1 right after decode, so each unwrap moves.
-        let finalizations: Vec<Arc<Verifiable<Finalization>>> = kept
-            .into_iter()
-            .map(|arc| Arc::new(Arc::unwrap_or_clone(arc).into()))
-            .collect();
+    fn deliver(kept: Vec<Finalization>) -> Vec<ShardScopedInput> {
+        let finalizations: Vec<Verifiable<Finalization>> =
+            kept.into_iter().map(Verifiable::from).collect();
         vec![ShardScopedInput::Protocol(Box::new(
             ProtocolEvent::FinalizationsReceived { finalizations },
         ))]
@@ -621,9 +616,9 @@ mod settled_txs_tests {
 
     /// A finalization settling one leg that ran: what reaches beyond this
     /// shard, and so what puts it in the settled set.
-    fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
+    fn finalization(height: u64) -> Verifiable<Finalization> {
         let tick = TickId::new(SHARD, BlockHeight::new(height));
-        Arc::new(Verifiable::from(Finalization::new(
+        Verifiable::from(Finalization::new(
             tick,
             TickHalf::Determined,
             Some(certificate(tick, height)),
@@ -636,7 +631,7 @@ mod settled_txs_tests {
                     events: Capped::empty(),
                 }),
             )]),
-        )))
+        ))
     }
 
     /// Commit `count` blocks (1..=count), each carrying its own settled

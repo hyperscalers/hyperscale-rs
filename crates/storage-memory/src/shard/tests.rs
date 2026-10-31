@@ -677,10 +677,10 @@ fn dedup_window_records_only_what_a_finalization_decided() {
             events: Capped::empty(),
         }),
     );
-    let leg = Arc::new(Verifiable::from(
+    let leg = Verifiable::from(
         make_leg_finalization(BlockHeight::new(1), tx_hash)
             .with_receipts(Capped::from_array([receipt])),
-    ));
+    );
     let block = push_certificate(block_with_txs(BlockHeight::new(1), 1_000, vec![tx]), leg);
     commit_empty(&storage, &block);
 

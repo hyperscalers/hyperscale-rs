@@ -497,10 +497,7 @@ impl ExecutionSim {
             self.height.inner() * BLOCK_INTERVAL_MS,
             ValidatorId::new(0),
             txs.into_iter().map(Arc::new).collect(),
-            certificates
-                .into_iter()
-                .map(|fw| Arc::new(Verifiable::from(fw)))
-                .collect(),
+            certificates.into_iter().map(Verifiable::from).collect(),
         );
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
         let committee_anchor = self.committee_anchor();
@@ -872,7 +869,7 @@ impl ExecutionSim {
         let verified = Verified::new_unchecked_for_test(finalization);
         self.coord
             .finalization_store()
-            .insert(tick_id, Arc::new(Verifiable::from(verified)));
+            .insert(tick_id, Verifiable::from(verified));
     }
 
     /// The ticks a proposal would carry certificates for, in the order it

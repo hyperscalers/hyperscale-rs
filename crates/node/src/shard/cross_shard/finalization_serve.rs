@@ -1,7 +1,5 @@
 //! Inbound finalization fetch request handling.
 
-use std::sync::Arc;
-
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::cache::BoundedCache;
 use hyperscale_types::network::request::GetFinalizationsRequest;
@@ -18,12 +16,9 @@ use crate::serve::{Answer, encoded_len};
 /// whole. One half alone fits the frame, so the first is always
 /// answered and every request makes progress. What is cut is simply not
 /// answered, and the requester asks for it again.
-fn answer_of<const N: usize>(
-    asked: usize,
-    found: Vec<Arc<Finalization>>,
-) -> Answer<Arc<Finalization>, N> {
+fn answer_of<const N: usize>(asked: usize, found: Vec<Finalization>) -> Answer<Finalization, N> {
     let mut answer = Answer::of(asked).within(MAX_FETCH_RESPONSE_BYTES);
-    answer.offer_all(found, |fw| encoded_len(&**fw));
+    answer.offer_all(found, encoded_len);
     answer
 }
 
@@ -37,18 +32,18 @@ fn answer_of<const N: usize>(
 /// finalizations past the cache window must still get a complete answer from
 /// durable storage.
 ///
-/// The wire response carries raw `Arc<Finalization>` bodies — the
+/// The wire response carries raw `Finalization` bodies — the
 /// verification marker is process-local and doesn't cross the network.
 pub fn serve_finalizations_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
-    fw_cache: &BoundedCache<FinalizationHash, Arc<Verifiable<Finalization>>>,
+    fw_cache: &BoundedCache<FinalizationHash, Verifiable<Finalization>>,
     req: &GetFinalizationsRequest,
 ) -> GetFinalizationsResponse {
-    let mut found: Vec<Arc<Finalization>> = Vec::new();
+    let mut found: Vec<Finalization> = Vec::new();
     let mut missing: Vec<FinalizationHash> = Vec::new();
     for id in &req.finalization_hashes {
         if let Some(fw) = fw_cache.get(id) {
-            found.push(Arc::new(fw.as_unverified().clone()));
+            found.push(fw.as_unverified().clone());
         } else {
             missing.push(*id);
         }
@@ -62,8 +57,7 @@ pub fn serve_finalizations_request<S: ShardStorage>(
                     Finalization::reconstruct(cert, |tx_hash, receipt_hash| {
                         pending_chain.consensus_receipt(tx_hash, receipt_hash)
                     })
-                })
-                .map(Arc::new),
+                }),
         );
     }
 
@@ -73,6 +67,8 @@ pub fn serve_finalizations_request<S: ShardStorage>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, ConsensusReceipt, GlobalReceiptHash, Hash, LocalKey,
@@ -85,7 +81,7 @@ mod tests {
     /// A legs half of tick `height` whose members' receipts each write
     /// one cell at the value cap: about as heavy as a full tick's stating
     /// half.
-    fn heavy(height: u64) -> Arc<Finalization> {
+    fn heavy(height: u64) -> Finalization {
         let receipts: Vec<StoredReceipt> = (0..21u8)
             .map(|seed| {
                 let mut writes = StateWrites::default();
@@ -107,10 +103,10 @@ mod tests {
                 )
             })
             .collect();
-        Arc::new(Finalization::accepting(
+        Finalization::accepting(
             TickId::new(ShardId::ROOT, BlockHeight::new(height)),
             Capped::new(receipts).expect("a few receipts"),
-        ))
+        )
     }
 
     /// Two heavy halves do not fit one response: the budget answers the
@@ -119,7 +115,7 @@ mod tests {
     #[test]
     fn a_response_of_two_heavy_halves_is_cut_to_fit() {
         let found = vec![heavy(1), heavy(2)];
-        let size = |fw: &Arc<Finalization>| hbor_to_vec(&**fw).expect("encodes").len();
+        let size = |fw: &Finalization| hbor_to_vec(fw).expect("encodes").len();
         assert!(
             found.iter().map(size).sum::<usize>() > MAX_WIRE_MESSAGE_BYTES,
             "two heavy halves overrun the frame",

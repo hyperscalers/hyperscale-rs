@@ -1200,7 +1200,7 @@ impl Ledger {
     /// issued was taken or taken back. A leg that failed is the
     /// transaction's end on this shard — it issued nothing — and its own
     /// finalization releases it.
-    pub(crate) fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
+    pub(crate) fn release_resolved(&mut self, finalizations: &[Verifiable<Finalization>]) {
         for finalization in finalizations {
             let deciding: BTreeSet<TxHash> = finalization.deciding_tx_hashes().collect();
             for (tx_hash, decision) in finalization.tx_decisions() {
@@ -1715,7 +1715,7 @@ mod tests {
 
         let resolved =
             make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Accept);
-        ledger.release_resolved(&[Arc::new(Verifiable::from(resolved))]);
+        ledger.release_resolved(&[(Verifiable::from(resolved))]);
         assert_eq!(ledger.len(), 0);
     }
 
@@ -1730,7 +1730,7 @@ mod tests {
 
         let aborted =
             make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Aborted);
-        ledger.release_resolved(&[Arc::new(Verifiable::from(aborted))]);
+        ledger.release_resolved(&[(Verifiable::from(aborted))]);
         assert_eq!(ledger.len(), 0);
     }
 
@@ -2520,7 +2520,7 @@ mod tests {
             commit_as(&mut ledger, &tx, &issuing());
             ledger.certify(tx.hash(), Certified::ByExecution);
             let finalization = make_finalization(BlockHeight::new(1), tx.hash(), decision);
-            ledger.release_resolved(&[Arc::new(Verifiable::from(finalization))]);
+            ledger.release_resolved(&[(Verifiable::from(finalization))]);
             (ledger, tx)
         };
 
@@ -2576,7 +2576,7 @@ mod tests {
         ledger.certify(tx.hash(), Certified::ByExecution);
 
         let own = make_leg_finalization(BlockHeight::new(1), tx.hash());
-        ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
+        ledger.release_resolved(&[(Verifiable::from(own))]);
         assert_eq!(ledger.len(), 1, "the leg's finalization decides nothing");
 
         let past = ms(60_000)
@@ -2831,7 +2831,7 @@ mod tests {
         ledger.certify(tx.hash(), Certified::ByExecution);
 
         let own = make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Reject);
-        ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
+        ledger.release_resolved(&[(Verifiable::from(own))]);
         assert_eq!(ledger.len(), 0, "a failed leg's finalization decides it");
         assert!(
             ledger.owed.values().all(|owed| owed.part.kept().is_none()),
@@ -3101,7 +3101,7 @@ mod tests {
                             TransactionDecision::Reject
                         };
                         let resolved = make_finalization(BlockHeight::new(1), tx.hash(), decision);
-                        ledger.release_resolved(&[Arc::new(Verifiable::from(resolved))]);
+                        ledger.release_resolved(&[(Verifiable::from(resolved))]);
                     }
                     6 => {
                         ledger.record_abandonment_records(&[AbandonmentRecord::new(

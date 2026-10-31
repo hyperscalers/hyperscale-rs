@@ -825,7 +825,7 @@ struct ResponseWire {
     header: BlockHeader,
     qc: QuorumCertificate,
     transactions: Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>,
-    certificates: Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)>,
+    certificates: Vec<(FinalizationHash, Option<Verifiable<Finalization>>)>,
     provisions: ProvisionsWire,
     abandonment_records: Vec<AbandonmentRecord>,
     state_claims: Vec<StateClaim>,

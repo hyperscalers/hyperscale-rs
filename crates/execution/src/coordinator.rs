@@ -4323,10 +4323,10 @@ impl ExecutionCoordinator {
                 anchor = local.vote_anchor_ts().as_millis(),
                 "Re-anchoring a held finalization on a later certificate"
             );
-            let reanchored: Arc<Verifiable<Finalization>> =
-                Arc::new(Verified::<Finalization>::seal(reanchored).into());
+            let reanchored: Verifiable<Finalization> =
+                Verified::<Finalization>::seal(reanchored).into();
             self.finalized.remove(&held.receipt_hash());
-            self.finalized.insert(*tick_id, Arc::clone(&reanchored));
+            self.finalized.insert(*tick_id, reanchored.clone());
             finalizations.push(reanchored);
         }
         if finalizations.is_empty() {
@@ -4431,9 +4431,8 @@ impl ExecutionCoordinator {
             return Vec::new();
         };
         self.legs_offered.insert(tick, names);
-        let half: Arc<Verifiable<Finalization>> =
-            Arc::new(Verified::<Finalization>::seal(half).into());
-        self.finalized.insert(tick, Arc::clone(&half));
+        let half: Verifiable<Finalization> = Verified::<Finalization>::seal(half).into();
+        self.finalized.insert(tick, half.clone());
         vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
             finalizations: vec![half],
         })]
@@ -4456,13 +4455,12 @@ impl ExecutionCoordinator {
         let stating = tick.take_stating_finalization();
 
         // Local-finalization gate produces `Verified<Finalization>`; lift
-        // into the `Block::Live.certificates` transport shape once so the
-        // store, the admission event, and any downstream `PendingBlock`
-        // entry share the same `Arc` without further per-consumer cloning.
+        // into the `Block::Live.certificates` transport shape, whose
+        // clones the store, the admission event and any downstream
+        // `PendingBlock` entry share.
         let mut actions = Vec::new();
         for half in determined.into_iter().chain(stating) {
-            let finalized_arc = Arc::new(Verified::<Finalization>::seal(half).into());
-            actions.extend(self.emit_finalized(finalized_arc));
+            actions.extend(self.emit_finalized(Verified::<Finalization>::seal(half).into()));
         }
 
         if self
@@ -4484,11 +4482,11 @@ impl ExecutionCoordinator {
     /// Record a freshly built finalization and emit its admission event,
     /// which covers both the shard consensus subscriber and the `io_loop`
     /// serving cache.
-    fn emit_finalized(&self, finalized_arc: Arc<Verifiable<Finalization>>) -> Vec<Action> {
+    fn emit_finalized(&self, finalized: Verifiable<Finalization>) -> Vec<Action> {
         self.finalized
-            .insert(*finalized_arc.tick_id(), Arc::clone(&finalized_arc));
+            .insert(*finalized.tick_id(), finalized.clone());
         vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
-            finalizations: vec![finalized_arc],
+            finalizations: vec![finalized],
         })]
     }
 
@@ -4534,7 +4532,7 @@ impl ExecutionCoordinator {
     pub fn admit_finalization(
         &mut self,
         topology_schedule: &TopologySchedule,
-        tick: Arc<Verifiable<Finalization>>,
+        tick: Verifiable<Finalization>,
     ) -> Vec<Action> {
         // Already-finalized short-circuit — a second fetch arrival for a
         // finalization we've already admitted is wasted verification work.
@@ -4606,7 +4604,7 @@ impl ExecutionCoordinator {
     #[must_use]
     pub fn on_finalization_verified(
         &mut self,
-        result: Result<Arc<Verified<Finalization>>, (Arc<Finalization>, FinalizationVerifyError)>,
+        result: Result<Verified<Finalization>, (Finalization, FinalizationVerifyError)>,
     ) -> Vec<Action> {
         // Release the in-flight slot regardless of outcome — future
         // arrivals can dispatch again.
@@ -4629,12 +4627,8 @@ impl ExecutionCoordinator {
                 ]))];
             }
         };
-        // Lift the verification result into the `Block::Live.certificates`
-        // transport shape exactly once so the admission event and any
-        // downstream pending-block storage share the same `Arc`.
-        let tick = Arc::new((*tick).clone().into());
         vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
-            finalizations: vec![tick],
+            finalizations: vec![tick.into()],
         })]
     }
 
@@ -4677,16 +4671,13 @@ impl ExecutionCoordinator {
     /// Order is all this offers: which of them a block may carry is
     /// admission's, read off the committed rows.
     #[must_use]
-    pub fn get_finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
+    pub fn get_finalizations(&self) -> Vec<Verifiable<Finalization>> {
         self.finalized.all()
     }
 
-    /// Get a finalization by its identity (returns `Arc` for sharing).
+    /// Get a finalization by its identity.
     #[must_use]
-    pub fn get_finalization(
-        &self,
-        hash: &FinalizationHash,
-    ) -> Option<Arc<Verifiable<Finalization>>> {
+    pub fn get_finalization(&self, hash: &FinalizationHash) -> Option<Verifiable<Finalization>> {
         self.finalized.get(hash)
     }
 
@@ -4705,10 +4696,7 @@ impl ExecutionCoordinator {
     /// committed, ticks are persisted to storage and should be fetched
     /// from there.
     #[must_use]
-    pub fn get_finalization_for_tx(
-        &self,
-        tx_hash: TxHash,
-    ) -> Option<Arc<Verifiable<Finalization>>> {
+    pub fn get_finalization_for_tx(&self, tx_hash: TxHash) -> Option<Verifiable<Finalization>> {
         self.finalized.get_for_tx(tx_hash)
     }
 
@@ -7071,15 +7059,13 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
-        );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let _fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
@@ -7111,12 +7097,12 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let tick = Arc::new(Finalization::new(
+        let tick = Finalization::new(
             tick_id,
             TickHalf::Determined,
             Some(ec),
             Capped::from_array([]),
-        ));
+        );
         let fw_hash = tick.receipt_hash();
         let actions = state.on_finalization_verified(Err((
             tick,
@@ -7162,18 +7148,16 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
-        );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let fw_hash = tick.receipt_hash();
 
-        let actions = state.admit_finalization(&topo, Arc::clone(&tick));
+        let actions = state.admit_finalization(&topo, tick.clone());
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -7217,18 +7201,16 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
-        );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let fw_hash = tick.receipt_hash();
 
-        let actions = state.admit_finalization(&topo, Arc::clone(&tick));
+        let actions = state.admit_finalization(&topo, tick.clone());
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -7261,12 +7243,12 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let tick = Arc::new(Verified::new_unchecked_for_test(Finalization::new(
+        let tick = Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
             TickHalf::Determined,
             Some(ec),
             Capped::from_array([]),
-        )));
+        ));
         let actions = state.on_finalization_verified(Ok(tick));
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -8111,18 +8093,16 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
-        );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let _fw_hash = tick.receipt_hash();
 
-        let first = state.admit_finalization(&topo, Arc::clone(&tick));
+        let first = state.admit_finalization(&topo, tick.clone());
         assert_eq!(first.len(), 1);
         assert!(matches!(first[0], Action::VerifyFinalization { .. }));
 
@@ -8157,13 +8137,13 @@ mod tests {
             Capped::from_array([]),
         );
         let verifiable_finalization =
-            Arc::new(Verified::new_unchecked_for_test(raw_finalization.clone()).into());
+            Verified::new_unchecked_for_test(raw_finalization.clone()).into();
         // Seed the canonical store directly (mirrors what `finalize`
         // does on the local-aggregation path).
         state.finalized.insert(tick_id, verifiable_finalization);
 
         let receipt_hash = raw_finalization.receipt_hash();
-        let actions = state.admit_finalization(&topo, Arc::new(Verifiable::from(raw_finalization)));
+        let actions = state.admit_finalization(&topo, Verifiable::from(raw_finalization));
         assert!(
             matches!(
                 actions.as_slice(),
@@ -8193,15 +8173,13 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::empty(), // no signers — far below 2f+1
         );
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(bogus_ec),
-                Capped::from_array([]),
-            )
-            .into(),
-        );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(bogus_ec),
+            Capped::from_array([]),
+        )
+        .into();
         let fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
@@ -8621,18 +8599,16 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
-        );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let _fw_hash = tick.receipt_hash();
 
-        let actions = coord.admit_finalization(&behind, Arc::clone(&tick));
+        let actions = coord.admit_finalization(&behind, tick);
         assert!(
             !actions
                 .iter()
@@ -10100,10 +10076,9 @@ mod tests {
             ValidatorId::new(0),
             vec![Arc::new(held)],
         );
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+        let finalization: Verifiable<Finalization> =
             helpers_make_finalization(BlockHeight::new(2), held_hash, TransactionDecision::Accept)
-                .into(),
-        );
+                .into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(3),
@@ -10341,8 +10316,8 @@ mod tests {
             },
             Some(vec![1]),
         );
-        let finalization: Arc<Verifiable<Finalization>> =
-            Arc::new(make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), writes).into());
+        let finalization: Verifiable<Finalization> =
+            make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), writes).into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(4),
@@ -10381,7 +10356,7 @@ mod tests {
         leg: TxHash,
         outcome: ExecutionOutcome,
         writes: StateWrites,
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         half_leaving(TickHalf::Legs, vec![(leg, outcome, writes)])
     }
 
@@ -10391,7 +10366,7 @@ mod tests {
     fn half_leaving(
         half: TickHalf,
         members: Vec<(TxHash, ExecutionOutcome, StateWrites)>,
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
         let outcomes = members
             .iter()
@@ -10432,7 +10407,7 @@ mod tests {
         } else {
             Finalization::new(tick_id, half, Some(certificate), receipts)
         };
-        Arc::new(half.into())
+        half.into()
     }
 
     /// The legs half of tick 2 at `ROOT` over a certificate attesting
@@ -10441,7 +10416,7 @@ mod tests {
     fn legs_naming(
         members: Vec<(TxHash, ExecutionOutcome, StateWrites)>,
         named: &[TxHash],
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         let whole = half_leaving(TickHalf::Legs, members);
         let receipts: Vec<StoredReceipt> = whole
             .receipts()
@@ -10449,14 +10424,12 @@ mod tests {
             .filter(|receipt| named.contains(&receipt.tx_hash))
             .cloned()
             .collect();
-        Arc::new(
-            whole
-                .as_unverified()
-                .clone()
-                .naming(&named.iter().copied().collect())
-                .with_receipts(Capped::new(receipts).expect("a list written out in a test"))
-                .into(),
-        )
+        whole
+            .as_unverified()
+            .clone()
+            .naming(&named.iter().copied().collect())
+            .with_receipts(Capped::new(receipts).expect("a list written out in a test"))
+            .into()
     }
 
     /// The line naming `tx` a member settling on its own tick's
@@ -10601,7 +10574,7 @@ mod tests {
     }
 
     /// A block at `height` on `ROOT` carrying `finalization`.
-    fn settling(height: u64, finalization: Arc<Verifiable<Finalization>>) -> CertifiedBlock {
+    fn settling(height: u64, finalization: Verifiable<Finalization>) -> CertifiedBlock {
         let now_ms = height * 1_000;
         test_certify(
             helpers_make_live_block(
@@ -10664,10 +10637,9 @@ mod tests {
             "the block below tick 3 being written does not release it",
         );
 
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         let effects =
             state.commit_block_carrying(&schedule, &settling(4, determined), Naming::Manifest);
         assert_eq!(
@@ -10741,10 +10713,9 @@ mod tests {
             Naming::Manifest,
         );
         let _ = state.on_block_persisted(&schedule, BlockHeight::new(3));
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         state.commit_block_carrying(&schedule, &settling(4, determined), Naming::Manifest);
         let runs_tick_3 = |actions: &[Action]| {
             actions.iter().any(|action| {
@@ -10820,10 +10791,9 @@ mod tests {
             Naming::Manifest,
         );
         let _ = state.on_block_persisted(schedule, BlockHeight::new(3));
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         state.commit_block_carrying(schedule, &settling(4, determined), Naming::Manifest);
         state
     }
@@ -10869,10 +10839,9 @@ mod tests {
     fn stating_of(
         outcomes: Vec<TxOutcome>,
         receipts: Vec<StoredReceipt>,
-    ) -> Arc<Verifiable<Finalization>> {
-        let half: Arc<Verifiable<Finalization>> = Arc::new(
-            stating_half_on(ShardId::ROOT, BlockHeight::new(2), outcomes, receipts).into(),
-        );
+    ) -> Verifiable<Finalization> {
+        let half: Verifiable<Finalization> =
+            stating_half_on(ShardId::ROOT, BlockHeight::new(2), outcomes, receipts).into();
         assert_eq!(half.validate_against_certificates(), Ok(()));
         half
     }
@@ -11155,10 +11124,9 @@ mod tests {
         let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
         let leg = test_transaction(3).hash();
         let mut state = holding_a_leg(&schedule, &held_tx, leg, BTreeMap::new());
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         state.commit_block_carrying(&schedule, &settling(3, determined), Naming::Manifest);
         state.on_block_persisted(&schedule, BlockHeight::new(3));
         let later = make_live_block(
@@ -11394,10 +11362,9 @@ mod tests {
             "the tick seated from the line carries the abort until it settles",
         );
 
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+        let finalization: Verifiable<Finalization> =
             helpers_make_finalization(BlockHeight::new(3), tx.hash(), TransactionDecision::Aborted)
-                .into(),
-        );
+                .into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(5),
@@ -11593,10 +11560,9 @@ mod tests {
         ));
         // The tick at height 2 settles at height 4, one block above where
         // composition resumes.
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+        let finalization: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), settled_hash, StateWrites::default())
-                .into(),
-        );
+                .into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(4),
@@ -12573,7 +12539,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .release_resolved(&[Arc::new(Verifiable::from(make_leg_finalization(
+            .release_resolved(&[(Verifiable::from(make_leg_finalization(
                 BlockHeight::new(1),
                 tx_hash,
             )))]);
@@ -15574,7 +15540,7 @@ mod tests {
     fn commit_stating(
         state: &mut ExecutionCoordinator,
         tick_id: TickId,
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         let stating = announced(&state.finalize(&tick_id))
             .into_iter()
             .find(|fw| fw.half() == TickHalf::Stated)
@@ -15584,7 +15550,7 @@ mod tests {
     }
 
     /// The transactions each finalization states a yes for.
-    fn stated_by(finalizations: &[Arc<Verifiable<Finalization>>]) -> Vec<Vec<TxHash>> {
+    fn stated_by(finalizations: &[Verifiable<Finalization>]) -> Vec<Vec<TxHash>> {
         finalizations
             .iter()
             .map(|fw| fw.stated_outcomes().map(TxOutcome::tx_hash).collect())
@@ -15592,7 +15558,7 @@ mod tests {
     }
 
     /// The stating halves the store holds for a proposer.
-    fn held_stating(state: &ExecutionCoordinator) -> Vec<Arc<Verifiable<Finalization>>> {
+    fn held_stating(state: &ExecutionCoordinator) -> Vec<Verifiable<Finalization>> {
         state
             .get_finalizations()
             .into_iter()
@@ -15786,7 +15752,7 @@ mod tests {
     fn stating_announced_at_the_next_commit(
         state: &mut ExecutionCoordinator,
         schedule: &TopologySchedule,
-    ) -> Vec<Arc<Verifiable<Finalization>>> {
+    ) -> Vec<Verifiable<Finalization>> {
         let block = make_live_block_on_shard(
             HOME,
             BlockHeight::new(2),
@@ -15899,7 +15865,7 @@ mod tests {
             },
         );
         assert_eq!(state.voted_receipt_root(&tick_id), Some(root));
-        let determined: Vec<Arc<Verifiable<Finalization>>> = announced(&actions)
+        let determined: Vec<Verifiable<Finalization>> = announced(&actions)
             .into_iter()
             .filter(|fw| fw.is_determined())
             .collect();
@@ -16014,7 +15980,7 @@ mod tests {
         tick_id: TickId,
         names: &[TxHash],
         (hash, height): (BlockHash, BlockHeight),
-    ) -> Vec<Arc<Verifiable<Finalization>>> {
+    ) -> Vec<Verifiable<Finalization>> {
         let accepting = BTreeMap::from([(tick_id, names.iter().copied().collect())]);
         let mut built = Vec::new();
         for action in state.offer_accepting(hash, height, &accepting) {
@@ -16035,7 +16001,7 @@ mod tests {
     }
 
     /// The members each finalization `actions` announce names, in order.
-    fn announced(actions: &[Action]) -> Vec<Arc<Verifiable<Finalization>>> {
+    fn announced(actions: &[Action]) -> Vec<Verifiable<Finalization>> {
         actions
             .iter()
             .filter_map(|action| match action {
@@ -16048,7 +16014,7 @@ mod tests {
             .collect()
     }
 
-    fn names_of(finalizations: &[Arc<Verifiable<Finalization>>]) -> Vec<Vec<TxHash>> {
+    fn names_of(finalizations: &[Verifiable<Finalization>]) -> Vec<Vec<TxHash>> {
         finalizations
             .iter()
             .map(|fw| fw.tx_hashes().collect())
@@ -17100,13 +17066,11 @@ mod tests {
         for half in [TickHalf::Determined, TickHalf::Legs] {
             state.finalized.insert(
                 tick_id,
-                Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                    Finalization::new(
-                        tick_id,
-                        half,
-                        Some(certificate.clone()),
-                        Capped::from_array([]),
-                    ),
+                Verifiable::from(Verified::new_unchecked_for_test(Finalization::new(
+                    tick_id,
+                    half,
+                    Some(certificate.clone()),
+                    Capped::from_array([]),
                 ))),
             );
         }
@@ -17155,13 +17119,11 @@ mod tests {
         );
         state.finalized.insert(
             tick_id,
-            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                Finalization::new(
-                    tick_id,
-                    TickHalf::Legs,
-                    Some(taken_before),
-                    Capped::from_array([]),
-                ),
+            Verifiable::from(Verified::new_unchecked_for_test(Finalization::new(
+                tick_id,
+                TickHalf::Legs,
+                Some(taken_before),
+                Capped::from_array([]),
             ))),
         );
         assert_eq!(

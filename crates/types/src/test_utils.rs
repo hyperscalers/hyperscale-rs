@@ -409,7 +409,7 @@ pub fn make_live_block(
     timestamp_ms: u64,
     proposer: ValidatorId,
     transactions: Vec<Arc<Transaction>>,
-    certificates: Vec<Arc<Verifiable<Finalization>>>,
+    certificates: Vec<Verifiable<Finalization>>,
 ) -> Block {
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id,
