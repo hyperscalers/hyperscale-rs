@@ -318,6 +318,36 @@ pub enum WindowLookup<'a> {
     Evicted,
 }
 
+/// The anchor that selects the committee which signed a header's QC,
+/// by what named it: see [`TopologySchedule::signing_anchor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningAnchor {
+    /// The held parent's own `parent_qc` timestamp.
+    Parent(WeightedTimestamp),
+    /// The beacon's attested boundary, which names the parent.
+    Boundary(WeightedTimestamp),
+    /// The header's own `parent_qc` timestamp, which names a different
+    /// window than the parent's across an epoch cut.
+    OwnQc(WeightedTimestamp),
+}
+
+impl SigningAnchor {
+    /// The weighted timestamp the committee lookup resolves.
+    #[must_use]
+    pub const fn weighted_timestamp(self) -> WeightedTimestamp {
+        match self {
+            Self::Parent(wt) | Self::Boundary(wt) | Self::OwnQc(wt) => wt,
+        }
+    }
+
+    /// Whether the parent named the committee, held or attested by the
+    /// beacon, rather than the header itself.
+    #[must_use]
+    pub const fn names_parent(self) -> bool {
+        matches!(self, Self::Parent(_) | Self::Boundary(_))
+    }
+}
+
 /// Result of resolving a shard's committee at a weighted timestamp
 /// against the retained window.
 pub enum ScheduleLookup<'a> {
@@ -1244,16 +1274,17 @@ impl TopologySchedule {
         shard: ShardId,
         header: &BlockHeader,
         parent_anchor: Option<WeightedTimestamp>,
-    ) -> WeightedTimestamp {
-        parent_anchor.unwrap_or_else(|| {
-            self.head()
-                .boundary(shard)
-                .filter(|boundary| boundary.block_hash == header.parent_block_hash())
-                .map_or_else(
-                    || header.parent_qc().weighted_timestamp(),
-                    |boundary| boundary.weighted_timestamp,
-                )
-        })
+    ) -> SigningAnchor {
+        if let Some(parent_anchor) = parent_anchor {
+            return SigningAnchor::Parent(parent_anchor);
+        }
+        self.head()
+            .boundary(shard)
+            .filter(|boundary| boundary.block_hash == header.parent_block_hash())
+            .map_or_else(
+                || SigningAnchor::OwnQc(header.parent_qc().weighted_timestamp()),
+                |boundary| SigningAnchor::Boundary(boundary.weighted_timestamp),
+            )
     }
 
     /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified) for

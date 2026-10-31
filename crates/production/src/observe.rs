@@ -332,7 +332,9 @@ fn summarise(
     let header = certified.header();
     let qc = certified.qc();
     let shard = header.shard_id();
-    let anchor = schedule.signing_anchor(shard, header, parent_anchor);
+    let anchor = schedule
+        .signing_anchor(shard, header, parent_anchor)
+        .weighted_timestamp();
     let committee =
         match schedule.lookup_for_shard_certified_fenced(shard, anchor, qc.weighted_timestamp()) {
             Some((ScheduleLookup::Committee(snapshot), _)) => Some(Arc::clone(snapshot)),

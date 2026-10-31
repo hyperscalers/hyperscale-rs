@@ -1587,16 +1587,16 @@ impl RemoteHeaderCoordinator {
     }
 
     /// Anchor selecting the committee that signed the QC over `header`'s
-    /// block, and whether a held parent named it. A block's committee
+    /// block, and whether the parent named it. A block's committee
     /// anchors on its parent, so the window that signed this QC is the one
-    /// the parent dates itself in. Without the parent, the beacon's
-    /// attested boundary stands in for the boundary block, and otherwise the
-    /// header's own anchor does — the same window except across an epoch
-    /// cut. A header resolved without its parent that fails verification
-    /// waits for the parent ([`Self::await_parent`]) rather than being
-    /// dropped. Both the first dispatch and the failed-candidate retry drain
-    /// resolve through here, so a buffered sibling verifies under the same
-    /// committee its predecessor did.
+    /// the parent dates itself in. Without the parent held, the beacon's
+    /// attested boundary names it for the boundary block, and otherwise the
+    /// header's own anchor stands in — the same window except across an
+    /// epoch cut. A header resolved on its own anchor that fails
+    /// verification waits for the parent ([`Self::await_parent`]) rather
+    /// than being dropped. Both the first dispatch and the failed-candidate
+    /// retry drain resolve through here, so a buffered sibling verifies
+    /// under the same committee its predecessor did.
     fn committee_anchor_wt(
         &self,
         topology_schedule: &TopologySchedule,
@@ -1610,9 +1610,10 @@ impl RemoteHeaderCoordinator {
                 self.held_header(shard, parent_height, header.parent_block_hash())
             })
             .map(|parent| parent.parent_qc().weighted_timestamp());
+        let anchor = topology_schedule.signing_anchor(shard, header, parent_anchor);
         (
-            topology_schedule.signing_anchor(shard, header, parent_anchor),
-            if parent_anchor.is_some() {
+            anchor.weighted_timestamp(),
+            if anchor.names_parent() {
                 HeaderCommittee::Resolved
             } else {
                 HeaderCommittee::Guessed
@@ -1684,7 +1685,7 @@ impl RemoteHeaderCoordinator {
 
     /// Check `certified_header`, which failed under a guessed committee,
     /// again under the one its parent names: re-offered at once when the
-    /// parent is held by now, parked for it otherwise.
+    /// parent is held or attested by now, parked for it otherwise.
     fn retry_under_parent(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1739,8 +1740,8 @@ impl RemoteHeaderCoordinator {
         }]
     }
 
-    /// Re-offer the headers of `shard` whose parent is now held, keeping
-    /// the rest parked. A re-offered header resolves under its parent, so
+    /// Re-offer the headers of `shard` whose parent is now held or attested
+    /// at the beacon's boundary, keeping the rest parked. A re-offered header resolves under its parent, so
     /// one that fails again is dropped rather than parked: each is checked
     /// at most once more.
     fn reoffer_awaiting_parent(
@@ -2587,6 +2588,68 @@ mod tests {
         let actions = coord.on_remote_header_received(&schedule, child, gossip(1));
         let keys = verify_qc_keys(&actions).expect("anchored on the boundary");
         assert_eq!(*keys, expected0);
+        assert_eq!(
+            verify_qc_committee(&actions),
+            Some(HeaderCommittee::Resolved),
+            "the beacon's boundary names the committee as a held parent would",
+        );
+    }
+
+    /// A header parked for its parent is re-offered once the beacon
+    /// attests that parent as the shard's boundary, and checked under the
+    /// committee the boundary names.
+    #[test]
+    fn a_parked_header_is_reoffered_once_the_boundary_names_its_parent() {
+        use hyperscale_types::{BeaconWitnessLeafCount, ShardAnchor, StateRoot};
+
+        const ED: u64 = 1_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let boundary_hash = BlockHash::from_raw(Hash::from_bytes(b"boundary"));
+        let schedule_with = |boundaries: BTreeMap<ShardId, ShardAnchor>| {
+            let head = Arc::new(shard_snapshot(2, &ids, 0).with_boundaries(boundaries));
+            let mut schedule = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), head);
+            schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
+            schedule
+        };
+        let before = schedule_with(BTreeMap::new());
+        let after = schedule_with(BTreeMap::from([(
+            remote,
+            ShardAnchor {
+                state_root: StateRoot::ZERO,
+                block_hash: boundary_hash,
+                height: BlockHeight::new(5),
+                weighted_timestamp: WeightedTimestamp::from_millis(ED - 1),
+                witness_base: BeaconWitnessLeafCount::ZERO,
+                terminal_settled_txs: None,
+                handoff_complete: None,
+                terminal_epoch: None,
+            },
+        )]));
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+
+        let child = chained_remote_header(remote, BlockHeight::new(6), boundary_hash, ED + 1);
+        let actions = coord.on_remote_header_received(&before, child.clone(), gossip(1));
+        assert_eq!(
+            verify_qc_committee(&actions),
+            Some(HeaderCommittee::Guessed)
+        );
+        let _ = coord.on_remote_header_qc_verified(
+            &before,
+            &child,
+            gossip(1),
+            Err(CertifiedHeaderVerifyError::Qc(
+                QcVerifyError::InvalidSignature,
+            )),
+            HeaderCommittee::Guessed,
+        );
+
+        let actions = coord.on_beacon_block_persisted(&after);
+        assert_eq!(
+            verify_qc_committee(&actions),
+            Some(HeaderCommittee::Resolved),
+            "the parked header is checked again under the boundary's committee",
+        );
     }
 
     /// A block whose anchor sits below the one already committed does not

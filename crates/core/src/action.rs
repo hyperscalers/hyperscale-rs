@@ -49,16 +49,18 @@ pub enum QcSubject {
 /// checks the header's QC against, echoed back on
 /// [`ProtocolEvent::RemoteHeaderQcVerified`].
 ///
-/// A block's QC is signed by the committee its parent anchors. Without the
-/// parent held, the header's own anchor stands in, which names a different
-/// window across an epoch cut, so a failure there says nothing against the
-/// header or the peer that sent it.
+/// A block's QC is signed by the committee its parent anchors. When neither
+/// a held parent nor the beacon's attested boundary names the parent, the
+/// header's own anchor stands in, which names a different window across an
+/// epoch cut, so a failure there says nothing against the header or the
+/// peer that sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderCommittee {
-    /// A held parent named the committee: a failure is the header's own.
+    /// The parent named the committee, held or attested by the beacon: a
+    /// failure is the header's own.
     Resolved,
-    /// No held parent named it: a failure waits for the parent and a
-    /// check under the committee it names.
+    /// The header's own anchor named it: a failure waits for the parent
+    /// and a check under the committee it names.
     Guessed,
 }
 
