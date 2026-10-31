@@ -114,10 +114,23 @@ pub enum ProposalAdmission {
 }
 
 /// One proposer's evaluation slot for the in-flight epoch: the copy it
-/// judged, by its PC element, and what it made of that copy.
+/// judged, by its PC element, what it made of that copy, and whether
+/// that copy is the one its author notified.
 struct Evaluation {
     element: PcValueElement,
     admission: ProposalAdmission,
+    notified: bool,
+}
+
+impl Evaluation {
+    /// Whether another copy of the proposer's proposal, `notified` by
+    /// its author or not, is judged afresh. A fetched copy may be any
+    /// peer's, so one the pool did not take leaves the author's own
+    /// notification its judgement; every other copy waits on the dwell
+    /// that frees the slot.
+    fn yields_to(&self, notified: bool) -> bool {
+        notified && !self.notified && self.admission != ProposalAdmission::Admitted
+    }
 }
 
 /// One validator's beacon consensus duty.
@@ -207,7 +220,9 @@ pub struct BeaconParticipant {
     ///
     /// Each slot keeps what its evaluation made of the copy it judged, so
     /// a later arrival of that same copy, however the first came in, is
-    /// answered with the same admission rather than judged again.
+    /// answered with the same admission rather than judged again. A
+    /// fetched copy the pool did not take leaves the author's own
+    /// notified copy one judgement ([`Evaluation::yields_to`]).
     evaluated_proposers: BTreeMap<ValidatorId, Evaluation>,
 
     /// Committee members whose in-flight-epoch proposal the input dwell
@@ -744,6 +759,20 @@ impl BeaconParticipant {
         epoch: Epoch,
         proposal: Verified<BeaconProposal>,
     ) -> (ProposalAdmission, Vec<BeaconAction>) {
+        self.evaluate_proposal(fold, from, epoch, proposal, true)
+    }
+
+    /// Judge `from`'s proposal for `epoch` into the pool, `notified` by
+    /// its author or brought in by a fetch — see
+    /// [`Self::on_beacon_proposal_received`].
+    fn evaluate_proposal(
+        &mut self,
+        fold: &BeaconFold,
+        from: ValidatorId,
+        epoch: Epoch,
+        proposal: Verified<BeaconProposal>,
+        notified: bool,
+    ) -> (ProposalAdmission, Vec<BeaconAction>) {
         if !fold.state.committee.contains(&from) {
             trace!(
                 ?from,
@@ -779,18 +808,19 @@ impl BeaconParticipant {
             }
             let element = proposal.pc_element_hash(epoch);
             if let Some(evaluated) = self.evaluated_proposers.get(&from) {
-                let admission = if evaluated.element == element {
-                    evaluated.admission
-                } else {
-                    ProposalAdmission::Abstained
-                };
-                return (admission, Vec::new());
+                if evaluated.element == element {
+                    return (evaluated.admission, Vec::new());
+                }
+                if !evaluated.yields_to(notified) {
+                    return (ProposalAdmission::Abstained, Vec::new());
+                }
             }
             self.evaluated_proposers.insert(
                 from,
                 Evaluation {
                     element,
                     admission: ProposalAdmission::Abstained,
+                    notified,
                 },
             );
             let upgraded = fold
@@ -1180,9 +1210,12 @@ impl BeaconParticipant {
             let Some(proposal) = self.awaiting_boundaries.remove(&from) else {
                 continue;
             };
-            self.evaluated_proposers.remove(&from);
+            let notified = self
+                .evaluated_proposers
+                .remove(&from)
+                .is_some_and(|evaluated| evaluated.notified);
             actions.extend(
-                self.on_beacon_proposal_received(fold, from, epoch, proposal)
+                self.evaluate_proposal(fold, from, epoch, proposal, notified)
                     .1,
             );
         }
@@ -2012,8 +2045,9 @@ impl BeaconParticipant {
     /// pins the fetched bytes to that element by hash.
     ///
     /// A proposal the input dwell asked for is not yet vouched for by
-    /// anyone, so it enters through [`Self::on_beacon_proposal_received`]
-    /// exactly as a gossiped copy would.
+    /// anyone, so it is judged as a notified copy would be, except that
+    /// it leaves its author's own notification a judgement of its own
+    /// when the pool does not take it.
     ///
     /// Out-of-band responses drop silently.
     pub fn on_beacon_proposal_fetched(
@@ -2028,7 +2062,7 @@ impl BeaconParticipant {
                 return Vec::new();
             }
             return self
-                .on_beacon_proposal_received(fold, validator, epoch, proposal)
+                .evaluate_proposal(fold, validator, epoch, proposal, false)
                 .1;
         }
         let _ = self.proposal_pool.admit(validator, epoch, proposal);

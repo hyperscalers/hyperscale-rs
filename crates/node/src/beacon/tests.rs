@@ -590,17 +590,17 @@ fn a_wire_proposal_reaches_the_loop_only_once_checked() {
 /// for `epoch` from a peer: the handler defers it, and the participants'
 /// check of the evidence settles it.
 fn settled_on_notified(fix: &Fixture, epoch: Epoch, proposal: BeaconProposal) -> Verdict {
-    settled_on_notified_after(fix, epoch, proposal, |_, _| {})
+    settled_on_notified_after(fix, epoch, proposal, |_, _| {}).0
 }
 
 /// [`settled_on_notified`], once `before` has run on the host with
-/// `committee[0]` seated.
+/// `committee[0]` seated, and the host as the notification left it.
 fn settled_on_notified_after(
     fix: &Fixture,
     epoch: Epoch,
     proposal: BeaconProposal,
     before: impl FnOnce(&mut Host, &Receiver<HostEvent>),
-) -> Verdict {
+) -> (Verdict, Host) {
     let registry = Arc::new(HandlerRegistry::new(BTreeSet::from([SHARD])));
     let (mut host, events) = fix.host_through_network(
         SimNetworkAdapter::new(Arc::clone(&registry)),
@@ -635,7 +635,10 @@ fn settled_on_notified_after(
         let _ = host.step(event);
     }
     let verdict = settled.lock().expect("record lock").take();
-    verdict.expect("the loop settles the deferred verdict")
+    (
+        verdict.expect("the loop settles the deferred verdict"),
+        host,
+    )
 }
 
 /// `author`'s signed proposal for `epoch`, carrying `equivocations`.
@@ -698,10 +701,24 @@ fn settled_on_notified_after_its_fetch(
     proposal: BeaconProposal,
     pooled: bool,
 ) -> Verdict {
+    settled_on_notified_after_a_fetch(fix, proposal.clone(), pooled, proposal).0
+}
+
+/// The verdict a host settles on `committee[1]`'s notification of its
+/// epoch-1 `notified` proposal, and the host it leaves, once the input
+/// dwell has fetched `fetched` for that author and evaluated it.
+/// `pooled` is whether the fetched copy is expected to have entered the
+/// pool.
+fn settled_on_notified_after_a_fetch(
+    fix: &Fixture,
+    fetched: BeaconProposal,
+    pooled: bool,
+    notified: BeaconProposal,
+) -> (Verdict, Host) {
     let epoch = Epoch::new(1);
     let author = fix.committee.validator_id(1);
-    let fetched = Verified::new_unchecked_for_test(proposal.clone());
-    settled_on_notified_after(fix, epoch, proposal, |host, events| {
+    let fetched = Verified::new_unchecked_for_test(fetched);
+    settled_on_notified_after(fix, epoch, notified, |host, events| {
         let participant = attachment(host, 0, fix);
         for event in [
             ProtocolEvent::BeaconCommitteeStartTimer,
@@ -763,6 +780,29 @@ fn a_notified_proposal_fetched_first_settles_on_its_evaluation() {
         settled_on_notified_after_its_fetch(&fix, honest, true),
         Verdict::Accept,
     );
+}
+
+/// A copy a fetch brought in does not use up its author's own
+/// notification: once the dwell's fetched copy is refuted, the author's
+/// honest proposal is judged when its notification arrives, and pooled.
+#[test]
+fn a_notified_proposal_is_judged_after_a_refused_fetched_copy() {
+    let fix = Fixture::new();
+    let epoch = Epoch::new(1);
+    let author = fix.committee.validator_id(1);
+    let forged = signed_proposal(&fix, 1, epoch, vec![forged_equivocation(&fix)]);
+    let honest = signed_proposal(&fix, 1, epoch, Vec::new());
+    let element = honest.pc_element_hash(epoch);
+    let (verdict, host) = settled_on_notified_after_a_fetch(&fix, forged, false, honest);
+    assert_eq!(verdict, Verdict::Accept);
+    let pooled = host
+        .beacon
+        .participant(fix.committee.validator_id(0))
+        .expect("the participant runs")
+        .proposal_pool()
+        .get(author)
+        .map(|proposal| proposal.pc_element_hash(epoch));
+    assert_eq!(pooled, Some(element), "the notified copy is pooled");
 }
 
 /// An honest proposal is never held against its author: not when the
