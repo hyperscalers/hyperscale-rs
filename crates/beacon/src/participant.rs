@@ -2074,14 +2074,15 @@ impl BeaconParticipant {
     /// validator's pubkey ([`BeaconFold::verify_fetched_proposal`]):
     /// hand it to whichever consumer asked.
     ///
-    /// A proposal commit assembly awaits is admitted straight to the
-    /// pool, and the stashed assembly for `epoch` resumes once every
-    /// awaited fetch has resolved. That admission skips the
-    /// witness-admission gate: it only ever resolves a proposal an
-    /// already-committed `PcVector` element references, so the embedded
-    /// witnesses are threshold-vouched (≥ f+1 honest voters verified them
-    /// before the value could commit), and the committed-proposal decode
-    /// pins the fetched bytes to that element by hash.
+    /// A proposal commit assembly awaits answers the await only if it
+    /// hashes to the committed `PcVector` element at its author's
+    /// position. That copy goes straight to the pool, in place of any
+    /// other copy its author signed, and the stashed assembly for `epoch`
+    /// resumes once every awaited fetch has resolved. It skips the
+    /// witness-admission gate: the embedded witnesses are
+    /// threshold-vouched (≥ f+1 honest voters verified them before the
+    /// value could commit). Any other copy leaves the await open for
+    /// another peer's.
     ///
     /// A proposal the input dwell asked for is not yet vouched for by
     /// anyone, so it is judged as a notified copy would be, except that
@@ -2097,7 +2098,10 @@ impl BeaconParticipant {
         validator: ValidatorId,
         proposal: Verified<BeaconProposal>,
     ) -> (FetchedProposal, Vec<BeaconAction>) {
-        if !self.commit_assembly.is_awaiting(epoch, validator) {
+        let Some(element) =
+            self.commit_assembly
+                .awaited_element(epoch, validator, &fold.state.committee)
+        else {
             if epoch != self.proposal_pool.epoch() || !self.dwell_fetches.remove(&validator) {
                 return (FetchedProposal::Answered, Vec::new());
             }
@@ -2108,8 +2112,16 @@ impl BeaconParticipant {
             }
             self.dwell_fetches.insert(validator);
             return (FetchedProposal::Unanswered, actions);
+        };
+        if proposal.pc_element_hash(epoch) != element {
+            trace!(
+                ?validator,
+                epoch = epoch.inner(),
+                "Fetched BeaconProposal is not the committed copy — awaiting another",
+            );
+            return (FetchedProposal::Unanswered, Vec::new());
         }
-        let _ = self.proposal_pool.admit(validator, epoch, proposal);
+        self.proposal_pool.pin(validator, epoch, proposal);
         let actions = match self.commit_assembly.on_proposal_resolved(
             epoch,
             validator,

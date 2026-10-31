@@ -123,13 +123,29 @@ impl CommitAssembler {
     }
 
     /// Whether `epoch`'s stash is still awaiting `validator`'s proposal.
-    /// The coordinator gates the verify + admit of a fetched proposal on
-    /// this so an out-of-band response does no work.
     #[must_use]
     pub fn is_awaiting(&self, epoch: Epoch, validator: ValidatorId) -> bool {
         self.pending
             .get(&epoch)
             .is_some_and(|p| p.awaiting.contains(&validator))
+    }
+
+    /// The committed element `epoch`'s stash awaits for `validator`, at
+    /// its position among `members`, if the stash still awaits it. A
+    /// fetched copy answers the await only if it hashes to this element.
+    #[must_use]
+    pub(crate) fn awaited_element(
+        &self,
+        epoch: Epoch,
+        validator: ValidatorId,
+        members: &[ValidatorId],
+    ) -> Option<PcValueElement> {
+        let pending = self.pending.get(&epoch)?;
+        if !pending.awaiting.contains(&validator) {
+            return None;
+        }
+        let position = members.iter().position(|member| *member == validator)?;
+        pending.output.iter().nth(position).copied()
     }
 
     /// A fetched proposal for `validator` has been verified and admitted

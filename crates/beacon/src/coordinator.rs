@@ -952,7 +952,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::participant::{MAX_INPUT_DWELL_REARMS, ProposalAdmission};
+    use crate::participant::{FetchedProposal, MAX_INPUT_DWELL_REARMS, ProposalAdmission};
     use crate::shard_source::ChunkFetchId;
     use crate::{boundary, rules};
 
@@ -3896,6 +3896,95 @@ mod tests {
             fetches_divergent,
             "expected a BeaconProposal fetch for the divergent proposer, got {kinds:?}",
         );
+    }
+
+    /// Decide `output` for the in-flight epoch with a verifying cert,
+    /// as the SPC FSM would on `OutputHigh`.
+    fn decide(coord: &mut BeaconCoordinator, output: &PcVector) -> Vec<CoordinatorAction> {
+        let committee = coord.fold.state.committee.clone();
+        let n = committee.len();
+        let keys: Vec<_> = (0..n as u64).map(keypair).collect();
+        let cert_committee: Vec<_> = committee
+            .iter()
+            .copied()
+            .zip(keys.iter().map(BlsSigner::public_key))
+            .collect();
+        let signer_positions: Vec<usize> = (0..n - n.saturating_sub(1) / 3).collect();
+        let cert = build_direct_cert(
+            SpcView::new(1),
+            Epoch::GENESIS.next(),
+            &keys,
+            &cert_committee,
+            &signer_positions,
+            &PcVector::empty(),
+        );
+        let recipients = coord.spc_recipients();
+        coord.on_spc_output_high(
+            Epoch::GENESIS.next(),
+            output,
+            Verified::new_unchecked_for_test(cert),
+            &recipients,
+        )
+    }
+
+    /// Commit assembly awaits the copy the committed vector names. A
+    /// fetched copy its author also signed but the vector does not name
+    /// leaves the await open, and the committed copy, fetched next,
+    /// completes the assembly: whether the pool held nothing for the
+    /// author or held the other copy.
+    #[test]
+    fn commit_assembly_takes_only_the_committed_copy_of_a_fetched_proposal() {
+        for pooled_other in [false, true] {
+            let mut coord = fresh_coord();
+            coord.bootstrap_spc_for_next_epoch();
+            let in_flight = Epoch::GENESIS.next();
+            let committee = coord.fold.state.committee.clone();
+            let author = committee[1];
+            let named = sample_proposal(0xFE);
+            let other = sample_proposal(0xFF);
+            let mut elements = Vec::with_capacity(committee.len());
+            for id in &committee {
+                if *id == author {
+                    elements.push(named.pc_element_hash(in_flight));
+                    if pooled_other {
+                        coord
+                            .participant
+                            .proposal_pool
+                            .admit(*id, in_flight, other.clone());
+                    }
+                    continue;
+                }
+                let p = sample_proposal(u8::try_from(id.inner()).unwrap_or(0));
+                elements.push(p.pc_element_hash(in_flight));
+                coord.participant.proposal_pool.admit(*id, in_flight, p);
+            }
+            let _ = decide(&mut coord, &PcVector::new(elements));
+
+            let (fetched, actions) =
+                coord
+                    .participant
+                    .on_beacon_proposal_fetched(&coord.fold, in_flight, author, other);
+            assert_eq!(
+                fetched,
+                FetchedProposal::Unanswered,
+                "the other copy leaves the await open (pooled other: {pooled_other})",
+            );
+            assert!(actions.is_empty(), "nothing assembles on the other copy");
+
+            let (fetched, actions) =
+                coord
+                    .participant
+                    .on_beacon_proposal_fetched(&coord.fold, in_flight, author, named);
+            assert_eq!(fetched, FetchedProposal::Answered);
+            assert!(
+                actions.iter().any(|action| matches!(
+                    action,
+                    BeaconAction::Participant(ParticipantAction::BroadcastBeaconCandidate { .. })
+                )),
+                "the committed copy completes the assembly (pooled other: {pooled_other}): \
+                 {actions:?}",
+            );
+        }
     }
 
     /// `on_spc_output_high` broadcasts a candidate and prevotes its

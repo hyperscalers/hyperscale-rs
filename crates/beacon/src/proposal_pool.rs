@@ -69,6 +69,20 @@ impl BeaconProposalPool {
         self.proposals.insert(from, proposal);
         true
     }
+
+    /// Hold `proposal` as `from`'s, in place of any copy already held:
+    /// the copy a committed vector names, which no earlier copy from an
+    /// equivocating `from` may keep out. Ignored for another epoch.
+    pub(crate) fn pin(
+        &mut self,
+        from: ValidatorId,
+        epoch: Epoch,
+        proposal: Verified<BeaconProposal>,
+    ) {
+        if epoch == self.epoch {
+            self.proposals.insert(from, proposal);
+        }
+    }
 }
 
 // Flat accessors; names are the documentation.
