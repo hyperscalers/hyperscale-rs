@@ -512,9 +512,15 @@ impl RemoteHeaderCoordinator {
                     "Remote header QC verification failed"
                 );
 
-                self.drop_candidate(shard, height, source);
-                self.drop_identical_candidates(certified_header);
-                let mut actions = self.dispatch_next_candidate(topology_schedule, shard, height);
+                // The failure settles only the copy it checked. One the
+                // retention pruned while in flight leaves nothing to drop,
+                // and whatever the height holds since has a check of its
+                // own in flight.
+                let mut actions = if self.drop_identical_candidates(certified_header) {
+                    self.dispatch_next_candidate(topology_schedule, shard, height)
+                } else {
+                    Vec::new()
+                };
                 // A header that failed under a guess may be honest: it is
                 // checked again under its parent's committee, even when the
                 // retention has already pruned its pending entry. The next
@@ -1025,11 +1031,12 @@ impl RemoteHeaderCoordinator {
     /// Drop every candidate identical to `failed`, whose check just failed:
     /// they are one item, which that check settled for all of them. One
     /// that failed under a guessed committee is checked again on `failed`
-    /// itself once its parent names the committee.
-    fn drop_identical_candidates(&mut self, failed: &CertifiedBlockHeader) {
+    /// itself once its parent names the committee. False if no candidate
+    /// is identical to `failed`: its check was stale.
+    fn drop_identical_candidates(&mut self, failed: &CertifiedBlockHeader) -> bool {
         let height = failed.height();
         let Some(store) = self.shards.get_mut(&failed.shard_id()) else {
-            return;
+            return false;
         };
         let identical: Vec<HeaderSource> = store
             .pending(height)
@@ -1038,9 +1045,10 @@ impl RemoteHeaderCoordinator {
             .filter(|(_, candidate)| *candidate == failed)
             .map(|(source, _)| *source)
             .collect();
-        for source in identical {
-            store.remove_candidate(height, source);
+        for source in &identical {
+            store.remove_candidate(height, *source);
         }
+        !identical.is_empty()
     }
 
     /// Drop everything held for a shard whose handoff evidence window has
@@ -2828,6 +2836,96 @@ mod tests {
             verify_qc_count(&actions),
             0,
             "no identical copy is left to check"
+        );
+    }
+
+    /// A check's result is about the copy it checked. A copy whose
+    /// certificate claims an old clock is pruned by the retention while
+    /// its check is in flight, and the same source can then hold a
+    /// different copy at the height, queued behind another check: the
+    /// stale failure neither drops that unchecked copy nor dispatches a
+    /// second check beside the one in flight.
+    #[test]
+    fn a_stale_failure_touches_only_the_copy_it_checked() {
+        const ED: u64 = 100_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(0),
+            Arc::new(shard_snapshot(2, &ids, 0)),
+        );
+        schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+        let height = BlockHeight::new(6);
+        let forged = Err(CertifiedHeaderVerifyError::Qc(
+            QcVerifyError::InvalidSignature,
+        ));
+
+        let in_flight = chained_remote_header(remote, height, BlockHash::ZERO, 2 * ED - 2);
+        let checked = CertifiedBlockHeader::new(
+            in_flight.header().clone(),
+            QuorumCertificate::new(
+                in_flight.qc().block_hash(),
+                remote,
+                height,
+                BlockHash::ZERO,
+                Round::INITIAL,
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(ED + 1),
+            ),
+        );
+        let actions =
+            coord.on_remote_header_received(&schedule, checked.clone(), HeaderSource::Fetched);
+        assert_eq!(verify_qc_count(&actions), 1);
+
+        let tip = chained_remote_header(remote, BlockHeight::new(50), BlockHash::ZERO, 2 * ED - 1);
+        let _ = coord.on_remote_header_received(&schedule, tip, gossip(1));
+        assert!(coord.get_pending(remote, height).is_none());
+
+        let actions = coord.on_remote_header_received(&schedule, in_flight.clone(), gossip(2));
+        assert_eq!(verify_qc_count(&actions), 1);
+        let unchecked = chained_remote_header(remote, height, BlockHash::ZERO, 2 * ED - 3);
+        let actions =
+            coord.on_remote_header_received(&schedule, unchecked.clone(), HeaderSource::Fetched);
+        assert_eq!(
+            verify_qc_count(&actions),
+            0,
+            "queued behind the check in flight"
+        );
+
+        let actions = coord.on_remote_header_qc_verified(
+            &schedule,
+            &checked,
+            HeaderSource::Fetched,
+            forged.clone(),
+            HeaderCommittee::Resolved,
+        );
+        assert_eq!(
+            verify_qc_count(&actions),
+            0,
+            "the check in flight is not dispatched again",
+        );
+        assert_eq!(
+            coord
+                .get_pending(remote, height)
+                .and_then(|pending| pending.get(&HeaderSource::Fetched)),
+            Some(&unchecked),
+            "the source's unchecked copy stays queued",
+        );
+
+        let actions = coord.on_remote_header_qc_verified(
+            &schedule,
+            &in_flight,
+            gossip(2),
+            forged,
+            HeaderCommittee::Resolved,
+        );
+        assert_eq!(
+            verify_qc_count(&actions),
+            1,
+            "the unchecked copy is checked next"
         );
     }
 
