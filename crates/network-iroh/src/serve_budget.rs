@@ -176,9 +176,16 @@ mod tests {
     #[test]
     fn processor_time_counts_work_and_not_waits() {
         let ((), slept) = processor_time(|| sleep(Duration::from_millis(50)));
+        // Spun until the thread's own clock has counted the work, so a
+        // runner that deschedules the thread stretches the wait rather
+        // than shortening the count. The wall cap only ends a clock that
+        // never advances.
         let ((), worked) = processor_time(|| {
             let started = WallClock::now();
-            while started.elapsed() < Duration::from_millis(50) {
+            let clock = thread_clock();
+            while thread_clock().saturating_sub(clock) < Duration::from_millis(25)
+                && started.elapsed() < Duration::from_secs(10)
+            {
                 spin_loop();
             }
         });
