@@ -236,11 +236,6 @@ struct ScheduledNotification {
     sequence: u64,
     record: DeliveryRecord,
     payload: Vec<u8>,
-    /// [`Provenance::Local`] only for a host's own notification to itself,
-    /// carrying the bytes it sent: the one delivery production makes in
-    /// process. A replay, a duplicate or a rewrite on that link is the
-    /// network's copy, which production never hands a host as its own.
-    provenance: Provenance,
 }
 
 impl PartialEq for ScheduledNotification {
@@ -1749,7 +1744,6 @@ impl SimulatedNetwork {
                         wire_bytes,
                     },
                     payload,
-                    provenance: peer(from),
                 }));
         }
         Self::remember(&mut self.notifications_carried, message_type, carried);
@@ -1777,6 +1771,54 @@ impl SimulatedNetwork {
         }));
     }
 
+    /// Hand `host` its own notification, as production dispatches it in
+    /// process while sending: no partition, loss or latency touches it, and
+    /// it is no traffic on the wire. A scenario's drop rule still takes it,
+    /// so a cut the scenario installs on a message type holds wherever the
+    /// recipients sit; whether it fired is returned. A rewrite installed on
+    /// the host still reaches it, and that copy, like a duplicate or replay
+    /// the network brings on the link, arrives as a peer's: production never
+    /// hands a host anything but its own bytes as its own.
+    fn notify_in_process(
+        &mut self,
+        host: NodeIndex,
+        now: Duration,
+        type_id: &'static str,
+        mut carried: Carried,
+        streams: &mut LinkStreams,
+    ) -> Decision {
+        let decision = self.faults.decide(
+            &MessageContext {
+                sender: HostId(host),
+                recipient: HostId(host),
+                type_id,
+                tier: Tier::Notification,
+            },
+            now,
+        );
+        // Sim-only: iroh's fault gate guards only the legs it sends to
+        // peers, so there a drop rule never reaches a host's own copy.
+        if decision == Decision::Drop {
+            return decision;
+        }
+        let sent = self.rewritten(host, host, type_id, Tier::Notification, &carried.payload);
+        let provenance = if sent == carried.payload {
+            Provenance::Local
+        } else {
+            peer(host)
+        };
+        carried.payload = sent;
+        if let Some(handler) = self
+            .registries
+            .get(host as usize)
+            .and_then(|registry| registry.get_notification(type_id))
+        {
+            let _ = handler(carried.payload.clone(), provenance);
+        }
+        self.echo_notification(host, host, now, type_id, carried, streams);
+        decision
+    }
+
     // ─── Notification Acceptance (Latency-Modeled) ───
 
     /// Buffer notifications for delivery with simulated latency.
@@ -1785,7 +1827,8 @@ impl SimulatedNetwork {
     /// live on: checks partition/loss, samples latency, and queues into
     /// `pending_notifications`. Recipients sharing a host collapse to one
     /// delivery, as the production transport dispatches a host's local
-    /// recipients once.
+    /// recipients once. The sender's own host is handed its copy here and
+    /// now ([`Self::notify_in_process`]).
     ///
     /// The harness calls [`flush_notifications()`](Self::flush_notifications)
     /// to deliver due messages via each target's registered notification handler.
@@ -1827,6 +1870,20 @@ impl SimulatedNetwork {
                 }
             }
             for to in hosts {
+                if to == sender {
+                    let carried = Carried {
+                        payload: payload.clone(),
+                        shard: None,
+                        class,
+                        wire_bytes: data.len(),
+                    };
+                    if self.notify_in_process(sender, now, type_id, carried, streams)
+                        == Decision::Drop
+                    {
+                        stats.messages_dropped_fault += 1;
+                    }
+                    continue;
+                }
                 match self.should_deliver(sender, to, now, data.len(), streams.link(sender, to)) {
                     None => {
                         if self.is_partitioned(sender, to, now) {
@@ -1854,14 +1911,8 @@ impl SimulatedNetwork {
                         // wrongly, which is the one thing a drop rule cannot
                         // model. Rewriting inside the recipient loop is what
                         // lets one sender equivocate across its peers.
-                        let sent =
+                        let payload =
                             self.rewritten(sender, to, type_id, Tier::Notification, &payload);
-                        let provenance = if sender == to && sent == payload {
-                            Provenance::Local
-                        } else {
-                            peer(sender)
-                        };
-                        let payload = sent;
                         stats.messages_sent += 1;
                         if let Some(ref analyzer) = self.traffic_analyzer {
                             analyzer.record_message(type_id, payload.len(), data.len(), sender, to);
@@ -1881,7 +1932,6 @@ impl SimulatedNetwork {
                                     wire_bytes: data.len(),
                                 },
                                 payload: payload.clone(),
-                                provenance,
                             }));
                         let carried = Carried {
                             payload,
@@ -2145,12 +2195,9 @@ impl SimulatedNetwork {
         } = self;
         let delivered = flush_heap(pending_notifications, now, |scheduled| {
             let ScheduledNotification {
-                record,
-                payload,
-                provenance,
-                ..
+                record, payload, ..
             } = scheduled;
-            let (to, message_type) = (record.to, record.message_type);
+            let (from, to, message_type) = (record.from, record.to, record.message_type);
             if down.contains(&record.from)
                 || down.contains(&to)
                 || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
@@ -2171,7 +2218,7 @@ impl SimulatedNetwork {
                 return false;
             };
             // The simulator charges no peer, so the verdict changes nothing.
-            let _ = handler(payload, provenance);
+            let _ = handler(payload, peer(from));
             true
         });
         (delivered, stats)
@@ -4339,6 +4386,68 @@ mod tests {
                 (b"own".to_vec(), Provenance::Local),
             ]
         );
+    }
+
+    /// A host's notification to itself is dispatched in process as it is
+    /// sent, as production does: a partition or loss that takes every leg on
+    /// the wire never touches it, and it waits on no latency.
+    #[test]
+    fn a_hosts_notification_to_itself_is_handed_over_at_once() {
+        const TYPE: &str = "test.notification";
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 1.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let seen = record_notifications(&network, TYPE);
+        let mut streams = LinkStreams::new(42);
+        network.isolate_node(0);
+
+        network.accept_notifications(
+            0,
+            Duration::ZERO,
+            vec![PendingNotification {
+                recipients: vec![ValidatorId::new(0), ValidatorId::new(1)],
+                type_id: TYPE,
+                class: MessageClass::Bulk,
+                data: compression::compress(b"own"),
+            }],
+            &mut streams,
+        );
+
+        assert_eq!(
+            *seen[0].lock().unwrap(),
+            vec![(b"own".to_vec(), Provenance::Local)]
+        );
+        network.flush_notifications(FAR_FUTURE);
+        assert_eq!(seen[0].lock().unwrap().len(), 1);
+        assert!(seen[1].lock().unwrap().is_empty(), "the wire leg is lost");
+    }
+
+    /// A drop rule a scenario installs on a message type takes a host's
+    /// notification to itself too, so the cut holds wherever its
+    /// recipients sit.
+    #[test]
+    fn a_drop_rule_takes_a_hosts_notification_to_itself() {
+        const TYPE: &str = "test.notification";
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let seen = record_notifications(&network, TYPE);
+        let mut streams = LinkStreams::new(42);
+        let _rule = network.fault().drop_type(TYPE).install();
+
+        notify(&mut network, 0, 0, TYPE, b"own", &mut streams);
+
+        assert!(seen[0].lock().unwrap().is_empty());
     }
 
     /// A rewrite installed on a host reaches its notification to itself too,
