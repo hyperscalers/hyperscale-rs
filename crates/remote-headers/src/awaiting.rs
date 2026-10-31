@@ -54,6 +54,13 @@ impl<V> AwaitingTopologyBuffer<V> {
         }
     }
 
+    /// Whether any value buffered under `shard` satisfies `predicate`.
+    pub(crate) fn any_in(&self, shard: ShardId, predicate: impl FnMut(&V) -> bool) -> bool {
+        self.by_shard
+            .get(&shard)
+            .is_some_and(|queue| queue.iter().any(predicate))
+    }
+
     /// Remove and return every value buffered under `shard`, in FIFO order.
     pub(crate) fn drain_shard(&mut self, shard: ShardId) -> Vec<V> {
         self.by_shard

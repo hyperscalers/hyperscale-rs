@@ -409,6 +409,18 @@ impl RemoteHeaderCoordinator {
         // routing view.
         let (anchor, named_by) =
             self.committee_anchor_wt(topology_schedule, shard, certified_header.header());
+        // A copy identical to one parked for its parent would fail the same
+        // guessed check. The parked copy's check under its parent settles
+        // this one's verdict too, since both name the same item.
+        if named_by == HeaderCommittee::Guessed && self.parked_for_parent(&certified_header) {
+            trace!(
+                shard = shard.inner(),
+                height = height.inner(),
+                source = ?source,
+                "Remote header already parked for its parent — skipping"
+            );
+            return vec![];
+        }
         let committee = match topology_schedule.lookup_for_shard_certified_fenced(
             shard,
             anchor,
@@ -474,10 +486,11 @@ impl RemoteHeaderCoordinator {
     /// Handle QC verification result for a remote header.
     ///
     /// On success: promotes to verified, emits `RemoteHeaderAdmitted` continuation.
-    /// On failure: removes the failed candidate and tries the next source's
-    /// header. One that failed under a guessed `committee` is checked again
-    /// under the committee its parent names: at once if the parent is held
-    /// by now, otherwise once it arrives.
+    /// On failure: removes the failed candidate and every copy identical to
+    /// it, and tries the next source's header. One that failed under a
+    /// guessed `committee` is checked again under the committee its parent
+    /// names: at once if the parent is held by now, otherwise once it
+    /// arrives.
     pub fn on_remote_header_qc_verified(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -500,6 +513,7 @@ impl RemoteHeaderCoordinator {
                 );
 
                 self.drop_candidate(shard, height, source);
+                self.drop_identical_candidates(certified_header);
                 let mut actions = self.dispatch_next_candidate(topology_schedule, shard, height);
                 // A header that failed under a guess may be honest: it is
                 // checked again under its parent's committee, even when the
@@ -1004,6 +1018,27 @@ impl RemoteHeaderCoordinator {
     /// Drop `source`'s pending candidate at `(shard, height)`.
     fn drop_candidate(&mut self, shard: ShardId, height: BlockHeight, source: HeaderSource) {
         if let Some(store) = self.shards.get_mut(&shard) {
+            store.remove_candidate(height, source);
+        }
+    }
+
+    /// Drop every candidate identical to `failed`, whose check just failed:
+    /// they are one item, which that check settled for all of them. One
+    /// that failed under a guessed committee is checked again on `failed`
+    /// itself once its parent names the committee.
+    fn drop_identical_candidates(&mut self, failed: &CertifiedBlockHeader) {
+        let height = failed.height();
+        let Some(store) = self.shards.get_mut(&failed.shard_id()) else {
+            return;
+        };
+        let identical: Vec<HeaderSource> = store
+            .pending(height)
+            .into_iter()
+            .flatten()
+            .filter(|(_, candidate)| *candidate == failed)
+            .map(|(source, _)| *source)
+            .collect();
+        for source in identical {
             store.remove_candidate(height, source);
         }
     }
@@ -1740,10 +1775,20 @@ impl RemoteHeaderCoordinator {
         }]
     }
 
+    /// Whether a copy identical to `certified_header` is parked for its
+    /// parent. One parked copy stands for every identical one: they are one
+    /// item to verify and to settle.
+    fn parked_for_parent(&self, certified_header: &CertifiedBlockHeader) -> bool {
+        self.awaiting_parent
+            .any_in(certified_header.shard_id(), |(_, parked)| {
+                parked == certified_header
+            })
+    }
+
     /// Re-offer the headers of `shard` whose parent is now held or attested
-    /// at the beacon's boundary, keeping the rest parked. A re-offered header resolves under its parent, so
-    /// one that fails again is dropped rather than parked: each is checked
-    /// at most once more.
+    /// at the beacon's boundary, keeping the rest parked. A re-offered
+    /// header resolves under its parent, so one that fails again is dropped
+    /// rather than parked: each is checked at most once more.
     fn reoffer_awaiting_parent(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -2199,6 +2244,25 @@ mod tests {
         CertifiedBlockHeader::new(header, qc)
     }
 
+    /// `certified` under a QC that differs from its own in the round alone:
+    /// another copy of the same block, not an identical one.
+    fn recertified(certified: &CertifiedBlockHeader) -> CertifiedBlockHeader {
+        let qc = certified.qc();
+        CertifiedBlockHeader::new(
+            certified.header().clone(),
+            QuorumCertificate::new(
+                qc.block_hash(),
+                qc.shard_id(),
+                qc.height(),
+                BlockHash::ZERO,
+                Round::new(1),
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                qc.weighted_timestamp(),
+            ),
+        )
+    }
+
     /// A QC over block `h` is signed by `committee(h)`, which anchors on
     /// `h-1` — so a header whose parent sits below an epoch cut verifies
     /// under the earlier window however far past the cut it dates itself.
@@ -2378,7 +2442,8 @@ mod tests {
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
 
         // The parent anchors below the cut, the child above it. Two senders
-        // offer the child: the first dispatches, the second waits pending.
+        // offer the child, each under its own QC: the first dispatches, the
+        // second waits pending.
         let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
         let child =
             chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
@@ -2389,7 +2454,7 @@ mod tests {
             ValidatorId::new(1),
         );
         let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
-        let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(3));
+        let _ = coord.on_remote_header_received(&schedule, recertified(&child), gossip(3));
 
         let retried = coord.on_remote_header_qc_verified(
             &schedule,
@@ -2649,6 +2714,120 @@ mod tests {
             verify_qc_committee(&actions),
             Some(HeaderCommittee::Resolved),
             "the parked header is checked again under the boundary's committee",
+        );
+    }
+
+    fn verify_qc_count(actions: &[Action]) -> usize {
+        actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::Consensus(ConsensusAction::VerifyRemoteHeaderQc { .. })
+                )
+            })
+            .count()
+    }
+
+    /// A copy identical to one parked for its parent is not checked again
+    /// under the same guess, while another copy of the block is.
+    #[test]
+    fn a_copy_identical_to_a_parked_header_is_not_checked_again() {
+        const ED: u64 = 1_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(0),
+            Arc::new(shard_snapshot(2, &ids, 0)),
+        );
+        schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+
+        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
+        let child =
+            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+        let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
+        let _ = coord.on_remote_header_qc_verified(
+            &schedule,
+            &child,
+            gossip(1),
+            Err(CertifiedHeaderVerifyError::Qc(
+                QcVerifyError::InvalidSignature,
+            )),
+            HeaderCommittee::Guessed,
+        );
+
+        let actions = coord.on_remote_header_received(&schedule, child.clone(), gossip(2));
+        assert_eq!(
+            verify_qc_count(&actions),
+            0,
+            "the parked copy stands for it"
+        );
+        let actions = coord.on_remote_header_received(&schedule, recertified(&child), gossip(3));
+        assert_eq!(verify_qc_count(&actions), 1, "another copy is its own item");
+    }
+
+    /// Identical copies queued behind a check that fails are settled by it
+    /// and dropped with it, and park as one: once the parent names the
+    /// committee, the block is checked once, and a failure there leaves no
+    /// identical copy to check after it.
+    #[test]
+    fn identical_copies_fail_and_park_as_one() {
+        const ED: u64 = 1_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(0),
+            Arc::new(shard_snapshot(2, &ids, 0)),
+        );
+        schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+
+        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
+        let child =
+            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+        let forged = Err(CertifiedHeaderVerifyError::Qc(
+            QcVerifyError::InvalidSignature,
+        ));
+
+        let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
+        let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(2));
+        let actions = coord.on_remote_header_qc_verified(
+            &schedule,
+            &child,
+            gossip(1),
+            forged.clone(),
+            HeaderCommittee::Guessed,
+        );
+        assert_eq!(
+            verify_qc_count(&actions),
+            0,
+            "the identical copy queued behind fails with it",
+        );
+
+        let actions = coord.on_verified_remote_header_received(
+            &schedule,
+            Verified::new_unchecked_for_test(parent),
+            ValidatorId::new(1),
+        );
+        assert_eq!(
+            verify_qc_count(&actions),
+            1,
+            "the parent re-offers the block once"
+        );
+        let actions = coord.on_remote_header_qc_verified(
+            &schedule,
+            &child,
+            gossip(1),
+            forged,
+            HeaderCommittee::Resolved,
+        );
+        assert_eq!(
+            verify_qc_count(&actions),
+            0,
+            "no identical copy is left to check"
         );
     }
 
