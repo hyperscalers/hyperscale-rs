@@ -599,6 +599,17 @@ fn a_wire_proposal_reaches_the_loop_only_once_checked() {
 /// for `epoch` from a peer: the handler defers it, and the participants'
 /// check of the evidence settles it.
 fn settled_on_notified(fix: &Fixture, epoch: Epoch, proposal: BeaconProposal) -> Verdict {
+    settled_on_notified_after(fix, epoch, proposal, |_, _| {})
+}
+
+/// [`settled_on_notified`], once `before` has run on the host with
+/// `committee[0]` seated.
+fn settled_on_notified_after(
+    fix: &Fixture,
+    epoch: Epoch,
+    proposal: BeaconProposal,
+    before: impl FnOnce(&mut Host, &Receiver<HostEvent>),
+) -> Verdict {
     let registry = Arc::new(HandlerRegistry::new(BTreeSet::from([SHARD])));
     let (mut host, events) = fix.host_through_network(
         SimNetworkAdapter::new(Arc::clone(&registry)),
@@ -608,6 +619,7 @@ fn settled_on_notified(fix: &Fixture, epoch: Epoch, proposal: BeaconProposal) ->
     while let Ok(event) = events.try_recv() {
         let _ = host.step(event);
     }
+    before(&mut host, &events);
     let handler = registry
         .get_notification(BeaconProposalNotification::message_type_id())
         .expect("the host handles beacon proposals");
@@ -657,14 +669,10 @@ fn signed_proposal(
     .into_inner()
 }
 
-/// A proposal its author signed over forged equivocation evidence is
-/// held against the peer that notified it: only its author notifies a
-/// proposal, and no honest author carries evidence that fails under the
-/// accused's registered key.
-#[test]
-fn a_peer_notifying_forged_evidence_is_refused() {
-    let fix = Fixture::new();
-    let forged = PcVoteEquivocation {
+/// Epoch-1 equivocation evidence against `committee[2]` whose signatures
+/// fail under its registered key.
+fn forged_equivocation(fix: &Fixture) -> PcVoteEquivocation {
+    PcVoteEquivocation {
         validator: fix.committee.validator_id(2),
         epoch: Epoch::new(1),
         view: SpcView::new(0),
@@ -673,11 +681,96 @@ fn a_peer_notifying_forged_evidence_is_refused() {
         sig_a: ConsensusSignature::ZERO,
         value_b: PcVector::new([PcValueElement::new([0xBB; 32])]),
         sig_b: ConsensusSignature::ZERO,
-    };
-    let proposal = signed_proposal(&fix, 1, Epoch::new(1), vec![forged]);
+    }
+}
+
+/// A proposal its author signed over forged equivocation evidence is
+/// held against the peer that notified it: only its author notifies a
+/// proposal, and no honest author carries evidence that fails under the
+/// accused's registered key.
+#[test]
+fn a_peer_notifying_forged_evidence_is_refused() {
+    let fix = Fixture::new();
+    let proposal = signed_proposal(&fix, 1, Epoch::new(1), vec![forged_equivocation(&fix)]);
     assert_eq!(
         settled_on_notified(&fix, Epoch::new(1), proposal),
         Verdict::Reject,
+    );
+}
+
+/// The verdict a host settles on `committee[1]`'s notification of its
+/// epoch-1 `proposal`, once the input dwell has already fetched that same
+/// proposal and evaluated it. `pooled` is whether the fetched copy is
+/// expected to have entered the pool.
+fn settled_on_notified_after_its_fetch(
+    fix: &Fixture,
+    proposal: BeaconProposal,
+    pooled: bool,
+) -> Verdict {
+    let epoch = Epoch::new(1);
+    let author = fix.committee.validator_id(1);
+    let fetched = Verified::new_unchecked_for_test(proposal.clone());
+    settled_on_notified_after(fix, epoch, proposal, |host, events| {
+        let participant = attachment(host, 0, fix);
+        for event in [
+            ProtocolEvent::BeaconCommitteeStartTimer,
+            ProtocolEvent::BeaconSpcInputDwellTimer,
+        ] {
+            let _ = host.step(HostEvent::Beacon(BeaconScopedInput::ParticipantTimer {
+                participant,
+                event: Box::new(event),
+            }));
+            while let Ok(event) = events.try_recv() {
+                let _ = host.step(event);
+            }
+        }
+        assert!(
+            host.network()
+                .drain_pending_requests()
+                .iter()
+                .any(|request| request
+                    .request::<GetBeaconProposalRequest>()
+                    .is_some_and(|request| request.validator == author)),
+            "the dwell asks for the author's missing proposal",
+        );
+        let _ = host.step(HostEvent::Beacon(BeaconScopedInput::Answered {
+            ids: proposals(&[(epoch, author)]),
+            event: Box::new(ProtocolEvent::BeaconProposalFetched {
+                epoch,
+                validator: author,
+                proposal: fetched,
+            }),
+        }));
+        while let Ok(event) = events.try_recv() {
+            let _ = host.step(event);
+        }
+        assert_eq!(
+            host.beacon
+                .participant(fix.committee.validator_id(0))
+                .expect("the participant runs")
+                .proposal_pool()
+                .get(author)
+                .is_some(),
+            pooled,
+        );
+    })
+}
+
+/// A proposal the input dwell fetched and refuted is still held against
+/// its author when the author's own notification of it arrives later;
+/// one the fetch admitted is not.
+#[test]
+fn a_notified_proposal_fetched_first_settles_on_its_evaluation() {
+    let fix = Fixture::new();
+    let forged = signed_proposal(&fix, 1, Epoch::new(1), vec![forged_equivocation(&fix)]);
+    assert_eq!(
+        settled_on_notified_after_its_fetch(&fix, forged, false),
+        Verdict::Reject,
+    );
+    let honest = signed_proposal(&fix, 1, Epoch::new(1), Vec::new());
+    assert_eq!(
+        settled_on_notified_after_its_fetch(&fix, honest, true),
+        Verdict::Accept,
     );
 }
 

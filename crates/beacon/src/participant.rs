@@ -113,6 +113,13 @@ pub enum ProposalAdmission {
     Refuted,
 }
 
+/// One proposer's evaluation slot for the in-flight epoch: the copy it
+/// judged, by its PC element, and what it made of that copy.
+struct Evaluation {
+    element: PcValueElement,
+    admission: ProposalAdmission,
+}
+
 /// One validator's beacon consensus duty.
 pub struct BeaconParticipant {
     me: ValidatorId,
@@ -197,7 +204,11 @@ pub struct BeaconParticipant {
     /// dwell asks at most once per re-arm, so the work stays bounded by
     /// [`MAX_INPUT_DWELL_REARMS`] per member. Cleared on adoption
     /// alongside the proposal-pool reset.
-    evaluated_proposers: BTreeSet<ValidatorId>,
+    ///
+    /// Each slot keeps what its evaluation made of the copy it judged, so
+    /// a later arrival of that same copy, however the first came in, is
+    /// answered with the same admission rather than judged again.
+    evaluated_proposers: BTreeMap<ValidatorId, Evaluation>,
 
     /// Committee members whose in-flight-epoch proposal the input dwell
     /// has asked peers for. A proposal lost on gossip still reaches
@@ -275,7 +286,7 @@ impl BeaconParticipant {
             vote_equivocations_observed: VoteEquivocationObservations::new(),
             proposal_pool: BeaconProposalPool::new(fold.state.current_epoch.next()),
             proposed: None,
-            evaluated_proposers: BTreeSet::new(),
+            evaluated_proposers: BTreeMap::new(),
             dwell_fetches: BTreeSet::new(),
             awaiting_boundaries: BTreeMap::new(),
             boundary_asks: BTreeSet::new(),
@@ -760,9 +771,22 @@ impl BeaconParticipant {
                 );
                 return (ProposalAdmission::Abstained, Vec::new());
             }
-            if !self.evaluated_proposers.insert(from) {
-                return (ProposalAdmission::Abstained, Vec::new());
+            let element = proposal.pc_element_hash(epoch);
+            if let Some(evaluated) = self.evaluated_proposers.get(&from) {
+                let admission = if evaluated.element == element {
+                    evaluated.admission
+                } else {
+                    ProposalAdmission::Abstained
+                };
+                return (admission, Vec::new());
             }
+            self.evaluated_proposers.insert(
+                from,
+                Evaluation {
+                    element,
+                    admission: ProposalAdmission::Abstained,
+                },
+            );
             let upgraded = fold
                 .upgrade_proposal_equivocations(&proposal)
                 .and_then(|upgraded| fold.upgrade_proposal_vote_equivocations(&upgraded))
@@ -776,7 +800,7 @@ impl BeaconParticipant {
                         ?admission,
                         "BeaconProposalReceived carries unverifiable evidence — dropping",
                     );
-                    return (admission, Vec::new());
+                    return (self.record_evaluation(from, admission), Vec::new());
                 }
             };
             // A boundary is judged against this member's view of the
@@ -816,6 +840,7 @@ impl BeaconParticipant {
             );
             return (ProposalAdmission::Abstained, Vec::new());
         }
+        let admission = self.record_evaluation(from, ProposalAdmission::Admitted);
         if self.spc.should_feed_view_one_input(epoch) {
             let pooled = fold
                 .state
@@ -830,13 +855,24 @@ impl BeaconParticipant {
             // [`MAX_INPUT_DWELL_REARMS`]); the dwell handles a member whose
             // proposal never arrives.
             if pooled == fold.state.committee.len() {
-                return (
-                    ProposalAdmission::Admitted,
-                    self.feed_view_one_input(fold, epoch),
-                );
+                return (admission, self.feed_view_one_input(fold, epoch));
             }
         }
-        (ProposalAdmission::Admitted, Vec::new())
+        (admission, Vec::new())
+    }
+
+    /// Keep `admission` as what `from`'s evaluation slot made of the copy
+    /// it judged, and return it. A no-op for a sender with no slot: the
+    /// local member's own proposal is never judged.
+    fn record_evaluation(
+        &mut self,
+        from: ValidatorId,
+        admission: ProposalAdmission,
+    ) -> ProposalAdmission {
+        if let Some(evaluated) = self.evaluated_proposers.get_mut(&from) {
+            evaluated.admission = admission;
+        }
+        admission
     }
 
     /// Build view 1's local input vector from the current pool view and
