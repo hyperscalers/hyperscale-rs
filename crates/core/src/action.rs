@@ -15,11 +15,11 @@ use hyperscale_types::{
     BlockManifest, BlockVote, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EpochWindows, EscrowedValue,
     ExecutionCertificate, ExecutionVote, Finalization, FrontierInputs, GlobalReceiptRoot, Hash,
-    HeaderFetchCount, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
-    PriceTable, ProposerTimestamp, ProvisionTxRootsMap, Provisions, QuorumCertificate, RatifyPhase,
-    RatifyRound, RatifyVote, ReadFence, ReadySignal, ReshapeKind, ReshapeThresholds,
-    ReshapeTrigger, ResolvedCommittee, RevealChain, Round, SettledTxsRoot, Settling,
-    ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedTransactions,
+    HeaderFetchCount, HeaderSource, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
+    PcVoteEquivocation, PriceTable, ProposerTimestamp, ProvisionTxRootsMap, Provisions,
+    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadFence, ReadySignal, ReshapeKind,
+    ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, SettledTxsRoot,
+    Settling, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedTransactions,
     SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
     SpcView, SplitChildRoots, StandingAnswers, StateClaim, StateRoot, SubstateClaim, SubstateEntry,
     SubstateKey, SweepFrontier, TickId, Timeout, TimeoutCertificate, TopologySchedule,
@@ -789,10 +789,10 @@ pub enum Action {
     VerifyRemoteHeaderQc {
         /// The remote header to verify.
         certified_header: CertifiedBlockHeader,
-        /// Sender of the candidate header; threaded back through the
+        /// Source of the candidate header; threaded back through the
         /// callback so the coordinator can remove the failed candidate
         /// from its pending map on error.
-        sender: ValidatorId,
+        source: HeaderSource,
         /// Public keys for the remote shard's committee (from topology).
         committee_public_keys: Vec<ConsensusPublicKey>,
         /// Quorum threshold for the remote shard.

@@ -18,15 +18,15 @@ use hyperscale_types::{
     CandidateBeaconBlockVerifyError, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
     CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, CheckOutcome, Epoch,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationVerifyError, Hash, LeafIndex, MerkleInclusionProof, PcVote1, PcVote1VerifyError,
-    PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provisions, ProvisionsVerifyError,
-    QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError,
-    ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
-    SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
-    SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StandingAnswers, StateClaim,
-    StoredReceipt, SubstateKey, TickId, Timeout, TopologySchedule, Transaction, TxHash, TxOutcome,
-    TxResolution, ValidatorId, VerdictCells, Verifiable, VerificationKind, Verified,
-    WeightedTimestamp,
+    FinalizationVerifyError, Hash, HeaderSource, LeafIndex, MerkleInclusionProof, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provisions,
+    ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
+    RatifyVoteVerifyError, ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
+    ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    StandingAnswers, StateClaim, StoredReceipt, SubstateKey, TickId, Timeout, TopologySchedule,
+    Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells, Verifiable,
+    VerificationKind, Verified, WeightedTimestamp,
 };
 
 use crate::action::{CrossShardExecutionRequest, QcSubject};
@@ -118,14 +118,12 @@ pub enum ProtocolEvent {
     /// Received a committed block header from a remote shard whose QC
     /// still needs to be checked. Produced by gossip and sync paths —
     /// wire decode always lands the wrapper in `Verifiable::Unverified`.
-    ///
-    /// The `sender` field is the authenticated sender identity — `IoLoop`
-    /// verified the sender's signature before admitting this event.
     UnverifiedRemoteHeaderReceived {
         /// Header + QC bundle from the remote shard.
         certified_header: CertifiedBlockHeader,
-        /// Authenticated sender identity (signature-verified by `IoLoop`).
-        sender: ValidatorId,
+        /// Where the copy came from: a gossip sender whose signature
+        /// `IoLoop` verified before admitting this event, or a fetch.
+        source: HeaderSource,
     },
 
     /// Every peer a remote-header range fetch from `source_shard` reached
@@ -323,9 +321,9 @@ pub enum ProtocolEvent {
         /// from this copy, which outlives the pending entry it was
         /// dispatched from.
         certified_header: CertifiedBlockHeader,
-        /// Sender of the candidate header — needed by the coordinator to
+        /// Source of the candidate header — needed by the coordinator to
         /// remove the failed candidate from its pending map on error.
-        sender: ValidatorId,
+        source: HeaderSource,
         /// Verified composite on success (full predicate: QC verified +
         /// linkage check, BFT-transitive header trust via the source
         /// committee — see

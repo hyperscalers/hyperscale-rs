@@ -13,8 +13,21 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeader, BlockHeight, Hash, QcVerifyError, QuorumCertificate, ShardId,
-    StateRoot, Verifiable, Verified,
+    StateRoot, ValidatorId, Verifiable, Verified,
 };
+
+/// Where a copy of a remote [`CertifiedBlockHeader`] came from.
+///
+/// Orders gossiped copies before fetched ones, so a gossiped copy is the
+/// first of a height's candidates to be checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HeaderSource {
+    /// Gossiped under this validator's signature, which held.
+    Gossip(ValidatorId),
+    /// Fetched: no peer vouches for the copy, which stands on its
+    /// quorum certificate alone.
+    Fetched,
+}
 
 /// Failure modes of [`CertifiedBlockHeader`] verification.
 ///

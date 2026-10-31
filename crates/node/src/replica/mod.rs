@@ -373,11 +373,11 @@ impl StateMachine for NodeStateMachine {
             // `RemoteHeaderAdmitted`.
             ProtocolEvent::UnverifiedRemoteHeaderReceived {
                 certified_header,
-                sender,
+                source,
             } => self
                 .shard
                 .remote_headers_coordinator
-                .on_remote_header_received(sched, certified_header, sender),
+                .on_remote_header_received(sched, certified_header, source),
             ProtocolEvent::VerifiedRemoteHeaderReceived {
                 certified_header,
                 sender,
@@ -398,12 +398,12 @@ impl StateMachine for NodeStateMachine {
             }
             ProtocolEvent::RemoteHeaderQcVerified {
                 certified_header,
-                sender,
+                source,
                 result,
             } => self
                 .shard
                 .remote_headers_coordinator
-                .on_remote_header_qc_verified(sched, &certified_header, sender, *result),
+                .on_remote_header_qc_verified(sched, &certified_header, source, *result),
             ProtocolEvent::CommitProofNeeded {
                 source_shard,
                 block_height,

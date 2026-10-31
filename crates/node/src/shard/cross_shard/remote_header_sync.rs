@@ -21,7 +21,9 @@ use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetRemoteHeadersRequest;
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
-use hyperscale_types::{BlockHeight, CertifiedBlockHeader, HeaderFetchCount, ShardId, ValidatorId};
+use hyperscale_types::{
+    BlockHeight, CertifiedBlockHeader, HeaderFetchCount, HeaderSource, ShardId,
+};
 
 use crate::event::{FetchFailureKind, ShardScopedInput, classify_fetch_error};
 use crate::shard::{ShardLoop, push_shard_input};
@@ -218,11 +220,9 @@ where
         let mut delivered_heights = Vec::with_capacity(headers.len());
         for header in headers {
             delivered_heights.push(header.header().height());
-            // The `sender` field carries no meaning for fetched headers —
-            // a sentinel value avoids confusion with real validator ids.
             self.dispatch_event(ProtocolEvent::UnverifiedRemoteHeaderReceived {
                 certified_header: header,
-                sender: ValidatorId::new(u64::MAX),
+                source: HeaderSource::Fetched,
             });
         }
         delivered_heights

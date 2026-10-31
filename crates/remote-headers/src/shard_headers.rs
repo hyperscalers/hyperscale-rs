@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use hyperscale_types::{
-    BlockHeight, CertifiedBlockHeader, ValidatorId, Verified, WeightedTimestamp,
+    BlockHeight, CertifiedBlockHeader, HeaderSource, Verified, WeightedTimestamp,
 };
 
 use crate::coordinator::RemoteHeaderMemoryStats;
@@ -48,11 +48,11 @@ pub struct ShardHeaders {
     /// meaningful when remote block cadence varies.
     tip: (BlockHeight, WeightedTimestamp),
 
-    /// Headers received but not yet QC-verified, one candidate per sender.
-    /// Multiple senders may gossip the same header; all candidates are kept
-    /// until QC verification picks the valid one. A height holds at least
-    /// one candidate.
-    pending: BTreeMap<BlockHeight, BTreeMap<ValidatorId, CertifiedBlockHeader>>,
+    /// Headers received but not yet QC-verified, one candidate per source.
+    /// Multiple sources may deliver the same header; all candidates are
+    /// kept until QC verification picks the valid one. A height holds at
+    /// least one candidate.
+    pending: BTreeMap<BlockHeight, BTreeMap<HeaderSource, CertifiedBlockHeader>>,
     /// `pending` by its newest candidate's timestamp: a height is retained
     /// while any of its candidates is.
     pending_by_age: BTreeSet<(WeightedTimestamp, BlockHeight)>,
@@ -118,7 +118,7 @@ impl ShardHeaders {
     pub fn pending(
         &self,
         height: BlockHeight,
-    ) -> Option<&BTreeMap<ValidatorId, CertifiedBlockHeader>> {
+    ) -> Option<&BTreeMap<HeaderSource, CertifiedBlockHeader>> {
         self.pending.get(&height)
     }
 
@@ -166,20 +166,20 @@ impl ShardHeaders {
             .min()
     }
 
-    /// Hold `header` as `sender`'s candidate at `height`.
+    /// Hold `header` as `source`'s candidate at `height`.
     pub fn add_candidate(
         &mut self,
         height: BlockHeight,
-        sender: ValidatorId,
+        source: HeaderSource,
         header: CertifiedBlockHeader,
     ) -> Candidate {
         let before = self.pending_age(height);
         let candidates = self.pending.entry(height).or_default();
-        if candidates.contains_key(&sender) {
+        if candidates.contains_key(&source) {
             return Candidate::Duplicate;
         }
         let first = candidates.is_empty();
-        candidates.insert(sender, header);
+        candidates.insert(source, header);
         self.reindex_pending(height, before);
         if first {
             Candidate::First
@@ -188,16 +188,16 @@ impl ShardHeaders {
         }
     }
 
-    /// Drop `sender`'s candidate at `height`, and the height with it once
+    /// Drop `source`'s candidate at `height`, and the height with it once
     /// no candidate is left.
     pub fn remove_candidate(
         &mut self,
         height: BlockHeight,
-        sender: ValidatorId,
+        source: HeaderSource,
     ) -> Option<CertifiedBlockHeader> {
         let before = self.pending_age(height);
         let candidates = self.pending.get_mut(&height)?;
-        let removed = candidates.remove(&sender);
+        let removed = candidates.remove(&source);
         if candidates.is_empty() {
             self.pending.remove(&height);
         }
@@ -205,16 +205,16 @@ impl ShardHeaders {
         removed
     }
 
-    /// The lowest-sender candidate at `height`: the next to verify.
+    /// The lowest-source candidate at `height`: the next to verify.
     pub fn first_candidate(
         &self,
         height: BlockHeight,
-    ) -> Option<(ValidatorId, CertifiedBlockHeader)> {
+    ) -> Option<(HeaderSource, CertifiedBlockHeader)> {
         self.pending
             .get(&height)?
             .iter()
             .next()
-            .map(|(sender, header)| (*sender, header.clone()))
+            .map(|(source, header)| (*source, header.clone()))
     }
 
     /// Drop every candidate at `height`.
@@ -471,10 +471,14 @@ impl ShardHeaders {
 mod tests {
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ProposerTimestamp,
-        QuorumCertificate, Round, ShardId, SignerBitfield,
+        QuorumCertificate, Round, ShardId, SignerBitfield, ValidatorId,
     };
 
     use super::*;
+
+    const fn gossip(sender: u64) -> HeaderSource {
+        HeaderSource::Gossip(ValidatorId::new(sender))
+    }
 
     /// A header at `height` whose parent QC stamps `parent_qc_wt`.
     fn header_at(height: BlockHeight, parent_qc_wt: u64) -> CertifiedBlockHeader {
@@ -521,15 +525,15 @@ mod tests {
         let mut store = ShardHeaders::default();
 
         assert_eq!(
-            store.add_candidate(height, ValidatorId::new(1), old.clone()),
+            store.add_candidate(height, gossip(1), old.clone()),
             Candidate::First
         );
         assert_eq!(
-            store.add_candidate(height, ValidatorId::new(2), new),
+            store.add_candidate(height, gossip(2), new),
             Candidate::Queued
         );
         assert_eq!(
-            store.add_candidate(height, ValidatorId::new(2), old),
+            store.add_candidate(height, gossip(2), old),
             Candidate::Duplicate
         );
         store.assert_indexed();
@@ -542,7 +546,7 @@ mod tests {
         );
         store.assert_indexed();
 
-        store.remove_candidate(height, ValidatorId::new(2));
+        store.remove_candidate(height, gossip(2));
         store.assert_indexed();
         store.prune(cutoff, WeightedTimestamp::ZERO, None);
         assert!(

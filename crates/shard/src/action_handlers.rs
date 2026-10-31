@@ -1013,7 +1013,7 @@ where
 
         Action::VerifyRemoteHeaderQc {
             certified_header,
-            sender,
+            source,
             committee_public_keys,
             quorum_threshold,
         } => {
@@ -1059,7 +1059,7 @@ where
             );
             ctx.notify_protocol(ProtocolEvent::RemoteHeaderQcVerified {
                 certified_header,
-                sender,
+                source,
                 result,
             });
         }

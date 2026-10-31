@@ -30,8 +30,8 @@ use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::{
-    CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ShardForkProof, Signed,
-    SignedContext, Stopwatch, ValidatorId, Verifiable,
+    CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, HeaderSource, ShardForkProof,
+    Signed, SignedContext, Stopwatch, ValidatorId, Verifiable,
 };
 
 use super::CertifiedHeaderVerificationItem;
@@ -129,7 +129,7 @@ where
                             shard,
                             ProtocolEvent::UnverifiedRemoteHeaderReceived {
                                 certified_header: raw,
-                                sender: gossip.sender,
+                                source: HeaderSource::Gossip(gossip.sender),
                             },
                         );
                     } else {

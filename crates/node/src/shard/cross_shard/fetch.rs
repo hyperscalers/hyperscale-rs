@@ -22,9 +22,8 @@ use hyperscale_types::network::response::{
 };
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    Anchor, BlockHeight, Finalization, FinalizationHash, ProvisionHash, Provisions, ShardId,
-    SubstateKey, TerminalEvidence, ValidatorId, VerdictCells, Verifiable,
-    settled_txs_root_from_hashes,
+    Anchor, BlockHeight, Finalization, FinalizationHash, HeaderSource, ProvisionHash, Provisions,
+    ShardId, SubstateKey, TerminalEvidence, VerdictCells, Verifiable, settled_txs_root_from_hashes,
 };
 
 use crate::event::ShardScopedInput;
@@ -109,8 +108,7 @@ impl SolicitedAnswer for LocalProvisionBinding {
 
     /// The bundled source header goes ahead of its provisions, so the
     /// verification pipeline has a chance to admit it first. The header
-    /// is QC-self-authenticating; sender is the fetched-header sentinel
-    /// (no peer attestation).
+    /// is QC-self-authenticating.
     fn deliver(kept: Vec<LocalProvisionEntry>) -> Vec<ShardScopedInput> {
         let mut inputs = Vec::with_capacity(kept.len() * 2);
         for entry in kept {
@@ -118,7 +116,7 @@ impl SolicitedAnswer for LocalProvisionBinding {
                 inputs.push(ShardScopedInput::Protocol(Box::new(
                     ProtocolEvent::UnverifiedRemoteHeaderReceived {
                         certified_header,
-                        sender: ValidatorId::new(u64::MAX),
+                        source: HeaderSource::Fetched,
                     },
                 )));
             }

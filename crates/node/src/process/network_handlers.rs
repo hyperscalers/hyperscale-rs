@@ -29,7 +29,7 @@ use hyperscale_types::network::request::beacon::{
 use hyperscale_types::network::request::{GetFinalizationsRequest, GetLocalProvisionsRequest};
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    BeaconProposal, ExecutionCertificate, ShardId, Signed, Verifiable, signed_bytes,
+    BeaconProposal, ExecutionCertificate, HeaderSource, ShardId, Signed, Verifiable, signed_bytes,
 };
 use tracing::warn;
 
@@ -140,7 +140,7 @@ where
                             Err(certified_header) => {
                                 ProtocolEvent::UnverifiedRemoteHeaderReceived {
                                     certified_header,
-                                    sender,
+                                    source: HeaderSource::Gossip(sender),
                                 }
                             }
                         };

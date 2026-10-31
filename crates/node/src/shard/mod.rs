@@ -944,9 +944,10 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-        ChainOrigin, Epoch, FrontierInputs, LocalTimestamp, ProposerTimestamp, QuorumCertificate,
-        Round, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, SignerBitfield, StateRoot,
-        SweepFrontier, TopologySchedule, ValidatorId, Verified, VotePosition, WeightedTimestamp,
+        ChainOrigin, Epoch, FrontierInputs, HeaderSource, LocalTimestamp, ProposerTimestamp,
+        QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
+        SignerBitfield, StateRoot, SweepFrontier, TopologySchedule, ValidatorId, Verified,
+        VotePosition, WeightedTimestamp,
     };
 
     use crate::event::{BeaconScopedInput, HostEvent};
@@ -1513,7 +1514,7 @@ mod tests {
         let certified = CertifiedBlockHeader::new(header, qc);
         loop_of(&mut host).dispatch_event(ProtocolEvent::RemoteHeaderQcVerified {
             certified_header: certified.clone(),
-            sender: fix.committee.validator_id(2),
+            source: HeaderSource::Gossip(fix.committee.validator_id(2)),
             result: Box::new(Ok(Verified::new_unchecked_for_test(certified))),
         });
         let fetches = remote_fetches(&host);
