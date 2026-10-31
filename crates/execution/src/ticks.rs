@@ -26,7 +26,7 @@
 //! - [`check_vote_retry_timeouts`](TickRegistry::check_vote_retry_timeouts)
 //!   returns a `Vec<RetryEffect>` — the coordinator resolves the attesting
 //!   committee via topology and wraps each as
-//!   `Action::SignAndSendExecutionVote`.
+//!   `ExecutionAction::SignAndSendExecutionVote`.
 //! - [`classify_attestation`](TickRegistry::classify_attestation) returns
 //!   [`AttestationRouting`] — the coordinator fans out into
 //!   `EarlyArrivalBuffer::buffer_ec` / `clear_routed` and walks the affected
@@ -71,7 +71,7 @@ pub struct PendingVoteRetry {
 }
 
 /// One retry the coordinator should lift to an
-/// `Action::SignAndSendExecutionVote` by resolving the attesting committee
+/// `ExecutionAction::SignAndSendExecutionVote` by resolving the attesting committee
 /// via topology.
 #[derive(Debug, Clone)]
 pub struct RetryEffect {

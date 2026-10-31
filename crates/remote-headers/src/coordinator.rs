@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::{Action, ConsensusAction, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
@@ -286,7 +286,7 @@ impl RemoteHeaderCoordinator {
     /// Handle a committed block header that arrived already verified —
     /// emitted by a colocated proposer through the local-dispatch fast
     /// path (see [`ProtocolEvent::VerifiedRemoteHeaderReceived`]). Skips
-    /// the pending bookkeeping and the `Action::VerifyRemoteHeaderQc`
+    /// the pending bookkeeping and the `ConsensusAction::VerifyRemoteHeaderQc`
     /// dispatch, promoting straight to the verified map and emitting
     /// the same `RemoteHeaderAdmitted` continuation downstream consumers
     /// already expect.
@@ -1938,12 +1938,12 @@ impl RemoteHeaderCoordinator {
             .collect();
         let quorum_threshold = topology_snapshot.quorum_threshold_for_shard(shard);
 
-        vec![Action::VerifyRemoteHeaderQc {
+        vec![Action::Consensus(ConsensusAction::VerifyRemoteHeaderQc {
             certified_header,
             source,
             committee_public_keys,
             quorum_threshold,
-        }]
+        })]
     }
 
     /// Whether `shard` resolves a non-empty committee for request routing at
@@ -2370,10 +2370,10 @@ mod tests {
 
     fn verify_qc_keys(actions: &[Action]) -> Option<&Vec<ConsensusPublicKey>> {
         actions.iter().find_map(|a| match a {
-            Action::VerifyRemoteHeaderQc {
+            Action::Consensus(ConsensusAction::VerifyRemoteHeaderQc {
                 committee_public_keys,
                 ..
-            } => Some(committee_public_keys),
+            }) => Some(committee_public_keys),
             _ => None,
         })
     }

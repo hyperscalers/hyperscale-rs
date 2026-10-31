@@ -50,7 +50,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
+    Action, CrossShardExecutionRequest, ExecutionAction, FetchIds, FetchRequest, ProtocolEvent,
+    ProvisionAction, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Member, abandoned_never};
 use hyperscale_engine::tick_select::{
@@ -845,16 +846,18 @@ impl ExecutionCoordinator {
             };
             let (recipients, local_recipient) =
                 self.addressed(vec![tick_leader(tick_id, &committee)]);
-            actions.push(Action::SignAndSendExecutionVote {
-                block_hash: tick.block_hash(),
-                vote_anchor_ts,
-                tick_id: *tick_id,
-                global_receipt_root,
-                tx_outcomes,
-                recipients,
-                local_recipient,
-                signer,
-            });
+            actions.push(Action::Execution(
+                ExecutionAction::SignAndSendExecutionVote {
+                    block_hash: tick.block_hash(),
+                    vote_anchor_ts,
+                    tick_id: *tick_id,
+                    global_receipt_root,
+                    tx_outcomes,
+                    recipients,
+                    local_recipient,
+                    signer,
+                },
+            ));
         }
         actions
     }
@@ -1829,16 +1832,18 @@ impl ExecutionCoordinator {
             );
             let (recipients, local_recipient) = self.addressed(vec![leader]);
             for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
-                actions.push(Action::SignAndSendExecutionVote {
-                    block_hash: completion.block_hash,
-                    vote_anchor_ts: completion.vote_anchor_ts,
-                    tick_id: completion.tick_id,
-                    global_receipt_root: completion.global_receipt_root,
-                    tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: recipients.clone(),
-                    local_recipient,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::SignAndSendExecutionVote {
+                        block_hash: completion.block_hash,
+                        vote_anchor_ts: completion.vote_anchor_ts,
+                        tick_id: completion.tick_id,
+                        global_receipt_root: completion.global_receipt_root,
+                        tx_outcomes: (*tx_outcomes).clone(),
+                        recipients: recipients.clone(),
+                        local_recipient,
+                        signer,
+                    },
+                ));
             }
         }
         actions
@@ -2063,12 +2068,14 @@ impl ExecutionCoordinator {
         Some(
             held.and_then(|certificate| {
                 let signer = self.envelope_signer(topology_schedule, &certificate)?;
-                Some(Action::BroadcastExecutionCertificate {
-                    shard: self.local_shard,
-                    certificate,
-                    recipients: vec![vote.validator()],
-                    signer,
-                })
+                Some(Action::Execution(
+                    ExecutionAction::BroadcastExecutionCertificate {
+                        shard: self.local_shard,
+                        certificate,
+                        recipients: vec![vote.validator()],
+                        signer,
+                    },
+                ))
             })
             .into_iter()
             .collect(),
@@ -2098,11 +2105,13 @@ impl ExecutionCoordinator {
             vote_count = votes.len(),
             "Dispatching execution vote provisions verification"
         );
-        vec![Action::VerifyAndAggregateExecutionVotes {
-            tick_id,
-            block_hash,
-            votes,
-        }]
+        vec![Action::Execution(
+            ExecutionAction::VerifyAndAggregateExecutionVotes {
+                tick_id,
+                block_hash,
+                votes,
+            },
+        )]
     }
 
     /// Handle a verified execution vote (own vote or already-verified).
@@ -2238,12 +2247,14 @@ impl ExecutionCoordinator {
 
         // tx_outcomes are extracted from votes by the aggregation handler
         // (all quorum votes carry identical outcomes).
-        let mut actions = vec![Action::AggregateExecutionCertificate {
-            tick_id,
-            global_receipt_root,
-            votes,
-            committee,
-        }];
+        let mut actions = vec![Action::Execution(
+            ExecutionAction::AggregateExecutionCertificate {
+                tick_id,
+                global_receipt_root,
+                votes,
+                committee,
+            },
+        )];
         if !ec_tx_hashes.is_empty() {
             actions.push(Action::RecordTxEcCreated {
                 tx_hashes: ec_tx_hashes,
@@ -2301,12 +2312,14 @@ impl ExecutionCoordinator {
         if let Some(signer) = envelope_signer
             && !local_peers.is_empty()
         {
-            actions.push(Action::BroadcastExecutionCertificate {
-                shard: self.local_shard,
-                certificate: certificate.clone(),
-                recipients: local_peers,
-                signer,
-            });
+            actions.push(Action::Execution(
+                ExecutionAction::BroadcastExecutionCertificate {
+                    shard: self.local_shard,
+                    certificate: certificate.clone(),
+                    recipients: local_peers,
+                    signer,
+                },
+            ));
         }
 
         // Broadcast each target shard its own projection. Track the
@@ -2326,12 +2339,14 @@ impl ExecutionCoordinator {
                 self.committed_ts,
             );
             if let Some(signer) = envelope_signer {
-                actions.push(Action::BroadcastExecutionCertificate {
-                    shard: *target_shard,
-                    certificate: projected,
-                    recipients,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::BroadcastExecutionCertificate {
+                        shard: *target_shard,
+                        certificate: projected,
+                        recipients,
+                        signer,
+                    },
+                ));
             }
         }
 
@@ -2466,10 +2481,12 @@ impl ExecutionCoordinator {
         }
 
         match self.gate(topology_schedule, &cert) {
-            Ok(keys) => vec![Action::VerifyExecutionCertificateSignature {
-                public_keys: keys.unwrap_or_default(),
-                certificate: cert,
-            }],
+            Ok(keys) => vec![Action::Execution(
+                ExecutionAction::VerifyExecutionCertificateSignature {
+                    public_keys: keys.unwrap_or_default(),
+                    certificate: cert,
+                },
+            )],
             Err(Gate::BeaconBehind) => {
                 self.parked
                     .park(Waiting::Beacon, Parked::Certificate(Box::new(cert)));
@@ -2946,16 +2963,18 @@ impl ExecutionCoordinator {
             let (recipients, local_recipient) =
                 self.addressed(vec![tick_leader(&tick_id, &committee)]);
             for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
-                actions.push(Action::SignAndSendExecutionVote {
-                    block_hash,
-                    vote_anchor_ts,
-                    tick_id,
-                    global_receipt_root,
-                    tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: recipients.clone(),
-                    local_recipient,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::SignAndSendExecutionVote {
+                        block_hash,
+                        vote_anchor_ts,
+                        tick_id,
+                        global_receipt_root,
+                        tx_outcomes: (*tx_outcomes).clone(),
+                        recipients: recipients.clone(),
+                        local_recipient,
+                        signer,
+                    },
+                ));
             }
         }
         actions
@@ -3011,7 +3030,7 @@ impl ExecutionCoordinator {
         );
     }
 
-    /// Lift fired retries to `Action::SignAndSendExecutionVote`s.
+    /// Lift fired retries to `ExecutionAction::SignAndSendExecutionVote`s.
     fn lift_vote_retries(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -3068,16 +3087,18 @@ impl ExecutionCoordinator {
                 .collect();
             let (recipients, local_recipient) = self.addressed(recipients);
             for signer in signers {
-                actions.push(Action::SignAndSendExecutionVote {
-                    block_hash,
-                    vote_anchor_ts,
-                    tick_id,
-                    global_receipt_root,
-                    tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: recipients.clone(),
-                    local_recipient,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::SignAndSendExecutionVote {
+                        block_hash,
+                        vote_anchor_ts,
+                        tick_id,
+                        global_receipt_root,
+                        tx_outcomes: (*tx_outcomes).clone(),
+                        recipients: recipients.clone(),
+                        local_recipient,
+                        signer,
+                    },
+                ));
             }
         }
         actions
@@ -3307,12 +3328,14 @@ impl ExecutionCoordinator {
         // deterministic across validators.
         for directive in self.outbound_certs.on_block_committed(self.committed_ts) {
             if let Some(signer) = self.envelope_signer(topology_schedule, &directive.certificate) {
-                actions.push(Action::BroadcastExecutionCertificate {
-                    shard: directive.target_shard,
-                    certificate: directive.certificate,
-                    recipients: directive.recipients,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::BroadcastExecutionCertificate {
+                        shard: directive.target_shard,
+                        certificate: directive.certificate,
+                        recipients: directive.recipients,
+                        signer,
+                    },
+                ));
             }
         }
 
@@ -3430,15 +3453,17 @@ impl ExecutionCoordinator {
             if let Some((requests, shard_recipients)) =
                 build_provision_requests(anchored, transactions, &self.signers, local_shard)
             {
-                actions.push(Action::FetchAndBroadcastProvisions {
-                    block_hash,
-                    requests,
-                    source_shard: local_shard,
-                    block_height: height,
-                    source_block_ts: header.parent_qc().weighted_timestamp(),
-                    shard_recipients,
-                    signer: proposer,
-                });
+                actions.push(Action::Provisions(
+                    ProvisionAction::FetchAndBroadcastProvisions {
+                        block_hash,
+                        requests,
+                        source_shard: local_shard,
+                        block_height: height,
+                        source_block_ts: header.parent_qc().weighted_timestamp(),
+                        shard_recipients,
+                        signer: proposer,
+                    },
+                ));
             }
             if let Some((parent_hash, anchor, mut targets)) = pending_push {
                 // The records still standing whose consumers have not
@@ -3459,13 +3484,13 @@ impl ExecutionCoordinator {
                     .keys()
                     .map(|&target| (target, anchored.committee_for_shard(target).to_vec()))
                     .collect();
-                actions.push(Action::PushCrossingReadings {
+                actions.push(Action::Provisions(ProvisionAction::PushCrossingReadings {
                     block_hash: parent_hash,
                     anchor,
                     targets,
                     shard_recipients,
                     signer: proposer,
-                });
+                }));
             }
         }
         // Every live block is pushed for, whether or not it wrote a
@@ -4205,14 +4230,14 @@ impl ExecutionCoordinator {
             .filter(|(_, height, _)| *height == tick.tick)
             .map(|(_, _, resolution)| resolution.clone())
             .collect();
-        vec![Action::ExecuteTransactions {
+        vec![Action::Execution(ExecutionAction::ExecuteTransactions {
             tick: tick.tick,
             fates,
             tick_ts: tick.tick_ts,
             env: tick.env,
             requests: tick.requests,
             included: tick.included,
-        }]
+        })]
     }
 
     /// Replay buffered certificates for transactions that have just
@@ -4384,12 +4409,12 @@ impl ExecutionCoordinator {
                 continue;
             }
             self.legs_asked.insert(*tick, tip);
-            actions.push(Action::BuildLegsHalf {
+            actions.push(Action::Execution(ExecutionAction::BuildLegsHalf {
                 tick: *tick,
                 names: names.clone(),
                 tip,
                 tip_height,
-            });
+            }));
         }
         actions
     }
@@ -4508,7 +4533,7 @@ impl ExecutionCoordinator {
     ///
     /// Runs [`Self::gate`] over the certificate it carries, if any, and
     /// dispatches signature verification to the crypto pool via
-    /// [`Action::VerifyFinalization`]. The matching
+    /// [`ExecutionAction::VerifyFinalization`]. The matching
     /// [`ProtocolEvent::FinalizationVerified`] feeds
     /// [`Self::on_finalization_verified`], which emits
     /// `Continuation(FinalizationsAdmitted)` only when the certificate
@@ -4549,10 +4574,10 @@ impl ExecutionCoordinator {
             ]))];
         }
         match self.gate(topology_schedule, &tick) {
-            Ok(public_keys) => vec![Action::VerifyFinalization {
+            Ok(public_keys) => vec![Action::Execution(ExecutionAction::VerifyFinalization {
                 finalization: tick,
                 public_keys,
-            }],
+            })],
             Err(Gate::InFlight) => Vec::new(),
             Err(Gate::BeaconBehind) => {
                 self.parked.park(Waiting::Beacon, Parked::Fetched(tick));
@@ -4592,7 +4617,7 @@ impl ExecutionCoordinator {
         effects
     }
 
-    /// Handle the result of [`Action::VerifyFinalization`]. Emits the
+    /// Handle the result of [`ExecutionAction::VerifyFinalization`]. Emits the
     /// admission continuation only when every EC's signature passed.
     #[must_use]
     pub fn on_finalization_verified(
@@ -5267,11 +5292,10 @@ mod tests {
         // Should request execution (single-shard path) and set up tick tracking
         assert!(!actions.is_empty());
         // First action should be ExecuteTransactions
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::ExecuteTransactions { .. }))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+        )));
 
         // TickState should be set up for this tick.
         let tick_id = state.ticks.tick_assignment(tx_hash);
@@ -5310,9 +5334,10 @@ mod tests {
             .actions;
 
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::ExecuteTransactions { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "a tick running unfetched code must not dispatch"
         );
         assert!(
@@ -5345,7 +5370,9 @@ mod tests {
         let dispatched: Vec<&TxHash> = released
             .iter()
             .filter_map(|action| match action {
-                Action::ExecuteTransactions { requests, .. } => Some(requests),
+                Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. }) => {
+                    Some(requests)
+                }
                 _ => None,
             })
             .flatten()
@@ -5383,16 +5410,19 @@ mod tests {
                 Naming::Composed,
             )
             .actions;
-        let Some(Action::ExecuteTransactions {
+        let Some(Action::Execution(ExecutionAction::ExecuteTransactions {
             tick,
             tick_ts,
             env,
             requests,
             included,
             ..
-        }) = actions
-            .into_iter()
-            .find(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        })) = actions.into_iter().find(|action| {
+            matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )
+        })
         else {
             panic!("a tick running code this node holds must dispatch");
         };
@@ -5421,11 +5451,11 @@ mod tests {
         let dispatched: Vec<TxHash> = again
             .iter()
             .filter_map(|action| match action {
-                Action::ExecuteTransactions {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
                     tick: dispatched_tick,
                     requests,
                     ..
-                } if *dispatched_tick == tick => Some(requests),
+                }) if *dispatched_tick == tick => Some(requests),
                 _ => None,
             })
             .flatten()
@@ -5457,9 +5487,10 @@ mod tests {
             .actions;
 
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::ExecuteTransactions { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "only the code a member runs can hold its tick"
         );
     }
@@ -5603,9 +5634,10 @@ mod tests {
         // Once the schedule carries its epoch the vote must still be there.
         let recovered = state.emit_vote_actions(&resolved);
         assert!(
-            recovered
-                .iter()
-                .any(|a| matches!(a, Action::SignAndSendExecutionVote { .. })),
+            recovered.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+            )),
             "the tick must still vote once its committee resolves, got {recovered:?}",
         );
     }
@@ -5788,12 +5820,12 @@ mod tests {
         // Elapsed == VOTE_RETRY_TIMEOUT, so should emit retry.
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::SignAndSendExecutionVote {
+            Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                 recipients,
                 local_recipient,
                 tick_id: wid,
                 ..
-            } => {
+            }) => {
                 assert_eq!(wid, &tick_id);
                 assert_eq!(
                     (recipients, *local_recipient),
@@ -5814,7 +5846,9 @@ mod tests {
         state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
         let next = state.check_vote_retry_timeouts(&topo);
         assert_eq!(next.len(), 1);
-        if let Action::SignAndSendExecutionVote { recipients, .. } = &next[0] {
+        if let Action::Execution(ExecutionAction::SignAndSendExecutionVote { recipients, .. }) =
+            &next[0]
+        {
             assert_eq!(
                 recipients, &others,
                 "the second fire addresses the committee"
@@ -5850,7 +5884,7 @@ mod tests {
         let retries = |actions: &[Action]| {
             actions
                 .iter()
-                .filter(|a| matches!(a, Action::SignAndSendExecutionVote { tick_id: t, .. } if *t == tick_id))
+                .filter(|a| matches!(a, Action::Execution(ExecutionAction::SignAndSendExecutionVote { tick_id: t, .. }) if *t == tick_id))
                 .count()
         };
 
@@ -5936,11 +5970,11 @@ mod tests {
         let tick_id = ready_tick_at(&mut state, &schedule, height, 1_000);
         let sent_to = |actions: &[Action]| {
             actions.iter().find_map(|a| match a {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     recipients,
                     local_recipient,
                     ..
-                } => Some((recipients.clone(), *local_recipient)),
+                }) => Some((recipients.clone(), *local_recipient)),
                 _ => None,
             })
         };
@@ -6035,15 +6069,18 @@ mod tests {
         }
         assert!(state.ticks.contains_tracker(&tick_id));
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate { .. })
+            )),
             "two of four is short of quorum"
         );
         let own = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, me));
         assert!(
-            own.iter()
-                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            own.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate { .. })
+            )),
             "{own:?}"
         );
     }
@@ -6126,22 +6163,22 @@ mod tests {
         let mut aggregated = 0usize;
         while let Some(action) = pending.pop() {
             match action {
-                Action::VerifyAndAggregateExecutionVotes {
+                Action::Execution(ExecutionAction::VerifyAndAggregateExecutionVotes {
                     tick_id,
                     block_hash,
                     votes,
-                } => {
+                }) => {
                     let verified =
                         Verified::<ExecutionVote>::verify_batch(&BlsVerifier, &net, votes);
                     pending
                         .extend(state.on_votes_verified(schedule, tick_id, block_hash, verified));
                 }
-                Action::AggregateExecutionCertificate {
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate {
                     tick_id,
                     global_receipt_root,
                     votes,
                     committee,
-                } => {
+                }) => {
                     aggregated += 1;
                     let certificate = Verified::<ExecutionCertificate>::aggregate(
                         &BlsVerifier,
@@ -6192,11 +6229,11 @@ mod tests {
         let (anchor, outcomes) = cast
             .iter()
             .find_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     vote_anchor_ts,
                     tx_outcomes,
                     ..
-                } => Some((*vote_anchor_ts, tx_outcomes.clone())),
+                }) => Some((*vote_anchor_ts, tx_outcomes.clone())),
                 _ => None,
             })
             .expect("the tick's vote is cast");
@@ -6308,14 +6345,15 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BroadcastExecutionCertificate { recipients, .. } if recipients == &vec![late]
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate { recipients, .. }) if recipients == &vec![late]
             )),
             "{actions:?}"
         );
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate { .. })
+            )),
             "{actions:?}"
         );
         assert!(!state.ticks.contains_tracker(&tick_id));
@@ -6380,9 +6418,10 @@ mod tests {
         state.committed_ts = WeightedTimestamp::from_millis(5_000).plus(VOTE_RETRY_TIMEOUT);
         let actions = state.check_vote_retry_timeouts(&topo);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SignAndSendExecutionVote { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+            )),
             "the retry still fires: {actions:?}"
         );
     }
@@ -6456,7 +6495,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BroadcastExecutionCertificate { certificate: sent, recipients, .. }
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate { certificate: sent, recipients, .. })
                     if recipients == &vec![voter] && sent.tick_id() == &tick_id
             )),
             "the late voter is sent the certificate: {actions:?}"
@@ -6583,12 +6622,12 @@ mod tests {
             .emit_vote_actions(&schedule)
             .into_iter()
             .find_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     vote_anchor_ts,
                     global_receipt_root,
                     tx_outcomes,
                     ..
-                } => Some((vote_anchor_ts, global_receipt_root, tx_outcomes)),
+                }) => Some((vote_anchor_ts, global_receipt_root, tx_outcomes)),
                 _ => None,
             })
             .expect("the new tick is voted");
@@ -6755,7 +6794,12 @@ mod tests {
         // Should have: BroadcastEC(local) + BroadcastEC(remote shard 1)
         let broadcast_actions: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, Action::BroadcastExecutionCertificate { .. }))
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::Execution(ExecutionAction::BroadcastExecutionCertificate { .. })
+                )
+            })
             .collect();
 
         assert!(
@@ -6766,14 +6810,18 @@ mod tests {
 
         // One should be for the local shard (shard 0).
         let has_local = broadcast_actions.iter().any(|a| match a {
-            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardId::ROOT,
+            Action::Execution(ExecutionAction::BroadcastExecutionCertificate { shard, .. }) => {
+                *shard == ShardId::ROOT
+            }
             _ => false,
         });
         assert!(has_local, "Should include local shard broadcast");
 
         // One should be for the remote shard (shard 1).
         let has_remote = broadcast_actions.iter().any(|a| match a {
-            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardId::leaf(1, 1),
+            Action::Execution(ExecutionAction::BroadcastExecutionCertificate { shard, .. }) => {
+                *shard == ShardId::leaf(1, 1)
+            }
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
@@ -6830,7 +6878,10 @@ mod tests {
                 .on_certificate_aggregated(&topo, &tick_id, &cert)
                 .into_iter()
                 .filter_map(|a| match a {
-                    Action::BroadcastExecutionCertificate { signer, .. } => Some(signer),
+                    Action::Execution(ExecutionAction::BroadcastExecutionCertificate {
+                        signer,
+                        ..
+                    }) => Some(signer),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -6896,7 +6947,9 @@ mod tests {
         let broadcasts: Vec<ShardId> = actions
             .iter()
             .filter_map(|action| match action {
-                Action::BroadcastExecutionCertificate { shard, .. } => Some(*shard),
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate {
+                    shard, ..
+                }) => Some(*shard),
                 _ => None,
             })
             .collect();
@@ -6956,9 +7009,11 @@ mod tests {
             actions
                 .iter()
                 .find_map(|a| match a {
-                    Action::BroadcastExecutionCertificate {
-                        shard, certificate, ..
-                    } if *shard == target => Some(certificate.clone()),
+                    Action::Execution(ExecutionAction::BroadcastExecutionCertificate {
+                        shard,
+                        certificate,
+                        ..
+                    }) if *shard == target => Some(certificate.clone()),
                     _ => None,
                 })
                 .expect("a broadcast for the target shard")
@@ -7020,7 +7075,10 @@ mod tests {
 
         let actions = state.admit_finalization(&topo, tick);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], Action::VerifyFinalization { .. }));
+        assert!(matches!(
+            actions[0],
+            Action::Execution(ExecutionAction::VerifyFinalization { .. })
+        ));
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
@@ -7233,7 +7291,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(matches!(
             first[0],
-            Action::VerifyExecutionCertificateSignature { .. }
+            Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
         ));
 
         // Same bytes mid-flight — must drop without dispatching another
@@ -7280,7 +7338,9 @@ mod tests {
             assert!(
                 matches!(
                     suffix.as_slice(),
-                    [Action::VerifyExecutionCertificateSignature { .. }]
+                    [Action::Execution(
+                        ExecutionAction::VerifyExecutionCertificateSignature { .. }
+                    )]
                 ),
                 "pending {pending}: an EC within the frontier dispatches, got {suffix:?}"
             );
@@ -7387,9 +7447,12 @@ mod tests {
             )
         };
         let dispatched = |actions: &[Action]| {
-            actions
-                .iter()
-                .any(|action| matches!(action, Action::VerifyExecutionCertificateSignature { .. }))
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+                )
+            })
         };
 
         // The proof first, retired as every commit retires the mirror.
@@ -7734,9 +7797,10 @@ mod tests {
         state.proven_anchors().record(proven);
         let actions = state.on_committed_remote_header(&topo, proven);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "the committed event must replay the deferred EC, got {actions:?}"
         );
     }
@@ -7775,9 +7839,10 @@ mod tests {
 
         let actions = state.on_execution_certificate(&topo, make_cert(covered).into());
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "a set-covered EC must dispatch without a commit proof, got {actions:?}"
         );
 
@@ -7823,9 +7888,10 @@ mod tests {
             },
         );
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "the set must replay the parked EC into dispatch, got {actions:?}"
         );
     }
@@ -7899,7 +7965,9 @@ mod tests {
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(matches!(
             actions.as_slice(),
-            [Action::VerifyExecutionCertificateSignature { .. }]
+            [Action::Execution(
+                ExecutionAction::VerifyExecutionCertificateSignature { .. }
+            )]
         ));
     }
 
@@ -7939,7 +8007,7 @@ mod tests {
         assert_eq!(again.len(), 1);
         assert!(matches!(
             again[0],
-            Action::VerifyExecutionCertificateSignature { .. }
+            Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
         ));
     }
 
@@ -8019,7 +8087,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::VerifyExecutionCertificateSignature { .. }
+            Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
         ));
     }
 
@@ -8054,7 +8122,10 @@ mod tests {
 
         let first = state.admit_finalization(&topo, tick.clone());
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0], Action::VerifyFinalization { .. }));
+        assert!(matches!(
+            first[0],
+            Action::Execution(ExecutionAction::VerifyFinalization { .. })
+        ));
 
         let second = state.admit_finalization(&topo, tick);
         assert!(second.is_empty());
@@ -8189,9 +8260,10 @@ mod tests {
         state.on_committed_remote_header(&topo, proven);
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "must dispatch signature verification even when no local tracker matches"
         );
         // Nothing lands in the early-arrival buffer until verification passes.
@@ -8330,9 +8402,10 @@ mod tests {
         let public_keys = actions
             .iter()
             .find_map(|a| match a {
-                Action::VerifyExecutionCertificateSignature { public_keys, .. } => {
-                    Some(public_keys)
-                }
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature {
+                    public_keys,
+                    ..
+                }) => Some(public_keys),
                 _ => None,
             })
             .expect("on_execution_certificate dispatches a signature verification");
@@ -8396,7 +8469,10 @@ mod tests {
         let committee = actions
             .iter()
             .find_map(|a| match a {
-                Action::AggregateExecutionCertificate { committee, .. } => Some(committee),
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate {
+                    committee,
+                    ..
+                }) => Some(committee),
                 _ => None,
             })
             .expect("vote quorum dispatches certificate aggregation");
@@ -8474,7 +8550,10 @@ mod tests {
         let committee = actions
             .iter()
             .find_map(|a| match a {
-                Action::AggregateExecutionCertificate { committee, .. } => Some(committee),
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate {
+                    committee,
+                    ..
+                }) => Some(committee),
                 _ => None,
             })
             .expect("vote quorum dispatches certificate aggregation");
@@ -8508,18 +8587,20 @@ mod tests {
 
         let actions = coord.on_execution_certificate(&behind, Verifiable::from(cert));
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "an EC whose epoch the beacon hasn't reached must buffer, not dispatch",
         );
 
         let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
         let drained = coord.on_beacon_block_persisted(&caught_up).actions;
         assert!(
-            drained
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            drained.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "draining on catch-up must dispatch the buffered EC's verification",
         );
     }
@@ -8560,18 +8641,20 @@ mod tests {
 
         let actions = coord.admit_finalization(&behind, tick);
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyFinalization { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyFinalization { .. })
+            )),
             "a finalization whose EC epoch the beacon hasn't reached must buffer, not dispatch",
         );
 
         let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
         let drained = coord.on_beacon_block_persisted(&caught_up).actions;
         assert!(
-            drained
-                .iter()
-                .any(|a| matches!(a, Action::VerifyFinalization { .. })),
+            drained.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyFinalization { .. })
+            )),
             "draining on catch-up must dispatch the buffered tick's verification",
         );
     }
@@ -8829,9 +8912,10 @@ mod tests {
                 ready_tick_at(&mut state, &schedule, height, anchor_ms);
                 let actions = state.emit_vote_actions(&schedule);
                 assert!(
-                    !actions
-                        .iter()
-                        .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
+                    !actions.iter().any(|action| matches!(
+                        action,
+                        Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+                    )),
                     "{me:?} signs the tick at {height:?}: {actions:?}",
                 );
             }
@@ -8859,16 +8943,19 @@ mod tests {
                 Naming::Composed,
             )
             .actions;
-        let Some(Action::ExecuteTransactions {
+        let Some(Action::Execution(ExecutionAction::ExecuteTransactions {
             tick,
             tick_ts,
             env,
             requests,
             included,
             ..
-        }) = actions
-            .into_iter()
-            .find(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        })) = actions.into_iter().find(|action| {
+            matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )
+        })
         else {
             panic!("a tick running code this node holds must dispatch");
         };
@@ -8877,9 +8964,10 @@ mod tests {
             state.on_execution_batch_unavailable(tick, tick_ts, env, requests, included, package);
         let written = state.on_block_persisted(&bridged, BlockHeight::new(1));
         assert!(
-            !written
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !written.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "a write dispatches a tick below the bridge again: {written:?}",
         );
         let again = state
@@ -8897,7 +8985,7 @@ mod tests {
         assert!(
             !again.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { tick: dispatched, .. } if *dispatched == tick
+                Action::Execution(ExecutionAction::ExecuteTransactions { tick: dispatched, .. }) if *dispatched == tick
             )),
             "a tick below the bridge is dispatched again: {again:?}",
         );
@@ -8935,9 +9023,10 @@ mod tests {
             )
             .actions;
         assert!(
-            !queued
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !queued.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "tick 2 waits for height 1 to be written: {queued:?}",
         );
         let ran = state.on_block_persisted(
@@ -8945,8 +9034,10 @@ mod tests {
             BlockHeight::new(1),
         );
         assert!(
-            !ran.iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !ran.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "a write after the fold dispatches a tick below the bridge: {ran:?}",
         );
     }
@@ -8964,11 +9055,11 @@ mod tests {
             .revote_stalled_ticks(schedule)
             .iter()
             .filter_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     tick_id: voted,
                     vote_anchor_ts,
                     ..
-                } if *voted == tick_id => Some(vote_anchor_ts.as_millis()),
+                }) if *voted == tick_id => Some(vote_anchor_ts.as_millis()),
                 _ => None,
             })
             .collect()
@@ -9274,11 +9365,11 @@ mod tests {
             .emit_vote_actions(&schedule)
             .into_iter()
             .find_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     global_receipt_root,
                     tx_outcomes,
                     ..
-                } => Some((global_receipt_root, tx_outcomes)),
+                }) => Some((global_receipt_root, tx_outcomes)),
                 _ => None,
             })
             .expect("the tick casts its own vote");
@@ -9332,9 +9423,10 @@ mod tests {
         );
         let answered = state.on_execution_vote(&schedule, revote.into());
         assert!(
-            !answered
-                .iter()
-                .any(|a| matches!(a, Action::BroadcastExecutionCertificate { .. })),
+            !answered.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate { .. })
+            )),
             "a re-attestation is not answered with the lapsing certificate: {answered:?}",
         );
         assert_eq!(
@@ -9779,7 +9871,7 @@ mod tests {
         let env = actions
             .iter()
             .find_map(|action| match action {
-                Action::ExecuteTransactions { env, .. } => Some(env),
+                Action::Execution(ExecutionAction::ExecuteTransactions { env, .. }) => Some(env),
                 _ => None,
             })
             .expect("the commit dispatches its tick");
@@ -10162,10 +10254,10 @@ mod tests {
         );
         assert!(
             state.pending_ticks.is_empty()
-                && !effects
-                    .actions
-                    .iter()
-                    .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+                && !effects.actions.iter().any(|action| matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
             "the dispatch drops the replaced tick from the queue",
         );
         let crossing = test_certify(
@@ -10228,9 +10320,12 @@ mod tests {
             Naming::Manifest,
         );
         let executes = |actions: &[Action]| {
-            actions
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. }))
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )
+            })
         };
         assert!(
             !executes(&effects.actions),
@@ -10276,7 +10371,7 @@ mod tests {
         let dispatched = effects
             .actions
             .iter()
-            .position(|action| matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3)));
+            .position(|action| matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3)));
         assert!(restored.is_some(), "the settled half's writes are seated");
         assert!(dispatched.is_some(), "and tick 3 then runs");
         assert!(
@@ -10563,7 +10658,7 @@ mod tests {
         );
         let runs_tick_3 = |actions: &[Action]| {
             actions.iter().position(|action| {
-                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+                matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3))
             })
         };
         assert_eq!(
@@ -10654,7 +10749,7 @@ mod tests {
         state.commit_block_carrying(&schedule, &settling(4, determined), Naming::Manifest);
         let runs_tick_3 = |actions: &[Action]| {
             actions.iter().any(|action| {
-                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+                matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3))
             })
         };
         let members = || {
@@ -10784,7 +10879,7 @@ mod tests {
     /// Whether `actions` dispatch tick 3.
     fn runs_tick_3(actions: &[Action]) -> bool {
         actions.iter().any(|action| {
-            matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+            matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3))
         })
     }
 
@@ -10983,7 +11078,9 @@ mod tests {
             actions
                 .iter()
                 .filter_map(|action| match action {
-                    Action::ExecuteTransactions { tick, .. } => Some(tick.inner()),
+                    Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) => {
+                        Some(tick.inner())
+                    }
                     _ => None,
                 })
                 .collect()
@@ -11078,7 +11175,7 @@ mod tests {
         assert!(
             effects.actions.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(4)
+                Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(4)
             )),
             "tick 4 runs with the leg still owed",
         );
@@ -11446,9 +11543,10 @@ mod tests {
             .on_committed_state_restored(&schedule, &StubVmStatics)
             .actions;
         assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "nothing is dispatched at a height whose baseline the store has retired",
         );
         assert_eq!(
@@ -11546,7 +11644,10 @@ mod tests {
         assert!(
             actions[..restored.expect("seated")]
                 .iter()
-                .all(|action| !matches!(action, Action::ExecuteTransactions { .. })),
+                .all(|action| !matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
             "and seated before anything the replay composes reads a baseline",
         );
     }
@@ -11886,7 +11987,7 @@ mod tests {
         );
         assert!(
             actions.iter().any(
-                |action| matches!(action, Action::ExecuteTransactions { requests, .. }
+                |action| matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. })
                     if requests.iter().any(|r| r.tx_hash == held_hash))
             ),
             "and runs it, because the tick that holds it is the tick that ran it",
@@ -12965,7 +13066,7 @@ mod tests {
     /// Whether a commit dispatched any member.
     fn dispatched(actions: &[Action]) -> bool {
         actions.iter().any(|action| {
-            matches!(action, Action::ExecuteTransactions { requests, .. } if !requests.is_empty())
+            matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. }) if !requests.is_empty())
         })
     }
 
@@ -13038,7 +13139,7 @@ mod tests {
             vec![bundle.naming([(claim, id), (decline, id)])],
         );
         actions.iter().find_map(|action| match action {
-            Action::ExecuteTransactions { requests, .. } => {
+            Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. }) => {
                 requests.first().map(|request| request.member.clone())
             }
             _ => None,
@@ -13485,7 +13586,12 @@ mod tests {
                 state.on_block_persisted(&schedule, BlockHeight::new(1)),
             ]
             .concat();
-            actions.retain(|action| matches!(action, Action::ExecuteTransactions { .. }));
+            actions.retain(|action| {
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )
+            });
             (state, actions)
         };
         for (replica, (mut state, before)) in [
@@ -13494,9 +13600,10 @@ mod tests {
             ("restored the reclaiming block unrun", restored(2)),
         ] {
             assert!(
-                !before
-                    .iter()
-                    .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+                !before.iter().any(|action| matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
                 "{replica}: the reclaiming block dispatches nothing: {before:?}",
             );
             assert!(
@@ -13508,16 +13615,14 @@ mod tests {
                 .actions;
             actions.extend(state.on_block_persisted(&schedule, BlockHeight::new(2)));
             let dispatched = actions.iter().find_map(|action| match action {
-                Action::ExecuteTransactions { tick, requests, .. }
-                    if *tick == BlockHeight::new(2) =>
-                {
-                    Some(
-                        requests
-                            .iter()
-                            .map(|request| request.tx_hash)
-                            .collect::<Vec<_>>(),
-                    )
-                }
+                Action::Execution(ExecutionAction::ExecuteTransactions {
+                    tick, requests, ..
+                }) if *tick == BlockHeight::new(2) => Some(
+                    requests
+                        .iter()
+                        .map(|request| request.tx_hash)
+                        .collect::<Vec<_>>(),
+                ),
                 _ => None,
             });
             assert_eq!(
@@ -13568,7 +13673,7 @@ mod tests {
         assert!(
             actions.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { requests, .. }
+                Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. })
                     if requests.iter().any(|request| request.tx_hash == tx_hash)
             )),
             "the next block naming it runs it: {actions:?}",
@@ -14227,9 +14332,10 @@ mod tests {
             "the reading is the one the fold judges the answer's deletion on",
         );
         assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "and no member is composed for it",
         );
     }
@@ -14322,7 +14428,7 @@ mod tests {
         assert!(
             !folded.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { requests, .. }
+                Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. })
                     if requests.iter().any(|request| request.tx_hash == tx_hash)
             )),
             "no member is composed for it",
@@ -15662,9 +15768,10 @@ mod tests {
             &[(near, succeeded()), (far, succeeded())],
         );
         assert!(
-            !scanned
-                .iter()
-                .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
+            !scanned.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+            )),
             "a certified tick is sent no vote: {scanned:?}",
         );
         assert_eq!(
@@ -15775,11 +15882,10 @@ mod tests {
         let (mut state, tick_id, near, far) = seated_awaiting_its_batch(&[1]);
         certified_by_its_shard(&mut state, &schedule, tick_id, (near, far));
         let scanned = batch_returned(&mut state, &schedule, tick_id, &[(near, succeeded())]);
-        assert!(
-            !scanned
-                .iter()
-                .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
-        );
+        assert!(!scanned.iter().any(|action| matches!(
+            action,
+            Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+        )),);
         assert_eq!(
             state.voted_receipt_root(&tick_id),
             None,
@@ -15857,9 +15963,9 @@ mod tests {
         let accepting = BTreeMap::from([(tick_id, names.iter().copied().collect())]);
         let mut built = Vec::new();
         for action in state.offer_accepting(hash, height, &accepting) {
-            let Action::BuildLegsHalf {
+            let Action::Execution(ExecutionAction::BuildLegsHalf {
                 tick, names, tip, ..
-            } = action
+            }) = action
             else {
                 continue;
             };
@@ -15946,7 +16052,9 @@ mod tests {
             actions
                 .iter()
                 .filter_map(|action| match action {
-                    Action::BuildLegsHalf { tick, tip, .. } => Some((*tick, *tip)),
+                    Action::Execution(ExecutionAction::BuildLegsHalf { tick, tip, .. }) => {
+                        Some((*tick, *tip))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -17415,12 +17523,12 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     signer,
                     recipients,
                     local_recipient,
                     ..
-                } => Some((*signer, recipients.clone(), *local_recipient)),
+                }) => Some((*signer, recipients.clone(), *local_recipient)),
                 _ => None,
             })
             .collect()
@@ -17535,7 +17643,9 @@ mod tests {
                 .actions
                 .iter()
                 .filter_map(|a| match a {
-                    Action::PushCrossingReadings { signer, .. } => Some(*signer),
+                    Action::Provisions(ProvisionAction::PushCrossingReadings {
+                        signer, ..
+                    }) => Some(*signer),
                     _ => None,
                 })
                 .collect();
@@ -17553,13 +17663,13 @@ mod tests {
         actions
             .iter()
             .filter_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     tick_id: voted,
                     vote_anchor_ts,
                     recipients,
                     signer,
                     ..
-                } if *voted == tick_id => {
+                }) if *voted == tick_id => {
                     assert_eq!(recipients.len(), 1, "the first send goes to the leader");
                     Some((*signer, vote_anchor_ts.as_millis()))
                 }

@@ -11,7 +11,7 @@
 //!   returns, for a live commit, the restart's replay and a parked commit
 //!   folded on a beacon block alike.
 
-use hyperscale_core::Action;
+use hyperscale_core::{Action, ConsensusAction};
 use hyperscale_execution::CommitEffects;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, MAX_FINALIZED_TX_PER_BLOCK,
@@ -124,9 +124,11 @@ impl ShardParticipation {
         // waiting to complete; nudge the proposer to re-evaluate without it.
         self.shard_coordinator.queue_ready_proposal();
 
-        actions.push(Action::BroadcastShardForkProof {
-            proof: Box::new(proof),
-        });
+        actions.push(Action::Consensus(
+            ConsensusAction::BroadcastShardForkProof {
+                proof: Box::new(proof),
+            },
+        ));
         actions
     }
 
@@ -157,10 +159,10 @@ impl ShardParticipation {
             );
             return Vec::new();
         };
-        vec![Action::VerifyShardForkProof {
+        vec![Action::Consensus(ConsensusAction::VerifyShardForkProof {
             proof: Box::new(proof),
             committees,
-        }]
+        })]
     }
 
     /// Validate in-flight before letting shard ingest a received header.
@@ -315,7 +317,10 @@ impl ShardParticipation {
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine, TimerId};
+    use hyperscale_core::{
+        Action, ConsensusAction, ExecutionAction, FetchIds, FetchRequest, ProtocolEvent,
+        StateMachine, TimerId,
+    };
     use hyperscale_execution::CommitEffects;
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
@@ -437,9 +442,10 @@ mod tests {
             },
         );
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::BroadcastShardForkProof { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::BroadcastShardForkProof { .. })
+            )),
             "a newly proven fork must re-gossip",
         );
 
@@ -450,9 +456,10 @@ mod tests {
             },
         );
         assert!(
-            !again
-                .iter()
-                .any(|a| matches!(a, Action::BroadcastShardForkProof { .. })),
+            !again.iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::BroadcastShardForkProof { .. })
+            )),
             "an already-fenced shard is not re-gossiped",
         );
     }
@@ -486,11 +493,10 @@ mod tests {
                 proof: Box::new(make_fork_proof(shard)),
             },
         );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::BroadcastShardForkProof { .. })),
-        );
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::Consensus(ConsensusAction::BroadcastShardForkProof { .. })
+        )),);
     }
 
     /// A gossiped proof on a discarded branch is not sent for
@@ -506,7 +512,12 @@ mod tests {
                 },
             )
             .iter()
-            .any(|a| matches!(a, Action::VerifyShardForkProof { .. }))
+            .any(|a| {
+                matches!(
+                    a,
+                    Action::Consensus(ConsensusAction::VerifyShardForkProof { .. })
+                )
+            })
         };
         assert!(
             verifies(TestNode::new().node),
@@ -547,7 +558,7 @@ mod tests {
 
         let saw_proposal = actions
             .iter()
-            .any(|a| matches!(a, Action::BuildProposal { .. }));
+            .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. })));
         assert!(
             saw_proposal,
             "expected BuildProposal after TransactionsAdmitted on a leader; got {actions:?}",
@@ -582,7 +593,7 @@ mod tests {
 
         let saw_proposal = actions
             .iter()
-            .any(|a| matches!(a, Action::BuildProposal { .. }));
+            .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. })));
         assert!(
             !saw_proposal,
             "non-leader must not emit BuildProposal; got {actions:?}",
@@ -649,7 +660,11 @@ mod tests {
         };
         let runs_tick_2 = |actions: &[Action]| {
             actions.iter().any(|action| {
-                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(2))
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. })
+                        if *tick == BlockHeight::new(2)
+                )
             })
         };
 
@@ -886,7 +901,10 @@ mod tests {
         let binding = batch
             .iter()
             .find_map(|action| match action {
-                Action::VerifyAndBuildQuorumCertificate { binding, .. } => Some(*binding),
+                Action::Consensus(ConsensusAction::VerifyAndBuildQuorumCertificate {
+                    binding,
+                    ..
+                }) => Some(*binding),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("the votes reach a batch: {batch:?}"));
@@ -1103,7 +1121,12 @@ mod tests {
                 }
             )
         });
-        let dispatched = position(|action| matches!(action, Action::ExecuteTransactions { .. }));
+        let dispatched = position(|action| {
+            matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )
+        });
         assert!(
             reported < dispatched,
             "the mempool hears the block before the fold's actions"

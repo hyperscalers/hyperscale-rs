@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use hyperscale_core::{Action, QcSubject};
+use hyperscale_core::{Action, ConsensusAction, QcSubject};
 use hyperscale_metrics::record_sync_block_filtered;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ConsensusPublicKey,
@@ -491,7 +491,7 @@ impl BlockSyncManager {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Record `certified` as awaiting QC verification and construct the
-    /// corresponding [`Action::VerifyQcSignature`] to dispatch. The
+    /// corresponding [`ConsensusAction::VerifyQcSignature`] to dispatch. The
     /// tracking insert is paired with the action emission so the two can
     /// never get out of sync; callers should check
     /// [`Self::has_pending_verification`] first to avoid clobbering an
@@ -527,12 +527,12 @@ impl BlockSyncManager {
             PendingSyncedBlockVerification::InFlight(certified),
         );
 
-        Action::VerifyQcSignature {
+        Action::Consensus(ConsensusAction::VerifyQcSignature {
             qc,
             public_keys,
             quorum_threshold,
             subject: QcSubject::SyncedBlock(block_hash),
-        }
+        })
     }
 
     /// Handle QC verification result for a synced block.

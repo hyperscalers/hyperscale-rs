@@ -652,11 +652,11 @@ impl ProvisionCoordinator {
     /// path (see [`ProtocolEvent::VerifiedProvisionsReceived`]). Applies
     /// the same admission guards as the unverified path and, if the
     /// matching remote header is present, admits the bundle directly
-    /// without dispatching [`Action::VerifyProvisions`].
+    /// without dispatching [`ProvisionAction::VerifyProvisions`](hyperscale_core::ProvisionAction::VerifyProvisions).
     ///
     /// Fast-path is conditional on the remote header having reached the
     /// verified state. When the header is still pending (race against
-    /// `Action::VerifyRemoteHeaderQc`), the bundle falls back to the raw
+    /// `ConsensusAction::VerifyRemoteHeaderQc`), the bundle falls back to the raw
     /// buffer and will re-run merkle verification once the header lands —
     /// correct, but suboptimal until the parallel remote-header
     /// preservation lands.
@@ -1014,7 +1014,7 @@ impl ProvisionCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_core::FetchRequest;
+    use hyperscale_core::{FetchRequest, ProvisionAction};
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, Anchor, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
@@ -1221,9 +1221,10 @@ mod tests {
         let provisions = make_provisions(tx_hash, source, ShardId::leaf(2, 0), height);
         let actions = coordinator.on_state_provisions_received(&sched(), provisions);
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyProvisions { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Provisions(ProvisionAction::VerifyProvisions { .. })
+            )),
             "a merely-certified source block must not open provision verification"
         );
 
@@ -1231,9 +1232,10 @@ mod tests {
         // verification.
         let actions = coordinator.on_committed_remote_header(&sched(), &header);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyProvisions { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Provisions(ProvisionAction::VerifyProvisions { .. })
+            )),
             "the committed event must drain the parked bundle"
         );
     }
@@ -1289,9 +1291,10 @@ mod tests {
         let recovering = sched_recovering(source, BlockHeight::new(5));
         let actions = coordinator.on_committed_remote_header(&recovering, &header);
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyProvisions { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Provisions(ProvisionAction::VerifyProvisions { .. })
+            )),
             "a fenced header must not open verification"
         );
         assert!(
@@ -1589,7 +1592,8 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { provisions, .. } if provisions.transactions()[0].tx_hash == tx_hash
+            Action::Provisions(ProvisionAction::VerifyProvisions { provisions, .. })
+                if provisions.transactions()[0].tx_hash == tx_hash
         ));
     }
 
@@ -1640,7 +1644,8 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { provisions, .. } if provisions.transactions()[0].tx_hash == tx_hash
+            Action::Provisions(ProvisionAction::VerifyProvisions { provisions, .. })
+                if provisions.transactions()[0].tx_hash == tx_hash
         ));
     }
 
@@ -1824,7 +1829,7 @@ mod tests {
         // Should emit exactly ONE VerifyProvisions action with all 3 transactions
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::VerifyProvisions { provisions, .. } => {
+            Action::Provisions(ProvisionAction::VerifyProvisions { provisions, .. }) => {
                 assert_eq!(provisions.transactions().len(), 3);
             }
             other => panic!("Expected VerifyProvisions, got {other:?}"),
@@ -1860,7 +1865,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { anchor, .. }
+            Action::Provisions(ProvisionAction::VerifyProvisions { anchor, .. })
                 if anchor.height == BlockHeight::new(10)
         ));
     }
@@ -1892,7 +1897,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyProvisions { anchor, .. }
+            Action::Provisions(ProvisionAction::VerifyProvisions { anchor, .. })
                 if anchor.height == BlockHeight::new(10)
         ));
     }

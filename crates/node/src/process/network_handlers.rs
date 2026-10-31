@@ -430,7 +430,7 @@ where
         // Wire decode lands the wrapper as `Verifiable::Unverified`;
         // local-dispatched sends from a colocated source-shard proposer
         // arrive already verified and skip the state machine's
-        // `Action::VerifyProvisions` dispatch. The envelope signature is
+        // `ProvisionAction::VerifyProvisions` dispatch. The envelope signature is
         // checked only on a peer's copy.
 
         let senders = self.process.shard_event_senders.clone();

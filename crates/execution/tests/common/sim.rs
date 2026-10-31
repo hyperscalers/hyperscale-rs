@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
+use hyperscale_core::{Action, CrossShardExecutionRequest, ExecutionAction, TickBatchOutcome};
 use hyperscale_engine::tick_select::terms_of;
 use hyperscale_engine::{AllCodeRuns, ExecutedTx, PROTOCOL_RESOURCE};
 use hyperscale_execution::action_handlers::{
@@ -634,13 +634,13 @@ impl ExecutionSim {
     fn absorb(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::ExecuteTransactions {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
                     tick,
                     fates,
                     requests,
                     included,
                     ..
-                } => {
+                }) => {
                     let release_at = match self.schedule {
                         Schedule::Eager => self.height,
                         Schedule::Lagged(n) => BlockHeight::new(
@@ -915,13 +915,13 @@ impl ExecutionSim {
     pub fn certify_votable(&mut self) -> Vec<Finalization> {
         let mut certified = Vec::new();
         for action in self.coord.emit_vote_actions(&self.topology) {
-            let Action::SignAndSendExecutionVote {
+            let Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                 vote_anchor_ts,
                 tick_id,
                 global_receipt_root,
                 tx_outcomes,
                 ..
-            } = action
+            }) = action
             else {
                 continue;
             };

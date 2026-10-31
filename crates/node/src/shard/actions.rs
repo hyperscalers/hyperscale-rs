@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::{
-    Action, ActionContext, ActionOwner, CommitSource, FetchRequest, ProtocolEvent, Signing,
+    Action, ActionContext, CommitSource, Delegated, FetchRequest, ProtocolEvent, Signing,
 };
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_execution::action_handlers::handle_action as handle_execution_action;
@@ -48,36 +48,14 @@ where
     pub(super) fn process_action(&mut self, action: Action) {
         match action {
             // ─── Coordinator policy: delegated to worker pools ─────────────
-            Action::AggregateExecutionCertificate { .. }
-            | Action::VerifyAndAggregateExecutionVotes { .. }
-            | Action::VerifyExecutionCertificateSignature { .. }
-            | Action::VerifyFinalization { .. }
-            | Action::BuildLegsHalf { .. }
-            | Action::BuildProposal { .. }
-            | Action::VerifyAndBuildQuorumCertificate { .. }
-            | Action::VerifyQcSignature { .. }
-            | Action::VerifyTimeout { .. }
-            | Action::VerifyRemoteHeaderQc { .. }
-            | Action::VerifyShardForkProof { .. }
-            | Action::VerifyStateRoot(_)
-            | Action::VerifyBeaconWitnessRoot { .. }
-            | Action::VerifyBodyRoot { .. }
-            | Action::VerifyProvisionTxRoots { .. }
-            | Action::VerifyResolutions { .. }
-            | Action::VerifyProvisions { .. }
-            | Action::ExecuteTransactions { .. }
-            | Action::FetchAndBroadcastProvisions { .. }
-            | Action::PushCrossingReadings { .. }
-            | Action::BroadcastBlockHeader { .. }
-            | Action::SignAndBroadcastBlockVote { .. }
-            | Action::SignAndBroadcastTimeout { .. }
-            | Action::SignAndBroadcastQcAnnouncement { .. }
-            | Action::SignAndBroadcastReadySignal { .. }
-            | Action::BroadcastCertifiedBlockHeader { .. }
-            | Action::BroadcastShardForkProof { .. }
-            | Action::SignAndSendExecutionVote { .. }
-            | Action::BroadcastExecutionCertificate { .. } => {
-                self.dispatch_delegated_action(action);
+            Action::Consensus(action) => {
+                self.dispatch_delegated_action(action, handle_shard_action::<S, N>);
+            }
+            Action::Execution(action) => {
+                self.dispatch_delegated_action(action, handle_execution_action::<S, N>);
+            }
+            Action::Provisions(action) => {
+                self.dispatch_delegated_action(action, handle_provisions_action::<S, N>);
             }
 
             // ─── Tick chain maintenance ────────────────────────────────────
@@ -593,18 +571,18 @@ where
 
     // ─── Delegated Work ─────────────────────────────────────────────────
 
-    /// Dispatch a delegated action to the appropriate thread pool.
+    /// Dispatch delegated work to its pool, run there by `handle`, the
+    /// handler of the coordinator crate whose type it is.
     ///
     /// Spawns the work as a fire-and-forget closure. Results return via
     /// this shard's event channel and are processed on a future `step()`
     /// call. With `SyncDispatch` (simulation), `spawn_*` runs inline so
     /// events enter the channel immediately and are drained by the harness.
-    fn dispatch_delegated_action(&self, action: Action) {
-        let owner = action.owner();
-        let pool = owner
-            .pool()
-            .expect("dispatch_delegated_action called for delegated actions only");
-
+    fn dispatch_delegated_action<A: Delegated>(
+        &self,
+        action: A,
+        handle: fn(A, &ActionContext<'_, S, N>),
+    ) {
         let shard = self.shard;
         let handles = Arc::clone(&self.process.dispatch_handles);
         let topology_snapshot = Arc::clone(self.replica.topology_arc());
@@ -642,7 +620,7 @@ where
         let tick_chain = Arc::clone(&self.io.tick_chain);
         let prepared_commits = self.io.block_commit.prepared_commits_handle();
 
-        self.process.dispatch.spawn(pool, move || {
+        self.process.dispatch.spawn(A::POOL, move || {
             // Action handlers emit `ProtocolEvent`s; stamp each with this
             // loop's shard so the receiver routes back to it. `Arc`-shaped
             // so handlers can clone it into callback closures that outlive
@@ -670,15 +648,7 @@ where
                 commit_prepared: &commit_prepared,
                 par,
             };
-            match owner {
-                ActionOwner::Shard => handle_shard_action(action, &ctx),
-                ActionOwner::Execution => handle_execution_action(action, &ctx),
-                ActionOwner::Provisions => handle_provisions_action(action, &ctx),
-                ActionOwner::Local => unreachable!(
-                    "dispatch_delegated_action called with a Local-owned action — \
-                     process_action's outer match should have routed it"
-                ),
-            }
+            handle(action, &ctx);
         });
     }
 
@@ -721,7 +691,7 @@ enum SignerResolution {
 /// preference to the lowest-id attached signer in `committee`, the
 /// artifact's governing committee, and is dropped only with none.
 fn resolve_signer<T>(
-    action: &Action,
+    action: &impl Delegated,
     attached: &BTreeMap<ValidatorId, T>,
     committee: &[ValidatorId],
 ) -> SignerResolution {
@@ -813,7 +783,9 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
 
-    use hyperscale_core::{Action, ProtocolEvent, StateRootCheck};
+    use hyperscale_core::{
+        Action, ConsensusAction, Delegated, ProtocolEvent, ProvisionAction, StateRootCheck,
+    };
     use hyperscale_hbor::Capped;
     use hyperscale_storage::test_helpers::commit_writes;
     use hyperscale_storage::{
@@ -961,7 +933,7 @@ mod tests {
             Fixture::new().host_with_events_over(storage.clone(), parent_block_height);
         while events.try_recv().is_ok() {}
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"a certified child"));
-        loop_of(&mut host).drain_actions(vec![Action::VerifyStateRoot(Box::new(StateRootCheck {
+        let check = ConsensusAction::VerifyStateRoot(Box::new(StateRootCheck {
             block_hash,
             transactions: Arc::new(Capped::empty()),
             parent_block_hash: BlockHash::ZERO,
@@ -983,7 +955,8 @@ mod tests {
             members,
             parent_judgement: None,
             state_claims: Vec::new(),
-        }))]);
+        }));
+        loop_of(&mut host).drain_actions(vec![Action::Consensus(check)]);
         events
             .try_iter()
             .find_map(|event| match event {
@@ -1061,7 +1034,7 @@ mod tests {
 
     /// [`resolve_signer`] among the `attached` ids.
     fn resolve(
-        action: &Action,
+        action: &impl Delegated,
         attached: &[ValidatorId],
         committee: &[ValidatorId],
     ) -> SignerResolution {
@@ -1074,8 +1047,8 @@ mod tests {
         ValidatorId::new(id)
     }
 
-    fn provisions_preferring(signer: ValidatorId) -> Action {
-        Action::FetchAndBroadcastProvisions {
+    fn provisions_preferring(signer: ValidatorId) -> ProvisionAction {
+        ProvisionAction::FetchAndBroadcastProvisions {
             block_hash: BlockHash::ZERO,
             requests: Vec::new(),
             source_shard: SHARD,
@@ -1125,7 +1098,7 @@ mod tests {
     #[test]
     fn a_safety_bearing_action_naming_an_unattached_signer_is_dropped() {
         let committee = [validator(1), validator(2), validator(3)];
-        let announcement = |signer| Action::SignAndBroadcastQcAnnouncement {
+        let announcement = |signer| ConsensusAction::SignAndBroadcastQcAnnouncement {
             qc: QuorumCertificate::genesis(SHARD, ChainOrigin::root(WeightedTimestamp::ZERO)),
             recipients: Vec::new(),
             signer,
@@ -1142,8 +1115,13 @@ mod tests {
             resolve(&announcement(validator(1)), &[validator(1)], &committee),
             SignerResolution::Signs(validator(1)),
         );
+        let check = ConsensusAction::VerifyResolutions {
+            block_hash: BlockHash::ZERO,
+            entries: Vec::new(),
+            windows: EpochWindows::new(0, 1_000),
+        };
         assert_eq!(
-            resolve(&Action::ClearTickChain, &[validator(1)], &committee),
+            resolve(&check, &[validator(1)], &committee),
             SignerResolution::Unsigned,
         );
     }
@@ -1157,11 +1135,13 @@ mod tests {
         let mut removed = host.remove_shard(SHARD).expect("the fixture hosts SHARD");
         while events.try_recv().is_ok() {}
         let block_hash = BlockHash::from_raw(Hash::from_bytes(b"a block with no records"));
-        removed.drain_actions(vec![Action::VerifyResolutions {
-            block_hash,
-            entries: Vec::new(),
-            windows: EpochWindows::new(0, 1_000),
-        }]);
+        removed.drain_actions(vec![Action::Consensus(
+            ConsensusAction::VerifyResolutions {
+                block_hash,
+                entries: Vec::new(),
+                windows: EpochWindows::new(0, 1_000),
+            },
+        )]);
         assert!(
             events.try_iter().any(|event| matches!(
                 event,

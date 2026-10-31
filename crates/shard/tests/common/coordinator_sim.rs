@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, ActionContext, CommitSource, FetchIds, Gate, Parallelism, ParentJudgement,
-    PreparedBlock, ProtocolEvent, QcSubject, Signing, StateRootCheck, TimerId,
+    Action, ActionContext, CommitSource, ConsensusAction, FetchIds, Gate, Parallelism,
+    ParentJudgement, PreparedBlock, ProtocolEvent, QcSubject, Signing, StateRootCheck, TimerId,
 };
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::{ExecutionMode, Executor};
@@ -1275,7 +1275,7 @@ impl ShardCoordinatorSim {
             self.coordinators[to_idx]
                 .drain_ready_state_root_verifications()
                 .into_iter()
-                .map(|check| Action::VerifyStateRoot(Box::new(check))),
+                .map(|check| Action::Consensus(ConsensusAction::VerifyStateRoot(Box::new(check)))),
         );
         if self.coordinators[to_idx].take_ready_proposal() {
             actions.extend(self.try_propose_for(to_idx));
@@ -1389,7 +1389,7 @@ impl ShardCoordinatorSim {
         emitter_idx: usize,
         me: ValidatorId,
         key: &Arc<dyn Signer>,
-        action: Action,
+        action: ConsensusAction,
     ) -> (Vec<ProtocolEvent>, Vec<PreparedBlock>) {
         let production = self
             .production
@@ -1429,7 +1429,7 @@ impl ShardCoordinatorSim {
     /// Run `action`, a signing action, through the production handler as
     /// the replica at `idx`, under a key that reads the replica's stored
     /// registers at each signature it makes.
-    pub fn sign_in_production(&self, idx: usize, action: Action) -> SignedInProduction {
+    pub fn sign_in_production(&self, idx: usize, action: ConsensusAction) -> SignedInProduction {
         let me = self.members[idx].0;
         let probe = Arc::new(RegisterProbe {
             inner: Arc::clone(&self.sks[idx]),
@@ -1452,7 +1452,12 @@ impl ShardCoordinatorSim {
     /// as the replica at `emitter_idx`: its prepared block joins the
     /// replica's pending chain and the proposal it reports is queued
     /// back to it.
-    fn build_in_production(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
+    fn build_in_production(
+        &mut self,
+        emitter_idx: usize,
+        me: ValidatorId,
+        action: ConsensusAction,
+    ) {
         let key = Arc::clone(&self.sks[emitter_idx]);
         let (reported, prepared) = self.run_in_production(emitter_idx, me, &key, action);
         for block in prepared {
@@ -1504,17 +1509,19 @@ impl ShardCoordinatorSim {
 
     #[allow(clippy::too_many_lines)] // single dispatch over shard-emitted Action variants
     fn absorb_one(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
-        if self.production.is_some() && matches!(action, Action::BuildProposal { .. }) {
-            self.build_in_production(emitter_idx, me, action);
+        if self.production.is_some()
+            && let Action::Consensus(build @ ConsensusAction::BuildProposal { .. }) = action
+        {
+            self.build_in_production(emitter_idx, me, build);
             return;
         }
         match action {
-            Action::BroadcastBlockHeader {
+            Action::Consensus(ConsensusAction::BroadcastBlockHeader {
                 header,
                 manifest,
                 recipients: committee_ids,
                 position,
-            } => {
+            }) => {
                 // Mirror the production sign handler: the proposer's spent
                 // round is durable before the header signature exists.
                 self.storages[emitter_idx].persist_vote_position(me, &position);
@@ -1583,7 +1590,7 @@ impl ShardCoordinatorSim {
                     }
                 }
             }
-            Action::SignAndBroadcastBlockVote {
+            Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote {
                 block_hash,
                 parent_block_hash,
                 height,
@@ -1592,7 +1599,7 @@ impl ShardCoordinatorSim {
                 next_proposers,
                 position,
                 signer: _,
-            } => {
+            }) => {
                 self.votes_cast[emitter_idx].push((block_hash, round));
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
@@ -1645,7 +1652,11 @@ impl ShardCoordinatorSim {
                     event: SimEvent::VerifiedVote { vote: verified },
                 });
             }
-            Action::SignAndBroadcastQcAnnouncement { qc, recipients, .. } => {
+            Action::Consensus(ConsensusAction::SignAndBroadcastQcAnnouncement {
+                qc,
+                recipients,
+                ..
+            }) => {
                 let mut announcement = QcAnnouncementNotification {
                     qc,
                     sender: me,
@@ -1666,14 +1677,14 @@ impl ShardCoordinatorSim {
                     });
                 }
             }
-            Action::SignAndBroadcastTimeout {
+            Action::Consensus(ConsensusAction::SignAndBroadcastTimeout {
                 round,
                 high_qc,
                 high_tc,
                 recipients,
                 position,
                 signer: _,
-            } => {
+            }) => {
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
                 self.storages[emitter_idx].persist_vote_position(me, &position);
@@ -1710,10 +1721,10 @@ impl ShardCoordinatorSim {
                     event: SimEvent::VerifiedTimeout { timeout: verified },
                 });
             }
-            Action::VerifyTimeout {
+            Action::Consensus(ConsensusAction::VerifyTimeout {
                 timeout,
                 voter_public_key,
-            } => {
+            }) => {
                 // Mirror the production handler: the consensus crypto pool
                 // verifies the share (inline here) and feeds the verified
                 // timeout back to the emitter's `TimeoutKeeper`.
@@ -1732,7 +1743,7 @@ impl ShardCoordinatorSim {
             // light-client gossip; the single-shard sim has
             // nothing to deliver it to. Folds into the no-op
             // bucket below.
-            Action::BuildProposal {
+            Action::Consensus(ConsensusAction::BuildProposal {
                 shard_id,
                 chain_origin,
                 proposer,
@@ -1772,7 +1783,7 @@ impl ShardCoordinatorSim {
                 manifest,
                 timeout_cert,
                 standing_answers,
-            } => {
+            }) => {
                 // ExtendStaleParent re-parents the proposal onto an ancestor
                 // whose QC round sits below the honest lock, so honest
                 // replicas decline it under the safe-vote rule. It stays
@@ -1960,7 +1971,7 @@ impl ShardCoordinatorSim {
                     },
                 });
             }
-            Action::VerifyAndBuildQuorumCertificate {
+            Action::Consensus(ConsensusAction::VerifyAndBuildQuorumCertificate {
                 block_hash,
                 shard_id,
                 height,
@@ -1971,7 +1982,7 @@ impl ShardCoordinatorSim {
                 verified_votes,
                 total_votes,
                 binding,
-            } => {
+            }) => {
                 let result = verify_and_build_qc(
                     &BlsVerifier,
                     &self.network,
@@ -1995,12 +2006,12 @@ impl ShardCoordinatorSim {
                     },
                 });
             }
-            Action::VerifyQcSignature {
+            Action::Consensus(ConsensusAction::VerifyQcSignature {
                 qc,
                 public_keys,
                 quorum_threshold,
                 subject,
-            } => {
+            }) => {
                 let qc_ctx = QcContext {
                     verifier: &BlsVerifier,
                     network: &self.network,
@@ -2016,10 +2027,10 @@ impl ShardCoordinatorSim {
                     event: SimEvent::QcSignatureVerified { subject, result },
                 });
             }
-            Action::VerifyBodyRoot {
+            Action::Consensus(ConsensusAction::VerifyBodyRoot {
                 block,
                 validity_anchor,
-            } => {
+            }) => {
                 let result = block.header().body_root().verify(&BodyRootContext {
                     block: &block,
                     validity_anchor,
@@ -2033,12 +2044,12 @@ impl ShardCoordinatorSim {
                     ),
                 });
             }
-            Action::VerifyProvisionTxRoots {
+            Action::Consensus(ConsensusAction::VerifyProvisionTxRoots {
                 block_hash,
                 expected,
                 transactions,
                 topology_snapshot,
-            } => {
+            }) => {
                 let committing = committing_shards(&topology_snapshot);
                 let ptx_ctx = ProvisionTxRootsContext {
                     local_shard: self.shard,
@@ -2056,7 +2067,7 @@ impl ShardCoordinatorSim {
                     ),
                 });
             }
-            Action::VerifyBeaconWitnessRoot {
+            Action::Consensus(ConsensusAction::VerifyBeaconWitnessRoot {
                 block_hash,
                 expected_root,
                 expected_leaf_count,
@@ -2077,7 +2088,7 @@ impl ShardCoordinatorSim {
                 thresholds,
                 finalizations,
                 topology_snapshot,
-            } => {
+            }) => {
                 let receipts: Vec<StoredReceipt> = finalizations
                     .iter()
                     .flat_map(|fw| fw.receipts().iter().cloned())
@@ -2114,7 +2125,7 @@ impl ShardCoordinatorSim {
                     ),
                 });
             }
-            Action::VerifyStateRoot(check) => {
+            Action::Consensus(ConsensusAction::VerifyStateRoot(check)) => {
                 let StateRootCheck {
                     block_hash,
                     transactions,
@@ -2354,7 +2365,7 @@ impl ShardCoordinatorSim {
                 self.pace_timers
                     .insert(emitter_idx, self.now.plus(duration));
             }
-            Action::BroadcastCertifiedBlockHeader { .. }
+            Action::Consensus(ConsensusAction::BroadcastCertifiedBlockHeader { .. })
             | Action::SetTimer { .. }
             | Action::CancelTimer { .. }
             | Action::AbandonFetch(_)

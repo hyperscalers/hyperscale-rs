@@ -11,7 +11,7 @@
 //! emitted `VerifyProvisions` action only needs to check merkle proofs
 //! against the committed state root.
 
-use hyperscale_core::Action;
+use hyperscale_core::{Action, ProvisionAction};
 use hyperscale_types::{
     Anchor, CertifiedBlockHeader, Hash, ProvisionTxRoot, Provisions, ShardId, Verified,
     compute_merkle_root,
@@ -61,8 +61,8 @@ pub fn build_verify_action(
         return None;
     }
 
-    Some(Action::VerifyProvisions {
+    Some(Action::Provisions(ProvisionAction::VerifyProvisions {
         provisions,
         anchor: Anchor::of(certified_header),
-    })
+    }))
 }

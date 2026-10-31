@@ -4,7 +4,7 @@
 //! deterministic simulator. The [`Executor`] does NOT own storage: the
 //! runner owns it and passes a snapshot per call.
 //!
-//! State machines emit `Action::ExecuteTransactions`; the runner drives
+//! State machines emit `ExecutionAction::ExecuteTransactions`; the runner drives
 //! the executor over the tick's batch, which projects the
 //! [`CachedOutput`] into the local shard's [`ExecutedTx`] via
 //! [`project_to_shard`].

@@ -931,7 +931,9 @@ mod tests {
     use std::sync::Arc;
 
     use crossbeam::channel::Receiver;
-    use hyperscale_core::{Action, CommitSource, Gate, ProtocolEvent, StateMachine};
+    use hyperscale_core::{
+        Action, CommitSource, ConsensusAction, ExecutionAction, Gate, ProtocolEvent, StateMachine,
+    };
     use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
     use hyperscale_network::HandlerRegistry;
     use hyperscale_network_memory::{PendingRequest, SimNetworkAdapter};
@@ -1195,9 +1197,11 @@ mod tests {
         let asked = actions
             .iter()
             .find_map(|action| match action {
-                Action::SignAndBroadcastTimeout {
-                    signer, position, ..
-                } if *signer == joiner => Some(position.registers.last_voted_round),
+                Action::Consensus(ConsensusAction::SignAndBroadcastTimeout {
+                    signer,
+                    position,
+                    ..
+                }) if *signer == joiner => Some(position.registers.last_voted_round),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("the replica asks the joiner for a timeout: {actions:?}"));
@@ -1294,7 +1298,7 @@ mod tests {
 
     /// A timeout `signer` signs at `round`, its position advanced to it.
     fn timeout_at(signer: ValidatorId, round: u64) -> Action {
-        Action::SignAndBroadcastTimeout {
+        Action::Consensus(ConsensusAction::SignAndBroadcastTimeout {
             round: Round::new(round),
             high_qc: QuorumCertificate::genesis(SHARD, ChainOrigin::root(WeightedTimestamp::ZERO)),
             high_tc: None,
@@ -1307,7 +1311,7 @@ mod tests {
                 justification: Vec::new(),
             },
             signer,
-        }
+        })
     }
 
     /// A signature queued on the pool under one attachment of a
@@ -1541,16 +1545,18 @@ mod tests {
         let _ = host.network().drain_pending_notifications();
 
         let voter = fix.committee.validator_id(0);
-        loop_of(&mut host).drain_actions(vec![Action::SignAndSendExecutionVote {
-            block_hash: BlockHash::ZERO,
-            vote_anchor_ts: WeightedTimestamp::ZERO,
-            tick_id: TickId::new(SHARD, BlockHeight::new(1)),
-            global_receipt_root: GlobalReceiptRoot::ZERO,
-            tx_outcomes: Vec::new(),
-            recipients: Vec::new(),
-            local_recipient: true,
-            signer: voter,
-        }]);
+        loop_of(&mut host).drain_actions(vec![Action::Execution(
+            ExecutionAction::SignAndSendExecutionVote {
+                block_hash: BlockHash::ZERO,
+                vote_anchor_ts: WeightedTimestamp::ZERO,
+                tick_id: TickId::new(SHARD, BlockHeight::new(1)),
+                global_receipt_root: GlobalReceiptRoot::ZERO,
+                tx_outcomes: Vec::new(),
+                recipients: Vec::new(),
+                local_recipient: true,
+                signer: voter,
+            },
+        )]);
 
         assert!(
             events.try_iter().any(|event| matches!(

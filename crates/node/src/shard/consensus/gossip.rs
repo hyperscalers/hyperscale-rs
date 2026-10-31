@@ -13,7 +13,7 @@
 //!    for envelope signature verification; on success they emit as
 //!    `ProtocolEvent::UnverifiedRemoteHeaderReceived` (the marker tracks
 //!    the QC predicate, which the envelope check doesn't establish), and
-//!    the state machine still dispatches `Action::VerifyRemoteHeaderQc`
+//!    the state machine still dispatches `ConsensusAction::VerifyRemoteHeaderQc`
 //!    against them. The check settles the gossip verdict the inbound
 //!    handler deferred to it, so the transport forwards a header only once
 //!    its sender signature holds up, and charges the peer that delivered

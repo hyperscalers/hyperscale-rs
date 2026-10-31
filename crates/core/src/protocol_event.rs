@@ -141,7 +141,7 @@ pub enum ProtocolEvent {
     /// holds — produced only by the local-dispatch fast path when a
     /// colocated proposer's broadcast carries `Verifiable::Verified`.
     /// The recipient skips both the envelope signature check and
-    /// `Action::VerifyRemoteHeaderQc`, admitting the header directly.
+    /// `ConsensusAction::VerifyRemoteHeaderQc`, admitting the header directly.
     VerifiedRemoteHeaderReceived {
         /// Header + QC bundle, sealed via
         /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
@@ -490,9 +490,9 @@ pub enum ProtocolEvent {
     /// produced only by the local-dispatch fast path when a source-shard
     /// replica on the same host emits a notification carrying
     /// `Verifiable::Verified`. The recipient skips
-    /// [`Action::VerifyProvisions`] and admits directly.
+    /// [`ProvisionAction::VerifyProvisions`] and admits directly.
     ///
-    /// [`Action::VerifyProvisions`]: crate::Action::VerifyProvisions
+    /// [`ProvisionAction::VerifyProvisions`]: crate::ProvisionAction::VerifyProvisions
     VerifiedProvisionsReceived {
         /// Verified provisions batch sealed via
         /// [`Verified::<Provisions>::from_local`].
@@ -646,7 +646,7 @@ pub enum ProtocolEvent {
     },
 
     /// A legs half was built from the yes receipts staged at a committed
-    /// tip, answering `Action::BuildLegsHalf`.
+    /// tip, answering `ExecutionAction::BuildLegsHalf`.
     ///
     /// Routed to `ExecutionCoordinator::on_legs_half_built`, which records
     /// the names it carries and offers it in place of the half held.

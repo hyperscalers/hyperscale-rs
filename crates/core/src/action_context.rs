@@ -1,7 +1,7 @@
 //! Shared context for executing delegated actions.
 //!
 //! Coordinator crates (`hyperscale_shard`, `hyperscale_execution`, etc.) accept
-//! [`ActionContext`] when handling [`crate::Action`] variants, so they can read
+//! [`ActionContext`] when handling their [`crate::Delegated`] work, so they can read
 //! storage/topology/engine state without depending on the node crate. Outcomes
 //! flow back via the `notify` and `commit_prepared` callbacks.
 
@@ -33,7 +33,7 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     pub executor: &'a Executor,
     pub topology_snapshot: &'a TopologySnapshot,
     /// The attached signer the action is dispatched under, resolved from
-    /// [`crate::Action::signer`] by the dispatch site. `None` for an
+    /// [`crate::Delegated::signer`] by the dispatch site. `None` for an
     /// action no signer signs; a signing handler finding `None` drops its
     /// action unsigned.
     pub signing: Option<Signing<'a>>,

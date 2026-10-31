@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ParentJudgement, StateRootCheck};
+use hyperscale_core::{Action, ConsensusAction, ParentJudgement, StateRootCheck};
 use hyperscale_storage::{MemberInputs, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
@@ -828,10 +828,10 @@ impl VerificationPipeline {
             "Initiating body root verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::BodyRoot);
-        vec![Action::VerifyBodyRoot {
+        vec![Action::Consensus(ConsensusAction::VerifyBodyRoot {
             block: block.clone(),
             validity_anchor: block.header().parent_qc().weighted_timestamp(),
-        }]
+        })]
     }
 
     /// Initiate provision tx-root verification for a block.
@@ -847,12 +847,12 @@ impl VerificationPipeline {
             "Initiating provision tx-root verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::ProvisionTxRoots);
-        vec![Action::VerifyProvisionTxRoots {
+        vec![Action::Consensus(ConsensusAction::VerifyProvisionTxRoots {
             block_hash,
             expected: block.header().provision_tx_roots().clone(),
             transactions: block.transactions().clone(),
             topology_snapshot: topology_snapshot.clone(),
-        }]
+        })]
     }
 
     /// Initiate the check of a block's resolutions against the bodies
@@ -897,11 +897,11 @@ impl VerificationPipeline {
             "Initiating resolutions verification"
         );
         self.mark_root_in_flight(block_hash, VerificationKind::Resolutions);
-        vec![Action::VerifyResolutions {
+        vec![Action::Consensus(ConsensusAction::VerifyResolutions {
             block_hash,
             entries,
             windows: schedule.windows(),
-        }]
+        })]
     }
 
     /// Initiate beacon-witness root verification for a block, or defer
@@ -1019,28 +1019,30 @@ impl VerificationPipeline {
         };
 
         self.mark_root_in_flight(block_hash, VerificationKind::BeaconWitnessRoot);
-        vec![Action::VerifyBeaconWitnessRoot {
-            block_hash,
-            expected_root: header.beacon_witness_root(),
-            expected_leaf_count: header.beacon_witness_leaf_count(),
-            claimed_base: header.beacon_witness_base(),
-            claimed_reveal_chain: header.reveal_chain(),
-            parent_reveal_chain,
-            parent_committee_anchor_epoch: schedule.epoch_for(parent_committee_anchor_wt),
-            committee_anchor_epoch: schedule.epoch_for(committee_anchor_wt),
-            parent_leaves_start,
-            parent_witness_leaves,
-            parent_round: header.parent_qc().round(),
-            height: header.height(),
-            round: header.round(),
-            witness_sources: Arc::clone(block.witness_sources()),
-            substate_bytes,
-            claimed_substate_bytes: header.load().substate_bytes,
-            settling,
-            thresholds,
-            finalizations,
-            topology_snapshot: topology_snapshot.clone(),
-        }]
+        vec![Action::Consensus(
+            ConsensusAction::VerifyBeaconWitnessRoot {
+                block_hash,
+                expected_root: header.beacon_witness_root(),
+                expected_leaf_count: header.beacon_witness_leaf_count(),
+                claimed_base: header.beacon_witness_base(),
+                claimed_reveal_chain: header.reveal_chain(),
+                parent_reveal_chain,
+                parent_committee_anchor_epoch: schedule.epoch_for(parent_committee_anchor_wt),
+                committee_anchor_epoch: schedule.epoch_for(committee_anchor_wt),
+                parent_leaves_start,
+                parent_witness_leaves,
+                parent_round: header.parent_qc().round(),
+                height: header.height(),
+                round: header.round(),
+                witness_sources: Arc::clone(block.witness_sources()),
+                substate_bytes,
+                claimed_substate_bytes: header.load().substate_bytes,
+                settling,
+                thresholds,
+                finalizations,
+                topology_snapshot: topology_snapshot.clone(),
+            },
+        )]
     }
 
     /// Substate byte total behind the block's parent state, for the reshape
@@ -3037,7 +3039,7 @@ mod tests {
         assert!(
             matches!(
                 actions.as_slice(),
-                [Action::VerifyBeaconWitnessRoot { settling: carried, .. }] if *carried == settling
+                [Action::Consensus(ConsensusAction::VerifyBeaconWitnessRoot { settling: carried, .. })] if *carried == settling
             ),
             "{actions:?}",
         );

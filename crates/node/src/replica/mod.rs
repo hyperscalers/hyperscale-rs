@@ -29,7 +29,7 @@ mod test_support;
 use std::sync::Arc;
 
 pub use config::{AttachedSigner, ReplicaConfig};
-use hyperscale_core::{Action, ProtocolEvent, StateMachine};
+use hyperscale_core::{Action, ConsensusAction, ProtocolEvent, StateMachine};
 use hyperscale_execution::ExecutionCoordinator;
 use hyperscale_mempool::MempoolCoordinator;
 #[cfg(test)]
@@ -300,7 +300,7 @@ impl NodeStateMachine {
             s.shard_coordinator
                 .drain_ready_state_root_verifications()
                 .into_iter()
-                .map(|check| Action::VerifyStateRoot(Box::new(check))),
+                .map(|check| Action::Consensus(ConsensusAction::VerifyStateRoot(Box::new(check)))),
         );
 
         // If any emitter latched a proposal-retry during this dispatch (or

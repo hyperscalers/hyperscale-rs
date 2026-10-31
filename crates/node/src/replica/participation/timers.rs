@@ -224,7 +224,7 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
+    use hyperscale_core::{Action, ExecutionAction, ProtocolEvent, StateMachine, TimerId};
     use hyperscale_types::LocalTimestamp;
 
     use crate::assert_emits;
@@ -299,7 +299,15 @@ mod tests {
             let actions = node.handle(now, ProtocolEvent::CleanupTimer);
             resent += actions
                 .iter()
-                .filter(|a| matches!(a, Action::SignAndSendExecutionVote { tick_id: t, .. } if *t == tick_id))
+                .filter(|a| {
+                    matches!(
+                        a,
+                        Action::Execution(ExecutionAction::SignAndSendExecutionVote {
+                            tick_id: t,
+                            ..
+                        }) if *t == tick_id
+                    )
+                })
                 .count();
         }
         assert_eq!(resent, 1);

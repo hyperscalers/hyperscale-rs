@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent, StateRootCheck};
+use hyperscale_core::{
+    ActionContext, ConsensusAction, PreparedBlock, ProtocolEvent, StateRootCheck,
+};
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{
     CommittedSets, ManifestInputs, ManifestKind, contentions, end_lines, licensed_lines,
@@ -87,7 +89,7 @@ pub struct QcVerificationResult {
 /// Returns an empty `verified_votes` vec on success and the full verified
 /// set on failure so the caller can accumulate across rounds.
 ///
-/// Called from the dispatch layer via `Action::VerifyAndBuildQuorumCertificate`;
+/// Called from the dispatch layer via `ConsensusAction::VerifyAndBuildQuorumCertificate`;
 /// the split helpers exist for focused unit testing of each phase.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
@@ -935,20 +937,18 @@ where
     })
 }
 
-/// Handle the shard-owned delegated [`Action`] variants.
+/// Run shard consensus work.
 ///
 /// Outcomes flow through `ctx.notify` (state-machine inputs) and
-/// `ctx.commit_prepared` (prepared blocks for the `io_loop`'s chain). Variants
-/// owned by other coordinator crates hit `unreachable!()` — the caller
-/// (node's dispatcher) routes by variant prefix.
-#[allow(clippy::too_many_lines)] // single dispatch over shard-owned Action variants
-pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
+/// `ctx.commit_prepared` (prepared blocks for the `io_loop`'s chain).
+#[allow(clippy::too_many_lines)] // single dispatch over ConsensusAction variants
+pub fn handle_action<S, N>(action: ConsensusAction, ctx: &ActionContext<'_, S, N>)
 where
     S: ShardStorage,
     N: Network,
 {
     match action {
-        Action::VerifyAndBuildQuorumCertificate {
+        ConsensusAction::VerifyAndBuildQuorumCertificate {
             block_hash,
             shard_id,
             height,
@@ -983,7 +983,7 @@ where
             });
         }
 
-        Action::VerifyQcSignature {
+        ConsensusAction::VerifyQcSignature {
             qc,
             public_keys,
             quorum_threshold,
@@ -1011,7 +1011,7 @@ where
             ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { subject, result });
         }
 
-        Action::VerifyRemoteHeaderQc {
+        ConsensusAction::VerifyRemoteHeaderQc {
             certified_header,
             source,
             committee_public_keys,
@@ -1064,7 +1064,7 @@ where
             });
         }
 
-        Action::VerifyShardForkProof { proof, committees } => {
+        ConsensusAction::VerifyShardForkProof { proof, committees } => {
             let start = Stopwatch::start();
             let verified = proof
                 .verify_resolved(ctx.verifier, ctx.topology_snapshot.network(), &committees)
@@ -1079,7 +1079,7 @@ where
             ctx.notify_protocol(ProtocolEvent::ShardForkProofVerified { proof, verified });
         }
 
-        Action::VerifyBodyRoot {
+        ConsensusAction::VerifyBodyRoot {
             block,
             validity_anchor,
         } => {
@@ -1096,7 +1096,7 @@ where
             ));
         }
 
-        Action::VerifyProvisionTxRoots {
+        ConsensusAction::VerifyProvisionTxRoots {
             block_hash,
             expected,
             transactions,
@@ -1122,7 +1122,7 @@ where
             ));
         }
 
-        Action::VerifyResolutions {
+        ConsensusAction::VerifyResolutions {
             block_hash,
             entries,
             windows,
@@ -1203,7 +1203,7 @@ where
             });
         }
 
-        Action::VerifyBeaconWitnessRoot {
+        ConsensusAction::VerifyBeaconWitnessRoot {
             block_hash,
             expected_root,
             expected_leaf_count,
@@ -1269,7 +1269,7 @@ where
             ));
         }
 
-        Action::VerifyStateRoot(check) => {
+        ConsensusAction::VerifyStateRoot(check) => {
             let StateRootCheck {
                 block_hash,
                 transactions,
@@ -1491,7 +1491,7 @@ where
             });
         }
 
-        Action::BuildProposal {
+        ConsensusAction::BuildProposal {
             shard_id,
             chain_origin,
             proposer,
@@ -1763,7 +1763,7 @@ where
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
-        Action::BroadcastBlockHeader {
+        ConsensusAction::BroadcastBlockHeader {
             header,
             manifest,
             recipients,
@@ -1798,7 +1798,7 @@ where
             ctx.network.notify(&recipients, &gossip);
         }
 
-        Action::SignAndBroadcastBlockVote {
+        ConsensusAction::SignAndBroadcastBlockVote {
             block_hash,
             parent_block_hash,
             height,
@@ -1843,7 +1843,7 @@ where
             ctx.notify_protocol(ProtocolEvent::VerifiedBlockVoteReceived { vote: verified });
         }
 
-        Action::SignAndBroadcastTimeout {
+        ConsensusAction::SignAndBroadcastTimeout {
             round,
             high_qc,
             high_tc,
@@ -1880,7 +1880,7 @@ where
             ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived { timeout: verified });
         }
 
-        Action::SignAndBroadcastQcAnnouncement {
+        ConsensusAction::SignAndBroadcastQcAnnouncement {
             qc,
             recipients,
             signer: _,
@@ -1906,7 +1906,7 @@ where
             ctx.network.notify(&recipients, &announcement);
         }
 
-        Action::SignAndBroadcastReadySignal {
+        ConsensusAction::SignAndBroadcastReadySignal {
             shard,
             wt_window_start,
             wt_window_end,
@@ -1943,7 +1943,7 @@ where
             }
         }
 
-        Action::VerifyTimeout {
+        ConsensusAction::VerifyTimeout {
             timeout,
             voter_public_key,
         } => {
@@ -1962,7 +1962,7 @@ where
             }
         }
 
-        Action::BroadcastCertifiedBlockHeader { certified_header } => {
+        ConsensusAction::BroadcastCertifiedBlockHeader { certified_header } => {
             let Some(signing) = &ctx.signing else {
                 tracing::error!("certified header gossip dispatched without a signer; skipping");
                 return;
@@ -1990,7 +1990,7 @@ where
             ctx.network.broadcast_global(&gossip);
         }
 
-        Action::BroadcastShardForkProof { proof } => {
+        ConsensusAction::BroadcastShardForkProof { proof } => {
             // Self-authenticating: gossip the proof unsigned; every recipient
             // re-verifies it against its own topology.
             let gossip = ShardForkProofGossip {
@@ -1998,8 +1998,6 @@ where
             };
             ctx.network.broadcast_global(&gossip);
         }
-
-        _ => unreachable!("hyperscale_shard::handle_action called with non-shard action"),
     }
 }
 

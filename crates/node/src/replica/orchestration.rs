@@ -180,7 +180,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use hyperscale_core::{ProtocolEvent, StateMachine};
+    use hyperscale_core::{ConsensusAction, ProtocolEvent, StateMachine};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::RecoveredState;
     use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
@@ -545,7 +545,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, Action::BuildProposal { .. })),
+                .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. }))),
             "expected BuildProposal after BeaconBlockPersisted on a leader; got {actions:?}",
         );
     }
@@ -615,7 +615,9 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndBroadcastReadySignal { signer, .. } => Some(*signer),
+                Action::Consensus(ConsensusAction::SignAndBroadcastReadySignal {
+                    signer, ..
+                }) => Some(*signer),
                 _ => None,
             })
             .collect()
@@ -845,7 +847,10 @@ mod tests {
         actions.iter().any(|action| {
             matches!(
                 action,
-                Action::SignAndBroadcastBlockVote { block_hash: voted, .. } if *voted == block_hash
+                Action::Consensus(ConsensusAction::SignAndBroadcastBlockVote {
+                    block_hash: voted,
+                    ..
+                }) if *voted == block_hash
             )
         })
     }
@@ -908,7 +913,10 @@ mod tests {
         let binding = batch
             .iter()
             .find_map(|action| match action {
-                Action::VerifyAndBuildQuorumCertificate { binding, .. } => Some(*binding),
+                Action::Consensus(ConsensusAction::VerifyAndBuildQuorumCertificate {
+                    binding,
+                    ..
+                }) => Some(*binding),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("the halted committee reaches a batch: {batch:?}"));

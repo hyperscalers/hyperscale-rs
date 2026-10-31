@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_core::Action;
+use hyperscale_core::{Action, ConsensusAction};
 use hyperscale_engine::tick_select::{ManifestInputs, terms_of};
 use hyperscale_metrics::record_retirements_spent;
 use hyperscale_storage::{
@@ -1539,7 +1539,7 @@ pub fn assemble_build_action(
     // form; HBOR encoding is byte-identical between the raw and
     // verified shapes, but the field type is raw.
     let parent_qc_raw = parent_qc.into_inner();
-    let action = Action::BuildProposal {
+    let action = Action::Consensus(ConsensusAction::BuildProposal {
         shard_id: local_shard,
         chain_origin: chain.chain_origin().cut(),
         proposer: me,
@@ -1579,7 +1579,7 @@ pub fn assemble_build_action(
         manifest,
         timeout_cert,
         standing_answers,
-    };
+    });
 
     BuildActionPlan {
         action,

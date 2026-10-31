@@ -42,8 +42,9 @@ mod timer;
 mod traits;
 
 pub use action::{
-    Action, ActionOwner, CrossShardExecutionRequest, KeepDelta, ObserveDelta, ParentJudgement,
-    ParticipationChange, ProvisionsRequest, QcSubject, StateRootCheck, SyncClaimId,
+    Action, ConsensusAction, CrossShardExecutionRequest, Delegated, ExecutionAction, KeepDelta,
+    ObserveDelta, ParentJudgement, ParticipationChange, ProvisionAction, ProvisionsRequest,
+    QcSubject, StateRootCheck, SyncClaimId,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock, Signing};
 pub use beacon_action::{BeaconAction, BeaconBlockCheck, ParticipantAction};

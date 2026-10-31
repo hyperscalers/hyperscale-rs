@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 
-use hyperscale_core::{Action, ActionContext, ProtocolEvent, ProvisionsRequest};
+use hyperscale_core::{ActionContext, ProtocolEvent, ProvisionAction, ProvisionsRequest};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_metrics::{record_fetch_response_refused, record_signature_verification_latency};
 use hyperscale_network::Network;
@@ -70,17 +70,14 @@ where
     batches
 }
 
-/// Handle the provisions-owned delegated [`Action`] variants.
-///
-/// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
-/// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
-pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
+/// Run provision work. Outcomes flow through `ctx.notify`.
+pub fn handle_action<S, N>(action: ProvisionAction, ctx: &ActionContext<'_, S, N>)
 where
     S: ShardStorage,
     N: Network,
 {
     match action {
-        Action::VerifyProvisions { provisions, anchor } => {
+        ProvisionAction::VerifyProvisions { provisions, anchor } => {
             let merkle_start = Stopwatch::start();
             let ctx_verify = ProvisionsContext { anchor };
             let result = match provisions.verify(&ctx_verify) {
@@ -109,7 +106,7 @@ where
             );
             ctx.notify_protocol(ProtocolEvent::StateProvisionsVerified { result, anchor });
         }
-        Action::FetchAndBroadcastProvisions {
+        ProvisionAction::FetchAndBroadcastProvisions {
             block_hash,
             requests,
             source_shard,
@@ -148,7 +145,7 @@ where
                 // own merkle-proof predicate by construction; wrap as
                 // `Verified` so the local-dispatch fast path can let a
                 // target-shard replica on this host admit without
-                // re-running `Action::VerifyProvisions`.
+                // re-running `ProvisionAction::VerifyProvisions`.
                 let verified = Verified::<Provisions>::from_local(provisions);
 
                 let msg = signed_bytes(
@@ -175,13 +172,12 @@ where
                 ctx.network.notify(&recipients, &notification);
             }
         }
-        Action::PushCrossingReadings {
+        ProvisionAction::PushCrossingReadings {
             block_hash,
             anchor,
             targets,
             shard_recipients,
             signer: _,
         } => push_crossing_readings(ctx, block_hash, anchor, &targets, &shard_recipients),
-        _ => unreachable!("hyperscale_provisions::handle_action called with non-provisions action"),
     }
 }

@@ -61,7 +61,7 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_core::{Action, ProtocolEvent, StateMachine};
+    use hyperscale_core::{Action, ConsensusAction, ProtocolEvent, StateMachine};
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         BlockHeight, LocalTimestamp, MerkleInclusionProof, Provisions, ShardId, Verified,
@@ -101,7 +101,7 @@ mod tests {
 
         let saw_proposal = actions
             .iter()
-            .any(|a| matches!(a, Action::BuildProposal { .. }));
+            .any(|a| matches!(a, Action::Consensus(ConsensusAction::BuildProposal { .. })));
         assert!(
             saw_proposal,
             "expected BuildProposal after ProvisionsAdmitted on a leader; got {actions:?}",

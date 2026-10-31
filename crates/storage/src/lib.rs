@@ -7,7 +7,7 @@
 //! # Design
 //!
 //! Storage is an implementation detail of runners, not the state machine.
-//! The state machine emits `Action::ExecuteTransactions` and receives
+//! The state machine emits `ExecutionAction::ExecuteTransactions` and receives
 //! `ProtocolEvent::ExecutionBatchCompleted` - it never touches storage directly.
 //!
 //! Runners own storage and pass it to the executor:
