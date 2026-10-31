@@ -112,7 +112,7 @@ where
     fn floor_pins(&self) -> (Option<BlockHeight>, Option<BlockHeight>) {
         let topology = self.process.topology_snapshot().load();
         let attested = topology.boundary(self.shard).map(|anchor| anchor.height);
-        let oldest_pin = [self.io.storage.oldest_pin(), attested]
+        let oldest_pin = [self.io.boundary_pins.oldest(), attested]
             .into_iter()
             .flatten()
             .min();
