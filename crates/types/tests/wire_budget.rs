@@ -999,6 +999,7 @@ fn full_engagements() -> Vec<Engagement> {
             source: ShardId::leaf(63, u64::MAX >> 1),
             tx_hash: TxHash::from(hash_at(at)),
             source_height: BlockHeight::new(u64::MAX),
+            source_anchor: WeightedTimestamp::from_millis(u64::MAX),
         })
         .collect()
 }

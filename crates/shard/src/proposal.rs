@@ -60,6 +60,8 @@ pub struct ProposalAsk<'a> {
     pub intake: IntakeView<'a>,
     /// The committee the block is classified under.
     pub(crate) committee: &'a TopologySnapshot,
+    /// The epoch grid a recovery's band is placed on.
+    pub(crate) windows: EpochWindows,
     pub(crate) local_shard: ShardId,
     pub(crate) dedup: &'a CommitDedupIndex,
     pub(crate) committed_anchor: WeightedTimestamp,
@@ -111,9 +113,13 @@ impl ProposalAsk<'_> {
             return true;
         }
         let tx_hash = tx.hash();
-        self.dedup
-            .engaged(payer_shard, tx_hash, self.committed_anchor, self.committee)
-            || riding(payer_shard, tx_hash)
+        self.dedup.engaged(
+            payer_shard,
+            tx_hash,
+            self.committed_anchor,
+            self.committee,
+            self.windows,
+        ) || riding(payer_shard, tx_hash)
     }
 }
 

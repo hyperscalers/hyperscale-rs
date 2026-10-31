@@ -5,7 +5,10 @@ use std::collections::BTreeSet;
 
 use hyperscale_hbor::{Capped, Hbor};
 
-use crate::{BlockHeight, MAX_ENGAGEMENTS_PER_BLOCK, Provisions, ShardId, TxHash, Verifiable};
+use crate::{
+    BlockHeight, MAX_ENGAGEMENTS_PER_BLOCK, Provisions, ShardId, TxHash, Verifiable,
+    WeightedTimestamp,
+};
 
 /// One transaction a committed provision batch names: the evidence that
 /// `source` committed `tx_hash` at `source_height`.
@@ -20,6 +23,11 @@ pub struct Engagement {
     pub tx_hash: TxHash,
     /// The height of the source block the batch was read at.
     pub source_height: BlockHeight,
+    /// The source block's anchor, its parent-QC weighted timestamp
+    /// ([`Provisions::source_block_ts`]): what places the entry inside
+    /// or outside a recovery's band once the recovery is no longer
+    /// pending.
+    pub source_anchor: WeightedTimestamp,
 }
 
 /// The engagements a sealed block keeps of the provisions it dropped,
@@ -33,10 +41,12 @@ impl Engagement {
     pub fn of_batch(batch: &Provisions) -> impl Iterator<Item = Self> + '_ {
         let source = batch.source_shard();
         let source_height = batch.block_height();
+        let source_anchor = batch.source_block_ts();
         batch.transactions().iter().map(move |entry| Self {
             source,
             tx_hash: entry.tx_hash,
             source_height,
+            source_anchor,
         })
     }
 

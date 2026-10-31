@@ -920,7 +920,7 @@ mod tests {
                 source,
                 ShardId::ROOT,
                 BlockHeight::new(height),
-                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(height * 1_000),
                 MerkleInclusionProof::dummy(),
                 Capped::new(
                     seeds
@@ -945,6 +945,7 @@ mod tests {
                 source,
                 tx_hash: tx(seed),
                 source_height: BlockHeight::new(height),
+                source_anchor: WeightedTimestamp::from_millis(height * 1_000),
             })
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -980,7 +981,10 @@ mod tests {
 
         for block in [&live, &sealed] {
             let qc = create_test_qc(block);
-            let rehydrated = ElidedCertifiedBlock::elide(block, qc, &Inventory::empty())
+            let elided = ElidedCertifiedBlock::elide(block, qc, &Inventory::empty());
+            let decoded: ElidedCertifiedBlock =
+                hbor_from_slice(&hbor_to_vec(&elided).expect("encodes")).expect("decodes");
+            let rehydrated = decoded
                 .try_rehydrate(|_| None, |_| None, |_| None)
                 .expect("every body rides inline");
             assert_eq!(rehydrated.block().is_live(), block.is_live());

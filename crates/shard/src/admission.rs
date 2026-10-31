@@ -204,13 +204,20 @@ impl ProvisionsFold {
     /// Whether an admitted batch from `source` names `tx_hash`, at any
     /// source height.
     pub(crate) fn engages(&self, source: ShardId, tx_hash: TxHash) -> bool {
-        let at = |source_height| Engagement {
+        let at = |source_height, source_anchor| Engagement {
             source,
             tx_hash,
             source_height,
+            source_anchor,
         };
         self.engaged
-            .range(at(BlockHeight::GENESIS)..=at(BlockHeight::new(u64::MAX)))
+            .range(
+                at(BlockHeight::GENESIS, WeightedTimestamp::ZERO)
+                    ..=at(
+                        BlockHeight::new(u64::MAX),
+                        WeightedTimestamp::from_millis(u64::MAX),
+                    ),
+            )
             .next()
             .is_some()
     }
@@ -459,7 +466,7 @@ impl<'p> Section for TransactionsSection<'p> {
             && !fold.provisions.engages(payer_shard, tx_hash)
             && !ctx
                 .dedup
-                .engaged(payer_shard, tx_hash, ctx.anchor, ctx.snapshot)
+                .engaged(payer_shard, tx_hash, ctx.anchor, ctx.snapshot, ctx.windows)
         {
             return Err(format!(
                 "cross-shard VM transaction {tx_hash} lacks its payer bundle from \

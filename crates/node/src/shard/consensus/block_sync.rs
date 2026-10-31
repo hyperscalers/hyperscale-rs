@@ -1345,6 +1345,7 @@ mod tests {
             source: ShardId::leaf(1, 1),
             tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
             source_height: BlockHeight::new(3),
+            source_anchor: WeightedTimestamp::ZERO,
         };
         let committed = vec![entry(1), entry(2)];
         let root = EngagementRoot::over(&committed);

@@ -852,6 +852,7 @@ fn dedup_window_seeds_engagements_from_block_lists() {
         source: payer,
         tx_hash,
         source_height: BlockHeight::new(1),
+        source_anchor: WeightedTimestamp::ZERO,
     };
     let mut expected = vec![
         (

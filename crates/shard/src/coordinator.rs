@@ -22,7 +22,7 @@ use hyperscale_types::{
     Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn, Epoch,
     EpochWindows, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
     MAX_READY_SIGNALS_PER_BLOCK, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
-    ReshapeKind, ReshapeThresholds, ReshapeTrigger, Reshaping, ScheduleLookup, Settling, ShardId,
+    ReshapeKind, ReshapeThresholds, ReshapeTrigger, ScheduleLookup, Settling, ShardId,
     SplitAtBoundary, StateClaim, StoredReceipt, SubstateClaim, SubstateKey, TickId, TxsInFlight,
     VerificationKind, WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
     settling_in,
@@ -2615,32 +2615,31 @@ impl ShardCoordinator {
     }
 
     /// What the replica building a block on `parent` asks its node with,
-    /// every reading taken at `parent`: `committee`, which the block is
-    /// classified under, the shards `reshaping` at the block's anchor,
-    /// the rows of `members` standing toward each shard, the answers and
-    /// owed crossings the chain stands holding there, the drain on the
-    /// parent's header, the transactions `chain` carries, the engagements
-    /// committed behind them, and the claims `carried` by the blocks
-    /// above the committed tip beside those of the committed blocks.
+    /// every reading taken at `parent` from the block's admission `ctx`:
+    /// the committee the block is classified under, the shards reshaping
+    /// at the block's anchor, the rows of the members standing toward
+    /// each shard, the answers and owed crossings the chain stands
+    /// holding there, the drain on the parent's header, the transactions
+    /// the chain behind the parent carries, the engagements committed
+    /// behind them, and the claims `carried` by the blocks above the
+    /// committed tip beside those of the committed blocks.
     fn ask_at<'a>(
         &'a self,
-        committee: &'a TopologySnapshot,
-        reshaping: Reshaping<'a>,
+        ctx: &Committed<'a>,
         parent: BlockHash,
-        members: &MemberIndex,
-        chain: &'a QcChainSets,
         carried: &'a CarriedClaims,
     ) -> ProposalAsk<'a> {
         ProposalAsk {
             intake: IntakeView {
-                trie: committee.shard_trie(),
-                reshaping,
-                standing: standing_toward(members),
-                answers: self.standing_over(parent, members),
+                trie: ctx.snapshot.shard_trie(),
+                reshaping: ctx.reshaping,
+                standing: standing_toward(ctx.members),
+                answers: self.standing_over(parent, ctx.members),
                 in_flight: self.chain_view().parent_in_flight(parent),
-                carried: &chain.txs,
+                carried: &ctx.chain.txs,
             },
-            committee,
+            committee: ctx.snapshot,
+            windows: ctx.windows,
             local_shard: self.local_shard,
             dedup: &self.dedup_index,
             committed_anchor: self.committed_block_anchor_wt,
@@ -3555,14 +3554,7 @@ impl ShardCoordinator {
             retirement_claims,
             local_crossings,
             ready_at: _,
-        } = gather(&self.ask_at(
-            committee,
-            ctx.reshaping,
-            parent_block_hash,
-            &members,
-            &chain,
-            &carried,
-        ));
+        } = gather(&self.ask_at(&ctx, parent_block_hash, &carried));
         // In the order the folds depend on: provisions first, since a
         // cross-shard transaction rides only beside (or after) its payer
         // bundle; finalizations before the verdict claims, which carry
@@ -10838,7 +10830,7 @@ mod tests {
                 ENGAGING_PAYER,
                 ShardId::ROOT,
                 BlockHeight::new(height),
-                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(height * 1_000),
                 MerkleInclusionProof::dummy(),
                 Capped::new(
                     seeds
@@ -13692,26 +13684,27 @@ mod tests {
         );
         let at = next_anchor(&chain);
         let snapshot = schedule.head();
+        let windows = schedule.windows();
         for seed in 1..=4 {
             let tx_hash = engaged_tx(seed);
             assert_eq!(
                 live.dedup_index
-                    .engaged(ENGAGING_PAYER, tx_hash, at, snapshot),
+                    .engaged(ENGAGING_PAYER, tx_hash, at, snapshot, windows),
                 sealed
                     .dedup_index
-                    .engaged(ENGAGING_PAYER, tx_hash, at, snapshot),
+                    .engaged(ENGAGING_PAYER, tx_hash, at, snapshot, windows),
                 "transaction {seed}"
             );
         }
         assert!(
             !live
                 .dedup_index
-                .engaged(ENGAGING_PAYER, engaged_tx(2), at, snapshot),
+                .engaged(ENGAGING_PAYER, engaged_tx(2), at, snapshot, windows),
             "the second block's entry lapsed a horizon after it"
         );
         assert!(
             live.dedup_index
-                .engaged(ENGAGING_PAYER, engaged_tx(1), at, snapshot),
+                .engaged(ENGAGING_PAYER, engaged_tx(1), at, snapshot, windows),
             "the first block's transaction was engaged again inside the horizon"
         );
     }
@@ -14872,6 +14865,14 @@ mod tests {
         );
         let restarted = CommitDedupIndex::seeded(&window, tip_anchor);
 
+        assert!(
+            live.dedup_index
+                .engagement_rows()
+                .iter()
+                .all(|(engagement, _)| engagement.source_anchor
+                    == WeightedTimestamp::from_millis(engagement.source_height.inner() * 1_000)),
+            "the live tier keeps each batch's source anchor"
+        );
         assert_eq!(
             restarted.engagement_rows(),
             live.dedup_index.engagement_rows()
@@ -14880,9 +14881,20 @@ mod tests {
         for seed in 1..=4 {
             let tx_hash = engaged_tx(seed);
             assert_eq!(
-                restarted.engaged(ENGAGING_PAYER, tx_hash, at, schedule.head()),
-                live.dedup_index
-                    .engaged(ENGAGING_PAYER, tx_hash, at, schedule.head()),
+                restarted.engaged(
+                    ENGAGING_PAYER,
+                    tx_hash,
+                    at,
+                    schedule.head(),
+                    schedule.windows()
+                ),
+                live.dedup_index.engaged(
+                    ENGAGING_PAYER,
+                    tx_hash,
+                    at,
+                    schedule.head(),
+                    schedule.windows()
+                ),
                 "transaction {seed}"
             );
         }
@@ -15182,10 +15194,11 @@ mod tests {
             terms: Arc::new(Capped::empty()),
             witness_sources,
         };
-        let (mut state, _) = committed_through(from, [engaging]);
+        let (mut state, schedule) = committed_through(from, [engaging]);
         let ask = ProposalAsk {
             intake: IntakeView::idle(topo.shard_trie()),
             committee: &topo,
+            windows: schedule.windows(),
             local_shard: local,
             dedup: &state.dedup_index,
             committed_anchor: state.committed_block_anchor_wt,

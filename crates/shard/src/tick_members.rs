@@ -363,7 +363,7 @@ pub fn committed_sets(
         for source in judged.sources() {
             let engaged = own.engaged.contains(&(source, row.tx))
                 || ancestry.engaged.contains(&(source, row.tx))
-                || dedup.engaged(source, row.tx, anchor, committee);
+                || dedup.engaged(source, row.tx, anchor, committee, schedule.windows());
             if engaged {
                 sets.engaged.insert((source, row.tx));
             }
