@@ -186,7 +186,7 @@ fn take_due_beacon_timers(
     due.into_keys()
         .filter_map(|(owner, id)| match timer_event(&id, owner) {
             HostEvent::Beacon(input) => Some(input),
-            _ => None,
+            HostEvent::Shard(..) => None,
         })
         .collect()
 }

@@ -2,13 +2,11 @@
 //! hands back to the runner: its timer operations and output.
 //!
 //! [`HostEvent`] is the envelope the runner pushes into the event
-//! channel. It is a typed sum over the three drivers a
+//! channel. It is a typed sum over the two drivers a
 //! [`NodeHost`](crate::host::NodeHost) routes to:
 //!
 //! - [`HostEvent::Beacon`] carries a [`BeaconScopedInput`] routed to the
 //!   host's beacon loop.
-//! - [`HostEvent::Process`] carries a [`ProcessScopedInput`] with no
-//!   shard tag — inputs that fan out across every hosted shard.
 //! - [`HostEvent::Shard`] carries a [`ShardScopedInput`] tagged with
 //!   the hosted-shard id it routes to. Every shard-coherent input
 //!   (gossip, sync, fetch results, signature-verified headers, protocol
@@ -503,35 +501,6 @@ impl ShardScopedInput {
     }
 }
 
-/// Inputs that aren't anchored to a particular hosted shard.
-///
-/// `SubmitTransaction` is the only entry — the runner fans it across
-/// every hosted shard the transaction touches.
-#[derive(Debug, Clone, strum::IntoStaticStr)]
-pub enum ProcessScopedInput {
-    /// Client submitted a transaction.
-    SubmitTransaction {
-        /// Transaction submitted by the local client; will be validated then gossiped.
-        tx: Transaction,
-    },
-}
-
-impl ProcessScopedInput {
-    /// Priority for ordering events at the same simulation timestamp.
-    #[must_use]
-    pub(crate) const fn priority(&self) -> EventPriority {
-        match self {
-            Self::SubmitTransaction { .. } => EventPriority::Client,
-        }
-    }
-
-    /// Telemetry label.
-    #[must_use]
-    pub(crate) fn type_name(&self) -> &'static str {
-        self.into()
-    }
-}
-
 /// One attachment of a validator identity to the host's beacon loop.
 ///
 /// Every attach takes a fresh serial from the host's process, so an
@@ -904,17 +873,14 @@ impl From<Sender<HostEvent>> for ShardInbox {
 
 /// An input plus the driver the host's `step()` routes it to.
 ///
-/// The shard variant carries the hosted-shard tag inline; the process and
-/// beacon variants have no tag — the process fan is host-wide, and a host runs
-/// one beacon loop.
+/// The shard variant carries the hosted-shard tag inline; the beacon variant
+/// has none, since a host runs one beacon loop.
 #[derive(Debug, Clone)]
 pub enum HostEvent {
     /// Routed to the hosted shard identified by [`ShardId`]: its replica
     /// for state-machine events, its loop for shard-scoped pipeline
     /// fixups.
     Shard(ShardId, ShardScopedInput),
-    /// Process-scoped — not anchored to a single shard.
-    Process(ProcessScopedInput),
     /// Beacon-scoped — routed to the host's
     /// [`BeaconLoop`](crate::beacon::BeaconLoop). Carries a
     /// [`BeaconScopedInput`]: beacon traffic, what the replicas report,
@@ -927,12 +893,6 @@ impl HostEvent {
     #[must_use]
     pub const fn shard(shard: ShardId, input: ShardScopedInput) -> Self {
         Self::Shard(shard, input)
-    }
-
-    /// Construct a process-scoped envelope.
-    #[must_use]
-    pub const fn process(input: ProcessScopedInput) -> Self {
-        Self::Process(input)
     }
 
     /// Construct a shard-scoped `Protocol` envelope for `event`.
@@ -959,7 +919,6 @@ impl HostEvent {
     pub fn priority(&self) -> EventPriority {
         match self {
             Self::Shard(_, input) => input.priority(),
-            Self::Process(input) => input.priority(),
             Self::Beacon(input) => input.priority(),
         }
     }
@@ -969,7 +928,6 @@ impl HostEvent {
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::Shard(_, input) => input.type_name(),
-            Self::Process(input) => input.type_name(),
             Self::Beacon(input) => input.type_name(),
         }
     }

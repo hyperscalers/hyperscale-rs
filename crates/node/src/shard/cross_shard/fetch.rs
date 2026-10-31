@@ -811,7 +811,7 @@ mod solicited_tests {
             .try_iter()
             .map(|event| match event {
                 HostEvent::Shard(_, input) => input,
-                _ => panic!("a shard reply pushes shard inputs"),
+                HostEvent::Beacon(_) => panic!("a shard reply pushes shard inputs"),
             })
             .collect();
         (verdict, inputs)

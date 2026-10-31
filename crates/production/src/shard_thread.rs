@@ -325,10 +325,6 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
                     warn!(received_shard = ?other, this_shard = ?shard, "Dropping cross-shard event");
                     continue;
                 }
-                HostEvent::Process(_) => {
-                    warn!(shard = ?shard, "Dropping process-scoped event on shard channel");
-                    continue;
-                }
                 HostEvent::Beacon(_) => {
                     // Beacon-loop traffic runs on the beacon thread, never on
                     // a shard's thread.
@@ -520,7 +516,7 @@ mod tests {
     fn tag(event: &HostEvent) -> u64 {
         match event {
             HostEvent::Shard(shard, _) => shard.path(),
-            _ => unreachable!("only shard inputs are pushed"),
+            HostEvent::Beacon(_) => unreachable!("only shard inputs are pushed"),
         }
     }
 

@@ -371,7 +371,7 @@ mod tests {
                 .try_iter()
                 .filter_map(|event| match event {
                     HostEvent::Shard(_, input) => Some(input),
-                    _ => None,
+                    HostEvent::Beacon(_) => None,
                 })
                 .collect();
             (verdict, inputs)

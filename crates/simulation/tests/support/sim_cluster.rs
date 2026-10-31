@@ -20,7 +20,6 @@ use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::event::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
     ChainMentions, ClaimsSection, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership,
     chain_mentions, claims_sections, declines_naming, reads_record, record_wait, records_naming,
@@ -882,11 +881,8 @@ impl SimCluster {
     /// delayed. A client routes to the committee the beacon names, and
     /// so does this.
     fn submit_at(&mut self, host: NodeIndex, tx: &Transaction) {
-        self.runner.schedule_initial_event(
-            host,
-            Duration::ZERO,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: underived(tx) }),
-        );
+        self.runner
+            .schedule_submission(host, Duration::ZERO, underived(tx));
     }
 
     /// The lowest-indexed host that is up: what the harness reads a
@@ -948,11 +944,7 @@ impl Cluster for SimCluster {
 
     fn submit_after(&mut self, delay: Duration, tx: Transaction) -> bool {
         let host = self.host_for_tx(&tx).unwrap_or(0);
-        self.runner.schedule_initial_event(
-            host,
-            delay,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: underived(&tx) }),
-        );
+        self.runner.schedule_submission(host, delay, underived(&tx));
         true
     }
 

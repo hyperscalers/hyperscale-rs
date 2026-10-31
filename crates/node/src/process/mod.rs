@@ -642,8 +642,8 @@ pub struct ShardRoute {
 }
 
 /// Routing decision for a locally-submitted transaction. Returned by
-/// [`ProcessIo::compute_submit_fanout`]; consumed by `NodeHost` (sim)
-/// or the production routing thread.
+/// [`ProcessIo::compute_submit_fanout`]; carried out by
+/// [`ProcessIo::apply_submit_fanout`].
 pub enum SubmitFanout {
     /// At least one hosted shard is in the tx's touched set. `source`
     /// admits, takes `locally_submitted` ownership, and gossips out;

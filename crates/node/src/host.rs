@@ -3,17 +3,15 @@
 //! `NodeHost` bundles `Arc<ProcessIo>` (process-scoped resources) plus
 //! one [`ShardLoop`] per hosted shard. It owns the event-routing seam:
 //! [`NodeHost::step`] dispatches `HostEvent::Shard` to the targeted
-//! `ShardLoop::step` and `HostEvent::Process` to cross-shard handlers
-//! (transaction submission fan-out) that need access to every hosted
-//! shard.
+//! `ShardLoop::step` and `HostEvent::Beacon` to the host's beacon loop.
 //!
 //! Two runners drive a `NodeHost`, each built via [`NodeHost::new`].
 //! Production decomposes it with [`NodeHost::into_parts`] and runs each
 //! [`ShardLoop`] (and the host's beacon loop) on its own pinned thread via
 //! [`ShardLoop::run_step`]; simulation keeps the whole host and drives it
-//! single-threaded over a global event queue through [`NodeHost::step`],
-//! which fans a `HostEvent::Process` out across every hosted shard.
-//! Both paths share `ShardLoop::step` for dispatch and the same
+//! single-threaded over a global event queue through [`NodeHost::step`].
+//! Both route a client submission through
+//! [`ProcessIo::submit_transaction`] into the loops' channels. Both paths share `ShardLoop::step` for dispatch and the same
 //! `clear_scratch` / `take_output` scratch lifecycle, so the two drivers
 //! cannot drift.
 
@@ -33,13 +31,13 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, Derivation, Epoch, LocalTimestamp, ShardId, Signer,
-    TransactionStatus, TxHash, ValidatorId, Verified,
+    Transaction, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 
 use crate::NodeStateMachine;
 use crate::beacon::{BeaconCandidateCache, BeaconLoop, BeaconProposalCache, resume_fold};
 use crate::config::NodeConfig;
-use crate::event::{HostEvent, ProcessScopedInput, Registration, ShardInbox, StepOutput};
+use crate::event::{HostEvent, Registration, ShardInbox, StepOutput};
 use crate::process::{ProcessIo, register_shard_request_handlers};
 use crate::replica::ReplicaConfig;
 use crate::shard::boundary_pins::BoundaryPins;
@@ -512,21 +510,20 @@ where
                     sl.step(input);
                 }
             }
-            HostEvent::Process(input) => self.step_process_input(input),
             HostEvent::Beacon(input) => self.beacon.dispatch_event(input),
         }
 
         self.drain_pending_output()
     }
 
-    /// Dispatch a process-scoped input. Companion to [`Self::step`];
-    /// one arm per [`ProcessScopedInput`] variant.
-    fn step_process_input(&mut self, input: ProcessScopedInput) {
-        match input {
-            ProcessScopedInput::SubmitTransaction { tx } => {
-                self.handle_submit_transaction(&tx);
-            }
-        }
+    /// Route a locally submitted transaction through
+    /// [`ProcessIo::submit_transaction`], the one submission path every
+    /// runner takes. The routed inputs land on the hosted shards' and the
+    /// beacon loop's channels, which the runner drains as it does any
+    /// other event.
+    #[must_use]
+    pub fn submit_transaction(&self, tx: &Transaction) -> bool {
+        self.process.submit_transaction(tx)
     }
 
     /// Drain accumulated step outputs (statuses, timer ops, action

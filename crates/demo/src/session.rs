@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
-use hyperscale_node::event::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_transactions::{Ceilings, Client, Terms};
@@ -550,11 +549,8 @@ impl Session {
             }
         }
         let hash = tx.hash();
-        self.runner.schedule_initial_event(
-            0,
-            Duration::from_millis(1),
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
-        );
+        self.runner
+            .schedule_submission(0, Duration::from_millis(1), tx);
         self.nonce += 1;
         self.tracked.insert(hash, None);
         self.pending

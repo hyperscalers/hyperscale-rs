@@ -7,7 +7,7 @@
 //! - [`StateMachine`]: The trait that all state machines implement
 //!
 //! The driver-specific input types (`HostEvent`, `ShardScopedInput`,
-//! `ProcessScopedInput`, `FetchFailureKind`, `EventPriority`) live in
+//! `FetchFailureKind`, `EventPriority`) live in
 //! `hyperscale_node::event`, since they're not part of the
 //! deterministic state-machine contract.
 //!
@@ -25,7 +25,7 @@
 //! - **Pure-ish**: Mutates self, but performs no I/O
 //!
 //! All I/O is handled by the runner (simulation or production) which:
-//! 1. Delivers shard / process inputs to the shard's loop
+//! 1. Delivers shard inputs to the shard's loop
 //! 2. `ShardLoop` intercepts I/O events (sync, fetch, validation) and forwards
 //!    `ProtocolEvent`s to the state machine
 //! 3. Executes the returned actions

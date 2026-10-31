@@ -6,11 +6,15 @@ use std::time::Duration;
 use hyperscale_dispatch_sync::Job;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::event::{EventPriority, HostEvent};
+use hyperscale_types::Transaction;
 
 /// What the runner does for a host when its key comes up.
 pub enum SimEvent {
     /// Feed the host one of its own events.
     Host(HostEvent),
+    /// A client hands the host a transaction, which it routes as a
+    /// production RPC submission does: into its loops' channels.
+    Submit(Transaction),
     /// Flush the host's batches whose deadlines have passed: a production
     /// shard loop sleeps until its nearest batch deadline and flushes what
     /// expired when it wakes.
@@ -26,6 +30,7 @@ impl SimEvent {
     pub(crate) fn priority(&self) -> EventPriority {
         match self {
             Self::Host(event) => event.priority(),
+            Self::Submit(_) => EventPriority::Client,
             Self::BatchDeadline => EventPriority::Timer,
             Self::Deferred(_) | Self::Restart => EventPriority::Internal,
         }
@@ -35,6 +40,7 @@ impl SimEvent {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Host(event) => event.type_name(),
+            Self::Submit(_) => "SubmitTransaction",
             Self::BatchDeadline => "BatchDeadline",
             Self::Deferred(_) => "Deferred",
             Self::Restart => "Restart",

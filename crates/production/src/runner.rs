@@ -12,12 +12,12 @@
 //! `ProdTimerManager`s' `sleep` tasks, and the per-host metrics + GC
 //! tick. Inbound network messages land on the addressed shard's bounded
 //! network lane and dispatch callbacks on its internal lane; RPC
-//! submissions fan out via [`ProcessIo::compute_submit_fanout`] into the
+//! submissions fan out via [`ProcessIo::submit_transaction`] into the
 //! relevant shards' internal lanes.
 //!
 //! [`ShardLoop`]: hyperscale_node::ShardLoop
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
-//! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::ProcessIo::compute_submit_fanout
+//! [`ProcessIo::submit_transaction`]: hyperscale_node::ProcessIo::submit_transaction
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -769,15 +769,15 @@ impl ProductionRunner {
     /// Build a transaction-submission closure for RPC handlers.
     ///
     /// The closure captures `Arc<ProcessIo>` plus the per-shard event
-    /// senders; each invocation reads the lock-free topology snapshot,
-    /// computes the touched-shard fanout via
-    /// [`ProcessIo::compute_submit_fanout`], and pushes the resulting
-    /// `AdmitTransaction` / `AdmitAndGossipTransaction` /
+    /// senders; each invocation routes through
+    /// [`ProcessIo::submit_transaction`], which reads the lock-free
+    /// topology snapshot, computes the touched-shard fanout, and pushes
+    /// the resulting `AdmitTransaction` / `AdmitAndGossipTransaction` /
     /// `GossipTransaction` envelopes onto the relevant per-shard
-    /// channels. Returns `true` on success, `false` only when every
-    /// per-shard channel is closed (shutdown).
+    /// channels. Returns `false` on a closed channel (shutdown) or an
+    /// envelope that derives no routing.
     ///
-    /// [`ProcessIo::compute_submit_fanout`]: hyperscale_node::ProcessIo::compute_submit_fanout
+    /// [`ProcessIo::submit_transaction`]: hyperscale_node::ProcessIo::submit_transaction
     /// # Panics
     ///
     /// Panics if `run()` has already consumed the host. The closure

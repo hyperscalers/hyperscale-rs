@@ -19,7 +19,6 @@ use std::process::Command;
 use std::time::Duration;
 
 use hex::encode;
-use hyperscale_node::event::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::tx::{
     build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, genesis_accounts, recipient,
     sender, validity_around,
@@ -93,11 +92,7 @@ fn run_once(seed: u64, install_faults: impl FnOnce(&mut SimulationRunner)) -> Ru
             100,
             validity_around(runner.chain_now()),
         );
-        runner.schedule_initial_event(
-            0,
-            Duration::from_millis(delay_ms),
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
-        );
+        runner.schedule_submission(0, Duration::from_millis(delay_ms), tx);
     }
     runner.run_until(Duration::from_secs(10));
 

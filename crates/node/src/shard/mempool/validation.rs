@@ -34,9 +34,7 @@ use hyperscale_types::{
 
 use super::{DeferredTransaction, Origin};
 use crate::batch_accumulator::BatchAccumulator;
-use crate::event::{BeaconScopedInput, HostEvent, ShardScopedInput};
-use crate::host::NodeHost;
-use crate::process::SubmitFanout;
+use crate::event::{HostEvent, ShardScopedInput};
 use crate::shard::{ShardLoop, push_protocol_event, push_shard_input};
 
 /// Byte budget one outbound gossip batch accumulates before it flushes:
@@ -391,68 +389,6 @@ where
                 });
                 report_validation_outcomes(&event_tx, local_shard, verdicts);
             });
-    }
-}
-
-impl<S, N, D> NodeHost<S, N, D>
-where
-    S: ShardStorage,
-    N: Network,
-    D: Dispatch,
-{
-    /// Locally-submitted transaction (sim): compute the routing decision
-    /// via [`ProcessIo::compute_submit_fanout`] and apply it synchronously
-    /// — each affected hosted shard's `step()` runs in this call frame.
-    ///
-    /// Production's RPC ingestion thread reuses
-    /// [`ProcessIo::compute_submit_fanout`] but applies the decision via
-    /// `process.shard_event_senders` so cross-thread fan-out doesn't
-    /// require a `&mut NodeHost`.
-    ///
-    /// [`ProcessIo::compute_submit_fanout`]: crate::process::ProcessIo::compute_submit_fanout
-    pub(crate) fn handle_submit_transaction(&mut self, tx: &Transaction) {
-        // Seed the canonical-instance cache so gossip echoes of this tx
-        // arriving on other hosted shards' topics share its validation
-        // verdict.
-        let tx = &self.process.canonical_txs.canonicalize(tx);
-        match self.process.compute_submit_fanout(tx) {
-            SubmitFanout::Admit {
-                source,
-                passive,
-                touched_shards,
-            } => {
-                self.shard_loop_mut(source.shard).step(
-                    ShardScopedInput::AdmitAndGossipTransaction {
-                        tx: tx.clone(),
-                        touched_shards,
-                    },
-                );
-                for route in passive {
-                    self.shard_loop_mut(route.shard)
-                        .step(ShardScopedInput::AdmitTransaction { tx: tx.clone() });
-                }
-            }
-            SubmitFanout::GossipOnly {
-                host,
-                touched_shards,
-            } => {
-                self.shard_loop_mut(host.shard)
-                    .step(ShardScopedInput::GossipTransaction {
-                        tx: tx.clone(),
-                        touched_shards,
-                    });
-            }
-            SubmitFanout::WantsRecords { wanted } => {
-                self.beacon
-                    .dispatch_event(BeaconScopedInput::SubmissionWantsRecords {
-                        deferred: DeferredTransaction::new(tx.clone(), wanted),
-                    });
-            }
-            SubmitFanout::PublishDirect { touched_shards } => {
-                self.process.publish_direct(tx, &touched_shards);
-            }
-            SubmitFanout::Parked | SubmitFanout::Underivable => {}
-        }
     }
 }
 

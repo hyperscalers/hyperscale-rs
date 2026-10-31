@@ -259,7 +259,7 @@ fn offer_network(inbox: &ShardInbox, event: HostEvent, provenance: Provenance) -
     };
     let (shard, kind) = match &event {
         HostEvent::Shard(shard, _) => (Some(*shard), event.type_name()),
-        _ => (None, event.type_name()),
+        HostEvent::Beacon(_) => (None, event.type_name()),
     };
     let offer = inbox.offer(event, peer);
     if let Some(shard) = shard {

@@ -39,8 +39,8 @@ use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
     BeaconChainConfig, Block, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash,
     GenesisValidators, LocalTimestamp, NetworkDefinition, PrincipalAddr, RoutingCommittees,
-    ShardId, Signer, StakePoolSeat, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
-    ValidatorInfo, ValidatorSet, Verifier, cache, shard_prefix_path,
+    ShardId, Signer, StakePoolSeat, TopologySnapshot, Transaction, TransactionStatus, TxHash,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifier, cache, shard_prefix_path,
 };
 use invariants::Invariants;
 use tracing::{debug, info, trace};
@@ -1303,14 +1303,20 @@ impl SimulationRunner {
         &mut self.network
     }
 
-    /// Schedule an initial event (e.g., to start the simulation).
-    /// Schedule an event for initial delivery. The event must be wrapped
-    /// in the appropriate [`HostEvent`] envelope: shard-scoped variants
-    /// via [`HostEvent::shard`] / [`HostEvent::protocol`],
-    /// `SubmitTransaction` via [`HostEvent::process`].
+    /// Schedule an event for delivery to `host` after `delay`, wrapped in
+    /// its [`HostEvent`] envelope: shard-scoped variants via
+    /// [`HostEvent::shard`] / [`HostEvent::protocol`].
     pub fn schedule_initial_event(&mut self, host: NodeIndex, delay: Duration, event: HostEvent) {
         let time = self.now + delay;
         self.schedule_event(host, time, event);
+    }
+
+    /// Hand `host` a client's `tx` after `delay`. The host routes it
+    /// through [`NodeHost::submit_transaction`] into its loops' channels,
+    /// and what it routes is scheduled at the same instant.
+    pub fn schedule_submission(&mut self, host: NodeIndex, delay: Duration, tx: Transaction) {
+        let time = self.now + delay;
+        self.schedule(host, time, SimEvent::Submit(tx));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1736,11 +1742,15 @@ impl SimulationRunner {
                         input.extend_from_slice(&shard.depth().to_le_bytes());
                         input.extend_from_slice(&shard.path().to_le_bytes());
                     }
-                    HostEvent::Process(_) => input.push(1),
                     HostEvent::Beacon(_) => input.push(2),
                 }
                 // Type names are ASCII, so a 0xFF terminator delimits them.
                 input.extend_from_slice(event.type_name().as_bytes());
+                input.push(0xFF);
+            }
+            SimEvent::Submit(_) => {
+                input.push(1);
+                input.extend_from_slice(event.kind().as_bytes());
                 input.push(0xFF);
             }
             SimEvent::BatchDeadline => input.push(3),
@@ -1769,6 +1779,13 @@ impl SimulationRunner {
                 };
                 self.drain_host_io(host);
                 self.process_step_output(host, output);
+            }
+            SimEvent::Submit(tx) => {
+                self.wake(host);
+                if self.armed(host, |h| h.submit_transaction(&tx)).is_none() {
+                    return;
+                }
+                self.drain_host_io(host);
             }
             SimEvent::BatchDeadline => {
                 let now = self.wake(host);
