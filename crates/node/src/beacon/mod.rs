@@ -39,7 +39,7 @@ use hyperscale_beacon::action_handlers::verify_beacon_block;
 use hyperscale_beacon::coordinator::retention_floor;
 use hyperscale_beacon::{Adopted, BeaconFold, CandidateKeys, ChainRegistration, ProposalAdmission};
 use hyperscale_core::{
-    BeaconAction, BeaconBlockCheck, BeaconFetchIds, ParticipationChange, ProtocolEvent,
+    BeaconBlockCheck, BeaconFetchIds, FoldAction, ParticipationChange, ProtocolEvent,
 };
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_network::{Network, Verdict, VerdictKey};
@@ -135,7 +135,7 @@ where
     actions_generated: usize,
 
     /// Beacon-block catch-up sync, scope `()`. The fold emits
-    /// `BeaconAction::StartBeaconBlockSync` when a gossiped block sits more than
+    /// `FoldAction::StartBeaconBlockSync` when a gossiped block sits more than
     /// one epoch ahead of its tip; this FSM drives the
     /// `GetBeaconBlockRequest` fetches that close the gap.
     beacon_block: BeaconBlockSync,
@@ -662,21 +662,19 @@ where
     }
 
     /// Handle the actions the fold emitted.
-    fn run_fold_actions(&mut self, actions: Vec<BeaconAction>) {
+    fn run_fold_actions(&mut self, actions: Vec<FoldAction>) {
         self.actions_generated += actions.len();
         for action in actions {
-            self.process_action(BeaconOwner::Fold, action);
+            self.process_fold_action(action);
         }
     }
 
-    /// Carry out one action on `owner`'s behalf: the loop's own effects —
-    /// commit, topology, seat trigger, catch-up sync, fetches,
-    /// commit-proof asks — inline, the fold's block checks and a
-    /// participant's work on the dispatch pool, and a participant's
-    /// timers into the step's timer scratch.
-    pub(super) fn process_action(&mut self, owner: BeaconOwner, action: BeaconAction) {
+    /// Carry out one of the fold's actions: its commit, topology,
+    /// catch-up sync and witness fetches inline, its block checks on the
+    /// dispatch pool.
+    pub(super) fn process_fold_action(&mut self, action: FoldAction) {
         match action {
-            BeaconAction::CommitBeaconBlock { block, state } => {
+            FoldAction::CommitBeaconBlock { block, state } => {
                 self.process
                     .beacon_storage
                     .commit_beacon_block(&block, &state);
@@ -685,7 +683,7 @@ where
                 // epoch's fetch.
                 self.on_sync_admitted(block.epoch());
             }
-            BeaconAction::TopologyChanged { epoch, schedule } => {
+            FoldAction::TopologyChanged { epoch, schedule } => {
                 self.process.apply_topology(epoch, Arc::clone(&schedule));
                 self.reroute_record_asks();
                 for (shard, sender) in self.shard_senders.values() {
@@ -698,35 +696,12 @@ where
                     ));
                 }
             }
-            BeaconAction::ReconfigureParticipation(change) => {
-                self.pending_participation_changes.push(change);
+            FoldAction::StartBeaconBlockSync { target } => self.start_sync(target),
+            FoldAction::Fetch { ids, shard } => {
+                self.ask(BeaconOwner::Fold, ids, shard, None, None);
             }
-            BeaconAction::StartBeaconBlockSync { target } => {
-                self.start_sync(target);
-            }
-            BeaconAction::Fetch {
-                ids,
-                shard,
-                preferred,
-                class,
-            } => self.ask(owner, ids, shard, preferred, class),
-            BeaconAction::AbandonFetch(ids) => self.abandon(owner, ids),
-            BeaconAction::AskCommitProof {
-                source_shard,
-                block_height,
-            } => self.route_proof_ask((source_shard, block_height)),
-            BeaconAction::VerifyBeaconBlock(check) => self.dispatch_block_check(check),
-            BeaconAction::SetTimer { id, duration } => {
-                self.push_participant_timer(owner, |owner| TimerOp::Set {
-                    owner,
-                    id,
-                    duration,
-                });
-            }
-            BeaconAction::CancelTimer { id } => {
-                self.push_participant_timer(owner, |owner| TimerOp::Cancel { owner, id });
-            }
-            BeaconAction::Participant(work) => self.run_participant_work(owner, work),
+            FoldAction::AbandonFetch(ids) => self.abandon(BeaconOwner::Fold, ids),
+            FoldAction::VerifyBeaconBlock(check) => self.dispatch_block_check(check),
         }
     }
 

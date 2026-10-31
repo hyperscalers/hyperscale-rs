@@ -1092,7 +1092,7 @@ pub enum ProtocolEvent {
         proposal: Verified<BeaconProposal>,
     },
 
-    /// Result of an [`BeaconAction::VerifyBeaconBlock`](crate::BeaconAction::VerifyBeaconBlock) dispatch. The
+    /// Result of a [`FoldAction::VerifyBeaconBlock`](crate::FoldAction::VerifyBeaconBlock) dispatch. The
     /// verified handle rides back on success so the coordinator can
     /// route it into adoption without stashing during the verify
     /// round-trip.

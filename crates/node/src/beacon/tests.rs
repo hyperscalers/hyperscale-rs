@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crossbeam::channel::{Receiver, unbounded};
 use hyperscale_beacon::coordinator::LocalChainAnchors;
-use hyperscale_core::{BeaconAction, BeaconFetchIds, TimerId};
+use hyperscale_core::{BeaconAction, BeaconFetchIds, FoldAction, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
 use hyperscale_hbor::{Bytes, Capped, to_vec as hbor_to_vec};
@@ -53,8 +53,12 @@ type Loop = BeaconLoop<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 
 const PROPOSAL: (Epoch, ValidatorId) = (Epoch::new(1), ValidatorId::new(1));
 
+fn attached(n: u64) -> Attachment {
+    Attachment::new(ValidatorId::new(n), n)
+}
+
 fn participant(n: u64) -> BeaconOwner {
-    BeaconOwner::Participant(Attachment::new(ValidatorId::new(n), n))
+    BeaconOwner::Participant(attached(n))
 }
 
 fn proposals(ids: &[(Epoch, ValidatorId)]) -> BeaconFetchIds {
@@ -297,8 +301,8 @@ fn a_participants_record_fetch_is_dropped() {
     let mut host = fix.host(BlockHeight::GENESIS);
     let _ = host.network().drain_pending_requests();
     let instance = Address::new([3; 31], AddressClass::Component);
-    host.beacon.process_action(
-        participant(2),
+    host.beacon.process_participant_action(
+        attached(2),
         BeaconAction::Fetch {
             ids: BeaconFetchIds::InstanceRecords(vec![instance]),
             shard: SHARD,
@@ -1097,9 +1101,9 @@ fn a_proposal_ask_goes_to_its_authors_shard() {
     add(&mut host, &fix, 2);
     let _ = host.network().drain_pending_requests();
 
-    let owner = BeaconOwner::Participant(attachment(&host, 2, &fix));
+    let owner = attachment(&host, 2, &fix);
     let mut routed = |author: ValidatorId| {
-        host.beacon.process_action(
+        host.beacon.process_participant_action(
             owner,
             BeaconAction::Fetch {
                 ids: proposals(&[(Epoch::new(1), author)]),
@@ -1532,8 +1536,8 @@ fn asks(receiver: &Receiver<HostEvent>) -> Vec<(ShardId, BlockHeight)> {
 }
 
 fn ask_proof(host: &mut Host, source: ShardId, height: BlockHeight) {
-    host.beacon.process_action(
-        participant(2),
+    host.beacon.process_participant_action(
+        attached(2),
         BeaconAction::AskCommitProof {
             source_shard: source,
             block_height: height,
@@ -2129,17 +2133,15 @@ fn an_adoption_on_the_beacon_loop_releases_a_parked_submission() {
     let (folded, held) = host.process.folded_schedule();
     let (_, newest) = held.retained_epochs().expect("the host holds a schedule");
     let epoch = folded.next();
-    host.beacon.process_action(
-        BeaconOwner::Fold,
-        BeaconAction::TopologyChanged {
+    host.beacon
+        .process_fold_action(FoldAction::TopologyChanged {
             epoch,
             schedule: Arc::new(TopologySchedule::new(
                 fix.genesis_state().chain_config.epoch_windows(),
                 newest.next(),
                 Arc::new(live),
             )),
-        },
-    );
+        });
     assert_eq!(
         routed(&events),
         Some(SHARD),

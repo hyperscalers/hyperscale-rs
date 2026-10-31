@@ -13,7 +13,6 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
     BeaconBlockHash, BeaconProposal, CandidateBeaconBlock, Epoch, Signer, ValidatorId, Verified,
 };
-use tracing::warn;
 
 use super::BeaconLoop;
 use crate::beacon::{BeaconCandidateBinding, BeaconProposalBinding};
@@ -102,7 +101,7 @@ where
     /// Arm `validator`'s committee-start and ratify timers off the
     /// fold's clock.
     fn arm_startup(&mut self, validator: ValidatorId) {
-        let actions = self.fold.on_startup();
+        let actions = BeaconParticipant::on_startup(&self.fold);
         self.run_participant_actions(validator, actions);
     }
 
@@ -135,52 +134,59 @@ where
         self.run_fold_actions(actions);
     }
 
-    /// Handle the actions `validator`'s participant emitted: the effects
-    /// any owner's actions have, its timers, and its delegated actions on
-    /// the dispatch pool.
+    /// Handle the actions `validator`'s participant emitted.
     fn run_participant_actions(&mut self, validator: ValidatorId, actions: Vec<BeaconAction>) {
         let Some(participant) = self.participants.get(&validator) else {
             return;
         };
-        let owner = BeaconOwner::Participant(participant.attachment);
+        let attachment = participant.attachment;
         self.actions_generated += actions.len();
         for action in actions {
-            self.process_action(owner, action);
+            self.process_participant_action(attachment, action);
         }
     }
 
-    /// Buffer a timer operation `owner` armed or cancelled. Only a
-    /// participant arms beacon timers; the fold's startup timers are
-    /// armed on each participant's behalf.
-    pub(super) fn push_participant_timer(
+    /// Carry out one action of the participant `attachment` names: the
+    /// seat trigger, catch-up sync, fetches and commit-proof asks inline,
+    /// its timers into the step's timer scratch, and its delegated work
+    /// on the dispatch pool unless another participant already runs
+    /// that check.
+    pub(super) fn process_participant_action(
         &mut self,
-        owner: BeaconOwner,
-        op: impl FnOnce(TimerOwner) -> TimerOp,
+        attachment: Attachment,
+        action: BeaconAction,
     ) {
-        let BeaconOwner::Participant(attachment) = owner else {
-            warn!(
-                ?owner,
-                "BeaconLoop: a timer no participant armed — dropping"
-            );
-            return;
-        };
-        self.pending_timer_ops
-            .push(op(TimerOwner::Participant(attachment)));
-    }
-
-    /// Run a participant's delegated work on the dispatch pool, unless it
-    /// is a check another participant already runs.
-    pub(super) fn run_participant_work(&mut self, owner: BeaconOwner, work: ParticipantAction) {
-        let BeaconOwner::Participant(attachment) = owner else {
-            warn!(
-                ?owner,
-                action = work.type_name(),
-                "BeaconLoop: participant work no participant emitted — dropping"
-            );
-            return;
-        };
-        if !self.joins_a_shared_check(attachment, &work) {
-            self.dispatch_participant_action(attachment.validator, work);
+        let owner = BeaconOwner::Participant(attachment);
+        match action {
+            BeaconAction::Participant(work) => {
+                if !self.joins_a_shared_check(attachment, &work) {
+                    self.dispatch_participant_action(attachment.validator, work);
+                }
+            }
+            BeaconAction::ReconfigureParticipation(change) => {
+                self.pending_participation_changes.push(change);
+            }
+            BeaconAction::StartBeaconBlockSync { target } => self.start_sync(target),
+            BeaconAction::SetTimer { id, duration } => self.pending_timer_ops.push(TimerOp::Set {
+                owner: TimerOwner::Participant(attachment),
+                id,
+                duration,
+            }),
+            BeaconAction::CancelTimer { id } => self.pending_timer_ops.push(TimerOp::Cancel {
+                owner: TimerOwner::Participant(attachment),
+                id,
+            }),
+            BeaconAction::Fetch {
+                ids,
+                shard,
+                preferred,
+                class,
+            } => self.ask(owner, ids, shard, preferred, class),
+            BeaconAction::AbandonFetch(ids) => self.abandon(owner, ids),
+            BeaconAction::AskCommitProof {
+                source_shard,
+                block_height,
+            } => self.route_proof_ask((source_shard, block_height)),
         }
     }
 

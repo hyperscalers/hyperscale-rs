@@ -572,7 +572,7 @@ where
     }
 }
 
-/// Run the fold's [`hyperscale_core::BeaconAction::VerifyBeaconBlock`].
+/// Run the fold's [`hyperscale_core::FoldAction::VerifyBeaconBlock`].
 ///
 /// Checks the block's certificate, settles the gossip verdict deferred on
 /// it, and hands the outcome to `notify`. The fold signs nothing, so the

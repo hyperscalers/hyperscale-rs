@@ -15,16 +15,12 @@ use hyperscale_types::{
 
 use crate::{BeaconFetchIds, ParticipationChange, TimerId};
 
-/// An action the beacon fold or one of the host's beacon participants
-/// emits, for the beacon loop that drives them.
+/// An action the host's beacon fold emits, for the beacon loop that
+/// drives it.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
-pub enum BeaconAction {
-    /// A participant's delegated work, run on the consensus dispatch
-    /// pool under that participant's signer and release gate.
-    Participant(ParticipantAction),
-
-    /// The fold's check of a beacon block's certificates. Result returns
-    /// via [`crate::ProtocolEvent::BeaconBlockVerified`].
+pub enum FoldAction {
+    /// Check a beacon block's certificates. Result returns via
+    /// [`crate::ProtocolEvent::BeaconBlockVerified`].
     VerifyBeaconBlock(BeaconBlockCheck),
 
     /// Persist a committed beacon block + its resulting `BeaconState`
@@ -39,10 +35,10 @@ pub enum BeaconAction {
     /// Propagate the folded topology to every loop on the host and the
     /// network layer.
     ///
-    /// Emitted by the fold on every beacon commit. The host publishes the
-    /// schedule's head as its shared topology snapshot, keys fetch
-    /// routing on the schedule's terminal-clamped committees, and hands
-    /// the schedule to each shard loop.
+    /// Emitted on every beacon commit. The host publishes the schedule's
+    /// head as its shared topology snapshot, keys fetch routing on the
+    /// schedule's terminal-clamped committees, and hands the schedule to
+    /// each shard loop.
     TopologyChanged {
         /// Beacon epoch the schedule was folded at. The host's one fold
         /// emits it once per adopted block, so the epochs published only
@@ -53,12 +49,6 @@ pub enum BeaconAction {
         schedule: Arc<TopologySchedule>,
     },
 
-    /// The lookahead committees move a local validator onto or off
-    /// a shard at the next window — surface the delta to the runner so
-    /// it can reconfigure physical participation (open storage and
-    /// bootstrap a joined shard, schedule a left shard's drain).
-    ReconfigureParticipation(ParticipationChange),
-
     /// Request the runner to start (or raise the target of) beacon-chain
     /// gap-fill sync.
     ///
@@ -66,6 +56,49 @@ pub enum BeaconAction {
     /// epoch ahead of the fold's tip. The beacon loop's `Sync` machine
     /// fetches the missing blocks epoch by epoch and feeds each back as
     /// `ProtocolEvent::BeaconBlockSyncReadyToApply`.
+    StartBeaconBlockSync {
+        /// The epoch to sync the beacon chain up to.
+        target: Epoch,
+    },
+
+    /// Ask `shard`'s committee for the witness runs `ids` names.
+    Fetch {
+        /// What to fetch.
+        ids: BeaconFetchIds,
+        /// Committee whose members serve the request.
+        shard: ShardId,
+    },
+
+    /// The fold no longer wants `ids`. An id another owner on the loop
+    /// still asks for stays in flight.
+    AbandonFetch(BeaconFetchIds),
+}
+
+impl FoldAction {
+    /// The action type name for telemetry.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        self.into()
+    }
+}
+
+/// An action one of the host's beacon participants emits, for the
+/// beacon loop that drives it.
+#[derive(Debug, Clone, strum::IntoStaticStr)]
+pub enum BeaconAction {
+    /// The participant's delegated work, run on the consensus dispatch
+    /// pool under its signer and release gate.
+    Participant(ParticipantAction),
+
+    /// The lookahead committees move a local validator onto or off
+    /// a shard at the next window — surface the delta to the runner so
+    /// it can reconfigure physical participation (open storage and
+    /// bootstrap a joined shard, schedule a left shard's drain).
+    ReconfigureParticipation(ParticipationChange),
+
+    /// Request the runner to start (or raise the target of) beacon-chain
+    /// gap-fill sync up to the epoch the participant's ratification
+    /// works on, in case its peers already committed it.
     StartBeaconBlockSync {
         /// The epoch to sync the beacon chain up to.
         target: Epoch,

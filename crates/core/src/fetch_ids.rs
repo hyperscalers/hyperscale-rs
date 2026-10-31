@@ -1,11 +1,12 @@
 //! The ids of one fetch family, in one shape.
 //!
 //! Every payload the unified fetch protocols address has its own id type,
-//! and three messages carry a batch of them: a coordinator cancelling ids
+//! and two kinds of message carry a batch of them: an owner cancelling ids
 //! it no longer wants ([`crate::Action::AbandonFetch`],
+//! [`crate::FoldAction::AbandonFetch`],
 //! [`crate::BeaconAction::AbandonFetch`]), and the node's own response
 //! boundary releasing ids a peer failed to answer or answered in full.
-//! All three name the same `(binding, Vec<Id>)` pair, so one enum per
+//! Each names the same `(binding, Vec<Id>)` pair, so one enum per
 //! loop spells it and that loop's one dispatcher routes it to the
 //! binding's state machine.
 

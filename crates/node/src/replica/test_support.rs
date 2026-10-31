@@ -16,7 +16,7 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::LocalChainAnchors;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_beacon::{BeaconFold, ChainRegistration};
-use hyperscale_core::{Action, BeaconAction, ProtocolEvent, StateMachine};
+use hyperscale_core::{Action, FoldAction, ProtocolEvent, StateMachine};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::AllCodeRuns;
 use hyperscale_mempool::MempoolConfig;
@@ -96,7 +96,7 @@ impl TestNode {
         self.fold.set_now(now);
         let adopted = self.fold.adopt(block).expect("the block extends the tip");
         for action in adopted.actions {
-            if let BeaconAction::TopologyChanged { epoch, schedule } = action {
+            if let FoldAction::TopologyChanged { epoch, schedule } = action {
                 let _ = self.handle(now, ProtocolEvent::BeaconBlockPersisted { epoch, schedule });
             }
         }

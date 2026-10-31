@@ -2,7 +2,7 @@
 //! through one or more epochs and captures the committed (block,
 //! state) pair each replica produces.
 //!
-//! Adversary-free honest path: every emitted [`BeaconAction`] translates into
+//! Adversary-free honest path: every emitted [`CoordinatorAction`] translates into
 //! the equivalent inbound event on every recipient (and a self-feedback
 //! delivery for sign-and-broadcast variants, mirroring the production
 //! action handler's `notify_protocol(... from = me)` loopback). Two
@@ -16,10 +16,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use hyperscale_beacon::coordinator::BeaconCoordinator;
+use hyperscale_beacon::coordinator::{BeaconCoordinator, CoordinatorAction};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{
-    Action, BeaconAction, BeaconBlockCheck, BeaconFetchIds, ParticipantAction, ProtocolEvent,
+    Action, BeaconAction, BeaconBlockCheck, BeaconFetchIds, FoldAction, ParticipantAction,
+    ProtocolEvent,
 };
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
@@ -74,7 +75,7 @@ pub struct Crossing {
     pub leaf_count: u64,
 }
 
-/// One captured commit event from a replica's `BeaconAction::CommitBeaconBlock`.
+/// One captured commit event from a replica's `FoldAction::CommitBeaconBlock`.
 #[derive(Clone)]
 pub struct CapturedCommit {
     pub epoch: Epoch,
@@ -155,7 +156,7 @@ pub struct CoordinatorSim {
     sks: Vec<Arc<BlsSigner>>,
     network: NetworkDefinition,
     /// Per-replica committed (block, state) tuples, ordered by capture
-    /// time. One push per `BeaconAction::CommitBeaconBlock` the replica
+    /// time. One push per `FoldAction::CommitBeaconBlock` the replica
     /// emits.
     pub commits: Vec<Vec<CapturedCommit>>,
     network_q: VecDeque<Envelope>,
@@ -910,7 +911,7 @@ impl CoordinatorSim {
         &mut self,
         replica_idx: usize,
         block: &Verified<CertifiedBeaconBlock>,
-    ) -> Vec<BeaconAction> {
+    ) -> Vec<CoordinatorAction> {
         let wrapped = Verifiable::from((**block).clone());
         let dispatched = self.coordinators[replica_idx].on_beacon_block_received(wrapped);
         let resolved = self.resolve_verifications(replica_idx, dispatched);
@@ -941,17 +942,17 @@ impl CoordinatorSim {
     fn resolve_verifications(
         &mut self,
         replica_idx: usize,
-        actions: Vec<BeaconAction>,
-    ) -> Vec<BeaconAction> {
+        actions: Vec<CoordinatorAction>,
+    ) -> Vec<CoordinatorAction> {
         let mut out = Vec::new();
         for action in actions {
             match action {
-                BeaconAction::VerifyBeaconBlock(BeaconBlockCheck {
+                CoordinatorAction::Fold(FoldAction::VerifyBeaconBlock(BeaconBlockCheck {
                     block,
                     committee,
                     active_pool,
                     equivocation_signers,
-                }) => {
+                })) => {
                     let result = block
                         .upgrade(&CertifiedBeaconBlockVerifyContext {
                             verifier: &BlsVerifier,
@@ -964,11 +965,13 @@ impl CoordinatorSim {
                     let post = self.coordinators[replica_idx].on_beacon_block_verified(result);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
-                BeaconAction::Participant(ParticipantAction::VerifyBeaconCandidate {
-                    candidate,
-                    committee,
-                    equivocation_signers,
-                }) => {
+                CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::VerifyBeaconCandidate {
+                        candidate,
+                        committee,
+                        equivocation_signers,
+                    },
+                )) => {
                     let block_hash = candidate.block_hash();
                     let result = candidate
                         .upgrade(&CandidateVerifyContext {
@@ -982,10 +985,9 @@ impl CoordinatorSim {
                         .on_beacon_candidate_verified(block_hash, result);
                     out.extend(self.resolve_verifications(replica_idx, post));
                 }
-                BeaconAction::Participant(ParticipantAction::VerifyRatifyVote {
-                    vote,
-                    signers,
-                }) => {
+                CoordinatorAction::Participant(BeaconAction::Participant(
+                    ParticipantAction::VerifyRatifyVote { vote, signers },
+                )) => {
                     let anchor = vote.anchor_hash();
                     let epoch = vote.epoch();
                     let round = vote.round();
@@ -1227,7 +1229,7 @@ impl CoordinatorSim {
         self.commits.iter().map(Vec::len).collect()
     }
 
-    fn deliver(&mut self, env: Envelope) -> Vec<BeaconAction> {
+    fn deliver(&mut self, env: Envelope) -> Vec<CoordinatorAction> {
         match env.event {
             SimEvent::PcVote1 {
                 epoch, view, vote, ..
@@ -1282,15 +1284,66 @@ impl CoordinatorSim {
     /// envelopes (and captured commits). Unhandled action variants
     /// panic — keeping the sim honest about which beacon actions it
     /// models.
-    fn absorb(&mut self, emitter_idx: usize, actions: Vec<BeaconAction>) {
+    fn absorb(&mut self, emitter_idx: usize, actions: Vec<CoordinatorAction>) {
         let me = self.members[emitter_idx].0;
         for action in actions {
             self.absorb_one(emitter_idx, me, action);
         }
     }
 
+    fn absorb_one(&mut self, emitter_idx: usize, me: ValidatorId, action: CoordinatorAction) {
+        match action {
+            CoordinatorAction::Fold(action) => self.absorb_fold(emitter_idx, action),
+            CoordinatorAction::Participant(action) => {
+                self.absorb_participant(emitter_idx, me, action);
+            }
+        }
+    }
+
+    fn absorb_fold(&mut self, emitter_idx: usize, action: FoldAction) {
+        match action {
+            FoldAction::CommitBeaconBlock { block, state } => {
+                self.commits[emitter_idx].push(CapturedCommit {
+                    epoch: block.epoch(),
+                    block,
+                    state: *state,
+                });
+            }
+            FoldAction::VerifyBeaconBlock(BeaconBlockCheck {
+                block,
+                committee,
+                active_pool,
+                equivocation_signers,
+            }) => {
+                // Production runs this on the consensus crypto pool; the
+                // sim collapses the round-trip to a synchronous inline
+                // verify + result-feedback so verification timing doesn't
+                // reshape envelope-delivery ordering.
+                let result = block
+                    .upgrade(&CertifiedBeaconBlockVerifyContext {
+                        verifier: &BlsVerifier,
+                        network: &self.network,
+                        committee: &committee,
+                        active_pool: &active_pool,
+                        equivocation_signers: &equivocation_signers,
+                    })
+                    .map_err(|(_, e)| e);
+                let post = self.coordinators[emitter_idx].on_beacon_block_verified(result);
+                self.absorb(emitter_idx, post);
+            }
+            FoldAction::Fetch { .. }
+            | FoldAction::AbandonFetch(_)
+            | FoldAction::TopologyChanged { .. }
+            | FoldAction::StartBeaconBlockSync { .. } => {
+                // The sim hands each replica its witness chunks itself;
+                // topology and block catch-up sync are runner concerns
+                // the sim doesn't model.
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // single dispatch over BeaconAction variants
-    fn absorb_one(&mut self, emitter_idx: usize, me: ValidatorId, action: BeaconAction) {
+    fn absorb_participant(&mut self, emitter_idx: usize, me: ValidatorId, action: BeaconAction) {
         match action {
             BeaconAction::Participant(ParticipantAction::BuildAndBroadcastBeaconProposal {
                 epoch,
@@ -1637,35 +1690,6 @@ impl CoordinatorSim {
                     }
                 }
             }
-            BeaconAction::CommitBeaconBlock { block, state } => {
-                self.commits[emitter_idx].push(CapturedCommit {
-                    epoch: block.epoch(),
-                    block,
-                    state: *state,
-                });
-            }
-            BeaconAction::VerifyBeaconBlock(BeaconBlockCheck {
-                block,
-                committee,
-                active_pool,
-                equivocation_signers,
-            }) => {
-                // Production runs this on the consensus crypto pool; the
-                // sim collapses the round-trip to a synchronous inline
-                // verify + result-feedback so verification timing doesn't
-                // reshape envelope-delivery ordering.
-                let result = block
-                    .upgrade(&CertifiedBeaconBlockVerifyContext {
-                        verifier: &BlsVerifier,
-                        network: &self.network,
-                        committee: &committee,
-                        active_pool: &active_pool,
-                        equivocation_signers: &equivocation_signers,
-                    })
-                    .map_err(|(_, e)| e);
-                let post = self.coordinators[emitter_idx].on_beacon_block_verified(result);
-                self.absorb(emitter_idx, post);
-            }
             BeaconAction::Participant(ParticipantAction::VerifyBeaconCandidate {
                 candidate,
                 committee,
@@ -1927,11 +1951,10 @@ impl CoordinatorSim {
             | BeaconAction::AbandonFetch(_)
             | BeaconAction::SetTimer { .. }
             | BeaconAction::CancelTimer { .. }
-            | BeaconAction::TopologyChanged { .. }
             | BeaconAction::ReconfigureParticipation(_)
             | BeaconAction::StartBeaconBlockSync { .. } => {
                 // Other Fetch/Abandon variants don't surface from the
-                // beacon coordinator under this sim; timers, topology,
+                // beacon participant under this sim; timers,
                 // participation, and block catch-up sync are runner
                 // concerns the sim doesn't model.
             }

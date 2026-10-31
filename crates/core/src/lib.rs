@@ -47,7 +47,7 @@ pub use action::{
     ProvisionAction, ProvisionsRequest, QcSubject, StateRootCheck, SyncClaimId,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock, Signing};
-pub use beacon_action::{BeaconAction, BeaconBlockCheck, ParticipantAction};
+pub use beacon_action::{BeaconAction, BeaconBlockCheck, FoldAction, ParticipantAction};
 pub use fetch_ids::{BeaconFetchIds, FetchIds};
 pub use fetch_request::FetchRequest;
 pub use gate::{Gate, GateEntry};

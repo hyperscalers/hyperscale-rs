@@ -13,7 +13,7 @@ use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{BeaconAction, BeaconBlockCheck, BeaconFetchIds, TimerId};
+use hyperscale_core::{BeaconBlockCheck, BeaconFetchIds, FoldAction};
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BeaconBlock, BeaconCert, BeaconProposal, BeaconProposalVerifyContext, BeaconState, BlockHash,
@@ -75,7 +75,7 @@ pub struct Adopted {
     pub effects: SlotEffects,
     /// The fold's own actions: the commit, the topology and the witness
     /// fetches the adoption released.
-    pub actions: Vec<BeaconAction>,
+    pub actions: Vec<FoldAction>,
 }
 
 /// A follower of the beacon chain.
@@ -250,7 +250,7 @@ impl BeaconFold {
     /// every crossing the fold already holds, which no further header
     /// may arrive to ask for; leaving drops the pooled witness chunks and
     /// releases the in-flight witness fetches.
-    pub fn set_host_on_committee(&mut self, on: bool) -> Vec<BeaconAction> {
+    pub fn set_host_on_committee(&mut self, on: bool) -> Vec<FoldAction> {
         let was = mem::replace(&mut self.host_on_committee, on);
         match (was, on) {
             (false, true) => {
@@ -364,7 +364,7 @@ impl BeaconFold {
     /// success [`Self::on_beacon_block_verified`] hands the verified
     /// block off to [`Self::adopt`]. A block more than one epoch
     /// ahead of the local tip is dropped and triggers gap-fill sync
-    /// ([`BeaconAction::StartBeaconBlockSync`]) to fetch the missing epochs in
+    /// ([`FoldAction::StartBeaconBlockSync`]) to fetch the missing epochs in
     /// order.
     ///
     /// Cert verification uses `self.state.committee` for Normal blocks
@@ -376,7 +376,7 @@ impl BeaconFold {
     pub fn on_beacon_block_received(
         &mut self,
         block: Verifiable<CertifiedBeaconBlock>,
-    ) -> Vec<BeaconAction> {
+    ) -> Vec<FoldAction> {
         let epoch = block.epoch();
         let tip_epoch = self.latest_block.epoch();
         if epoch <= tip_epoch {
@@ -401,7 +401,7 @@ impl BeaconFold {
             // claimed epoch is only a target hint — the runner's sync
             // backs off on epochs that don't exist, so a bogus far-future
             // epoch can't busy-loop the network.
-            return vec![BeaconAction::StartBeaconBlockSync { target: epoch }];
+            return vec![FoldAction::StartBeaconBlockSync { target: epoch }];
         }
 
         if block.prev_block_hash() != self.latest_block.block_hash() {
@@ -442,7 +442,7 @@ impl BeaconFold {
     fn tip_competitor_verification(
         &mut self,
         block: &Verifiable<CertifiedBeaconBlock>,
-    ) -> Option<Vec<BeaconAction>> {
+    ) -> Option<Vec<FoldAction>> {
         if block.epoch() != self.latest_block.epoch()
             || block.epoch() == Epoch::GENESIS
             || block.prev_block_hash() != self.latest_block.prev_block_hash()
@@ -491,7 +491,7 @@ impl BeaconFold {
     }
 
     /// Dispatch a block's cert + equivocation verification. Returns a
-    /// single [`BeaconAction::VerifyBeaconBlock`] on a fresh slot, or an empty
+    /// single [`FoldAction::VerifyBeaconBlock`] on a fresh slot, or an empty
     /// vector when the slot is already in flight or already verified —
     /// the in-flight slot's result drives admission for any duplicate.
     fn dispatch_block_verification(
@@ -500,11 +500,11 @@ impl BeaconFold {
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,
         active_pool: Vec<(ValidatorId, ConsensusPublicKey)>,
         equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
-    ) -> Vec<BeaconAction> {
+    ) -> Vec<FoldAction> {
         if !self.verification.mark_block_in_flight(block.block_hash()) {
             return Vec::new();
         }
-        vec![BeaconAction::VerifyBeaconBlock(BeaconBlockCheck {
+        vec![FoldAction::VerifyBeaconBlock(BeaconBlockCheck {
             block,
             committee,
             active_pool,
@@ -512,7 +512,7 @@ impl BeaconFold {
         })]
     }
 
-    /// A previously-dispatched [`BeaconAction::VerifyBeaconBlock`] has
+    /// A previously-dispatched [`FoldAction::VerifyBeaconBlock`] has
     /// returned. Clear the pipeline slot, and on the `Ok` arm adopt
     /// the verified block (unless the tip has since moved past it).
     /// Drops silently on the `Err` arm.
@@ -663,11 +663,11 @@ impl BeaconFold {
         // committee actually changed. The commit precedes it so a shard
         // never hears of an epoch that is not yet durable.
         let mut actions = vec![
-            BeaconAction::CommitBeaconBlock {
+            FoldAction::CommitBeaconBlock {
                 block,
                 state: Box::new(self.state.clone()),
             },
-            BeaconAction::TopologyChanged {
+            FoldAction::TopologyChanged {
                 epoch: self.state.current_epoch,
                 schedule: Arc::clone(&self.topology_schedule),
             },
@@ -705,7 +705,7 @@ impl BeaconFold {
         &mut self,
         token: ChainRegistration,
         certified_header: &Verified<CertifiedBlockHeader>,
-    ) -> Vec<BeaconAction> {
+    ) -> Vec<FoldAction> {
         if !self.hosted.contains_key(&token) {
             return Vec::new();
         }
@@ -754,7 +754,7 @@ impl BeaconFold {
     pub fn on_source_header(
         &mut self,
         certified_header: &Verified<CertifiedBlockHeader>,
-    ) -> Vec<BeaconAction> {
+    ) -> Vec<FoldAction> {
         self.record_source_header(certified_header);
         if !self.host_on_committee {
             return Vec::new();
@@ -821,7 +821,7 @@ impl BeaconFold {
         lo: LeafIndex,
         payloads: Vec<ShardWitnessPayload>,
         range_proof: Vec<Hash>,
-    ) -> Option<Vec<BeaconAction>> {
+    ) -> Option<Vec<FoldAction>> {
         if !self.host_on_committee {
             return Some(Vec::new());
         }
@@ -871,7 +871,7 @@ impl BeaconFold {
     /// gap-filling to do across responses. `chunk_bounds` already caps the
     /// run at the fold's per-epoch budget, which bounds the work one
     /// header can trigger.
-    pub(crate) fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<BeaconAction> {
+    pub(crate) fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<FoldAction> {
         let (anchor, block_height, prior, chunk_end) = {
             let Some(crossing) =
                 boundary::crossing_to_source(&self.state, &self.shard_source, shard)
@@ -905,7 +905,7 @@ impl BeaconFold {
         // tracker's record is for cancellation, not dedup.
         self.shard_source
             .register_pending_fetch(shard, block_height, anchor, prior, chunk_end);
-        vec![BeaconAction::Fetch {
+        vec![FoldAction::Fetch {
             ids: BeaconFetchIds::Witnesses(vec![(
                 shard,
                 block_height,
@@ -914,8 +914,6 @@ impl BeaconFold {
                 LeafIndex::new(chunk_end),
             )]),
             shard,
-            preferred: None,
-            class: None,
         }]
     }
 
@@ -929,7 +927,7 @@ impl BeaconFold {
     /// never landed); once it folds, the boundary advances its watermark and
     /// the terminal record drops, ending the re-drive. The fold seeds a
     /// split's children or composes a merge's parent.
-    pub fn redrive_terminal_witness_fetches(&mut self) -> Vec<BeaconAction> {
+    pub fn redrive_terminal_witness_fetches(&mut self) -> Vec<FoldAction> {
         if !self.host_on_committee {
             return Vec::new();
         }
@@ -992,29 +990,6 @@ impl BeaconFold {
                 .handoff_evidence_expiry(shard)
                 .is_some_and(|expiry| now > expiry)
         })
-    }
-
-    /// Schedule the first `BeaconCommitteeStart` timer so the upcoming
-    /// epoch's SPC instance bootstraps. Subsequent epochs self-arm when a
-    /// participant settles an adoption; this only covers the resume gap
-    /// from a freshly-built or just-loaded fold.
-    ///
-    /// Fires at the next epoch's wall-clock boundary (the close of the
-    /// current epoch's window), or immediately if
-    /// `now` is already past it. Tests that want fast beacon kickoff
-    /// override `chain_config.epoch_duration_ms` in the genesis config.
-    #[must_use]
-    pub fn on_startup(&self) -> Vec<BeaconAction> {
-        vec![
-            BeaconAction::SetTimer {
-                id: TimerId::BeaconCommitteeStart,
-                duration: self.duration_until_next_epoch_boundary(),
-            },
-            BeaconAction::SetTimer {
-                id: TimerId::BeaconRatifyTrigger,
-                duration: self.duration_until_next_ratify_fire(),
-            },
-        ]
     }
 
     /// Wall-clock boundary of the upcoming epoch — the close of the current
@@ -1363,9 +1338,9 @@ fn latch_terminal(schedule: &TopologySchedule, chain: &mut HostedChain) {
     }
 }
 
-fn abandon_witnesses(ids: Vec<ChunkFetchId>) -> Vec<BeaconAction> {
+fn abandon_witnesses(ids: Vec<ChunkFetchId>) -> Vec<FoldAction> {
     if ids.is_empty() {
         return Vec::new();
     }
-    vec![BeaconAction::AbandonFetch(BeaconFetchIds::Witnesses(ids))]
+    vec![FoldAction::AbandonFetch(BeaconFetchIds::Witnesses(ids))]
 }

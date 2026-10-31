@@ -285,7 +285,7 @@ pub enum ConsensusAction {
     /// (which holds the topology schedule) resolves each QC's committee via
     /// [`ShardForkProof::resolve_committees`] and passes them here so the
     /// handler runs pure signature verification — the same emitter-resolves shape as
-    /// [`crate::BeaconAction::VerifyBeaconBlock`].
+    /// [`crate::FoldAction::VerifyBeaconBlock`].
     ///
     /// Delegated to the consensus crypto pool. Returns
     /// `ProtocolEvent::ShardForkProofVerified`.

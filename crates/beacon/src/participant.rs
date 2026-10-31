@@ -1055,6 +1055,30 @@ impl BeaconParticipant {
         equivocations
     }
 
+    /// Arm the first `BeaconCommitteeStart` and `BeaconRatifyTrigger`
+    /// timers off `fold`'s clock, so the upcoming epoch's SPC instance
+    /// bootstraps. Subsequent epochs self-arm when the participant
+    /// settles an adoption; this only covers the resume gap from a
+    /// freshly built or just loaded participant.
+    ///
+    /// The committee start fires at the next epoch's wall-clock boundary
+    /// (the close of the current epoch's window), or immediately if `now`
+    /// is already past it. Tests that want fast beacon kickoff override
+    /// `chain_config.epoch_duration_ms` in the genesis config.
+    #[must_use]
+    pub fn on_startup(fold: &BeaconFold) -> Vec<BeaconAction> {
+        vec![
+            BeaconAction::SetTimer {
+                id: TimerId::BeaconCommitteeStart,
+                duration: fold.duration_until_next_epoch_boundary(),
+            },
+            BeaconAction::SetTimer {
+                id: TimerId::BeaconRatifyTrigger,
+                duration: fold.duration_until_next_ratify_fire(),
+            },
+        ]
+    }
+
     /// `TimerId::BeaconCommitteeStart` fired — the upcoming epoch's
     /// wall-clock boundary has been reached. If the local validator
     /// is on the next committee and no SPC instance is already
