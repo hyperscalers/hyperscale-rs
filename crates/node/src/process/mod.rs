@@ -249,7 +249,7 @@ where
     }
 
     /// Shared lock-free topology snapshot handle, refreshed on every
-    /// `BeaconAction::TopologyChanged`. Long-running consumers hold the
+    /// `FoldAction::TopologyChanged`. Long-running consumers hold the
     /// handle and re-load to observe beacon commits.
     #[must_use]
     pub const fn topology_snapshot(&self) -> &SharedTopologySnapshot {
