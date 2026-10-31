@@ -231,7 +231,11 @@ impl Section for ProvisionsSection {
     /// recovery does not fence it, within the block's transaction cap.
     ///
     /// Content from a recovering shard above its attested frontier is
-    /// refused network-wide, and folding the check into admission keeps
+    /// refused network-wide, and so, once the recovery completes, is a
+    /// batch from its band, above the frontier and anchored below the
+    /// bridge, whose ticks the recovered chain lets go of at its
+    /// crossing block, a halt recovery's harvested tail included.
+    /// Folding the checks into admission keeps
     /// every replica's verdict a pure function of the block's own
     /// anchor: a block anchored before the recovery folded resolves a
     /// snapshot without the record and stays valid.
@@ -255,6 +259,17 @@ impl Section for ProvisionsSection {
             return Err(format!(
                 "provisions batch {provision_hash:?} from recovering shard {source_shard:?} above \
                  the attested frontier"
+            ));
+        }
+        if ctx.snapshot.recovery_orphaned(
+            ctx.windows,
+            source_shard,
+            batch.source_block_ts(),
+            batch.block_height(),
+        ) {
+            return Err(format!(
+                "provisions batch {provision_hash:?} from {source_shard:?} anchored below a \
+                 recovery's bridge above its frontier"
             ));
         }
         let tx_count = fold.tx_count.saturating_add(batch.transactions().len());
@@ -1869,15 +1884,15 @@ mod state_claim_tests {
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, Deadline, Epoch, EpochWindows,
         GlobalReceiptHash, Hash, Inclusion, MerkleInclusionProof, NetworkDefinition, Owes,
-        RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ShardId, ShardRecovery, StateClaim,
-        Stated, SubstateKey, TopologySchedule, TopologySnapshot, TxHash, ValidatorSet,
-        WeightedTimestamp, verdict_leaf,
+        ProvisionEntry, Provisions, RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ShardId,
+        ShardRecovery, StateClaim, Stated, SubstateKey, TopologySchedule, TopologySnapshot, TxHash,
+        ValidatorSet, WeightedTimestamp, verdict_leaf,
     };
     use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, ProtocolHasher, Terms};
     use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
     use super::fixtures::{Against, DEPARTURE_CUT_MS, departures};
-    use super::{Section, StateClaimsFold, StateClaimsSection};
+    use super::{ProvisionsFold, ProvisionsSection, Section, StateClaimsFold, StateClaimsSection};
 
     const PRODUCER: ShardId = ShardId::leaf(1, 0);
 
@@ -2474,6 +2489,53 @@ mod state_claim_tests {
                 admit(&against, &read_at(counterpart, height, anchor_ms)),
                 Ok(())
             );
+        }
+    }
+
+    /// A provision batch from the counterpart's block at `height`
+    /// anchored at `anchor_ms`, naming one transaction.
+    fn batch_at(counterpart: ShardId, local: ShardId, height: u64, anchor_ms: u64) -> Provisions {
+        Provisions::new(
+            counterpart,
+            local,
+            BlockHeight::new(height),
+            WeightedTimestamp::from_millis(anchor_ms),
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([ProvisionEntry::new(
+                TxHash::from(Hash::from_bytes(b"provisioned")),
+                Capped::empty(),
+            )]),
+        )
+    }
+
+    /// Once the counterpart's recovery record has cleared, a provision
+    /// batch from a block its recovery let go of is refused, a harvested
+    /// block above the frontier and a coast block alike, both anchored
+    /// below the bridge; while the recovery is pending the frontier
+    /// refuses them already. A batch at the frontier and one at a fresh
+    /// block anchored past the bridge are admitted once it clears.
+    #[test]
+    fn a_batch_from_a_recovery_band_is_refused_after_the_record_clears() {
+        let block = WeightedTimestamp::from_millis(30_000);
+        for pending in [true, false] {
+            let (against, counterpart) = beside_a_recovered_counterpart(block, pending);
+            let admit_batch = |height, anchor_ms| {
+                ProvisionsSection::admit(
+                    &against.ctx(),
+                    &mut ProvisionsFold::default(),
+                    &batch_at(counterpart, against.local_shard, height, anchor_ms),
+                )
+            };
+            for (label, height, anchor_ms) in [("harvested", 10, 3_000), ("coast", 12, 20_900)] {
+                assert!(
+                    admit_batch(height, anchor_ms).is_err(),
+                    "pending {pending}: a {label} block",
+                );
+            }
+            assert_eq!(admit_batch(RECOVERED_FRONTIER, 2_500), Ok(()));
+            if !pending {
+                assert_eq!(admit_batch(13, 21_100), Ok(()));
+            }
         }
     }
 
