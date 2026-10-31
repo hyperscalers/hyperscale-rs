@@ -430,6 +430,15 @@ pub enum ShardScopedInput {
         /// Hash of the committing block.
         block_hash: BlockHash,
     },
+
+    /// A commit flush on the I/O pool wrote every block through
+    /// `height`. The loop advances its commit pipeline and reads what
+    /// the replica's `ProtocolEvent::BlockPersisted` carries off the
+    /// store, so only the loop builds that event.
+    BlockFlushed {
+        /// The highest height the flush wrote.
+        height: BlockHeight,
+    },
 }
 
 impl ShardScopedInput {
@@ -487,7 +496,8 @@ impl ShardScopedInput {
             | Self::TransactionValidationsFailed { .. }
             | Self::QcOnlyCommitPrepared { .. }
             | Self::QcOnlyCommitDiverged { .. }
-            | Self::QcOnlyCommitWrittenPast { .. } => EventPriority::Internal,
+            | Self::QcOnlyCommitWrittenPast { .. }
+            | Self::BlockFlushed { .. } => EventPriority::Internal,
         }
     }
 

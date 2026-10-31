@@ -11,7 +11,7 @@
 //!    prepared commits are in hand, prune stale prepared commits, and hand
 //!    the run to one task on the I/O pool, which writes each block in height
 //!    order with one fsync for the batch, then emits deferred
-//!    `BlockCommitted` events and a final `BlockPersisted`.
+//!    `BlockCommitted` events and a final `BlockFlushed` input.
 //!
 //! The coordinator does not feed events to the state machine; the shard's
 //! loop drives that based on the [`AccumulateDecision`] returned from
@@ -37,8 +37,8 @@ use hyperscale_types::{
 };
 use tracing::debug;
 
-use crate::event::HostEvent;
-use crate::shard::push_protocol_event;
+use crate::event::{HostEvent, ShardScopedInput};
+use crate::shard::{push_protocol_event, push_shard_input};
 
 /// Handle to the assembled `Verified<CertifiedBlock>` that the
 /// shard's loop forwards to `BlockCommitted`. Cloned `Arc` to the commit
@@ -469,8 +469,8 @@ struct ReadyCommit {
 }
 
 pub struct BlockCommitCoordinator {
-    /// Shard this coordinator persists for. Stamped onto emitted
-    /// `BlockPersisted` events.
+    /// Shard this coordinator persists for. Stamped onto the inputs a
+    /// flush sends back.
     shard: ShardId,
 
     /// Epoch-boundary pin trigger; `None` leaves boundary pinning off.
@@ -487,7 +487,7 @@ pub struct BlockCommitCoordinator {
     pending: Vec<PendingCommit>,
 
     /// Highest block height durably persisted to `RocksDB`. Updated by
-    /// [`mark_persisted`](Self::mark_persisted) when `BlockPersisted`
+    /// [`mark_persisted`](Self::mark_persisted) when `BlockFlushed`
     /// arrives. Drives backpressure: if consensus runs too far ahead,
     /// `BlockCommitted` is deferred until the disk write completes.
     persisted_height: BlockHeight,
@@ -495,7 +495,7 @@ pub struct BlockCommitCoordinator {
     /// Highest block height handed to the store by [`flush`](Self::flush),
     /// advanced synchronously as each batch spawns. Unlike
     /// [`persisted_height`](Self::persisted_height), which lags behind the
-    /// `BlockPersisted` round-trip, this reflects the store's actual write
+    /// `BlockFlushed` round-trip, this reflects the store's actual write
     /// frontier — the gate that keeps successive flush batches height
     /// contiguous reads it so a later block never writes over an
     /// unmaterialized parent version. [`commit_in_flight`](Self::commit_in_flight)
@@ -667,7 +667,7 @@ impl BlockCommitCoordinator {
 
     /// Whether the store's write frontier has reached `height`: the block
     /// is persisted, or a flush has handed it to the store and its
-    /// `BlockPersisted` has not come back yet.
+    /// `BlockFlushed` has not come back yet.
     pub(crate) fn is_written(&self, height: BlockHeight) -> bool {
         height <= self.flushed_height.max(self.persisted_height)
     }
@@ -727,7 +727,7 @@ impl BlockCommitCoordinator {
 
         // Skip blocks at or below the store's write frontier: persisted by
         // the sync path, or handed to the store by an earlier flush whose
-        // `BlockPersisted` has not come back yet. A flush empties
+        // `BlockFlushed` has not come back yet. A flush empties
         // `pending`, so `pending` alone cannot dedup a block a second
         // commit path reaches after it.
         if self.is_written(height) {
@@ -805,7 +805,7 @@ impl BlockCommitCoordinator {
     /// ordering: the I/O pool does not guarantee FIFO across separate
     /// `spawn()` calls.
     ///
-    /// Deferred `BlockCommitted` and `BlockPersisted` events return to
+    /// Deferred `BlockCommitted` events and `BlockFlushed` return to
     /// the pinned thread via `event_tx`; see `ProcessIo::shard_event_senders`
     /// for the off-thread → pinned-thread routing convention.
     pub(crate) fn flush<D: Dispatch>(&mut self, event_tx: &Sender<HostEvent>, dispatch: &D) {
@@ -824,7 +824,7 @@ impl BlockCommitCoordinator {
         // Cascading commits (e.g. QC formation during BlockCommitted processing)
         // can push a child block into pending before its parent. Without
         // sorting, the child block (which may lack a PreparedCommit) would defer
-        // and block the ready parent, causing a deadlock where BlockPersisted
+        // and block the ready parent, causing a deadlock where BlockFlushed
         // never fires.
         commits.sort_by_key(|c| c.certified.block().height().inner());
 
@@ -924,19 +924,17 @@ impl BlockCommitCoordinator {
                 }
             }
 
-            // Clear the in-flight flag before sending BlockPersisted. The
+            // Clear the in-flight flag before sending BlockFlushed. The
             // channel send synchronizes-with recv on the main thread, so
-            // the flag is guaranteed visible when the flush that event's
+            // the flag is guaranteed visible when the flush that input's
             // handling triggers drains any backlog.
             in_flight.store(false, Ordering::Release);
 
-            push_protocol_event(
+            push_shard_input(
                 &event_tx,
                 shard,
-                ProtocolEvent::BlockPersisted {
+                ShardScopedInput::BlockFlushed {
                     height: max_persisted,
-                    substate_bytes: 0,
-                    standing_answers: None,
                 },
             );
         });
@@ -964,7 +962,7 @@ impl BlockCommitCoordinator {
         let mut ready = Vec::with_capacity(commits.len());
         let mut cache = self.prepared_commits.lock().unwrap();
         let mut deferring = false;
-        // Gate from the store's write frontier, not the `BlockPersisted`
+        // Gate from the store's write frontier, not the `BlockFlushed`
         // round-trip: a block just handed to the store isn't yet marked
         // persisted but its tree version is materializing, so a
         // contiguous successor is safe to follow it. Take the max so a
@@ -1078,7 +1076,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::event::ShardScopedInput;
 
     /// Shared sink the test closures record their (height, tag) commit
     /// against. Threaded through `make_commit` so the test can assert on
@@ -1194,24 +1191,27 @@ mod tests {
         TAG_GEN.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn drain_protocol_events(rx: &Receiver<HostEvent>) -> Vec<ProtocolEvent> {
+    fn drain_inputs(rx: &Receiver<HostEvent>) -> Vec<ShardScopedInput> {
         let mut out = Vec::new();
-        while let Ok(HostEvent::Shard(_, ShardScopedInput::Protocol(event))) = rx.try_recv() {
-            out.push(*event);
+        while let Ok(HostEvent::Shard(_, input)) = rx.try_recv() {
+            out.push(input);
         }
         out
     }
 
-    fn count_committed(events: &[ProtocolEvent]) -> usize {
-        events
+    fn count_committed(inputs: &[ShardScopedInput]) -> usize {
+        inputs
             .iter()
-            .filter(|e| matches!(e, ProtocolEvent::BlockCommitted { .. }))
+            .filter(|input| {
+                matches!(input, ShardScopedInput::Protocol(event)
+                    if matches!(**event, ProtocolEvent::BlockCommitted { .. }))
+            })
             .count()
     }
 
-    fn last_persisted_height(events: &[ProtocolEvent]) -> Option<BlockHeight> {
-        events.iter().rev().find_map(|e| match e {
-            ProtocolEvent::BlockPersisted { height, .. } => Some(*height),
+    fn last_flushed_height(inputs: &[ShardScopedInput]) -> Option<BlockHeight> {
+        inputs.iter().rev().find_map(|input| match input {
+            ShardScopedInput::BlockFlushed { height } => Some(*height),
             _ => None,
         })
     }
@@ -1605,7 +1605,7 @@ mod tests {
         );
 
         // Fanned out, the held commit holds nothing back.
-        let events = drain_protocol_events(&rx);
+        let events = drain_inputs(&rx);
         assert_eq!(count_committed(&events), 1, "events: {events:?}");
         coord.note_broadcast(BlockHeight::new(max_lag + 1));
         coord.note_broadcast(BlockHeight::new(max_lag + 2));
@@ -1716,10 +1716,10 @@ mod tests {
         coord.flush(&tx, &dispatch);
 
         assert_eq!(committed_heights(&sink), vec![1, 2, 3]);
-        // No deferred BlockCommitted (all immediate); BlockPersisted at top.
-        let events = drain_protocol_events(&rx);
+        // No deferred BlockCommitted (all immediate); BlockFlushed at top.
+        let events = drain_inputs(&rx);
         assert_eq!(count_committed(&events), 0);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(3)));
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(3)));
     }
 
     #[test]
@@ -1763,11 +1763,11 @@ mod tests {
             vec![841],
             "the gate drains only the contiguous prefix, holding 843 behind the 842 gap",
         );
-        let _ = drain_protocol_events(&rx);
+        let _ = drain_inputs(&rx);
 
         // The last predecessor arrives; the gate releases 842 and the held
         // 843 in one contiguous batch — driven by the store write frontier,
-        // not the `BlockPersisted` round-trip (never fired in this test).
+        // not the `BlockFlushed` round-trip (never handled in this test).
         enqueue(
             &mut coord,
             &committee,
@@ -1781,8 +1781,8 @@ mod tests {
             vec![841, 842, 843],
             "the late predecessor releases the held commit in height order",
         );
-        let events = drain_protocol_events(&rx);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(843)));
+        let events = drain_inputs(&rx);
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(843)));
     }
 
     #[test]
@@ -1813,8 +1813,8 @@ mod tests {
         coord.flush(&tx, &dispatch);
 
         assert_eq!(committed_heights(&sink), vec![2]);
-        let events = drain_protocol_events(&rx);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(2)));
+        let events = drain_inputs(&rx);
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(2)));
     }
 
     /// A commit whose notification was deferred and whose height the
@@ -1843,7 +1843,7 @@ mod tests {
             Arc::clone(&sink),
         );
         assert!(
-            drain_protocol_events(&rx).is_empty(),
+            drain_inputs(&rx).is_empty(),
             "the notification was deferred, so nothing has fired yet"
         );
 
@@ -1855,7 +1855,7 @@ mod tests {
             committed_heights(&sink).is_empty(),
             "the write is what sync made unnecessary"
         );
-        let events = drain_protocol_events(&rx);
+        let events = drain_inputs(&rx);
         assert_eq!(
             count_committed(&events),
             1,
@@ -1884,9 +1884,9 @@ mod tests {
 
         assert!(committed_heights(&sink).is_empty());
         assert_eq!(coord.pending_len(), 1, "block must remain pending");
-        // No spawned write means no BlockPersisted should have fired.
-        let events = drain_protocol_events(&rx);
-        assert!(last_persisted_height(&events).is_none());
+        // No spawned write means no BlockFlushed should have fired.
+        let events = drain_inputs(&rx);
+        assert!(last_flushed_height(&events).is_none());
     }
 
     #[test]
@@ -1934,8 +1934,8 @@ mod tests {
         assert!(pending_heights.contains(&2));
         assert!(pending_heights.contains(&3));
 
-        let events = drain_protocol_events(&rx);
-        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(1)));
+        let events = drain_inputs(&rx);
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(1)));
     }
 
     #[test]
@@ -1960,12 +1960,9 @@ mod tests {
 
         coord.flush(&tx, &dispatch);
 
-        let events = drain_protocol_events(&rx);
+        let events = drain_inputs(&rx);
         assert_eq!(count_committed(&events), 2, "events: {events:?}");
-        assert_eq!(
-            last_persisted_height(&events),
-            Some(BlockHeight::new(total))
-        );
+        assert_eq!(last_flushed_height(&events), Some(BlockHeight::new(total)));
     }
 
     #[test]

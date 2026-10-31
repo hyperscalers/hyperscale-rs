@@ -545,8 +545,8 @@ where
             ShardScopedInput::ProposalFetched { proposal } => {
                 self.handle_proposal_fetched(*proposal);
             }
+            ShardScopedInput::BlockFlushed { height } => self.handle_block_flushed(height),
             ShardScopedInput::Protocol(event) => match *event {
-                ProtocolEvent::BlockPersisted { height, .. } => self.handle_block_persisted(height),
                 persisted @ ProtocolEvent::BeaconBlockPersisted { .. } => {
                     self.handle_beacon_block_persisted(persisted);
                 }

@@ -3,11 +3,11 @@
 //! `ShardScopedInput::Protocol(_)` is the channel for state-machine events that
 //! re-enter `ShardLoop` via `dispatch_event` (continuation-style). Most are pure
 //! passthrough — feed the variant straight into the state machine. The
-//! exceptions are `BlockPersisted`, which carries `ShardLoop`-side commit
-//! pipeline state (`block_commit`, `pending_chain`) that needs updating
-//! before the state machine sees the event, and `CommittedStateRestored`,
-//! after which the loop derives the chain floor of the store it resumed
-//! on.
+//! exceptions are `CommittedStateRestored`, after which the loop derives
+//! the chain floor of the store it resumed on, and the
+//! `ShardScopedInput::BlockFlushed` step, which updates `ShardLoop`-side
+//! commit pipeline state (`block_commit`, `pending_chain`) before the
+//! state machine sees the `BlockPersisted` it builds.
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
@@ -23,12 +23,13 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Update the commit pipeline before forwarding `BlockPersisted` to the
-    /// state machine: the persisted height advances `block_commit`'s gate
-    /// and `pending_chain`'s pruning watermark, and the event picks up
-    /// the authoritative substate byte total from storage so the state
+    /// Update the commit pipeline for a flush that wrote through
+    /// `height`, then tell the state machine with `BlockPersisted`: the
+    /// persisted height advances `block_commit`'s gate and
+    /// `pending_chain`'s pruning watermark, and the event carries the
+    /// authoritative substate byte total from storage so the state
     /// machine's count frontier reconciles even across sync commits.
-    pub(in crate::shard) fn handle_block_persisted(&mut self, height: BlockHeight) {
+    pub(in crate::shard) fn handle_block_flushed(&mut self, height: BlockHeight) {
         self.io.block_commit.mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.io.pending_chain.prune(height);
