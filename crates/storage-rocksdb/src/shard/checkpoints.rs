@@ -348,7 +348,8 @@ impl CheckpointRing {
     }
 
     /// Create a checkpoint of the database's current state, labelled with
-    /// the committed block `height` it captures.
+    /// the committed block `height` it captures. The caller holds the
+    /// store's `commit_lock` with the store at `height`.
     ///
     /// Idempotent: if a checkpoint for `height` already exists it is kept
     /// as-is (a replayed commit must not clobber a checkpoint a joiner
@@ -556,7 +557,24 @@ impl BoundaryStore for RocksDbShardStorage {
         MemberIndex::load(self, shard)
     }
 
+    /// A checkpoint captures the live store, so the pin holds
+    /// `commit_lock`: no block lands between the check that the store
+    /// stands at `height` and the capture labelled with it, and no two
+    /// creations share the ring's temporary name at once.
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| "commit lock poisoned".to_string())?;
+        if self.checkpoints.entry_path(height).exists() {
+            return Ok(());
+        }
+        let (version, _) = self.read_jmt_metadata();
+        if version != height.inner() {
+            return Err(format!(
+                "the store stands at {version}, not at the boundary {height}"
+            ));
+        }
         self.checkpoints.create(height).map_err(|e| e.to_string())
     }
 
@@ -650,7 +668,7 @@ impl BoundaryStore for RocksDbShardStorage {
                 .write(batch)
                 .map_err(|e| format!("boundary header write failed: {e}"))?;
         }
-        if let Err(error) = self.checkpoints.create(height) {
+        if let Err(error) = self.pin_boundary(height) {
             warn!(
                 %height,
                 %error,
@@ -915,6 +933,30 @@ mod tests {
                 .join(entry_name(BlockHeight::new(1)))
                 .exists()
         );
+    }
+
+    /// A pin asked for once the boundary's child has landed — a caller
+    /// that saw the store at the boundary, then lost the race to the
+    /// child's write — is refused rather than labelling the child's
+    /// state as the boundary's. A pin the store already holds stands.
+    #[test]
+    fn a_pin_after_the_child_lands_never_captures_the_child() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        commit_one(&storage, 1);
+        commit_one(&storage, 2);
+
+        assert!(storage.pin_boundary(BlockHeight::new(1)).is_err());
+        assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
+
+        storage.pin_boundary(BlockHeight::new(2)).unwrap();
+        commit_one(&storage, 3);
+        storage.pin_boundary(BlockHeight::new(2)).unwrap();
+        let (version, _) = storage
+            .open_boundary(BlockHeight::new(2))
+            .expect("pinned")
+            .read_jmt_metadata();
+        assert_eq!(version, 2);
     }
 
     #[test]
