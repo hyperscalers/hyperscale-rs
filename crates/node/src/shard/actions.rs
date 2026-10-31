@@ -107,7 +107,12 @@ where
                 // holds its keys now rather than the committee this
                 // chain is leaving.
                 for tx in &txs {
-                    self.process.submit_transaction(tx);
+                    if !self.process.submit_transaction(tx) {
+                        tracing::warn!(
+                            tx_hash = ?tx.hash(),
+                            "Dropping a re-offered transaction: it did not route"
+                        );
+                    }
                 }
             }
             Action::Fetch(req) => self.process_fetch_request(req),

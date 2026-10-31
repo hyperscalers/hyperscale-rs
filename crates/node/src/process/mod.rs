@@ -410,8 +410,15 @@ where
                 .lock()
                 .expect("parked submissions lock"),
         );
+        // The submitter was answered when the transaction parked, so a
+        // release that fails to route has no one left to tell.
         for tx in released {
-            self.submit_transaction(&tx);
+            if !self.submit_transaction(&tx) {
+                tracing::warn!(
+                    tx_hash = ?tx.hash(),
+                    "Dropping a parked submission: its release did not route"
+                );
+            }
         }
     }
 
@@ -435,6 +442,7 @@ where
     /// threads can invoke this concurrently with each other and with a
     /// shard's detach, because the fanout routes from one load of the
     /// sender map and carries the senders it picked.
+    #[must_use]
     pub fn submit_transaction(&self, tx: &Transaction) -> bool {
         // Seed the canonical-instance cache so gossip echoes of this tx
         // arriving on other hosted shards' topics share its validation
