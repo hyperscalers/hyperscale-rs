@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_core::{BeaconFetchIds, FetchIds};
+use hyperscale_core::BeaconFetchIds;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
@@ -32,18 +32,11 @@ where
     pub(super) fn ask(
         &mut self,
         owner: BeaconOwner,
-        ids: FetchIds,
+        ids: BeaconFetchIds,
         shard: ShardId,
         preferred: Option<ValidatorId>,
         class: Option<MessageClass>,
     ) {
-        let FetchIds::Beacon(ids) = ids else {
-            warn!(
-                ?ids,
-                "BeaconLoop: dropping a fetch the beacon loop does not drive"
-            );
-            return;
-        };
         self.visit_ids(
             ids,
             &mut Ask {
@@ -77,10 +70,8 @@ where
 
     /// `owner` no longer wants `ids`. An id another owner still asks for
     /// stays in flight.
-    pub(super) fn abandon(&mut self, owner: BeaconOwner, ids: FetchIds) {
-        if let FetchIds::Beacon(ids) = ids {
-            self.visit_ids(ids, &mut Abandon(owner));
-        }
+    pub(super) fn abandon(&mut self, owner: BeaconOwner, ids: BeaconFetchIds) {
+        self.visit_ids(ids, &mut Abandon(owner));
     }
 
     pub(super) fn abandon_for<B: Asked>(&mut self, owner: BeaconOwner, ids: Vec<B::Id>) {
@@ -115,10 +106,8 @@ where
     }
 
     /// A response boundary released `ids`.
-    pub(super) fn release(&mut self, ids: FetchIds, how: Release) {
-        if let FetchIds::Beacon(ids) = ids {
-            self.visit_ids(ids, &mut Let(how));
-        }
+    pub(super) fn release(&mut self, ids: BeaconFetchIds, how: Release) {
+        self.visit_ids(ids, &mut Let(how));
     }
 
     /// The loop's fetch tick: every fetch retries what its backoff lets go.

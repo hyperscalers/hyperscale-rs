@@ -8,7 +8,6 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{LocalTimestamp, MessageClass, ShardId, ValidatorId};
-use tracing::warn;
 
 use super::{ShardIo, ShardLoop};
 use crate::event::{TimerOp, TimerOwner};
@@ -130,11 +129,6 @@ where
             ($($arm:ident => $binding:ty,)*) => {
                 match ids {
                     $(FetchIds::$arm(ids) => self.drive_fetch::<$binding>(intent.input(ids)),)*
-                    // No replica emits a beacon fetch: the host's beacon
-                    // loop drives them for its fold and participants.
-                    FetchIds::Beacon(ids) => {
-                        warn!(?ids, "a beacon fetch reached a shard loop — dropping");
-                    }
                 }
             };
         }
@@ -320,14 +314,12 @@ impl FetchTicker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_core::BeaconFetchIds;
     use hyperscale_hbor::Capped;
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::GetProvisionsRequest;
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash,
-        MerkleInclusionProof, ProvisionEntry, Provisions, ProvisionsVerifyError, StateRoot, TxHash,
-        WeightedTimestamp,
+        Anchor, BlockHash, BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions,
+        ProvisionsVerifyError, StateRoot, TxHash, WeightedTimestamp,
     };
 
     use super::*;
@@ -415,41 +407,6 @@ mod tests {
             },
         });
         assert_eq!(provisions_asked(&mut host), 1, "the fetch goes out again");
-    }
-
-    /// A beacon fetch that reaches a shard loop is dropped: nothing is
-    /// asked, nothing is left pending, and the loop's tick drives none.
-    #[test]
-    fn the_shard_fetch_tick_drives_no_beacon_fetch() {
-        let fix = Fixture::new();
-        let mut host = fix.host(BlockHeight::GENESIS);
-        let _ = host.network().drain_pending_requests();
-        let shard_loop = loop_of(&mut host);
-        let candidate = (
-            Epoch::new(1),
-            BeaconBlockHash::from_raw(Hash::from_bytes(b"candidate")),
-        );
-        for ids in [
-            BeaconFetchIds::Candidates(vec![candidate]),
-            BeaconFetchIds::InstanceRecords(vec![Address::new([3; 31], AddressClass::Component)]),
-            BeaconFetchIds::PackageArtifacts(vec![Hash::from_bytes(b"package")]),
-        ] {
-            shard_loop.request_fetch(FetchIds::Beacon(ids), SHARD, None, None);
-        }
-        shard_loop.handle_fetch_tick();
-        shard_loop.pending_timer_ops.clear();
-        shard_loop.update_fetch_tick_timer();
-        assert!(
-            !shard_loop
-                .pending_timer_ops
-                .iter()
-                .any(|op| is_set(Some(op))),
-            "nothing is left pending for the shard's tick to drive",
-        );
-        assert!(
-            host.network().drain_pending_requests().is_empty(),
-            "no beacon ask leaves a shard loop",
-        );
     }
 
     fn is_set(op: Option<&TimerOp>) -> bool {

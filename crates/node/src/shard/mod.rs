@@ -76,7 +76,7 @@ use crate::shard::commit::PreparedCommitMap;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
-/// Updated by the host when `Action::TopologyChanged` is processed.
+/// Updated by the host when `BeaconAction::TopologyChanged` is processed.
 /// Handler closures call `.load()` to get the current snapshot atomically.
 pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 

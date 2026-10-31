@@ -6,7 +6,7 @@ use std::sync::Arc;
 use hyperscale_beacon::action_handlers::handle_action as handle_beacon_action;
 use hyperscale_beacon::verification::RatifyVoteSlotKey;
 use hyperscale_beacon::{BeaconFold, BeaconParticipant, ParticipantStep};
-use hyperscale_core::{Action, ActionOwner, BeaconActionContext, Gate, ProtocolEvent};
+use hyperscale_core::{BeaconAction, BeaconActionContext, Gate, ParticipantAction, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
@@ -138,51 +138,59 @@ where
     /// Handle the actions `validator`'s participant emitted: the effects
     /// any owner's actions have, its timers, and its delegated actions on
     /// the dispatch pool.
-    fn run_participant_actions(&mut self, validator: ValidatorId, actions: Vec<Action>) {
+    fn run_participant_actions(&mut self, validator: ValidatorId, actions: Vec<BeaconAction>) {
         let Some(participant) = self.participants.get(&validator) else {
             return;
         };
-        let attachment = participant.attachment;
+        let owner = BeaconOwner::Participant(participant.attachment);
         self.actions_generated += actions.len();
         for action in actions {
-            if let Some(action) =
-                self.process_shared_action(BeaconOwner::Participant(attachment), action)
-            {
-                self.process_participant_action(attachment, action);
-            }
+            self.process_action(owner, action);
         }
     }
 
-    /// Handle one of a participant's own actions: a timer it arms or
-    /// cancels, or a beacon-owned action run on the dispatch pool.
-    fn process_participant_action(&mut self, attachment: Attachment, action: Action) {
-        let owner = TimerOwner::Participant(attachment);
-        match action {
-            Action::SetTimer { id, duration } => {
-                self.pending_timer_ops.push(TimerOp::Set {
-                    owner,
-                    id,
-                    duration,
-                });
-            }
-            Action::CancelTimer { id } => {
-                self.pending_timer_ops.push(TimerOp::Cancel { owner, id });
-            }
-            other if other.owner() == ActionOwner::Beacon => {
-                if !self.joins_a_shared_check(attachment, &other) {
-                    self.dispatch_participant_action(attachment.validator, other);
-                }
-            }
-            other => warn!(
-                action = other.type_name(),
-                "BeaconLoop: unexpected participant action — dropping"
-            ),
+    /// Buffer a timer operation `owner` armed or cancelled. Only a
+    /// participant arms beacon timers; the fold's startup timers are
+    /// armed on each participant's behalf.
+    pub(super) fn push_participant_timer(
+        &mut self,
+        owner: BeaconOwner,
+        op: impl FnOnce(TimerOwner) -> TimerOp,
+    ) {
+        let BeaconOwner::Participant(attachment) = owner else {
+            warn!(
+                ?owner,
+                "BeaconLoop: a timer no participant armed — dropping"
+            );
+            return;
+        };
+        self.pending_timer_ops
+            .push(op(TimerOwner::Participant(attachment)));
+    }
+
+    /// Run a participant's delegated work on the dispatch pool, unless it
+    /// is a check another participant already runs.
+    pub(super) fn run_participant_work(&mut self, owner: BeaconOwner, work: ParticipantAction) {
+        let BeaconOwner::Participant(attachment) = owner else {
+            warn!(
+                ?owner,
+                action = work.type_name(),
+                "BeaconLoop: participant work no participant emitted — dropping"
+            );
+            return;
+        };
+        if !self.joins_a_shared_check(attachment, &work) {
+            self.dispatch_participant_action(attachment.validator, work);
         }
     }
 
     /// Whether `action` is a check another participant already runs, which
     /// `attachment` now waits on too. The first to ask runs it.
-    pub(super) fn joins_a_shared_check(&mut self, attachment: Attachment, action: &Action) -> bool {
+    pub(super) fn joins_a_shared_check(
+        &mut self,
+        attachment: Attachment,
+        action: &ParticipantAction,
+    ) -> bool {
         let Some(check) = SharedCheck::of_action(action) else {
             return false;
         };
@@ -221,7 +229,11 @@ where
     /// Run one participant's beacon-owned delegated action on the
     /// consensus dispatch pool, behind its release gate. Its outcomes
     /// return to that participant as continuations.
-    pub(super) fn dispatch_participant_action(&self, validator: ValidatorId, action: Action) {
+    pub(super) fn dispatch_participant_action(
+        &self,
+        validator: ValidatorId,
+        action: ParticipantAction,
+    ) {
         let Some(participant) = self.participants.get(&validator) else {
             return;
         };
@@ -300,16 +312,16 @@ pub(super) enum SharedCheck {
 }
 
 impl SharedCheck {
-    fn of_action(action: &Action) -> Option<Self> {
+    fn of_action(action: &ParticipantAction) -> Option<Self> {
         match action {
-            Action::VerifyRatifyVote { vote, .. } => Some(Self::RatifyVote((
+            ParticipantAction::VerifyRatifyVote { vote, .. } => Some(Self::RatifyVote((
                 vote.anchor_hash(),
                 vote.epoch(),
                 vote.round(),
                 vote.phase(),
                 vote.signer(),
             ))),
-            Action::VerifyBeaconCandidate { candidate, .. } => {
+            ParticipantAction::VerifyBeaconCandidate { candidate, .. } => {
                 Some(Self::Candidate(candidate.block_hash()))
             }
             _ => None,

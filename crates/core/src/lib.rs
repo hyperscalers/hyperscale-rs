@@ -33,6 +33,7 @@
 
 mod action;
 mod action_context;
+mod beacon_action;
 mod fetch_ids;
 mod fetch_request;
 mod gate;
@@ -45,6 +46,7 @@ pub use action::{
     ParticipationChange, ProvisionsRequest, QcSubject, StateRootCheck, SyncClaimId,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock, Signing};
+pub use beacon_action::{BeaconAction, BeaconBlockCheck, ParticipantAction};
 pub use fetch_ids::{BeaconFetchIds, FetchIds};
 pub use fetch_request::FetchRequest;
 pub use gate::{Gate, GateEntry};

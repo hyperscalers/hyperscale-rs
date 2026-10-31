@@ -396,7 +396,7 @@ pub struct SimulationRunner {
     beacon_network: NetworkDefinition,
 
     /// Placement deltas the hosts emitted via
-    /// `Action::ReconfigureParticipation`, in deterministic event
+    /// `BeaconAction::ReconfigureParticipation`, in deterministic event
     /// order. Drained by the harness via
     /// [`Self::take_participation_changes`].
     pending_participation_changes: Vec<(NodeIndex, ParticipationChange)>,

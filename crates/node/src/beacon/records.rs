@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_core::{BeaconFetchIds, FetchIds};
+use hyperscale_core::BeaconFetchIds;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::{Executor, artifact_package, instance_of_record};
 use hyperscale_hbor::{Bytes, Capped};
@@ -56,8 +56,10 @@ impl FetchBinding for InstanceRecordBinding {
 
     const NAME: &'static str = "instance_record";
 
-    fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::Beacon(BeaconFetchIds::InstanceRecords(ids))
+    type Ids = BeaconFetchIds;
+
+    fn ids(ids: Vec<Self::Id>) -> BeaconFetchIds {
+        BeaconFetchIds::InstanceRecords(ids)
     }
 }
 
@@ -127,8 +129,10 @@ impl FetchBinding for PackageArtifactBinding {
 
     const NAME: &'static str = "package_artifact";
 
-    fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::Beacon(BeaconFetchIds::PackageArtifacts(ids))
+    type Ids = BeaconFetchIds;
+
+    fn ids(ids: Vec<Self::Id>) -> BeaconFetchIds {
+        BeaconFetchIds::PackageArtifacts(ids)
     }
 }
 

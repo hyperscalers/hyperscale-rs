@@ -543,12 +543,18 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
 ///
 /// Each fetch payload (transactions, provisions, headers, …) gets one impl —
 /// living with its subsystem state in `shard/{consensus,cross_shard,mempool}`
-/// or `beacon` — that owns the `Id` type and the [`FetchIds`] arm it rides
-/// in. Which `Fetch<Id>` instance backs it and the wire shape of its
-/// requests are [`FetchedBy`], per loop that drives it.
+/// or `beacon` — that owns the `Id` type and the arm of its loop's id
+/// family it rides in: [`FetchIds`] for a shard loop's,
+/// [`BeaconFetchIds`](hyperscale_core::BeaconFetchIds) for the beacon
+/// loop's. Which `Fetch<Id>` instance
+/// backs it and the wire shape of its requests are [`FetchedBy`], per
+/// loop that drives it.
 pub trait FetchBinding: 'static {
     /// Id used to address payloads of this kind.
     type Id: Clone + Ord + Hash + std::fmt::Debug + Send + Sync + 'static;
+
+    /// The id family of the loop that drives this binding.
+    type Ids: Send + 'static;
 
     /// Stable identifier for this binding — used in dispatch tracing.
     const NAME: &'static str;
@@ -558,10 +564,10 @@ pub trait FetchBinding: 'static {
     /// to `true`; bag-of-hashes fetches leave it `false`.
     const PER_ID: bool = false;
 
-    /// The [`FetchIds`] arm that carries this binding's ids — how a
+    /// The [`Self::Ids`] arm that carries this binding's ids — how a
     /// response boundary names the ids it failed or fulfilled, and the
     /// inverse of the one dispatcher that routes a batch back here.
-    fn ids(ids: Vec<Self::Id>) -> FetchIds;
+    fn ids(ids: Vec<Self::Id>) -> Self::Ids;
 }
 
 /// A loop that owns fetch state: the shard loop's [`ShardIo`] or the
@@ -572,7 +578,7 @@ pub trait FetchOwner {
 }
 
 /// A binding as the fetch-state owner `O` drives it.
-pub trait FetchedBy<O: FetchOwner>: FetchBinding {
+pub trait FetchedBy<O: FetchOwner>: FetchBinding<Ids = <O::Reply as FetchReply>::Ids> {
     /// Locate this binding's `Fetch<Id>` instance inside `O`.
     fn fetch_mut(owner: &mut O) -> &mut Fetch<Self::Id>;
 
@@ -587,18 +593,21 @@ pub trait FetchedBy<O: FetchOwner>: FetchBinding {
 /// failure releases what it asked for and an answer reaches what wanted
 /// it.
 pub trait FetchReply: Clone + Send + 'static {
+    /// The id family of the loop this reply reaches.
+    type Ids;
+
     /// Release `ids` after a request that failed with `error`: on the
     /// tick when it never reached a peer, at once otherwise.
-    fn failed(&self, ids: FetchIds, error: &RequestError);
+    fn failed(&self, ids: Self::Ids, error: &RequestError);
 
     /// Release `ids` for retry after an answer that did not settle them:
     /// one refused, or one that left them out.
-    fn refused(&self, ids: FetchIds);
+    fn refused(&self, ids: Self::Ids);
 
     /// Retire `ids` and hand over the event their answer carries. The
     /// ids are released first, so the freed capacity is available if
     /// handling the event re-drives the fetch.
-    fn answered(&self, ids: FetchIds, event: ProtocolEvent);
+    fn answered(&self, ids: Self::Ids, event: ProtocolEvent);
 }
 
 /// A shard loop's reply handle: its event channel, with the hosted shard
@@ -612,6 +621,8 @@ pub struct ShardReply {
 }
 
 impl FetchReply for ShardReply {
+    type Ids = FetchIds;
+
     fn failed(&self, ids: FetchIds, error: &RequestError) {
         let release = if defers_to_the_tick(error) {
             ShardScopedInput::FetchUnroutable(ids)
@@ -745,7 +756,7 @@ pub const fn defers_to_the_tick(error: &RequestError) -> bool {
 /// [`ScopedAnswer::answer`] to `reply`. A transport error releases the
 /// ids without rejecting the response — the network already recorded
 /// it — while an answer that is not an answer counts as a refusal.
-pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply>(
+pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply<Ids = B::Ids>>(
     ids: Vec<B::Id>,
     route: Route,
     network: &N,
@@ -794,7 +805,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network, R: FetchReply>(
 /// Release `requested` after a request that failed with `error`. The
 /// network has already recorded the failure against its peer, so the
 /// response is not rejected again here.
-pub fn transport_failed<B: FetchBinding, R: FetchReply>(
+pub fn transport_failed<B: FetchBinding, R: FetchReply<Ids = B::Ids>>(
     requested: Vec<B::Id>,
     error: &RequestError,
     reply: &R,
@@ -859,7 +870,7 @@ pub trait SolicitedAnswer: FetchBinding {
 /// what a [`SolicitedAnswer`]'s kept items reach it as.
 pub trait HandsOver<Input>: FetchReply {
     /// Retire `fulfilled`, when given, then hand over `inputs` in order.
-    fn hand_over(&self, fulfilled: Option<FetchIds>, inputs: Vec<Input>);
+    fn hand_over(&self, fulfilled: Option<Self::Ids>, inputs: Vec<Input>);
 }
 
 /// Issue one request for `ids` and route its answer to `reply` under the
@@ -868,7 +879,7 @@ pub fn dispatch_solicited<B, N, R>(ids: Vec<B::Id>, route: Route, network: &N, r
 where
     B: SolicitedAnswer,
     N: Network,
-    R: HandsOver<B::Input>,
+    R: HandsOver<B::Input> + FetchReply<Ids = B::Ids>,
 {
     let request = B::request(&ids);
     let reply = reply.clone();
@@ -888,7 +899,7 @@ pub fn settle_solicited<B, R>(
 ) -> ResponseVerdict
 where
     B: SolicitedAnswer,
-    R: HandsOver<B::Input>,
+    R: HandsOver<B::Input> + FetchReply<Ids = B::Ids>,
 {
     let response = match result {
         Ok(response) => response,

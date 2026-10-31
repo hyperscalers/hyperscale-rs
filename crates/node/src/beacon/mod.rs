@@ -38,7 +38,9 @@ use crossbeam::channel::Sender;
 use hyperscale_beacon::action_handlers::verify_beacon_block;
 use hyperscale_beacon::coordinator::retention_floor;
 use hyperscale_beacon::{Adopted, BeaconFold, CandidateKeys, ChainRegistration, ProposalAdmission};
-use hyperscale_core::{Action, FetchIds, FetchRequest, ParticipationChange, ProtocolEvent};
+use hyperscale_core::{
+    BeaconAction, BeaconBlockCheck, BeaconFetchIds, ParticipationChange, ProtocolEvent,
+};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_storage::{BeaconStorage, ShardStorage};
@@ -109,7 +111,7 @@ where
     now: LocalTimestamp,
 
     /// Per-step scratch: placement deltas emitted via
-    /// `Action::ReconfigureParticipation` — the seat/drain triggers the runner
+    /// `BeaconAction::ReconfigureParticipation` — the seat/drain triggers the runner
     /// acts on. Cleared at step entry, drained into the step's `StepOutput`.
     pending_participation_changes: Vec<ParticipationChange>,
 
@@ -133,7 +135,7 @@ where
     actions_generated: usize,
 
     /// Beacon-block catch-up sync, scope `()`. The fold emits
-    /// `Action::StartBeaconBlockSync` when a gossiped block sits more than
+    /// `BeaconAction::StartBeaconBlockSync` when a gossiped block sits more than
     /// one epoch ahead of its tip; this FSM drives the
     /// `GetBeaconBlockRequest` fetches that close the gap.
     beacon_block: BeaconBlockSync,
@@ -441,7 +443,7 @@ where
     /// as failed instead, which retries them at once the first time and
     /// on the tick after: an await the answer was to resolve stays open
     /// for another peer's.
-    fn on_answer(&mut self, ids: FetchIds, event: ProtocolEvent) {
+    fn on_answer(&mut self, ids: BeaconFetchIds, event: ProtocolEvent) {
         match event {
             ProtocolEvent::ShardWitnessesReceived {
                 shard_id,
@@ -509,7 +511,7 @@ where
     /// against it.
     fn verify_fetched_candidate(
         &mut self,
-        ids: FetchIds,
+        ids: BeaconFetchIds,
         candidate: Verifiable<CandidateBeaconBlock>,
     ) {
         let key = VerdictKey::of(candidate.as_unverified());
@@ -659,35 +661,22 @@ where
             });
     }
 
-    /// Handle the actions the fold emitted: the effects any owner's
-    /// actions have, and its block checks on the dispatch pool.
-    fn run_fold_actions(&mut self, actions: Vec<Action>) {
+    /// Handle the actions the fold emitted.
+    fn run_fold_actions(&mut self, actions: Vec<BeaconAction>) {
         self.actions_generated += actions.len();
         for action in actions {
-            match self.process_shared_action(BeaconOwner::Fold, action) {
-                None => {}
-                Some(action @ Action::VerifyBeaconBlock { .. }) => {
-                    self.dispatch_block_check(action);
-                }
-                Some(other) => warn!(
-                    action = other.type_name(),
-                    "BeaconLoop: an action the fold does not emit — dropping"
-                ),
-            }
+            self.process_action(BeaconOwner::Fold, action);
         }
     }
 
-    /// Carry out one of the loop's own effects that the fold and the
-    /// participants alike emit — commit, topology, seat trigger, catch-up
-    /// sync, fetches, commit-proof asks — on `owner`'s behalf. Any other
-    /// action comes back for its owner's own handler.
-    pub(super) fn process_shared_action(
-        &mut self,
-        owner: BeaconOwner,
-        action: Action,
-    ) -> Option<Action> {
+    /// Carry out one action on `owner`'s behalf: the loop's own effects —
+    /// commit, topology, seat trigger, catch-up sync, fetches,
+    /// commit-proof asks — inline, the fold's block checks and a
+    /// participant's work on the dispatch pool, and a participant's
+    /// timers into the step's timer scratch.
+    pub(super) fn process_action(&mut self, owner: BeaconOwner, action: BeaconAction) {
         match action {
-            Action::CommitBeaconBlock { block, state } => {
+            BeaconAction::CommitBeaconBlock { block, state } => {
                 self.process
                     .beacon_storage
                     .commit_beacon_block(&block, &state);
@@ -696,7 +685,7 @@ where
                 // epoch's fetch.
                 self.on_sync_admitted(block.epoch());
             }
-            Action::TopologyChanged { epoch, schedule } => {
+            BeaconAction::TopologyChanged { epoch, schedule } => {
                 self.process.apply_topology(epoch, Arc::clone(&schedule));
                 self.reroute_record_asks();
                 for (shard, sender) in self.shard_senders.values() {
@@ -709,31 +698,41 @@ where
                     ));
                 }
             }
-            Action::ReconfigureParticipation(change) => {
+            BeaconAction::ReconfigureParticipation(change) => {
                 self.pending_participation_changes.push(change);
             }
-            Action::StartBeaconBlockSync { target } => {
+            BeaconAction::StartBeaconBlockSync { target } => {
                 self.start_sync(target);
             }
-            Action::Fetch(FetchRequest::Ask {
+            BeaconAction::Fetch {
                 ids,
                 shard,
                 preferred,
                 class,
-            }) => self.ask(owner, ids, shard, preferred, class),
-            Action::AbandonFetch(ids) => self.abandon(owner, ids),
-            Action::Continuation(ProtocolEvent::CommitProofNeeded {
+            } => self.ask(owner, ids, shard, preferred, class),
+            BeaconAction::AbandonFetch(ids) => self.abandon(owner, ids),
+            BeaconAction::AskCommitProof {
                 source_shard,
                 block_height,
-            }) => self.route_proof_ask((source_shard, block_height)),
-            other => return Some(other),
+            } => self.route_proof_ask((source_shard, block_height)),
+            BeaconAction::VerifyBeaconBlock(check) => self.dispatch_block_check(check),
+            BeaconAction::SetTimer { id, duration } => {
+                self.push_participant_timer(owner, |owner| TimerOp::Set {
+                    owner,
+                    id,
+                    duration,
+                });
+            }
+            BeaconAction::CancelTimer { id } => {
+                self.push_participant_timer(owner, |owner| TimerOp::Cancel { owner, id });
+            }
+            BeaconAction::Participant(work) => self.run_participant_work(owner, work),
         }
-        None
     }
 
     /// Run the fold's block check on the consensus dispatch pool; its
     /// outcome returns to the fold.
-    fn dispatch_block_check(&self, action: Action) {
+    fn dispatch_block_check(&self, check: BeaconBlockCheck) {
         let handles = Arc::clone(&self.process.dispatch_handles);
         let verifier = Arc::clone(&self.process.verifier);
         let network = self.fold.network().clone();
@@ -748,7 +747,7 @@ where
                     }));
                 };
                 verify_beacon_block(
-                    action,
+                    check,
                     verifier.as_ref(),
                     &network,
                     handles.network.as_ref(),

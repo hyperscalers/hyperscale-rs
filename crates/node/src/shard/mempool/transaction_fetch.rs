@@ -31,6 +31,8 @@ impl FetchBinding for TransactionBinding {
 
     const NAME: &'static str = "transaction";
 
+    type Ids = FetchIds;
+
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::Transactions(ids)
     }

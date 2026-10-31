@@ -11,7 +11,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{ByzantineBehaviour, CoordinatorSim, Crossing};
-use hyperscale_core::Action;
+use hyperscale_core::{BeaconAction, ParticipantAction};
 use hyperscale_hbor::Capped;
 use hyperscale_types::test_utils::test_pool;
 use hyperscale_types::{
@@ -327,13 +327,14 @@ fn adoption_path_advances_non_participating_replica() {
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+            .any(|a| matches!(a, BeaconAction::CommitBeaconBlock { .. })),
         "expected CommitBeaconBlock in {actions:?}",
     );
     assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastBeaconBlock { .. })),
+        !actions.iter().any(|a| matches!(
+            a,
+            BeaconAction::Participant(ParticipantAction::BroadcastBeaconBlock { .. })
+        )),
         "adoption path must not re-broadcast: {actions:?}",
     );
     assert_eq!(sim_b.commits[0].len(), 1);
@@ -800,7 +801,7 @@ fn consecutive_skips_advance_chain() {
 /// `PcVector` carries a non-`ZERO` element at validator 0's position
 /// because the ⌈2M/3⌉+1 quorum's input vectors agree. Replica 1's
 /// commit-assembly decode finds the proposal missing, the coordinator
-/// emits `Action::FetchBeaconProposal`, the sim routes the fetch to
+/// emits a `BeaconAction::Fetch` for it, the sim routes the fetch to
 /// a peer who has the proposal pooled, and replica 1 admits it +
 /// finishes assembly + commits the same block hash as everyone else.
 #[test]
@@ -1269,7 +1270,7 @@ fn partition_stalls_committee_side_then_skip_settles() {
     assert!(
         actions
             .iter()
-            .any(|a| matches!(a, Action::CommitBeaconBlock { .. })),
+            .any(|a| matches!(a, BeaconAction::CommitBeaconBlock { .. })),
         "the healed replica must adopt the skip block; got {actions:?}",
     );
     assert_eq!(
@@ -1470,12 +1471,12 @@ fn a_candidate_ahead_of_the_tip_is_prevoted_once_its_parent_is_adopted() {
     assert!(
         actions.iter().any(|action| matches!(
             action,
-            Action::SignAndBroadcastRatifyVote {
+            BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote {
                 epoch,
                 phase: RatifyPhase::Prevote,
                 block_hash,
                 ..
-            } if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
+            }) if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
         )),
         "the late member never prevoted the candidate it held: {actions:?}",
     );
@@ -1530,12 +1531,12 @@ fn candidates_further_ahead_give_way_to_a_nearer_one() {
     assert!(
         actions.iter().any(|action| matches!(
             action,
-            Action::SignAndBroadcastRatifyVote {
+            BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote {
                 epoch,
                 phase: RatifyPhase::Prevote,
                 block_hash,
                 ..
-            } if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
+            }) if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
         )),
         "the late member never prevoted the candidate the forged ones crowded out: {actions:?}",
     );
@@ -1585,16 +1586,16 @@ fn a_candidate_several_blocks_ahead_of_the_tip_is_prevoted_once_its_parent_is_ad
         "a candidate ahead of the tip dispatched work: {early:?}"
     );
 
-    let prevotes_candidate = |actions: &[Action]| {
+    let prevotes_candidate = |actions: &[BeaconAction]| {
         actions.iter().any(|action| {
             matches!(
                 action,
-                Action::SignAndBroadcastRatifyVote {
+                BeaconAction::Participant(ParticipantAction::SignAndBroadcastRatifyVote {
                     epoch,
                     phase: RatifyPhase::Prevote,
                     block_hash,
                     ..
-                } if *epoch == Epoch::new(3) && *block_hash == candidate.block_hash()
+                }) if *epoch == Epoch::new(3) && *block_hash == candidate.block_hash()
             )
         })
     };

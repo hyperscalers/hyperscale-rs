@@ -63,6 +63,8 @@ impl FetchBinding for LocalProvisionBinding {
 
     const NAME: &'static str = "local_provision";
 
+    type Ids = FetchIds;
+
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::LocalProvisions(ids)
     }
@@ -139,6 +141,8 @@ impl FetchBinding for FinalizationBinding {
 
     const NAME: &'static str = "finalization";
 
+    type Ids = FetchIds;
+
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::Finalizations(ids)
     }
@@ -207,6 +211,8 @@ impl FetchBinding for StateProofBinding {
     type Id = (Anchor, SubstateKey);
 
     const NAME: &'static str = "state_proof";
+
+    type Ids = FetchIds;
 
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::StateProofs(ids)
@@ -290,6 +296,8 @@ impl FetchBinding for VerdictProofBinding {
 
     const NAME: &'static str = "verdict_proof";
 
+    type Ids = FetchIds;
+
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::VerdictProofs(ids)
     }
@@ -363,6 +371,8 @@ impl FetchBinding for SettledTxsBinding {
 
     const NAME: &'static str = "settled_txs";
 
+    type Ids = FetchIds;
+
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::SettledTxs(ids)
     }
@@ -433,6 +443,8 @@ impl FetchBinding for ProvisionBinding {
     /// Cross-shard provisions are addressed by a single `(shard, height)` —
     /// each request targets exactly one scope.
     const PER_ID: bool = true;
+
+    type Ids = FetchIds;
 
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::RemoteProvisions(ids)
@@ -796,7 +808,7 @@ mod solicited_tests {
         response: <B::Request as Request>::Response,
     ) -> (ResponseVerdict, Vec<ShardScopedInput>)
     where
-        B: SolicitedAnswer<Input = ShardScopedInput>,
+        B: SolicitedAnswer<Input = ShardScopedInput, Ids = FetchIds>,
     {
         let (sender, events) = unbounded();
         let verdict = settle_solicited::<B, _>(

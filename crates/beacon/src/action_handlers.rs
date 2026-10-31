@@ -1,16 +1,17 @@
-//! Delegated-action handlers for beacon-owned [`Action`] variants.
+//! Delegated-action handlers for the beacon loop.
 //!
-//! [`handle_action`] runs off the driving thread on the Consensus
-//! dispatch pool for the beacon loop's participants; results return to
-//! the participant via `ctx.notify(ProtocolEvent::*)`. The beacon loop
-//! routes any [`ActionOwner::Beacon`](hyperscale_core::ActionOwner) action
-//! a participant emits here, and [`verify_beacon_block`] runs the fold's
-//! block checks. Mirrors `hyperscale_shard::action_handlers::handle_action`.
-//! The context is the storage-free [`BeaconActionContext`].
+//! [`handle_action`] runs a participant's [`ParticipantAction`] off the
+//! driving thread on the Consensus dispatch pool; results return to the
+//! participant via `ctx.notify(ProtocolEvent::*)`. [`verify_beacon_block`]
+//! runs the fold's block checks. Mirrors
+//! `hyperscale_shard::action_handlers::handle_action`. The context is the
+//! storage-free [`BeaconActionContext`].
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, BeaconActionContext, GateEntry, ProtocolEvent};
+use hyperscale_core::{
+    BeaconActionContext, BeaconBlockCheck, GateEntry, ParticipantAction, ProtocolEvent,
+};
 use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_types::network::gossip::beacon::{
     BeaconBlockGossip, BeaconCandidateGossip, RatifyProof, RatifyVoteGossip,
@@ -57,17 +58,16 @@ fn enter_gate<'c, N: Network>(
     entry
 }
 
-/// Dispatch a beacon-owned [`Action`]. Panics on non-beacon variants —
-/// the node's owner-keyed dispatch is the gate.
-#[allow(clippy::too_many_lines)] // single dispatch over beacon-owned Action variants
-pub fn handle_action<N>(action: Action, ctx: &BeaconActionContext<'_, N>)
+/// Run a participant's delegated work.
+#[allow(clippy::too_many_lines)] // single dispatch over ParticipantAction variants
+pub fn handle_action<N>(action: ParticipantAction, ctx: &BeaconActionContext<'_, N>)
 where
     N: Network,
 {
     let me = ctx.me;
     let network = ctx.topology_snapshot.network();
     match action {
-        Action::SignAndBroadcastPcVote1 {
+        ParticipantAction::SignAndBroadcastPcVote1 {
             epoch,
             view,
             v_in,
@@ -100,7 +100,7 @@ where
                 vote: verified,
             });
         }
-        Action::SignAndBroadcastPcVote2 {
+        ParticipantAction::SignAndBroadcastPcVote2 {
             epoch,
             view,
             qc1,
@@ -133,7 +133,7 @@ where
                 vote: Box::new(verified),
             });
         }
-        Action::SignAndBroadcastPcVote3 {
+        ParticipantAction::SignAndBroadcastPcVote3 {
             epoch,
             view,
             qc2,
@@ -166,7 +166,7 @@ where
                 vote: Box::new(verified),
             });
         }
-        Action::SignAndBroadcastEmptyView {
+        ParticipantAction::SignAndBroadcastEmptyView {
             epoch,
             view,
             reported,
@@ -201,7 +201,7 @@ where
                 msg: Box::new(verified),
             });
         }
-        Action::BroadcastSpcNewView {
+        ParticipantAction::BroadcastSpcNewView {
             epoch,
             proposal,
             recipients,
@@ -229,7 +229,7 @@ where
                 &SpcNewViewNotification::new(epoch, me, sig, Arc::new(Verifiable::from(*proposal))),
             );
         }
-        Action::BroadcastSpcNewCommit {
+        ParticipantAction::BroadcastSpcNewCommit {
             epoch,
             msg,
             recipients,
@@ -257,7 +257,7 @@ where
                 &SpcNewCommitNotification::new(epoch, me, sig, Arc::new(Verifiable::from(*msg))),
             );
         }
-        Action::BuildAndBroadcastBeaconProposal {
+        ParticipantAction::BuildAndBroadcastBeaconProposal {
             epoch,
             boundary_qcs,
             equivocations,
@@ -302,10 +302,10 @@ where
                 proposal: verified,
             });
         }
-        Action::BroadcastBeaconBlock { block } => {
+        ParticipantAction::BroadcastBeaconBlock { block } => {
             ctx.network.broadcast_global(&BeaconBlockGossip::new(block));
         }
-        Action::SignAndBroadcastRatifyVote {
+        ParticipantAction::SignAndBroadcastRatifyVote {
             anchor,
             epoch,
             round,
@@ -387,12 +387,12 @@ where
             ));
             ctx.notify_protocol(ProtocolEvent::VerifiedRatifyVoteReceived { vote });
         }
-        Action::BroadcastBeaconCandidate { candidate } => {
+        ParticipantAction::BroadcastBeaconCandidate { candidate } => {
             (ctx.cache_beacon_candidate)(candidate.clone());
             ctx.network
                 .broadcast_global(&BeaconCandidateGossip::new(candidate));
         }
-        Action::VerifyRatifyVote { vote, signers } => {
+        ParticipantAction::VerifyRatifyVote { vote, signers } => {
             let anchor = vote.anchor_hash();
             let epoch = vote.epoch();
             let round = vote.round();
@@ -425,7 +425,7 @@ where
                 result,
             });
         }
-        Action::VerifyBeaconCandidate {
+        ParticipantAction::VerifyBeaconCandidate {
             candidate,
             committee,
             equivocation_signers,
@@ -446,7 +446,7 @@ where
             ctx.network.settle(key, checked(result.is_ok()));
             ctx.notify_protocol(ProtocolEvent::BeaconCandidateVerified { block_hash, result });
         }
-        Action::VerifyPcVote1 {
+        ParticipantAction::VerifyPcVote1 {
             epoch,
             view,
             vote,
@@ -467,7 +467,7 @@ where
                 result: result.map_err(|(_, e)| e),
             });
         }
-        Action::VerifyPcVote2 {
+        ParticipantAction::VerifyPcVote2 {
             epoch,
             view,
             vote,
@@ -488,7 +488,7 @@ where
                 result: result.map_err(|(_, e)| e),
             });
         }
-        Action::VerifyPcVote3 {
+        ParticipantAction::VerifyPcVote3 {
             epoch,
             view,
             vote,
@@ -509,7 +509,7 @@ where
                 result: result.map_err(|(_, e)| e),
             });
         }
-        Action::VerifySpcNewView {
+        ParticipantAction::VerifySpcNewView {
             epoch,
             from,
             proposal,
@@ -529,7 +529,7 @@ where
                 result: result.map_err(|(_, e)| e),
             });
         }
-        Action::VerifySpcNewCommit {
+        ParticipantAction::VerifySpcNewCommit {
             epoch,
             from,
             msg,
@@ -549,7 +549,7 @@ where
                 result: result.map_err(|(_, e)| e),
             });
         }
-        Action::VerifySpcEmptyView {
+        ParticipantAction::VerifySpcEmptyView {
             epoch,
             msg,
             committee,
@@ -569,37 +569,27 @@ where
                 result: result.map_err(|(_, e)| e),
             });
         }
-        _ => unreachable!(
-            "hyperscale_beacon::handle_action called with an action no participant emits"
-        ),
     }
 }
 
-/// Run the fold's [`Action::VerifyBeaconBlock`].
+/// Run the fold's [`hyperscale_core::BeaconAction::VerifyBeaconBlock`].
 ///
 /// Checks the block's certificate, settles the gossip verdict deferred on
 /// it, and hands the outcome to `notify`. The fold signs nothing, so the
 /// check needs no participant's context.
-///
-/// # Panics
-///
-/// Panics on any other action.
 pub fn verify_beacon_block<N: Network>(
-    action: Action,
+    check: BeaconBlockCheck,
     verifier: &dyn Verifier,
     network: &NetworkDefinition,
     transport: &N,
     notify: &dyn Fn(ProtocolEvent),
 ) {
-    let Action::VerifyBeaconBlock {
+    let BeaconBlockCheck {
         block,
         committee,
         active_pool,
         equivocation_signers,
-    } = action
-    else {
-        unreachable!("verify_beacon_block called with another action");
-    };
+    } = check;
     // A gossip handler deferred its verdict on the block to this check;
     // the fold dispatches it only for a block it can place, so a failure
     // is the block's own.

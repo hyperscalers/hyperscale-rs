@@ -21,7 +21,9 @@ use std::time::Duration;
 use crossbeam::channel::Sender;
 use hyperscale_beacon::ChainRegistration;
 use hyperscale_beacon::coordinator::LocalChainAnchors;
-use hyperscale_core::{CommitSource, FetchIds, ParticipationChange, ProtocolEvent, TimerId};
+use hyperscale_core::{
+    BeaconFetchIds, CommitSource, FetchIds, ParticipationChange, ProtocolEvent, TimerId,
+};
 use hyperscale_network::{PeerId, RequestError};
 use hyperscale_types::network::gossip::MAX_GOSSIP_TX_BATCH;
 use hyperscale_types::network::notification::BlockHeaderNotification;
@@ -659,19 +661,19 @@ pub enum BeaconScopedInput {
 
     /// A fetch attempt for these ids failed or was refused; retry at
     /// once the first time since the tick, and on the tick after that.
-    FetchFailed(FetchIds),
+    FetchFailed(BeaconFetchIds),
     /// A fetch request for these ids never reached a peer; retry on the
     /// tick.
-    FetchUnroutable(FetchIds),
+    FetchUnroutable(BeaconFetchIds),
     /// A fetch for these ids was answered whole at its response boundary;
     /// they retire.
-    FetchFulfilled(FetchIds),
+    FetchFulfilled(BeaconFetchIds),
     /// A fetch for `ids` was answered with `event`. The ids retire once
     /// the loop takes what the answer carries, and are released as
     /// failed when its fold refuses a witness run.
     Answered {
         /// The ids the answered request asked for.
-        ids: FetchIds,
+        ids: BeaconFetchIds,
         /// What the answer carries. Boxed for the reason
         /// [`Self::Protocol`] is.
         event: Box<ProtocolEvent>,
@@ -1033,7 +1035,7 @@ pub struct StepOutput {
     pub actions_generated: usize,
     /// Timer operations (set/cancel) to be processed by the runner.
     pub timer_ops: Vec<TimerOp>,
-    /// Placement deltas emitted via [`Action::ReconfigureParticipation`](hyperscale_core::Action::ReconfigureParticipation)
+    /// Placement deltas emitted via [`BeaconAction::ReconfigureParticipation`](hyperscale_core::BeaconAction::ReconfigureParticipation)
     /// during this step. The runner reconfigures physical shard
     /// membership from these — they are requests to the process layer,
     /// not state-machine state.

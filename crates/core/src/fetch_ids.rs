@@ -2,11 +2,12 @@
 //!
 //! Every payload the unified fetch protocols address has its own id type,
 //! and three messages carry a batch of them: a coordinator cancelling ids
-//! it no longer wants ([`crate::Action::AbandonFetch`]), and the node's
-//! own response boundary releasing ids a peer failed to answer or
-//! answered in full. All three name the same `(binding, Vec<Id>)` pair,
-//! so one enum spells it and one dispatcher routes it to the binding's
-//! state machine.
+//! it no longer wants ([`crate::Action::AbandonFetch`],
+//! [`crate::BeaconAction::AbandonFetch`]), and the node's own response
+//! boundary releasing ids a peer failed to answer or answered in full.
+//! All three name the same `(binding, Vec<Id>)` pair, so one enum per
+//! loop spells it and that loop's one dispatcher routes it to the
+//! binding's state machine.
 
 use hyperscale_types::{
     Address, Anchor, BeaconBlockHash, BlockHash, BlockHeight, Epoch, FinalizationHash, Hash,
@@ -14,14 +15,12 @@ use hyperscale_types::{
     VerdictCells,
 };
 
-/// A batch of ids under the binding that fetches them, keyed exactly as
-/// that binding's state machine is.
+/// A batch of ids under the shard-loop binding that fetches them, keyed
+/// exactly as that binding's state machine is.
 ///
 /// One variant per binding, which is not quite one per
-/// [`crate::FetchRequest`]: a payload the node fetches without a request
-/// variant of its own — a package artifact, an instance record — still
-/// has ids to release, and so still has a variant here, under
-/// [`BeaconFetchIds`] when the host's beacon loop is what fetches it.
+/// [`crate::FetchRequest`]. The fetches the host's beacon loop drives
+/// are [`BeaconFetchIds`]: no shard loop can be handed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchIds {
     /// Transactions by hash.
@@ -47,13 +46,11 @@ pub enum FetchIds {
     /// Block proposals a committee member's vote named and this replica
     /// never received, by block hash.
     Proposals(Vec<BlockHash>),
-    /// The fetches the host's beacon loop drives. No replica emits them.
-    Beacon(BeaconFetchIds),
 }
 
 /// The ids of the fetches the host's beacon loop drives: for its fold and
 /// its participants, and the records and code every loop on the host
-/// shares.
+/// shares. The beacon loop's counterpart of [`FetchIds`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeaconFetchIds {
     /// Missing beacon proposals as `(epoch, validator)`.

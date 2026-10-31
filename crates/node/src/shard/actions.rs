@@ -80,36 +80,6 @@ where
                 self.dispatch_delegated_action(action);
             }
 
-            // ─── The beacon runs on the host's beacon loop ─────────────────
-            Action::SignAndBroadcastPcVote1 { .. }
-            | Action::SignAndBroadcastPcVote2 { .. }
-            | Action::SignAndBroadcastPcVote3 { .. }
-            | Action::SignAndBroadcastEmptyView { .. }
-            | Action::BroadcastSpcNewView { .. }
-            | Action::BroadcastSpcNewCommit { .. }
-            | Action::BuildAndBroadcastBeaconProposal { .. }
-            | Action::BroadcastBeaconBlock { .. }
-            | Action::SignAndBroadcastRatifyVote { .. }
-            | Action::BroadcastBeaconCandidate { .. }
-            | Action::VerifyBeaconBlock { .. }
-            | Action::VerifyRatifyVote { .. }
-            | Action::VerifyBeaconCandidate { .. }
-            | Action::VerifyPcVote1 { .. }
-            | Action::VerifyPcVote2 { .. }
-            | Action::VerifyPcVote3 { .. }
-            | Action::VerifySpcNewView { .. }
-            | Action::VerifySpcNewCommit { .. }
-            | Action::VerifySpcEmptyView { .. }
-            | Action::StartBeaconBlockSync { .. }
-            | Action::CommitBeaconBlock { .. }
-            | Action::TopologyChanged { .. }
-            | Action::ReconfigureParticipation(_) => {
-                warn!(
-                    action = action.type_name(),
-                    "a beacon action reached a shard loop — dropping"
-                );
-            }
-
             // ─── Tick chain maintenance ────────────────────────────────────
             // Applied synchronously on the shard thread so a dispatch
             // action later in the same batch reads the resolved chain.
@@ -704,8 +674,8 @@ where
                 ActionOwner::Shard => handle_shard_action(action, &ctx),
                 ActionOwner::Execution => handle_execution_action(action, &ctx),
                 ActionOwner::Provisions => handle_provisions_action(action, &ctx),
-                ActionOwner::Beacon | ActionOwner::Local => unreachable!(
-                    "dispatch_delegated_action called with a beacon or Local-owned action — \
+                ActionOwner::Local => unreachable!(
+                    "dispatch_delegated_action called with a Local-owned action — \
                      process_action's outer match should have routed it"
                 ),
             }

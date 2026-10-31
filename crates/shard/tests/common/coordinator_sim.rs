@@ -2357,10 +2357,9 @@ impl ShardCoordinatorSim {
             Action::BroadcastCertifiedBlockHeader { .. }
             | Action::SetTimer { .. }
             | Action::CancelTimer { .. }
-            | Action::TopologyChanged { .. }
             | Action::AbandonFetch(_)
             | Action::ReopenSyncHeight { .. } => {
-                // Timers, topology changes, fetch abandons, sync reopens
+                // Timers, fetch abandons, sync reopens
                 // (tests feed synced blocks by hand), and cross-shard
                 // light-client gossip have no in-sim delivery target.
             }

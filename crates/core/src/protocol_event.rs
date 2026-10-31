@@ -893,10 +893,10 @@ pub enum ProtocolEvent {
     /// Round-1 PC vote received whose verification predicate already
     /// holds — produced only by the local sign-and-emit handler (or by
     /// a colocated peer's local-dispatch fast path). The recipient
-    /// skips [`Action::VerifyPcVote1`] and feeds the typed handle
+    /// skips [`ParticipantAction::VerifyPcVote1`] and feeds the typed handle
     /// straight into the SPC sub-machine.
     ///
-    /// [`Action::VerifyPcVote1`]: crate::Action::VerifyPcVote1
+    /// [`ParticipantAction::VerifyPcVote1`]: crate::ParticipantAction::VerifyPcVote1
     VerifiedPcVote1Received {
         /// Epoch whose SPC instance the vote was signed for.
         epoch: Epoch,
@@ -908,9 +908,9 @@ pub enum ProtocolEvent {
     },
 
     /// Round-2 PC vote received whose verification predicate already
-    /// holds. Skips [`Action::VerifyPcVote2`].
+    /// holds. Skips [`ParticipantAction::VerifyPcVote2`].
     ///
-    /// [`Action::VerifyPcVote2`]: crate::Action::VerifyPcVote2
+    /// [`ParticipantAction::VerifyPcVote2`]: crate::ParticipantAction::VerifyPcVote2
     VerifiedPcVote2Received {
         /// Epoch whose SPC instance the vote was signed for.
         epoch: Epoch,
@@ -922,9 +922,9 @@ pub enum ProtocolEvent {
     },
 
     /// Round-3 PC vote received whose verification predicate already
-    /// holds. Skips [`Action::VerifyPcVote3`].
+    /// holds. Skips [`ParticipantAction::VerifyPcVote3`].
     ///
-    /// [`Action::VerifyPcVote3`]: crate::Action::VerifyPcVote3
+    /// [`ParticipantAction::VerifyPcVote3`]: crate::ParticipantAction::VerifyPcVote3
     VerifiedPcVote3Received {
         /// Epoch whose SPC instance the vote was signed for.
         epoch: Epoch,
@@ -973,10 +973,10 @@ pub enum ProtocolEvent {
 
     /// SPC `empty-view` attestation whose verification predicate
     /// already holds — produced only by the local sign-and-emit
-    /// handler. The coordinator skips [`Action::VerifySpcEmptyView`]
+    /// handler. The coordinator skips [`ParticipantAction::VerifySpcEmptyView`]
     /// and feeds the typed handle straight into the SPC sub-machine.
     ///
-    /// [`Action::VerifySpcEmptyView`]: crate::Action::VerifySpcEmptyView
+    /// [`ParticipantAction::VerifySpcEmptyView`]: crate::ParticipantAction::VerifySpcEmptyView
     VerifiedSpcEmptyViewReceived {
         /// Epoch whose SPC instance the message was signed for.
         epoch: Epoch,
@@ -996,7 +996,7 @@ pub enum ProtocolEvent {
     /// A `BeaconProposal` arrived, its sender authenticated and its VRF
     /// reveal checked: the wire handler checks a peer's reveal under the
     /// sender's key before pushing the event, and the local
-    /// `Action::BuildAndBroadcastBeaconProposal` loopback and a colocated
+    /// `ParticipantAction::BuildAndBroadcastBeaconProposal` loopback and a colocated
     /// sender hand over what their signing checked.
     BeaconProposalReceived {
         /// Authenticated sender id.
@@ -1019,13 +1019,13 @@ pub enum ProtocolEvent {
     },
 
     /// A locally-signed [`RatifyVote`] arrived via the
-    /// [`Action::SignAndBroadcastRatifyVote`] self-loopback path. The
+    /// [`ParticipantAction::SignAndBroadcastRatifyVote`] self-loopback path. The
     /// signing validator produced the signature, so the vote is verified
     /// by construction — coordinator skips
-    /// [`Action::VerifyRatifyVote`] and pools it directly.
+    /// [`ParticipantAction::VerifyRatifyVote`] and pools it directly.
     ///
-    /// [`Action::SignAndBroadcastRatifyVote`]: crate::Action::SignAndBroadcastRatifyVote
-    /// [`Action::VerifyRatifyVote`]: crate::Action::VerifyRatifyVote
+    /// [`ParticipantAction::SignAndBroadcastRatifyVote`]: crate::ParticipantAction::SignAndBroadcastRatifyVote
+    /// [`ParticipantAction::VerifyRatifyVote`]: crate::ParticipantAction::VerifyRatifyVote
     VerifiedRatifyVoteReceived {
         /// Verified vote, sealed via
         /// [`Verified::<RatifyVote>::sign_local`].
@@ -1041,12 +1041,12 @@ pub enum ProtocolEvent {
         candidate: Verifiable<CandidateBeaconBlock>,
     },
 
-    /// Result of an [`Action::VerifyBeaconCandidate`] dispatch. The
+    /// Result of an [`ParticipantAction::VerifyBeaconCandidate`] dispatch. The
     /// verified handle rides back on success so the coordinator can
     /// route it into the ratification tracker without stashing during
     /// the verify round-trip.
     ///
-    /// [`Action::VerifyBeaconCandidate`]: crate::Action::VerifyBeaconCandidate
+    /// [`ParticipantAction::VerifyBeaconCandidate`]: crate::ParticipantAction::VerifyBeaconCandidate
     BeaconCandidateVerified {
         /// The checked candidate's block hash, on both arms, so a failed
         /// check frees the slot it held. The hash leaves the SPC cert
@@ -1089,7 +1089,7 @@ pub enum ProtocolEvent {
         proposal: Verified<BeaconProposal>,
     },
 
-    /// Result of an [`Action::VerifyBeaconBlock`](crate::Action::VerifyBeaconBlock) dispatch. The
+    /// Result of an [`BeaconAction::VerifyBeaconBlock`](crate::BeaconAction::VerifyBeaconBlock) dispatch. The
     /// verified handle rides back on success so the coordinator can
     /// route it into adoption without stashing during the verify
     /// round-trip.
@@ -1098,9 +1098,9 @@ pub enum ProtocolEvent {
         result: Result<Verified<CertifiedBeaconBlock>, CertifiedBeaconBlockVerifyError>,
     },
 
-    /// Result of an [`Action::VerifyRatifyVote`] dispatch.
+    /// Result of an [`ParticipantAction::VerifyRatifyVote`] dispatch.
     ///
-    /// [`Action::VerifyRatifyVote`]: crate::Action::VerifyRatifyVote
+    /// [`ParticipantAction::VerifyRatifyVote`]: crate::ParticipantAction::VerifyRatifyVote
     RatifyVoteVerified {
         /// Vote anchor, extracted from the unverified payload at
         /// dispatch time. Carried with the epoch, round, phase, and
@@ -1120,7 +1120,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<RatifyVote>, RatifyVoteVerifyError>,
     },
 
-    /// Result of an [`Action::VerifyPcVote1`](crate::Action::VerifyPcVote1) dispatch. The verified
+    /// Result of an [`ParticipantAction::VerifyPcVote1`](crate::ParticipantAction::VerifyPcVote1) dispatch. The verified
     /// handle rides back so the coordinator can route it into the right
     /// view's inner PC sub-machine without stashing.
     PcVote1Verified {
@@ -1137,7 +1137,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<PcVote1>, PcVote1VerifyError>,
     },
 
-    /// Result of an [`Action::VerifyPcVote2`](crate::Action::VerifyPcVote2) dispatch.
+    /// Result of an [`ParticipantAction::VerifyPcVote2`](crate::ParticipantAction::VerifyPcVote2) dispatch.
     PcVote2Verified {
         /// Epoch the inner PC instance belongs to.
         epoch: Epoch,
@@ -1149,7 +1149,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<PcVote2>, PcVote2VerifyError>,
     },
 
-    /// Result of an [`Action::VerifyPcVote3`](crate::Action::VerifyPcVote3) dispatch.
+    /// Result of an [`ParticipantAction::VerifyPcVote3`](crate::ParticipantAction::VerifyPcVote3) dispatch.
     PcVote3Verified {
         /// Epoch the inner PC instance belongs to.
         epoch: Epoch,
@@ -1161,7 +1161,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<PcVote3>, PcVote3VerifyError>,
     },
 
-    /// Result of an [`Action::VerifySpcNewView`](crate::Action::VerifySpcNewView) dispatch.
+    /// Result of an [`ParticipantAction::VerifySpcNewView`](crate::ParticipantAction::VerifySpcNewView) dispatch.
     SpcNewViewVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
@@ -1177,7 +1177,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<SpcProposalObject>, SpcProposalObjectVerifyError>,
     },
 
-    /// Result of an [`Action::VerifySpcNewCommit`](crate::Action::VerifySpcNewCommit) dispatch.
+    /// Result of an [`ParticipantAction::VerifySpcNewCommit`](crate::ParticipantAction::VerifySpcNewCommit) dispatch.
     SpcNewCommitVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,
@@ -1192,7 +1192,7 @@ pub enum ProtocolEvent {
         result: Result<Verified<SpcNewCommitMsg>, SpcNewCommitMsgVerifyError>,
     },
 
-    /// Result of an [`Action::VerifySpcEmptyView`](crate::Action::VerifySpcEmptyView) dispatch.
+    /// Result of an [`ParticipantAction::VerifySpcEmptyView`](crate::ParticipantAction::VerifySpcEmptyView) dispatch.
     SpcEmptyViewVerified {
         /// Epoch the SPC instance belongs to.
         epoch: Epoch,

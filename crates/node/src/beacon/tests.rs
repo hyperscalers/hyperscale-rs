@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crossbeam::channel::{Receiver, unbounded};
 use hyperscale_beacon::coordinator::LocalChainAnchors;
-use hyperscale_core::{BeaconFetchIds, TimerId};
+use hyperscale_core::{BeaconAction, BeaconFetchIds, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
 use hyperscale_hbor::{Bytes, Capped, to_vec as hbor_to_vec};
@@ -57,8 +57,8 @@ fn participant(n: u64) -> BeaconOwner {
     BeaconOwner::Participant(Attachment::new(ValidatorId::new(n), n))
 }
 
-fn proposals(ids: &[(Epoch, ValidatorId)]) -> FetchIds {
-    FetchIds::Beacon(BeaconFetchIds::Proposals(ids.to_vec()))
+fn proposals(ids: &[(Epoch, ValidatorId)]) -> BeaconFetchIds {
+    BeaconFetchIds::Proposals(ids.to_vec())
 }
 
 /// `owner` asks for `ids` through the loop, as its participant would.
@@ -171,7 +171,7 @@ fn a_refused_witness_run_retries_once_and_then_on_the_tick() {
         LeafIndex::new(0),
         LeafIndex::new(1),
     );
-    let ids = || FetchIds::Beacon(BeaconFetchIds::Witnesses(vec![run]));
+    let ids = || BeaconFetchIds::Witnesses(vec![run]);
     host.beacon.ask(BeaconOwner::Fold, ids(), SHARD, None, None);
     let in_flight = |beacon: &Loop| beacon.fetches.shard_witness.in_flight_count();
     assert_eq!(in_flight(&host.beacon), 1);
@@ -241,12 +241,7 @@ fn a_fetched_candidate_failing_verification_is_asked_again() {
     let fix = Fixture::new();
     let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
     let forged = forged_candidate(&fix);
-    let ids = || {
-        FetchIds::Beacon(BeaconFetchIds::Candidates(vec![(
-            Epoch::new(1),
-            forged.block_hash(),
-        )]))
-    };
+    let ids = || BeaconFetchIds::Candidates(vec![(Epoch::new(1), forged.block_hash())]);
     host.beacon
         .ask(participant(2), ids(), ShardId::ROOT, None, None);
     let _ = host.step(HostEvent::Beacon(BeaconScopedInput::Answered {
@@ -282,10 +277,7 @@ fn a_peer_answering_a_forged_candidate_is_distrusted() {
 
     host.beacon.ask(
         participant(2),
-        FetchIds::Beacon(BeaconFetchIds::Candidates(vec![(
-            Epoch::new(1),
-            forged.block_hash(),
-        )])),
+        BeaconFetchIds::Candidates(vec![(Epoch::new(1), forged.block_hash())]),
         SHARD,
         None,
         None,
@@ -305,16 +297,15 @@ fn a_participants_record_fetch_is_dropped() {
     let mut host = fix.host(BlockHeight::GENESIS);
     let _ = host.network().drain_pending_requests();
     let instance = Address::new([3; 31], AddressClass::Component);
-    let unhandled = host.beacon.process_shared_action(
+    host.beacon.process_action(
         participant(2),
-        Action::Fetch(FetchRequest::Ask {
-            ids: FetchIds::Beacon(BeaconFetchIds::InstanceRecords(vec![instance])),
+        BeaconAction::Fetch {
+            ids: BeaconFetchIds::InstanceRecords(vec![instance]),
             shard: SHARD,
             preferred: None,
             class: None,
-        }),
+        },
     );
-    assert!(unhandled.is_none());
     assert!(host.beacon.interest.records.is_empty());
     assert_eq!(host.beacon.fetches.instance_record.pending_count(), 0);
     assert!(host.network().drain_pending_requests().is_empty());
@@ -1068,16 +1059,15 @@ fn a_proposal_ask_goes_to_its_authors_shard() {
 
     let owner = BeaconOwner::Participant(attachment(&host, 2, &fix));
     let mut routed = |author: ValidatorId| {
-        let unhandled = host.beacon.process_shared_action(
+        host.beacon.process_action(
             owner,
-            Action::Fetch(FetchRequest::Ask {
+            BeaconAction::Fetch {
                 ids: proposals(&[(Epoch::new(1), author)]),
                 shard: ShardId::ROOT,
                 preferred: Some(author),
                 class: None,
-            }),
+            },
         );
-        assert!(unhandled.is_none());
         let requests = host.network().drain_pending_requests();
         assert_eq!(requests.len(), 1);
         requests[0].shard
@@ -1502,14 +1492,13 @@ fn asks(receiver: &Receiver<HostEvent>) -> Vec<(ShardId, BlockHeight)> {
 }
 
 fn ask_proof(host: &mut Host, source: ShardId, height: BlockHeight) {
-    let unhandled = host.beacon.process_shared_action(
+    host.beacon.process_action(
         participant(2),
-        Action::Continuation(ProtocolEvent::CommitProofNeeded {
+        BeaconAction::AskCommitProof {
             source_shard: source,
             block_height: height,
-        }),
+        },
     );
-    assert!(unhandled.is_none());
 }
 
 /// A participant's ask for a hosted shard's commit proof goes to a
@@ -2100,9 +2089,9 @@ fn an_adoption_on_the_beacon_loop_releases_a_parked_submission() {
     let (folded, held) = host.process.folded_schedule();
     let (_, newest) = held.retained_epochs().expect("the host holds a schedule");
     let epoch = folded.next();
-    let unhandled = host.beacon.process_shared_action(
+    host.beacon.process_action(
         BeaconOwner::Fold,
-        Action::TopologyChanged {
+        BeaconAction::TopologyChanged {
             epoch,
             schedule: Arc::new(TopologySchedule::new(
                 fix.genesis_state().chain_config.epoch_windows(),
@@ -2111,7 +2100,6 @@ fn an_adoption_on_the_beacon_loop_releases_a_parked_submission() {
             )),
         },
     );
-    assert!(unhandled.is_none());
     assert_eq!(
         routed(&events),
         Some(SHARD),

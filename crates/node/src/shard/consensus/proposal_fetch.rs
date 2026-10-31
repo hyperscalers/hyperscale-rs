@@ -95,6 +95,8 @@ impl FetchBinding for ProposalBinding {
 
     const PER_ID: bool = true;
 
+    type Ids = FetchIds;
+
     fn ids(ids: Vec<Self::Id>) -> FetchIds {
         FetchIds::Proposals(ids)
     }

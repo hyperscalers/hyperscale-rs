@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_core::{BeaconFetchIds, FetchIds, ProtocolEvent};
+use hyperscale_core::{BeaconFetchIds, ProtocolEvent};
 use hyperscale_metrics::record_fetch_response_refused;
 use hyperscale_network::{Network, RequestError, ResponseVerdict, VerdictKey};
 use hyperscale_types::network::request::beacon::{
@@ -269,7 +269,9 @@ impl BeaconReply {
 }
 
 impl FetchReply for BeaconReply {
-    fn failed(&self, ids: FetchIds, error: &RequestError) {
+    type Ids = BeaconFetchIds;
+
+    fn failed(&self, ids: BeaconFetchIds, error: &RequestError) {
         self.push(if defers_to_the_tick(error) {
             BeaconScopedInput::FetchUnroutable(ids)
         } else {
@@ -277,11 +279,11 @@ impl FetchReply for BeaconReply {
         });
     }
 
-    fn refused(&self, ids: FetchIds) {
+    fn refused(&self, ids: BeaconFetchIds) {
         self.push(BeaconScopedInput::FetchFailed(ids));
     }
 
-    fn answered(&self, ids: FetchIds, event: ProtocolEvent) {
+    fn answered(&self, ids: BeaconFetchIds, event: ProtocolEvent) {
         self.push(BeaconScopedInput::Answered {
             ids,
             event: Box::new(event),
@@ -290,7 +292,7 @@ impl FetchReply for BeaconReply {
 }
 
 impl HandsOver<BeaconScopedInput> for BeaconReply {
-    fn hand_over(&self, fulfilled: Option<FetchIds>, inputs: Vec<BeaconScopedInput>) {
+    fn hand_over(&self, fulfilled: Option<BeaconFetchIds>, inputs: Vec<BeaconScopedInput>) {
         if let Some(ids) = fulfilled {
             self.push(BeaconScopedInput::FetchFulfilled(ids));
         }
@@ -308,8 +310,10 @@ impl FetchBinding for ShardWitnessBinding {
 
     const NAME: &'static str = "shard_witness";
 
-    fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::Beacon(BeaconFetchIds::Witnesses(ids))
+    type Ids = BeaconFetchIds;
+
+    fn ids(ids: Vec<Self::Id>) -> BeaconFetchIds {
+        BeaconFetchIds::Witnesses(ids)
     }
 }
 
@@ -375,8 +379,10 @@ impl FetchBinding for BeaconProposalBinding {
 
     const NAME: &'static str = "beacon_proposal";
 
-    fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::Beacon(BeaconFetchIds::Proposals(ids))
+    type Ids = BeaconFetchIds;
+
+    fn ids(ids: Vec<Self::Id>) -> BeaconFetchIds {
+        BeaconFetchIds::Proposals(ids)
     }
 }
 
@@ -416,8 +422,10 @@ impl FetchBinding for BeaconCandidateBinding {
 
     const NAME: &'static str = "beacon_candidate";
 
-    fn ids(ids: Vec<Self::Id>) -> FetchIds {
-        FetchIds::Beacon(BeaconFetchIds::Candidates(ids))
+    type Ids = BeaconFetchIds;
+
+    fn ids(ids: Vec<Self::Id>) -> BeaconFetchIds {
+        BeaconFetchIds::Candidates(ids)
     }
 }
 

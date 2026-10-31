@@ -10,21 +10,18 @@ use hyperscale_engine::legs::Member;
 use hyperscale_engine::tick_select::ManifestInputs;
 use hyperscale_storage::{BlockSweep, CommittedHere, FeeTerms, MemberInputs, TickResolution};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
-    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBlock,
+    AbandonmentRecord, Anchor, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EpochWindows, EscrowedValue,
     ExecutionCertificate, ExecutionVote, Finalization, FrontierInputs, GlobalReceiptRoot, Hash,
-    HeaderFetchCount, HeaderSource, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
-    PcVoteEquivocation, PriceTable, ProposerTimestamp, ProvisionTxRootsMap, Provisions,
-    QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadFence, ReadySignal, ReshapeKind,
-    ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, SettledTxsRoot,
-    Settling, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedTransactions,
-    SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
-    SpcView, SplitChildRoots, StandingAnswers, StateClaim, StateRoot, SubstateClaim, SubstateEntry,
-    SubstateKey, SweepFrontier, TickId, Timeout, TimeoutCertificate, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionStatus, TxHash, TxOutcome, UnsettledTx, ValidatorId,
-    Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
+    HeaderFetchCount, HeaderSource, PriceTable, ProposerTimestamp, ProvisionTxRootsMap, Provisions,
+    QuorumCertificate, ReadFence, ReadySignal, ReshapeKind, ReshapeThresholds, ReshapeTrigger,
+    ResolvedCommittee, RevealChain, Round, SettledTxsRoot, Settling, ShardForkProof, ShardId,
+    ShardLoad, SharedTransactions, SharedWitnessSources, SplitChildRoots, StandingAnswers,
+    StateClaim, StateRoot, SubstateClaim, SubstateEntry, SubstateKey, SweepFrontier, TickId,
+    Timeout, TimeoutCertificate, TopologySnapshot, Transaction, TransactionStatus, TxHash,
+    TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
+    WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -275,7 +272,7 @@ pub enum KeepDelta {
 /// detected on the lookahead committees one epoch before it takes
 /// effect.
 ///
-/// Carried by [`Action::ReconfigureParticipation`] out of the state
+/// Carried by [`crate::BeaconAction::ReconfigureParticipation`] out of the state
 /// machine to whoever owns physical shard membership — the production
 /// shard supervisor, or the simulation harness via `StepOutput`. The
 /// consumer starts bootstrapping `joins` immediately (snap-sync + tail
@@ -1324,34 +1321,6 @@ pub enum Action {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Topology
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Propagate the folded topology to the `io_loop` / network layer.
-    ///
-    /// Emitted by the state machine on every beacon commit. The io side
-    /// publishes the schedule's head as its shared topology snapshot,
-    /// keys fetch routing on the schedule's terminal-clamped committees,
-    /// and resolves a followed block's window through the schedule.
-    TopologyChanged {
-        /// Beacon epoch the schedule was folded at. The host's one fold
-        /// emits it once per adopted block, so the epochs published only
-        /// rise.
-        epoch: Epoch,
-        /// The beacon's window schedule as of this fold: the head, the
-        /// retained windows and the lookahead, one clone per epoch.
-        schedule: Arc<TopologySchedule>,
-    },
-
-    /// The lookahead committees move a local validator onto or off
-    /// a shard at the next window — surface the delta to the runner so
-    /// it can reconfigure physical participation (open storage and
-    /// bootstrap a joined shard, schedule a left shard's drain).
-    ///
-    /// Not delegated: the payload travels out of the shard thread to
-    /// the process-level owner of shard membership.
-    ReconfigureParticipation(ParticipationChange),
-
-    // ═══════════════════════════════════════════════════════════════════════
     // Storage: Read Requests (returns callback ProtocolEvent)
     // ═══════════════════════════════════════════════════════════════════════
     /// Restore committed state (height, hash, QC) from local storage.
@@ -1402,20 +1371,6 @@ pub enum Action {
     /// to is served by nobody reachable, and the scope completes at its
     /// frontier. A later `StartBlockSync` raises the target again.
     SettleBlockSync,
-
-    /// Request the runner to start (or raise the target of) beacon-chain
-    /// gap-fill sync.
-    ///
-    /// Emitted by the beacon fold when it observes a committed beacon
-    /// block more than one epoch ahead of its tip. The runner's beacon
-    /// `Sync` machine fetches the missing blocks epoch by epoch and feeds
-    /// each back as `ProtocolEvent::BeaconBlockSyncReadyToApply`.
-    StartBeaconBlockSync {
-        /// The epoch we need to sync the beacon chain up to. The sync
-        /// fetches above the lowest tip among the coordinators its driver
-        /// hosts, the requester's among them.
-        target: Epoch,
-    },
 
     /// Request the runner to start (or raise the target of) remote-header
     /// sync for `source_shard`. The runner's `RemoteHeaderSync`
@@ -1488,329 +1443,6 @@ pub enum Action {
         /// Transactions to put back in front of the network.
         txs: Vec<Transaction>,
     },
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Beacon consensus
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Sign a PC round-1 vote over `v_in` and broadcast it to the SPC
-    /// committee. Handler reconstructs the canonical signing bytes
-    /// from `(epoch, view, v_in)`, signs with the local signer,
-    /// broadcasts the wire-form vote, and feeds the signed vote back
-    /// to the state machine via `ProtocolEvent::PcVoteReceived` with
-    /// `from = local validator`.
-    SignAndBroadcastPcVote1 {
-        /// Epoch the PC instance belongs to.
-        epoch: Epoch,
-        /// SPC view this vote belongs to.
-        view: SpcView,
-        /// Local input vector being signed as `v_in`.
-        v_in: PcVector,
-        /// SPC committee members the vote ships to (excluding self).
-        recipients: Vec<ValidatorId>,
-    },
-
-    /// Sign a PC round-2 vote derived from `qc1` and broadcast it.
-    SignAndBroadcastPcVote2 {
-        /// Epoch the PC instance belongs to.
-        epoch: Epoch,
-        /// SPC view this vote belongs to.
-        view: SpcView,
-        /// Source round-1 QC; `v2.x == qc1.x` is enforced at the
-        /// signer.
-        qc1: Box<Verified<PcQc1>>,
-        /// SPC committee members the vote ships to (excluding self).
-        recipients: Vec<ValidatorId>,
-    },
-
-    /// Sign a PC round-3 vote derived from `qc2` and broadcast it.
-    SignAndBroadcastPcVote3 {
-        /// Epoch the PC instance belongs to.
-        epoch: Epoch,
-        /// SPC view this vote belongs to.
-        view: SpcView,
-        /// Source round-2 QC; `v3.x_p == qc2.x_p` is enforced at the
-        /// signer.
-        qc2: Box<Verified<PcQc2>>,
-        /// SPC committee members the vote ships to (excluding self).
-        recipients: Vec<ValidatorId>,
-    },
-
-    /// Sign an SPC empty-view attestation and broadcast it. Feeds the
-    /// signed message back to the state machine via
-    /// `ProtocolEvent::VerifiedSpcEmptyViewReceived`.
-    SignAndBroadcastEmptyView {
-        /// Epoch the SPC instance belongs to.
-        epoch: Epoch,
-        /// View this empty-view attestation skips.
-        view: SpcView,
-        /// Local max high triple reported in the attestation, carried
-        /// verified-by-construction from the FSM's
-        /// [`Verified<SpcHighTriple>`] pool.
-        reported: Box<Verified<SpcHighTriple>>,
-        /// SPC committee members the message ships to (excluding
-        /// self).
-        recipients: Vec<ValidatorId>,
-    },
-
-    /// Broadcast a `new-view` notification to the SPC committee — the
-    /// cert is already aggregated, no signing happens at the handler.
-    BroadcastSpcNewView {
-        /// Epoch the SPC instance belongs to.
-        epoch: Epoch,
-        /// Proposal object pairing the view with its backing cert,
-        /// carried verified-by-construction from the FSM.
-        proposal: Box<Verified<SpcProposalObject>>,
-        /// SPC committee members the notification ships to (excluding
-        /// self).
-        recipients: Vec<ValidatorId>,
-    },
-
-    /// Broadcast a `new-commit` notification — the embedded `proof`
-    /// is a `PcQc3` that self-authenticates the committed value.
-    BroadcastSpcNewCommit {
-        /// Epoch the SPC instance belongs to.
-        epoch: Epoch,
-        /// Committed-low message, carried verified-by-construction
-        /// from the FSM's inner-PC QC3.
-        msg: Box<Verified<SpcNewCommitMsg>>,
-        /// SPC committee members the notification ships to (excluding
-        /// self).
-        recipients: Vec<ValidatorId>,
-    },
-
-    /// Sign a VRF reveal, build a `BeaconProposal` carrying the
-    /// proposer's `boundary_qcs` and equivocation evidence, and unicast
-    /// it to the rest of the beacon committee. Handler feeds the signed
-    /// proposal back to the state machine via
-    /// `ProtocolEvent::BeaconProposalReceived` with `from = local
-    /// validator` so the same admission path peer proposals use also
-    /// admits our own.
-    BuildAndBroadcastBeaconProposal {
-        /// Epoch this proposal targets; bound into the VRF reveal's
-        /// signing context.
-        epoch: Epoch,
-        /// Per-shard canonical boundary QCs this proposer observed (only
-        /// shards whose witness chunk it can supply), or `None` for an
-        /// active shard whose crossing it hasn't yet seen.
-        boundary_qcs: BTreeMap<ShardId, Option<QuorumCertificate>>,
-        /// Equivocation evidence to embed. Raw — built locally from
-        /// verified PC votes.
-        equivocations: Vec<PcVoteEquivocation>,
-        /// Fork proofs to embed, one per forked shard. Raw — drained from
-        /// the local observation buffer of verified proofs.
-        fork_proofs: BTreeMap<ShardId, ShardForkProof>,
-        /// Shard double-vote pairs to embed. Raw — drained from the
-        /// local observation buffer of verified pairs.
-        vote_equivocations: Vec<ShardVoteEquivocation>,
-        /// Beacon-committee members the proposal ships to (excluding
-        /// self).
-        recipients: Vec<ValidatorId>,
-    },
-
-    /// Broadcast a finalized beacon block (post-SPC commit) over the
-    /// beacon gossip topic.
-    BroadcastBeaconBlock {
-        /// Certified block to broadcast.
-        block: Verified<CertifiedBeaconBlock>,
-    },
-
-    /// Verify the certs authenticating a beacon block — the pool
-    /// ratify cert on every non-genesis block, plus the SPC proposal
-    /// cert on a Normal block — **and** every `PcVoteEquivocation`
-    /// carried in the block's committed proposals. Result returns via
-    /// [`ProtocolEvent::BeaconBlockVerified`] carrying the block back;
-    /// `valid` is the AND-reduction over every cert check and every
-    /// equivocation check.
-    VerifyBeaconBlock {
-        /// Block whose certs + embedded equivocation witnesses are
-        /// being verified. A `Verifiable::Verified` wrapper
-        /// short-circuits dispatch. Carried back through the result
-        /// event so the coordinator doesn't have to stash it
-        /// separately.
-        block: Verifiable<CertifiedBeaconBlock>,
-        /// Beacon committee for the block's epoch — the SPC cert's
-        /// signer base. Positional ordering matches the cert's
-        /// bitfields.
-        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
-        /// Active validator pool at the anchor's epoch — the ratify
-        /// cert's signer base. Positional ordering matches the cert's
-        /// bitfield.
-        active_pool: Vec<(ValidatorId, ConsensusPublicKey)>,
-        /// Pubkeys for the validators referenced by embedded
-        /// `PcVoteEquivocation` evidence. Empty when the block
-        /// carries no equivocations. Lookup-shape, order doesn't
-        /// matter.
-        equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
-    },
-
-    /// Sign and broadcast a [`RatifyVote`] globally. The action handler
-    /// signs the vote using the runner-held signer (the coordinator
-    /// has no signing material), broadcasts the result over the global
-    /// beacon-ratify topic, and loops the verified vote back to the
-    /// state machine so the local ratification tracker pools its own
-    /// contribution. Quorum aggregation happens off-chain inside the
-    /// tracker.
-    SignAndBroadcastRatifyVote {
-        /// Anchor block hash the vote rides against (the latest
-        /// committed beacon block at the dispatching coordinator).
-        anchor: BeaconBlockHash,
-        /// Epoch whose block the vote ratifies. Must be
-        /// `current_epoch.next()` at the local tip — older or further
-        /// epochs are rejected at admission.
-        epoch: Epoch,
-        /// Ratification round the vote is cast in.
-        round: RatifyRound,
-        /// Prevote or precommit.
-        phase: RatifyPhase,
-        /// Hash of the block the vote names — the verified candidate's
-        /// or the canonical skip block's.
-        block_hash: BeaconBlockHash,
-        /// Peers' verified votes proving the polka behind the vote. A
-        /// prevote's is the newest polka the tracker has evidence of,
-        /// broadcast alongside it so a polka whose votes were lost still
-        /// reaches the pool. A precommit's is the prevote quorum it
-        /// locks on, persisted with its slot rather than broadcast, so
-        /// a restarted member's lock still carries its proof.
-        proof: Vec<Verified<RatifyVote>>,
-    },
-
-    /// Verify a single-signer [`RatifyVote`] signature. The result
-    /// returns to the state machine carrying the typed verified handle
-    /// on success.
-    VerifyRatifyVote {
-        /// Vote to verify. A `Verifiable::Verified` wrapper
-        /// short-circuits dispatch.
-        vote: Box<Verifiable<RatifyVote>>,
-        /// Active validator pool used to look up the signer's pubkey.
-        signers: Vec<(ValidatorId, ConsensusPublicKey)>,
-    },
-
-    /// Broadcast an SPC-certified [`CandidateBeaconBlock`] over the
-    /// beacon gossip topic for pool ratification. The candidate is
-    /// self-authenticating (its SPC cert rides along); no signing
-    /// needed.
-    BroadcastBeaconCandidate {
-        /// Candidate to broadcast.
-        candidate: Verified<CandidateBeaconBlock>,
-    },
-
-    /// Verify a [`CandidateBeaconBlock`]: its SPC proposal cert against
-    /// the epoch's committee, every `PcVoteEquivocation` carried in its
-    /// committed proposals, and the proposal-to-cert content binding.
-    /// The result returns to the state machine carrying the candidate
-    /// back.
-    VerifyBeaconCandidate {
-        /// Candidate whose cert + embedded equivocation witnesses are
-        /// being verified. A `Verifiable::Verified` wrapper
-        /// short-circuits dispatch.
-        candidate: Verifiable<CandidateBeaconBlock>,
-        /// Beacon committee for the candidate's epoch, in positional
-        /// order matching the SPC cert's signer bitfields.
-        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
-        /// Pubkeys for the validators referenced by embedded
-        /// `PcVoteEquivocation` evidence. Empty when the candidate
-        /// carries no equivocations.
-        equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
-    },
-
-    /// Verify a round-1 PC vote against its `(epoch, view)` committee.
-    /// Result returns via [`ProtocolEvent::PcVote1Verified`] carrying the
-    /// typed verified handle on success.
-    VerifyPcVote1 {
-        /// Epoch the inner PC instance belongs to.
-        epoch: Epoch,
-        /// SPC view whose inner PC produced this vote.
-        view: SpcView,
-        /// Vote to verify. A `Verifiable::Verified` wrapper
-        /// short-circuits verify dispatch.
-        vote: Verifiable<PcVote1>,
-        /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
-    },
-
-    /// Verify a round-2 PC vote against its `(epoch, view)` committee.
-    /// Result returns via [`ProtocolEvent::PcVote2Verified`].
-    VerifyPcVote2 {
-        /// Epoch the inner PC instance belongs to.
-        epoch: Epoch,
-        /// SPC view whose inner PC produced this vote.
-        view: SpcView,
-        /// Vote to verify. A `Verifiable::Verified` wrapper
-        /// short-circuits verify dispatch; the embedded round-1 QC's
-        /// marker shortcuts its sub-check.
-        vote: Box<Verifiable<PcVote2>>,
-        /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
-    },
-
-    /// Verify a round-3 PC vote against its `(epoch, view)` committee.
-    /// Result returns via [`ProtocolEvent::PcVote3Verified`].
-    VerifyPcVote3 {
-        /// Epoch the inner PC instance belongs to.
-        epoch: Epoch,
-        /// SPC view whose inner PC produced this vote.
-        view: SpcView,
-        /// Vote to verify. A `Verifiable::Verified` wrapper
-        /// short-circuits verify dispatch; the embedded round-2 QC's
-        /// marker shortcuts its sub-check.
-        vote: Box<Verifiable<PcVote3>>,
-        /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
-    },
-
-    /// Verify an SPC `NewView` proposal object. Result returns via
-    /// [`ProtocolEvent::SpcNewViewVerified`] carrying the typed
-    /// verified handle on success.
-    VerifySpcNewView {
-        /// Epoch the SPC instance belongs to.
-        epoch: Epoch,
-        /// Sender of the `NewView` (carried back through the result event).
-        from: ValidatorId,
-        /// Proposal object to verify. A `Verifiable::Verified`
-        /// wrapper short-circuits the dispatch.
-        proposal: Box<Verifiable<SpcProposalObject>>,
-        /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
-    },
-
-    /// Verify an SPC `NewCommit` message. Result returns via
-    /// [`ProtocolEvent::SpcNewCommitVerified`].
-    VerifySpcNewCommit {
-        /// Epoch the SPC instance belongs to.
-        epoch: Epoch,
-        /// Wire-level sender — carried back through the result so the
-        /// coordinator can clear its per-`(epoch, view, sender)`
-        /// pipeline slot. `NewCommit` is self-authenticating via the
-        /// embedded `proof`, so this label is dedup metadata only.
-        from: ValidatorId,
-        /// New-commit message to verify. A `Verifiable::Verified`
-        /// wrapper short-circuits dispatch; the embedded QC3 marker
-        /// shortcuts its sub-check.
-        msg: Box<Verifiable<SpcNewCommitMsg>>,
-        /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
-    },
-
-    /// Verify an empty-view attestation (sig + embedded reported QC3).
-    /// Result returns via [`ProtocolEvent::SpcEmptyViewVerified`].
-    VerifySpcEmptyView {
-        /// Epoch the SPC instance belongs to.
-        epoch: Epoch,
-        /// Attestation to verify. A `Verifiable::Verified` wrapper
-        /// short-circuits dispatch.
-        msg: Box<Verifiable<SpcEmptyViewMsg>>,
-        /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
-    },
-
-    /// Persist a committed beacon block + its resulting `BeaconState`
-    /// to `BeaconStorage`. Both writes go in one atomic batch.
-    CommitBeaconBlock {
-        /// Certified committed block.
-        block: Verified<CertifiedBeaconBlock>,
-        /// State the block advances to. Boxed to bound enum size.
-        state: Box<BeaconState>,
-    },
 }
 
 impl Action {
@@ -1868,39 +1500,16 @@ impl Action {
             | Self::AttachCertifiedUncommitted { .. }
             | Self::EmitTransactionStatus { .. }
             | Self::RecordTxEcCreated { .. }
-            | Self::TopologyChanged { .. }
-            | Self::ReconfigureParticipation(..)
             | Self::RestoreCommittedState
             | Self::StartBlockSync { .. }
             | Self::SyncBlockApplied { .. }
             | Self::ReopenSyncHeight { .. }
             | Self::SettleBlockSync
-            | Self::StartBeaconBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }
             | Self::FetchCommitProof { .. }
             | Self::Fetch(..)
             | Self::AbandonFetch(..)
-            | Self::ReofferTransactions { .. }
-            | Self::SignAndBroadcastPcVote1 { .. }
-            | Self::SignAndBroadcastPcVote2 { .. }
-            | Self::SignAndBroadcastPcVote3 { .. }
-            | Self::SignAndBroadcastEmptyView { .. }
-            | Self::BroadcastSpcNewView { .. }
-            | Self::BroadcastSpcNewCommit { .. }
-            | Self::BuildAndBroadcastBeaconProposal { .. }
-            | Self::BroadcastBeaconBlock { .. }
-            | Self::VerifyBeaconBlock { .. }
-            | Self::SignAndBroadcastRatifyVote { .. }
-            | Self::VerifyRatifyVote { .. }
-            | Self::BroadcastBeaconCandidate { .. }
-            | Self::VerifyBeaconCandidate { .. }
-            | Self::VerifyPcVote1 { .. }
-            | Self::VerifyPcVote2 { .. }
-            | Self::VerifyPcVote3 { .. }
-            | Self::VerifySpcNewView { .. }
-            | Self::VerifySpcNewCommit { .. }
-            | Self::VerifySpcEmptyView { .. }
-            | Self::CommitBeaconBlock { .. } => None,
+            | Self::ReofferTransactions { .. } => None,
         }
     }
 
@@ -1953,41 +1562,19 @@ impl Action {
             | Self::FetchAndBroadcastProvisions { .. }
             | Self::PushCrossingReadings { .. } => ActionOwner::Provisions,
 
-            Self::SignAndBroadcastPcVote1 { .. }
-            | Self::SignAndBroadcastPcVote2 { .. }
-            | Self::SignAndBroadcastPcVote3 { .. }
-            | Self::SignAndBroadcastEmptyView { .. }
-            | Self::BroadcastSpcNewView { .. }
-            | Self::BroadcastSpcNewCommit { .. }
-            | Self::BuildAndBroadcastBeaconProposal { .. }
-            | Self::BroadcastBeaconBlock { .. }
-            | Self::SignAndBroadcastRatifyVote { .. }
-            | Self::BroadcastBeaconCandidate { .. }
-            | Self::VerifyBeaconBlock { .. }
-            | Self::VerifyRatifyVote { .. }
-            | Self::VerifyBeaconCandidate { .. }
-            | Self::VerifyPcVote1 { .. }
-            | Self::VerifyPcVote2 { .. }
-            | Self::VerifyPcVote3 { .. }
-            | Self::VerifySpcNewView { .. }
-            | Self::VerifySpcNewCommit { .. }
-            | Self::VerifySpcEmptyView { .. } => ActionOwner::Beacon,
-
             // Run inline on the runner thread: timers, fetch driving,
-            // commits, sync starts, status emission, topology plumbing.
+            // commits, sync starts, status emission.
             Self::AbandonFetch(..)
             | Self::AttachCertifiedUncommitted { .. }
             | Self::CancelTimer { .. }
             | Self::ClearTickChain
             | Self::RaiseTickFloor { .. }
-            | Self::CommitBeaconBlock { .. }
             | Self::CommitBlock { .. }
             | Self::CommitBlockByQcOnly { .. }
             | Self::Continuation(..)
             | Self::EmitTransactionStatus { .. }
             | Self::Fetch(..)
             | Self::FetchCommitProof { .. }
-            | Self::ReconfigureParticipation(..)
             | Self::RecordTxEcCreated { .. }
             | Self::ReofferTransactions { .. }
             | Self::ReopenSyncHeight { .. }
@@ -1995,11 +1582,9 @@ impl Action {
             | Self::RestoreCommittedState
             | Self::SetTimer { .. }
             | Self::SettleBlockSync
-            | Self::StartBeaconBlockSync { .. }
             | Self::StartBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }
-            | Self::SyncBlockApplied { .. }
-            | Self::TopologyChanged { .. } => ActionOwner::Local,
+            | Self::SyncBlockApplied { .. } => ActionOwner::Local,
         }
     }
 }
@@ -2016,13 +1601,8 @@ pub enum ActionOwner {
     /// Provision-coordinator actions: state-provision verification,
     /// outbound provision fetch + broadcast.
     Provisions,
-    /// Beacon-coordinator actions: PC/SPC sign-and-broadcast,
-    /// beacon-block / candidate / ratify-vote gossip, shard-witness
-    /// fetch dispatch, beacon-side crypto verification.
-    Beacon,
     /// I/O-loop-internal effects (timers, commits, status emission,
-    /// fetch driving, topology plumbing). Not delegated to a worker
-    /// pool.
+    /// fetch driving). Not delegated to a worker pool.
     Local,
 }
 
@@ -2030,12 +1610,12 @@ impl ActionOwner {
     /// Which thread pool this owner's work runs on, or `None` for
     /// [`ActionOwner::Local`], which the runner handles inline.
     ///
-    /// Shard and beacon work shares the liveness-critical pool; execution
-    /// and provision work shares the throughput-bound one.
+    /// Shard work runs on the liveness-critical pool; execution and
+    /// provision work shares the throughput-bound one.
     #[must_use]
     pub const fn pool(self) -> Option<DispatchPool> {
         match self {
-            Self::Shard | Self::Beacon => Some(DispatchPool::Consensus),
+            Self::Shard => Some(DispatchPool::Consensus),
             Self::Execution | Self::Provisions => Some(DispatchPool::Throughput),
             Self::Local => None,
         }

@@ -198,9 +198,7 @@ impl ShardParticipation {
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_core::{
-        Action, BeaconFetchIds, FetchIds, FetchRequest, ProtocolEvent, StateMachine,
-    };
+    use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{RecoveredState, ReplayWindow};
     use hyperscale_types::test_utils::{
@@ -402,12 +400,7 @@ mod tests {
             assert!(
                 !matches!(
                     action,
-                    Action::EmitTransactionStatus { .. }
-                        | Action::StartRemoteHeaderSync { .. }
-                        | Action::Fetch(FetchRequest::Ask {
-                            ids: FetchIds::Beacon(BeaconFetchIds::Witnesses(_)),
-                            ..
-                        })
+                    Action::EmitTransactionStatus { .. } | Action::StartRemoteHeaderSync { .. }
                 ),
                 "a replay ran a live hook: {action:?}",
             );
