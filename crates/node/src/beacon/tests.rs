@@ -536,6 +536,64 @@ fn a_participant_on_the_spc_committee_recovers_a_lost_proposal_through_the_host_
     );
 }
 
+/// A fetched copy the participant refutes leaves its ask open: the
+/// fetch asks again rather than retiring the id, and the peer that
+/// relayed the author's signed copy is not held to account for it.
+#[test]
+fn a_refuted_fetched_proposal_is_asked_again_at_no_cost_to_its_relay() {
+    let fix = Fixture::new();
+    let (mut wire, mut host, events) = wired(&fix, SyncDispatch::new());
+    let author = fix.committee.validator_id(1);
+    add(&mut host, &fix, 2);
+
+    let forged = Verifiable::from(signed_proposal(
+        &fix,
+        1,
+        Epoch::new(1),
+        vec![forged_equivocation(&fix)],
+    ));
+    let served = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&served);
+    wire.peer
+        .register_request_handler(SHARD, move |request: GetBeaconProposalRequest| {
+            let held = request.validator == author;
+            if held {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+            GetBeaconProposalResponse::new(held.then(|| forged.clone()))
+        });
+
+    let participant = attachment(&host, 2, &fix);
+    for event in [
+        ProtocolEvent::BeaconCommitteeStartTimer,
+        ProtocolEvent::BeaconSpcInputDwellTimer,
+    ] {
+        let _ = host.step(HostEvent::Beacon(BeaconScopedInput::ParticipantTimer {
+            participant,
+            event: Box::new(event),
+        }));
+        wire.pump(&mut host, &events);
+    }
+
+    assert_eq!(
+        served.load(Ordering::Relaxed),
+        2,
+        "the refuted copy is asked for again at once, and then waits for the tick",
+    );
+    assert!(
+        host.beacon
+            .fetches
+            .beacon_proposal
+            .pending_ids()
+            .any(|&id| id == (Epoch::new(1), author)),
+        "the refuted copy does not retire the ask",
+    );
+    assert!(
+        wire.network.distrust(0, 1, wire.now) < f64::EPSILON,
+        "the relay of an author's signed copy is not distrusted",
+    );
+}
+
 /// A peer's proposal reaches the beacon loop only once the wire
 /// handler has checked its VRF reveal, and carries that check: one
 /// whose reveal fails is dropped there, never forwarded.

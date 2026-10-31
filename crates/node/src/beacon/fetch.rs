@@ -30,8 +30,8 @@ use hyperscale_types::network::response::beacon::{
     GetBeaconCandidateResponse, GetBeaconProposalResponse, GetShardWitnessesResponse,
 };
 use hyperscale_types::{
-    Address, BeaconBlockHash, BeaconProposalVerifyContext, BlockHash, BlockHeight, Epoch, Hash,
-    LeafIndex, NetworkDefinition, ShardId, ValidatorId, Verifier,
+    Address, BeaconBlockHash, BeaconProposal, BeaconProposalVerifyContext, BlockHash, BlockHeight,
+    Epoch, Hash, LeafIndex, NetworkDefinition, ShardId, ValidatorId, Verifier,
 };
 use tracing::warn;
 
@@ -149,6 +149,18 @@ pub struct ProposalKeys {
     pub(crate) network: NetworkDefinition,
 }
 
+/// The item a fetched copy of `validator`'s `epoch` proposal defers its
+/// peer's verdict on. Apart from the key its author's notification of the
+/// same bytes settles, so a refutation held against the author never
+/// lands on a peer that relayed what the author signed.
+pub(super) fn fetched_proposal_key(
+    epoch: Epoch,
+    validator: ValidatorId,
+    proposal: &BeaconProposal,
+) -> VerdictKey {
+    VerdictKey::of(&(validator, proposal.pc_element_hash(epoch)))
+}
+
 impl BeaconReply {
     pub(crate) const fn new(sender: Sender<HostEvent>, proposal_keys: ProposalKeys) -> Self {
         Self {
@@ -162,10 +174,12 @@ impl BeaconReply {
     }
 
     /// The response boundary of a proposal fetch for `id`: a proposal
-    /// whose reveal holds under its author's key retires `id` and is
-    /// handed over checked; one that fails is the peer's fault and is
-    /// asked of another. A peer that does not hold it, or an author this
-    /// host holds no key for, releases `id` at no cost to the peer.
+    /// whose reveal holds under its author's key is handed over checked,
+    /// and the participants it reaches settle both `id` and the peer's
+    /// verdict ([`fetched_proposal_key`]); one that fails is the peer's
+    /// fault and is asked of another. A peer that does not hold it, or an
+    /// author this host holds no key for, releases `id` at no cost to the
+    /// peer.
     fn settle_proposal(
         &self,
         id: (Epoch, ValidatorId),
@@ -194,6 +208,7 @@ impl BeaconReply {
         };
         match proposal.upgrade(&ctx) {
             Ok(checked) => {
+                let key = fetched_proposal_key(epoch, validator, &checked);
                 self.answered(
                     ids,
                     ProtocolEvent::BeaconProposalFetched {
@@ -202,7 +217,7 @@ impl BeaconReply {
                         proposal: checked,
                     },
                 );
-                ResponseVerdict::Accept
+                ResponseVerdict::defer(key)
             }
             Err((_, err)) => {
                 warn!(
@@ -467,7 +482,8 @@ mod tests {
 
     /// A fetched proposal whose VRF reveal fails under its author's key
     /// rejects the peer that gave it and is asked of another; one that
-    /// holds is handed over already checked.
+    /// holds is handed over already checked, its peer's verdict left to
+    /// the participants it reaches.
     #[test]
     fn a_fetched_proposal_failing_its_reveal_rejects_its_peer() {
         let fix = Fixture::new();
@@ -519,10 +535,10 @@ mod tests {
         .and_then(BeaconProposalDraft::sign)
         .expect("the author's key signs its proposal")
         .into_inner();
-        assert!(matches!(
-            reply.settle_proposal(id, answer(honest)),
-            ResponseVerdict::Accept
-        ));
+        assert_eq!(
+            reply.settle_proposal(id, answer(honest.clone())),
+            ResponseVerdict::defer(fetched_proposal_key(Epoch::new(1), author, &honest)),
+        );
         let Ok(HostEvent::Beacon(BeaconScopedInput::Answered { event, .. })) = events.try_recv()
         else {
             panic!("an honest proposal is handed over");

@@ -830,7 +830,10 @@ impl BeaconCoordinator {
         else {
             return Vec::new();
         };
-        self.drive(|p, fold| p.on_beacon_proposal_fetched(fold, epoch, validator, proposal))
+        self.drive(|p, fold| {
+            p.on_beacon_proposal_fetched(fold, epoch, validator, proposal)
+                .1
+        })
     }
 
     /// This coordinator's proposal pool — lets tests and sims run

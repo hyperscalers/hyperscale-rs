@@ -37,7 +37,9 @@ use std::sync::Arc;
 use crossbeam::channel::Sender;
 use hyperscale_beacon::action_handlers::verify_beacon_block;
 use hyperscale_beacon::coordinator::retention_floor;
-use hyperscale_beacon::{Adopted, BeaconFold, CandidateKeys, ChainRegistration, ProposalAdmission};
+use hyperscale_beacon::{
+    Adopted, BeaconFold, CandidateKeys, ChainRegistration, FetchedProposal, ProposalAdmission,
+};
 use hyperscale_core::{
     BeaconBlockCheck, BeaconFetchIds, FoldAction, ParticipationChange, ProtocolEvent,
 };
@@ -437,12 +439,13 @@ where
     }
 
     /// A fetch's answer. Its ids retire only once what it carries has
-    /// passed the check its consumers would run, and before what it
-    /// carries is taken, so the freed capacity is there for any fetch
-    /// that re-drives. An answer that fails its check releases its ids
-    /// as failed instead, which retries them at once the first time and
-    /// on the tick after: an await the answer was to resolve stays open
-    /// for another peer's.
+    /// passed the check its consumers would run: a witness run or a
+    /// candidate before what it carries is taken, so the freed capacity is
+    /// there for any fetch that re-drives, and a proposal once the
+    /// participants have judged it. An answer that fails its check
+    /// releases its ids as failed instead, which retries them at once the
+    /// first time and on the tick after: an await the answer was to
+    /// resolve stays open for another peer's.
     fn on_answer(&mut self, ids: BeaconFetchIds, event: ProtocolEvent) {
         match event {
             ProtocolEvent::ShardWitnessesReceived {
@@ -468,15 +471,7 @@ where
                 epoch,
                 validator: author,
                 proposal,
-            } => {
-                self.release(ids, Release::Admitted);
-                for validator in self.validator_list() {
-                    let proposal = proposal.clone();
-                    self.drive(validator, |p, fold| {
-                        p.on_beacon_proposal_fetched(fold, epoch, author, proposal)
-                    });
-                }
-            }
+            } => self.take_fetched_proposal(ids, epoch, author, &proposal),
             ProtocolEvent::BeaconCandidateReceived { candidate } => {
                 self.verify_fetched_candidate(ids, candidate);
             }
@@ -499,6 +494,50 @@ where
                 );
                 self.release(ids, Release::Failed);
             }
+        }
+    }
+
+    /// Hand a fetched proposal to every participant, then settle its fetch
+    /// and the verdict its answer deferred on what they made of it. A
+    /// copy that leaves some participant's ask open is released as failed,
+    /// so another peer is asked, and the interest of every participant it
+    /// did answer is dropped; its relay is not held to account, since the
+    /// author signed what it carries. Any other outcome retires the ids.
+    fn take_fetched_proposal(
+        &mut self,
+        ids: BeaconFetchIds,
+        epoch: Epoch,
+        author: ValidatorId,
+        proposal: &Verified<BeaconProposal>,
+    ) {
+        let mut answered = Vec::new();
+        let mut outcome = FetchedProposal::Answered;
+        for validator in self.validator_list() {
+            let proposal = proposal.clone();
+            let mut taken = FetchedProposal::Answered;
+            self.drive(validator, |p, fold| {
+                let (fetched, actions) =
+                    p.on_beacon_proposal_fetched(fold, epoch, author, proposal);
+                taken = fetched;
+                actions
+            });
+            outcome = outcome.max(taken);
+            if taken == FetchedProposal::Answered
+                && let Some(participant) = self.participants.get(&validator)
+            {
+                answered.push(BeaconOwner::Participant(participant.attachment));
+            }
+        }
+        let key = fetch::fetched_proposal_key(epoch, author, proposal);
+        if outcome == FetchedProposal::Unanswered {
+            for owner in answered {
+                self.abandon(owner, ids.clone());
+            }
+            self.process.network.settle(key, Verdict::Ignore);
+            self.release(ids, Release::Failed);
+        } else {
+            self.process.network.settle(key, Verdict::Accept);
+            self.release(ids, Release::Admitted);
         }
     }
 

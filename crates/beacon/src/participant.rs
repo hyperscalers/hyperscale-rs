@@ -113,6 +113,21 @@ pub enum ProposalAdmission {
     Refuted,
 }
 
+/// What a participant made of a proposal a fetch brought back. Ordered so
+/// co-hosted participants' outcomes for one copy combine by their
+/// maximum: the fetch is done only once no participant still asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FetchedProposal {
+    /// The participant does not ask for it any more: the copy answered
+    /// its ask, whatever its judgement made of the copy, or it never
+    /// asked.
+    Answered,
+    /// The copy does not answer the participant's ask, which stays open
+    /// for another peer's copy. Its author signed it, so the peer that
+    /// relayed it answers for nothing in it.
+    Unanswered,
+}
+
 /// One proposer's evaluation slot for the in-flight epoch: the copy it
 /// judged, by its PC element, what it made of that copy, and whether
 /// that copy is the one its author notified.
@@ -2071,7 +2086,8 @@ impl BeaconParticipant {
     /// A proposal the input dwell asked for is not yet vouched for by
     /// anyone, so it is judged as a notified copy would be, except that
     /// it leaves its author's own notification a judgement of its own
-    /// when the pool does not take it.
+    /// when the pool does not take it. A copy it refutes leaves the ask
+    /// open: another peer may hold the copy the author's peers pooled.
     ///
     /// Out-of-band responses drop silently.
     pub fn on_beacon_proposal_fetched(
@@ -2080,17 +2096,21 @@ impl BeaconParticipant {
         epoch: Epoch,
         validator: ValidatorId,
         proposal: Verified<BeaconProposal>,
-    ) -> Vec<BeaconAction> {
+    ) -> (FetchedProposal, Vec<BeaconAction>) {
         if !self.commit_assembly.is_awaiting(epoch, validator) {
             if epoch != self.proposal_pool.epoch() || !self.dwell_fetches.remove(&validator) {
-                return Vec::new();
+                return (FetchedProposal::Answered, Vec::new());
             }
-            return self
-                .evaluate_proposal(fold, validator, epoch, proposal, false)
-                .1;
+            let (admission, actions) =
+                self.evaluate_proposal(fold, validator, epoch, proposal, false);
+            if admission != ProposalAdmission::Refuted {
+                return (FetchedProposal::Answered, actions);
+            }
+            self.dwell_fetches.insert(validator);
+            return (FetchedProposal::Unanswered, actions);
         }
         let _ = self.proposal_pool.admit(validator, epoch, proposal);
-        match self.commit_assembly.on_proposal_resolved(
+        let actions = match self.commit_assembly.on_proposal_resolved(
             epoch,
             validator,
             &self.proposal_pool,
@@ -2100,7 +2120,8 @@ impl BeaconParticipant {
                 committed, cert, ..
             } => self.assemble_and_broadcast_candidate(fold, epoch, committed, *cert),
             AssemblyDecision::AwaitFetch { .. } | AssemblyDecision::Idle => Vec::new(),
-        }
+        };
+        (FetchedProposal::Answered, actions)
     }
 
     /// Feed this participant one beacon consensus event: a peer's message,
