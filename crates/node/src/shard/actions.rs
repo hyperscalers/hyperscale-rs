@@ -665,17 +665,12 @@ where
         let event_tx = self.event_sender().clone();
         let verifier = Arc::clone(&self.process.verifier);
         let par = self.process.dispatch.parallelism();
-        // Resolve the shard's handles here, on the shard's own thread,
-        // rather than inside the spawned closure: the dispatch pool is
-        // process-wide and outlives this `ShardLoop`, so a job spawned as
-        // the shard is torn down would otherwise find its entry already
-        // dropped from `per_shard`.
-        let shard_handles = handles
-            .per_shard
-            .load()
-            .get(&shard)
-            .expect("a loop's shard is hosted while it runs")
-            .clone();
+        // The loop's own stores, so a job spawned as the shard is torn
+        // down, or by a loop its host already let go of, still holds them.
+        let storage = Arc::clone(&self.io.storage);
+        let pending_chain = Arc::clone(&self.io.pending_chain);
+        let tick_chain = Arc::clone(&self.io.tick_chain);
+        let prepared_commits = self.io.block_commit.prepared_commits_handle();
 
         self.process.dispatch.spawn(pool, move || {
             // Action handlers emit `ProtocolEvent`s; stamp each with this
@@ -684,10 +679,8 @@ where
             // the action call.
             let notify: Arc<dyn Fn(ProtocolEvent) + Send + Sync> =
                 Arc::new(move |event| push_protocol_event(&event_tx, shard, event));
-            let commit_prepared = make_commit_prepared(
-                Arc::clone(&shard_handles.pending_chain),
-                Arc::clone(&shard_handles.prepared_commits),
-            );
+            let commit_prepared =
+                make_commit_prepared(Arc::clone(&pending_chain), prepared_commits);
             let ctx = ActionContext {
                 executor: handles.executor.as_ref(),
                 topology_snapshot: &topology_snapshot,
@@ -697,9 +690,9 @@ where
                     gate: gate.as_ref(),
                 }),
                 shard,
-                pending_chain: &shard_handles.pending_chain,
-                tick_chain: &shard_handles.tick_chain,
-                vote_registers: shard_handles.storage.as_ref(),
+                pending_chain: &pending_chain,
+                tick_chain: &tick_chain,
+                vote_registers: storage.as_ref(),
                 beacon_chain: handles.beacon_storage.as_ref(),
                 network: &handles.network,
                 verifier: verifier.as_ref(),
@@ -861,9 +854,10 @@ mod tests {
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
         Address, AddressClass, BlockHash, BlockHeight, ChainOrigin, CheckOutcome, ConsensusReceipt,
-        Finalization, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, SWEEP_BUCKET_MS,
-        SettledWrites, StateWrites, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, TickId,
-        TxHash, ValidatorId, Verifiable, VerificationKind, WeightedTimestamp, shard_prefix_path,
+        EpochWindows, Finalization, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate,
+        SWEEP_BUCKET_MS, SettledWrites, StateWrites, StoredReceipt, SubstateKey, SweepBucket,
+        SweepFrontier, TickId, TxHash, ValidatorId, Verifiable, VerificationKind,
+        WeightedTimestamp, shard_prefix_path,
     };
 
     use super::{SignerResolution, resolve_signer};
@@ -1181,6 +1175,37 @@ mod tests {
         assert_eq!(
             resolve(&Action::ClearTickChain, &[validator(1)], &committee),
             SignerResolution::Unsigned,
+        );
+    }
+
+    /// A loop its host has let go of still dispatches over its own
+    /// stores: the host's dispatch handles no longer name its shard, and
+    /// the check answers all the same.
+    #[test]
+    fn a_loop_removed_from_its_host_still_dispatches_its_checks() {
+        let (mut host, events) = Fixture::new().host_with_events(BlockHeight::GENESIS);
+        let mut removed = host.remove_shard(SHARD).expect("the fixture hosts SHARD");
+        while events.try_recv().is_ok() {}
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"a block with no records"));
+        removed.drain_actions(vec![Action::VerifyResolutions {
+            block_hash,
+            entries: Vec::new(),
+            windows: EpochWindows::new(0, 1_000),
+        }]);
+        assert!(
+            events.try_iter().any(|event| matches!(
+                event,
+                HostEvent::Shard(SHARD, ShardScopedInput::Protocol(event))
+                    if matches!(
+                        *event,
+                        ProtocolEvent::BlockCheckCompleted {
+                            block_hash: checked,
+                            kind: VerificationKind::Resolutions,
+                            ..
+                        } if checked == block_hash
+                    )
+            )),
+            "the check answers on the removed loop's channel",
         );
     }
 }

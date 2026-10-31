@@ -278,8 +278,8 @@ where
     /// the maps swap; events already queued die with the channel receiver.
     ///
     /// Returns its `ShardLoop` for the caller to drop or take the store
-    /// from. The loop must not step again: an action it dispatches looks up
-    /// the dispatch handles this drops, and panics.
+    /// from. Work the loop dispatches after this runs over the loop's own
+    /// stores, unsigned: its signers' gates are closed.
     ///
     /// Returns `None` if the shard isn't hosted.
     pub fn remove_shard(&mut self, shard: ShardId) -> Option<ShardLoop<S, N, D>> {

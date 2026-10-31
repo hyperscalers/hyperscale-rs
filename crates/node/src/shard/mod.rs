@@ -88,10 +88,10 @@ pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 /// per dispatch, the crossbeam `Sender` clone is independent of these
 /// handles, and the key is the attached signer's the action names.
 ///
-/// Shard-scoped handles (`pending_chain`, `prepared_commits`) live in
-/// `per_shard`, keyed by the hosted shard id. Delegated handlers select
-/// the right entry from the emitting loop's shard, loading the map per
-/// dispatch so shards added or dropped at runtime are observed.
+/// Shard-scoped handles live in `per_shard`, keyed by the hosted shard
+/// id, for the readers that pick a shard by what they are asked: a
+/// preview by its payer's shard, a record lookup across every store. A
+/// shard loop's own delegated work runs over the handles its loop holds.
 pub struct DispatchHandles<S: ShardStorage, N> {
     pub(crate) executor: Arc<Executor>,
     pub(crate) network: Arc<N>,
