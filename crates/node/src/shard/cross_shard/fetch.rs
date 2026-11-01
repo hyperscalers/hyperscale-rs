@@ -526,6 +526,12 @@ impl SolicitedAnswer for ProvisionBinding {
         ))]
     }
 
+    /// A server lays its parts out by leaf index, so an answer carrying
+    /// one twice, or out of order, is no honest answer.
+    fn well_formed(response: &GetProvisionResponse) -> bool {
+        response.is_in_leaf_order()
+    }
+
     /// Every part names exactly one transaction, so none is filtered: an
     /// engagement echo with no entries is a part like any other.
     fn items(response: GetProvisionResponse) -> Vec<Provision> {
@@ -962,6 +968,34 @@ mod solicited_tests {
         assert_eq!(verdict, ResponseVerdict::Accept);
         assert_eq!(failed_ids(&inputs), vec![at(1)]);
         assert!(!inputs.iter().any(is_fulfilled));
+    }
+
+    /// An answer carrying a part twice is refused whole: nothing reaches
+    /// the coordinator, every asked index is asked again, and the peer
+    /// is blamed. The same parts once each, in leaf order, are kept.
+    #[test]
+    fn an_answer_repeating_a_part_is_refused_whole() {
+        let at = |index| (SOURCE, LOCAL, BlockHeight::new(10), index);
+        let first = bundle(LOCAL, 10, b"a");
+        let second = bundle(LOCAL, 10, b"b").at_leaf(1, 2);
+
+        let (verdict, inputs) = settle::<ProvisionBinding>(
+            vec![at(0), at(1)],
+            parts([first.clone(), first.clone(), second.clone()]),
+        );
+        assert_eq!(verdict, ResponseVerdict::Reject);
+        assert_eq!(failed_ids(&inputs), vec![at(0), at(1)]);
+        assert!(
+            !inputs
+                .iter()
+                .any(|input| matches!(input, ShardScopedInput::Protocol(_))),
+            "nothing of it is handed over",
+        );
+
+        let (verdict, inputs) =
+            settle::<ProvisionBinding>(vec![at(0), at(1)], parts([first, second]));
+        assert_eq!(verdict, ResponseVerdict::Accept);
+        assert!(failed_ids(&inputs).is_empty());
     }
 
     /// The count witness reaches the coordinator from an answer that

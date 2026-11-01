@@ -2,6 +2,7 @@
 
 use hyperscale_hbor::{Capped, Hbor};
 
+use crate::provisioning::provision::in_leaf_order;
 use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Provision, ProvisionCount};
 
 /// Response to a provision fetch request: the asked parts the source
@@ -33,6 +34,13 @@ impl GetProvisionResponse {
             parts: Capped::empty(),
             count: None,
         }
+    }
+
+    /// Whether the parts run strictly ascending by leaf index, as a
+    /// server lays them out, so none rides in twice.
+    #[must_use]
+    pub fn is_in_leaf_order(&self) -> bool {
+        in_leaf_order(self.parts.iter())
     }
 }
 

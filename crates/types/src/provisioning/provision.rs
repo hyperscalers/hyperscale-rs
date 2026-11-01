@@ -261,6 +261,41 @@ impl Provision {
             },
         })
     }
+
+    /// This part with its leaf moved to `index` of `count`, the path left
+    /// empty, for tests that order parts without walking them.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn at_leaf(&self, index: u32, count: u32) -> Self {
+        let carried = &*self.0;
+        Self::new(ProvisionParts {
+            source_shard: carried.source_shard,
+            target_shard: carried.target_shard,
+            block_height: carried.block_height,
+            source_block_ts: carried.source_block_ts,
+            tx_hash: carried.tx_hash,
+            entries: carried.entries.clone(),
+            proof: carried.proof.clone(),
+            leaf: LeafPath {
+                count,
+                index,
+                siblings: Capped::empty(),
+            },
+        })
+    }
+}
+
+/// Whether `parts` run strictly ascending by leaf index: the order every
+/// honest packer and server lays a block's parts out in, which leaves no
+/// room for one part twice.
+pub fn in_leaf_order<'a>(parts: impl IntoIterator<Item = &'a Provision>) -> bool {
+    let mut previous: Option<u32> = None;
+    parts.into_iter().all(|part| {
+        let index = part.leaf().index;
+        let ascending = previous.is_none_or(|previous| previous < index);
+        previous = Some(index);
+        ascending
+    })
 }
 
 /// Inputs the [`Provision`] verifier reads against.

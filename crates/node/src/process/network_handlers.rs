@@ -452,8 +452,9 @@ where
                         );
                         return Verdict::Ignore;
                     };
-                    // Every packed part names the scope it was signed under.
-                    if !notification.is_uniform() {
+                    // Every packed part names the scope it was signed
+                    // under, in leaf order.
+                    if !notification.is_well_formed() {
                         return Verdict::Reject;
                     }
 

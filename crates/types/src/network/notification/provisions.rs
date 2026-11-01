@@ -2,6 +2,7 @@
 
 use hyperscale_hbor::{Capped, Hbor};
 
+use crate::provisioning::provision::in_leaf_order;
 use crate::{
     BlockHeight, ConsensusSignature, MAX_TXS_PER_BLOCK, MessageClass, NetworkDefinition,
     NetworkMessage, Provision, ProvisionsSenderMessage, ShardId, Signed, ValidatorId, Verifiable,
@@ -55,15 +56,16 @@ impl ProvisionsNotification {
         }
     }
 
-    /// Whether every packed part names the notification's own scope.
+    /// Whether every packed part names the notification's own scope, the
+    /// parts strictly ascending by leaf index, so none rides in twice.
     #[must_use]
-    pub fn is_uniform(&self) -> bool {
+    pub fn is_well_formed(&self) -> bool {
         self.parts.iter().all(|part| {
             let part = part.as_unverified();
             part.source_shard() == self.source_shard
                 && part.target_shard() == self.target_shard
                 && part.block_height() == self.block_height
-        })
+        }) && in_leaf_order(self.parts.iter().map(Verifiable::as_unverified))
     }
 }
 
@@ -96,5 +98,50 @@ impl NetworkMessage for ProvisionsNotification {
 
     fn class() -> MessageClass {
         MessageClass::CrossShardProgress
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Hash, TxHash};
+
+    const SOURCE: ShardId = ShardId::leaf(1, 0);
+    const TARGET: ShardId = ShardId::leaf(1, 1);
+
+    fn packing(indices: &[u32]) -> ProvisionsNotification {
+        let parts = indices
+            .iter()
+            .map(|&index| {
+                Verifiable::from(
+                    Provision::dummy(
+                        SOURCE,
+                        TARGET,
+                        BlockHeight::new(4),
+                        TxHash::from(Hash::from_bytes(&index.to_le_bytes())),
+                    )
+                    .at_leaf(index, 8),
+                )
+            })
+            .collect();
+        ProvisionsNotification::new(
+            SOURCE,
+            TARGET,
+            BlockHeight::new(4),
+            Capped::new(parts).expect("a few parts"),
+            ValidatorId::new(0),
+            ConsensusSignature::ZERO,
+        )
+    }
+
+    /// A pack lays its parts out strictly by leaf index, so one carrying
+    /// a part twice, or out of order, is refused before its signature is
+    /// paid for.
+    #[test]
+    fn a_pack_repeating_or_reordering_a_leaf_is_refused() {
+        assert!(packing(&[]).is_well_formed());
+        assert!(packing(&[0, 2, 5]).is_well_formed());
+        assert!(!packing(&[0, 2, 2]).is_well_formed(), "a leaf twice");
+        assert!(!packing(&[2, 0]).is_well_formed(), "out of order");
     }
 }

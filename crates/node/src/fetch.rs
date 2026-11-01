@@ -864,6 +864,13 @@ pub trait SolicitedAnswer: FetchBinding {
         Vec::new()
     }
 
+    /// Whether an answer is laid out the way an honest server lays one
+    /// out. One that is not is refused whole: none of it is handed over,
+    /// every asked id is asked again elsewhere, and the peer is blamed.
+    fn well_formed(_response: &<Self::Request as Request>::Response) -> bool {
+        true
+    }
+
     /// The items an answer carries. One that carries nothing the asker
     /// can use is left out, which reads as the peer not holding it.
     fn items(response: <Self::Request as Request>::Response) -> Vec<Self::Item>;
@@ -915,6 +922,12 @@ where
         Ok(response) => response,
         Err(error) => return transport_failed::<B, R>(requested, &error, reply),
     };
+    if !B::well_formed(&response) {
+        warn!(binding = B::NAME, "Dropping a malformed fetch answer");
+        record_fetch_response_refused(B::NAME, "malformed");
+        reply.refused(B::ids(requested));
+        return ResponseVerdict::Reject;
+    }
     let beside = B::beside(&requested, &response);
     if !beside.is_empty() {
         reply.hand_over(None, beside);
