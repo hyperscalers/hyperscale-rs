@@ -827,6 +827,13 @@ impl SimCluster {
         self.runner.shard_stats(host_index(host), shard)
     }
 
+    /// The cross-shard provision fetch ids `host`'s replica of `shard`
+    /// holds pending, or `None` when the host doesn't carry it.
+    #[must_use]
+    pub fn provision_fetch_pending(&self, host: usize, shard: ShardId) -> Option<usize> {
+        self.runner.provision_fetch_pending(host_index(host), shard)
+    }
+
     /// The header `host`'s copy of `shard` holds certified at `height`.
     #[must_use]
     pub fn certified_header(

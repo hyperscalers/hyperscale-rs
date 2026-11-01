@@ -2959,11 +2959,7 @@ pub(crate) fn payment_request(signer: PrincipalAddr, amount: u128, now: Duration
 /// request signed for a transaction-shaped window yields a nullifier a
 /// scenario's clock can outrun and watch the sweep retire.
 #[must_use]
-pub(crate) fn payment_request_for(
-    signer: PrincipalAddr,
-    amount: u128,
-    window: TimestampRange,
-) -> Intent {
+pub fn payment_request_for(signer: PrincipalAddr, amount: u128, window: TimestampRange) -> Intent {
     declaration_under(signer, scenario_header(window), |b| {
         let incoming = b.declare(*PROTOCOL_RESOURCE, [Constraint::MinAmount(amount)]);
         account::deposit(b, signer, incoming)
@@ -2983,7 +2979,7 @@ pub(crate) fn payment_request_for(
 /// Panics if the composed envelope does not derive, which would be a
 /// defect in the builder rather than a runtime condition.
 #[must_use]
-pub(crate) fn build_composed_tx(
+pub fn build_composed_tx(
     composer: &Ed25519PrivateKey,
     from: PrincipalAddr,
     signer_key: &Ed25519PrivateKey,

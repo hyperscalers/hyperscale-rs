@@ -386,6 +386,15 @@ where
             .map(|shard_loop| shard_loop.replica.shard_coordinator().stats())
     }
 
+    /// The cross-shard provision fetch ids `shard`'s replica still holds
+    /// pending, or `None` if `shard` isn't hosted.
+    #[must_use]
+    pub fn provision_fetch_pending(&self, shard: ShardId) -> Option<usize> {
+        self.shards
+            .get(&shard)
+            .map(|shard_loop| shard_loop.io.fetch_metrics().provision_pending)
+    }
+
     /// Whether any replica this host runs has `validator` attached, a
     /// retained terminated loop's included. An identity attached to no
     /// replica may move between hosts.

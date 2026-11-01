@@ -1025,6 +1025,15 @@ impl SimulationRunner {
             .and_then(|h| h.shard_stats(shard))
     }
 
+    /// The cross-shard provision fetch ids `host`'s replica of `shard`
+    /// holds pending, or `None` when the host doesn't carry it.
+    #[must_use]
+    pub fn provision_fetch_pending(&self, host: NodeIndex, shard: ShardId) -> Option<usize> {
+        self.hosts
+            .get(host as usize)
+            .and_then(|h| h.provision_fetch_pending(shard))
+    }
+
     /// Get the last emitted transaction status for a host.
     #[must_use]
     pub fn tx_status(&self, host: NodeIndex, tx_hash: &TxHash) -> Option<TransactionStatus> {
