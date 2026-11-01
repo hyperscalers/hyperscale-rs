@@ -649,7 +649,10 @@ mod tests {
                         .is_some_and(|p| p.block().is_none())
                 );
                 assert_eq!(
-                    QcChainSets::behind(view, top_hash).engaged,
+                    QcChainSets::behind(view, top_hash)
+                        .engaged
+                        .into_keys()
+                        .collect::<BTreeSet<_>>(),
                     [sealed_part, assembled_part, received_part]
                         .iter()
                         .map(|part| Engagement::of_part(part))

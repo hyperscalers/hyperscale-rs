@@ -2,6 +2,7 @@
 //! shard and height that sent them.
 
 use std::collections::BTreeSet;
+use std::ops::RangeInclusive;
 
 use hyperscale_hbor::{Capped, Hbor};
 
@@ -61,19 +62,24 @@ impl Engagement {
         source: ShardId,
         tx_hash: TxHash,
     ) -> impl Iterator<Item = &Self> {
-        let at = |source_height, source_anchor| Self {
+        set.range(Self::pair_range(source, tx_hash))
+    }
+
+    /// The span of the sort order holding every entry naming `tx_hash`
+    /// from `source`.
+    #[must_use]
+    pub const fn pair_range(source: ShardId, tx_hash: TxHash) -> RangeInclusive<Self> {
+        Self {
             source,
             tx_hash,
-            source_height,
-            source_anchor,
-        };
-        set.range(
-            at(BlockHeight::GENESIS, WeightedTimestamp::ZERO)
-                ..=at(
-                    BlockHeight::new(u64::MAX),
-                    WeightedTimestamp::from_millis(u64::MAX),
-                ),
-        )
+            source_height: BlockHeight::GENESIS,
+            source_anchor: WeightedTimestamp::ZERO,
+        }..=Self {
+            source,
+            tx_hash,
+            source_height: BlockHeight::new(u64::MAX),
+            source_anchor: WeightedTimestamp::from_millis(u64::MAX),
+        }
     }
 
     /// Whether the source still vouches for this entry under `snapshot`,

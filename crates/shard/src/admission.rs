@@ -18,7 +18,7 @@
 //! recomputes — a root, a validity window, a reservation — is the
 //! pipeline's.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::marker::PhantomData;
 use std::ops::Bound;
 
@@ -32,10 +32,10 @@ use hyperscale_types::{
     MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_OWED_TOWARD_SHARD,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STAGED_RECEIPT_BYTES, MAX_STANDING_TOWARD_SHARD,
     MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Provision,
-    ProvisionHash, Reshaping, Settlement, ShardId, ShardTrie, StandingToward, StateClaim,
-    SubstateKey, TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
-    WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction, claims_admit_block,
-    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
+    ProvisionHash, RETENTION_HORIZON, Reshaping, Settlement, ShardId, ShardTrie, StandingToward,
+    StateClaim, SubstateKey, TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    TxOutcome, WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
+    claims_admit_block, evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -61,8 +61,11 @@ pub(crate) struct QcChainSets {
     /// Provision batches an ancestor carries.
     pub(crate) provisions: HashSet<ProvisionHash>,
     /// What an ancestor's provisions engage, a sealed ancestor's kept
-    /// list included.
-    pub(crate) engaged: BTreeSet<Engagement>,
+    /// list included, each until the ancestor's anchor plus
+    /// [`RETENTION_HORIZON`]: the deadline the dedup index gives it once
+    /// the ancestor commits, so a voter that has committed the ancestor
+    /// and one that has not let go of it at the same anchor.
+    pub(crate) engaged: BTreeMap<Engagement, WeightedTimestamp>,
     /// Transactions an ancestor's finalizations decided.
     pub(crate) resolved: HashSet<TxHash>,
     /// Finalizations an ancestor carries.
@@ -87,6 +90,10 @@ impl QcChainSets {
             if header.height() <= chain.committed_height() {
                 break;
             }
+            let deadline = header
+                .parent_qc()
+                .weighted_timestamp()
+                .plus(RETENTION_HORIZON);
             // A pending block carries its manifest before its body
             // assembles, which is the whole point of reading it there;
             // a certified one carries the body and nothing else.
@@ -95,7 +102,7 @@ impl QcChainSets {
                 sets.txs.extend(manifest.tx_hashes().iter().copied());
                 sets.provisions
                     .extend(manifest.provision_hashes().iter().copied());
-                sets.engaged.extend(pending.engagements());
+                sets.engage(pending.engagements(), deadline);
                 sets.finalizations
                     .extend(manifest.cert_ids().iter().copied());
                 for fw in pending.finalizations() {
@@ -105,7 +112,7 @@ impl QcChainSets {
                 sets.txs
                     .extend(block.transactions().iter().map(|tx| tx.hash()));
                 sets.provisions.extend(block.provision_hashes());
-                sets.engaged.extend(block.engagements().iter().copied());
+                sets.engage(block.engagements().iter().copied(), deadline);
                 for fw in block.certificates().iter() {
                     sets.finalizations.insert(fw.receipt_hash());
                     sets.resolved.extend(fw.deciding_tx_hashes());
@@ -114,6 +121,36 @@ impl QcChainSets {
             current_hash = header.parent_block_hash();
         }
         sets
+    }
+
+    /// Hold `engagements` until `deadline`, keeping the earlier deadline
+    /// of an entry two ancestors carry, as the dedup index keeps the
+    /// first block to commit it.
+    fn engage(
+        &mut self,
+        engagements: impl IntoIterator<Item = Engagement>,
+        deadline: WeightedTimestamp,
+    ) {
+        for engagement in engagements {
+            self.engaged
+                .entry(engagement)
+                .and_modify(|held| *held = (*held).min(deadline))
+                .or_insert(deadline);
+        }
+    }
+
+    /// Every engagement of `tx_hash` from `source` an ancestor carries
+    /// whose deadline is past `at`.
+    pub(crate) fn engaged_live(
+        &self,
+        source: ShardId,
+        tx_hash: TxHash,
+        at: WeightedTimestamp,
+    ) -> impl Iterator<Item = Engagement> + '_ {
+        self.engaged
+            .range(Engagement::pair_range(source, tx_hash))
+            .filter(move |(_, deadline)| **deadline > at)
+            .map(|(engagement, _)| *engagement)
     }
 }
 
@@ -293,9 +330,9 @@ impl Section for ProvisionsSection {
             .dedup
             .standing(source_shard, tx_hash, ctx.anchor, ctx.snapshot, ctx.windows)
             .chain(
-                Engagement::of_pair(&ctx.chain.engaged, source_shard, tx_hash)
-                    .chain(Engagement::of_pair(&fold.engaged, source_shard, tx_hash))
-                    .copied()
+                ctx.chain
+                    .engaged_live(source_shard, tx_hash, ctx.anchor)
+                    .chain(Engagement::of_pair(&fold.engaged, source_shard, tx_hash).copied())
                     .filter(|held| held.stands_under(ctx.snapshot, ctx.windows)),
             )
             .find(|held| *held != engagement);

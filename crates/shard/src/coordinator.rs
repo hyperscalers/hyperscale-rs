@@ -23637,9 +23637,12 @@ mod tests {
         assert!(assembling.add_provision(arrived.clone()));
         state.pending_blocks.insert(assembling);
 
-        let engaged: BTreeSet<Engagement> = [&arrived, &missing]
+        // Each held until the block's own anchor plus the horizon, as the
+        // dedup index holds it once the block commits.
+        let deadline = WeightedTimestamp::from_millis(100_000).plus(RETENTION_HORIZON);
+        let engaged: BTreeMap<Engagement, WeightedTimestamp> = [&arrived, &missing]
             .into_iter()
-            .map(|part| Engagement::of_part(part))
+            .map(|part| (Engagement::of_part(part), deadline))
             .collect();
         let decided: HashSet<TxHash> = finalization.deciding_tx_hashes().collect();
         assert!(!decided.is_empty());

@@ -6055,7 +6055,10 @@ pub mod tests {
         let two = TwoBlocks::new();
         for recorded in [false, true] {
             let mut against = TwoBlocks::against(recorded, CommitDedupIndex::new());
-            against.chain.engaged = BTreeSet::from([Engagement::of_part(&two.second)]);
+            against.chain.engaged = BTreeMap::from([(
+                Engagement::of_part(&two.second),
+                against.anchor.plus(RETENTION_HORIZON),
+            )]);
             let (voted, selected) = two.judged(&against, &[&two.first]);
             if recorded {
                 assert!(refused_as_orphaned(&voted), "{voted:?}");
@@ -6063,6 +6066,40 @@ pub mod tests {
                 assert!(refused_for_standing(&voted), "{voted:?}");
             }
             assert!(selected.is_empty(), "recorded {recorded}");
+        }
+    }
+
+    /// A held engagement lets go at its carrying block's anchor plus the
+    /// retention horizon whether a voter reads it off the QC chain or has
+    /// committed the carrying block, so voters at different committed
+    /// tips answer alike on both sides of the deadline.
+    #[test]
+    fn a_held_engagement_lets_go_at_one_deadline_committed_or_not() {
+        let two = TwoBlocks::new();
+        let carried_at = two.first.source_block_ts().plus(Duration::from_millis(100));
+        let deadline = carried_at.plus(RETENTION_HORIZON);
+        let snapshot = TestCommittee::new(4, 42).topology_snapshot(2);
+        let admitted = |committed: bool, anchor: WeightedTimestamp| {
+            let mut against = Against::window(snapshot.clone());
+            against.local_shard = TWO_BLOCKS_LOCAL;
+            against.anchor = anchor;
+            if committed {
+                against.dedup = two.committed(&two.first);
+            } else {
+                against.chain.engaged =
+                    BTreeMap::from([(Engagement::of_part(&two.first), deadline)]);
+            }
+            select_provisions(
+                &against.ctx(),
+                &mut ProvisionsFold::default(),
+                vec![two.second.clone()],
+            )
+            .len()
+        };
+        let before = WeightedTimestamp::from_millis(deadline.as_millis() - 1);
+        for committed in [false, true] {
+            assert_eq!(admitted(committed, before), 0, "committed {committed}");
+            assert_eq!(admitted(committed, deadline), 1, "committed {committed}");
         }
     }
 
