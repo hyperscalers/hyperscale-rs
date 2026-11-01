@@ -15,8 +15,8 @@ use hyperscale_hbor::{
     Bytes, Capped, Hash32, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
 };
 use hyperscale_jmt::{
-    Blake3Hasher, Key as JmtKey, LeafValue, MAX_SINGLE_CLAIM_PROOF_BYTES, MemoryStore, MultiProof,
-    NodeKey, Tree,
+    Blake3Hasher, Key as JmtKey, LeafValue, MAX_PROOF_CLAIMS, MAX_SINGLE_CLAIM_PROOF_BYTES,
+    MemoryStore, MultiProof, NodeKey, Tree,
 };
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
@@ -26,22 +26,23 @@ use hyperscale_types::{
     DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock, Engagement,
     ExecutionCertificate, ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash,
     Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK, MAX_ENGAGEMENTS_PER_BLOCK,
-    MAX_ENVELOPE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
-    MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STAGED_RECEIPT_BYTES, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES,
-    MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms, MerkleInclusionProof, Movement,
-    ProvisionHash, ProvisionTxRoot, Provisions, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach,
-    Reserves, Role, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES,
-    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, Settlement,
-    ShardId, SignerBitfield, StateClaim, StateRoot, StateWrites, Stated, StatedTerms,
-    StoredReceipt, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
+    MAX_ENVELOPE_BYTES, MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
+    MAX_HOLDS_PER_MEMBER, MAX_MERKLE_PROOF_LEN, MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STAGED_RECEIPT_BYTES,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK,
+    MAX_TICK_MANIFEST_BYTES, MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms,
+    MerkleInclusionProof, Movement, ProvisionEntry, ProvisionHash, ProvisionTxRoot, Provisions,
+    ProvisionsContext, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach, Reserves, Role, RoutePrefix,
+    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, Settlement, ShardId,
+    SignerBitfield, StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt,
+    SubstateEntry, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
     TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickHalf, TickId, TickLine,
     TickManifest, Transaction, TransactionEnvelope, TxHash, TxOutcome, UNSETTLED_TX_BYTES,
-    UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-    evidence_admits_block, receipt_hash_of, shard_prefix_path, staged_yes_bytes,
-    state_claims_admit_block, tick_manifest_admits_block, tick_terms_admit_block,
+    UnsettledTx, Verifiable, Verify, WeightedTimestamp, WitnessSources,
+    compute_global_receipt_root, evidence_admits_block, receipt_hash_of, shard_prefix_path,
+    staged_yes_bytes, state_claims_admit_block, tick_manifest_admits_block, tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{IntentHash, MAX_CROSSINGS_PER_TX, Mode, Moves, ResourceAddr};
@@ -439,6 +440,77 @@ fn a_single_cell_claims_p99_is_what_the_budget_is_derived_from() {
     let _: MultiProof =
         MultiProof::decode(claim_over(&store, shard, root, &keys[..1]).proof.as_bytes())
             .expect("a claim's proof decodes");
+}
+
+/// One transaction's bundle at the most cells a proof may claim, every
+/// cell present and then every cell absent, proven against a spread
+/// tree.
+///
+/// An absent cell's claim ends at a leaf for another key or an empty
+/// slot, which encodes wider than a leaf at the key, while its entry
+/// carries no value. The bundle carrying every declared cell explicitly
+/// verifies and stays within a fetch response either way.
+#[test]
+fn a_bundle_of_absent_cells_at_the_claim_cap_fits_a_fetch_response() {
+    let shard = ShardId::leaf(1, 0);
+    let (store, root, held) = spread_tree(shard, 2 * MAX_PROOF_CLAIMS, 11);
+    let (_, _, missing) = spread_tree(shard, MAX_PROOF_CLAIMS, 13);
+    let anchor = Anchor {
+        shard,
+        height: BlockHeight::new(1),
+        state_root: root,
+        ts: WeightedTimestamp::from_millis(0),
+    };
+    let bundle_over = |keys: &[SubstateKey], present: bool| {
+        let jmt_keys: Vec<JmtKey> = keys.iter().map(SubstateKey::to_bytes).collect();
+        let proof = Jmt::prove(
+            &store,
+            &NodeKey::new(1, shard_prefix_path(shard)),
+            &jmt_keys,
+        )
+        .expect("every key proves against a held version")
+        .encode();
+        let mut entries: Vec<SubstateEntry> = keys
+            .iter()
+            .map(|key| {
+                let value = present.then(|| Bytes::new(key.to_bytes().to_vec()).unwrap());
+                SubstateEntry::new(*key, value)
+            })
+            .collect();
+        entries.sort_by_key(|entry| entry.key);
+        Provisions::new(
+            shard,
+            ShardId::leaf(1, 1),
+            anchor.height,
+            anchor.ts,
+            MerkleInclusionProof::new(proof),
+            Capped::from_array([ProvisionEntry::new(
+                TxHash::from(hash_at(0)),
+                Capped::new(entries).expect("the claim cap is under the entry cap"),
+            )]),
+        )
+    };
+    let present = bundle_over(&held[..MAX_PROOF_CLAIMS], true);
+    let absent = bundle_over(&missing, false);
+    for (label, bundle) in [("present", &present), ("absent", &absent)] {
+        bundle
+            .verify(&ProvisionsContext { anchor })
+            .unwrap_or_else(|error| panic!("the {label} bundle verifies: {error}"));
+        let proof = bundle.proof().as_bytes().len();
+        let encoded = hbor_to_vec(bundle).expect("a bundle encodes").len();
+        println!(
+            "{MAX_PROOF_CLAIMS} {label} cells: proof {proof} bytes, bundle {encoded} bytes, of \
+             {MAX_MERKLE_PROOF_LEN} and {MAX_FETCH_RESPONSE_BYTES}",
+        );
+        assert!(
+            proof <= MAX_MERKLE_PROOF_LEN,
+            "the {label} proof is buildable"
+        );
+        assert!(
+            encoded <= MAX_FETCH_RESPONSE_BYTES,
+            "the {label} bundle fits a fetch response",
+        );
+    }
 }
 
 /// The budget is what bounds the section, not the name count: the names

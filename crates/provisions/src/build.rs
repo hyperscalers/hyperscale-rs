@@ -35,6 +35,7 @@ use tracing::warn;
 /// # Panics
 ///
 /// If a list written out here is past the cap its type states.
+#[must_use]
 pub fn build_provisions<S>(
     view: &SubstateView<S>,
     source_shard: ShardId,
@@ -53,91 +54,8 @@ where
         if !req.targets.contains(&target_shard) {
             continue;
         }
-
-        // Read the exact flat keys of the transaction's local read set at
-        // the source height. No ownership walk — identity keying made
-        // ownership maps structurally absent — and nothing naming what the
-        // receiver needs: it re-derives that from the envelope. A keyless
-        // request still stages its transaction: the payer shard's
-        // empty-entry bundle is the engagement evidence.
-        let mut entries = Vec::with_capacity(req.local_keys.len());
-        for key in &req.local_keys {
-            let Some(value) = view.get_substate_at_height(*key, source_block_height) else {
-                warn!(
-                    source_shard = source_shard.inner(),
-                    target_shard = target_shard.inner(),
-                    block_height = source_block_height.inner(),
-                    tx_hash = %req.tx_hash,
-                    "build_provisions: height unavailable for flat key"
-                );
-                return None;
-            };
-            if let Some(value) = value {
-                all_keys.push(*key);
-                entries.push(SubstateEntry::new(
-                    *key,
-                    Some(Bytes::new(value).expect("a list under the cap its source already met")),
-                ));
-            }
-        }
-        // A declared interval serves as the entry leaves it holds at the
-        // source height: enumerate the orders from the versioned index,
-        // then read each leaf like any other — the receiver re-derives
-        // the interval from the self-describing leaf values, and every
-        // leaf verifies against the source root like a cell's does.
-        for range in &req.local_ranges {
-            let Some(held) = view.get_entries_at_height(*range, source_block_height) else {
-                warn!(
-                    source_shard = source_shard.inner(),
-                    target_shard = target_shard.inner(),
-                    block_height = source_block_height.inner(),
-                    tx_hash = %req.tx_hash,
-                    "build_provisions: height unavailable for range"
-                );
-                return None;
-            };
-            for (order, _) in held {
-                let leaf_key = entry_leaf_key(
-                    &ProtocolHasher,
-                    EntryKey {
-                        owner: range.owner,
-                        collection: range.collection,
-                        order,
-                    },
-                );
-                let Some(value) = view.get_substate_at_height(leaf_key, source_block_height) else {
-                    warn!(
-                        source_shard = source_shard.inner(),
-                        target_shard = target_shard.inner(),
-                        block_height = source_block_height.inner(),
-                        tx_hash = %req.tx_hash,
-                        "build_provisions: height unavailable for entry leaf"
-                    );
-                    return None;
-                };
-                let Some(value) = value else {
-                    // The index enumerated this order at this height, so
-                    // its leaf must exist — the "index ≡ leaves"
-                    // invariant. Serving without it would ship an
-                    // under-provisioned bundle whose failure surfaces as
-                    // untraceable receipt divergence on the target shard;
-                    // refusing keeps the defect at its source.
-                    warn!(
-                        source_shard = source_shard.inner(),
-                        block_height = source_block_height.inner(),
-                        tx_hash = %req.tx_hash,
-                        order,
-                        "build_provisions: entry index names an order with no leaf"
-                    );
-                    return None;
-                };
-                all_keys.push(leaf_key);
-                entries.push(SubstateEntry::new(
-                    leaf_key,
-                    Some(Bytes::new(value).expect("a list under the cap its source already met")),
-                ));
-            }
-        }
+        let entries = read_declared(view, source_shard, target_shard, source_block_height, req)?;
+        all_keys.extend(entries.iter().map(|entry| entry.key));
         staged.push((req.tx_hash, entries));
     }
 
@@ -176,4 +94,108 @@ where
         proof,
         transactions,
     ))
+}
+
+/// One transaction's declared local reads at `source_block_height`,
+/// sorted by key with one copy per key, or `None` where the height is
+/// unavailable or the entry index names an order with no leaf.
+///
+/// The exact flat keys of the read set, with no ownership walk — identity
+/// keying made ownership maps structurally absent — and nothing naming
+/// what the receiver needs: it re-derives that from the envelope. A
+/// keyless request reads nothing, and its transaction still stages: the
+/// payer shard's empty-entry bundle is the engagement evidence. A
+/// declared cell absent at the source height is carried as `None` and
+/// proven absent, so a receiver can tell it from one left out.
+fn read_declared<S>(
+    view: &SubstateView<S>,
+    source_shard: ShardId,
+    target_shard: ShardId,
+    source_block_height: BlockHeight,
+    req: &ProvisionsRequest,
+) -> Option<Vec<SubstateEntry>>
+where
+    S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
+{
+    let mut entries = Vec::with_capacity(req.local_keys.len());
+    for key in &req.local_keys {
+        let Some(value) = view.get_substate_at_height(*key, source_block_height) else {
+            warn!(
+                source_shard = source_shard.inner(),
+                target_shard = target_shard.inner(),
+                block_height = source_block_height.inner(),
+                tx_hash = %req.tx_hash,
+                "build_provisions: height unavailable for flat key"
+            );
+            return None;
+        };
+        entries.push(SubstateEntry::new(
+            *key,
+            value.map(|value| {
+                Bytes::new(value).expect("a list under the cap its source already met")
+            }),
+        ));
+    }
+    // A declared interval serves as the entry leaves it holds at the
+    // source height: enumerate the orders from the versioned index, then
+    // read each leaf like any other — the receiver re-derives the
+    // interval from the self-describing leaf values, and every leaf
+    // verifies against the source root like a cell's does.
+    for range in &req.local_ranges {
+        let Some(held) = view.get_entries_at_height(*range, source_block_height) else {
+            warn!(
+                source_shard = source_shard.inner(),
+                target_shard = target_shard.inner(),
+                block_height = source_block_height.inner(),
+                tx_hash = %req.tx_hash,
+                "build_provisions: height unavailable for range"
+            );
+            return None;
+        };
+        for (order, _) in held {
+            let leaf_key = entry_leaf_key(
+                &ProtocolHasher,
+                EntryKey {
+                    owner: range.owner,
+                    collection: range.collection,
+                    order,
+                },
+            );
+            let Some(value) = view.get_substate_at_height(leaf_key, source_block_height) else {
+                warn!(
+                    source_shard = source_shard.inner(),
+                    target_shard = target_shard.inner(),
+                    block_height = source_block_height.inner(),
+                    tx_hash = %req.tx_hash,
+                    "build_provisions: height unavailable for entry leaf"
+                );
+                return None;
+            };
+            let Some(value) = value else {
+                // The index enumerated this order at this height, so its
+                // leaf must exist — the "index ≡ leaves" invariant.
+                // Serving without it would ship an under-provisioned
+                // bundle whose failure surfaces as untraceable receipt
+                // divergence on the target shard; refusing keeps the
+                // defect at its source.
+                warn!(
+                    source_shard = source_shard.inner(),
+                    block_height = source_block_height.inner(),
+                    tx_hash = %req.tx_hash,
+                    order,
+                    "build_provisions: entry index names an order with no leaf"
+                );
+                return None;
+            };
+            entries.push(SubstateEntry::new(
+                leaf_key,
+                Some(Bytes::new(value).expect("a list under the cap its source already met")),
+            ));
+        }
+    }
+    // One copy per key: a key declared twice, or both as a cell and as a
+    // leaf a range holds, reads the same value at one height.
+    entries.sort_by_key(|entry| entry.key);
+    entries.dedup_by_key(|entry| entry.key);
+    Some(entries)
 }
