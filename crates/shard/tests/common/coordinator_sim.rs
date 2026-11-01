@@ -2211,23 +2211,30 @@ impl ShardCoordinatorSim {
                         self.shard,
                         &transactions,
                     )
-                    .expect("the sim derives every transaction it proposes")
                 });
-                let verify_result = expected_root.verify(&StateRootContext {
-                    computed_root: &computed_root,
-                    claimed_split_child_roots,
-                    split_child_roots_required,
-                    claimed_terminal_settled_txs,
-                    computed_terminal_settled_txs,
-                    terminal_settled_txs_required,
-                    provision_tx_roots: parent_judgement
-                        .as_ref()
-                        .zip(computed_provision_tx_roots.as_ref())
-                        .map(|(judgement, computed)| ProvisionTxRootsJudged {
-                            claimed: &judgement.provisions.claimed,
-                            computed,
-                        }),
-                });
+                // A judged block carrying a transaction this replica has
+                // not derived has no map to compare, and is refused.
+                let routed = !matches!(computed_provision_tx_roots, Some(Err(_)));
+                let computed_provision_tx_roots = computed_provision_tx_roots.and_then(Result::ok);
+                let checked = routed
+                    .then(|| {
+                        expected_root.verify(&StateRootContext {
+                            computed_root: &computed_root,
+                            claimed_split_child_roots,
+                            split_child_roots_required,
+                            claimed_terminal_settled_txs,
+                            computed_terminal_settled_txs,
+                            terminal_settled_txs_required,
+                            provision_tx_roots: parent_judgement
+                                .as_ref()
+                                .zip(computed_provision_tx_roots.as_ref())
+                                .map(|(judgement, computed)| ProvisionTxRootsJudged {
+                                    claimed: &judgement.provisions.claimed,
+                                    computed,
+                                }),
+                        })
+                    })
+                    .is_some_and(|verified| verified.is_ok());
                 let bytes_delta = jmt_snapshot.bytes_delta;
                 let answers =
                     jmt_snapshot.answer_delta(&view.snapshot(), &shard_prefix_path(self.shard));
@@ -2237,7 +2244,7 @@ impl ShardCoordinatorSim {
                     &view.snapshot(),
                     &shard_prefix_path(self.shard),
                 );
-                if verify_result.is_ok() {
+                if checked {
                     self.pending_chains[emitter_idx].insert(
                         block_hash,
                         ChainEntry {
@@ -2260,13 +2267,14 @@ impl ShardCoordinatorSim {
                     event: SimEvent::BlockCheckCompleted {
                         block_hash,
                         kind: VerificationKind::StateRoot,
-                        outcome: match verify_result {
-                            Ok(_) => CheckOutcome::Checked {
+                        outcome: if checked {
+                            CheckOutcome::Checked {
                                 bytes_delta,
                                 answers,
                                 additions,
-                            },
-                            Err(_) => CheckOutcome::Refused,
+                            }
+                        } else {
+                            CheckOutcome::Refused
                         },
                     },
                 });
