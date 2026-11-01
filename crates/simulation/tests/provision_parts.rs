@@ -10,7 +10,6 @@
 
 mod support;
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -254,19 +253,25 @@ fn an_unbuildable_part_costs_only_its_own_transaction() {
         let hashes = transfers.submit(c);
 
         // The unbuildable index stays asked on the recipient's shard,
-        // rotating peers, while its transaction waits.
-        let asked = Cell::new(false);
-        c.run_until(epochs(3), |c| {
-            if pending(c).iter().any(|count| count.is_some_and(|n| n > 0)) {
-                asked.set(true);
-            }
-            hashes
-                .iter()
-                .all(|hash| c.tx_status(*hash).is_some_and(|s| s.is_final()))
+        // rotating peers, while its transaction waits: once every
+        // transfer with a buildable part is final, a fetch id is still
+        // pending.
+        let buildable_final = c.run_until(epochs(3), |c| {
+            let dropped = dropped.lock().unwrap_or_else(PoisonError::into_inner);
+            !dropped.is_empty()
+                && hashes
+                    .iter()
+                    .filter(|hash| !dropped.contains(hash))
+                    .all(|hash| c.tx_status(*hash).is_some_and(|s| s.is_final()))
         });
         assert!(
-            asked.get(),
-            "the unbuildable index was never asked, so the sweep shows nothing",
+            buildable_final,
+            "the transfers with a buildable part never finished",
+        );
+        assert!(
+            pending(c).iter().any(|count| count.is_some_and(|n| n > 0)),
+            "the unbuildable index is no longer asked while its transaction waits: {:?}",
+            pending(c),
         );
         let outcomes = settle(c, &hashes);
         assert!(handles.iter().any(|handle| handle.fired() > 0));
