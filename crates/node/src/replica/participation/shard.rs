@@ -315,6 +315,7 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use hyperscale_core::{
@@ -327,11 +328,13 @@ mod tests {
         TestCommittee, certify, make_live_block, naming_its_own, shard_fork_proof, test_transaction,
     };
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest,
-        BlockManifestParts, BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-        ConsensusSignature, Hash, LocalTimestamp, ProposerTimestamp, Provision, ProvisionTxRoot,
-        QuorumCertificate, RETENTION_HORIZON, Round, ShardForkProof, ShardId, Transaction,
-        TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified, WeightedTimestamp,
+        Address, AddressClass, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
+        BlockManifest, BlockManifestParts, BlockVote, CertifiedBlock, CertifiedBlockHeader,
+        ChainOrigin, ConsensusSignature, Hash, LeafPath, LocalKey, LocalTimestamp,
+        MerkleInclusionProof, ProposerTimestamp, Provision, ProvisionParts, ProvisionTxRoot,
+        QuorumCertificate, RETENTION_HORIZON, Round, ShardForkProof, ShardId, SubstateEntry,
+        SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+        Verified, WeightedTimestamp, provision_leaf, served_digest,
     };
 
     use crate::replica::NodeStateMachine;
@@ -365,7 +368,7 @@ mod tests {
                 is_fallback: header.is_fallback(),
                 state_root: header.state_root(),
                 body_root: header.body_root(),
-                provision_tx_roots: Capped::new(std::collections::BTreeMap::from([(
+                provision_tx_roots: Capped::new(BTreeMap::from([(
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
                 )]))
@@ -792,6 +795,185 @@ mod tests {
             0,
             "outbound entry must be evicted — the block's weighted timestamp now exceeds the deadline",
         );
+    }
+
+    /// The source of the parts below.
+    const SOURCE: ShardId = ShardId::leaf(1, 1);
+    /// The source block the parts come from.
+    const SOURCE_HEIGHT: BlockHeight = BlockHeight::new(5);
+
+    /// A node whose provisions coordinator holds [`SOURCE`]'s committed
+    /// header at [`SOURCE_HEIGHT`], which commits one transaction's part
+    /// serving one key here; that part honestly, and stripped of its entry.
+    fn holding_a_source_header() -> (TestNode, Provision, Provision) {
+        let mut node = TestNode::new();
+        let tx_hash = TxHash::from(Hash::from_bytes(b"tx"));
+        let key = SubstateKey {
+            owner: Address::new([0x10; 31], AddressClass::Component),
+            local: LocalKey([1; 16]),
+        };
+        let leaf = provision_leaf(tx_hash, served_digest([key].into_iter()));
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: SOURCE,
+            height: SOURCE_HEIGHT,
+            provision_tx_roots: Capped::new(BTreeMap::from([(
+                ShardId::ROOT,
+                ProvisionTxRoot::over(&[leaf]),
+            )]))
+            .expect("one target"),
+            ..Default::default()
+        });
+        let certified_header = Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+            header,
+            QuorumCertificate::genesis(SOURCE, ChainOrigin::root(WeightedTimestamp::ZERO)),
+        ));
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::RemoteHeaderAdmitted {
+                certified_header: certified_header.clone(),
+            },
+        );
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::RemoteHeaderCommitted { certified_header },
+        );
+        let part = |entries: Vec<SubstateEntry>| {
+            Provision::new(ProvisionParts {
+                source_shard: SOURCE,
+                target_shard: ShardId::ROOT,
+                block_height: SOURCE_HEIGHT,
+                source_block_ts: WeightedTimestamp::ZERO,
+                tx_hash,
+                entries: Capped::new(entries).expect("within the cap"),
+                proof: MerkleInclusionProof::new(Vec::new()),
+                leaf: LeafPath {
+                    count: 1,
+                    index: 0,
+                    siblings: Capped::empty(),
+                },
+            })
+        };
+        let honest = part(vec![SubstateEntry::new(key, None)]);
+        let stripped = part(Vec::new());
+        assert_ne!(honest.hash(), stripped.hash());
+        (node, honest, stripped)
+    }
+
+    /// The round-0 leader's height-1 header carrying `part`, handed to the
+    /// node: what it does on receipt.
+    fn a_block_naming(node: &mut TestNode, part: &Provision) -> Vec<Action> {
+        let header = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            /* timestamp_ms */ 1_000,
+            ValidatorId::new(0),
+            vec![],
+            vec![],
+        )
+        .header()
+        .clone();
+        let manifest = BlockManifest::new(BlockManifestParts {
+            provision_hashes: Capped::from_array([part.hash()]),
+            ..Default::default()
+        });
+        node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BlockHeaderReceived {
+                header: Arc::new(header),
+                manifest,
+            },
+        )
+    }
+
+    /// Whether the node's pending blocks still fetch `part`.
+    fn still_waits_on(node: &TestNode, part: &Provision) -> bool {
+        node.node
+            .shard_coordinator()
+            .check_pending_block_fetches(true)
+            .iter()
+            .any(|action| {
+                matches!(
+                    action,
+                    Action::Fetch(FetchRequest::Ask {
+                        ids: FetchIds::LocalProvisions(hashes),
+                        ..
+                    }) if hashes.contains(&part.hash())
+                )
+            })
+    }
+
+    /// Whether `actions` carry the block on toward a vote: its pending
+    /// data complete, the node starts the body check the vote waits on.
+    fn moves_to_vote(actions: &[Action]) -> bool {
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::Consensus(ConsensusAction::VerifyBodyRoot { .. })
+            )
+        })
+    }
+
+    /// A target proposer that strips an honest part of its entries and
+    /// names the stripped one in its block gets no vote: the voter fetches
+    /// the part by hash, refuses it, since its leaf no longer binds the
+    /// keys the source header committed, and the block stays waiting on
+    /// it. The same block naming the honest part moves on once the part is
+    /// admitted.
+    #[test]
+    fn a_block_naming_a_stripped_part_is_never_voted_on() {
+        let (mut node, _, stripped) = holding_a_source_header();
+        let received = a_block_naming(&mut node, &stripped);
+        assert!(!moves_to_vote(&received), "{received:?}");
+        assert!(still_waits_on(&node, &stripped));
+
+        let mut refused = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::UnverifiedProvisionsReceived {
+                parts: vec![stripped.clone()],
+            },
+        );
+        let Some(Action::Continuation(verdicts @ ProtocolEvent::StateProvisionsVerified { .. })) =
+            refused.pop()
+        else {
+            panic!("the stripped part is judged on arrival: {refused:?}")
+        };
+        let ProtocolEvent::StateProvisionsVerified { results, .. } = &verdicts else {
+            unreachable!("matched above")
+        };
+        assert!(
+            results.iter().all(Result::is_err),
+            "its leaf does not bind the committed keys: {results:?}",
+        );
+        let after = node.handle(LocalTimestamp::ZERO, verdicts);
+        assert!(
+            !after.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
+            )),
+            "the stripped part is refused: {after:?}",
+        );
+        assert!(
+            node.node
+                .provisions_coordinator()
+                .get_provisions_by_hash(stripped.hash())
+                .is_none()
+        );
+        assert!(!moves_to_vote(&after), "{after:?}");
+        assert!(still_waits_on(&node, &stripped));
+
+        let (mut node, honest, _) = holding_a_source_header();
+        let received = a_block_naming(&mut node, &honest);
+        assert!(!moves_to_vote(&received), "{received:?}");
+        assert!(still_waits_on(&node, &honest));
+        let admitted = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::ProvisionsAdmitted {
+                provision: Verified::new_unchecked_for_test(honest.clone()).into(),
+                source_block_ts: WeightedTimestamp::ZERO,
+            },
+        );
+        assert!(!still_waits_on(&node, &honest));
+        assert!(moves_to_vote(&admitted), "{admitted:?}");
     }
 
     /// Counterpart to the gate-fires test: when the manifest fits inside

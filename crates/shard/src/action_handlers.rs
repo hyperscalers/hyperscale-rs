@@ -2101,6 +2101,7 @@ mod tests {
         Answerers, GossipHandler, NotificationHandler, RequestError, RequestHandler,
         ResponseVerdict,
     };
+    use hyperscale_provisions::Unrouted;
     use hyperscale_storage::test_helpers::{commit_writes, placeholder_local_ec};
     use hyperscale_storage::{
         ChainEntry, PendingChain, ShardChainReader, TickChain, committed_here,
@@ -3335,14 +3336,26 @@ mod tests {
 
     /// A judged block carrying a transaction this node has not derived
     /// has no map to compare, and is refused rather than passed or left
-    /// unanswered.
+    /// unanswered: even under an empty claim, which a map that skipped
+    /// the transaction would match.
     #[test]
     fn an_unrouted_transaction_under_a_judgement_is_refused() {
         let block = Judged::new();
-        let (outcome, seated) = block.check(
-            underived(&block),
-            Some(block.judgement(block.honest.clone())),
+        let tx = underived(&block);
+        let state = block
+            .pending_chain
+            .view_at(BlockHash::ZERO, BlockHeight::GENESIS);
+        assert_eq!(
+            provision_tx_roots(
+                &state.snapshot(),
+                &block.trie,
+                LOCAL,
+                std::slice::from_ref(&tx)
+            ),
+            Err(Unrouted { tx_hash: tx.hash() }),
         );
+        let (outcome, seated) =
+            block.check(tx, Some(block.judgement(ProvisionTxRootsMap::default())));
         assert_eq!(outcome, CheckOutcome::Refused);
         assert!(!seated);
     }
