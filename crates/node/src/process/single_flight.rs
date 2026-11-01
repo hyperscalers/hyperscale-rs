@@ -97,11 +97,12 @@ impl<K: Ord + Copy, V: Clone> SingleFlight<K, V> {
 
     /// Answer each of `keys` from the cache, from a production already
     /// running for it, or by running `produce` here over the keys nobody
-    /// holds. `produce` returns a value for each key it made. A key it
-    /// leaves out was not made: it is unavailable to this caller, and a
-    /// caller that was waiting on it asks for it again, producing it
-    /// itself if nobody has taken it up meanwhile, while its wait budget
-    /// lasts. `produce` runs once per such round.
+    /// holds, handed to it in ascending order. `produce` returns a value
+    /// for each key it made. A key it leaves out was not made: it is
+    /// unavailable to this caller, and a caller that was waiting on it
+    /// asks for it again, producing it itself if nobody has taken it up
+    /// meanwhile, while its wait budget lasts. `produce` runs once per
+    /// such round.
     ///
     /// The cache checks, the joins and the producer's reservations share
     /// one critical section, so at most one production runs per key. This
@@ -185,7 +186,8 @@ impl<K: Ord + Copy, V: Clone> SingleFlight<K, V> {
         own: Held<K, V>,
         produce: &mut impl FnMut(&[K]) -> Vec<(K, V)>,
     ) -> Vec<(K, Flight<V>)> {
-        let keys: Vec<K> = own.iter().map(|(key, _)| *key).collect();
+        let mut keys: Vec<K> = own.iter().map(|(key, _)| *key).collect();
+        keys.sort_unstable();
         let guards: Vec<InFlightGuard<K, V>> = own
             .into_iter()
             .map(|(key, waiter)| InFlightGuard {
@@ -196,7 +198,7 @@ impl<K: Ord + Copy, V: Clone> SingleFlight<K, V> {
             .collect();
         let mut made: BTreeMap<K, V> = produce(&keys)
             .into_iter()
-            .filter(|(key, _)| keys.contains(key))
+            .filter(|(key, _)| keys.binary_search(key).is_ok())
             .collect();
         {
             let mut state = lock(&self.state);
@@ -564,5 +566,54 @@ mod tests {
                 "and it evicts nothing"
             );
         }
+    }
+
+    thread_local! {
+        static COMPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A key that counts how often it is compared.
+    #[derive(Clone, Copy, Debug)]
+    struct Counted(u32);
+
+    impl PartialEq for Counted {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other).is_eq()
+        }
+    }
+
+    impl Eq for Counted {}
+
+    impl PartialOrd for Counted {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for Counted {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            COMPARED.with(|compared| compared.set(compared.get() + 1));
+            self.0.cmp(&other.0)
+        }
+    }
+
+    /// Producing many keys at once costs comparisons in proportion to
+    /// `n log n`, not to `n²`.
+    #[test]
+    fn producing_many_keys_compares_them_a_logarithmic_number_of_times() {
+        const KEYS: u32 = 4096;
+        let flight: SingleFlight<Counted, u32> = SingleFlight::new(1 << 20, |_| 1, 4, BUDGET);
+        let keys: Vec<Counted> = (0..KEYS).map(Counted).collect();
+        COMPARED.with(|compared| compared.set(0));
+
+        let answers =
+            flight.get_or_produce(&keys, |own| own.iter().map(|key| (*key, key.0)).collect());
+
+        assert_eq!(answers.len(), KEYS as usize);
+        let compared = COMPARED.with(std::cell::Cell::get);
+        assert!(
+            compared < 32 * (KEYS * KEYS.ilog2()) as usize,
+            "{compared} comparisons for {KEYS} keys",
+        );
     }
 }
