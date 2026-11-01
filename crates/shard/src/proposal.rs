@@ -1690,6 +1690,44 @@ mod tests {
         against
     }
 
+    /// A part offered twice is selected once, so the proposer never
+    /// builds a block its voters refuse for naming it twice.
+    #[test]
+    fn a_part_offered_twice_is_selected_once() {
+        let part = |seed: &[u8]| {
+            Verifiable::from(Provision::dummy(
+                ShardId::leaf(1, 1),
+                ShardId::ROOT,
+                BlockHeight::new(3),
+                TxHash::from(Hash::from_bytes(seed)),
+            ))
+        };
+        let (first, second) = (part(b"first"), part(b"second"));
+        let against = finalizations_against(empty_dedup_index());
+        let selected = select_provisions(
+            &against.ctx(),
+            &mut ProvisionsFold::default(),
+            vec![first.clone(), second.clone(), first.clone()],
+        );
+        let hashes: Vec<_> = selected
+            .iter()
+            .map(|part| part.as_unverified().hash())
+            .collect();
+        assert_eq!(
+            hashes,
+            vec![first.as_unverified().hash(), second.as_unverified().hash()]
+        );
+        assert_eq!(
+            admit_all::<ProvisionsSection>(
+                &against.ctx(),
+                &mut ProvisionsFold::default(),
+                selected.iter().map(Verifiable::as_unverified),
+            ),
+            Ok(()),
+            "its voters admit what it selected",
+        );
+    }
+
     const DEPARTED: ShardId = ShardId::leaf(1, 0);
     const SURVIVOR: ShardId = ShardId::leaf(1, 1);
 

@@ -198,6 +198,8 @@ pub(crate) struct ProvisionsFold {
     /// What the admitted batches engage — what the transactions section
     /// reads to engage a cross-shard transaction in the same block.
     pub(crate) engaged: BTreeSet<Engagement>,
+    /// The admitted parts, each named once.
+    admitted: HashSet<ProvisionHash>,
 }
 
 impl ProvisionsFold {
@@ -214,7 +216,8 @@ impl Section for ProvisionsSection {
     type Item = Provision;
     type Fold = ProvisionsFold;
 
-    /// A batch the chain does not already carry, from a shard whose
+    /// A batch named once in the block and not already carried by the
+    /// chain, from a shard whose
     /// recovery does not fence it, within the block's transaction cap.
     ///
     /// Content from a recovering shard above its attested frontier is
@@ -228,6 +231,11 @@ impl Section for ProvisionsSection {
     /// snapshot without the record and stays valid.
     fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, batch: &Provision) -> Result<(), String> {
         let provision_hash = batch.hash();
+        if fold.admitted.contains(&provision_hash) {
+            return Err(format!(
+                "provisions batch {provision_hash:?} already named in this block"
+            ));
+        }
         if ctx.chain.provisions.contains(&provision_hash) {
             return Err(format!(
                 "provisions batch {provision_hash:?} already in QC chain ancestor"
@@ -268,6 +276,7 @@ impl Section for ProvisionsSection {
         }
         fold.tx_count = tx_count;
         fold.engaged.insert(Engagement::of_part(batch));
+        fold.admitted.insert(provision_hash);
         Ok(())
     }
 }

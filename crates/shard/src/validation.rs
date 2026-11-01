@@ -5408,6 +5408,19 @@ pub mod tests {
         assert!(admit(&plain(), &block).is_ok());
     }
 
+    /// A block naming one part twice is refused: each copy would count
+    /// toward the block's cap and crowd out a part it owes.
+    #[test]
+    fn validate_no_duplicate_provisions_rejects_a_part_named_twice() {
+        let p = provisions_with_seed(1);
+        let block = block_with_provisions(
+            BlockHeight::new(6),
+            vec![p.clone(), provisions_with_seed(2), p],
+        );
+        let err = admit(&plain(), &block).unwrap_err();
+        assert!(err.contains("already named in this block"), "{err}");
+    }
+
     #[test]
     fn validate_no_duplicate_provisions_rejects_qc_chain_dup() {
         let p = provisions_with_seed(1);
