@@ -1,13 +1,15 @@
 //! Shared provision construction.
 //!
 //! Both the gossip emit path ([`fetch_and_broadcast_provision`]) and the
-//! fetch serve path (`serve_provision_request` in the node crate) flow
-//! through [`build_provisions`]. Keeping a single function means a
+//! fetch serve path (`build_served_parts` in the node crate) flow
+//! through [`build_provisions_until`]. Keeping a single function means a
 //! receiver absorbs byte-identical parts regardless of which transport
 //! delivered them — any future field-ordering leak gets caught in one
 //! place rather than drifting between two near-identical loops.
 //!
 //! [`fetch_and_broadcast_provision`]: crate::action_handlers::fetch_and_broadcast_provision
+
+use std::ops::ControlFlow;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_hbor::{Bytes, Capped};
@@ -73,36 +75,74 @@ pub fn build_provisions<S>(
 where
     S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
 {
+    let mut parts = Vec::new();
+    build_provisions_until(
+        view,
+        source_shard,
+        target_shard,
+        source_block_height,
+        source_block_ts,
+        requests,
+        |index, build| {
+            if wanted(index) {
+                parts.extend(build());
+            }
+            ControlFlow::Continue(())
+        },
+    );
+    parts
+}
+
+/// Offer each leaf index of what `requests` owe `target_shard` to
+/// `take`, in index order, with a builder for its part, until `take`
+/// breaks.
+///
+/// The builder answers [`build_provisions`]' part for that index, or
+/// `None` where it is unbuildable, and runs only if `take` calls it: a
+/// caller answering within a budget builds what it takes and nothing
+/// past the point it stops.
+pub fn build_provisions_until<S>(
+    view: &SubstateView<S>,
+    source_shard: ShardId,
+    target_shard: ShardId,
+    source_block_height: BlockHeight,
+    source_block_ts: WeightedTimestamp,
+    requests: &[ProvisionsRequest],
+    mut take: impl FnMut(u32, &mut dyn FnMut() -> Option<Provision>) -> ControlFlow<()>,
+) where
+    S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
+{
     let owed: Vec<&ProvisionsRequest> = requests_for(requests, target_shard).collect();
     let leaves: Vec<Hash> = owed.iter().map(|req| provision_leaf(req.tx_hash)).collect();
-    let mut parts = Vec::new();
     for (req, leaf) in owed.into_iter().zip(LeafPath::all(&leaves)) {
-        if !wanted(leaf.index) {
-            continue;
-        }
         let index = leaf.index;
-        let Some(part) = build_part(
-            view,
-            source_shard,
-            target_shard,
-            source_block_height,
-            source_block_ts,
-            req,
-            leaf,
-        ) else {
-            warn!(
-                source_shard = source_shard.inner(),
-                target_shard = target_shard.inner(),
-                block_height = source_block_height.inner(),
-                tx_hash = %req.tx_hash,
-                index,
-                "build_provisions: part unbuildable"
+        let mut leaf = Some(leaf);
+        let mut build = || {
+            let part = build_part(
+                view,
+                source_shard,
+                target_shard,
+                source_block_height,
+                source_block_ts,
+                req,
+                leaf.take()?,
             );
-            continue;
+            if part.is_none() {
+                warn!(
+                    source_shard = source_shard.inner(),
+                    target_shard = target_shard.inner(),
+                    block_height = source_block_height.inner(),
+                    tx_hash = %req.tx_hash,
+                    index,
+                    "build_provisions: part unbuildable"
+                );
+            }
+            part
         };
-        parts.push(part);
+        if take(index, &mut build).is_break() {
+            return;
+        }
     }
-    parts
 }
 
 /// One transaction's part at `leaf`, or `None` where it cannot be built.

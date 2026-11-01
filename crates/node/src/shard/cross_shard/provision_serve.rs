@@ -1,10 +1,11 @@
 //! Inbound provision-request handling for cross-shard fetches.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_execution::provision_request;
-use hyperscale_provisions::{ProvisionStore, build_provisions, provision_count};
+use hyperscale_provisions::{ProvisionStore, build_provisions_until, provision_count};
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::request::GetProvisionsRequest;
@@ -17,46 +18,91 @@ use tracing::warn;
 
 use crate::serve::Answer;
 
-/// What this node serves of one source block for one target: every part
-/// it could build, in leaf order, and the count witness.
+/// The bytes of served parts kept per hosted shard seat, so a host with
+/// k seats keeps up to k times this.
+///
+/// Thirty-two full fetch responses: the parts a target committee is
+/// still asking for are those of the few newest blocks, and a part the
+/// cache let go is built again when next asked.
+pub const PROVISION_CACHE_BYTES: usize = 32 * MAX_FETCH_RESPONSE_BYTES;
+
+/// What this node serves at one leaf index of a source block for one
+/// target: the part, or `None` where this node cannot build it, beside
+/// the block's count witness.
 #[derive(Clone)]
-pub struct ServedProvisions {
-    parts: Vec<Provision>,
-    count: Option<ProvisionCount>,
+pub struct ServedPart {
+    part: Option<Provision>,
+    bytes: usize,
+    count: ProvisionCount,
 }
 
-impl ServedProvisions {
-    /// The answer to an ask for `indices`: the built parts among them, as
-    /// many as a fetch response's budget carries past the first, and the
-    /// count witness whatever was built. An index left out is asked
-    /// again elsewhere.
+impl ServedPart {
+    /// `part` as served at its index of the block `count` states.
     #[must_use]
-    pub fn answer(&self, indices: &[u32]) -> GetProvisionResponse {
-        let mut answer = Answer::<Provision, MAX_TXS_PER_BLOCK>::of(indices.len())
-            .within(MAX_FETCH_RESPONSE_BYTES);
-        answer.offer_all(
-            self.parts
-                .iter()
-                .filter(|part| indices.contains(&part.leaf().index))
-                .cloned(),
-            encoded_len,
-        );
-        GetProvisionResponse {
-            parts: answer.finish(),
-            count: self.count,
+    pub fn new(part: Option<Provision>, count: ProvisionCount) -> Self {
+        Self {
+            bytes: part.as_ref().map_or(0, encoded_len),
+            part,
+            count,
         }
+    }
+
+    /// What it costs the serve cache: its part's encoding and its slot.
+    pub const fn weight(&self) -> usize {
+        self.bytes.saturating_add(size_of::<Self>())
     }
 }
 
-/// Build what this node serves of its block at `height` for
-/// `target_shard`, or `None` where it does not hold the block.
+/// What one build of a held block made for an ask.
+pub struct BuiltParts {
+    /// The block's count witness, or `None` where it owes the target
+    /// nothing.
+    pub count: Option<ProvisionCount>,
+    /// A served part for each index built, in leaf order.
+    pub parts: Vec<(u32, ServedPart)>,
+}
+
+/// The answer to an ask from what was served at its indices, in leaf
+/// order: the built parts, as many as a fetch response's budget carries
+/// past the first, and the count witness — taken from any of them, else
+/// `count`. An index left out is asked again elsewhere.
+pub fn provision_answer(
+    asked: usize,
+    served: impl IntoIterator<Item = ServedPart>,
+    count: Option<ProvisionCount>,
+) -> GetProvisionResponse {
+    let mut answer =
+        Answer::<Provision, MAX_TXS_PER_BLOCK>::of(asked).within(MAX_FETCH_RESPONSE_BYTES);
+    let mut count = count;
+    for served in served {
+        count = Some(served.count);
+        if let Some(part) = served.part
+            && answer.offer(part, served.bytes).is_break()
+        {
+            break;
+        }
+    }
+    GetProvisionResponse {
+        parts: answer.finish(),
+        count,
+    }
+}
+
+/// Build what this node serves at `indices` (ascending) of its block at
+/// `height` for `target_shard`, or `None` where it does not hold the
+/// block.
+///
+/// Builds in leaf order and stops once what it built fills a fetch
+/// response, so one ask costs at most a response's worth of parts
+/// whatever it names; an index past that point is not built, and is
+/// asked again. An owed index that cannot be built is served as `None`.
 ///
 /// Reads the source block through [`PendingChain`] so heights still inside
 /// the shard-committed / JMT-persisted window are reachable; reconstructs
 /// per-tx [`ProvisionsRequest`]s from the block's declared reads + writes;
-/// then hands them to [`build_provisions`], which is the same function the
-/// gossip emit path runs, so a receiver absorbs byte-identical parts
-/// regardless of which transport delivered them.
+/// then builds through [`build_provisions_until`], the builder the gossip
+/// emit path runs, so a receiver absorbs byte-identical parts regardless
+/// of which transport delivered them.
 ///
 /// `derivation` is this node's: routing is a derived fact, and a block
 /// read back out of storage carries none.
@@ -64,14 +110,15 @@ impl ServedProvisions {
 /// Takes `local_shard` and the active `ShardTrie` rather than a topology
 /// handle. The caller loads the trie at serve time so routing always resolves
 /// against the current partition.
-pub fn build_served_provisions<S: ShardStorage>(
+pub fn build_served_parts<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
     derivation: &dyn Derivation,
     local_shard: ShardId,
     shard_trie: &ShardTrie,
     height: BlockHeight,
     target_shard: ShardId,
-) -> Option<ServedProvisions> {
+    indices: &[u32],
+) -> Option<BuiltParts> {
     let Some(certified) = pending_chain.certified_block(height) else {
         warn!(
             block_height = height.inner(),
@@ -98,19 +145,39 @@ pub fn build_served_provisions<S: ShardStorage>(
         request.targets = vec![target_shard];
         requests.push(request);
     }
+    let Some(count) = provision_count(&requests, target_shard) else {
+        return Some(BuiltParts {
+            count: None,
+            parts: Vec::new(),
+        });
+    };
     let view = pending_chain.view_at_persisted_tip();
-    let parts = build_provisions(
+    let mut parts = Vec::new();
+    let mut spent = 0usize;
+    build_provisions_until(
         &view,
         local_shard,
         target_shard,
         height,
         block.header().parent_qc().weighted_timestamp(),
         &requests,
-        |_| true,
+        |index, build| {
+            if indices.binary_search(&index).is_err() {
+                return ControlFlow::Continue(());
+            }
+            let served = ServedPart::new(build(), count);
+            spent = spent.saturating_add(served.bytes);
+            parts.push((index, served));
+            if spent >= MAX_FETCH_RESPONSE_BYTES {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
     );
-    Some(ServedProvisions {
+    Some(BuiltParts {
+        count: Some(count),
         parts,
-        count: provision_count(&requests, target_shard),
     })
 }
 
@@ -132,13 +199,10 @@ pub fn outbound_answer(
         count: first.leaf().count,
         merkle_root: first.leaf().merkle_root(first.leaf_hash())?,
     };
-    Some(
-        ServedProvisions {
-            parts,
-            count: Some(count),
-        }
-        .answer(&req.indices),
-    )
+    let served = parts
+        .into_iter()
+        .map(|part| ServedPart::new(Some(part), count));
+    Some(provision_answer(req.indices.len(), served, Some(count)))
 }
 
 #[cfg(test)]
@@ -226,16 +290,31 @@ mod tests {
         );
         let pending_chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
 
-        let served = build_served_provisions(
-            &pending_chain,
-            &StubVmStatics,
-            local,
-            &trie,
-            height,
-            payer_shard,
-        )
-        .expect("the block is held")
-        .answer(&[0]);
+        let build = |indices: &[u32]| {
+            build_served_parts(
+                &pending_chain,
+                &StubVmStatics,
+                local,
+                &trie,
+                height,
+                payer_shard,
+                indices,
+            )
+            .expect("the block is held")
+        };
+        let past = build(&[1]);
+        assert!(
+            past.parts.is_empty(),
+            "an index past the count builds nothing"
+        );
+        assert!(past.count.is_some(), "and still states the count");
+
+        let first = build(&[0]);
+        let served = provision_answer(
+            1,
+            first.parts.into_iter().map(|(_, served)| served),
+            first.count,
+        );
         assert_eq!(
             served
                 .parts
@@ -263,13 +342,14 @@ mod tests {
             .map(provision_leaf)
             .collect();
         let count = ProvisionCount::over(&leaves);
-        let served = ServedProvisions {
-            parts: Vec::new(),
-            count: Some(count),
-        };
-        let answer = served.answer(&[0, 1, 7]);
-        assert!(answer.parts.is_empty());
-        assert_eq!(answer.count, Some(count));
-        assert!(!GetProvisionsRequest::is_empty_response(&answer));
+        let unbuildable = ServedPart::new(None, count);
+        for answer in [
+            provision_answer(3, [unbuildable], None),
+            provision_answer(3, [], Some(count)),
+        ] {
+            assert!(answer.parts.is_empty());
+            assert_eq!(answer.count, Some(count));
+            assert!(!GetProvisionsRequest::is_empty_response(&answer));
+        }
     }
 }

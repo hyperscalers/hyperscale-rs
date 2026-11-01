@@ -26,11 +26,13 @@ use hyperscale_types::network::request::beacon::{
     GetBeaconBlockRequest, GetBeaconCandidateRequest, GetBeaconProposalRequest,
     GetShardWitnessesRequest,
 };
-use hyperscale_types::network::request::{GetFinalizationsRequest, GetLocalProvisionsRequest};
+use hyperscale_types::network::request::{
+    GetFinalizationsRequest, GetLocalProvisionsRequest, GetProvisionsRequest,
+};
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    BeaconProposal, ExecutionCertificate, HeaderSource, ShardId, Signed, Verifiable, Verified,
-    signed_bytes,
+    BeaconProposal, BlockHeight, ExecutionCertificate, HeaderSource, ShardId, Signed, Verifiable,
+    Verified, signed_bytes,
 };
 use tracing::warn;
 
@@ -38,9 +40,9 @@ use crate::beacon::gossip::register_beacon_gossip_handlers;
 use crate::event::{HostEvent, Offer, ShardInbox, ShardScopedInput};
 use crate::host::NodeHost;
 use crate::process::ProcessIo;
-use crate::process::single_flight::{Flight, SingleFlight};
+use crate::process::single_flight::SingleFlight;
 use crate::serve::Served;
-use crate::shard::cross_shard::crossing_push;
+use crate::shard::cross_shard::{BuiltParts, ServedPart, crossing_push, provision_answer};
 use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
@@ -1085,6 +1087,45 @@ fn register_served<R, N>(
     });
 }
 
+/// Served parts kept per `(height, target shard, leaf index)`.
+type ProvisionFlight = SingleFlight<(BlockHeight, ShardId, u32), ServedPart>;
+
+/// Answer a provision ask through `flight`: each asked index from the
+/// cache, from a build another ask is already running for it, or by
+/// `build` over the indices nobody holds. A block not held builds
+/// nothing and is not kept: it may yet commit here, and a cached miss
+/// would outlive that.
+fn serve_provisions(
+    flight: &ProvisionFlight,
+    req: &GetProvisionsRequest,
+    build: impl FnOnce(&[u32]) -> Option<BuiltParts>,
+) -> GetProvisionResponse {
+    let mut indices: Vec<u32> = req.indices.to_vec();
+    indices.sort_unstable();
+    indices.dedup();
+    let keys: Vec<_> = indices
+        .iter()
+        .map(|index| (req.height, req.target_shard, *index))
+        .collect();
+    let mut count = None;
+    let served = flight.get_or_produce(&keys, |own| {
+        let own: Vec<u32> = own.iter().map(|(.., index)| *index).collect();
+        let Some(made) = build(&own) else {
+            return Vec::new();
+        };
+        count = made.count;
+        made.parts
+            .into_iter()
+            .map(|(index, served)| ((req.height, req.target_shard, index), served))
+            .collect()
+    });
+    provision_answer(
+        req.indices.len(),
+        served.into_iter().filter_map(|(_, flight)| flight.value()),
+        count,
+    )
+}
+
 /// Register one shard's per-type request handlers with the network.
 ///
 /// Each handler is a closure that captures that shard's state and
@@ -1119,9 +1160,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::beacon::witness_serve::serve_shard_witnesses_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        SettledTxsCache, build_served_provisions, outbound_answer, serve_cells_request,
-        serve_finalizations_request, serve_local_provisions_request, serve_remote_headers_request,
-        serve_settled_txs_request, serve_state_proof_request,
+        PROVISION_CACHE_BYTES, SettledTxsCache, build_served_parts, outbound_answer,
+        serve_cells_request, serve_finalizations_request, serve_local_provisions_request,
+        serve_remote_headers_request, serve_settled_txs_request, serve_state_proof_request,
     };
     use crate::shard::mempool::serve_transaction_request;
     use crate::{serve_state_range_request, serve_witness_history_request};
@@ -1139,9 +1180,6 @@ pub fn register_shard_request_handlers<S, N, D>(
     // by then the producer has typically published a result that the
     // cache fast path will serve.
     const MAX_WAITERS_PER_KEY: usize = 64;
-
-    // Produced provisions kept per shard, by (height, target shard).
-    const PROVISION_CACHE_CAPACITY: usize = 256;
 
     // Each handler closure captures this shard's `PendingChain` and
     // per-protocol caches. Every CHAIN read goes through
@@ -1239,18 +1277,20 @@ pub fn register_shard_request_handlers<S, N, D>(
 
     // ── provision.request → serve from local store ───────────────
     //
-    // Dedup + cache: the proof for (block_height, target_shard) is
-    // deterministic, and many validators request the same provisions.
-    // Without dedup each request regenerates the merkle proof, and under
-    // load the redundant generations per height thrash the CPU.
+    // Dedup + cache: the part at (block_height, target_shard, index) is
+    // deterministic, and many validators request the same parts. Without
+    // dedup each request regenerates the merkle proof, and under load the
+    // redundant generations per height thrash the CPU. The cache is held
+    // to `PROVISION_CACHE_BYTES` for this seat.
 
     let pending_chain = Arc::clone(&io.pending_chain);
     let topology_snapshot = process.topology_snapshot.clone();
     let outbound_cache = Arc::clone(&io.caches.provision_store);
     let derivation = process.derivation();
 
-    let provisions_flight = SingleFlight::new(
-        PROVISION_CACHE_CAPACITY,
+    let provisions_flight: ProvisionFlight = SingleFlight::new(
+        PROVISION_CACHE_BYTES,
+        ServedPart::weight,
         MAX_WAITERS_PER_KEY,
         PRODUCER_WAIT_BUDGET,
     );
@@ -1267,26 +1307,17 @@ pub fn register_shard_request_handlers<S, N, D>(
                 return response;
             }
 
-            // The block's whole build is kept per (height, target), and
-            // each ask answered from it. A block not held is not kept:
-            // it may yet commit here, and a cached miss would outlive
-            // that.
-            let cache_key = (req.height.inner(), req.target_shard.inner());
-            match provisions_flight.get_or_produce(cache_key, || {
-                build_served_provisions(
+            serve_provisions(&provisions_flight, req, |indices| {
+                build_served_parts(
                     &pending_chain,
                     derivation.as_ref(),
                     shard,
                     topology_snapshot.load().shard_trie(),
                     req.height,
                     req.target_shard,
+                    indices,
                 )
-            }) {
-                Flight::Cached(served) | Flight::Joined(served) | Flight::Produced(served) => {
-                    served.answer(&req.indices)
-                }
-                Flight::Unavailable => GetProvisionResponse::empty(),
-            }
+            })
         },
     );
 
@@ -1411,6 +1442,7 @@ pub fn register_shard_request_handlers<S, N, D>(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use crossbeam::channel::{Receiver, unbounded};
     use hyperscale_core::ProtocolEvent;
@@ -1423,15 +1455,19 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockProposalMessage,
-        CertifiedBlockHeader, ChainOrigin, ConsensusSignature, NetworkDefinition, NetworkMessage,
-        QuorumCertificate, ReadySignal, ShardId, Verifiable, Verified, WeightedTimestamp,
-        signed_bytes,
+        CertifiedBlockHeader, ChainOrigin, ConsensusSignature, Hash, LeafPath,
+        MAX_MERKLE_PROOF_LEN, MerkleInclusionProof, NetworkDefinition, NetworkMessage, Provision,
+        ProvisionCount, ProvisionParts, QuorumCertificate, ReadySignal, ShardId, TxHash,
+        Verifiable, Verified, WeightedTimestamp, provision_leaf, signed_bytes,
     };
 
+    use super::{GetProvisionsRequest, ProvisionFlight, serve_provisions};
     use crate::event::{
         HostEvent, NETWORK_LANE_CAPACITY, NetworkLaneReceiver, ShardInbox, ShardScopedInput,
         network_lane,
     };
+    use crate::process::single_flight::SingleFlight;
+    use crate::shard::cross_shard::{BuiltParts, PROVISION_CACHE_BYTES, ServedPart};
     use crate::shard::push_shard_input;
     use crate::shard::test_host::{CountingVerifier, Fixture, Host, SHARD, loop_of};
 
@@ -1786,5 +1822,74 @@ mod tests {
             "the host's own header lands verified",
         );
         assert_eq!(network.len(), 0);
+    }
+
+    /// The part a source block at `height` owes its one target, its
+    /// proof at the decode cap.
+    fn heavy_part(height: u64) -> ServedPart {
+        let tx_hash = TxHash::from(Hash::from_bytes(&height.to_le_bytes()));
+        let part = Provision::new(ProvisionParts {
+            source_shard: SHARD,
+            target_shard: ShardId::leaf(1, 1),
+            block_height: BlockHeight::new(height),
+            source_block_ts: WeightedTimestamp::ZERO,
+            tx_hash,
+            entries: Capped::empty(),
+            proof: MerkleInclusionProof::new(vec![0x5A; MAX_MERKLE_PROOF_LEN]),
+            leaf: LeafPath {
+                count: 1,
+                index: 0,
+                siblings: Capped::empty(),
+            },
+        });
+        ServedPart::new(Some(part), ProvisionCount::over(&[provision_leaf(tx_hash)]))
+    }
+
+    /// A seat's provision serve keeps the parts it built within its byte
+    /// budget. Filled with parts at the proof cap, it answers each again
+    /// without building; a newer block's part lets the oldest go, and
+    /// that one is built again when next asked.
+    #[test]
+    fn the_provision_serve_cache_lets_its_oldest_part_go_at_its_byte_budget() {
+        let flight: ProvisionFlight = SingleFlight::new(
+            PROVISION_CACHE_BYTES,
+            ServedPart::weight,
+            1,
+            Duration::from_secs(5),
+        );
+        let fits = u64::try_from(PROVISION_CACHE_BYTES / heavy_part(0).weight()).unwrap();
+        let ask = |height: u64| -> bool {
+            let mut built = false;
+            let response = serve_provisions(
+                &flight,
+                &GetProvisionsRequest::new(
+                    BlockHeight::new(height),
+                    ShardId::leaf(1, 1),
+                    Capped::from_array([0]),
+                ),
+                |indices| {
+                    assert_eq!(indices, [0]);
+                    built = true;
+                    Some(BuiltParts {
+                        count: None,
+                        parts: vec![(0, heavy_part(height))],
+                    })
+                },
+            );
+            assert_eq!(response.parts.len(), 1, "every ask is answered");
+            built
+        };
+
+        for height in 1..=fits {
+            assert!(ask(height), "the first ask builds");
+        }
+        for height in 1..=fits {
+            assert!(!ask(height), "a part within the budget is kept");
+        }
+        assert!(ask(fits + 1), "a newer block's part builds");
+        assert!(ask(1), "the oldest went to make room, and is built again");
+        for height in 2..=fits + 1 {
+            assert!(!ask(height), "the rest are still kept");
+        }
     }
 }
