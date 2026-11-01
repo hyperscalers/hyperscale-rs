@@ -32,28 +32,47 @@ struct QueuedProvision {
 #[derive(Debug)]
 pub struct QueuedProvisionBuffer {
     queue: Vec<QueuedProvision>,
+    /// The hash of every entry in `queue`, each once.
+    queued: HashSet<ProvisionHash>,
     min_dwell_time: Duration,
 }
 
 impl QueuedProvisionBuffer {
-    pub(crate) const fn new(min_dwell_time: Duration) -> Self {
+    pub(crate) fn new(min_dwell_time: Duration) -> Self {
         Self {
             queue: Vec::new(),
+            queued: HashSet::new(),
             min_dwell_time,
         }
     }
 
-    /// Push verified provisions onto the proposal queue.
+    /// Push verified provisions onto the proposal queue. A part already
+    /// queued keeps its place and its dwell.
     pub(crate) fn enqueue(
         &mut self,
         provisions: Verified<Provision>,
         source_block_ts: WeightedTimestamp,
         added_at: LocalTimestamp,
     ) {
+        if !self.queued.insert(provisions.hash()) {
+            return;
+        }
         self.queue.push(QueuedProvision {
             provisions,
             added_at,
             source_block_ts,
+        });
+    }
+
+    /// Keep only the entries `keep` holds to.
+    fn retain(&mut self, keep: impl Fn(&QueuedProvision) -> bool) {
+        let queued = &mut self.queued;
+        self.queue.retain(|q| {
+            let kept = keep(q);
+            if !kept {
+                queued.remove(&q.provisions.hash());
+            }
+            kept
         });
     }
 
@@ -63,21 +82,19 @@ impl QueuedProvisionBuffer {
         if committed_hashes.is_empty() {
             return;
         }
-        self.queue
-            .retain(|q| !committed_hashes.contains(&q.provisions.hash()));
+        self.retain(|q| !committed_hashes.contains(&q.provisions.hash()));
     }
 
     /// Drop queued provisions whose deadline has passed `now`.
     pub(crate) fn drop_past_deadline(&mut self, now: WeightedTimestamp) {
-        self.queue
-            .retain(|q| q.provisions.deadline(q.source_block_ts) > now);
+        self.retain(|q| q.provisions.deadline(q.source_block_ts) > now);
     }
 
     /// Drop queued provisions sourced from `shard` strictly above a pending
     /// recovery's attested frontier — every peer rejects them, so proposing
     /// them only burns rounds.
     pub(crate) fn purge_fenced(&mut self, shard: ShardId, frontier: BlockHeight) {
-        self.queue.retain(|q| {
+        self.retain(|q| {
             q.provisions.source_shard() != shard || q.provisions.block_height() <= frontier
         });
     }
@@ -229,6 +246,22 @@ mod tests {
         buf.on_block_committed(&committed);
 
         assert_eq!(buf.queue_len(), 0);
+    }
+
+    /// A part queued twice is offered once, keeps its first dwell, and
+    /// queues again once its entry has gone.
+    #[test]
+    fn a_part_queued_twice_is_offered_once() {
+        let mut buf = QueuedProvisionBuffer::new(Duration::from_millis(500));
+        let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
+        buf.enqueue(provisions.clone(), ts(1_000), local(0));
+        buf.enqueue(provisions.clone(), ts(1_000), local(400));
+        assert_eq!(buf.queue_len(), 1);
+        assert_eq!(buf.queued(local(500), ts(1_000)).len(), 1);
+
+        buf.on_block_committed(&std::iter::once(provisions.hash()).collect());
+        buf.enqueue(provisions, ts(1_000), local(600));
+        assert_eq!(buf.queue_len(), 1);
     }
 
     #[test]

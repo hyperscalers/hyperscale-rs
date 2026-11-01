@@ -10,7 +10,7 @@
 //! headers, then dispatches `VerifyProvisions` to verify the QC signature
 //! once and merkle proofs per state entry against the committed state root.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -297,7 +297,7 @@ impl ProvisionCoordinator {
         // because a window two coordinators both maintain is two windows
         // that have to agree.
         let manifest = BlockManifest::from_block(block);
-        let committed: std::collections::HashSet<ProvisionHash> =
+        let committed: HashSet<ProvisionHash> =
             manifest.provision_hashes().iter().copied().collect();
         self.queue.on_block_committed(&committed);
         // Single retention cutoff for the orphan sweep, one span for
@@ -653,7 +653,12 @@ impl ProvisionCoordinator {
             let local_ts = self.expected.local_ts();
             let source_block_ts = certified_header.header().parent_qc().weighted_timestamp();
             let mut owed = Vec::with_capacity(drained.len());
+            let mut seen = HashSet::new();
             for part in drained {
+                // A part parked twice, by two deliveries, is verified once.
+                if !seen.insert(part.hash()) {
+                    continue;
+                }
                 if self.committed_provisions.contains(&part.hash()) {
                     debug!(
                         shard = shard.inner(),
@@ -747,15 +752,19 @@ impl ProvisionCoordinator {
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
+        let mut seen = HashSet::new();
         for part in parts {
             let source_shard = part.source_shard();
             let block_height = part.block_height();
-            if !self.takes(
-                topology_schedule,
-                source_shard,
-                part.target_shard(),
-                block_height,
-            ) {
+            // A part twice in one delivery is admitted once.
+            if !seen.insert(part.hash())
+                || !self.takes(
+                    topology_schedule,
+                    source_shard,
+                    part.target_shard(),
+                    block_height,
+                )
+            {
                 continue;
             }
 
@@ -831,15 +840,19 @@ impl ProvisionCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut by_block: BTreeMap<(ShardId, BlockHeight), Vec<Provision>> = BTreeMap::new();
+        let mut seen = HashSet::new();
         for part in parts {
             let source_shard = part.source_shard();
             let block_height = part.block_height();
-            if !self.takes(
-                topology_schedule,
-                source_shard,
-                part.target_shard(),
-                block_height,
-            ) {
+            // A part twice in one delivery is verified once.
+            if !seen.insert(part.hash())
+                || !self.takes(
+                    topology_schedule,
+                    source_shard,
+                    part.target_shard(),
+                    block_height,
+                )
+            {
                 continue;
             }
 
@@ -1959,6 +1972,68 @@ mod tests {
             }
             other => panic!("Expected VerifyProvisions, got {other:?}"),
         }
+    }
+
+    /// The parts of every verify action in `actions`, by hash.
+    fn sent_to_verify(actions: &[Action]) -> Vec<ProvisionHash> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Provisions(ProvisionAction::VerifyProvisions { parts, .. }) => {
+                    Some(parts.iter().map(Provision::hash))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// A part repeated within a delivery, or parked by two deliveries, is
+    /// verified once and queued once, whichever path it takes.
+    #[test]
+    fn a_repeated_part_is_verified_and_queued_once() {
+        let local = ShardId::leaf(2, 0);
+        let source_shard = ShardId::leaf(2, 1);
+        let height = BlockHeight::new(10);
+        let tx_hashes = txs(2);
+        let header = make_certified_header_committing(source_shard, height, local, &tx_hashes);
+        let parts = make_provisions_multi(tx_hashes, source_shard, local, height);
+        let (first, second) = (parts[0].clone(), parts[1].clone());
+
+        let mut coordinator = ProvisionCoordinator::new(local);
+        deliver_committed_header(&mut coordinator, &header);
+        let actions = coordinator.on_state_provisions_received(
+            &sched(),
+            vec![first.clone(), first.clone(), second.clone()],
+        );
+        assert_eq!(sent_to_verify(&actions), vec![first.hash(), second.hash()]);
+
+        let mut coordinator = ProvisionCoordinator::new(local);
+        coordinator.on_state_provisions_received(&sched(), vec![first.clone()]);
+        coordinator.on_state_provisions_received(&sched(), vec![first.clone()]);
+        coordinator.on_verified_state_provisions_received(
+            &sched(),
+            vec![
+                Verified::new_unchecked_for_test(second.clone()),
+                Verified::new_unchecked_for_test(second.clone()),
+            ],
+            LocalTimestamp::ZERO,
+        );
+        assert_eq!(coordinator.pipeline.pending_len(), 3, "the parked repeat");
+        let actions = deliver_committed_header(&mut coordinator, &header);
+        assert_eq!(sent_to_verify(&actions), vec![first.hash(), second.hash()]);
+
+        coordinator.on_state_provisions_verified(
+            verified(vec![first.clone(), first.clone(), second.clone()]),
+            Anchor::of(&header),
+            LocalTimestamp::ZERO,
+        );
+        let queued: Vec<_> = coordinator
+            .queued_provisions(LocalTimestamp::from_millis(60_000))
+            .iter()
+            .map(|part| part.hash())
+            .collect();
+        assert_eq!(queued, vec![first.hash(), second.hash()]);
     }
 
     #[test]
