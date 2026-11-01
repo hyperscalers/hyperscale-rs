@@ -3211,8 +3211,9 @@ mod tests {
     }
 
     /// Parts arriving by gossip across several notifications ask for
-    /// nothing: the expectation completes on the last of them, and no
-    /// fetch goes out then or after the timeout.
+    /// nothing: the first teaches the count while the expectation is not
+    /// yet requested, blocks commit short of the fallback timeout with
+    /// the rest still owed, and the last completes it.
     #[test]
     fn gossip_in_several_notifications_sends_no_fetch() {
         let txs = txs(3);
@@ -3223,26 +3224,32 @@ mod tests {
             ShardId::leaf(2, 0),
             BlockHeight::new(10),
         );
-        let mut actions = Vec::new();
-        for pack in [&parts[..2], &parts[2..]] {
-            actions.extend(coordinator.on_state_provisions_received(&sched(), pack.to_vec()));
+        let deliver = |coordinator: &mut ProvisionCoordinator, pack: &[Provision]| {
+            let mut actions = coordinator.on_state_provisions_received(&sched(), pack.to_vec());
             actions.extend(coordinator.on_state_provisions_verified(
                 verified(pack.to_vec()),
                 Anchor::of(&header),
                 LocalTimestamp::ZERO,
             ));
+            actions
+        };
+
+        let mut actions = deliver(&mut coordinator, &parts[..2]);
+        assert_eq!(coordinator.expected.len(), 1, "the third part is owed");
+        // The fallback timeout is ten blocks past the first commit.
+        for h in 1..=10 {
+            let committed =
+                coordinator.on_block_committed(&sched(), &make_block(BlockHeight::new(h)));
+            assert!(asked(&committed).is_empty(), "no fetch at height {h}");
+            actions.extend(committed);
         }
+        actions.extend(deliver(&mut coordinator, &parts[2..]));
         assert!(asked(&actions).is_empty());
         assert!(
             abandoned(&actions).is_empty(),
             "nothing was asked to let go of"
         );
         assert_eq!(coordinator.expected.len(), 0);
-        for h in 1..=30 {
-            let actions =
-                coordinator.on_block_committed(&sched(), &make_block(BlockHeight::new(h)));
-            assert!(asked(&actions).is_empty(), "no fetch at height {h}");
-        }
     }
 
     /// The witness teaches the count without index 0 ever arriving, and
