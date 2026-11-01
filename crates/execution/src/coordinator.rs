@@ -1125,6 +1125,7 @@ impl ExecutionCoordinator {
                 verified,
                 member.reach().clone(),
                 block.ts,
+                classification.shard_trie(),
                 classification.prices(),
                 member.classified().clone(),
             );
@@ -1248,7 +1249,6 @@ impl ExecutionCoordinator {
             });
         }
         lines.extend(self.candidates.named(
-            anchored.shard_trie(),
             &self.provisioning,
             &mut self.provisional_cells(),
             self.committed_ts,
@@ -1510,9 +1510,9 @@ impl ExecutionCoordinator {
                 | TickLine::End { .. } => {}
             }
         }
-        let (admitted, in_hand) =
-            self.candidates
-                .take_named(lines, &self.provisioning, anchored.shard_trie(), block.ts);
+        let (admitted, in_hand) = self
+            .candidates
+            .take_named(lines, &self.provisioning, block.ts);
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
@@ -13647,6 +13647,7 @@ mod tests {
             Verified::new_unchecked_for_test(straddling_transaction(1)),
             BTreeSet::from([HOME, PEER]),
             WeightedTimestamp::ZERO,
+            &ShardTrie::uniform(1),
             PriceTable::GENESIS,
             leg_classified(),
         );
@@ -13877,19 +13878,20 @@ mod tests {
         );
         // The candidate the want is filed for, which is what keeps the
         // want standing across the commits the tests make.
-        state.candidates.register_member(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-            Member::whole(HOME),
-            now,
-            PriceTable::GENESIS,
-        );
-        state.provisioning.advance_clock(now);
-        state.committed_ts = now;
         let trie = schedule
             .at(now)
             .expect("the window is seated")
             .shard_trie()
             .clone();
+        state.candidates.register_member(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+            Member::whole(HOME),
+            now,
+            &trie,
+            PriceTable::GENESIS,
+        );
+        state.provisioning.advance_clock(now);
+        state.committed_ts = now;
         let (state_root, proof) = state_and_proof(PEER, &[record_key], &[record_key]);
         let anchor = Anchor {
             shard: PEER,
