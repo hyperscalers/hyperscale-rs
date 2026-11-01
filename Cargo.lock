@@ -2447,6 +2447,7 @@ dependencies = [
  "hyperscale-jmt",
  "hyperscale-metrics",
  "hyperscale-network",
+ "hyperscale-provisions",
  "hyperscale-storage",
  "hyperscale-storage-memory",
  "hyperscale-storage-rocksdb",

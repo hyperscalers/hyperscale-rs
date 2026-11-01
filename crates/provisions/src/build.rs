@@ -117,8 +117,11 @@ fn requests_for(
 ///
 /// `view` is anchored at the source block itself, whose height every
 /// part names; nothing is built where it does not hold its anchor's
-/// state. No root is consulted: a sender holds what this builds to its
-/// own header's root before it leaves.
+/// state. No root is consulted, so nothing holds what this builds to
+/// what the source header committed: a fixture for tests of the parts
+/// themselves. A sender builds through [`build_owed_until`] once the
+/// leaves it owes walk to its header's root.
+#[cfg(feature = "test-utils")]
 #[must_use]
 pub fn build_provisions<S>(
     view: &SubstateView<S>,

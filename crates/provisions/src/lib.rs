@@ -29,7 +29,9 @@ mod store;
 mod verification;
 mod verified_headers;
 
-pub use build::{Owed, build_part, build_provisions};
+#[cfg(feature = "test-utils")]
+pub use build::build_provisions;
+pub use build::{Owed, build_part};
 pub use content::{Unrouted, leaves_over_requests, provision_tx_roots, served_keys, served_leaf};
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};

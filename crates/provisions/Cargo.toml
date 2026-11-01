@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Centralized provision coordination for cross-shard transactions"
 
+[features]
+test-utils = []
+
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-engine.workspace = true
@@ -23,6 +26,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 hyperscale-jmt.workspace = true
+hyperscale-provisions = { workspace = true, features = ["test-utils"] }
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
 hyperscale-storage-rocksdb.workspace = true

@@ -811,10 +811,10 @@ impl ProvisionCoordinator {
                     actions.extend(Self::retire_fetches_for(&part));
                     continue;
                 }
-                // This host built the part, but a proposer replaying its
-                // block after a restart skips transactions it never
-                // routed and builds parts on a short leaf list, so each
-                // meets the header's root like any other.
+                // This host built the part, and its sender held the leaves
+                // it owes to the header's root before sending. The part
+                // meets the root again here like any other, so no receive
+                // path admits one unchecked.
                 let anchor = Anchor::of(&verified_header);
                 if let Err(refusal) = judge_owed(self.local_shard, &part, &verified_header) {
                     actions.push(refused(vec![Err((part.into_inner(), refusal))], anchor));
