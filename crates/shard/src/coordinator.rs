@@ -4357,6 +4357,16 @@ impl ShardCoordinator {
             trace!("Already have pending block {}", block_hash);
             return sync_actions;
         }
+        // A block held certified needs no assembly, and a pending entry
+        // assembling it would shadow its body in the chain walks.
+        if self
+            .verification
+            .cached_verified_certified_block(block_hash)
+            .is_some()
+        {
+            trace!("Already hold certified block {}", block_hash);
+            return sync_actions;
+        }
 
         // Don't store headers far above the committed tip. A forged
         // quorum-power `parent_qc` passes `validate_header` at any height, so
@@ -8375,6 +8385,20 @@ impl ShardCoordinator {
         // `collect_commit_prefix` ancestor — once its child is admitted.
         self.verification
             .insert_verified_certified_block(block_hash, Arc::clone(&certified));
+        // A pending entry still assembling this block is superseded by the
+        // body: the chain walks read a pending entry's received content
+        // before a certified body, so a half-assembled entry left beside it
+        // would hide what the block carries, and its fetches and round
+        // pricing would chase content already held.
+        let superseded = if self
+            .pending_blocks
+            .get(block_hash)
+            .is_some_and(|pending| pending.block().is_none())
+        {
+            self.remove_pending_block(block_hash)
+        } else {
+            Vec::new()
+        };
         self.block_sync.mark_applied(height, block_hash);
         self.initiate_synced_state_root_verification(topology_schedule, certified.block());
         if matches!(self.retained_tip, Some(RetainedTip::Offered(_))) {
@@ -8386,6 +8410,7 @@ impl ShardCoordinator {
         // fetch the certified tip it must extend only from hosts that
         // synced it.
         let mut actions = vec![Action::SyncBlockApplied { height }];
+        actions.extend(superseded);
         actions.extend(certified_block_landed(Arc::clone(&certified)));
         let own = certified.qc_verified();
         let mut commits = self.try_two_chain_commit(own, CommitSource::Sync);
@@ -10253,7 +10278,7 @@ impl ShardCoordinator {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
     use hyperscale_core::{Action, Delegated};
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
@@ -10283,9 +10308,9 @@ mod tests {
         BeaconWitnessLeafCount, BlockHeaderParts, BlockManifestParts, BodyRoot, ChainOrigin,
         CollectionId, CommittedAt, ConsensusReceipt, ConsensusSignature, Deadline, Decision,
         Declared, DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause,
-        Epoch, Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LEAF_KEY_BYTES, LeafRoot,
-        MAX_HOLDS_PER_MEMBER, MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD,
+        Engagement, Epoch, Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs,
+        GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LEAF_KEY_BYTES,
+        LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD,
         MAX_TICK_MANIFEST_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK,
         MAX_UNSETTLED_TXS, MemberTerms, MerkleInclusionProof, Mode, NetworkDefinition, NetworkId,
         NetworkParams, Owes, PROGRESS_WAIT_MULTIPLIER, PrincipalAddr, ProvisionTxRoot,
@@ -10294,10 +10319,10 @@ mod tests {
         ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, StateWrites, StatedTerms,
         SubstateClaim, SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES,
         TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule,
-        TopologySnapshot, Transaction, TransactionEnvelope, TxOutcome, Unresolved, UnsettledTx,
-        VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, ValidatorInfo,
-        ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp, WindowLookup, WitnessSources,
-        decide, encode_amount, read_amount, receipt_hash_of, said_at, test_utils,
+        TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxOutcome,
+        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId,
+        ValidatorInfo, ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp, WindowLookup,
+        WitnessSources, decide, encode_amount, read_amount, receipt_hash_of, said_at, test_utils,
         tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
@@ -23535,6 +23560,112 @@ mod tests {
             state.is_block_syncing(),
             "the shard does not decide completion on its own"
         );
+    }
+
+    /// A block this node was still assembling when sync delivered it is
+    /// read whole by the chain walk: the synced body supersedes the
+    /// pending entry, so the walk reports every part it carries and every
+    /// transaction its finalizations decide, not only what had arrived.
+    #[test]
+    fn a_synced_block_supersedes_its_half_assembled_entry() {
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+
+        let part = |seed: u8| -> Verifiable<Provision> {
+            Provision::dummy_at(
+                ENGAGING_PAYER,
+                ShardId::ROOT,
+                BlockHeight::new(20),
+                WeightedTimestamp::from_millis(50),
+                engaged_tx(seed),
+            )
+            .into()
+        };
+        let (arrived, missing) = (part(1), part(2));
+        let finalization: Verifiable<Finalization> = test_utils::make_finalization(
+            BlockHeight::new(2),
+            engaged_tx(3),
+            TransactionDecision::Accept,
+        )
+        .into();
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let parent_qc = QuorumCertificate::new(
+            state.committed_hash,
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            BlockHash::ZERO,
+            Round::new(3),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(100_000),
+        );
+        let block = Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(4),
+                parent_block_hash: state.committed_hash,
+                parent_qc: parent_qc.into(),
+                timestamp: ProposerTimestamp::from_millis(100_000),
+                round: Round::new(4),
+                ..Default::default()
+            }),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::from_array([finalization.clone()])),
+            provisions: Arc::new(Capped::from_array([arrived.clone(), missing.clone()])),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let block_hash = block.hash();
+        let manifest = PendingBlock::from_complete_block(
+            &block,
+            vec![finalization.clone()],
+            vec![arrived.clone(), missing.clone()],
+            LocalTimestamp::ZERO,
+        )
+        .manifest()
+        .clone();
+        let header = block.header().clone();
+        let mut assembling =
+            PendingBlock::from_manifest(header.clone(), manifest.clone(), LocalTimestamp::ZERO);
+        assert!(assembling.add_provision(arrived.clone()));
+        state.pending_blocks.insert(assembling);
+
+        let engaged: BTreeSet<Engagement> = [&arrived, &missing]
+            .into_iter()
+            .map(|part| Engagement::of_part(part))
+            .collect();
+        let decided: HashSet<TxHash> = finalization.deciding_tx_hashes().collect();
+        assert!(!decided.is_empty());
+        let reads_whole = |state: &ShardCoordinator| {
+            let sets = QcChainSets::behind(&state.chain_view(), block_hash);
+            assert_eq!(sets.engaged, engaged);
+            assert_eq!(sets.resolved, decided);
+        };
+
+        let qc = make_test_qc(block_hash, BlockHeight::new(4));
+        let _ = state.apply_synced_block(&topology_schedule, block, qc);
+        reads_whole(&state);
+
+        let _ = state.on_block_header(
+            &topology_schedule,
+            &header,
+            manifest,
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(
+            !state.pending_blocks.contains_key(block_hash),
+            "a header arriving again opens no assembly beside the body"
+        );
+        reads_whole(&state);
     }
 
     /// A synced block whose QC verifies while the height below it is
