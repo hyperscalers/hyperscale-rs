@@ -6069,6 +6069,23 @@ pub mod tests {
         }
     }
 
+    /// With the first block's part in a QC-chain ancestor, the second's
+    /// part is admitted in the child once the anchor records the
+    /// recovery that orphans the first.
+    #[test]
+    fn a_second_source_block_is_admitted_below_an_ancestor_holding_an_orphaned_first() {
+        let two = TwoBlocks::new();
+        let mut against = TwoBlocks::against(true, CommitDedupIndex::new());
+        against.chain.engaged = BTreeMap::from([(
+            Engagement::of_part(&two.first),
+            against.anchor.plus(RETENTION_HORIZON),
+        )]);
+        let (voted, selected) = two.judged(&against, &[&two.second]);
+        assert_eq!(voted, Ok(()));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hash(), two.second.hash());
+    }
+
     /// A held engagement lets go at its carrying block's anchor plus the
     /// retention horizon whether a voter reads it off the QC chain or has
     /// committed the carrying block, so voters at different committed
