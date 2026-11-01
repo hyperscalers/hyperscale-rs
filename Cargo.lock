@@ -2454,6 +2454,7 @@ dependencies = [
  "papaya",
  "proptest",
  "serde",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -2501,6 +2502,7 @@ dependencies = [
  "hyperscale-metrics",
  "hyperscale-metrics-memory",
  "hyperscale-network",
+ "hyperscale-provisions",
  "hyperscale-storage",
  "hyperscale-storage-memory",
  "hyperscale-types",

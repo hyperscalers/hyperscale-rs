@@ -17,6 +17,7 @@
 
 pub mod action_handlers;
 mod build;
+mod content;
 mod coordinator;
 mod crossing_push;
 mod expected;
@@ -29,6 +30,7 @@ mod verification;
 mod verified_headers;
 
 pub use build::{build_provisions, build_provisions_until, provision_count};
+pub use content::{Unrouted, provision_tx_roots};
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};
 pub use requests::{ShardRecipients, build_provision_requests, provision_request};

@@ -24,6 +24,8 @@ use hyperscale_types::{
 };
 use tracing::warn;
 
+use crate::content::leaves_over_requests;
+
 /// The requests among `requests` that name `target_shard`, in order: one
 /// leaf each under the source header's root for that target.
 fn requests_for(
@@ -45,10 +47,9 @@ pub fn provision_count(
     requests: &[ProvisionsRequest],
     target_shard: ShardId,
 ) -> Option<ProvisionCount> {
-    let leaves: Vec<Hash> = requests_for(requests, target_shard)
-        .map(|req| provision_leaf(req.tx_hash))
-        .collect();
-    (!leaves.is_empty()).then(|| ProvisionCount::over(&leaves))
+    leaves_over_requests(requests)
+        .get(&target_shard)
+        .map(|leaves| ProvisionCount::over(leaves))
 }
 
 /// Build the parts of a source → target pair whose leaf index `wanted`

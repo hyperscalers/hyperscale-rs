@@ -21,6 +21,7 @@ use hyperscale_metrics::{
     record_signature_verification_failure, record_signature_verification_latency,
 };
 use hyperscale_network::{Network, Verdict, VerdictKey};
+use hyperscale_provisions::provision_tx_roots;
 use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
     MemberSections, ParentAnchor, PersistedPastAnchor, ShardChainWriter, ShardStorage,
@@ -44,14 +45,14 @@ use hyperscale_types::{
     Hash, LeafRoot, LocalReceiptRoot, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, ProposerTimestamp, Provision,
-    ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionsRoot, QcContext,
+    ProvisionHash, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, ProvisionsRoot, QcContext,
     QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, SectionRoots,
-    SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StandingAnswers, StateClaim,
-    StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim,
-    SubstateKey, SweepFrontier, TermsRoot, TermsSection, TickLine, TickManifest, TickManifestRoot,
-    Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
-    TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified,
-    Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
+    SetRoot, SettledTxsRoot, ShardId, ShardLoad, ShardTrie, SplitChildRoots, StandingAnswers,
+    StateClaim, StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt,
+    SubstateClaim, SubstateKey, SweepFrontier, TermsRoot, TermsSection, TickLine, TickManifest,
+    TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction,
+    TransactionRoot, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind,
+    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
     absorb_committed_cells, commit_witness_window, derive_leaves, fees_over_certificates,
     local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
     shard_prefix_path, shard_reveal_sign, signed_bytes, tick_terms_admit_block,
@@ -508,13 +509,9 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     provision_hashes.sort();
 
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
-    let provision_tx_roots = Verified::<ProvisionTxRootsMap>::compute(
-        local_shard,
-        topology_snapshot,
-        &transactions,
-        &committing_shards(topology_snapshot),
-    )
-    .into_inner();
+    let provision_tx_roots =
+        provision_tx_roots(topology_snapshot.shard_trie(), local_shard, &transactions)
+            .expect("a proposal's transactions are verified, which derives them");
 
     // Settlement order, folded the same way and read off the same list.
     // The certificates arrive in the order the ticks executed and the
@@ -1099,14 +1096,12 @@ where
             topology_snapshot,
         } => {
             let start = Stopwatch::start();
-            let committing = committing_shards(&topology_snapshot);
-            let ptx_ctx = ProvisionTxRootsContext {
-                local_shard: ctx.shard,
-                topology_snapshot: &topology_snapshot,
-                transactions: &transactions,
-                committing: &committing,
-            };
-            let result = expected.verify(&ptx_ctx);
+            let result = check_provision_tx_roots(
+                &expected,
+                topology_snapshot.shard_trie(),
+                ctx.shard,
+                &transactions,
+            );
             record_signature_verification_latency(
                 "provision_tx_roots",
                 start.elapsed().as_secs_f64(),
@@ -2016,25 +2011,33 @@ const fn remote_header_verdict(
     }
 }
 
-/// The shards that commit each transaction under `topology`.
+/// Whether `expected` is the provision roots map the block's own shard,
+/// `local`, computes over its `transactions` routed under `trie`: the
+/// one rule its proposer committed them by.
 ///
-/// Its participants, less any that only take delivery of its owed
-/// crossings: what a block's provision fan-out reaches, on the proposer
-/// and the verifier alike.
-pub fn committing_shards(
-    topology: &TopologySnapshot,
-) -> impl Fn(&Transaction) -> Vec<ShardId> + '_ {
-    move |tx| {
-        Classified::freeze(
-            tx.legs(),
-            tx.fee_payer(),
-            tx.accounts(),
-            topology.shard_trie(),
-        )
-        .committing(topology.all_shards_for_transaction(tx))
-        .into_iter()
-        .collect()
+/// # Errors
+///
+/// [`ProvisionTxRootsVerifyError::Mismatch`] when they differ, and
+/// [`ProvisionTxRootsVerifyError::Unrouted`] for a transaction this node
+/// has not derived, which leaves it no map to compare.
+pub fn check_provision_tx_roots(
+    expected: &ProvisionTxRootsMap,
+    trie: &ShardTrie,
+    local: ShardId,
+    transactions: &[Verifiable<Transaction>],
+) -> Result<(), ProvisionTxRootsVerifyError> {
+    let computed = provision_tx_roots(trie, local, transactions).map_err(|unrouted| {
+        ProvisionTxRootsVerifyError::Unrouted {
+            tx_hash: unrouted.tx_hash,
+        }
+    })?;
+    if &computed != expected {
+        return Err(ProvisionTxRootsVerifyError::Mismatch {
+            expected: expected.clone(),
+            computed,
+        });
     }
+    Ok(())
 }
 
 #[cfg(test)]

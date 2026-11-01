@@ -40,7 +40,7 @@ use hyperscale_network::{
     ResponseVerdict,
 };
 use hyperscale_shard::action_handlers::{
-    build_proposal, committing_shards, handle_action, swept_by, verify_and_build_qc,
+    build_proposal, check_provision_tx_roots, handle_action, swept_by, verify_and_build_qc,
 };
 use hyperscale_shard::parent_checks::{
     AtParent, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
@@ -66,15 +66,15 @@ use hyperscale_types::{
     CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey, ConsensusReceipt,
     ConsensusSignature, Epoch, EpochWindows, Finalization, FrontierInputs, GossipMessage, Hash,
     HborSigned, LocalReceiptRoot, LocalTimestamp, MessageClass, NetworkDefinition, NetworkMessage,
-    ProposerTimestamp, Provision, ProvisionTxRootsContext, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate,
-    ReadySignal, Request, Round, RoutingCommittees, SafeVoteRegisters, SectionRoots, SettledWrites,
-    ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload, SharedTransactions, SignError,
-    Signer, SignerBitfield, StateClaim, StateRoot, StateRootContext, StateRootVerifyError,
-    StoredReceipt, SubstateKey, SweepFrontier, Timeout, TimeoutContext, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionRoot, TxHash, ValidatorId, ValidatorInfo,
-    ValidatorSet, Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, local_settled_tx_hashes, shard_prefix_path, shard_reveal_sign, signed_bytes,
+    ProposerTimestamp, Provision, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, ProvisionsRoot,
+    QcContext, QcVerifyError, QuorumCertificate, ReadySignal, Request, Round, RoutingCommittees,
+    SafeVoteRegisters, SectionRoots, SettledWrites, ShardId, ShardLoad, ShardVoteEquivocation,
+    ShardWitnessPayload, SharedTransactions, SignError, Signer, SignerBitfield, StateClaim,
+    StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, SubstateKey, SweepFrontier,
+    Timeout, TimeoutContext, TopologySchedule, TopologySnapshot, Transaction, TransactionRoot,
+    TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, VerificationKind, Verified,
+    Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_prefix_path,
+    shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -2050,14 +2050,12 @@ impl ShardCoordinatorSim {
                 transactions,
                 topology_snapshot,
             }) => {
-                let committing = committing_shards(&topology_snapshot);
-                let ptx_ctx = ProvisionTxRootsContext {
-                    local_shard: self.shard,
-                    topology_snapshot: &topology_snapshot,
-                    transactions: &transactions,
-                    committing: &committing,
-                };
-                let result = expected.verify(&ptx_ctx);
+                let result = check_provision_tx_roots(
+                    &expected,
+                    topology_snapshot.shard_trie(),
+                    self.shard,
+                    &transactions,
+                );
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
                     event: check_completed(
