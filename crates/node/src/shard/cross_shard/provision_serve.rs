@@ -147,14 +147,18 @@ pub fn provision_answer(
 ///
 /// The candidates, in order, each skipped when it resolves to no
 /// committee here or repeats one already tried:
-/// 1. the committee anchor, the parent's own anchor, which the proposer
-///    classified the block under, skipped when the parent's header is
-///    not held;
-/// 2. the block's own anchor;
-/// 3. `schedule`'s head.
+/// 1. the committee anchor, the parent's own anchor, resolved as the
+///    proposer resolved it: terminal-clamped and across this shard's
+///    newest recovery bridge; skipped, with the next, when the parent's
+///    header is not held;
+/// 2. the committee anchor's own window, which a recovery folded after
+///    the block was proposed no longer bridges to;
+/// 3. the block's own anchor;
+/// 4. `schedule`'s head.
 ///
-/// They differ only when a target reshapes while this shard survives.
-/// Matching compares key-only roots and builds no proof.
+/// They differ only when a target reshapes while this shard survives,
+/// or across a recovery bridge. Matching compares key-only roots and
+/// builds no proof.
 ///
 /// `derivation` is this node's: routing is a derived fact, and a block
 /// read back out of storage carries none.
@@ -183,11 +187,17 @@ pub fn owed_leaves<S: ShardStorage>(
         ScheduleLookup::Committee(snapshot) => Some(snapshot.shard_trie().clone()),
         ScheduleLookup::NotYetCommitted | ScheduleLookup::Evicted => None,
     };
+    let bridged = |wt: WeightedTimestamp| {
+        schedule
+            .at_for_shard_live(local_shard, wt)
+            .map(|(snapshot, _)| snapshot.shard_trie().clone())
+    };
     let committee_anchor = height
         .prev()
         .and_then(|parent| pending_chain.certified_header(parent))
         .map(|parent| parent.header().parent_qc().weighted_timestamp());
     let candidates = [
+        committee_anchor.and_then(bridged),
         committee_anchor.and_then(resolve),
         resolve(block.header().parent_qc().weighted_timestamp()),
         Some(schedule.head().shard_trie().clone()),
@@ -377,9 +387,9 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
         Epoch, EpochWindows, FrontierInputs, NetworkDefinition, PrincipalAddr, ProvisionTxRoot,
-        ProvisionTxRootsMap, SubstateEntry, SubstateKey, SweepFrontier, TimestampRange,
-        TopologySnapshot, Transaction, TxHash, ValidatorSet, Verifiable, provision_leaf,
-        served_digest,
+        ProvisionTxRootsMap, RecoveryCause, ShardRecovery, SubstateEntry, SubstateKey,
+        SweepFrontier, TimestampRange, TopologySnapshot, Transaction, TxHash, ValidatorSet,
+        Verifiable, provision_leaf, served_digest,
     };
 
     use super::*;
@@ -788,45 +798,67 @@ mod tests {
     /// otherwise the block is the chain's first past genesis, whose
     /// header this store does not hold.
     fn owed_at_the_cut(parent_held: bool) -> Option<Owing> {
-        install_stub_protocol_statics();
-        let payer = PrincipalAddr::new([0x80; 31]);
-        let held = PrincipalAddr::new([0x10; 31]);
-        let tx = stub_transaction_with_reads(
-            payer,
-            &[held.address()],
-            &[payer.address()],
-            1_000,
-            validity(),
-        );
         let schedule = payer_shard_grown_at_1000();
         assert_eq!(
             schedule
                 .head()
                 .shard_trie()
-                .shard_for_prefix(payer.address()),
+                .shard_for_prefix(PAYER.address()),
             ShardId::leaf(2, 2),
             "past the cut the payer is a child's",
+        );
+        owed_of_block(
+            &schedule,
+            parent_held.then_some(500),
+            1_500,
+            &ShardTrie::uniform(1),
+            PAYER_SHARD,
+        )
+    }
+
+    /// The payer of the transaction [`owed_of_block`] carries.
+    const PAYER: PrincipalAddr = PrincipalAddr::new([0x80; 31]);
+
+    /// What this node owes `target` for a committed block anchored at
+    /// `anchor_ms` whose transaction reads a cell here for [`PAYER`], its
+    /// header's roots routed under `classified`. Its parent, anchored at
+    /// `parent_anchor_ms`, is held when that is given; otherwise the block
+    /// is the chain's first past genesis, whose header this store does
+    /// not hold.
+    fn owed_of_block(
+        schedule: &TopologySchedule,
+        parent_anchor_ms: Option<u64>,
+        anchor_ms: u64,
+        classified: &ShardTrie,
+        target: ShardId,
+    ) -> Option<Owing> {
+        install_stub_protocol_statics();
+        let held = PrincipalAddr::new([0x10; 31]);
+        let tx = stub_transaction_with_reads(
+            PAYER,
+            &[held.address()],
+            &[PAYER.address()],
+            1_000,
+            validity(),
         );
 
         let storage = Arc::new(SimShardStorage::default());
         let witness = BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO);
-        let height = if parent_held {
+        let height = parent_anchor_ms.map_or(HEIGHT, |parent_anchor_ms| {
             commit_settled_at(
                 &*storage,
-                &make_test_certified(make_test_block_with_anchor_wt(HEIGHT, 500)),
+                &make_test_certified(make_test_block_with_anchor_wt(HEIGHT, parent_anchor_ms)),
                 &[],
                 &[],
                 &witness,
             );
             HEIGHT.next()
-        } else {
-            HEIGHT
-        };
-        let roots = roots_of(&storage.snapshot(), &ShardTrie::uniform(1), &tx);
-        assert!(roots.contains_key(&PAYER_SHARD));
+        });
+        let roots = roots_of(&storage.snapshot(), classified, &tx);
+        assert!(roots.contains_key(&target));
         commit_settled_at(
             &*storage,
-            &make_test_certified(block_committing(height, 1_500, &tx, roots)),
+            &make_test_certified(block_committing(height, anchor_ms, &tx, roots)),
             &[],
             &[],
             &witness,
@@ -836,15 +868,15 @@ mod tests {
             pending_chain
                 .certified_header(height.prev().expect("past genesis"))
                 .is_some(),
-            parent_held,
+            parent_anchor_ms.is_some(),
         );
         owed_leaves(
             &pending_chain,
             &StubVmStatics,
             LOCAL,
-            &schedule,
+            schedule,
             height,
-            PAYER_SHARD,
+            target,
         )
     }
 
@@ -865,5 +897,52 @@ mod tests {
     #[test]
     fn a_block_whose_parent_header_is_absent_skips_the_committee_anchor() {
         assert!(owed_at_the_cut(false).is_none());
+    }
+
+    /// The first block past a halt recovery extends the halted tip, so
+    /// its committee anchor sits below the bridge and its proposer
+    /// classified it under the window the fresh committee was seated in,
+    /// where [`PAYER_SHARD`] has grown. Neither the committee anchor's own
+    /// window, nor the block's own (past the bridge, where the payer shard
+    /// has merged back), nor the head names the target the header does;
+    /// the bridged committee anchor does, and serves.
+    #[test]
+    fn a_block_past_a_recovery_bridge_serves_under_the_bridged_committee() {
+        let grown = ShardTrie::from_leaves([LOCAL, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
+        let recovering = |trie: &ShardTrie| {
+            Arc::new(
+                snapshot_of(trie).as_ref().clone().with_pending_recoveries(
+                    std::iter::once((
+                        LOCAL,
+                        ShardRecovery {
+                            cause: RecoveryCause::Halt,
+                            rotated_at: Epoch::new(20),
+                            retained: Vec::new(),
+                            attested_frontier: BlockHeight::GENESIS,
+                        },
+                    ))
+                    .collect(),
+                ),
+            )
+        };
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(2),
+            snapshot_of(&ShardTrie::uniform(1)),
+        );
+        schedule.insert(Epoch::new(21), recovering(&grown));
+        let head = recovering(&ShardTrie::uniform(1));
+        schedule.insert(Epoch::new(22), Arc::clone(&head));
+        schedule.set_head(head);
+        let target = ShardId::leaf(2, 2);
+        assert_eq!(grown.shard_for_prefix(PAYER.address()), target);
+
+        let Some(Owing::Leaves(owed)) =
+            owed_of_block(&schedule, Some(2_500), 22_500, &grown, target)
+        else {
+            panic!("the bridged committee anchor's routing matches the header")
+        };
+        assert_eq!(owed.trie, grown);
+        assert_eq!(owed.count().count, 1);
     }
 }
