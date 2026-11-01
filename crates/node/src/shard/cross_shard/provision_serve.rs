@@ -102,8 +102,9 @@ pub fn provision_answer(
 /// itself, so a block committed here but not yet persisted builds like
 /// any other, and no part pairs one height's values with another's
 /// proof. An owed index that view cannot build never will be, and is
-/// served as `None`. A block whose state this node does not hold yet
-/// builds nothing, which is not kept.
+/// served as `None`; a height below the store's retention floor reads
+/// nothing, so only its keyless parts build. A block whose state this
+/// node does not hold yet builds nothing, which is not kept.
 ///
 /// Reads the source block through [`PendingChain`] so heights still inside
 /// the shard-committed / JMT-persisted window are reachable; reconstructs
@@ -172,7 +173,6 @@ pub fn build_served_parts<S: ShardStorage>(
         &view,
         local_shard,
         target_shard,
-        height,
         block.header().parent_qc().weighted_timestamp(),
         &requests,
         |index, build| {

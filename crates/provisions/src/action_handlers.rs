@@ -21,9 +21,9 @@ use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedSto
 use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
-    Anchor, BlockHeight, MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, PROVISION_FRAMING_BYTES,
-    Provision, ProvisionContext, ProvisionsSenderMessage, ShardId, Stopwatch, ValidatorId,
-    Verifiable, Verified, Verify, WeightedTimestamp, signed_bytes,
+    Anchor, MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, PROVISION_FRAMING_BYTES, Provision,
+    ProvisionContext, ProvisionsSenderMessage, ShardId, Stopwatch, ValidatorId, Verifiable,
+    Verified, Verify, WeightedTimestamp, signed_bytes,
 };
 use tracing::warn;
 
@@ -79,7 +79,6 @@ pub(crate) fn pack(parts: Vec<Provision>) -> Vec<Vec<Provision>> {
 pub(crate) fn fetch_and_broadcast_provision<S, H>(
     view: &SubstateView<S>,
     source_shard: ShardId,
-    block_height: BlockHeight,
     source_block_ts: WeightedTimestamp,
     requests: &[ProvisionsRequest],
     shard_recipients: &HashMap<ShardId, Vec<ValidatorId>, H>,
@@ -97,7 +96,6 @@ where
             view,
             source_shard,
             *target_shard,
-            block_height,
             source_block_ts,
             requests,
             |_| true,
@@ -170,7 +168,6 @@ where
             let batches = fetch_and_broadcast_provision(
                 &view,
                 source_shard,
-                block_height,
                 source_block_ts,
                 &requests,
                 &shard_recipients,
@@ -260,7 +257,8 @@ where
 mod tests {
     use hyperscale_network::compression::compress;
     use hyperscale_types::{
-        Hash, LeafPath, MAX_WIRE_MESSAGE_BYTES, MerkleInclusionProof, ProvisionParts, TxHash,
+        BlockHeight, Hash, LeafPath, MAX_WIRE_MESSAGE_BYTES, MerkleInclusionProof, ProvisionParts,
+        TxHash,
     };
 
     use super::*;

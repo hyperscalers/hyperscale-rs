@@ -1229,6 +1229,44 @@ impl<S: SubstateStore + VersionedStore> SubstateView<S> {
         height <= (*self.base).jmt_height()
             || self.versioned_settled.iter().any(|(at, _)| *at == height)
     }
+
+    /// This view's state at its anchor, or `None` where the view does not
+    /// hold it: an anchor above the base's tip that its own chain does
+    /// not end at, or one at or below the tip whose history the base no
+    /// longer keeps.
+    ///
+    /// The reading a network-supplied anchor goes through, where
+    /// [`SubstateStore::snapshot`] would read a stale tip or panic below
+    /// the retention floor.
+    #[must_use]
+    pub fn served_snapshot(&self) -> Option<ViewSnapshot<S::Snapshot<'_>>> {
+        let base_snapshot = if self.anchor_height <= (*self.base).jmt_height() {
+            (*self.base).snapshot_held_at(self.anchor_height)?
+        } else if self
+            .versioned_settled
+            .last()
+            .is_some_and(|(at, _)| *at == self.anchor_height)
+        {
+            (*self.base).snapshot_at(self.anchor_height)
+        } else {
+            return None;
+        };
+        Some(self.over(base_snapshot))
+    }
+
+    /// The view's overlay laid over `base_snapshot`, a base reading at
+    /// the anchor.
+    fn over<Snap>(&self, base_snapshot: Snap) -> ViewSnapshot<Snap> {
+        ViewSnapshot {
+            base_snapshot,
+            anchor: self.anchor_height,
+            overlay: Arc::clone(&self.overlay),
+            overlay_entries: Arc::clone(&self.overlay_entries),
+            // Share the base-read cache so reads via either the view's
+            // direct impl or this snapshot populate the same map.
+            base_reads: Arc::clone(&self.base_reads),
+        }
+    }
 }
 
 impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
@@ -1244,15 +1282,7 @@ impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
         // leak post-anchor writes when this validator has persisted past
         // descendants that others haven't. This is the determinism fix
         // for cross-validator state_root computation.
-        ViewSnapshot {
-            base_snapshot: (*self.base).snapshot_at(self.anchor_height),
-            anchor: self.anchor_height,
-            overlay: Arc::clone(&self.overlay),
-            overlay_entries: Arc::clone(&self.overlay_entries),
-            // Share the base-read cache so reads via either the view's
-            // direct impl or this snapshot populate the same map.
-            base_reads: Arc::clone(&self.base_reads),
-        }
+        self.over((*self.base).snapshot_at(self.anchor_height))
     }
 
     fn jmt_height(&self) -> BlockHeight {
@@ -1890,6 +1920,30 @@ mod tests {
         let chain = empty_chain();
         let view = chain.view_at_persisted_tip();
         assert_eq!(view.cell(cell(test_prefix(9), [1; 16])), None);
+    }
+
+    /// A served reading exists only where the view holds its anchor's
+    /// state: its own chain ends there, or the base has persisted it. A
+    /// view of a block whose prep this chain does not hold, above the
+    /// base's tip, would read the tip instead, so it serves nothing.
+    #[test]
+    fn a_served_snapshot_needs_the_anchors_state() {
+        let chain = empty_chain();
+        let height = BlockHeight::new(3);
+        let (held, unheld) = (bh(b"held"), bh(b"unheld"));
+        chain.insert(
+            held,
+            entry_at(bh(b"parent"), height, &StateWrites::default()),
+        );
+
+        assert!(chain.view_at(held, height).served_snapshot().is_some());
+        assert!(chain.view_at(unheld, height).served_snapshot().is_none());
+
+        chain.base().persisted.store(3, Ordering::SeqCst);
+        assert!(
+            chain.view_at(unheld, height).served_snapshot().is_some(),
+            "a persisted height is the base's to read",
+        );
     }
 
     // ── chain reader accessors ────────────────────────────────────────

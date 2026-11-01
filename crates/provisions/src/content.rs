@@ -1,17 +1,54 @@
-//! What a source block's header commits to each target: one leaf per
-//! transaction the request rule owes it, in block order.
+//! What a source block owes each target: the keys each transaction's
+//! part serves, and the leaves its header commits, one per transaction
+//! the request rule owes the target, in block order.
 
 use std::collections::BTreeMap;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_hbor::Capped;
+use hyperscale_storage::Substates;
 use hyperscale_types::{
-    Hash, ProvisionTxRoot, ProvisionTxRootsMap, ShardId, ShardTrie, Transaction, TxHash,
-    Verifiable, provision_leaf,
+    EntryKey, Hash, ProtocolHasher, ProvisionTxRoot, ProvisionTxRootsMap, ShardId, ShardTrie,
+    SubstateKey, Transaction, TxHash, Verifiable, entry_leaf_key, provision_leaf,
 };
 use thiserror::Error;
 
 use crate::requests::provision_request;
+
+/// The keys `request`'s part serves out of `state`, the state the
+/// source block left.
+///
+/// Every declared local cell, and the leaf of each entry a declared
+/// local range holds in `state`, up to its cap; ascending, one copy
+/// each. The one function that decides a part's keys. Cells cost no
+/// read: a part's proof binds their presence and values. Only ranges
+/// read state.
+#[must_use]
+pub fn served_keys(state: &impl Substates, request: &ProvisionsRequest) -> Vec<SubstateKey> {
+    let mut keys = request.local_keys.clone();
+    for range in &request.local_ranges {
+        let held = state.entries_in_range(
+            range.owner,
+            range.collection,
+            range.lo,
+            range.hi,
+            range.cap as usize,
+        );
+        keys.extend(held.into_iter().map(|(order, _)| {
+            entry_leaf_key(
+                &ProtocolHasher,
+                EntryKey {
+                    owner: range.owner,
+                    collection: range.collection,
+                    order,
+                },
+            )
+        }));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
 
 /// A block transaction this node has not derived, so cannot route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
