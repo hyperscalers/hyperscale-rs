@@ -95,6 +95,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// terminal transaction — the replicated-execution factor.
     fn record_transaction_executed(&self) {}
 
+    /// Record the provisioned collection entries a core member on `shard`
+    /// executes over: the remote interval reads its counterparts served
+    /// it, as opposed to the cells they served.
+    fn record_provision_range_entries_consumed(&self, shard: u64, count: usize) {}
+
     /// Set the current block height gauge for a shard.
     fn set_block_height(&self, shard: u64, height: u64) {}
 
@@ -683,6 +688,13 @@ pub fn record_transaction_finalized(latency_secs: f64, cross_shard: bool) {
 #[inline]
 pub fn record_transaction_executed() {
     recorder().record_transaction_executed();
+}
+
+/// Record the provisioned collection entries a core member on `shard`
+/// executes over.
+#[inline]
+pub fn record_provision_range_entries_consumed(shard: u64, count: usize) {
+    recorder().record_provision_range_entries_consumed(shard, count);
 }
 
 /// Set the current block height gauge for a shard.

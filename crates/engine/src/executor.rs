@@ -26,15 +26,15 @@ use hyperscale_effects_bridge::{
     RecordStore, admit_package, declared_vector, envelope_bytes, is_protocol_vault,
     witness_from_event,
 };
-use hyperscale_metrics::record_transaction_executed;
+use hyperscale_metrics::{record_provision_range_entries_consumed, record_transaction_executed};
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
     EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
     MAX_STAGED_RECEIPT_BYTES, MAX_TICK_STAGED_BYTES, Movement, PriceTable, PrincipalAddr,
-    ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry, Transaction,
-    TxHash, Verified, WeightedTimestamp, compute_merkle_root, install_protocol_statics,
-    staged_yes_bytes, whole_work, witness_root, writes_root,
+    ProvisionalHolds, Role, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    install_protocol_statics, staged_yes_bytes, whole_work, witness_root, writes_root,
 };
 use hyperscale_vm_effects::{
     Admitted, Answered, ChainRecords, Composed, CrossingId, Declaration, DeclaredAccess,
@@ -272,19 +272,22 @@ pub fn materialize_declared(
 /// A provisioned leaf is a cell or an ordered-collection entry, and the
 /// leaf says which: an entry re-derives its own key and lands where the
 /// kernel's range capabilities read. An absent leaf adds nothing.
-fn provisioned_reads(lists: &[Arc<Vec<SubstateEntry>>]) -> MemoryStore {
+/// Returns the reads and how many of them are entries.
+fn provisioned_reads(lists: &[Arc<Vec<SubstateEntry>>]) -> (MemoryStore, usize) {
     let mut reads = MemoryStore::new();
+    let mut entries = 0;
     for entry in lists.iter().flat_map(|entries| entries.iter()) {
         let Some(value) = entry.value.as_ref() else {
             continue;
         };
         if let Some((key, value)) = entry_from_leaf(entry.key, value) {
             reads.entry_write(key.owner, key.collection, key.order, value);
+            entries += 1;
         } else {
             reads.write(entry.key, value.clone().into_inner());
         }
     }
-    reads
+    (reads, entries)
 }
 
 /// The VM engine: the genesis-static world, the compiled stdlib guests,
@@ -1555,7 +1558,13 @@ impl Executor {
         let own_reads: BTreeMap<TxHash, Arc<MemoryStore>> = inputs
             .iter()
             .filter(|i| !i.provisions.is_empty())
-            .map(|i| (i.tx_hash, Arc::new(provisioned_reads(i.provisions))))
+            .map(|i| {
+                let (reads, entries) = provisioned_reads(i.provisions);
+                if entries > 0 && i.member.role() == Role::Core {
+                    record_provision_range_entries_consumed(ctx.local_shard.inner(), entries);
+                }
+                (i.tx_hash, Arc::new(reads))
+            })
             .collect();
         let env_by_tx: BTreeMap<TxHash, EnvInputs> = inputs
             .iter()

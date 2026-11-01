@@ -43,6 +43,7 @@ pub struct Metrics {
     // === Transactions ===
     pub transactions_finalized: HistogramVec,
     pub transactions_executed: Counter,
+    pub provision_range_entries_consumed: CounterVec,
     /// Per-replica mempool size.
     pub mempool_size: GaugeVec,
 
@@ -333,6 +334,13 @@ impl Metrics {
             transactions_executed: register_counter!(
                 "hyperscale_transactions_executed_total",
                 "Engine executions of a transaction; against finalized transactions, the replicated-execution factor"
+            )
+            .unwrap(),
+
+            provision_range_entries_consumed: register_counter_vec!(
+                "hyperscale_provision_range_entries_consumed_total",
+                "Provisioned collection entries a core member executes over, by executing shard",
+                &["shard"]
             )
             .unwrap(),
 
@@ -1178,6 +1186,13 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_transaction_executed(&self) {
         self.metrics.transactions_executed.inc();
+    }
+
+    fn record_provision_range_entries_consumed(&self, shard: u64, count: usize) {
+        self.metrics
+            .provision_range_entries_consumed
+            .with_label_values(&[&shard.to_string()])
+            .inc_by(count as f64);
     }
 
     fn set_block_height(&self, shard: u64, height: u64) {

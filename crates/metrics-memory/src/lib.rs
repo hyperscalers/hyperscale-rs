@@ -299,6 +299,14 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("transactions_executed", None, 1);
     }
 
+    fn record_provision_range_entries_consumed(&self, shard: u64, count: usize) {
+        self.inc(
+            "provision_range_entries_consumed",
+            Some(&shard.to_string()),
+            count as u64,
+        );
+    }
+
     fn set_block_height(&self, shard: u64, height: u64) {
         self.set("block_height", Some(&shard.to_string()), height as f64);
     }
