@@ -2971,7 +2971,7 @@ impl ShardCoordinator {
         verdicts: &BTreeMap<TxHash, Decision>,
     ) -> Result<(Vec<TickLine>, ManifestBudget), Withheld> {
         let own = OwnContent::of(
-            &block.engagements().iter().copied().collect(),
+            block.engagements().iter().copied().collect(),
             record_arrivals(block.state_claims()),
         );
         let anchor = block.header().parent_qc().weighted_timestamp();

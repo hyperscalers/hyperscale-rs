@@ -77,7 +77,7 @@ pub fn run_by(lines: &[TickLine]) -> BTreeSet<TxHash> {
 pub struct Ancestry {
     /// Tick membership at the parent.
     pub rows: MemberIndex,
-    engaged: BTreeSet<(ShardId, TxHash)>,
+    engaged: BTreeSet<Engagement>,
     arrived: Vec<(SubstateKey, TxHash, BlockHeight)>,
 }
 
@@ -95,12 +95,7 @@ impl Ancestry {
         let mut arrived = Vec::new();
         for block in ancestors {
             rows.advance(&MemberInputs::of(block, windows));
-            engaged.extend(
-                block
-                    .engagements()
-                    .iter()
-                    .map(|engagement| (engagement.source, engagement.tx_hash)),
-            );
+            engaged.extend(block.engagements().iter().copied());
             arrived.extend(
                 record_arrivals(block.state_claims())
                     .into_iter()
@@ -119,21 +114,18 @@ impl Ancestry {
 /// records its claims read.
 #[derive(Debug, Default)]
 pub struct OwnContent {
-    engaged: BTreeSet<(ShardId, TxHash)>,
+    engaged: BTreeSet<Engagement>,
     arrived: BTreeSet<(SubstateKey, TxHash)>,
 }
 
 impl OwnContent {
     /// What `engagements` and `claims_read` add.
-    pub fn of(
-        engagements: &BTreeSet<Engagement>,
+    pub const fn of(
+        engagements: BTreeSet<Engagement>,
         claims_read: BTreeSet<(SubstateKey, TxHash)>,
     ) -> Self {
         Self {
-            engaged: engagements
-                .iter()
-                .map(|engagement| (engagement.source, engagement.tx_hash))
-                .collect(),
+            engaged: engagements,
             arrived: claims_read,
         }
     }
@@ -361,9 +353,11 @@ pub fn committed_sets(
         }
         let judged = Judged::of_row(row);
         for source in judged.sources() {
-            let engaged = own.engaged.contains(&(source, row.tx))
-                || ancestry.engaged.contains(&(source, row.tx))
-                || dedup.engaged(source, row.tx, anchor, committee, schedule.windows());
+            let engaged =
+                [&own.engaged, &ancestry.engaged].into_iter().any(|riding| {
+                    Engagement::of_pair(riding, source, row.tx)
+                        .any(|engagement| engagement.stands_under(committee, schedule.windows()))
+                }) || dedup.engaged(source, row.tx, anchor, committee, schedule.windows());
             if engaged {
                 sets.engaged.insert((source, row.tx));
             }

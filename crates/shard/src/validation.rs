@@ -5782,6 +5782,113 @@ pub mod tests {
         assert!(err.contains("payer bundle"), "{err}");
     }
 
+    /// A row's engagement reads the recovery exclusion alike whether the
+    /// batch rides the block itself, a pending ancestor, or a committed
+    /// block: once the source's recovery completes, a batch from its band
+    /// engages nothing on any of the three, while one from the fresh
+    /// chain or from below the frontier engages on all three. A voter
+    /// that has committed the ancestor and one that has not judge the
+    /// block alike.
+    #[test]
+    fn a_completed_recovery_band_engages_nothing_above_the_committed_tip() {
+        use hyperscale_types::RecoveryBinding;
+
+        use crate::tick_members::{Ancestry, OwnContent, committed_sets};
+
+        let local = ShardId::leaf(1, 0);
+        let source = ShardId::leaf(1, 1);
+        let windows = EpochWindows::new(0, 1_000);
+        let completed = TestCommittee::new(4, 42)
+            .topology_snapshot(2)
+            .with_recoveries(BTreeMap::from([(
+                source,
+                vec![RecoveryBinding {
+                    rotated_at: Epoch::new(2),
+                    attested_frontier: BlockHeight::new(5),
+                    completed: true,
+                }],
+            )]));
+        let schedule = TopologySchedule::new(windows, Epoch::new(4), Arc::new(completed.clone()));
+        let anchor = WeightedTimestamp::from_millis(4_000);
+
+        let tx_hash = TxHash::from(Hash::from_bytes(b"engaged by the band"));
+        let mut rows = MemberIndex::empty(local);
+        rows.members.insert(
+            tx_hash,
+            MemberRow {
+                waiting: Some(Waiting {
+                    staged: 0,
+                    leg: false,
+                    settlement: Settlement::Alone,
+                    declared: Capped::empty(),
+                    engages: Capped::from_array([source]),
+                    waits: false,
+                }),
+                ..member_row(tx_hash, RowState::Pending)
+            },
+        );
+        let carrying = |height: u64, source_anchor: u64| -> Block {
+            let batch: Verifiable<Provisions> =
+                Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+                    source,
+                    local,
+                    BlockHeight::new(height),
+                    WeightedTimestamp::from_millis(source_anchor),
+                    MerkleInclusionProof::dummy(),
+                    Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
+                ))
+                .into();
+            Block::Live {
+                header: header_at_height(BlockHeight::new(2), 100_000),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::from_array([batch])),
+                witness_sources: Arc::new(WitnessSources::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
+            }
+        };
+        let engages = |block: &Block| {
+            let judged = |ancestry: &Ancestry, own: &OwnContent, dedup: &CommitDedupIndex| {
+                committed_sets(&rows, ancestry, own, dedup, anchor, &completed, &schedule)
+                    .engaged
+                    .contains(&(source, tx_hash))
+            };
+            let bare = Ancestry::over(&rows, std::iter::empty(), windows);
+            let mut committed = CommitDedupIndex::new();
+            committed.register_committed_engagements(
+                &block.engagements(),
+                WeightedTimestamp::from_millis(3_500),
+            );
+            [
+                judged(
+                    &bare,
+                    &OwnContent::of(
+                        block.engagements().iter().copied().collect(),
+                        BTreeSet::new(),
+                    ),
+                    &CommitDedupIndex::new(),
+                ),
+                judged(
+                    &Ancestry::over(&rows, [block], windows),
+                    &OwnContent::default(),
+                    &CommitDedupIndex::new(),
+                ),
+                judged(&bare, &OwnContent::default(), &committed),
+            ]
+        };
+
+        assert_eq!(
+            engages(&carrying(9, 1_500)),
+            [false; 3],
+            "a batch from the band engages nothing once the recovery completes"
+        );
+        assert_eq!(engages(&carrying(9, 3_000)), [true; 3]);
+        assert_eq!(engages(&carrying(4, 1_500)), [true; 3]);
+    }
+
     /// The header's body root commits what the block's provisions name:
     /// an engagements section over anything else is refused, and the sealed form of
     /// an honest block, which keeps the list, passes as the live one does.

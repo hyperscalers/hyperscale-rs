@@ -385,19 +385,10 @@ impl CommitDedupIndex {
 
     /// Whether a committed batch from `source` engages `tx_hash` for an
     /// admission anchored at `at`: an entry whose deadline is past `at`,
-    /// from a source block no recovery in `snapshot` excludes. A pending
-    /// recovery excludes every height above its attested frontier
-    /// ([`TopologySnapshot::recovery_fences`]); any recovery the snapshot
-    /// records, pending or completed, excludes a block in its band, above
-    /// the frontier and anchored below the bridge on the grid `windows`
-    /// ([`TopologySnapshot::recovery_orphaned`]): the recovered chain
-    /// lets every tick there go at its crossing block, a halt
-    /// recovery's harvested tail included, so no transaction there is
-    /// the source's to vouch for.
+    /// from a source block that stands under `snapshot` on the grid
+    /// `windows` ([`Engagement::stands_under`]).
     ///
-    /// Both are read here rather than at registration because the
-    /// recovery record is committed beacon state, so the answer is a
-    /// function of the admitting anchor's snapshot, and an entry a later
+    /// Read here rather than at registration, so an entry a later
     /// recovery excludes stops engaging on every replica at once.
     pub(crate) fn engaged(
         &self,
@@ -412,8 +403,13 @@ impl CommitDedupIndex {
             .is_some_and(|blocks| {
                 blocks.iter().any(|block| {
                     block.deadline > at
-                        && !snapshot.recovery_fences(source, block.height)
-                        && !snapshot.recovery_orphaned(windows, source, block.anchor, block.height)
+                        && Engagement {
+                            source,
+                            tx_hash,
+                            source_height: block.height,
+                            source_anchor: block.anchor,
+                        }
+                        .stands_under(snapshot, windows)
                 })
             })
     }

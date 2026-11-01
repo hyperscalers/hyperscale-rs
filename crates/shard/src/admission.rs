@@ -204,20 +204,7 @@ impl ProvisionsFold {
     /// Whether an admitted batch from `source` names `tx_hash`, at any
     /// source height.
     pub(crate) fn engages(&self, source: ShardId, tx_hash: TxHash) -> bool {
-        let at = |source_height, source_anchor| Engagement {
-            source,
-            tx_hash,
-            source_height,
-            source_anchor,
-        };
-        self.engaged
-            .range(
-                at(BlockHeight::GENESIS, WeightedTimestamp::ZERO)
-                    ..=at(
-                        BlockHeight::new(u64::MAX),
-                        WeightedTimestamp::from_millis(u64::MAX),
-                    ),
-            )
+        Engagement::of_pair(&self.engaged, source, tx_hash)
             .next()
             .is_some()
     }

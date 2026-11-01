@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
-    BlockHeight, MAX_ENGAGEMENTS_PER_BLOCK, Provisions, ShardId, TxHash, Verifiable,
-    WeightedTimestamp,
+    BlockHeight, EpochWindows, MAX_ENGAGEMENTS_PER_BLOCK, Provisions, ShardId, TopologySnapshot,
+    TxHash, Verifiable, WeightedTimestamp,
 };
 
 /// One transaction a committed provision batch names: the evidence that
@@ -57,5 +57,50 @@ impl Engagement {
             .iter()
             .flat_map(|batch| Self::of_batch(batch))
             .collect()
+    }
+
+    /// Every entry of `set` naming `tx_hash` from `source`, whatever
+    /// source block sent it.
+    pub fn of_pair(
+        set: &BTreeSet<Self>,
+        source: ShardId,
+        tx_hash: TxHash,
+    ) -> impl Iterator<Item = &Self> {
+        let at = |source_height, source_anchor| Self {
+            source,
+            tx_hash,
+            source_height,
+            source_anchor,
+        };
+        set.range(
+            at(BlockHeight::GENESIS, WeightedTimestamp::ZERO)
+                ..=at(
+                    BlockHeight::new(u64::MAX),
+                    WeightedTimestamp::from_millis(u64::MAX),
+                ),
+        )
+    }
+
+    /// Whether the source still vouches for this entry under `snapshot`,
+    /// on the epoch grid `windows`: no recovery pending there fences its
+    /// height ([`TopologySnapshot::recovery_fences`]), and no recovery it
+    /// records, pending or completed, holds its block in the band the
+    /// recovered chain lets go of at its crossing block
+    /// ([`TopologySnapshot::recovery_orphaned`]).
+    ///
+    /// The one rule every engagement answers to, committed or riding a
+    /// block above the committed tip: the recovery record is committed
+    /// beacon state, so the answer is a function of the judging anchor's
+    /// snapshot, and a voter that has committed the carrying block
+    /// answers as one that has not.
+    #[must_use]
+    pub fn stands_under(&self, snapshot: &TopologySnapshot, windows: EpochWindows) -> bool {
+        !snapshot.recovery_fences(self.source, self.source_height)
+            && !snapshot.recovery_orphaned(
+                windows,
+                self.source,
+                self.source_anchor,
+                self.source_height,
+            )
     }
 }
