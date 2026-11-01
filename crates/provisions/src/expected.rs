@@ -14,7 +14,8 @@
 //!    It asks for every index not held and not asked if the count is known,
 //!    and otherwise for index 0, whose answer also brings the count witness.
 //! 2. **Learning the count while requested**: it asks for every index not
-//!    held and not asked.
+//!    held and not asked, once every part of the batch that taught it is
+//!    held.
 //!
 //! Gossip still arriving asks nothing, and every retry of an asked index
 //! belongs to the fetch layer. The expectation completes when all of its
@@ -32,7 +33,7 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_types::{
-    BlockHeight, CommittedClock, ProvisionCount, ShardId, ValidatorId, WeightedTimestamp,
+    BlockHeight, CommittedClock, Provision, ProvisionCount, ShardId, ValidatorId, WeightedTimestamp,
 };
 use tracing::warn;
 
@@ -154,14 +155,36 @@ impl Released {
     }
 }
 
-/// What holding one leaf did to its expectation.
+/// What holding a batch of leaves did to their expectations.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Held {
-    /// The expectation completed: what it asked for, let go of.
-    pub(crate) completed: Option<Released>,
-    /// The leaf taught the count while the entry was requested: the
-    /// indices to ask for now.
-    pub(crate) ask: Option<TimeoutEffect>,
+    /// The expectations that completed: what each asked for, let go of.
+    pub(crate) completed: Vec<Released>,
+    /// For each expectation whose count the batch taught while it was
+    /// requested, the indices to ask for now: neither held, by this batch
+    /// or before it, nor asked.
+    pub(crate) asks: Vec<TimeoutEffect>,
+}
+
+/// One part's leaf, counted as held toward its expectation.
+#[derive(Debug, Clone, Copy)]
+pub struct HeldLeaf {
+    pub(crate) source_shard: ShardId,
+    pub(crate) block_height: BlockHeight,
+    pub(crate) index: u32,
+    pub(crate) count: u32,
+}
+
+impl HeldLeaf {
+    /// The leaf `part` places its transaction at.
+    pub(crate) fn of(part: &Provision) -> Self {
+        Self {
+            source_shard: part.source_shard(),
+            block_height: part.block_height(),
+            index: part.leaf().index,
+            count: part.leaf().count,
+        }
+    }
 }
 
 /// Liveness tracker for cross-shard provisions we expect but haven't yet
@@ -222,41 +245,50 @@ impl ExpectedProvisionTracker {
             });
     }
 
-    /// Record leaf `index` of `count` as held for `(source_shard,
-    /// block_height)`, off a part that has walked its path to the
-    /// header's root. Completes and clears the expectation once every
-    /// committed leaf is held.
-    pub(crate) fn on_part_held(
-        &mut self,
-        source_shard: ShardId,
-        block_height: BlockHeight,
-        index: u32,
-        count: u32,
-    ) -> Held {
-        let key = (source_shard, block_height);
-        let Some(expected) = self.expected.get_mut(&key) else {
-            return Held::default();
-        };
-        let learned = expected.learn(count);
-        if index < count {
-            expected.held.insert(index);
-        }
-        if expected.is_complete() {
-            let asked = expected.asked.iter().copied().collect();
-            self.expected.remove(&key);
-            return Held {
-                completed: Some(Released {
-                    source_shard,
-                    block_height,
-                    indices: asked,
-                }),
-                ask: None,
+    /// Record each of `leaves` as held: leaf `index` of `count` under the
+    /// root `(source_shard, block_height)` owes this shard, off a part
+    /// that has walked its path to the header's root. Every leaf is held
+    /// before any expectation completes or asks, so a count one leaf
+    /// teaches asks for none of the batch's others.
+    pub(crate) fn on_parts_held(&mut self, leaves: impl IntoIterator<Item = HeldLeaf>) -> Held {
+        let mut learned = BTreeSet::new();
+        let mut touched = BTreeSet::new();
+        for HeldLeaf {
+            source_shard,
+            block_height,
+            index,
+            count,
+        } in leaves
+        {
+            let key = (source_shard, block_height);
+            let Some(expected) = self.expected.get_mut(&key) else {
+                continue;
             };
+            if expected.learn(count) {
+                learned.insert(key);
+            }
+            if index < count {
+                expected.held.insert(index);
+            }
+            touched.insert(key);
         }
-        Held {
-            completed: None,
-            ask: Self::ask_on_learning(key, expected, learned),
+        let mut held = Held::default();
+        for key in touched {
+            let Some(expected) = self.expected.get_mut(&key) else {
+                continue;
+            };
+            if expected.is_complete() {
+                held.completed.push(Released {
+                    source_shard: key.0,
+                    block_height: key.1,
+                    indices: expected.asked.iter().copied().collect(),
+                });
+                self.expected.remove(&key);
+            } else if let Some(ask) = Self::ask_on_learning(key, expected, learned.contains(&key)) {
+                held.asks.push(ask);
+            }
         }
+        held
     }
 
     /// Learn the count of `(source_shard, block_height)` off a count
@@ -464,6 +496,21 @@ mod tests {
     const SOURCE: ShardId = ShardId::leaf(2, 1);
     const HEIGHT: BlockHeight = BlockHeight::new(10);
 
+    /// Leaf `index` of `count` under the expected root.
+    const fn leaf(index: u32, count: u32) -> HeldLeaf {
+        HeldLeaf {
+            source_shard: SOURCE,
+            block_height: HEIGHT,
+            index,
+            count,
+        }
+    }
+
+    /// Hold leaf `index` of `count` alone.
+    fn hold(t: &mut ExpectedProvisionTracker, index: u32, count: u32) -> Held {
+        t.on_parts_held([leaf(index, count)])
+    }
+
     /// A tracker with one expectation for [`SOURCE`] at [`HEIGHT`].
     fn one_expected() -> ExpectedProvisionTracker {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
@@ -518,25 +565,21 @@ mod tests {
     #[test]
     fn an_expectation_completes_on_holding_every_leaf() {
         let mut t = one_expected();
-        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 2, 3), Held::default());
-        assert_eq!(
-            t.on_part_held(SOURCE, HEIGHT, 2, 3),
-            Held::default(),
-            "a repeat adds nothing"
-        );
-        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 0, 3), Held::default());
+        assert_eq!(hold(&mut t, 2, 3), Held::default());
+        assert_eq!(hold(&mut t, 2, 3), Held::default(), "a repeat adds nothing");
+        assert_eq!(hold(&mut t, 0, 3), Held::default());
         assert_eq!(t.len(), 1);
-        let held = t.on_part_held(SOURCE, HEIGHT, 1, 3);
+        let held = hold(&mut t, 1, 3);
         assert_eq!(
             held.completed,
-            Some(Released {
+            vec![Released {
                 source_shard: SOURCE,
                 block_height: HEIGHT,
                 indices: Vec::new(),
-            })
+            }]
         );
         assert_eq!(t.len(), 0);
-        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 1, 3), Held::default());
+        assert_eq!(hold(&mut t, 1, 3), Held::default());
     }
 
     /// Turning requested asks for index 0 alone while the count is
@@ -553,23 +596,43 @@ mod tests {
 
         // Index 3 of five arrives by gossip: the count is learned, and
         // the rest is asked, leaving out 0 (asked) and 3 (held).
-        let held = t.on_part_held(SOURCE, HEIGHT, 3, 5);
-        assert_eq!(held.ask, Some(ask(&[1, 2, 4])));
-        assert_eq!(held.completed, None);
+        let held = hold(&mut t, 3, 5);
+        assert_eq!(held.asks, vec![ask(&[1, 2, 4])]);
+        assert!(held.completed.is_empty());
 
         // Another learning teaches nothing new and asks nothing.
         assert_eq!(t.on_count_checked(SOURCE, HEIGHT, 5), None);
-        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 1, 5), Held::default());
+        assert_eq!(hold(&mut t, 1, 5), Held::default());
 
         // Completion lets go of every index it ever asked for.
         for index in [0, 2] {
-            assert_eq!(t.on_part_held(SOURCE, HEIGHT, index, 5), Held::default());
+            assert_eq!(hold(&mut t, index, 5), Held::default());
         }
-        let done = t.on_part_held(SOURCE, HEIGHT, 4, 5);
+        let done = hold(&mut t, 4, 5);
         assert_eq!(
-            done.completed.map(|released| released.indices),
-            Some(vec![0, 1, 2, 4])
+            done.completed
+                .into_iter()
+                .map(|released| released.indices)
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1, 2, 4]]
         );
+    }
+
+    /// A batch that teaches the count asks for none of its own leaves:
+    /// every one is held before the ask is drawn, and a batch holding
+    /// every leaf completes without asking at all.
+    #[test]
+    fn a_batch_teaching_the_count_asks_for_none_of_its_own() {
+        let mut t = one_expected();
+        assert_eq!(t.flush_all(), vec![ask(&[0])]);
+        let held = t.on_parts_held([leaf(3, 5), leaf(1, 5)]);
+        assert_eq!(held.asks, vec![ask(&[2, 4])]);
+
+        let mut t = one_expected();
+        assert_eq!(t.flush_all(), vec![ask(&[0])]);
+        let held = t.on_parts_held((0..3).map(|index| leaf(index, 3)));
+        assert!(held.asks.is_empty());
+        assert_eq!(held.completed.len(), 1);
     }
 
     /// A count known before the entry turns requested asks every index
@@ -582,7 +645,7 @@ mod tests {
             None,
             "not yet requested"
         );
-        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 2, 4), Held::default());
+        assert_eq!(hold(&mut t, 2, 4), Held::default());
         assert_eq!(t.flush_all(), vec![ask(&[0, 1, 3])]);
     }
 
@@ -631,7 +694,7 @@ mod tests {
     #[test]
     fn verified_before_timeout_never_emits() {
         let mut t = one_expected();
-        assert!(t.on_part_held(SOURCE, HEIGHT, 0, 1).completed.is_some());
+        assert!(!hold(&mut t, 0, 1).completed.is_empty());
 
         let well_past =
             ts(1_000
@@ -662,7 +725,7 @@ mod tests {
     fn cleanup_orphans_drops_aged_entries_and_releases_their_asks() {
         let mut t = one_expected();
         let _ = t.flush_all();
-        let _ = t.on_part_held(SOURCE, HEIGHT, 1, 2);
+        let _ = hold(&mut t, 1, 2);
 
         // Advance well past RETENTION_HORIZON.
         let far_future =

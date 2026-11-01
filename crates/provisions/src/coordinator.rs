@@ -25,7 +25,7 @@ use hyperscale_types::{
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::expected::{ExpectedProvisionTracker, Held, Released};
+use crate::expected::{ExpectedProvisionTracker, HeldLeaf, Released};
 use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
@@ -400,17 +400,24 @@ impl ProvisionCoordinator {
         (!ids.is_empty()).then(|| Action::AbandonFetch(FetchIds::RemoteProvisions(ids)))
     }
 
-    /// The fetch actions holding one leaf calls for: letting go of a
-    /// completed expectation's asks, and asking for the rest of one that
-    /// just learned its count.
-    fn follow(&self, held: Held) -> Vec<Action> {
-        let mut actions = Vec::new();
-        if let Some(released) = held.completed {
-            actions.extend(self.abandon(&[released]));
+    /// Count every one of `parts`' leaves as held toward its expectation,
+    /// returning the fetch actions that calls for: letting go of what a
+    /// completed expectation asked, and asking for the rest of one whose
+    /// count the batch taught — none of the batch's own parts among them.
+    /// Only a part whose leaf has walked to its header's root is held: a
+    /// committed one through the voters that admitted it, a verified one
+    /// through this node.
+    fn hold(&mut self, parts: &[Provision]) -> Vec<Action> {
+        if parts.is_empty() {
+            return Vec::new();
         }
-        if let Some(ask) = held.ask {
-            actions.push(ask.into_fetch_action(self.local_shard));
-        }
+        let held = self.expected.on_parts_held(parts.iter().map(HeldLeaf::of));
+        let mut actions: Vec<Action> = self.abandon(&held.completed).into_iter().collect();
+        actions.extend(
+            held.asks
+                .into_iter()
+                .map(|ask| ask.into_fetch_action(self.local_shard)),
+        );
         actions
     }
 
@@ -487,28 +494,6 @@ impl ProvisionCoordinator {
                 part.leaf().index,
             )])),
         ]
-    }
-
-    /// Retire `part` as already held — committed or already verified —
-    /// which counts its leaf as held toward its expectation. Only a part
-    /// whose leaf has walked to its header's root reaches here: a
-    /// committed one through the voters that admitted it, a verified one
-    /// through this node.
-    fn retire_held(&mut self, part: &Provision) -> Vec<Action> {
-        let held = self.hold(part);
-        let mut actions = Self::retire_fetches_for(part);
-        actions.extend(self.follow(held));
-        actions
-    }
-
-    /// Count `part`'s leaf as held toward its expectation.
-    fn hold(&mut self, part: &Provision) -> Held {
-        self.expected.on_part_held(
-            part.source_shard(),
-            part.block_height(),
-            part.leaf().index,
-            part.leaf().count,
-        )
     }
 
     /// Immediately emit an `Action::Fetch` of remote provisions for all outstanding expected
@@ -632,10 +617,6 @@ impl ProvisionCoordinator {
             // Store as verified (QC + commit proof already checked by the
             // remote-header coordinator).
             self.headers.insert(key, certified_header.clone());
-            // A count witness that arrived first is checked now.
-            if let Some(count) = self.expected.take_parked_count(shard, height) {
-                actions.extend(self.check_count(certified_header, count));
-            }
         }
 
         // Join with buffered provisions waiting for this header. Drop any
@@ -643,6 +624,8 @@ impl ProvisionCoordinator {
         // late header arrival can reanimate provisions the local commit
         // sweep already evicted and re-enqueue them for inclusion.
         let drained = self.pipeline.drain_pending_for_key(key);
+        let mut held = Vec::new();
+        let mut owed = Vec::with_capacity(drained.len());
         if !drained.is_empty() {
             debug!(
                 shard = shard.inner(),
@@ -652,7 +635,6 @@ impl ProvisionCoordinator {
             );
             let local_ts = self.expected.local_ts();
             let source_block_ts = certified_header.header().parent_qc().weighted_timestamp();
-            let mut owed = Vec::with_capacity(drained.len());
             let mut seen = HashSet::new();
             for part in drained {
                 // A part parked twice, by two deliveries, is verified once.
@@ -665,7 +647,8 @@ impl ProvisionCoordinator {
                         height = height.inner(),
                         "Dropping drained part: already committed"
                     );
-                    actions.extend(self.retire_held(&part));
+                    actions.extend(Self::retire_fetches_for(&part));
+                    held.push(part);
                     continue;
                 }
                 if part.deadline(source_block_ts) <= local_ts {
@@ -679,12 +662,18 @@ impl ProvisionCoordinator {
                 }
                 owed.push(part);
             }
-            actions.extend(build_verify_actions(
-                self.local_shard,
-                owed,
-                certified_header,
-            ));
         }
+        actions.extend(self.hold(&held));
+        // A count witness that arrived first is checked now, past what the
+        // drained parts already hold.
+        if targets_us && let Some(count) = self.expected.take_parked_count(shard, height) {
+            actions.extend(self.check_count(certified_header, count));
+        }
+        actions.extend(build_verify_actions(
+            self.local_shard,
+            owed,
+            certified_header,
+        ));
 
         actions
     }
@@ -753,6 +742,7 @@ impl ProvisionCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut seen = HashSet::new();
+        let mut held = Vec::new();
         for part in parts {
             let source_shard = part.source_shard();
             let block_height = part.block_height();
@@ -771,7 +761,8 @@ impl ProvisionCoordinator {
             if self.committed_provisions.contains(&part.hash())
                 || self.pipeline.has_verified(&part.hash())
             {
-                actions.extend(self.retire_held(&part));
+                actions.extend(Self::retire_fetches_for(&part));
+                held.push(part.into_inner());
                 continue;
             }
 
@@ -794,17 +785,13 @@ impl ProvisionCoordinator {
                 // routed and builds parts on a short leaf list, so each
                 // meets the header's root like any other.
                 let anchor = Anchor::of(&verified_header);
-                let verdict = match judge_owed(self.local_shard, &part, &verified_header) {
-                    Ok(()) => Ok(part),
-                    Err(refusal) => Err((part.into_inner(), refusal)),
-                };
-                if verdict.is_err() {
-                    actions.push(refused(vec![verdict], anchor));
+                if let Err(refusal) = judge_owed(self.local_shard, &part, &verified_header) {
+                    actions.push(refused(vec![Err((part.into_inner(), refusal))], anchor));
                     continue;
                 }
                 // Admit directly via the verified path; reuses the
                 // tombstone, queue, and `ProvisionsAdmitted` emission logic.
-                actions.extend(self.on_state_provisions_verified(vec![verdict], anchor, now));
+                actions.extend(self.admit(part, anchor, now, &mut held));
                 continue;
             }
 
@@ -824,6 +811,7 @@ impl ProvisionCoordinator {
                 self.pipeline
                     .buffer_pending(key, part.into_inner(), self.expected.local_ts());
         }
+        actions.extend(self.hold(&held));
         actions
     }
 
@@ -841,6 +829,7 @@ impl ProvisionCoordinator {
         let mut actions = Vec::new();
         let mut by_block: BTreeMap<(ShardId, BlockHeight), Vec<Provision>> = BTreeMap::new();
         let mut seen = HashSet::new();
+        let mut held = Vec::new();
         for part in parts {
             let source_shard = part.source_shard();
             let block_height = part.block_height();
@@ -868,7 +857,8 @@ impl ProvisionCoordinator {
             if self.committed_provisions.contains(&part.hash())
                 || self.pipeline.has_verified(&part.hash())
             {
-                actions.extend(self.retire_held(&part));
+                actions.extend(Self::retire_fetches_for(&part));
+                held.push(part);
                 continue;
             }
             by_block
@@ -918,6 +908,7 @@ impl ProvisionCoordinator {
                 &verified_header,
             ));
         }
+        actions.extend(self.hold(&held));
         actions
     }
 
@@ -934,6 +925,7 @@ impl ProvisionCoordinator {
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = vec![];
+        let mut held = Vec::new();
         for result in results {
             // A refused part satisfies nothing, whether its leaf missed
             // the header's root or its entries their proof: the
@@ -954,8 +946,9 @@ impl ProvisionCoordinator {
                     continue;
                 }
             };
-            actions.extend(self.admit(verified, anchor, now));
+            actions.extend(self.admit(verified, anchor, now, &mut held));
         }
+        actions.extend(self.hold(&held));
         actions
     }
 
@@ -1028,11 +1021,14 @@ impl ProvisionCoordinator {
     /// Keeping the header lets every distinct part verify against it, so
     /// the pending-block lookup can find whichever hash the proposer
     /// committed.
+    ///
+    /// Its leaf joins `held`, counted once the caller's whole batch is in.
     fn admit(
         &mut self,
         verified: Verified<Provision>,
         anchor: Anchor,
         now: LocalTimestamp,
+        held: &mut Vec<Provision>,
     ) -> Vec<Action> {
         let source_block_ts = anchor.ts;
         let provision_hash = verified.hash();
@@ -1052,11 +1048,13 @@ impl ProvisionCoordinator {
                 provision_hash = ?provision_hash,
                 "Dropping post-commit verify result — part already committed"
             );
-            return self.retire_held(&verified);
+            let actions = Self::retire_fetches_for(&verified);
+            held.push(verified.into_inner());
+            return actions;
         }
 
-        let held = self.hold(&verified);
-        let mut actions = self.follow(held);
+        held.push(Provision::clone(&verified));
+        let mut actions = Vec::new();
         let provision = self.pipeline.insert_verified(verified, source_block_ts);
 
         // Queue for inclusion in the next block proposal. Timestamp drives
@@ -3282,6 +3280,31 @@ mod tests {
         released.sort_unstable();
         assert_eq!(released, vec![0, 1, 2, 3]);
         assert_eq!(coordinator.expected.len(), 0);
+    }
+
+    /// A verified batch that teaches the count asks for none of its own
+    /// parts: they are all held before the ask is drawn, so the fetch the
+    /// timeout sent for index 0 is the only one out.
+    #[test]
+    fn a_batch_teaching_the_count_asks_for_none_of_its_own_parts() {
+        let txs = txs(4);
+        let (mut coordinator, header) = expecting(&txs);
+        assert_eq!(asked(&coordinator.flush_expected_provisions()), vec![0]);
+        let parts = make_provisions_multi(
+            txs,
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let rest = parts[1..].to_vec();
+        coordinator.on_state_provisions_received(&sched(), rest.clone());
+        let actions = coordinator.on_state_provisions_verified(
+            verified(rest),
+            Anchor::of(&header),
+            LocalTimestamp::ZERO,
+        );
+        assert!(asked(&actions).is_empty(), "{actions:?}");
+        assert_eq!(coordinator.expected.len(), 1, "index 0 is still owed");
     }
 
     /// A witness that does not wrap to the header's root is refused and
