@@ -17,6 +17,7 @@
 
 mod support;
 
+mod book;
 mod contention;
 mod execution;
 mod faults;
@@ -35,6 +36,7 @@ mod transactions;
 mod venue;
 mod witnesses;
 
+pub use book::{BOOK_SHARD, BOOK_VENUE_SHARD, BookRoute, RouteFill, book_route_genesis_accounts};
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
 pub use execution::{
     STANDING_PAYMENTS, a_consumer_never_committing_declines_a_pushed_record,
@@ -138,7 +140,7 @@ pub use route::{
     stated_venues_hear_each_others_yes_by_push,
 };
 pub use route_reshape::{
-    LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN,
+    LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN, a_book_route_reads_its_range_across_a_split,
     a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_within_a_merging_pair_settles_before_the_merge_cuts,
     a_departing_venue_clears_swaps_and_carries_on,

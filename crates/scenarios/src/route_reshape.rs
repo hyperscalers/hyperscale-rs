@@ -31,6 +31,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{Answered, ProtocolHasher, fee_hold_total_key};
 
+use crate::book::BookRoute;
 use crate::faults::{StagedHalt, await_halt_recovery, await_recovery_resume, freeze_shard};
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
@@ -2714,6 +2715,59 @@ fn await_departed<C: Cluster>(c: &mut C) {
         await_serves(c, left, epochs(28)) && await_serves(c, right, epochs(28)),
         "both splitter children must be served within budget",
     );
+}
+
+/// A route through a book whose fill reads a capped interval reads the
+/// interval its book's committing block left, before, during and after
+/// the split of the venue's shard.
+///
+/// The book sits on the second venue shard, which stays, and holds more
+/// asks than its fill's cap; the venue sits on the first, which is
+/// voted to split. Each route walks the book and sells what it bought at
+/// the venue, so its core spans both shards and the venue's shard runs
+/// the fill over the entries the book's shard provisions it. Local fills
+/// on the book's shard, submitted just before each route and beside it,
+/// delete the cheapest asks in the blocks around the route's. A route
+/// runs while both shards are live, one once the split is admitted, and
+/// one against the child the venue lands on after the cut. Each settles
+/// at the closed form over the lowest asks standing at the book's
+/// committing height, both worlds are conserved, and the venue's shard
+/// and the child counted provisioned entries a core member executed
+/// over.
+///
+/// # Panics
+///
+/// Panics as [`BookRoute::stand_up`] and [`BookRoute::run`] do, if the
+/// split is not admitted on the venue's shard alone or the cut is not
+/// served, if the venue's shard or its child counted no provisioned
+/// entry, or if either world does not settle.
+pub fn a_book_route_reads_its_range_across_a_split<C: FaultableCluster>(c: &mut C) {
+    let mut route = BookRoute::stand_up(c);
+    route.run(c, epochs(12), "live");
+
+    cast_threshold_vote(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
+    assert_only_the_departing_venue_admitted(c, epochs(20));
+    route.run(c, epochs(12), "departing");
+
+    await_cut(c, FIRST_VENUE_SHARD);
+    let child = owning_shard(c, route.venue_reserve().owner);
+    assert_ne!(
+        child, FIRST_VENUE_SHARD,
+        "the cut must land the venue on a child"
+    );
+    route.run(c, epochs(12), "split");
+
+    for shard in [FIRST_VENUE_SHARD, child] {
+        let consumed = c.metric(
+            "provision_range_entries_consumed",
+            Some(&shard.inner().to_string()),
+        );
+        assert!(
+            consumed > 0,
+            "{shard:?} must execute a route's fill over provisioned entries as a core member",
+        );
+    }
+    route.assert_conserved(c, epochs(12));
 }
 
 /// The venue whose shard the late vote takes away — one half of the

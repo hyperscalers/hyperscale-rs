@@ -29,7 +29,8 @@ use hyperscale_scenarios::tx::{
 use hyperscale_scenarios::{
     Budget, Ceiling, Certificates, Cluster, CoreLoad, FIRST_VENUE_SHARD, FaultableCluster,
     LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, PAYER_SHARD, Pair, RoutePayer, ScenarioConfig,
-    Spend, VENUE_SHARD, WIDE_VENUE_SHARD, a_consumer_never_committing_declines_a_pushed_record,
+    Spend, VENUE_SHARD, WIDE_VENUE_SHARD, a_book_route_reads_its_range_across_a_split,
+    a_consumer_never_committing_declines_a_pushed_record,
     a_core_stated_at_a_halt_is_accepted_on_both_venues,
     a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
@@ -109,7 +110,7 @@ use hyperscale_scenarios::{
     an_unseen_never_goes_when_its_producer_aborts,
     answers_end_at_the_read_frontier_across_a_reshape, assert_pair_rule, assume,
     attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production,
+    beacon_pool_partition_stalls_epoch_production, book_route_genesis_accounts,
     both_venues_read_a_routes_record_inside_the_finalization_delay,
     contested_publish_genesis_accounts, core_load_genesis_accounts, core_routes_under_load,
     cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
@@ -3273,6 +3274,22 @@ fn departing_route_cluster() -> SimCluster {
         &departing_route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     )
+}
+
+#[test]
+fn a_book_route_reads_its_range_across_a_split_sim() {
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 18,
+            split_bytes: departing_venue_split_bytes(),
+            ..cross_shard_config()
+        },
+        42,
+        &book_route_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(a_book_route_reads_its_range_across_a_split);
 }
 
 #[test]

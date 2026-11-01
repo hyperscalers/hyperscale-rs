@@ -1040,6 +1040,18 @@ impl Cluster for SimCluster {
         store.get_entries_at_height(range, store.jmt_height())
     }
 
+    fn entries_at(
+        &self,
+        shard: ShardId,
+        range: DeclaredRange,
+        height: BlockHeight,
+    ) -> Option<Vec<(u128, Vec<u8>)>> {
+        self.live_committee_hosts(shard)
+            .into_iter()
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .find_map(|store| store.get_entries_at_height(range, height))
+    }
+
     fn preview(
         &self,
         shard: ShardId,

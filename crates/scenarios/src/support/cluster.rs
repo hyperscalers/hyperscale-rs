@@ -195,6 +195,19 @@ pub trait Cluster {
         None
     }
 
+    /// [`entries`](Self::entries) as `shard` committed them at `height`:
+    /// what a part provisioned off that block carries. `None` when no
+    /// hosted store still holds that height.
+    fn entries_at(
+        &self,
+        shard: ShardId,
+        range: DeclaredRange,
+        height: BlockHeight,
+    ) -> Option<Vec<(u128, Vec<u8>)>> {
+        let _ = (shard, range, height);
+        None
+    }
+
     /// What `tx` would move and cost, run against `shard`'s committed tip
     /// without committing anything.
     ///

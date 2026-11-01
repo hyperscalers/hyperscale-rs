@@ -722,6 +722,19 @@ impl Harness {
         })?
     }
 
+    /// The committed entries of `range` on `shard` at `height`, off the
+    /// first host whose store still holds that height.
+    pub fn entries_at(
+        &self,
+        shard: ShardId,
+        range: DeclaredRange,
+        height: BlockHeight,
+    ) -> Option<Vec<(u128, Vec<u8>)>> {
+        self.hosts.iter().find_map(|h| {
+            h.read_store(shard, |store| store.get_entries_at_height(range, height))?
+        })
+    }
+
     /// The committed substate byte total `shard`'s live store recorded at
     /// its genesis. `None` if no host serves `shard`.
     pub fn genesis_substate_bytes(&self, shard: ShardId) -> Option<u64> {

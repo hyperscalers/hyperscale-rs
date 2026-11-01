@@ -30,7 +30,9 @@ use hyperscale_vm_effects::{
     Composed, Constraint, Hash32, InstanceMeta, Intent, IntentHeader, IntentTree, ManifestGraph,
     ResourceKind, SignedIntent, SlotId, Value, child_key, issued_resource, package_hash,
 };
-use hyperscale_vm_fixtures::{amm, amm_package_hash, lottery, lottery_package_hash};
+use hyperscale_vm_fixtures::{
+    amm, amm_package_hash, book, book_package_hash, lottery, lottery_package_hash,
+};
 use hyperscale_vm_manifest_builder::{
     GraphBuilder, IntentBuilder, TypedBuilder, TypedError, signing,
 };
@@ -2456,37 +2458,201 @@ fn build_venues_tx(
     validity: TimestampRange,
     route: &VenueRoute<'_>,
 ) -> Transaction {
-    let client = client();
-    let chain = client.records();
-    let composed = Composed::new(&chain, venues, &ProtocolHasher);
     let pools: Vec<amm::Amm> = venues
         .iter()
         .map(|venue| amm::Amm::at(venue.address(&ProtocolHasher)))
         .collect();
+    build_instances_tx(payer, sponsor, venues, validity, None, &|b| {
+        route(&pools, b)
+    })
+}
+
+/// Calls against sealed instances of any package, each typed against the
+/// record its own seal wrote, composed into one intent the payer signs
+/// (behind `sponsor`, when one pays). Each node's compute ceiling is
+/// `gas_per_node`, or the deployment default split over the nodes where
+/// none is named.
+///
+/// # Panics
+///
+/// If the scenario world does not answer a call.
+fn build_instances_tx(
+    payer: &Ed25519PrivateKey,
+    sponsor: Option<&Ed25519PrivateKey>,
+    instances: &[InstanceMeta],
+    validity: TimestampRange,
+    gas_per_node: Option<u64>,
+    calls: &dyn Fn(&mut TypedBuilder<'_>) -> Result<(), TypedError>,
+) -> Transaction {
+    let client = client();
+    let chain = client.records();
+    let composed = Composed::new(&chain, instances, &ProtocolHasher);
     let mut root = IntentBuilder::new(
         &composed,
         &ProtocolHasher,
         account_address(&payer.public_key().0),
         scenario_header(validity),
     );
-    route(&pools, &mut root).expect("every venue call types against its signature");
+    calls(&mut root).expect("every instance call types against its signature");
     let mut tree = root.build().expect("the intent declares no hole");
     // A sponsor attests the root first, which makes it the fee payer.
     let signers: Vec<&Ed25519PrivateKey> = sponsor.into_iter().chain([payer]).collect();
     tree.root.attested_by =
         Capped::new(signers.iter().map(|signer| principal_of(*signer)).collect())
             .expect("two attesters at most");
+    let ceilings = gas_per_node.map_or(Ceilings::Guessed, |gas| {
+        Ceilings::Measured(vec![gas; tree.node_count()])
+    });
 
     Transaction::new(client.sign_tree(
         &tree,
         &signers,
         Terms {
             max_fee: MAX_FEE,
-            ceilings: Ceilings::Guessed,
+            ceilings,
             priority_bp: 0,
             message: Vec::new(),
         },
     ))
+}
+
+/// The compute ceiling each node resting asks is signed with: more than
+/// the deployment default leaves a node of a manifest resting many.
+const ASK_GAS_PER_NODE: u64 = 200_000;
+
+/// The compute ceiling each node of a ladder walk is signed with, enough
+/// for the walk across a whole capped interval.
+const WALK_GAS_PER_NODE: u64 = 2_000_000;
+
+/// What a scenario venue holding `reserves` of (sold, bought) pays for
+/// `input` of the sold side: the curve's own arithmetic, the fee split
+/// off first and floored, the payout floored.
+#[must_use]
+pub(crate) const fn venue_quote(reserves: (u128, u128), input: u128) -> u128 {
+    let traded = input * (UNIT_SCALE - VENUE_FEE) / UNIT_SCALE;
+    reserves.1 * traded / (reserves.0 + traded)
+}
+
+/// The scale the pool's bounded fee type holds a share at.
+const UNIT_SCALE: u128 = 1_000_000_000_000_000_000;
+
+/// One quote subunit per tick, at the scale a book's stored tick holds.
+const ONE_QUOTE_PER_TICK: u128 = 1_000_000_000_000_000_000_000_000_000_000_000_000;
+
+/// The lowest tick count a scenario fill walks from, and the highest it
+/// walks to: the whole ladder.
+pub(crate) const FILL_TICKS: (u64, u64) = (1, u64::MAX);
+
+/// The metadata of an order book selling `pair.0` for `pair.1` at one
+/// quote subunit per tick, at the first salt whose address routes to
+/// `shard`.
+///
+/// # Panics
+///
+/// If no salt lands the book on `shard`.
+#[must_use]
+pub(crate) fn book_on(shard: ShardId, pair: (ResourceAddr, ResourceAddr)) -> InstanceMeta {
+    let trie = ShardTrie::uniform_from_count(1u64 << shard.depth());
+    let mut tick = [0u8; 32];
+    tick[..16].copy_from_slice(&ONE_QUOTE_PER_TICK.to_le_bytes());
+    (0..=u8::MAX)
+        .map(|salt| InstanceMeta {
+            package: book_package_hash(&ProtocolHasher),
+            config: Capped::new(vec![
+                Value::Address(pair.0.address()),
+                Value::Address(pair.1.address()),
+                Value::U256(tick),
+            ])
+            .unwrap(),
+            salt: Hash32([salt; 32]),
+        })
+        .find(|meta| trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard)
+        .unwrap_or_else(|| panic!("no book salt lands on {shard:?}"))
+}
+
+/// Rest one ask per `(ticks, size)` on `book`, each escrowing `size` of
+/// `base` withdrawn from `from`.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the calls.
+#[must_use]
+pub(crate) fn build_place_asks_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    book: &InstanceMeta,
+    base: ResourceAddr,
+    asks: &[(u64, u128)],
+    validity: TimestampRange,
+) -> Transaction {
+    let ladder = book::Book::at(book.address(&ProtocolHasher));
+    let gas = Some(ASK_GAS_PER_NODE);
+    build_instances_tx(payer, None, slice::from_ref(book), validity, gas, &|b| {
+        for &(ticks, size) in asks {
+            let funds = account::withdraw(b, from, base, size)?;
+            ladder.place_ask(b, ticks, funds)?;
+        }
+        Ok(())
+    })
+}
+
+/// Walk `book`'s whole ladder with `budget` of `quote`, banking what it
+/// buys and the change.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the calls.
+#[must_use]
+pub(crate) fn build_fill_asks_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    book: &InstanceMeta,
+    quote: ResourceAddr,
+    budget: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let ladder = book::Book::at(book.address(&ProtocolHasher));
+    let gas = Some(WALK_GAS_PER_NODE);
+    build_instances_tx(payer, None, slice::from_ref(book), validity, gas, &|b| {
+        let payment = account::withdraw(b, from, quote, budget)?;
+        let [bought, change] = ladder.fill_asks(b, FILL_TICKS.0, FILL_TICKS.1, payment)?;
+        account::deposit(b, from, bought)?;
+        account::deposit(b, from, change)
+    })
+}
+
+/// A route through a book and a venue: withdraw `amount` of `quote`,
+/// walk the book's ladder with it, sell what it bought at the venue, and
+/// bank the venue's payout and the book's change.
+///
+/// Both the fill and the swap write what they read, so both are core;
+/// where the book and the venue sit on different shards the core spans
+/// both, and the venue's shard executes the fill over the interval the
+/// book's shard provisions it.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the calls.
+#[must_use]
+pub(crate) fn build_book_route_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    (book, venue): (&InstanceMeta, &InstanceMeta),
+    quote: ResourceAddr,
+    amount: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let ladder = book::Book::at(book.address(&ProtocolHasher));
+    let pool = amm::Amm::at(venue.address(&ProtocolHasher));
+    let instances = [book.clone(), venue.clone()];
+    let gas = Some(WALK_GAS_PER_NODE);
+    build_instances_tx(payer, None, &instances, validity, gas, &|b| {
+        let payment = account::withdraw(b, from, quote, amount)?;
+        let [bought, change] = ladder.fill_asks(b, FILL_TICKS.0, FILL_TICKS.1, payment)?;
+        let out = pool.swap(b, bought, 0)?;
+        account::deposit(b, from, out)?;
+        account::deposit(b, from, change)
+    })
 }
 
 /// Build the seal of an instance of a runtime-published package.

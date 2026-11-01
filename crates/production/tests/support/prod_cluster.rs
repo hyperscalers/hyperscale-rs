@@ -523,6 +523,15 @@ impl Cluster for ProdCluster {
         self.inner.entries(shard, range)
     }
 
+    fn entries_at(
+        &self,
+        shard: ShardId,
+        range: DeclaredRange,
+        height: BlockHeight,
+    ) -> Option<Vec<(u128, Vec<u8>)>> {
+        self.inner.entries_at(shard, range, height)
+    }
+
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {
         self.inner.ran(shard, tx)
     }
