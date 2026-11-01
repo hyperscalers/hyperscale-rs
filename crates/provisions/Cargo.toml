@@ -25,8 +25,10 @@ tracing.workspace = true
 hyperscale-jmt.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
+hyperscale-storage-rocksdb.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

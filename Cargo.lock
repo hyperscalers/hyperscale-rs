@@ -2449,11 +2449,13 @@ dependencies = [
  "hyperscale-network",
  "hyperscale-storage",
  "hyperscale-storage-memory",
+ "hyperscale-storage-rocksdb",
  "hyperscale-types",
  "hyperscale-vm-effects",
  "papaya",
  "proptest",
  "serde",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
 ]

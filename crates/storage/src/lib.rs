@@ -72,7 +72,8 @@ pub use shard::members::{
 };
 pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{
-    BaseReadCache, ChainEntry, PendingChain, PersistedPastAnchor, SubstateView, TerminalWindow,
+    BaseReadCache, ChainEntry, PendingChain, PersistedPastAnchor, PreparedBlockView, SubstateView,
+    TerminalWindow,
 };
 pub use shard::read_frontier::{load_read_frontier, read_frontier_writes, with_frontier};
 pub use shard::recovered_state::{RECENT_HEADER_REPLAY, RecoveredState, recent_headers};

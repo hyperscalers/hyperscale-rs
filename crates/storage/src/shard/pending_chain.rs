@@ -1101,6 +1101,49 @@ impl<Snap: Substates> Anchored for ViewSnapshot<Snap> {
     }
 }
 
+/// The state a block leaves, read before the block is held anywhere: its
+/// parent's anchored state with the block's own settled writes laid over
+/// it.
+///
+/// What a proposer and a voter hold between `prepare_block_commit` and
+/// the block's commit. It reads what [`PendingChain::view_at`] of the
+/// block reads once the block is held, pending or persisted: the
+/// block's settled writes state every cell and entry it changed outright.
+pub struct PreparedBlockView<'a, P> {
+    /// The parent's anchored state.
+    pub parent: &'a P,
+    /// The block's prepared tree, whose settled writes are its complete
+    /// change.
+    pub block: &'a JmtSnapshot,
+}
+
+impl<P: Substates> Substates for PreparedBlockView<'_, P> {
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        let mut value = self.parent.cell(key);
+        self.block.settled.lay_leaf(key, &mut value);
+        value
+    }
+
+    fn entries_in_range(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        lo: u128,
+        hi: u128,
+        limit: usize,
+    ) -> Vec<(u128, Vec<u8>)> {
+        merge_entry_overlay(
+            self.parent,
+            entry_overlay_range(self.block.settled.entries(), owner, collection, lo, hi),
+            owner,
+            collection,
+            lo,
+            hi,
+            limit,
+        )
+    }
+}
+
 /// A sweep walk over a store that had persisted past the view's anchor
 /// by the time the walk finished.
 ///
