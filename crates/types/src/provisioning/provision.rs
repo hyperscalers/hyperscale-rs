@@ -15,7 +15,7 @@ use crate::state_key::jmt_value_hash;
 use crate::{
     Anchor, BlockHeight, Hash, LeafPath, MAX_PROVISION_WEIGHT, MerkleInclusionProof, ProvisionHash,
     RETENTION_HORIZON, ShardId, StateProofError, SubstateEntry, SubstateKey, TxHash, Verified,
-    Verify, WeightedTimestamp, provision_leaf,
+    Verify, WeightedTimestamp, provision_leaf, served_digest,
 };
 
 /// One transaction's reads from one source block, for one target shard.
@@ -183,10 +183,15 @@ impl Provision {
         &self.0.leaf
     }
 
-    /// The leaf this part's transaction is under its target's root.
+    /// The leaf this part is under its target's root: its transaction
+    /// and the keys it carries, so a part serving other keys than its
+    /// source committed walks to another root.
     #[must_use]
     pub fn leaf_hash(&self) -> Hash {
-        provision_leaf(self.0.tx_hash)
+        provision_leaf(
+            self.0.tx_hash,
+            served_digest(self.0.entries.iter().map(|entry| entry.key)),
+        )
     }
 
     /// Content hash, computed on first call and cached.

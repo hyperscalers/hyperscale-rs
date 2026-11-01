@@ -44,8 +44,9 @@ pub use body::{BodyRootContext, BodyRootVerifyError, SectionRoots, UnboundBody};
 pub use leaf::{LeafRoot, SetRoot};
 pub use provision_tx::{
     LeafPath, MAX_PROVISION_PATH_DEPTH, PROVISION_LEAF_DOMAIN_TAG, PROVISION_ROOT_DOMAIN_TAG,
-    ProvisionCount, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, provision_leaf,
+    PROVISION_SERVED_DOMAIN_TAG, ProvisionCount, ProvisionTxRootsMap, provision_leaf,
+    served_digest,
 };
 pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal_chain};
 pub use settled_txs::{local_settled_tx_hashes, settled_txs_root_from_hashes};
-pub use state::{SplitChildRoots, StateRootContext, StateRootVerifyError};
+pub use state::{ProvisionTxRootsJudged, SplitChildRoots, StateRootContext, StateRootVerifyError};

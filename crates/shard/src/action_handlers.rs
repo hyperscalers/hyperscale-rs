@@ -24,9 +24,9 @@ use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_provisions::provision_tx_roots;
 use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
-    MemberSections, ParentAnchor, PersistedPastAnchor, ShardChainWriter, ShardStorage,
-    SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore, answer_additions,
-    committed_tx_cells, creations_of, record_arrivals, settling_writes,
+    MemberSections, ParentAnchor, PersistedPastAnchor, PreparedBlockView, ShardChainWriter,
+    ShardStorage, SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore,
+    answer_additions, committed_tx_cells, creations_of, record_arrivals, settling_writes,
     without_colliding_committed_cells, without_colliding_member_rows,
 };
 use hyperscale_types::network::Signed;
@@ -45,14 +45,14 @@ use hyperscale_types::{
     Hash, LeafRoot, LocalReceiptRoot, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, ProposerTimestamp, Provision,
-    ProvisionHash, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, ProvisionsRoot, QcContext,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, SectionRoots,
-    SetRoot, SettledTxsRoot, ShardId, ShardLoad, ShardTrie, SplitChildRoots, StandingAnswers,
-    StateClaim, StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt,
-    SubstateClaim, SubstateKey, SweepFrontier, TermsRoot, TermsSection, TickLine, TickManifest,
-    TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction,
-    TransactionRoot, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind,
-    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
+    ProvisionHash, ProvisionTxRootsJudged, ProvisionsRoot, QcContext, QuorumCertificate,
+    ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, SectionRoots, SetRoot,
+    SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StandingAnswers, StateClaim,
+    StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim,
+    SubstateKey, SweepFrontier, TermsRoot, TermsSection, TickLine, TickManifest, TickManifestRoot,
+    Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
+    TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified,
+    Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
     absorb_committed_cells, commit_witness_window, derive_leaves, fees_over_certificates,
     local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
     shard_prefix_path, shard_reveal_sign, signed_bytes, tick_terms_admit_block,
@@ -509,9 +509,18 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     provision_hashes.sort();
 
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
-    let provision_tx_roots =
-        provision_tx_roots(topology_snapshot.shard_trie(), local_shard, &transactions)
-            .expect("a proposal's transactions are verified, which derives them");
+    // Each leaf binds the keys its part serves out of the state this
+    // block leaves, which the header's state root commits.
+    let provision_tx_roots = provision_tx_roots(
+        &PreparedBlockView {
+            parent: &anchored,
+            block: &jmt_snapshot,
+        },
+        topology_snapshot.shard_trie(),
+        local_shard,
+        &transactions,
+    )
+    .expect("a proposal's transactions are verified, which derives them");
 
     // Settlement order, folded the same way and read off the same list.
     // The certificates arrive in the order the ticks executed and the
@@ -1089,30 +1098,6 @@ where
             ));
         }
 
-        ConsensusAction::VerifyProvisionTxRoots {
-            block_hash,
-            expected,
-            transactions,
-            topology_snapshot,
-        } => {
-            let start = Stopwatch::start();
-            let result = check_provision_tx_roots(
-                &expected,
-                topology_snapshot.shard_trie(),
-                ctx.shard,
-                &transactions,
-            );
-            record_signature_verification_latency(
-                "provision_tx_roots",
-                start.elapsed().as_secs_f64(),
-            );
-            ctx.notify_protocol(check_completed(
-                block_hash,
-                VerificationKind::ProvisionTxRoots,
-                result,
-            ));
-        }
-
         ConsensusAction::VerifyResolutions {
             block_hash,
             entries,
@@ -1389,6 +1374,46 @@ where
                 },
                 block_height,
             );
+            // A judged block's provision roots are recomputed over the
+            // state it leaves, which its state root commits, and held to
+            // its claim whether the claim is empty or not. A certified
+            // block's are not judged.
+            let computed_provision_tx_roots = match &parent_judgement {
+                None => None,
+                Some(judgement) => {
+                    let start = Stopwatch::start();
+                    let computed = provision_tx_roots(
+                        &PreparedBlockView {
+                            parent: &anchored,
+                            block: &jmt_snapshot,
+                        },
+                        &judgement.provisions.trie,
+                        ctx.shard,
+                        &transactions,
+                    );
+                    record_signature_verification_latency(
+                        "provision_tx_roots",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    match computed {
+                        Ok(computed) => Some(computed),
+                        Err(unrouted) => {
+                            tracing::warn!(
+                                ?block_hash,
+                                height = block_height.inner(),
+                                %unrouted,
+                                "Rejecting block whose provision roots this node cannot route"
+                            );
+                            ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
+                                block_hash,
+                                kind: VerificationKind::StateRoot,
+                                outcome: CheckOutcome::Refused,
+                            });
+                            return;
+                        }
+                    }
+                }
+            };
             // A terminating shard's boundary header carries the settled
             // root its surviving counterparts read; recompute it from the
             // committed chain whenever the shard terminates at the next
@@ -1434,6 +1459,13 @@ where
                 claimed_terminal_settled_txs,
                 computed_terminal_settled_txs,
                 terminal_settled_txs_required,
+                provision_tx_roots: parent_judgement
+                    .as_ref()
+                    .zip(computed_provision_tx_roots.as_ref())
+                    .map(|(judgement, computed)| ProvisionTxRootsJudged {
+                        claimed: &judgement.provisions.claimed,
+                        computed,
+                    }),
             });
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
             let bytes_delta = jmt_snapshot.bytes_delta;
@@ -2011,51 +2043,33 @@ const fn remote_header_verdict(
     }
 }
 
-/// Whether `expected` is the provision roots map the block's own shard,
-/// `local`, computes over its `transactions` routed under `trie`: the
-/// one rule its proposer committed them by.
-///
-/// # Errors
-///
-/// [`ProvisionTxRootsVerifyError::Mismatch`] when they differ, and
-/// [`ProvisionTxRootsVerifyError::Unrouted`] for a transaction this node
-/// has not derived, which leaves it no map to compare.
-pub fn check_provision_tx_roots(
-    expected: &ProvisionTxRootsMap,
-    trie: &ShardTrie,
-    local: ShardId,
-    transactions: &[Verifiable<Transaction>],
-) -> Result<(), ProvisionTxRootsVerifyError> {
-    let computed = provision_tx_roots(trie, local, transactions).map_err(|unrouted| {
-        ProvisionTxRootsVerifyError::Unrouted {
-            tx_hash: unrouted.tx_hash,
-        }
-    })?;
-    if &computed != expected {
-        return Err(ProvisionTxRootsVerifyError::Mismatch {
-            expected: expected.clone(),
-            computed,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
+    use hyperscale_core::{Parallelism, ParentJudgement, ProvisionJudgement};
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_engine::{ExecutionMode, Executor};
     use hyperscale_hbor::Capped;
+    use hyperscale_network::{
+        Answerers, GossipHandler, NotificationHandler, RequestError, RequestHandler,
+        ResponseVerdict,
+    };
+    use hyperscale_storage::{PendingChain, TickChain};
+    use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
     use hyperscale_types::test_utils::{
-        TestCommittee, install_stub_protocol_statics, stating_half_on, stub_abort_charge,
-        stub_transaction, test_pool, test_prefix, test_principal,
+        StubVmStatics, TestCommittee, install_stub_protocol_statics, stating_half_on,
+        stub_abort_charge, stub_transaction, stub_transaction_with_reads, test_pool, test_prefix,
+        test_principal,
     };
     use hyperscale_types::{
         Address, AddressClass, BeaconBlockHash, BeaconChainConfig, BeaconState, BeaconWitnessEvent,
         BodyRoot, BodyRootVerifyError, CertifiedBeaconBlock, CommittedAt, Deadline,
-        DerivationError, Derived, ExecutionOutcome, GlobalReceiptHash, LocalKey, PriceTable,
-        ProposerTimestamp, Role, ShardCommittee, Signer, Stake, StateWrites, TickHalf,
-        TimestampRange, TransactionEnvelope, TxOutcome, receipt_hash_of,
+        DerivationError, Derived, ExecutionOutcome, GlobalReceiptHash, GossipMessage, LocalKey,
+        MessageClass, NetworkMessage, PriceTable, PrincipalAddr, ProposerTimestamp,
+        ProvisionTxRoot, ProvisionTxRootsMap, ReadFence, Request, Role, RoutingCommittees,
+        ShardCommittee, ShardTrie, Signer, Stake, StateWrites, TickHalf, TimestampRange,
+        TransactionEnvelope, TxOutcome, provision_leaf, receipt_hash_of, served_digest,
     };
 
     use super::*;
@@ -2982,5 +2996,303 @@ mod tests {
             waiting.defer(&[key], "copy"),
             Deferred::Settled("copy", Verdict::Reject)
         );
+    }
+
+    /// A network that drops everything it is handed.
+    struct Silent;
+
+    impl Network for Silent {
+        fn broadcast_to_shard<M: GossipMessage + 'static>(&self, _: ShardId, _: &M) {}
+        fn broadcast_global<M: GossipMessage + 'static>(&self, _: &M) {}
+        fn register_gossip_handler<M: GossipMessage + 'static>(&self, _: impl GossipHandler<M>) {}
+        fn register_host_gossip_handler<M: GossipMessage + 'static>(
+            &self,
+            _: impl Fn(M) + Send + Sync + 'static,
+        ) {
+        }
+        fn register_request_handler<R: Request + Send + 'static>(
+            &self,
+            _: ShardId,
+            _: impl RequestHandler<R>,
+        ) where
+            R::Response: Send + 'static,
+        {
+        }
+        fn notify<M: NetworkMessage + 'static>(&self, _: &[ValidatorId], _: &M) {}
+        fn register_notification_handler<M: NetworkMessage + Clone + 'static>(
+            &self,
+            _: impl NotificationHandler<M>,
+        ) {
+        }
+        fn subscribe_shard(&self, _: ShardId) {}
+        fn unsubscribe_shard(&self, _: ShardId) {}
+        fn update_topology(&self, _: Arc<TopologySnapshot>) {}
+        fn update_routing_committees(&self, _: Arc<RoutingCommittees>) {}
+        fn request_from<R: Request + Clone + 'static>(
+            &self,
+            _: ShardId,
+            _: Answerers,
+            _: Option<ValidatorId>,
+            _: R,
+            _: Option<MessageClass>,
+            _: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
+        ) {
+        }
+    }
+
+    /// The shard the judged blocks below are this replica's.
+    const LOCAL: ShardId = ShardId::leaf(1, 0);
+    /// The shard their transaction's payer is on.
+    const PAYER_SHARD: ShardId = ShardId::leaf(1, 1);
+
+    /// A block at height 1 over an empty store, carrying one transaction
+    /// that reads a cell here for a payer on the other shard: what this
+    /// shard owes the payer is the one part serving that cell.
+    struct Judged {
+        storage: Arc<SimShardStorage>,
+        pending_chain: Arc<PendingChain<SimShardStorage>>,
+        trie: ShardTrie,
+        tx: Verifiable<Transaction>,
+        /// The state root the block leaves, and the map that state gives.
+        root: StateRoot,
+        honest: ProvisionTxRootsMap,
+        sweep_frontier: SweepFrontier,
+    }
+
+    impl Judged {
+        fn new() -> Self {
+            install_stub_protocol_statics();
+            let trie = ShardTrie::uniform(1);
+            let payer = PrincipalAddr::new([0x80; 31]);
+            let held = PrincipalAddr::new([0x10; 31]);
+            assert_eq!(trie.shard_for_prefix(held.address()), LOCAL);
+            assert_eq!(trie.shard_for_prefix(payer.address()), PAYER_SHARD);
+            let tx = Verifiable::from(stub_transaction_with_reads(
+                payer,
+                &[held.address()],
+                &[payer.address()],
+                1_000,
+                TimestampRange::new(
+                    WeightedTimestamp::ZERO,
+                    WeightedTimestamp::from_millis(60_000),
+                ),
+            ));
+            let storage = Arc::new(SimShardStorage::default());
+            let pending_chain = Arc::new(PendingChain::new(
+                Arc::clone(&storage),
+                BlockHeight::GENESIS,
+            ));
+            let view = pending_chain.view_at(BlockHash::ZERO, BlockHeight::GENESIS);
+            let (removals, sweep_frontier) = view
+                .sweep_for_block(
+                    BlockSweep::of_child(SweepFrontier::ZERO, false),
+                    WeightedTimestamp::ZERO,
+                )
+                .expect("nothing is persisted");
+            let anchored = view.snapshot();
+            let (root, jmt_snapshot, _) = view.base().prepare_block_commit(
+                ParentAnchor {
+                    state_root: view.base().state_root(),
+                    height: BlockHeight::GENESIS,
+                    state: &anchored,
+                    pending: view.pending_snapshots(),
+                    base_reads: None,
+                },
+                &[],
+                ChainWrites {
+                    creations: &[],
+                    removals: &removals,
+                    sweep_frontier,
+                    frontier: &FrontierInputs::still(LOCAL),
+                    state_claims: &[],
+                    members: &MemberInputs::still(LOCAL),
+                },
+                BlockHeight::new(1),
+            );
+            let honest = provision_tx_roots(
+                &PreparedBlockView {
+                    parent: &anchored,
+                    block: &jmt_snapshot,
+                },
+                &trie,
+                LOCAL,
+                std::slice::from_ref(&tx),
+            )
+            .expect("the transaction is derived");
+            assert!(honest.contains_key(&PAYER_SHARD));
+            Self {
+                storage,
+                pending_chain,
+                trie,
+                tx,
+                root,
+                honest,
+                sweep_frontier,
+            }
+        }
+
+        /// The judgement a voter holds the block to, its header claiming
+        /// `claimed`.
+        fn judgement(&self, claimed: ProvisionTxRootsMap) -> ParentJudgement {
+            ParentJudgement {
+                fence: ReadFence::default(),
+                coasting: false,
+                provisions: ProvisionJudgement {
+                    claimed,
+                    trie: self.trie.clone(),
+                },
+            }
+        }
+
+        /// Run the state-root check of the block carrying `tx`, judged by
+        /// `judgement`: its outcome, and whether its tree was seated.
+        fn check(
+            &self,
+            tx: Verifiable<Transaction>,
+            judgement: Option<ParentJudgement>,
+        ) -> (CheckOutcome, bool) {
+            let check = StateRootCheck {
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"judged")),
+                transactions: Arc::new(Capped::from_array([tx])),
+                parent_block_hash: BlockHash::ZERO,
+                parent_state_root: self.storage.state_root(),
+                parent_block_height: BlockHeight::GENESIS,
+                expected_root: self.root,
+                finalizations: Vec::new(),
+                creations: Vec::new(),
+                block_height: BlockHeight::new(1),
+                claimed_split_child_roots: None,
+                split_child_roots_required: false,
+                terminal_settled_txs_required: false,
+                claimed_terminal_settled_txs: None,
+                parent_weighted_timestamp: WeightedTimestamp::ZERO,
+                settled_txs_window_floor: None,
+                parent_sweep_frontier: SweepFrontier::ZERO,
+                claimed_sweep_frontier: self.sweep_frontier,
+                frontier: FrontierInputs::still(LOCAL),
+                members: MemberInputs::still(LOCAL),
+                parent_judgement: judgement,
+                state_claims: Vec::new(),
+            };
+            let reported: Arc<Mutex<Vec<ProtocolEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&reported);
+            let seated = Mutex::new(0usize);
+            let commit_prepared = |_: PreparedBlock| {
+                *seated.lock().expect("seated lock") += 1;
+            };
+            let executor = Executor::new(ExecutionMode::Serial);
+            let snapshot = TestCommittee::new(4, 7).topology_snapshot(2);
+            let tick_chain = Arc::new(TickChain::new(Arc::clone(&self.storage)));
+            let ctx = ActionContext {
+                executor: &executor,
+                topology_snapshot: &snapshot,
+                signing: None,
+                shard: LOCAL,
+                pending_chain: &self.pending_chain,
+                tick_chain: &tick_chain,
+                vote_registers: self.storage.as_ref(),
+                beacon_chain: &SimBeaconStorage::new(),
+                network: &Arc::new(Silent),
+                verifier: &BlsVerifier,
+                notify: Arc::new(move |event| sink.lock().expect("reported lock").push(event)),
+                commit_prepared: &commit_prepared,
+                par: Parallelism::Sequential,
+            };
+            handle_action(ConsensusAction::VerifyStateRoot(Box::new(check)), &ctx);
+            let reported = std::mem::take(&mut *reported.lock().expect("reported lock"));
+            let [
+                ProtocolEvent::BlockCheckCompleted {
+                    kind: VerificationKind::StateRoot,
+                    outcome,
+                    ..
+                },
+            ] = &reported[..]
+            else {
+                panic!("one state-root verdict: {reported:?}")
+            };
+            let seated = *seated.lock().expect("seated lock") > 0;
+            (outcome.clone(), seated)
+        }
+    }
+
+    /// The map a voter computes over the state an honest block leaves is
+    /// the proposer's, and the block's state root checks out and seats.
+    #[test]
+    fn an_honest_provision_map_is_the_voters_own() {
+        let block = Judged::new();
+        let (outcome, seated) = block.check(
+            block.tx.clone(),
+            Some(block.judgement(block.honest.clone())),
+        );
+        assert!(matches!(outcome, CheckOutcome::Checked { .. }));
+        assert!(seated);
+    }
+
+    /// A header whose root for the payer shard commits the transaction's
+    /// part stripped of its cell, or any root but the one the served
+    /// keys give, refuses the state root and seats no tree.
+    #[test]
+    fn a_map_over_a_stripped_part_refuses_the_state_root() {
+        let block = Judged::new();
+        let stripped = ProvisionTxRootsMap::new(BTreeMap::from([(
+            PAYER_SHARD,
+            ProvisionTxRoot::over(&[provision_leaf(
+                block.tx.hash(),
+                served_digest(std::iter::empty()),
+            )]),
+        )]))
+        .expect("one target");
+        assert_ne!(stripped, block.honest);
+        let (outcome, seated) = block.check(block.tx.clone(), Some(block.judgement(stripped)));
+        assert_eq!(outcome, CheckOutcome::Refused);
+        assert!(!seated);
+    }
+
+    /// A header claiming no provision roots for a block that owes the
+    /// payer shard a part is refused: an empty claim is compared like any
+    /// other.
+    #[test]
+    fn an_empty_claim_over_an_owed_part_refuses_the_state_root() {
+        let block = Judged::new();
+        let (outcome, seated) = block.check(
+            block.tx.clone(),
+            Some(block.judgement(ProvisionTxRootsMap::default())),
+        );
+        assert_eq!(outcome, CheckOutcome::Refused);
+        assert!(!seated);
+    }
+
+    /// The block's transaction as a node whose derivation refused it
+    /// holds it: its declaration read, its routing not.
+    fn underived(block: &Judged) -> Verifiable<Transaction> {
+        let tx = Transaction::new(block.tx.as_unverified().body().clone());
+        assert!(tx.try_declared(&StubVmStatics).is_ok());
+        assert!(!tx.is_routed());
+        Verifiable::from(tx)
+    }
+
+    /// A judged block carrying a transaction this node has not derived
+    /// has no map to compare, and is refused rather than passed or left
+    /// unanswered.
+    #[test]
+    fn an_unrouted_transaction_under_a_judgement_is_refused() {
+        let block = Judged::new();
+        let (outcome, seated) = block.check(
+            underived(&block),
+            Some(block.judgement(block.honest.clone())),
+        );
+        assert_eq!(outcome, CheckOutcome::Refused);
+        assert!(!seated);
+    }
+
+    /// A certified block's state root is checked with no judgement: one
+    /// carrying a cross-shard transaction this node has not derived
+    /// seats its tree, its map never read.
+    #[test]
+    fn a_synced_block_with_an_underived_transaction_seats_its_tree() {
+        let block = Judged::new();
+        let (outcome, seated) = block.check(underived(&block), None);
+        assert!(matches!(outcome, CheckOutcome::Checked { .. }));
+        assert!(seated);
     }
 }

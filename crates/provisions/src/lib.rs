@@ -29,8 +29,8 @@ mod store;
 mod verification;
 mod verified_headers;
 
-pub use build::{build_provisions, build_provisions_until, provision_count};
-pub use content::{Unrouted, provision_tx_roots, served_keys};
+pub use build::{Owed, build_part, build_provisions};
+pub use content::{Unrouted, leaves_over_requests, provision_tx_roots, served_keys, served_leaf};
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};
 pub use requests::{ShardRecipients, build_provision_requests, provision_request};

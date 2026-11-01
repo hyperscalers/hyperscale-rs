@@ -11,12 +11,11 @@ use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlockHeader, ConsensusPublicKey,
     Epoch, EpochWindows, Finalization, FrontierInputs, Hash, HeaderSource, ProposerTimestamp,
-    Provision, ProvisionTxRootsMap, QuorumCertificate, ReadFence, ReadySignal, ReshapeKind,
-    ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, Settling,
-    ShardForkProof, ShardId, ShardLoad, SharedTransactions, SharedWitnessSources, StandingAnswers,
-    StateClaim, StateRoot, SubstateClaim, Timeout, TimeoutCertificate, TopologySnapshot,
-    Transaction, TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
-    WeightedTimestamp,
+    Provision, QuorumCertificate, ReadFence, ReadySignal, ReshapeKind, ReshapeThresholds,
+    ReshapeTrigger, ResolvedCommittee, RevealChain, Round, Settling, ShardForkProof, ShardId,
+    ShardLoad, SharedWitnessSources, StandingAnswers, StateClaim, StateRoot, SubstateClaim,
+    Timeout, TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId,
+    Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -405,25 +404,6 @@ pub enum ConsensusAction {
         validity_anchor: WeightedTimestamp,
     },
 
-    /// Verify a block's per-target-shard provisions commitments.
-    ///
-    /// Recomputes the per-target map from the block's transactions, its
-    /// certificates and its crossing re-offers, and compares against the
-    /// block header's `provision_tx_roots` by full-map equality. Catches
-    /// tampering with which txs are claimed to target which shard.
-    ///
-    /// Pure CPU operation — verified in parallel with other root verifications.
-    VerifyProvisionTxRoots {
-        /// Block whose provision-tx roots are being verified.
-        block_hash: BlockHash,
-        /// Expected per-target roots from the block header.
-        expected: ProvisionTxRootsMap,
-        /// Transactions in the block.
-        transactions: SharedTransactions,
-        /// Topology snapshot used to route txs to target shards.
-        topology_snapshot: TopologySnapshot,
-    },
-
     /// Check the figures a block's abandonment records restate against
     /// the committed transactions they name.
     ///
@@ -628,7 +608,6 @@ impl Delegated for ConsensusAction {
             | Self::VerifyStateRoot(_)
             | Self::VerifyBeaconWitnessRoot { .. }
             | Self::VerifyBodyRoot { .. }
-            | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyResolutions { .. } => None,
         }
     }

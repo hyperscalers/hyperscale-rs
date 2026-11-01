@@ -14,10 +14,10 @@ use hyperscale_engine::legs::Member;
 use hyperscale_storage::{CommittedHere, MemberInputs, TickResolution};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, DeclaredRange, Epoch,
-    EscrowedValue, Finalization, FrontierInputs, HeaderFetchCount, PriceTable, ReadFence,
-    SettledTxsRoot, ShardId, SharedTransactions, SplitChildRoots, StateClaim, StateRoot,
-    SubstateEntry, SubstateKey, SweepFrontier, TickId, Transaction, TransactionStatus, TxHash,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    EscrowedValue, Finalization, FrontierInputs, HeaderFetchCount, PriceTable, ProvisionTxRootsMap,
+    ReadFence, SettledTxsRoot, ShardId, ShardTrie, SharedTransactions, SplitChildRoots, StateClaim,
+    StateRoot, SubstateEntry, SubstateKey, SweepFrontier, TickId, Transaction, TransactionStatus,
+    TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 pub use provisions::ProvisionAction;
 
@@ -73,7 +73,7 @@ pub struct SyncClaimId(pub u64);
 /// What a block that arrives as a proposal is held to at its parent,
 /// beside the root.
 ///
-/// The two rules that read this validator's own view of the moment the
+/// The rules that read this validator's own view of the moment the
 /// block was made. They are asked of every block the vote pipeline
 /// checks, one this validator will not vote on included, and a refusal
 /// drops the pending block and the state-root checks deferred on it, and
@@ -89,6 +89,20 @@ pub struct ParentJudgement {
     /// its sweep must hold the parent's frontier rather than walk from
     /// it.
     pub coasting: bool,
+    /// What the block's provision roots are held to.
+    pub provisions: ProvisionJudgement,
+}
+
+/// What a judged block's provision roots are held to: the header's map,
+/// recomputed over the state the block leaves under the routing its
+/// proposer classified it by.
+#[derive(Debug, Clone)]
+pub struct ProvisionJudgement {
+    /// The header's `provision_tx_roots`, compared whether empty or not.
+    pub claimed: ProvisionTxRootsMap,
+    /// The trie of the block's committee snapshot, which routes its
+    /// transactions to their targets.
+    pub trie: ShardTrie,
 }
 
 /// What one block's state-root verification takes.

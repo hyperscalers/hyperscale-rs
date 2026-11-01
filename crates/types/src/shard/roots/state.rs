@@ -19,7 +19,9 @@ use hyperscale_hbor::Hbor;
 use hyperscale_jmt::{Blake3Hasher, Hasher};
 use thiserror::Error;
 
-use crate::{Hash, SettledTxsRoot, StateRoot, SweepFrontier, Verified, Verify};
+use crate::{
+    Hash, ProvisionTxRootsMap, SettledTxsRoot, StateRoot, SweepFrontier, Verified, Verify,
+};
 
 /// The two child hashes of the JMT root node behind a header's
 /// `state_root` — `r_p0` / `r_p1` for a shard whose split executes at the
@@ -83,6 +85,21 @@ pub struct StateRootContext<'a> {
     /// Whether the block's window requires the claim — set on a
     /// terminating shard's boundary header.
     pub terminal_settled_txs_required: bool,
+    /// The header's provision roots beside the map recomputed over the
+    /// state the block leaves, for a block judged at its parent; `None`
+    /// for a certified block, whose map is not judged.
+    pub provision_tx_roots: Option<ProvisionTxRootsJudged<'a>>,
+}
+
+/// A judged block's provision roots: what its header claims and what the
+/// verifier computed over the post-block state. They must be equal, empty
+/// or not.
+#[derive(Debug, Clone, Copy)]
+pub struct ProvisionTxRootsJudged<'a> {
+    /// The header's `provision_tx_roots`.
+    pub claimed: &'a ProvisionTxRootsMap,
+    /// The map the request rule and the served keys give.
+    pub computed: &'a ProvisionTxRootsMap,
 }
 
 /// Failure modes of [`StateRoot`] verification.
@@ -160,6 +177,12 @@ pub enum StateRootVerifyError {
         /// Pair recomputed by walking the committed retention window.
         computed: Option<SettledTxsRoot>,
     },
+
+    /// The header's provision roots are not the ones the block's
+    /// transactions and the keys they serve at the post-block state
+    /// give.
+    #[error("provision roots differ from the ones the block's served keys give")]
+    ProvisionTxRootsMismatch,
 }
 
 impl Verified<StateRoot> {
@@ -217,6 +240,11 @@ impl Verify<&StateRootContext<'_>> for StateRoot {
             }
             _ => {}
         }
+        if let Some(judged) = ctx.provision_tx_roots
+            && judged.claimed != judged.computed
+        {
+            return Err(StateRootVerifyError::ProvisionTxRootsMismatch);
+        }
         Ok(Verified::new_unchecked(*self))
     }
 }
@@ -224,7 +252,7 @@ impl Verify<&StateRootContext<'_>> for StateRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Hash;
+    use crate::{Hash, ProvisionTxRoot, ShardId};
 
     fn composing_pair() -> (SplitChildRoots, StateRoot) {
         let left = StateRoot::from_raw(Hash::from_bytes(b"left subtree"));
@@ -247,6 +275,7 @@ mod tests {
                 claimed_terminal_settled_txs: None,
                 computed_terminal_settled_txs: None,
                 terminal_settled_txs_required: false,
+                provision_tx_roots: None,
             })
             .is_ok()
         );
@@ -263,6 +292,7 @@ mod tests {
                 claimed_terminal_settled_txs: None,
                 computed_terminal_settled_txs: None,
                 terminal_settled_txs_required: false,
+                provision_tx_roots: None,
             })
             .unwrap_err(),
             StateRootVerifyError::MissingSplitChildRoots,
@@ -280,6 +310,7 @@ mod tests {
                 claimed_terminal_settled_txs: None,
                 computed_terminal_settled_txs: None,
                 terminal_settled_txs_required: false,
+                provision_tx_roots: None,
             })
             .unwrap_err(),
             StateRootVerifyError::UnexpectedSplitChildRoots,
@@ -301,6 +332,7 @@ mod tests {
                 claimed_terminal_settled_txs: None,
                 computed_terminal_settled_txs: None,
                 terminal_settled_txs_required: false,
+                provision_tx_roots: None,
             })
             .unwrap_err(),
             StateRootVerifyError::SplitChildRootsMismatch {
@@ -324,6 +356,7 @@ mod tests {
                     claimed_terminal_settled_txs: None,
                     computed_terminal_settled_txs: None,
                     terminal_settled_txs_required: false,
+                    provision_tx_roots: None,
                 })
                 .unwrap_err(),
             StateRootVerifyError::Mismatch { .. },
@@ -345,7 +378,44 @@ mod tests {
             claimed_terminal_settled_txs: claimed,
             computed_terminal_settled_txs: computed,
             terminal_settled_txs_required: required,
+            provision_tx_roots: None,
         }
+    }
+
+    /// A judged map that is not the computed one refuses the root, an
+    /// empty claim over a non-empty computation included; an equal one
+    /// passes.
+    #[test]
+    fn a_judged_provision_map_must_equal_the_computed_one() {
+        let (_, root) = composing_pair();
+        let empty = ProvisionTxRootsMap::default();
+        let owed = ProvisionTxRootsMap::new(
+            [(
+                ShardId::leaf(1, 1),
+                ProvisionTxRoot::from_raw(Hash::from_bytes(b"owed")),
+            )]
+            .into(),
+        )
+        .expect("one target");
+        let judged = |claimed, computed| StateRootContext {
+            computed_root: &root,
+            claimed_split_child_roots: None,
+            split_child_roots_required: false,
+            claimed_terminal_settled_txs: None,
+            computed_terminal_settled_txs: None,
+            terminal_settled_txs_required: false,
+            provision_tx_roots: Some(ProvisionTxRootsJudged { claimed, computed }),
+        };
+        assert_eq!(
+            root.verify(&judged(&empty, &owed)).unwrap_err(),
+            StateRootVerifyError::ProvisionTxRootsMismatch,
+        );
+        assert_eq!(
+            root.verify(&judged(&owed, &empty)).unwrap_err(),
+            StateRootVerifyError::ProvisionTxRootsMismatch,
+        );
+        assert!(root.verify(&judged(&owed, &owed)).is_ok());
+        assert!(root.verify(&judged(&empty, &empty)).is_ok());
     }
 
     fn settled(tag: &[u8]) -> SettledTxsRoot {

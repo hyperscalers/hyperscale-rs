@@ -10,7 +10,7 @@ use std::sync::Arc;
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_hbor::Capped;
 use hyperscale_jmt::{Key as JmtKey, MultiProof, NibblePath};
-use hyperscale_provisions::build_provisions;
+use hyperscale_provisions::{build_provisions, leaves_over_requests};
 use hyperscale_storage::test_helpers::{
     entry_key, make_settled_entries, make_settled_writes, state_key,
 };
@@ -21,7 +21,7 @@ use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BlockHeight, DeclaredRange, Hash, MAX_PROVISION_WEIGHT, Provision, ProvisionContext,
     ProvisionParts, ProvisionTxRoot, ProvisionVerifyError, SettledWrites, ShardId, SubstateEntry,
-    SubstateKey, TxHash, TypedHash, Verify, WeightedTimestamp, provision_leaf,
+    SubstateKey, TxHash, TypedHash, Verify, WeightedTimestamp,
 };
 
 /// A request from the transaction `seed` names, owed to the one target
@@ -161,6 +161,19 @@ fn parts_of(
     )
 }
 
+/// The leaves `chain`'s header would commit at genesis for what
+/// `requests` owe their one target.
+fn leaves_of(
+    chain: &Arc<PendingChain<SimShardStorage>>,
+    requests: &[ProvisionsRequest],
+) -> Vec<Hash> {
+    let view = chain.view_at_persisted_tip();
+    let state = view.served_snapshot().expect("genesis is held");
+    leaves_over_requests(&state, requests)
+        .remove(&ShardId::leaf(1, 1))
+        .expect("every request owes the one target")
+}
+
 /// The part `chain` builds for one transaction reading `local_keys`.
 fn cells_part(
     chain: &Arc<PendingChain<SimShardStorage>>,
@@ -250,11 +263,7 @@ fn each_transaction_builds_its_own_part_at_its_own_leaf() {
         .map(|seed| request(*seed, vec![state_key(7, 1)], Vec::new()))
         .collect();
     let parts = parts_of(&chain, &requests);
-    let leaves: Vec<Hash> = requests
-        .iter()
-        .map(|req| provision_leaf(req.tx_hash))
-        .collect();
-    let root = ProvisionTxRoot::over(&leaves);
+    let root = ProvisionTxRoot::over(&leaves_of(&chain, &requests));
 
     assert_eq!(parts.len(), 3);
     for (index, (part, req)) in parts.iter().zip(&requests).enumerate() {
@@ -304,11 +313,7 @@ fn an_unbuildable_part_leaves_its_neighbours_whole() {
         request(b"t2", vec![state_key(7, 1)], Vec::new()),
     ];
     let parts = parts_of(&chain, &requests);
-    let leaves: Vec<Hash> = requests
-        .iter()
-        .map(|req| provision_leaf(req.tx_hash))
-        .collect();
-    let root = ProvisionTxRoot::over(&leaves);
+    let root = ProvisionTxRoot::over(&leaves_of(&chain, &requests));
 
     let indices: Vec<u32> = parts.iter().map(|part| part.leaf().index).collect();
     assert_eq!(

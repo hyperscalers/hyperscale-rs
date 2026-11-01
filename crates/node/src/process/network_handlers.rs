@@ -32,8 +32,8 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    BeaconProposal, BlockHeight, ExecutionCertificate, HeaderSource, ProvisionCount, ShardId,
-    Signed, Verifiable, Verified, signed_bytes,
+    BeaconProposal, BlockHeight, ExecutionCertificate, HeaderSource, MAX_FETCH_RESPONSE_BYTES,
+    ShardId, Signed, Verifiable, Verified, signed_bytes,
 };
 use tracing::warn;
 
@@ -44,7 +44,7 @@ use crate::process::ProcessIo;
 use crate::process::single_flight::SingleFlight;
 use crate::serve::Served;
 use crate::shard::cross_shard::{
-    BuiltParts, PROVISION_CACHE_BYTES, ServedPart, crossing_push, provision_answer,
+    OwedLeaves, Owing, PROVISION_CACHE_BYTES, ServedPart, crossing_push, provision_answer,
 };
 use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
@@ -1091,19 +1091,18 @@ fn register_served<R, N>(
 }
 
 /// What one seat's provision serve keeps: the part served per `(height,
-/// target shard, leaf index)`, and the count witness per `(height,
-/// target shard)`, `None` where the block owes the target nothing.
+/// target shard, leaf index)`, and what the header owes the target per
+/// `(height, target shard)`, its leaves matched to the header's root.
+/// Both are a function of the committed header, so neither goes stale
+/// across a change of partition.
 struct ProvisionFlights {
     parts: SingleFlight<(BlockHeight, ShardId, u32), ServedPart>,
-    counts: SingleFlight<(BlockHeight, ShardId), Option<ProvisionCount>>,
+    owing: SingleFlight<(BlockHeight, ShardId), Owing>,
 }
 
-/// The count witnesses a seat keeps: enough for every target of the
+/// The bytes of matched leaves a seat keeps: the leaf lists of the
 /// blocks whose parts it keeps, which are few.
-const PROVISION_COUNTS_KEPT: usize = 4096;
-
-/// What one kept count witness costs, its key included.
-const PROVISION_COUNT_BYTES: usize = size_of::<((BlockHeight, ShardId), Option<ProvisionCount>)>();
+const PROVISION_LEAVES_BYTES: usize = MAX_FETCH_RESPONSE_BYTES;
 
 impl ProvisionFlights {
     fn new(max_waiters: usize, wait_budget: Duration) -> Self {
@@ -1114,9 +1113,9 @@ impl ProvisionFlights {
                 max_waiters,
                 wait_budget,
             ),
-            counts: SingleFlight::new(
-                PROVISION_COUNTS_KEPT * PROVISION_COUNT_BYTES,
-                |_| PROVISION_COUNT_BYTES,
+            owing: SingleFlight::new(
+                PROVISION_LEAVES_BYTES,
+                Owing::weight,
                 max_waiters,
                 wait_budget,
             ),
@@ -1124,36 +1123,39 @@ impl ProvisionFlights {
     }
 }
 
-/// Answer a provision ask through `flights`: the count witness first,
-/// then each asked index under it from the cache, from a build another
-/// ask is already running for it, or by `build` over the indices nobody
-/// holds. A block not held builds nothing and is not kept: it may yet
-/// commit here, and a cached miss would outlive that. A holder's answer
-/// states the count even when no part came of the ask, and an index
-/// past the count is never built.
+/// Answer a provision ask through `flights`: the block's leaves matched
+/// to its header's root first, by `match_leaves`, then each asked index
+/// under them from the cache, from a build another ask is already
+/// running for it, or by `build` over the indices nobody holds. A block
+/// not held or not matched builds nothing and is not kept: it may yet
+/// commit or match here, and a cached miss would outlive that. A
+/// holder's answer states the count even when no part came of the ask,
+/// and an index past the count is never built.
 fn serve_provisions(
     flights: &ProvisionFlights,
     req: &GetProvisionsRequest,
-    mut build: impl FnMut(&[u32]) -> Option<BuiltParts>,
+    mut match_leaves: impl FnMut() -> Option<Owing>,
+    mut build: impl FnMut(&OwedLeaves, &[u32]) -> Vec<(u32, ServedPart)>,
 ) -> GetProvisionResponse {
     let block = (req.height, req.target_shard);
     let mut tried = false;
-    let counted = flights.counts.get_or_produce(&[block], |_| {
+    let matched = flights.owing.get_or_produce(&[block], |_| {
         tried = true;
-        build(&[])
-            .map(|made| (block, made.count))
+        match_leaves()
+            .map(|owing| (block, owing))
             .into_iter()
             .collect()
     });
-    let count = match counted.into_iter().find_map(|(_, flight)| flight.value()) {
-        Some(count) => count,
+    let owing = match matched.into_iter().find_map(|(_, flight)| flight.value()) {
+        Some(owing) => Some(owing),
         None if tried => None,
-        // Turned away or out of wait while another ask derived it.
-        None => build(&[]).and_then(|made| made.count),
+        // Turned away or out of wait while another ask matched it.
+        None => match_leaves(),
     };
-    let Some(count) = count else {
+    let Some(Owing::Leaves(owed)) = owing else {
         return provision_answer(req.indices.len(), [], None);
     };
+    let count = owed.count();
 
     let mut indices: Vec<u32> = req
         .indices
@@ -1169,12 +1171,10 @@ fn serve_provisions(
         .collect();
     let served = flights.parts.get_or_produce(&keys, |own| {
         let own: Vec<u32> = own.iter().map(|(.., index)| *index).collect();
-        build(&own).map_or_else(Vec::new, |made| {
-            made.parts
-                .into_iter()
-                .map(|(index, served)| ((req.height, req.target_shard, index), served))
-                .collect()
-        })
+        build(&owed, &own)
+            .into_iter()
+            .map(|(index, served)| ((req.height, req.target_shard, index), served))
+            .collect()
     });
     provision_answer(
         req.indices.len(),
@@ -1217,7 +1217,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::beacon::witness_serve::serve_shard_witnesses_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        SettledTxsCache, build_served_parts, outbound_answer, serve_cells_request,
+        SettledTxsCache, build_served_parts, outbound_answer, owed_leaves, serve_cells_request,
         serve_finalizations_request, serve_local_provisions_request, serve_remote_headers_request,
         serve_settled_txs_request, serve_state_proof_request,
     };
@@ -1341,7 +1341,10 @@ pub fn register_shard_request_handlers<S, N, D>(
     // to `PROVISION_CACHE_BYTES` for this seat.
 
     let pending_chain = Arc::clone(&io.pending_chain);
-    let topology_snapshot = process.topology_snapshot.clone();
+    // Weak: the network holds this handler and the process holds the
+    // network, so a strong handle would keep the process, and its
+    // stores, alive past the host.
+    let schedule_source = Arc::downgrade(process);
     let outbound_cache = Arc::clone(&io.caches.provision_store);
     let derivation = process.derivation();
 
@@ -1359,17 +1362,32 @@ pub fn register_shard_request_handlers<S, N, D>(
                 return response;
             }
 
-            serve_provisions(&provisions_flights, req, |indices| {
-                build_served_parts(
-                    &pending_chain,
-                    derivation.as_ref(),
-                    shard,
-                    topology_snapshot.load().shard_trie(),
-                    req.height,
-                    req.target_shard,
-                    indices,
-                )
-            })
+            serve_provisions(
+                &provisions_flights,
+                req,
+                || {
+                    let process = schedule_source.upgrade()?;
+                    owed_leaves(
+                        &pending_chain,
+                        derivation.as_ref(),
+                        shard,
+                        &process.topology_schedule(),
+                        req.height,
+                        req.target_shard,
+                    )
+                },
+                |owed, indices| {
+                    build_served_parts(
+                        &pending_chain,
+                        derivation.as_ref(),
+                        shard,
+                        owed,
+                        req.height,
+                        req.target_shard,
+                        indices,
+                    )
+                },
+            )
         },
     );
 
@@ -1510,8 +1528,8 @@ mod tests {
         BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockProposalMessage,
         CertifiedBlockHeader, ChainOrigin, ConsensusSignature, Hash, LeafPath,
         MAX_MERKLE_PROOF_LEN, MerkleInclusionProof, NetworkDefinition, NetworkMessage, Provision,
-        ProvisionCount, ProvisionParts, QuorumCertificate, ReadySignal, ShardId, TxHash,
-        Verifiable, Verified, WeightedTimestamp, provision_leaf, signed_bytes,
+        ProvisionParts, QuorumCertificate, ReadySignal, ShardId, ShardTrie, TxHash, Verifiable,
+        Verified, WeightedTimestamp, provision_leaf, served_digest, signed_bytes,
     };
 
     use super::{GetProvisionsRequest, ProvisionFlights, serve_provisions};
@@ -1519,7 +1537,7 @@ mod tests {
         HostEvent, NETWORK_LANE_CAPACITY, NetworkLaneReceiver, ShardInbox, ShardScopedInput,
         network_lane,
     };
-    use crate::shard::cross_shard::{BuiltParts, PROVISION_CACHE_BYTES, ServedPart};
+    use crate::shard::cross_shard::{OwedLeaves, Owing, PROVISION_CACHE_BYTES, ServedPart};
     use crate::shard::push_shard_input;
     use crate::shard::test_host::{CountingVerifier, Fixture, Host, SHARD, loop_of};
 
@@ -1894,16 +1912,21 @@ mod tests {
                 siblings: Capped::empty(),
             },
         });
-        ServedPart::new(Some(part), heavy_count(height))
+        ServedPart::new(Some(part), heavy_owed(height).count())
     }
 
     fn heavy_tx(height: u64) -> TxHash {
         TxHash::from(Hash::from_bytes(&height.to_le_bytes()))
     }
 
-    /// The count witness of the source block at `height`: one leaf.
-    fn heavy_count(height: u64) -> ProvisionCount {
-        ProvisionCount::over(&[provision_leaf(heavy_tx(height))])
+    /// The leaf of a keyless part for `tx`.
+    fn keyless_leaf(tx: TxHash) -> Hash {
+        provision_leaf(tx, served_digest(std::iter::empty()))
+    }
+
+    /// The leaves of the source block at `height`: one.
+    fn heavy_owed(height: u64) -> OwedLeaves {
+        OwedLeaves::new(vec![keyless_leaf(heavy_tx(height))], ShardTrie::single())
     }
 
     /// A source block at height 1 owing its one target ten parts.
@@ -1918,12 +1941,12 @@ mod tests {
         )
     }
 
-    /// The block's count witness over its ten leaves.
-    fn owed_count() -> ProvisionCount {
+    /// The block's ten leaves.
+    fn owed() -> OwedLeaves {
         let leaves: Vec<Hash> = (0..OWED)
-            .map(|index| provision_leaf(TxHash::from(Hash::from_bytes(&index.to_le_bytes()))))
+            .map(|index| keyless_leaf(TxHash::from(Hash::from_bytes(&index.to_le_bytes()))))
             .collect();
-        ProvisionCount::over(&leaves)
+        OwedLeaves::new(leaves, ShardTrie::single())
     }
 
     /// The block's part at `index`.
@@ -1942,21 +1965,24 @@ mod tests {
                 siblings: Capped::empty(),
             },
         });
-        ServedPart::new(Some(part), owed_count())
+        ServedPart::new(Some(part), owed().count())
     }
 
     /// What the block's holder builds of `indices`, stopping after
     /// `stop` parts as a full response would.
-    fn owed_build(indices: &[u32], stop: usize) -> BuiltParts {
-        BuiltParts {
-            count: Some(owed_count()),
-            parts: indices
-                .iter()
-                .filter(|index| **index < OWED)
-                .take(stop)
-                .map(|index| (*index, owed_part(*index)))
-                .collect(),
-        }
+    fn owed_build(indices: &[u32], stop: usize) -> Vec<(u32, ServedPart)> {
+        indices
+            .iter()
+            .filter(|index| **index < OWED)
+            .take(stop)
+            .map(|index| (*index, owed_part(*index)))
+            .collect()
+    }
+
+    /// The holder's match of the block's leaves to its header's root.
+    #[allow(clippy::unnecessary_wraps)] // the matcher's shape
+    fn matched() -> Option<Owing> {
+        Some(Owing::Leaves(owed()))
     }
 
     /// An ask that joins the indices another ask's build stopped short
@@ -1970,12 +1996,10 @@ mod tests {
         let first = {
             let flight = Arc::clone(&flight);
             std::thread::spawn(move || {
-                serve_provisions(&flight, &ask_for(0..OWED), |indices| {
-                    if !indices.is_empty() {
-                        started_tx.send(()).expect("started");
-                        release_rx.recv().expect("release");
-                    }
-                    Some(owed_build(indices, OWED as usize / 2))
+                serve_provisions(&flight, &ask_for(0..OWED), matched, |_, indices| {
+                    started_tx.send(()).expect("started");
+                    release_rx.recv().expect("release");
+                    owed_build(indices, OWED as usize / 2)
                 })
             })
         };
@@ -1983,8 +2007,8 @@ mod tests {
         let second = {
             let flight = Arc::clone(&flight);
             std::thread::spawn(move || {
-                serve_provisions(&flight, &ask_for(OWED / 2..OWED), |indices| {
-                    Some(owed_build(indices, OWED as usize))
+                serve_provisions(&flight, &ask_for(OWED / 2..OWED), matched, |_, indices| {
+                    owed_build(indices, OWED as usize)
                 })
             })
         };
@@ -1997,7 +2021,7 @@ mod tests {
         let first = first.join().expect("first ask");
         assert_eq!(first.parts.len(), OWED as usize / 2);
         let second = second.join().expect("second ask");
-        assert_eq!(second.count, Some(owed_count()));
+        assert_eq!(second.count, Some(owed().count()));
         assert_eq!(
             second
                 .parts
@@ -2021,23 +2045,21 @@ mod tests {
         let first = {
             let flight = Arc::clone(&flight);
             std::thread::spawn(move || {
-                serve_provisions(&flight, &ask_for(0..OWED), |indices| {
-                    if !indices.is_empty() {
-                        started_tx.send(()).expect("started");
-                        release_rx.recv().expect("release");
-                    }
-                    Some(owed_build(indices, OWED as usize))
+                serve_provisions(&flight, &ask_for(0..OWED), matched, |_, indices| {
+                    started_tx.send(()).expect("started");
+                    release_rx.recv().expect("release");
+                    owed_build(indices, OWED as usize)
                 })
             })
         };
         started_rx.recv().expect("the first build started");
 
-        let turned_away = serve_provisions(&flight, &ask_for(0..OWED), |indices| {
+        let turned_away = serve_provisions(&flight, &ask_for(0..OWED), matched, |_, indices| {
             assert!(indices.is_empty(), "every asked index is in flight");
-            Some(owed_build(indices, OWED as usize))
+            owed_build(indices, OWED as usize)
         });
         assert!(turned_away.parts.is_empty());
-        assert_eq!(turned_away.count, Some(owed_count()));
+        assert_eq!(turned_away.count, Some(owed().count()));
         assert!(!GetProvisionsRequest::is_empty_response(&turned_away));
 
         release_tx.send(()).expect("release");
@@ -2045,8 +2067,8 @@ mod tests {
     }
 
     /// Asks that build nothing, an index past the count or a target the
-    /// block owes nothing, are answered from the kept count without
-    /// deriving the block again.
+    /// block owes nothing, are answered from the kept leaves without
+    /// matching the block again.
     #[test]
     fn asks_that_build_nothing_derive_the_block_once() {
         let flight = ProvisionFlights::new(1, Duration::from_secs(5));
@@ -2059,13 +2081,17 @@ mod tests {
                     target,
                     Capped::from_array([index]),
                 ),
-                |indices| {
-                    assert!(indices.is_empty(), "nothing is built");
+                || {
                     derived.set(derived.get() + 1);
-                    Some(BuiltParts {
-                        count: (target == ShardId::leaf(1, 1)).then(owed_count),
-                        parts: Vec::new(),
+                    Some(if target == ShardId::leaf(1, 1) {
+                        Owing::Leaves(owed())
+                    } else {
+                        Owing::Nothing
                     })
+                },
+                |_, indices| {
+                    assert!(indices.is_empty(), "nothing is built");
+                    Vec::new()
                 },
             )
         };
@@ -2073,7 +2099,7 @@ mod tests {
         for _ in 0..3 {
             let past = ask(ShardId::leaf(1, 1), u32::MAX);
             assert!(past.parts.is_empty());
-            assert_eq!(past.count, Some(owed_count()), "the count rides");
+            assert_eq!(past.count, Some(owed().count()), "the count rides");
         }
         assert_eq!(derived.get(), 1, "an index past the count derives once");
 
@@ -2102,20 +2128,11 @@ mod tests {
                     ShardId::leaf(1, 1),
                     Capped::from_array([0]),
                 ),
-                |indices| {
-                    let count = Some(heavy_count(height));
-                    if indices.is_empty() {
-                        return Some(BuiltParts {
-                            count,
-                            parts: Vec::new(),
-                        });
-                    }
+                || Some(Owing::Leaves(heavy_owed(height))),
+                |_, indices| {
                     assert_eq!(indices, [0]);
                     built = true;
-                    Some(BuiltParts {
-                        count,
-                        parts: vec![(0, heavy_part(height))],
-                    })
+                    vec![(0, heavy_part(height))]
                 },
             );
             assert_eq!(response.parts.len(), 1, "every ask is answered");

@@ -1,6 +1,7 @@
 //! What a source block owes each target: the keys each transaction's
 //! part serves, and the leaves its header commits, one per transaction
-//! the request rule owes the target, in block order.
+//! the request rule owes the target, in block order, each binding the
+//! transaction to the keys its part serves.
 
 use std::collections::BTreeMap;
 
@@ -9,7 +10,7 @@ use hyperscale_hbor::Capped;
 use hyperscale_storage::Substates;
 use hyperscale_types::{
     EntryKey, Hash, ProtocolHasher, ProvisionTxRoot, ProvisionTxRootsMap, ShardId, ShardTrie,
-    SubstateKey, Transaction, TxHash, Verifiable, entry_leaf_key, provision_leaf,
+    SubstateKey, Transaction, TxHash, Verifiable, entry_leaf_key, provision_leaf, served_digest,
 };
 use thiserror::Error;
 
@@ -58,25 +59,47 @@ pub struct Unrouted {
     pub tx_hash: TxHash,
 }
 
-/// The leaves each target's root holds over `requests`, in request
-/// order. A target no request names holds none.
+/// The leaf `request`'s part sits at under each of its targets' roots,
+/// over `keys`, its [`served_keys`].
 #[must_use]
-pub fn leaves_over_requests(requests: &[ProvisionsRequest]) -> BTreeMap<ShardId, Vec<Hash>> {
+pub fn served_leaf(request: &ProvisionsRequest, keys: &[SubstateKey]) -> Hash {
+    provision_leaf(request.tx_hash, served_digest(keys.iter().copied()))
+}
+
+/// Each request's [`served_keys`] out of `state`, in request order: read
+/// once however many targets a request names.
+#[must_use]
+pub fn keys_over_requests(
+    state: &impl Substates,
+    requests: &[ProvisionsRequest],
+) -> Vec<Vec<SubstateKey>> {
+    requests
+        .iter()
+        .map(|request| served_keys(state, request))
+        .collect()
+}
+
+/// The leaves each target's root holds over `requests`, whose served
+/// keys out of `state` are read once each, in request order. A target no
+/// request names holds none.
+#[must_use]
+pub fn leaves_over_requests(
+    state: &impl Substates,
+    requests: &[ProvisionsRequest],
+) -> BTreeMap<ShardId, Vec<Hash>> {
     let mut leaves: BTreeMap<ShardId, Vec<Hash>> = BTreeMap::new();
     for request in requests {
+        let leaf = served_leaf(request, &served_keys(state, request));
         for target in &request.targets {
-            leaves
-                .entry(*target)
-                .or_default()
-                .push(provision_leaf(request.tx_hash));
+            leaves.entry(*target).or_default().push(leaf);
         }
     }
     leaves
 }
 
 /// The per-target provision roots of a block `local_shard` holds with
-/// `transactions`, routed under `trie`: one entry for each target owed
-/// at least one leaf.
+/// `transactions`, routed under `trie`, over `state`, the state the block
+/// leaves: one entry for each target owed at least one leaf.
 ///
 /// # Errors
 ///
@@ -89,6 +112,7 @@ pub fn leaves_over_requests(requests: &[ProvisionsRequest]) -> BTreeMap<ShardId,
 /// Never: a block owes at most one entry per other shard, which is what
 /// [`ProvisionTxRootsMap`] caps.
 pub fn provision_tx_roots(
+    state: &impl Substates,
     trie: &ShardTrie,
     local_shard: ShardId,
     transactions: &[Verifiable<Transaction>],
@@ -101,7 +125,7 @@ pub fn provision_tx_roots(
         requests.extend(provision_request(trie, tx, local_shard));
     }
     Ok(Capped::new(
-        leaves_over_requests(&requests)
+        leaves_over_requests(state, &requests)
             .into_iter()
             .map(|(target, leaves)| (target, ProvisionTxRoot::over(&leaves)))
             .collect(),
@@ -111,15 +135,35 @@ pub fn provision_tx_roots(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::Address;
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, test_prefix, test_transaction_with_prefixes,
     };
+    use hyperscale_types::{Address, CollectionId};
 
     use super::*;
 
     const LOCAL: ShardId = ShardId::leaf(1, 0);
     const REMOTE: ShardId = ShardId::leaf(1, 1);
+
+    /// A state holding nothing.
+    struct Empty;
+
+    impl Substates for Empty {
+        fn cell(&self, _: SubstateKey) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn entries_in_range(
+            &self,
+            _: Address,
+            _: CollectionId,
+            _: u128,
+            _: u128,
+            _: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            Vec::new()
+        }
+    }
 
     /// A routed transaction paid from `seed` on this shard and writing
     /// under `prefixes`.
@@ -129,7 +173,14 @@ mod tests {
     }
 
     fn roots(transactions: &[Verifiable<Transaction>]) -> Result<ProvisionTxRootsMap, Unrouted> {
-        provision_tx_roots(&ShardTrie::uniform(1), LOCAL, transactions)
+        provision_tx_roots(&Empty, &ShardTrie::uniform(1), LOCAL, transactions)
+    }
+
+    /// The leaf `tx`'s part to [`REMOTE`] sits at.
+    fn leaf_of(tx: &Verifiable<Transaction>) -> Hash {
+        let request = provision_request(&ShardTrie::uniform(1), tx, LOCAL)
+            .expect("the transaction owes the remote shard");
+        served_leaf(&request, &served_keys(&Empty, &request))
     }
 
     #[test]
@@ -155,7 +206,7 @@ mod tests {
         assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec![REMOTE]);
         assert_eq!(
             map[&REMOTE],
-            ProvisionTxRoot::over(&[provision_leaf(a.hash()), provision_leaf(b.hash())]),
+            ProvisionTxRoot::over(&[leaf_of(&a), leaf_of(&b)]),
         );
     }
 

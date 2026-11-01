@@ -3459,6 +3459,7 @@ impl ExecutionCoordinator {
                         source_shard: local_shard,
                         block_height: height,
                         source_block_ts: header.parent_qc().weighted_timestamp(),
+                        claimed: header.provision_tx_roots().clone(),
                         shard_recipients,
                         signer: proposer,
                     },

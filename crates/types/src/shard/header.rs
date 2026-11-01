@@ -548,8 +548,11 @@ impl BlockHeader {
     ///
     /// Key = target shard; value = [`ProvisionTxRoot::over`] the tagged
     /// leaves of the transactions destined for that target, in block
-    /// order, which commits their count. Lets the target hold every part
-    /// it receives to a real leaf of the full set it was meant to receive.
+    /// order, which commits their count. Each leaf binds its transaction
+    /// to the keys its part serves out of the state this block leaves.
+    /// Lets the target hold every part it receives to a real leaf of the
+    /// full set it was meant to receive, carrying exactly the committed
+    /// keys.
     ///
     /// [`ProvisionTxRoot::over`]: crate::ProvisionTxRoot::over
     #[must_use]

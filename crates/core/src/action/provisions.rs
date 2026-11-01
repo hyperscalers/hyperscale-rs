@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_types::{
-    Anchor, BlockHash, BlockHeight, Provision, ShardId, SubstateKey, ValidatorId, WeightedTimestamp,
+    Anchor, BlockHash, BlockHeight, Provision, ProvisionTxRootsMap, ShardId, SubstateKey,
+    ValidatorId, WeightedTimestamp,
 };
 
 use super::{Delegated, ProvisionsRequest};
@@ -58,6 +59,9 @@ pub enum ProvisionAction {
         /// the bundle wire form and checked against the commit-proven
         /// header at verification.
         source_block_ts: WeightedTimestamp,
+        /// The block header's `provision_tx_roots`: a target's parts are
+        /// sent only when their leaves walk to its entry.
+        claimed: ProvisionTxRootsMap,
         /// Per-shard recipients for provision broadcasts (excluding self).
         shard_recipients: HashMap<ShardId, Vec<ValidatorId>>,
         /// The signer preferred to sign the envelopes: the block's proposer.

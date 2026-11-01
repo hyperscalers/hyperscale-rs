@@ -2189,7 +2189,7 @@ mod a_commit_past_the_replay {
         accounts.extend(venue_genesis_accounts_on(HOME, &[COUNTERPART]));
         let mut cluster = SimCluster::with_packages_on_dedicated_pool_hosts(
             &departing_counterpart_config(),
-            1,
+            2,
             &accounts,
             GenesisPackages::with_fixtures(),
         );

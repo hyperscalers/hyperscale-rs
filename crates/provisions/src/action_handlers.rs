@@ -1,13 +1,15 @@
 //! Pure provision functions invoked from the node's delegated-action dispatcher.
 //!
 //! These functions implement the source-side work for `FetchAndBroadcastProvisions`:
-//! looping over target shards and calling [`build_provisions`] for each so
-//! that gossip emit and fetch serve share one assembly path.
+//! looping over target shards, holding each target's leaves to the block's
+//! own root and building its parts through [`build_part`], so that gossip
+//! emit and fetch serve share one assembly path.
 //!
-//! [`build_provisions`]: crate::build::build_provisions
+//! [`build_part`]: crate::build::build_part
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
+use std::ops::ControlFlow;
 
 use hyperscale_core::{
     ActionContext, ProtocolEvent, ProvisionAction, ProvisionRefusal, ProvisionVerdict,
@@ -22,12 +24,13 @@ use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
     Anchor, MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, PROVISION_FRAMING_BYTES, Provision,
-    ProvisionContext, ProvisionsSenderMessage, ShardId, Stopwatch, ValidatorId, Verifiable,
-    Verified, Verify, WeightedTimestamp, signed_bytes,
+    ProvisionContext, ProvisionTxRootsMap, ProvisionsSenderMessage, ShardId, Stopwatch,
+    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, signed_bytes,
 };
 use tracing::warn;
 
-use crate::build::build_provisions;
+use crate::build::{Owed, build_owed_until};
+use crate::content::keys_over_requests;
 use crate::crossing_push::push_crossing_readings;
 
 /// One target shard's parts, packed into notifications, and who receives
@@ -72,15 +75,18 @@ pub(crate) fn pack(parts: Vec<Provision>) -> Vec<Vec<Provision>> {
 /// Build per-target-shard parts for the cross-shard broadcast.
 ///
 /// Loops over the recipient map (sorted by shard id for deterministic
-/// ordering) and delegates each target to [`build_provisions`]. A target
-/// none of whose parts builds is skipped — callers still emit an
-/// `OutboundProvisionBroadcast` event so the state machine can mark the
-/// action complete.
+/// ordering) and builds each target's parts out of `view`, the view
+/// anchored at the source block, once the leaves its served keys make
+/// walk to `claimed`, the block header's own roots. A target whose
+/// leaves do not, or none of whose parts builds, is skipped, and so is
+/// every target where the view does not hold the block's state: nothing
+/// leaves this source that its own header does not commit.
 pub(crate) fn fetch_and_broadcast_provision<S, H>(
     view: &SubstateView<S>,
     source_shard: ShardId,
     source_block_ts: WeightedTimestamp,
     requests: &[ProvisionsRequest],
+    claimed: &ProvisionTxRootsMap,
     shard_recipients: &HashMap<ShardId, Vec<ValidatorId>, H>,
 ) -> Vec<ProvisionBatch>
 where
@@ -90,15 +96,39 @@ where
     let mut sorted_recipients: Vec<_> = shard_recipients.iter().collect();
     sorted_recipients.sort_by_key(|(shard, _)| **shard);
 
+    let Some(state) = view.served_snapshot() else {
+        warn!(
+            source_shard = source_shard.inner(),
+            block_height = view.anchor_height().inner(),
+            "provision broadcast: the block's state is not held here; sending none"
+        );
+        return Vec::new();
+    };
+    let keys = keys_over_requests(&state, requests);
     let mut batches = Vec::with_capacity(sorted_recipients.len());
     for (target_shard, recipients) in sorted_recipients {
-        let parts = build_provisions(
+        let owed = Owed::over(requests, &keys, *target_shard);
+        if owed.root() != claimed.get(target_shard).copied() {
+            warn!(
+                source_shard = source_shard.inner(),
+                target_shard = target_shard.inner(),
+                block_height = view.anchor_height().inner(),
+                "provision broadcast: parts do not walk to the block's own root; sending none"
+            );
+            continue;
+        }
+        let mut parts = Vec::new();
+        build_owed_until(
             view,
+            &state,
             source_shard,
             *target_shard,
             source_block_ts,
-            requests,
-            |_| true,
+            &owed,
+            |_, build| {
+                parts.extend(build());
+                ControlFlow::Continue(())
+            },
         );
         if parts.is_empty() {
             continue;
@@ -161,6 +191,7 @@ where
             source_shard,
             block_height,
             source_block_ts,
+            claimed,
             shard_recipients,
             signer: _,
         } => {
@@ -170,6 +201,7 @@ where
                 source_shard,
                 source_block_ts,
                 &requests,
+                &claimed,
                 &shard_recipients,
             );
             if batches.is_empty() && !requests.is_empty() {
@@ -255,10 +287,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperscale_network::compression::compress;
+    use hyperscale_storage::test_helpers::{make_settled_writes, state_key};
+    use hyperscale_storage::{GenesisCommit, PendingChain};
+    use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         BlockHeight, Hash, LeafPath, MAX_WIRE_MESSAGE_BYTES, MerkleInclusionProof, ProvisionParts,
-        TxHash,
+        ProvisionTxRoot, TxHash, provision_leaf, served_digest,
     };
 
     use super::*;
@@ -296,6 +333,58 @@ mod tests {
             assert!(pack.iter().map(encoded_len).sum::<usize>() <= PACK_BYTES);
         }
         assert!(pack(Vec::new()).is_empty());
+    }
+
+    /// A source whose parts' leaves do not walk to its own header's root
+    /// for a target sends that target nothing, so nothing reaches the
+    /// outbound cache either; the same parts under the root they make
+    /// are sent.
+    #[test]
+    fn a_proposer_whose_parts_fail_its_own_root_sends_nothing() {
+        let target = ShardId::leaf(1, 1);
+        let storage = SimShardStorage::default();
+        let seeded = make_settled_writes(7, 1, vec![1]);
+        storage.install_genesis(&seeded, &seeded);
+        let chain = Arc::new(PendingChain::new(Arc::new(storage), BlockHeight::GENESIS));
+        let view = chain.view_at_persisted_tip();
+        let request = ProvisionsRequest {
+            tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
+            targets: vec![target],
+            local_keys: vec![state_key(7, 1)],
+            local_ranges: Vec::new(),
+        };
+        let requests = std::slice::from_ref(&request);
+        let recipients = HashMap::from([(target, vec![ValidatorId::new(1)])]);
+        let roots = |root| ProvisionTxRootsMap::new([(target, root)].into()).expect("one target");
+        let send = |claimed: &ProvisionTxRootsMap| {
+            fetch_and_broadcast_provision(
+                &view,
+                ShardId::leaf(1, 0),
+                WeightedTimestamp::ZERO,
+                requests,
+                claimed,
+                &recipients,
+            )
+        };
+
+        let stripped = roots(ProvisionTxRoot::over(&[provision_leaf(
+            request.tx_hash,
+            served_digest(std::iter::empty()),
+        )]));
+        assert!(send(&stripped).is_empty(), "a root over a stripped part");
+        assert!(
+            send(&ProvisionTxRootsMap::default()).is_empty(),
+            "a header owing the target nothing"
+        );
+
+        let state = view.served_snapshot().expect("genesis is held");
+        let owed = Owed::of(&state, requests, target);
+        let honest = roots(owed.root().expect("the target is owed a part"));
+        let [batch] = &send(&honest)[..] else {
+            panic!("the target's parts are sent under its own root")
+        };
+        assert_eq!(batch.target_shard, target);
+        assert_eq!(batch.packs.concat().len(), 1);
     }
 
     /// The frame caps a notification's compressed length, and compression

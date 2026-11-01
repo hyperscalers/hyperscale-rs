@@ -39,8 +39,9 @@ use hyperscale_network::{
     Answerers, GossipHandler, Network, NotificationHandler, RequestError, RequestHandler,
     ResponseVerdict,
 };
+use hyperscale_provisions::provision_tx_roots;
 use hyperscale_shard::action_handlers::{
-    build_proposal, check_provision_tx_roots, handle_action, swept_by, verify_and_build_qc,
+    build_proposal, handle_action, swept_by, verify_and_build_qc,
 };
 use hyperscale_shard::parent_checks::{
     AtParent, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
@@ -50,10 +51,10 @@ use hyperscale_shard::{
 };
 use hyperscale_storage::{
     AnswerFollow, BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex,
-    ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
-    SubstateStore, Substates, TerminalWindow, TickChain, VersionedStore, answer_additions,
-    carry_signed_rounds, colliding_committed_cell, colliding_member_row, creations_of,
-    filter_writes_to_prefix,
+    ParentAnchor, PendingChain, PreparedBlockView, RecoveredState, SafeVoteRegisterStore,
+    ShardChainWriter, SubstateStore, Substates, TerminalWindow, TickChain, VersionedStore,
+    answer_additions, carry_signed_rounds, colliding_committed_cell, colliding_member_row,
+    creations_of, filter_writes_to_prefix,
 };
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage, crash_point};
 use hyperscale_types::network::Signed;
@@ -66,15 +67,15 @@ use hyperscale_types::{
     CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey, ConsensusReceipt,
     ConsensusSignature, Epoch, EpochWindows, Finalization, FrontierInputs, GossipMessage, Hash,
     HborSigned, LocalReceiptRoot, LocalTimestamp, MessageClass, NetworkDefinition, NetworkMessage,
-    ProposerTimestamp, Provision, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, ProvisionsRoot,
-    QcContext, QcVerifyError, QuorumCertificate, ReadySignal, Request, Round, RoutingCommittees,
-    SafeVoteRegisters, SectionRoots, SettledWrites, ShardId, ShardLoad, ShardVoteEquivocation,
-    ShardWitnessPayload, SharedTransactions, SignError, Signer, SignerBitfield, StateClaim,
-    StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, SubstateKey, SweepFrontier,
-    Timeout, TimeoutContext, TopologySchedule, TopologySnapshot, Transaction, TransactionRoot,
-    TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, VerificationKind, Verified,
-    Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_prefix_path,
-    shard_reveal_sign, signed_bytes,
+    ProposerTimestamp, Provision, ProvisionTxRootsJudged, ProvisionsRoot, QcContext, QcVerifyError,
+    QuorumCertificate, ReadySignal, Request, Round, RoutingCommittees, SafeVoteRegisters,
+    SectionRoots, SettledWrites, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload,
+    SharedTransactions, SignError, Signer, SignerBitfield, StateClaim, StateRoot, StateRootContext,
+    StateRootVerifyError, StoredReceipt, SubstateKey, SweepFrontier, Timeout, TimeoutContext,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verifiable, VerificationKind, Verified, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_prefix_path, shard_reveal_sign,
+    signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -2044,27 +2045,6 @@ impl ShardCoordinatorSim {
                     ),
                 });
             }
-            Action::Consensus(ConsensusAction::VerifyProvisionTxRoots {
-                block_hash,
-                expected,
-                transactions,
-                topology_snapshot,
-            }) => {
-                let result = check_provision_tx_roots(
-                    &expected,
-                    topology_snapshot.shard_trie(),
-                    self.shard,
-                    &transactions,
-                );
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: check_completed(
-                        block_hash,
-                        VerificationKind::ProvisionTxRoots,
-                        result.is_ok(),
-                    ),
-                });
-            }
             Action::Consensus(ConsensusAction::VerifyBeaconWitnessRoot {
                 block_hash,
                 expected_root,
@@ -2221,6 +2201,18 @@ impl ShardCoordinatorSim {
                     },
                     block_height,
                 );
+                let computed_provision_tx_roots = parent_judgement.as_ref().map(|judgement| {
+                    provision_tx_roots(
+                        &PreparedBlockView {
+                            parent: &view.snapshot(),
+                            block: &jmt_snapshot,
+                        },
+                        &judgement.provisions.trie,
+                        self.shard,
+                        &transactions,
+                    )
+                    .expect("the sim derives every transaction it proposes")
+                });
                 let verify_result = expected_root.verify(&StateRootContext {
                     computed_root: &computed_root,
                     claimed_split_child_roots,
@@ -2228,6 +2220,13 @@ impl ShardCoordinatorSim {
                     claimed_terminal_settled_txs,
                     computed_terminal_settled_txs,
                     terminal_settled_txs_required,
+                    provision_tx_roots: parent_judgement
+                        .as_ref()
+                        .zip(computed_provision_tx_roots.as_ref())
+                        .map(|(judgement, computed)| ProvisionTxRootsJudged {
+                            claimed: &judgement.provisions.claimed,
+                            computed,
+                        }),
                 });
                 let bytes_delta = jmt_snapshot.bytes_delta;
                 let answers =

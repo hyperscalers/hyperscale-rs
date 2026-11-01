@@ -44,7 +44,7 @@ mod traits;
 pub use action::{
     Action, ConsensusAction, CrossShardExecutionRequest, Delegated, ExecutionAction,
     HeaderCommittee, KeepDelta, ObserveDelta, ParentJudgement, ParticipationChange,
-    ProvisionAction, ProvisionsRequest, QcSubject, StateRootCheck, SyncClaimId,
+    ProvisionAction, ProvisionJudgement, ProvisionsRequest, QcSubject, StateRootCheck, SyncClaimId,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock, Signing};
 pub use beacon_action::{BeaconAction, BeaconBlockCheck, FoldAction, ParticipantAction};

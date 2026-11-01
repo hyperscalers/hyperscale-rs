@@ -1061,6 +1061,7 @@ mod tests {
             source_shard: SHARD,
             block_height: BlockHeight::new(1),
             source_block_ts: WeightedTimestamp::ZERO,
+            claimed: Capped::default(),
             shard_recipients: HashMap::new(),
             signer,
         }

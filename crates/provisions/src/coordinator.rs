@@ -1156,19 +1156,25 @@ impl ProvisionCoordinator {
 mod tests {
     use hyperscale_core::{FetchRequest, ProvisionAction, ProvisionRefusal};
     use hyperscale_hbor::Capped;
+    use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         AggregateSignature, Anchor, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
         Hash, LeafPath, MAX_MERKLE_PROOF_LEN, MerkleInclusionProof, NetworkDefinition,
         ProposerTimestamp, ProvisionParts, ProvisionTxRoot, ProvisionVerifyError,
         QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield, StateRoot,
-        TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable, WeightedTimestamp,
-        WitnessSources, provision_leaf,
+        SubstateEntry, TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable,
+        WeightedTimestamp, WitnessSources, provision_leaf, served_digest,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
 
     use super::*;
     use crate::pipeline::MAX_PENDING_PROVISION_BYTES;
+
+    /// The leaf of a part for `tx` that carries no entries.
+    fn keyless_leaf(tx: TxHash) -> Hash {
+        provision_leaf(tx, served_digest(std::iter::empty()))
+    }
 
     /// A minimal head-only schedule with no pending recoveries — the
     /// unfenced ordinary case every non-fence test runs under.
@@ -1214,9 +1220,20 @@ mod tests {
         local_shard: ShardId,
         tx_hashes: &[TxHash],
     ) -> Verified<CertifiedBlockHeader> {
+        let leaves: Vec<Hash> = tx_hashes.iter().map(|h| keyless_leaf(*h)).collect();
+        make_certified_header_committing_leaves(shard, height, local_shard, &leaves)
+    }
+
+    /// A `CertifiedBlockHeader` whose `provision_tx_roots[local_shard]`
+    /// commits to `leaves`.
+    fn make_certified_header_committing_leaves(
+        shard: ShardId,
+        height: BlockHeight,
+        local_shard: ShardId,
+        leaves: &[Hash],
+    ) -> Verified<CertifiedBlockHeader> {
         let certified = make_certified_header_with_targets(shard, height, vec![local_shard]);
-        let leaves: Vec<Hash> = tx_hashes.iter().map(|h| provision_leaf(*h)).collect();
-        let root = ProvisionTxRoot::over(&leaves);
+        let root = ProvisionTxRoot::over(leaves);
         let (header, qc) = certified.into_inner().into_parts();
         let mut roots = header.provision_tx_roots().clone();
         roots
@@ -1690,7 +1707,7 @@ mod tests {
         target_shard: ShardId,
         height: BlockHeight,
     ) -> Vec<Provision> {
-        let leaves: Vec<Hash> = tx_hashes.iter().map(|tx| provision_leaf(*tx)).collect();
+        let leaves: Vec<Hash> = tx_hashes.iter().map(|tx| keyless_leaf(*tx)).collect();
         tx_hashes
             .into_iter()
             .zip(LeafPath::all(&leaves))
@@ -2266,6 +2283,76 @@ mod tests {
             Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
         )));
         assert_eq!(coordinator.expected.len(), 0);
+    }
+
+    /// A target proposer that strips an honest part of its entries and
+    /// names the stripped one in its block gets no vote: the voter fetching
+    /// it by hash refuses it, since its leaf no longer binds the keys the
+    /// source header committed, so the verified pipeline a pending block
+    /// fills from never holds it. The honest part is admitted.
+    #[test]
+    fn a_stripped_part_a_target_proposer_names_is_refused_and_the_honest_one_admitted() {
+        let local = ShardId::leaf(2, 0);
+        let source_shard = ShardId::leaf(2, 1);
+        let height = BlockHeight::new(10);
+        let tx_hash = TxHash::from(Hash::from_bytes(b"tx"));
+        let key = test_key(1);
+        let leaf = provision_leaf(tx_hash, served_digest([key].into_iter()));
+        let header = make_certified_header_committing_leaves(source_shard, height, local, &[leaf]);
+        let mut coordinator = ProvisionCoordinator::new(local);
+        deliver_committed_header(&mut coordinator, &header);
+
+        let part = |entries: Vec<SubstateEntry>| {
+            Provision::new(ProvisionParts {
+                source_shard,
+                target_shard: local,
+                block_height: height,
+                source_block_ts: WeightedTimestamp::ZERO,
+                tx_hash,
+                entries: Capped::new(entries).expect("within the cap"),
+                proof: MerkleInclusionProof::new(Vec::new()),
+                leaf: LeafPath {
+                    count: 1,
+                    index: 0,
+                    siblings: Capped::empty(),
+                },
+            })
+        };
+        let honest = part(vec![SubstateEntry::new(key, None)]);
+        let stripped = part(Vec::new());
+        assert_ne!(honest.hash(), stripped.hash());
+
+        let actions = coordinator.on_state_provisions_received(&sched(), vec![stripped.clone()]);
+        assert_eq!(
+            refusal_of(&actions),
+            Some(&ProvisionRefusal::ContentMismatch)
+        );
+        assert!(
+            coordinator
+                .get_provisions_by_hash(stripped.hash())
+                .is_none()
+        );
+
+        let actions = coordinator.on_state_provisions_received(&sched(), vec![honest.clone()]);
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Provisions(ProvisionAction::VerifyProvisions { .. })]
+        ));
+        let admitted = coordinator.on_state_provisions_verified(
+            verified(vec![honest.clone()]),
+            Anchor::of(&header),
+            LocalTimestamp::ZERO,
+        );
+        assert!(admitted.iter().any(|a| matches!(
+            a,
+            Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
+        )));
+        assert!(coordinator.get_provisions_by_hash(honest.hash()).is_some());
+        assert!(
+            coordinator
+                .get_provisions_by_hash(stripped.hash())
+                .is_none()
+        );
     }
 
     /// A colocated host's bundle meets the header root too: a short one
@@ -3211,7 +3298,7 @@ mod tests {
 
     /// The count witness of `txs`, as a holder of the block states it.
     fn witness_of(txs: &[TxHash]) -> ProvisionCount {
-        let leaves: Vec<Hash> = txs.iter().map(|tx| provision_leaf(*tx)).collect();
+        let leaves: Vec<Hash> = txs.iter().map(|tx| keyless_leaf(*tx)).collect();
         ProvisionCount::over(&leaves)
     }
 

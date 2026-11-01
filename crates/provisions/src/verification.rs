@@ -2,7 +2,9 @@
 //!
 //! The source block's `provision_tx_roots[local_shard]` commits to the
 //! ordered leaves the target shard is meant to receive and to their
-//! count. A part whose leaf does not walk its path to that root, or one
+//! count, each leaf binding its transaction to the keys its part serves.
+//! A part whose leaf, recomputed from the keys it carries, does not walk
+//! its path to that root, or one
 //! from a header that owes this shard nothing, is refused with a
 //! verdict: the refusal releases every fetch that could have carried it
 //! as failed, so another peer is asked, and leaves the expectation

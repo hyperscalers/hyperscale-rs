@@ -1,19 +1,19 @@
 //! Inbound provision-request handling for cross-shard fetches.
 
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_provisions::{
-    ProvisionStore, build_provisions_until, provision_count, provision_request,
+    Owed, ProvisionStore, build_part, provision_request, served_keys, served_leaf,
 };
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::request::GetProvisionsRequest;
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    BlockHeight, Derivation, MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, Provision,
-    ProvisionCount, ShardId, ShardTrie, derive_block_transactions,
+    Block, BlockHeight, CertifiedBlock, Derivation, Hash, LeafPath, MAX_FETCH_RESPONSE_BYTES,
+    MAX_TXS_PER_BLOCK, Provision, ProvisionCount, ScheduleLookup, ShardId, ShardTrie,
+    TopologySchedule, Verified, WeightedTimestamp, derive_block_transactions,
 };
 use tracing::warn;
 
@@ -54,13 +54,62 @@ impl ServedPart {
     }
 }
 
-/// What one build of a held block made for an ask.
-pub struct BuiltParts {
-    /// The block's count witness, or `None` where it owes the target
-    /// nothing.
-    pub count: Option<ProvisionCount>,
-    /// A served part for each index built, in leaf order.
-    pub parts: Vec<(u32, ServedPart)>,
+/// The leaves a held source block's header commits to one target, and
+/// the routing whose requests make them out of the block's own state:
+/// what every part this node serves of the block is built under.
+///
+/// Only ever made by matching the header's root, so it is a function of
+/// the committed header and kept for as long as the cache likes: a later
+/// change of partition cannot make it stale.
+#[derive(Clone)]
+pub struct OwedLeaves {
+    count: ProvisionCount,
+    leaves: Arc<[Hash]>,
+    trie: ShardTrie,
+}
+
+impl OwedLeaves {
+    /// `leaves`, whose root matched, made under `trie`.
+    #[must_use]
+    pub fn new(leaves: Vec<Hash>, trie: ShardTrie) -> Self {
+        Self {
+            count: ProvisionCount::over(&leaves),
+            leaves: leaves.into(),
+            trie,
+        }
+    }
+
+    /// The count witness the leaves make.
+    #[must_use]
+    pub const fn count(&self) -> ProvisionCount {
+        self.count
+    }
+}
+
+/// What a held source block's header commits to one target.
+#[derive(Clone)]
+pub enum Owing {
+    /// The header commits the target nothing.
+    Nothing,
+    /// The header commits these leaves.
+    Leaves(OwedLeaves),
+}
+
+impl Owing {
+    /// The leaves owed, if any.
+    #[must_use]
+    pub const fn leaves(&self) -> Option<&OwedLeaves> {
+        match self {
+            Self::Nothing => None,
+            Self::Leaves(owed) => Some(owed),
+        }
+    }
+
+    /// What it costs the serve cache: its leaves and its slot.
+    pub fn weight(&self) -> usize {
+        let leaves = self.leaves().map_or(0, |owed| owed.leaves.len());
+        (leaves * size_of::<Hash>()).saturating_add(size_of::<Self>())
+    }
 }
 
 /// The answer to an ask from what was served at its indices, in leaf
@@ -89,45 +138,168 @@ pub fn provision_answer(
     }
 }
 
+/// What this node's committed block at `height` owes `target_shard`:
+/// [`Owing::Nothing`] where its header commits the target nothing,
+/// [`Owing::Leaves`] once the leaves some candidate routing makes out of
+/// the block's own state walk to the header's root, and `None` where
+/// this node does not hold the block or its state, or no candidate
+/// matches. Only an answer is kept.
+///
+/// The candidates, in order, each skipped when it resolves to no
+/// committee here or repeats one already tried:
+/// 1. the committee anchor, the parent's own anchor, which the proposer
+///    classified the block under, skipped when the parent's header is
+///    not held;
+/// 2. the block's own anchor;
+/// 3. `schedule`'s head.
+///
+/// They differ only when a target reshapes while this shard survives.
+/// Matching compares key-only roots and builds no proof.
+///
+/// `derivation` is this node's: routing is a derived fact, and a block
+/// read back out of storage carries none.
+pub fn owed_leaves<S: ShardStorage>(
+    pending_chain: &Arc<PendingChain<S>>,
+    derivation: &dyn Derivation,
+    local_shard: ShardId,
+    schedule: &TopologySchedule,
+    height: BlockHeight,
+    target_shard: ShardId,
+) -> Option<Owing> {
+    let certified = held_block(pending_chain, derivation, height)?;
+    let block = certified.block();
+    let Some(claimed) = block
+        .header()
+        .provision_tx_roots()
+        .get(&target_shard)
+        .copied()
+    else {
+        return Some(Owing::Nothing);
+    };
+    let view = pending_chain.view_at(block.hash(), height);
+    let state = view.served_snapshot()?;
+
+    let resolve = |wt: WeightedTimestamp| match schedule.lookup_for_shard(local_shard, wt).0 {
+        ScheduleLookup::Committee(snapshot) => Some(snapshot.shard_trie().clone()),
+        ScheduleLookup::NotYetCommitted | ScheduleLookup::Evicted => None,
+    };
+    let committee_anchor = height
+        .prev()
+        .and_then(|parent| pending_chain.certified_header(parent))
+        .map(|parent| parent.header().parent_qc().weighted_timestamp());
+    let candidates = [
+        committee_anchor.and_then(resolve),
+        resolve(block.header().parent_qc().weighted_timestamp()),
+        Some(schedule.head().shard_trie().clone()),
+    ];
+    let mut tried: Vec<ShardTrie> = Vec::with_capacity(candidates.len());
+    for trie in candidates.into_iter().flatten() {
+        if tried.contains(&trie) {
+            continue;
+        }
+        let requests = requests_under(&trie, block, local_shard, target_shard);
+        let owed = Owed::of(&state, &requests, target_shard);
+        if owed.root() == Some(claimed) {
+            return Some(Owing::Leaves(OwedLeaves::new(owed.leaves().to_vec(), trie)));
+        }
+        tried.push(trie);
+    }
+    warn!(
+        local_shard = local_shard.inner(),
+        target_shard = target_shard.inner(),
+        block_height = height.inner(),
+        candidates = tried.len(),
+        "Provision request: no routing walks to the block's own root; serving none"
+    );
+    None
+}
+
 /// Build what this node serves at `indices` (ascending) of its block at
-/// `height` for `target_shard`, or `None` where it does not hold the
-/// block.
+/// `height` for `target_shard`, under `owed`, the leaves its header's
+/// root was matched to: nothing where it no longer holds the block or
+/// its state.
 ///
 /// Builds in leaf order and stops once what it built fills a fetch
 /// response, so one ask costs at most a response's worth of parts
 /// whatever it names; an index past that point is not built, and is
-/// asked again.
+/// asked again. Only the asked indices read state.
 ///
 /// Values and proofs both come from the view anchored at the block
 /// itself, so a block committed here but not yet persisted builds like
 /// any other, and no part pairs one height's values with another's
-/// proof. An owed index that view cannot build never will be, and is
-/// served as `None`; a height below the store's retention floor reads
-/// nothing, so only its keyless parts build. A block whose state this
-/// node does not hold yet builds nothing, which is not kept.
+/// proof. An owed index that view cannot build, or whose served keys
+/// no longer make its committed leaf, never will be, and is served as
+/// `None`.
 ///
-/// Reads the source block through [`PendingChain`] so heights still inside
-/// the shard-committed / JMT-persisted window are reachable; reconstructs
-/// per-tx [`ProvisionsRequest`]s from the block's declared reads + writes;
-/// then builds through [`build_provisions_until`], the builder the gossip
-/// emit path runs, so a receiver absorbs byte-identical parts regardless
-/// of which transport delivered them.
-///
-/// `derivation` is this node's: routing is a derived fact, and a block
-/// read back out of storage carries none.
-///
-/// Takes `local_shard` and the active `ShardTrie` rather than a topology
-/// handle. The caller loads the trie at serve time so routing always resolves
-/// against the current partition.
+/// Builds through [`build_part`], the builder the gossip emit path runs,
+/// so a receiver absorbs byte-identical parts regardless of which
+/// transport delivered them.
 pub fn build_served_parts<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
     derivation: &dyn Derivation,
     local_shard: ShardId,
-    shard_trie: &ShardTrie,
+    owed: &OwedLeaves,
     height: BlockHeight,
     target_shard: ShardId,
     indices: &[u32],
-) -> Option<BuiltParts> {
+) -> Vec<(u32, ServedPart)> {
+    let Some(certified) = held_block(pending_chain, derivation, height) else {
+        return Vec::new();
+    };
+    let block = certified.block();
+    let view = pending_chain.view_at(block.hash(), height);
+    let Some(state) = view.served_snapshot() else {
+        return Vec::new();
+    };
+    let requests = requests_under(&owed.trie, block, local_shard, target_shard);
+    if requests.len() != owed.leaves.len() {
+        return Vec::new();
+    }
+    let paths = LeafPath::all(&owed.leaves);
+    let source_block_ts = block.header().parent_qc().weighted_timestamp();
+    let mut parts = Vec::new();
+    let mut spent = 0usize;
+    for &index in indices {
+        let Some(((request, path), leaf)) = requests
+            .get(index as usize)
+            .zip(paths.get(index as usize))
+            .zip(owed.leaves.get(index as usize))
+        else {
+            break;
+        };
+        let keys = served_keys(&state, request);
+        let part = (served_leaf(request, &keys) == *leaf)
+            .then(|| {
+                build_part(
+                    &view,
+                    &state,
+                    local_shard,
+                    target_shard,
+                    source_block_ts,
+                    request,
+                    &keys,
+                    path.clone(),
+                )
+            })
+            .flatten();
+        let served = ServedPart::new(part, owed.count);
+        spent = spent.saturating_add(served.bytes);
+        parts.push((index, served));
+        if spent >= MAX_FETCH_RESPONSE_BYTES {
+            break;
+        }
+    }
+    parts
+}
+
+/// This node's committed block at `height`, its transactions derived
+/// here: a block read back out of storage carries no derivations, and a
+/// transaction this node has not derived names no provisions.
+fn held_block<S: ShardStorage>(
+    pending_chain: &Arc<PendingChain<S>>,
+    derivation: &dyn Derivation,
+    height: BlockHeight,
+) -> Option<Arc<Verified<CertifiedBlock>>> {
     let Some(certified) = pending_chain.certified_block(height) else {
         warn!(
             block_height = height.inner(),
@@ -135,64 +307,29 @@ pub fn build_served_parts<S: ShardStorage>(
         );
         return None;
     };
-    let block = certified.block();
-    // A block read back out of storage carries no derivations, and a
-    // transaction this node has not derived names no provisions.
-    derive_block_transactions(block, derivation);
+    derive_block_transactions(certified.block(), derivation);
+    Some(certified)
+}
 
-    // The same derivation the gossip emit path runs, narrowed to the
-    // requester: a transaction is served exactly when the requester is
-    // among the targets the emit path would have broadcast to.
-    let mut requests: Vec<ProvisionsRequest> = Vec::new();
-    for tx in block.transactions().iter() {
-        let Some(mut request) = provision_request(shard_trie, tx, local_shard) else {
-            continue;
-        };
-        if !request.targets.contains(&target_shard) {
-            continue;
-        }
-        request.targets = vec![target_shard];
-        requests.push(request);
-    }
-    let Some(count) = provision_count(&requests, target_shard) else {
-        return Some(BuiltParts {
-            count: None,
-            parts: Vec::new(),
-        });
-    };
-    let view = pending_chain.view_at(block.hash(), height);
-    if !view.holds(height) {
-        return Some(BuiltParts {
-            count: Some(count),
-            parts: Vec::new(),
-        });
-    }
-    let mut parts = Vec::new();
-    let mut spent = 0usize;
-    build_provisions_until(
-        &view,
-        local_shard,
-        target_shard,
-        block.header().parent_qc().weighted_timestamp(),
-        &requests,
-        |index, build| {
-            if indices.binary_search(&index).is_err() {
-                return ControlFlow::Continue(());
-            }
-            let served = ServedPart::new(build(), count);
-            spent = spent.saturating_add(served.bytes);
-            parts.push((index, served));
-            if spent >= MAX_FETCH_RESPONSE_BYTES {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        },
-    );
-    Some(BuiltParts {
-        count: Some(count),
-        parts,
-    })
+/// The requests `block`'s transactions owe `target_shard` routed under
+/// `trie`, in block order, each narrowed to that one target: the same
+/// rule the proposer committed the header's root by.
+fn requests_under(
+    trie: &ShardTrie,
+    block: &Block,
+    local_shard: ShardId,
+    target_shard: ShardId,
+) -> Vec<ProvisionsRequest> {
+    block
+        .transactions()
+        .iter()
+        .filter_map(|tx| provision_request(trie, tx, local_shard))
+        .filter(|request| request.targets.contains(&target_shard))
+        .map(|mut request| {
+            request.targets = vec![target_shard];
+            request
+        })
+        .collect()
 }
 
 /// The answer to `req` from the parts this node built as the source
@@ -221,13 +358,16 @@ pub fn outbound_answer(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
     use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_provisions::provision_tx_roots;
     use hyperscale_storage::test_helpers::{
-        commit_settled_at, make_test_block, make_test_certified,
+        commit_settled_at, make_test_block_with_anchor_wt, make_test_certified,
     };
     use hyperscale_storage::{
-        ChainEntry, ChainWrites, JmtSnapshot, MemberInputs, ParentAnchor, ShardChainWriter,
-        SubstateStore,
+        ChainEntry, ChainWrites, JmtSnapshot, MemberInputs, ParentAnchor, PreparedBlockView,
+        ShardChainWriter, SubstateStore, Substates,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::Request;
@@ -235,17 +375,52 @@ mod tests {
         StubVmStatics, install_stub_protocol_statics, stub_transaction, stub_transaction_with_reads,
     };
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
-        FrontierInputs, Hash, PrincipalAddr, ProvisionTxRoot, SubstateEntry, SubstateKey,
-        SweepFrontier, TimestampRange, Transaction, TxHash, Verifiable, Verified,
-        WeightedTimestamp, provision_leaf,
+        BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
+        Epoch, EpochWindows, FrontierInputs, NetworkDefinition, PrincipalAddr, ProvisionTxRoot,
+        ProvisionTxRootsMap, SubstateEntry, SubstateKey, SweepFrontier, TimestampRange,
+        TopologySnapshot, Transaction, TxHash, ValidatorSet, Verifiable, provision_leaf,
+        served_digest,
     };
 
     use super::*;
 
-    /// A live test block at `height` carrying `tx` as a store hands a
-    /// transaction back: decoded, with no derivation.
-    fn block_carrying(height: BlockHeight, tx: &Transaction) -> Block {
+    /// A schedule of one window whose trie is `trie`.
+    fn one_window(trie: &ShardTrie) -> TopologySchedule {
+        TopologySchedule::single(snapshot_of(trie))
+    }
+
+    /// A committee-less window over `trie`'s shards.
+    fn snapshot_of(trie: &ShardTrie) -> Arc<TopologySnapshot> {
+        Arc::new(TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &ValidatorSet::new(Vec::new()),
+            trie.leaves().map(|shard| (shard, Vec::new())).collect(),
+            HashMap::new(),
+            BTreeMap::new(),
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        ))
+    }
+
+    /// The provision roots `tx` owes at `state` from [`LOCAL`] routed
+    /// under `trie`.
+    fn roots_of(state: &impl Substates, trie: &ShardTrie, tx: &Transaction) -> ProvisionTxRootsMap {
+        provision_tx_roots(state, trie, LOCAL, &[Verifiable::from(tx.clone())])
+            .expect("the test derives its transaction")
+    }
+
+    /// A live test block at `height` anchored at `anchor_ms` carrying `tx`
+    /// as a store hands a transaction back, decoded, with no derivation,
+    /// its header committing `roots`.
+    fn block_committing(
+        height: BlockHeight,
+        anchor_ms: u64,
+        tx: &Transaction,
+        roots: ProvisionTxRootsMap,
+    ) -> Block {
         let decoded = Transaction::new(tx.body().clone());
         assert!(!decoded.is_routed());
         let Block::Live {
@@ -258,10 +433,14 @@ mod tests {
             terms,
             witness_sources,
             ..
-        } = make_test_block(height)
+        } = make_test_block_with_anchor_wt(height, anchor_ms)
         else {
             unreachable!("the fixture builds a live block")
         };
+        let header = BlockHeader::new(BlockHeaderParts {
+            provision_tx_roots: roots,
+            ..header.into_parts()
+        });
         Block::Live {
             header,
             transactions: Arc::new(Capped::from_array([Verifiable::from(decoded)])),
@@ -290,7 +469,7 @@ mod tests {
     /// payer on the other shard, and writes `value` to it, committed over
     /// an empty store that has not persisted it.
     struct Unpersisted {
-        trie: ShardTrie,
+        schedule: TopologySchedule,
         pending_chain: Arc<PendingChain<SimShardStorage>>,
         certified: Arc<Verified<CertifiedBlock>>,
         jmt_snapshot: Arc<JmtSnapshot>,
@@ -338,13 +517,40 @@ mod tests {
                 },
                 HEIGHT,
             );
+            let roots = roots_of(
+                &PreparedBlockView {
+                    parent: &storage.snapshot(),
+                    block: &jmt_snapshot,
+                },
+                &trie,
+                &tx,
+            );
             Self {
-                trie,
+                schedule: one_window(&trie),
                 pending_chain: Arc::new(PendingChain::new(storage, BlockHeight::GENESIS)),
-                certified: make_test_certified(block_carrying(HEIGHT, &tx)),
+                certified: make_test_certified(block_committing(HEIGHT, 0, &tx, roots)),
                 jmt_snapshot,
                 key,
             }
+        }
+
+        /// What the block owes the payer shard, or `None` where this
+        /// node cannot say.
+        fn owed(&self) -> Option<OwedLeaves> {
+            owed_leaves(
+                &self.pending_chain,
+                &StubVmStatics,
+                LOCAL,
+                &self.schedule,
+                HEIGHT,
+                PAYER_SHARD,
+            )
+            .map(|owing| {
+                owing
+                    .leaves()
+                    .expect("the block owes the payer shard")
+                    .clone()
+            })
         }
 
         /// Hold the block committed, its prepared state under `hash`.
@@ -367,17 +573,16 @@ mod tests {
         }
 
         /// Build the payer shard's part at index 0.
-        fn build(&self) -> BuiltParts {
+        fn build(&self) -> Vec<(u32, ServedPart)> {
             build_served_parts(
                 &self.pending_chain,
                 &StubVmStatics,
                 LOCAL,
-                &self.trie,
+                &self.owed().expect("the block and its state are held"),
                 HEIGHT,
                 PAYER_SHARD,
                 &[0],
             )
-            .expect("the block is held")
         }
     }
 
@@ -395,7 +600,7 @@ mod tests {
         );
 
         let built = block.build();
-        let [(0, served)] = &built.parts[..] else {
+        let [(0, served)] = &built[..] else {
             panic!("index 0 is built")
         };
         let part = served
@@ -412,23 +617,47 @@ mod tests {
         );
     }
 
-    /// A committed block whose state this node does not hold yet builds
-    /// nothing, rather than an unbuildable part a serve cache would keep
-    /// after the state lands.
+    /// A committed block whose state this node does not hold yet matches
+    /// nothing and builds nothing, rather than an answer a serve cache
+    /// would keep after the state lands: its leaves need the state's
+    /// range reads.
     #[test]
     fn a_block_whose_state_is_not_held_yet_builds_nothing() {
         let block = Unpersisted::new(&[7]);
         block.hold_under(BlockHash::from_raw(Hash::from_bytes(b"another prep")));
 
-        let early = block.build();
-        assert!(early.count.is_some(), "the count still rides");
-        assert!(early.parts.is_empty(), "no index is tried");
+        assert!(block.owed().is_none(), "nothing is said, and nothing kept");
 
         block.hold();
-        let [(0, served)] = &block.build().parts[..] else {
+        let [(0, served)] = &block.build()[..] else {
             panic!("index 0 is built")
         };
         assert!(served.part.is_some(), "and it builds once the state lands");
+    }
+
+    /// A block whose header commits another root than the one this
+    /// node's routings make out of the block's own state is served by
+    /// nothing, under no routing: its leaves match no candidate, so no
+    /// part is built and no proof generated.
+    #[test]
+    fn a_serve_with_no_matching_routing_builds_no_proof() {
+        install_stub_protocol_statics();
+        let mut block = Unpersisted::new(&[7]);
+        let tx = block.certified.block().transactions()[0]
+            .as_unverified()
+            .clone();
+        let forged = ProvisionTxRootsMap::new(BTreeMap::from([(
+            PAYER_SHARD,
+            ProvisionTxRoot::over(&[provision_leaf(tx.hash(), served_digest(std::iter::empty()))]),
+        )]))
+        .expect("one target");
+        block.certified = make_test_certified(block_committing(HEIGHT, 0, &tx, forged));
+        block.hold();
+
+        assert!(
+            block.owed().is_none(),
+            "a root over a stripped part matches no routing"
+        );
     }
 
     /// A committed block read back without its transactions' derivations
@@ -454,8 +683,10 @@ mod tests {
         let hash = routed.hash();
 
         let height = BlockHeight::new(1);
-        let block = block_carrying(height, &routed);
         let storage = Arc::new(SimShardStorage::default());
+        let roots = roots_of(&storage.snapshot(), &trie, &routed);
+        let claimed = roots[&payer_shard];
+        let block = block_committing(height, 0, &routed, roots);
         commit_settled_at(
             &*storage,
             &make_test_certified(block),
@@ -465,30 +696,36 @@ mod tests {
         );
         let pending_chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
 
+        let Some(Owing::Leaves(owed)) = owed_leaves(
+            &pending_chain,
+            &StubVmStatics,
+            local,
+            &one_window(&trie),
+            height,
+            payer_shard,
+        ) else {
+            panic!("the held block owes the payer shard")
+        };
         let build = |indices: &[u32]| {
             build_served_parts(
                 &pending_chain,
                 &StubVmStatics,
                 local,
-                &trie,
+                &owed,
                 height,
                 payer_shard,
                 indices,
             )
-            .expect("the block is held")
         };
-        let past = build(&[1]);
         assert!(
-            past.parts.is_empty(),
+            build(&[1]).is_empty(),
             "an index past the count builds nothing"
         );
-        assert!(past.count.is_some(), "and still states the count");
 
-        let first = build(&[0]);
         let served = provision_answer(
             1,
-            first.parts.into_iter().map(|(_, served)| served),
-            first.count,
+            build(&[0]).into_iter().map(|(_, served)| served),
+            Some(owed.count()),
         );
         assert_eq!(
             served
@@ -501,8 +738,8 @@ mod tests {
         );
         assert_eq!(
             served.count.map(|count| count.root()),
-            Some(ProvisionTxRoot::over(&[provision_leaf(hash)])),
-            "and the count witness states the one leaf",
+            Some(claimed),
+            "and the count witness wraps to the header's root",
         );
     }
 
@@ -514,7 +751,7 @@ mod tests {
         let tx = |seed: &[u8]| TxHash::from(Hash::from_bytes(seed));
         let leaves: Vec<Hash> = [tx(b"a"), tx(b"b")]
             .into_iter()
-            .map(provision_leaf)
+            .map(|tx| provision_leaf(tx, served_digest(std::iter::empty())))
             .collect();
         let count = ProvisionCount::over(&leaves);
         let unbuildable = ServedPart::new(None, count);
@@ -526,5 +763,107 @@ mod tests {
             assert_eq!(answer.count, Some(count));
             assert!(!GetProvisionsRequest::is_empty_response(&answer));
         }
+    }
+
+    /// A schedule cut at 1000 ms where [`PAYER_SHARD`] grows into two
+    /// children while [`LOCAL`] survives.
+    fn payer_shard_grown_at_1000() -> TopologySchedule {
+        let after = ShardTrie::from_leaves([LOCAL, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(0),
+            snapshot_of(&ShardTrie::uniform(1)),
+        );
+        let head = snapshot_of(&after);
+        schedule.insert(Epoch::new(1), Arc::clone(&head));
+        schedule.set_head(head);
+        schedule
+    }
+
+    /// What a surviving source owes [`PAYER_SHARD`] for its first block
+    /// anchored past the cut, whose transaction reads a cell here for a
+    /// payer there. Its proposer classified it under its parent's anchor,
+    /// before the cut, so its header names the payer shard as it stood.
+    /// The parent, anchored before the cut, is held when `parent_held`;
+    /// otherwise the block is the chain's first past genesis, whose
+    /// header this store does not hold.
+    fn owed_at_the_cut(parent_held: bool) -> Option<Owing> {
+        install_stub_protocol_statics();
+        let payer = PrincipalAddr::new([0x80; 31]);
+        let held = PrincipalAddr::new([0x10; 31]);
+        let tx = stub_transaction_with_reads(
+            payer,
+            &[held.address()],
+            &[payer.address()],
+            1_000,
+            validity(),
+        );
+        let schedule = payer_shard_grown_at_1000();
+        assert_eq!(
+            schedule
+                .head()
+                .shard_trie()
+                .shard_for_prefix(payer.address()),
+            ShardId::leaf(2, 2),
+            "past the cut the payer is a child's",
+        );
+
+        let storage = Arc::new(SimShardStorage::default());
+        let witness = BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO);
+        let height = if parent_held {
+            commit_settled_at(
+                &*storage,
+                &make_test_certified(make_test_block_with_anchor_wt(HEIGHT, 500)),
+                &[],
+                &[],
+                &witness,
+            );
+            HEIGHT.next()
+        } else {
+            HEIGHT
+        };
+        let roots = roots_of(&storage.snapshot(), &ShardTrie::uniform(1), &tx);
+        assert!(roots.contains_key(&PAYER_SHARD));
+        commit_settled_at(
+            &*storage,
+            &make_test_certified(block_committing(height, 1_500, &tx, roots)),
+            &[],
+            &[],
+            &witness,
+        );
+        let pending_chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
+        assert_eq!(
+            pending_chain
+                .certified_header(height.prev().expect("past genesis"))
+                .is_some(),
+            parent_held,
+        );
+        owed_leaves(
+            &pending_chain,
+            &StubVmStatics,
+            LOCAL,
+            &schedule,
+            height,
+            PAYER_SHARD,
+        )
+    }
+
+    /// A surviving source's block at the cut where its target grows is
+    /// served under the committee anchor, the one routing that names the
+    /// target as the header does: the block's own anchor and the head
+    /// both route its transaction to a child.
+    #[test]
+    fn a_block_at_the_cut_where_its_target_grows_serves_under_its_committee_anchor() {
+        let Some(Owing::Leaves(owed)) = owed_at_the_cut(true) else {
+            panic!("the committee anchor's routing matches the header")
+        };
+        assert_eq!(owed.count().count, 1);
+    }
+
+    /// With the parent's header not held, the committee anchor is not a
+    /// candidate, and the routings left do not match the header.
+    #[test]
+    fn a_block_whose_parent_header_is_absent_skips_the_committee_anchor() {
+        assert!(owed_at_the_cut(false).is_none());
     }
 }

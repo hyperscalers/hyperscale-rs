@@ -217,12 +217,12 @@ pub use shard::reshape::{ReshapeKind, ReshapeThresholds, ReshapeTrigger, Settlin
 pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, BodyRootContext, BodyRootVerifyError,
     LeafPath, LeafRoot, MAX_PROVISION_PATH_DEPTH, PROVISION_LEAF_DOMAIN_TAG,
-    PROVISION_ROOT_DOMAIN_TAG, ProvisionCount, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    REVEAL_CHAIN_DOMAIN_TAG, SectionRoots, SetRoot, SplitChildRoots, StateRootContext,
-    StateRootVerifyError, UnboundBody, commit_witness_window, derive_leaves,
+    PROVISION_ROOT_DOMAIN_TAG, PROVISION_SERVED_DOMAIN_TAG, ProvisionCount, ProvisionTxRootsJudged,
+    ProvisionTxRootsMap, REVEAL_CHAIN_DOMAIN_TAG, SectionRoots, SetRoot, SplitChildRoots,
+    StateRootContext, StateRootVerifyError, UnboundBody, commit_witness_window, derive_leaves,
     derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, provision_leaf, ready_leaf_payload,
-    settled_txs_root_from_hashes, settling_in,
+    served_digest, settled_txs_root_from_hashes, settling_in,
 };
 pub use shard::state_claim::{
     BoundaryOffer, CarriedClaims, Issuer, Recarried, StateClaim, Stated, answer_hashes,

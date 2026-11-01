@@ -11,7 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ConsensusAction, ParentJudgement, StateRootCheck};
+use hyperscale_core::{
+    Action, ConsensusAction, ParentJudgement, ProvisionJudgement, StateRootCheck,
+};
 use hyperscale_storage::{MemberInputs, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
@@ -834,27 +836,6 @@ impl VerificationPipeline {
         })]
     }
 
-    /// Initiate provision tx-root verification for a block.
-    pub(crate) fn initiate_provision_tx_root_verification(
-        &mut self,
-        block_hash: BlockHash,
-        block: &Block,
-        topology_snapshot: &TopologySnapshot,
-    ) -> Vec<Action> {
-        debug!(
-            ?block_hash,
-            target_count = block.header().provision_tx_roots().len(),
-            "Initiating provision tx-root verification"
-        );
-        self.mark_root_in_flight(block_hash, VerificationKind::ProvisionTxRoots);
-        vec![Action::Consensus(ConsensusAction::VerifyProvisionTxRoots {
-            block_hash,
-            expected: block.header().provision_tx_roots().clone(),
-            transactions: block.transactions().clone(),
-            topology_snapshot: topology_snapshot.clone(),
-        })]
-    }
-
     /// Initiate the check of a block's resolutions against the bodies
     /// they name: the figures its abandonment records restate, and the
     /// deliveries its finalizations carry against the lapse at the
@@ -1506,8 +1487,9 @@ impl VerificationPipeline {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Initiate every outstanding async verification for a candidate block in
-    /// parallel: state root, body root, per-target provision tx roots,
-    /// resolutions and beacon-witness root. Returns the actions the caller should dispatch;
+    /// parallel: state root (with the per-target provision tx roots the
+    /// post-block state gives), body root, resolutions and beacon-witness
+    /// root. Returns the actions the caller should dispatch;
     /// state-root verification is queued into the ready list and drained
     /// separately.
     ///
@@ -1561,19 +1543,16 @@ impl VerificationPipeline {
                             Some(ParentJudgement {
                                 fence,
                                 coasting: schedule.coasting(local_shard, anchor),
+                                provisions: ProvisionJudgement {
+                                    claimed: h.provision_tx_roots().clone(),
+                                    trie: topology_snapshot.shard_trie().clone(),
+                                },
                             }),
                         );
                     }
                 }
                 VerificationKind::BodyRoot => {
                     actions.extend(self.initiate_body_root_verification(block_hash, block));
-                }
-                VerificationKind::ProvisionTxRoots => {
-                    actions.extend(self.initiate_provision_tx_root_verification(
-                        block_hash,
-                        block,
-                        topology_snapshot,
-                    ));
                 }
                 VerificationKind::Resolutions => {
                     actions.extend(
@@ -2111,8 +2090,8 @@ mod tests {
         make_settling_finalization, test_transaction,
     };
     use hyperscale_types::{
-        AggregateSignature, DeclaredWork, EpochWindows, ReadFence, TransactionDecision, Verifiable,
-        WitnessSources,
+        AggregateSignature, DeclaredWork, EpochWindows, ProvisionTxRootsMap, ReadFence, ShardTrie,
+        TransactionDecision, Verifiable, WitnessSources,
     };
 
     fn disabled_count_source() -> SubstateCountSource<'static> {
@@ -2544,6 +2523,10 @@ mod tests {
             Some(ParentJudgement {
                 fence: ReadFence::default(),
                 coasting: false,
+                provisions: ProvisionJudgement {
+                    claimed: ProvisionTxRootsMap::default(),
+                    trie: ShardTrie::uniform(0),
+                },
             }),
         );
 
@@ -2614,6 +2597,10 @@ mod tests {
             Some(ParentJudgement {
                 fence: ReadFence::default(),
                 coasting: false,
+                provisions: ProvisionJudgement {
+                    claimed: ProvisionTxRootsMap::default(),
+                    trie: ShardTrie::uniform(0),
+                },
             }),
         );
 
@@ -2670,6 +2657,10 @@ mod tests {
             Some(ParentJudgement {
                 fence: ReadFence::default(),
                 coasting: false,
+                provisions: ProvisionJudgement {
+                    claimed: ProvisionTxRootsMap::default(),
+                    trie: ShardTrie::uniform(0),
+                },
             }),
         );
 
