@@ -189,8 +189,9 @@ pub fn owed_leaves<S: ShardStorage>(
     };
     let bridged = |wt: WeightedTimestamp| {
         schedule
-            .at_for_shard_live(local_shard, wt)
-            .map(|(snapshot, _)| snapshot.shard_trie().clone())
+            .live_committee(local_shard, wt)
+            .committee()
+            .map(|committee| committee.snapshot.shard_trie().clone())
     };
     let committee_anchor = height
         .prev()

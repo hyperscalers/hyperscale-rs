@@ -2542,9 +2542,11 @@ fn shard_fork_resumed() -> (SimCluster, ForkRun) {
             .get_certified_header(storage.committed_height())
             .expect("committed tip header");
         let wt = tip.header().parent_qc().weighted_timestamp();
-        let (snapshot, _bridged) = schedule
-            .at_for_shard_certified(shard, wt, wt)
-            .expect("the committed tip's committee resolves");
+        let snapshot = schedule
+            .certified_committee(shard, wt, wt)
+            .committee()
+            .expect("the committed tip's committee resolves")
+            .snapshot;
         let keys: Vec<_> = snapshot
             .consensus_committee_for_shard(shard)
             .iter()

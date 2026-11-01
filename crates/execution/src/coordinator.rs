@@ -1007,12 +1007,13 @@ impl ExecutionCoordinator {
         committee_anchor: WeightedTimestamp,
     ) -> &'t TopologySnapshot {
         topology_schedule
-            .at_for_shard_certified(
+            .certified_committee(
                 self.local_shard,
                 committee_anchor,
                 certified.qc().weighted_timestamp(),
             )
-            .map_or(anchored, |(snapshot, _)| snapshot.as_ref())
+            .committee()
+            .map_or(anchored, |committee| committee.snapshot.as_ref())
     }
 
     /// The trie that says who was party to a transaction, off the latest
@@ -4063,11 +4064,17 @@ impl ExecutionCoordinator {
         block: &Block,
     ) -> (Vec<Action>, Vec<TickId>) {
         let Some(floor) = block.height().prev().filter(|_| {
-            topology_schedule.crossing_block(
-                self.local_shard,
-                committee_anchor,
-                block.header().parent_qc().weighted_timestamp(),
-            )
+            topology_schedule
+                .live_committee(self.local_shard, committee_anchor)
+                .committee()
+                .is_some_and(|committee| {
+                    topology_schedule.crossing_block(
+                        committee.snapshot,
+                        self.local_shard,
+                        committee_anchor,
+                        block.header().parent_qc().weighted_timestamp(),
+                    )
+                })
         }) else {
             return (Vec::new(), Vec::new());
         };

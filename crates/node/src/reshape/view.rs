@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    NetworkDefinition, ReshapeSeat, ResolvedCommittee, ScheduleLookup, ShardAnchor, ShardId,
+    BlockResolution, NetworkDefinition, ReshapeSeat, ResolvedCommittee, ShardAnchor, ShardId,
     TopologySchedule, TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
@@ -143,12 +143,12 @@ impl<'a> ReshapeView<'a> {
     ) -> CommitteeLookup {
         match self
             .schedule
-            .lookup_for_shard_certified_fenced(shard, anchor_wt, qc_wt)
+            .certified_committee_fenced(shard, anchor_wt, qc_wt)
         {
-            Some((ScheduleLookup::Committee(snapshot), _)) => resolve(snapshot, shard)
+            Some(BlockResolution::Committee(committee)) => resolve(committee.snapshot, shard)
                 .map_or(CommitteeLookup::Unresolvable, CommitteeLookup::Resolved),
-            Some((ScheduleLookup::NotYetCommitted, _)) => CommitteeLookup::Pending,
-            Some((ScheduleLookup::Evicted, _)) | None => CommitteeLookup::Unresolvable,
+            Some(BlockResolution::NotYetCommitted) => CommitteeLookup::Pending,
+            Some(BlockResolution::Evicted) | None => CommitteeLookup::Unresolvable,
         }
     }
 

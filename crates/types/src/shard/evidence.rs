@@ -261,8 +261,10 @@ impl ShardForkProof {
             .map(|(ch, anchor_wt)| {
                 let shard = ch.shard_id();
                 let qc_wt = ch.qc().weighted_timestamp();
-                let (snapshot, _bridged) =
-                    schedule.at_for_shard_certified(shard, anchor_wt, qc_wt)?;
+                let snapshot = schedule
+                    .certified_committee(shard, anchor_wt, qc_wt)
+                    .committee()?
+                    .snapshot;
                 let public_keys = snapshot
                     .consensus_committee_for_shard(shard)
                     .iter()

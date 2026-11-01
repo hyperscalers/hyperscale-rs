@@ -230,12 +230,13 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
             .map_or(committed_block_anchor_wt, |(parent, _)| {
                 parent.header().parent_qc().weighted_timestamp()
             });
-        let Some((committee, _)) =
-            schedule.at_for_shard_certified(local_shard, committee_anchor, *certifying_wt)
+        let Some(committee) = schedule
+            .certified_committee(local_shard, committee_anchor, *certifying_wt)
+            .committee()
         else {
             return Err(block.hash());
         };
-        let committee = committee.as_ref();
+        let committee = committee.snapshot.as_ref();
         let receipts: Vec<StoredReceipt> = block
             .certificates()
             .iter()

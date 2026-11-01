@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hyperscale_types::{
-    BeaconState, BlockHash, BlockHeight, CertifiedBlockHeader, Epoch, GenesisConfigHash, Round,
-    ScheduleLookup, ShardId, ShardWitnessPayload, SlotEffects, TopologySchedule, ValidatorId,
-    Verified, WeightedTimestamp, missed_proposals_since_prev_commit,
+    BeaconState, BlockHash, BlockHeight, BlockResolution, CertifiedBlockHeader, Epoch,
+    GenesisConfigHash, Round, ScheduleLookup, ShardId, ShardWitnessPayload, SlotEffects,
+    TopologySchedule, ValidatorId, Verified, WeightedTimestamp, missed_proposals_since_prev_commit,
 };
 use tokio::sync::watch;
 
@@ -335,11 +335,10 @@ fn summarise(
     let anchor = schedule
         .signing_anchor(shard, header, parent_anchor)
         .weighted_timestamp();
-    let committee =
-        match schedule.lookup_for_shard_certified_fenced(shard, anchor, qc.weighted_timestamp()) {
-            Some((ScheduleLookup::Committee(snapshot), _)) => Some(Arc::clone(snapshot)),
-            _ => None,
-        };
+    let committee = schedule
+        .certified_committee_fenced(shard, anchor, qc.weighted_timestamp())
+        .and_then(BlockResolution::committee)
+        .map(|committee| Arc::clone(committee.snapshot));
     let signers = committee.as_ref().map(|snapshot| {
         let members = snapshot.consensus_committee_for_shard(shard);
         qc.signers()

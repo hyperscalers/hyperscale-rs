@@ -18,9 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    BeaconProposal, BeaconState, BlockHash, BlockHeader, BlockHeight, LocalTimestamp,
-    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, QcContext, QuorumCertificate,
-    ScheduleLookup, ShardEpochContribution, ShardId, TopologySchedule, ValidatorId, Verified,
+    BeaconProposal, BeaconState, BlockHash, BlockHeader, BlockHeight, BlockResolution,
+    LocalTimestamp, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, QcContext,
+    QuorumCertificate, ShardEpochContribution, ShardId, TopologySchedule, ValidatorId, Verified,
     Verifier, Verify,
 };
 use tracing::{debug, warn};
@@ -476,7 +476,7 @@ fn boundary_header_for(
 /// frontier has passed.
 ///
 /// Resolution is terminal-clamped and recovery-bridged
-/// (`lookup_for_shard_certified`): a splitting shard's terminal crossing
+/// (`certified_committee`): a splitting shard's terminal crossing
 /// can be anchored exactly on its cut — a crossing is parent-inclusive at
 /// the cut — and a terminal is anchored past it, where the anchor's
 /// half-open window no longer carries the shard; the block is still
@@ -509,7 +509,7 @@ fn boundary_qc_authentic(
     // own, so a crossing the fenced lookup rejects is the orphan a
     // beyond-f cohort forged extending the halted tip. Folding it would
     // clear the recovery and drop the cross-shard freeze.
-    let snapshot = match topology_schedule.lookup_for_shard_certified_fenced(
+    let snapshot = match topology_schedule.certified_committee_fenced(
         shard,
         committee_anchor_wt,
         qc.weighted_timestamp(),
@@ -521,15 +521,15 @@ fn boundary_qc_authentic(
             );
             return false;
         }
-        Some((ScheduleLookup::Committee(snapshot), _)) => snapshot,
-        Some((ScheduleLookup::NotYetCommitted, _)) => {
+        Some(BlockResolution::Committee(committee)) => committee.snapshot,
+        Some(BlockResolution::NotYetCommitted) => {
             debug!(
                 shard = shard.inner(),
                 "Boundary QC's committee epoch not committed yet — abstaining"
             );
             return false;
         }
-        Some((ScheduleLookup::Evicted, _)) => {
+        Some(BlockResolution::Evicted) => {
             warn!(
                 shard = shard.inner(),
                 anchor_epoch = topology_schedule.epoch_for(committee_anchor_wt).inner(),

@@ -16,7 +16,7 @@ use std::time::Duration;
 use hyperscale_core::{Action, ConsensusAction, HeaderCommittee, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
+    BlockHash, BlockHeader, BlockHeight, BlockResolution, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, CommitProof, CommittedClock, ConsensusPublicKey, ForkFence,
     HeaderFetchCount, HeaderSource, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup,
     ShardForkProof, ShardId, TRANSACTION_EVIDENCE_HORIZON, TopologySchedule, TopologySnapshot,
@@ -421,7 +421,7 @@ impl RemoteHeaderCoordinator {
             );
             return vec![];
         }
-        let committee = match topology_schedule.lookup_for_shard_certified_fenced(
+        let committee = match topology_schedule.certified_committee_fenced(
             shard,
             anchor,
             certified_header.qc().weighted_timestamp(),
@@ -435,12 +435,12 @@ impl RemoteHeaderCoordinator {
                 );
                 return vec![];
             }
-            Some((ScheduleLookup::Committee(committee), _)) => committee,
-            Some((ScheduleLookup::NotYetCommitted, _)) => {
+            Some(BlockResolution::Committee(committee)) => committee.snapshot,
+            Some(BlockResolution::NotYetCommitted) => {
                 self.awaiting.push(shard, (source, certified_header));
                 return vec![];
             }
-            Some((ScheduleLookup::Evicted, _)) => {
+            Some(BlockResolution::Evicted) => {
                 warn!(
                     shard = shard.inner(),
                     height = height.inner(),
@@ -1691,10 +1691,7 @@ impl RemoteHeaderCoordinator {
             // A recovery folded (or advanced) after this header buffered can
             // turn it into a suffix-band orphan the fenced lookup rejects;
             // drop it and drain the next candidate.
-            match topology_schedule
-                .lookup_for_shard_certified_fenced(shard, anchor, qc_wt)
-                .map(|(lookup, _)| lookup)
-            {
+            match topology_schedule.certified_committee_fenced(shard, anchor, qc_wt) {
                 None => {
                     warn!(
                         shard = shard.inner(),
@@ -1705,14 +1702,19 @@ impl RemoteHeaderCoordinator {
                     );
                     self.drop_candidate(shard, height, next_source);
                 }
-                Some(ScheduleLookup::Committee(committee)) => {
-                    return Self::emit_verify_qc(committee, named_by, next_source, next_header);
+                Some(BlockResolution::Committee(committee)) => {
+                    return Self::emit_verify_qc(
+                        committee.snapshot,
+                        named_by,
+                        next_source,
+                        next_header,
+                    );
                 }
-                Some(ScheduleLookup::NotYetCommitted) => {
+                Some(BlockResolution::NotYetCommitted) => {
                     self.drop_candidate(shard, height, next_source);
                     self.awaiting.push(shard, (next_source, next_header));
                 }
-                Some(ScheduleLookup::Evicted) => {
+                Some(BlockResolution::Evicted) => {
                     warn!(
                         shard = shard.inner(),
                         height = height.inner(),

@@ -19,13 +19,12 @@ use hyperscale_core::{
     StateRootCheck, SyncClaimId, TimerId,
 };
 use hyperscale_types::{
-    Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn, Epoch,
-    EpochWindows, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
+    Anchor, BlockHash, BlockResolution, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn,
+    Epoch, EpochWindows, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
     MAX_READY_SIGNALS_PER_BLOCK, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
-    ReshapeKind, ReshapeThresholds, ReshapeTrigger, ScheduleLookup, Settling, ShardId,
-    SplitAtBoundary, StateClaim, StoredReceipt, SubstateClaim, SubstateKey, TickId, TxsInFlight,
-    VerificationKind, WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
-    settling_in,
+    ReshapeKind, ReshapeThresholds, ReshapeTrigger, Settling, ShardId, SplitAtBoundary, StateClaim,
+    StoredReceipt, SubstateClaim, SubstateKey, TickId, TxsInFlight, VerificationKind,
+    WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window, settling_in,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -1245,8 +1244,9 @@ impl ShardCoordinator {
         anchor: WeightedTimestamp,
     ) -> Option<&'t Arc<TopologySnapshot>> {
         topology_schedule
-            .at_for_shard_live(self.local_shard, anchor)
-            .map(|(snapshot, _)| snapshot)
+            .live_committee(self.local_shard, anchor)
+            .committee()
+            .map(|committee| committee.snapshot)
             .filter(|snapshot| {
                 !snapshot
                     .consensus_committee_for_shard(self.local_shard)
@@ -1330,8 +1330,9 @@ impl ShardCoordinator {
         qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
         topology_schedule
-            .at_for_shard_certified(self.local_shard, committee_anchor, qc.weighted_timestamp())
-            .map(|(snapshot, _)| snapshot.as_ref())
+            .certified_committee(self.local_shard, committee_anchor, qc.weighted_timestamp())
+            .committee()
+            .map(|committee| committee.snapshot.as_ref())
     }
 
     /// Committee for the height in progress / our next proposal (extends
@@ -2987,7 +2988,8 @@ impl ShardCoordinator {
         let Some(parent_anchor) = self.block_anchor(block.header().parent_block_hash()) else {
             return Err(Withheld::deferred("the parent's anchor is not held".into()));
         };
-        let recovery = topology_schedule.crossing_block(self.local_shard, parent_anchor, anchor);
+        let recovery =
+            topology_schedule.crossing_block(committee, self.local_shard, parent_anchor, anchor);
         let victims = wounded(rows, anchor, block.state_claims());
         let (lines, missing, budget) = member_lines(
             rows,
@@ -3043,8 +3045,12 @@ impl ShardCoordinator {
             topology_schedule,
             anchor,
         );
-        let recovery =
-            topology_schedule.crossing_block(self.local_shard, self.block_anchor(parent)?, anchor);
+        let recovery = topology_schedule.crossing_block(
+            committee,
+            self.local_shard,
+            self.block_anchor(parent)?,
+            anchor,
+        );
         Some(ManifestInputs {
             committed: held,
             recovery,
@@ -4727,15 +4733,16 @@ impl ShardCoordinator {
         anchor: WeightedTimestamp,
         qc_wt: WeightedTimestamp,
     ) -> Option<&'t TopologySnapshot> {
-        let Some((ScheduleLookup::Committee(committee), _)) =
-            topology_schedule.lookup_for_shard_certified_fenced(self.local_shard, anchor, qc_wt)
+        let Some(BlockResolution::Committee(committee)) =
+            topology_schedule.certified_committee_fenced(self.local_shard, anchor, qc_wt)
         else {
             return None;
         };
         (!committee
+            .snapshot
             .consensus_committee_for_shard(self.local_shard)
             .is_empty())
-        .then_some(committee.as_ref())
+        .then_some(committee.snapshot.as_ref())
     }
 
     /// Verify sync claim `id`'s certificate against `committee`.
@@ -5011,19 +5018,16 @@ impl ShardCoordinator {
         // already defers on the same condition and which no vote bypasses.
         let proposer_committee = match self.block_anchor(header.parent_block_hash()) {
             None => None,
-            Some(anchor) => match topology_schedule
-                .lookup_for_shard_live(self.local_shard, anchor)
-                .0
-            {
-                ScheduleLookup::Committee(committee) => Some(committee.as_ref()),
-                ScheduleLookup::NotYetCommitted => {
+            Some(anchor) => match topology_schedule.live_committee(self.local_shard, anchor) {
+                BlockResolution::Committee(committee) => Some(committee.snapshot.as_ref()),
+                BlockResolution::NotYetCommitted => {
                     warn!(
                         signers = ?self.signers.keys(),
                         "No committee for header's epoch yet — beacon behind, dropping header"
                     );
                     return true;
                 }
-                ScheduleLookup::Evicted => {
+                BlockResolution::Evicted => {
                     warn!(
                         signers = ?self.signers.keys(),
                         "Header's committee epoch is below the schedule floor — dropping header"
@@ -5283,10 +5287,10 @@ impl ShardCoordinator {
             // pending, every vote redrive would check it again. A header the
             // fresh committee of a recovery not yet folded here proposed comes
             // back through block sync once a child names it.
-            if let ScheduleLookup::Committee(committee) = topology_schedule
-                .lookup_for_shard_live(self.local_shard, committee_anchor_wt)
-                .0
-                && let Err(e) = validate_proposer(committee.as_ref(), self.local_shard, &header)
+            if let BlockResolution::Committee(committee) =
+                topology_schedule.live_committee(self.local_shard, committee_anchor_wt)
+                && let Err(e) =
+                    validate_proposer(committee.snapshot.as_ref(), self.local_shard, &header)
             {
                 warn!(
                     signers = ?self.signers.keys(),
@@ -7698,9 +7702,13 @@ impl ShardCoordinator {
             let anchor = chain[i - 1].parent_qc().weighted_timestamp();
             let certified = chain[i + 1].parent_qc().weighted_timestamp();
             let by_live_committee = topology_schedule
-                .at_for_shard_certified(self.local_shard, anchor, certified)
-                .is_some_and(|(snapshot, _)| {
-                    snapshot.consensus_committee_for_shard(self.local_shard) == members
+                .certified_committee(self.local_shard, anchor, certified)
+                .committee()
+                .is_some_and(|committee| {
+                    committee
+                        .snapshot
+                        .consensus_committee_for_shard(self.local_shard)
+                        == members
                 });
             if by_live_committee {
                 self.view_change.observe_commit(chain[i], members);
@@ -8090,16 +8098,13 @@ impl ShardCoordinator {
         else {
             return self.await_synced_parent(topology_schedule, certified);
         };
-        let committee = match topology_schedule
-            .lookup_for_shard_certified(
-                self.local_shard,
-                committee_anchor_wt,
-                certified.qc().weighted_timestamp(),
-            )
-            .0
-        {
-            ScheduleLookup::Committee(committee) => committee,
-            ScheduleLookup::NotYetCommitted => {
+        let committee = match topology_schedule.certified_committee(
+            self.local_shard,
+            committee_anchor_wt,
+            certified.qc().weighted_timestamp(),
+        ) {
+            BlockResolution::Committee(committee) => committee.snapshot,
+            BlockResolution::NotYetCommitted => {
                 warn!(
                     height = certified.block().height().inner(),
                     "No committee for synced block's epoch yet — beacon behind, re-buffering"
@@ -8108,7 +8113,7 @@ impl ShardCoordinator {
                 self.block_sync.defer_block(height, certified);
                 return vec![];
             }
-            ScheduleLookup::Evicted => {
+            BlockResolution::Evicted => {
                 warn!(
                     height = certified.block().height().inner(),
                     "Synced block's committee epoch is below the schedule floor — rejecting"

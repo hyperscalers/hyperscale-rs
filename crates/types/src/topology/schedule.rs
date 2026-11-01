@@ -362,6 +362,47 @@ pub enum ScheduleLookup<'a> {
     Evicted,
 }
 
+/// The committee a block of one shard belongs to: the window that seats
+/// it and the epoch that window is keyed by.
+#[derive(Clone, Copy)]
+pub struct BlockCommittee<'a> {
+    /// The window resolved. Its trie and prices are the block's as well
+    /// as its committee, so it answers more than who signs.
+    pub snapshot: &'a Arc<TopologySnapshot>,
+    /// The epoch of the window resolved, after the terminal clamp: the
+    /// key [`TopologySchedule::signed_committee`] resolves back to this
+    /// window.
+    pub epoch: Epoch,
+    /// Whether the anchor resolved lands past the shard's terminal
+    /// window, as [`TopologySchedule::past_terminal`] reads it. Always
+    /// false for [`TopologySchedule::signed_committee`], which resolves
+    /// an epoch rather than an anchor.
+    pub past_terminal: bool,
+}
+
+/// Result of resolving the committee a block of one shard belongs to,
+/// with the miss reasons of [`ScheduleLookup`].
+#[derive(Clone, Copy)]
+pub enum BlockResolution<'a> {
+    /// The committee's window is retained.
+    Committee(BlockCommittee<'a>),
+    /// As [`ScheduleLookup::NotYetCommitted`].
+    NotYetCommitted,
+    /// As [`ScheduleLookup::Evicted`].
+    Evicted,
+}
+
+impl<'a> BlockResolution<'a> {
+    /// The resolved committee, or `None` for either miss.
+    #[must_use]
+    pub const fn committee(self) -> Option<BlockCommittee<'a>> {
+        match self {
+            Self::Committee(committee) => Some(committee),
+            Self::NotYetCommitted | Self::Evicted => None,
+        }
+    }
+}
+
 impl TopologySchedule {
     /// Build a schedule seeded with `head` as the committee governing
     /// `head_epoch`. The beacon coordinator inserts the lookahead and any
@@ -501,7 +542,11 @@ impl TopologySchedule {
     /// add the bridge, the frontier and the clamp that make its committee
     /// answerable.
     fn lookup_snapshot(&self, wt: WeightedTimestamp) -> ScheduleLookup<'_> {
-        let epoch = self.epoch_for(wt);
+        self.lookup_epoch(self.epoch_for(wt))
+    }
+
+    /// The snapshot keyed `epoch`, with the miss reason.
+    fn lookup_epoch(&self, epoch: Epoch) -> ScheduleLookup<'_> {
         if let Some(snapshot) = self.by_epoch.get(&epoch) {
             return ScheduleLookup::Committee(snapshot);
         }
@@ -639,7 +684,9 @@ impl TopologySchedule {
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> Option<(&Arc<TopologySnapshot>, bool)> {
-        Self::resolved(self.lookup_for_shard(shard, wt))
+        self.resolve_for_shard(shard, wt)
+            .committee()
+            .map(|committee| (committee.snapshot, committee.past_terminal))
     }
 
     /// Whether `wt` lands past `shard`'s terminal window: the
@@ -651,24 +698,6 @@ impl TopologySchedule {
     pub fn past_terminal(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
         self.at_for_shard(shard, wt)
             .is_some_and(|(_, past_terminal)| past_terminal)
-    }
-
-    /// Collapse a lookup tuple to its resolved committee — `None` for
-    /// [`NotYetCommitted`](ScheduleLookup::NotYetCommitted) and
-    /// [`Evicted`](ScheduleLookup::Evicted) alike. The one adapter behind
-    /// every `at_*` wrapper, so a new `ScheduleLookup` variant is handled
-    /// in one place.
-    ///
-    /// Callers that must tell the two apart — a transient lag deserves a
-    /// defer, an evicted window a reject — cannot use this and should read
-    /// the `lookup_*` form directly.
-    const fn resolved(
-        (lookup, past_terminal): (ScheduleLookup<'_>, bool),
-    ) -> Option<(&Arc<TopologySnapshot>, bool)> {
-        match lookup {
-            ScheduleLookup::Committee(snapshot) => Some((snapshot, past_terminal)),
-            _ => None,
-        }
     }
 
     /// The snapshot governing `wt` with the terminal clamp of
@@ -685,22 +714,50 @@ impl TopologySchedule {
     /// the block anchored there would carry the final window's split
     /// roots while the block after it failed the terminal test, and no
     /// header of the chain would carry the terminal settled root.
+    ///
+    /// The second value is also `true` for an [`Evicted`](ScheduleLookup::Evicted)
+    /// answer at a held window that carries no trace of the shard: the
+    /// anchor is past a terminal no retained window still records.
     #[must_use]
     pub fn lookup_for_shard(
         &self,
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> (ScheduleLookup<'_>, bool) {
+        match self.resolve_for_shard(shard, wt) {
+            BlockResolution::Committee(committee) => (
+                ScheduleLookup::Committee(committee.snapshot),
+                committee.past_terminal,
+            ),
+            BlockResolution::NotYetCommitted => (ScheduleLookup::NotYetCommitted, false),
+            BlockResolution::Evicted => (
+                ScheduleLookup::Evicted,
+                self.by_epoch.contains_key(&self.epoch_for(wt)),
+            ),
+        }
+    }
+
+    /// [`lookup_for_shard`](Self::lookup_for_shard) with the epoch of the
+    /// window resolved: the anchor's window, or the shard's terminal
+    /// window where the anchor's no longer carries it.
+    fn resolve_for_shard(&self, shard: ShardId, wt: WeightedTimestamp) -> BlockResolution<'_> {
         match self.lookup_snapshot(wt) {
             ScheduleLookup::Committee(snapshot) if !snapshot.shard_trie().contains(shard) => self
                 .terminal_window(shard, wt)
-                .map_or((ScheduleLookup::Evicted, true), |(epoch, s)| {
-                    (
-                        ScheduleLookup::Committee(s),
-                        epoch != self.anchor_epoch_for(wt),
-                    )
+                .map_or(BlockResolution::Evicted, |(epoch, snapshot)| {
+                    BlockResolution::Committee(BlockCommittee {
+                        snapshot,
+                        epoch,
+                        past_terminal: epoch != self.anchor_epoch_for(wt),
+                    })
                 }),
-            other => (other, false),
+            ScheduleLookup::Committee(snapshot) => BlockResolution::Committee(BlockCommittee {
+                snapshot,
+                epoch: self.epoch_for(wt),
+                past_terminal: false,
+            }),
+            ScheduleLookup::NotYetCommitted => BlockResolution::NotYetCommitted,
+            ScheduleLookup::Evicted => BlockResolution::Evicted,
         }
     }
 
@@ -821,8 +878,12 @@ impl TopologySchedule {
         self.bindings(shard).next_back()
     }
 
-    /// The bridge live work anchored at `wt` binds through: the newest
-    /// recovery's, when `wt`'s epoch sits below it.
+    /// Whether live work anchored at `wt` rides `shard`'s newest recovery
+    /// bridge: `wt`'s epoch sits below it, the band
+    /// [`live_committee`](Self::live_committee) re-binds to the fresh
+    /// committee. The one predicate every consumer reads (proposer gating,
+    /// state-root deferral, the live lookup itself), so the bridge band
+    /// cannot drift between them.
     ///
     /// A halted chain's tip anchor is many windows stale, and the anchor's
     /// window resolves the committee that halted, so such work binds to
@@ -831,30 +892,19 @@ impl TopologySchedule {
     /// crossing holds a tip anchored before the halt, and resolving the
     /// replaced committee for it would drop the very timeouts that carry
     /// it forward. Anchors at or past the bridge resolve as ordinary.
-    fn live_bridge(&self, shard: ShardId, wt: WeightedTimestamp) -> Option<Epoch> {
-        self.newest_recovery(shard)
-            .map(RecoveryBinding::bridge)
-            .filter(|&bridge| self.epoch_for(wt) < bridge)
-    }
-
-    /// Whether live work anchored at `wt` rides `shard`'s newest recovery
-    /// bridge — the band
-    /// [`lookup_for_shard_live`](Self::lookup_for_shard_live) re-binds to
-    /// the fresh committee. The one predicate every consumer reads
-    /// (proposer gating, state-root deferral, the live lookup itself), so
-    /// the bridge band cannot drift between them.
     #[must_use]
     pub fn recovery_bridging(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
-        self.live_bridge(shard, wt).is_some()
+        self.newest_recovery(shard)
+            .is_some_and(|newest| self.epoch_for(wt) < newest.bridge())
     }
 
-    /// Whether a block of `shard` whose parent QC is anchored at `wt` only
-    /// coasts: past its terminal cut, or across a halt recovery's bridge.
-    /// A coasting block is empty and writes nothing of its own accord, so
-    /// the state it carries is its parent's.
+    /// Whether a block of `shard` whose own parent QC is anchored at
+    /// `own_anchor` only coasts: past its terminal cut, or across a halt
+    /// recovery's bridge. A coasting block is empty and writes nothing of
+    /// its own accord, so the state it carries is its parent's.
     #[must_use]
-    pub fn coasting(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
-        self.past_terminal(shard, wt) || self.recovery_bridging(shard, wt)
+    pub fn coasting(&self, shard: ShardId, own_anchor: WeightedTimestamp) -> bool {
+        self.past_terminal(shard, own_anchor) || self.recovery_bridging(shard, own_anchor)
     }
 
     /// Whether a tick of `shard` anchored at `anchor_wt` is one a halt
@@ -880,47 +930,30 @@ impl TopologySchedule {
     }
 
     /// Whether the block of `shard` anchored at `anchor_wt`, whose parent
-    /// is anchored at `parent_anchor_wt`, is the shard's crossing block,
-    /// read off the committee the block is built and voted under: the one
-    /// [`at_for_shard_live`](Self::at_for_shard_live) resolves at the
-    /// parent's anchor, which is the block's committee anchor. The
-    /// proposer, every voter and execution ask this one question of one
-    /// snapshot, so the block whose manifest names the recovery's discard
-    /// is the block whose commit raises the tick chain floor.
+    /// is anchored at `parent_anchor_wt`, is the shard's crossing block:
+    /// the first anchored at or past the newest bridge `committee` records
+    /// for it. Its parent, a coast block, is anchored below that bridge.
+    ///
+    /// `committee` is the block's own: the snapshot
+    /// [`live_committee`](Self::live_committee) resolves at the parent's
+    /// anchor, which is the block's committee anchor. Read off that
+    /// snapshot rather than the head, so the proposer, every voter and
+    /// execution ask this one question of one record, and the block whose
+    /// manifest names the recovery's discard is the block whose commit
+    /// raises the tick chain floor. Bridges increase along a shard's
+    /// history, so a block past an older bridge and below a newer one
+    /// crosses nothing: the newer recovery's crossing block discards what
+    /// it would have.
     #[must_use]
     pub fn crossing_block(
         &self,
-        shard: ShardId,
-        parent_anchor_wt: WeightedTimestamp,
-        anchor_wt: WeightedTimestamp,
-    ) -> bool {
-        self.at_for_shard_live(shard, parent_anchor_wt)
-            .is_some_and(|(committee, _)| {
-                self.recovery_crossing(committee, shard, parent_anchor_wt, anchor_wt)
-            })
-    }
-
-    /// Whether the block of `shard` anchored at `anchor_wt`, whose parent
-    /// is anchored at `parent_anchor_wt`, is the shard's crossing block:
-    /// the first anchored at or past the newest bridge `snapshot` records
-    /// for it. Its parent, a coast block, is anchored below that bridge.
-    ///
-    /// Reads off a snapshot the caller names rather than the head, so a
-    /// block-validity input reads one record on every replica: the
-    /// committee `crossing_block` resolves through the live bridge at the
-    /// parent's anchor. Bridges increase along
-    /// a shard's history, so a block past an older bridge and below a
-    /// newer one crosses nothing: the newer recovery's crossing block
-    /// discards what it would have.
-    fn recovery_crossing(
-        &self,
-        snapshot: &TopologySnapshot,
+        committee: &TopologySnapshot,
         shard: ShardId,
         parent_anchor_wt: WeightedTimestamp,
         anchor_wt: WeightedTimestamp,
     ) -> bool {
         let (parent, anchor) = (self.epoch_for(parent_anchor_wt), self.epoch_for(anchor_wt));
-        snapshot
+        committee
             .recovery_bindings(shard)
             .next_back()
             .is_some_and(|newest| parent < newest.bridge() && newest.bridge() <= anchor)
@@ -1086,8 +1119,8 @@ impl TopologySchedule {
     /// During a pending recovery, whether a certified artifact resolves the
     /// **retained** (old) committee through the suffix band: a stale anchor
     /// (below the bridge) whose QC timestamp also sits below the bridge, so
-    /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified) does
-    /// not re-bind it to the fresh committee.
+    /// [`certified_committee`](Self::certified_committee) does not re-bind
+    /// it to the fresh committee.
     ///
     /// The fresh committee's own artifacts either re-bind (a bridge block,
     /// anchored below the bridge but certified at or past it) or anchor at a
@@ -1115,8 +1148,8 @@ impl TopologySchedule {
     /// which is to say its certifying committee is one a recovery
     /// replaced.
     ///
-    /// Mirrors [`lookup_for_shard_certified`](Self::lookup_for_shard_certified),
-    /// so the two never disagree about who certified a block: a suffix
+    /// Mirrors [`certified_committee`](Self::certified_committee), so the
+    /// two never disagree about who certified a block: a suffix
     /// block is the replaced committee's; a bridge block, anchored below a
     /// bridge but certified at or one skew window under it, is that
     /// recovery's fresh committee's until a later recovery's band takes it
@@ -1158,12 +1191,16 @@ impl TopologySchedule {
     /// so the binding is one value for every replica at every later
     /// fold: a mid-recovery top-up or a post-recovery shuffle lands in
     /// later entries and never re-binds work anchored below the bridge.
-    fn bridged_for_shard(&self, shard: ShardId, bridge: Epoch) -> (ScheduleLookup<'_>, bool) {
-        self.lookup_for_shard(shard, self.windows().window_of(bridge).start)
+    fn bridged_for_shard(&self, shard: ShardId, bridge: Epoch) -> BlockResolution<'_> {
+        self.resolve_for_shard(shard, self.windows().window_of(bridge).start)
     }
 
-    /// [`lookup_for_shard`](Self::lookup_for_shard) for **live** consensus
-    /// work — proposals, votes, and the tip committee. A recovering
+    /// The committee an uncertified block of `shard` whose committee
+    /// anchor is `committee_anchor` is built and voted under: the
+    /// anchor's window, terminal-clamped as
+    /// [`lookup_for_shard`](Self::lookup_for_shard) clamps it, and bridged
+    /// while [`recovery_bridging`](Self::recovery_bridging). For **live**
+    /// consensus work — proposals, votes, and the tip committee. A recovering
     /// shard's stale anchor resolves the fresh committee via the recovery
     /// bridge (see [`recovery_bridge`](Self::recovery_bridge)), so an
     /// honest folded member proposes and votes only on the fresh chain and
@@ -1172,34 +1209,47 @@ impl TopologySchedule {
     /// which is beyond f by construction (that is why the shard halted) and
     /// can still certify a competing chain from its own members plus any
     /// lagging honest one. That orphan is caught on the verifier side, not
-    /// here — see [`lookup_for_shard_certified`](Self::lookup_for_shard_certified).
+    /// here — see [`certified_committee`](Self::certified_committee).
     /// Never used to verify certified history — the halted suffix verifies
     /// against its own windows via the certified path.
     #[must_use]
-    pub fn lookup_for_shard_live(
+    pub fn live_committee(
         &self,
         shard: ShardId,
-        wt: WeightedTimestamp,
-    ) -> (ScheduleLookup<'_>, bool) {
-        if let Some(bridge) = self.live_bridge(shard, wt) {
-            return self.bridged_for_shard(shard, bridge);
+        committee_anchor: WeightedTimestamp,
+    ) -> BlockResolution<'_> {
+        match self.newest_recovery(shard) {
+            Some(newest) if self.recovery_bridging(shard, committee_anchor) => {
+                self.bridged_for_shard(shard, newest.bridge())
+            }
+            _ => self.resolve_for_shard(shard, committee_anchor),
         }
-        self.lookup_for_shard(shard, wt)
     }
 
-    /// [`at_for_shard`](Self::at_for_shard) with the recovery bridge of
-    /// [`lookup_for_shard_live`](Self::lookup_for_shard_live).
+    /// The committee of `shard` keyed `epoch`, the epoch a
+    /// [`BlockCommittee`] names: the window resolved back from its key,
+    /// with no anchor, bridge or clamp to apply.
+    /// [`Evicted`](BlockResolution::Evicted) for a held window that does
+    /// not carry the shard, since no resolution keys one.
     #[must_use]
-    pub fn at_for_shard_live(
-        &self,
-        shard: ShardId,
-        wt: WeightedTimestamp,
-    ) -> Option<(&Arc<TopologySnapshot>, bool)> {
-        Self::resolved(self.lookup_for_shard_live(shard, wt))
+    pub fn signed_committee(&self, shard: ShardId, epoch: Epoch) -> BlockResolution<'_> {
+        match self.lookup_epoch(epoch) {
+            ScheduleLookup::Committee(snapshot) if snapshot.shard_trie().contains(shard) => {
+                BlockResolution::Committee(BlockCommittee {
+                    snapshot,
+                    epoch,
+                    past_terminal: false,
+                })
+            }
+            ScheduleLookup::NotYetCommitted => BlockResolution::NotYetCommitted,
+            ScheduleLookup::Committee(_) | ScheduleLookup::Evicted => BlockResolution::Evicted,
+        }
     }
 
-    /// [`lookup_for_shard`](Self::lookup_for_shard) for a **certified**
-    /// artifact — a block or header carrying its own QC. A recovery
+    /// The committee that certified a block of `shard` whose committee
+    /// anchor is `anchor_wt` and whose QC is stamped `qc_wt`: the
+    /// [`lookup_for_shard`](Self::lookup_for_shard) resolution for a
+    /// **certified** artifact — a block or header carrying its own QC. A recovery
     /// bridge block is anchored below the bridge epoch but certified at
     /// or after it, and resolves the fresh committee; the halted suffix —
     /// certified while the old committee still governed, so its QC
@@ -1212,12 +1262,12 @@ impl TopologySchedule {
     /// the recovery. The QC bound tolerates
     /// one window below the bridge because the seating-window quiesce
     /// holds each honest vote at or past the bridge window, so an
-    /// honest-majority quorum's mean stamp cannot fall more than a skew
+    /// honest-majority quorum's median stamp cannot fall more than a skew
     /// window under it.
     ///
     /// That tolerance is calibrated for an adversarial *minority* in the
     /// quorum, and the retained committee is beyond f — an honest minority
-    /// in its own quorum — so it can drag the aggregated (mean) timestamp
+    /// in its own quorum — so it can drag the aggregated (median) timestamp
     /// arbitrarily below the bridge and land an orphan extending the
     /// halted tip back in the suffix band, where this resolves the old
     /// committee and its signatures verify. The re-bind narrows the local
@@ -1231,12 +1281,12 @@ impl TopologySchedule {
     /// unverifiable; its fetch retries succeed once its beacon catches up,
     /// the same self-healing as any beacon lag.
     #[must_use]
-    pub fn lookup_for_shard_certified(
+    pub fn certified_committee(
         &self,
         shard: ShardId,
         anchor_wt: WeightedTimestamp,
         qc_wt: WeightedTimestamp,
-    ) -> (ScheduleLookup<'_>, bool) {
+    ) -> BlockResolution<'_> {
         let (anchor, certified) = (self.epoch_for(anchor_wt), self.epoch_for(qc_wt).next());
         if let Some(bridge) = self
             .bindings(shard)
@@ -1246,19 +1296,7 @@ impl TopologySchedule {
         {
             return self.bridged_for_shard(shard, bridge);
         }
-        self.lookup_for_shard(shard, anchor_wt)
-    }
-
-    /// [`at_for_shard`](Self::at_for_shard) with the recovery bridge of
-    /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified).
-    #[must_use]
-    pub fn at_for_shard_certified(
-        &self,
-        shard: ShardId,
-        anchor_wt: WeightedTimestamp,
-        qc_wt: WeightedTimestamp,
-    ) -> Option<(&Arc<TopologySnapshot>, bool)> {
-        Self::resolved(self.lookup_for_shard_certified(shard, anchor_wt, qc_wt))
+        self.resolve_for_shard(shard, anchor_wt)
     }
 
     /// The anchor that selects the committee which signed the QC over
@@ -1287,8 +1325,8 @@ impl TopologySchedule {
             )
     }
 
-    /// [`lookup_for_shard_certified`](Self::lookup_for_shard_certified) for
-    /// verifiers that must reject the pending-recovery orphan: `None` for a
+    /// [`certified_committee`](Self::certified_committee) for verifiers
+    /// that must reject the pending-recovery orphan: `None` for a
     /// stale-anchored, suffix-band-stamped artifact — the shape only the
     /// retained (beyond-f) committee produces as *new* work during a halt
     /// recovery (see
@@ -1299,16 +1337,16 @@ impl TopologySchedule {
     /// only ever see new production during a recovery call this instead of
     /// pairing the two by hand.
     #[must_use]
-    pub fn lookup_for_shard_certified_fenced(
+    pub fn certified_committee_fenced(
         &self,
         shard: ShardId,
         anchor_wt: WeightedTimestamp,
         qc_wt: WeightedTimestamp,
-    ) -> Option<(ScheduleLookup<'_>, bool)> {
+    ) -> Option<BlockResolution<'_>> {
         if self.recovery_resolves_retained(shard, anchor_wt, qc_wt) {
             return None;
         }
-        Some(self.lookup_for_shard_certified(shard, anchor_wt, qc_wt))
+        Some(self.certified_committee(shard, anchor_wt, qc_wt))
     }
 
     /// The weighted timestamp at which `shard` terminated — the end of the
@@ -1714,6 +1752,26 @@ mod tests {
             1,
             ValidatorSet::new(Vec::new()),
         ))
+    }
+
+    /// The members `resolution` seats for `shard`, after checking that the
+    /// epoch it names resolves back to the same window.
+    fn members_of(
+        schedule: &TopologySchedule,
+        shard: ShardId,
+        resolution: BlockResolution<'_>,
+    ) -> Vec<ValidatorId> {
+        let BlockResolution::Committee(committee) = resolution else {
+            panic!("expected a resolved committee");
+        };
+        let Some(signed) = schedule
+            .signed_committee(shard, committee.epoch)
+            .committee()
+        else {
+            panic!("the epoch a committee names resolves back");
+        };
+        assert!(Arc::ptr_eq(signed.snapshot, committee.snapshot));
+        committee.snapshot.committee_for_shard(shard).to_vec()
     }
 
     fn halt_recovery(rotated_at: u64, retained: &[ValidatorId]) -> ShardRecovery {
@@ -2447,6 +2505,34 @@ mod tests {
                 .unwrap()
         ));
 
+        // The live resolution names the terminal window's epoch, and that
+        // epoch resolves the same window back.
+        let Some(live) = sched
+            .live_committee(p, WeightedTimestamp::from_millis(7500))
+            .committee()
+        else {
+            panic!("the terminal window resolves");
+        };
+        assert!(live.past_terminal);
+        assert_eq!(live.epoch, Epoch::new(6));
+        assert!(Arc::ptr_eq(
+            live.snapshot,
+            sched
+                .signed_committee(p, Epoch::new(6))
+                .committee()
+                .unwrap()
+                .snapshot
+        ));
+        // Window 7 no longer carries p, so no resolution keys p there.
+        assert!(matches!(
+            sched.signed_committee(p, Epoch::new(7)),
+            BlockResolution::Evicted
+        ));
+        assert!(matches!(
+            sched.signed_committee(p, Epoch::new(9)),
+            BlockResolution::NotYetCommitted
+        ));
+
         // A shard alive in the same window is untouched by the clamp.
         let (alive, past) = sched
             .at_for_shard(sibling, WeightedTimestamp::from_millis(7500))
@@ -2676,9 +2762,11 @@ mod tests {
         // The QC-bound tolerance: one window below the bridge still bridges.
         let edge_qc = WeightedTimestamp::from_millis(20_900);
 
-        // Live work at the stale anchor binds to the fresh committee.
+        // Live work at the stale anchor binds to the fresh committee. Each
+        // window is keyed once, so `members_of` resolving the epoch back
+        // to the same window pins the epoch too.
         assert_eq!(
-            committee_of(sched.lookup_for_shard_live(shard, stale_anchor).0),
+            members_of(&sched, shard, sched.live_committee(shard, stale_anchor)),
             fresh,
         );
         // The plain anchor lookup is untouched — historical resolution.
@@ -2689,10 +2777,10 @@ mod tests {
         // A suffix block — certified while the old committee governed —
         // keeps verifying against it.
         assert_eq!(
-            committee_of(
-                sched
-                    .lookup_for_shard_certified(shard, stale_anchor, suffix_qc)
-                    .0
+            members_of(
+                &sched,
+                shard,
+                sched.certified_committee(shard, stale_anchor, suffix_qc)
             ),
             old,
         );
@@ -2700,17 +2788,17 @@ mod tests {
         // bridge — verifies against the fresh committee.
         for qc_wt in [bridge_qc, edge_qc] {
             assert_eq!(
-                committee_of(
-                    sched
-                        .lookup_for_shard_certified(shard, stale_anchor, qc_wt)
-                        .0
+                members_of(
+                    &sched,
+                    shard,
+                    sched.certified_committee(shard, stale_anchor, qc_wt)
                 ),
                 fresh,
             );
         }
         // Current anchors resolve normally on both paths.
         assert_eq!(
-            committee_of(sched.lookup_for_shard_live(shard, bridge_qc).0),
+            members_of(&sched, shard, sched.live_committee(shard, bridge_qc)),
             fresh,
         );
 
@@ -2730,15 +2818,16 @@ mod tests {
         // call: the orphan shape is `None`, everything else resolves.
         assert!(
             sched
-                .lookup_for_shard_certified_fenced(shard, stale_anchor, suffix_qc)
+                .certified_committee_fenced(shard, stale_anchor, suffix_qc)
                 .is_none()
         );
         assert_eq!(
-            committee_of(
+            members_of(
+                &sched,
+                shard,
                 sched
-                    .lookup_for_shard_certified_fenced(shard, stale_anchor, bridge_qc)
+                    .certified_committee_fenced(shard, stale_anchor, bridge_qc)
                     .expect("bridge block passes the fence")
-                    .0
             ),
             fresh,
         );
@@ -2752,7 +2841,7 @@ mod tests {
         );
         plain.insert(Epoch::new(21), snap(&fresh));
         assert_eq!(
-            committee_of(plain.lookup_for_shard_live(shard, stale_anchor).0),
+            members_of(&plain, shard, plain.live_committee(shard, stale_anchor)),
             old,
         );
         assert!(!plain.recovery_resolves_retained(shard, stale_anchor, suffix_qc));
@@ -3239,10 +3328,6 @@ mod tests {
         sched.insert(Epoch::new(23), completed(&shuffled));
         sched.set_head(completed(&shuffled));
 
-        let committee_of = |lookup: ScheduleLookup<'_>| match lookup {
-            ScheduleLookup::Committee(snapshot) => snapshot.committee_for_shard(shard).to_vec(),
-            _ => panic!("expected a resolved committee"),
-        };
         let stale_anchor = WeightedTimestamp::from_millis(2_500);
         let suffix_qc = WeightedTimestamp::from_millis(2_900);
         let bridge_qc = WeightedTimestamp::from_millis(21_100);
@@ -3250,19 +3335,19 @@ mod tests {
         // The bridge band still re-binds to the fresh committee — the
         // bridge window's own entry, not the shuffled head.
         assert_eq!(
-            committee_of(
-                sched
-                    .lookup_for_shard_certified(shard, stale_anchor, bridge_qc)
-                    .0
+            members_of(
+                &sched,
+                shard,
+                sched.certified_committee(shard, stale_anchor, bridge_qc)
             ),
             fresh,
         );
         // The suffix keeps resolving the committee that produced it.
         assert_eq!(
-            committee_of(
-                sched
-                    .lookup_for_shard_certified(shard, stale_anchor, suffix_qc)
-                    .0
+            members_of(
+                &sched,
+                shard,
+                sched.certified_committee(shard, stale_anchor, suffix_qc)
             ),
             old,
         );
@@ -3270,13 +3355,13 @@ mod tests {
         // committee: a member one QC behind the first crossing must not
         // resolve the committee the recovery replaced.
         assert_eq!(
-            committee_of(sched.lookup_for_shard_live(shard, stale_anchor).0),
+            members_of(&sched, shard, sched.live_committee(shard, stale_anchor)),
             fresh,
         );
         // Live work anchored at the bridge or past it resolves as ordinary.
         let current = WeightedTimestamp::from_millis(23_500);
         assert_eq!(
-            committee_of(sched.lookup_for_shard_live(shard, current).0),
+            members_of(&sched, shard, sched.live_committee(shard, current)),
             shuffled,
         );
         // The pending-scoped fences do not outlive the recovery.
@@ -3406,20 +3491,20 @@ mod tests {
             // The first recovery's bridge block verifies against the
             // committee that certified it.
             assert_eq!(
-                committee_of(
-                    sched
-                        .lookup_for_shard_certified(shard, stale_anchor, first_bridge_qc)
-                        .0
+                members_of(
+                    &sched,
+                    shard,
+                    sched.certified_committee(shard, stale_anchor, first_bridge_qc)
                 ),
                 first,
             );
             // So does a block the first fresh committee certified in its
             // own windows.
             assert_eq!(
-                committee_of(
-                    sched
-                        .lookup_for_shard_certified(shard, first_era_anchor, first_era_qc)
-                        .0
+                members_of(
+                    &sched,
+                    shard,
+                    sched.certified_committee(shard, first_era_anchor, first_era_qc)
                 ),
                 first,
             );
@@ -3447,7 +3532,7 @@ mod tests {
             // Live work at either era's anchor binds the newest committee.
             for anchor in [stale_anchor, first_era_anchor] {
                 assert_eq!(
-                    committee_of(sched.lookup_for_shard_live(shard, anchor).0),
+                    members_of(&sched, shard, sched.live_committee(shard, anchor)),
                     second,
                 );
             }
@@ -3488,13 +3573,13 @@ mod tests {
 
         let crossings: Vec<(u64, u64)> = anchors
             .windows(2)
-            .filter(|pair| sched.recovery_crossing(&head, shard, at(pair[0]), at(pair[1])))
+            .filter(|pair| sched.crossing_block(&head, shard, at(pair[0]), at(pair[1])))
             .map(|pair| (pair[0], pair[1]))
             .collect();
         assert_eq!(crossings, vec![(40, 41)]);
         for pair in anchors.windows(2) {
             assert_eq!(
-                sched.recovery_crossing(&head, shard, at(pair[0]), at(pair[1])),
+                sched.crossing_block(&head, shard, at(pair[0]), at(pair[1])),
                 sched.coasting(shard, at(pair[0])) && !sched.coasting(shard, at(pair[1])),
                 "one block is the crossing and the first to name member lines: {pair:?}",
             );
@@ -3505,7 +3590,7 @@ mod tests {
             2,
             ValidatorSet::new(vec![]),
         ));
-        assert!(!sched.recovery_crossing(&plain, shard, at(40), at(41)));
+        assert!(!sched.crossing_block(&plain, shard, at(40), at(41)));
     }
 
     /// Only the crossing block crosses: a block past it, while the
@@ -3542,11 +3627,11 @@ mod tests {
                 Epoch::new(21),
                 Arc::clone(&head),
             );
-            assert!(sched.recovery_crossing(&head, shard, at(20), at(21)));
-            assert!(sched.recovery_crossing(&head, shard, at(3), at(25)));
+            assert!(sched.crossing_block(&head, shard, at(20), at(21)));
+            assert!(sched.crossing_block(&head, shard, at(3), at(25)));
             for (parent, block) in [(2, 3), (3, 20), (20, 20), (21, 21), (21, 22), (22, 40)] {
                 assert!(
-                    !sched.recovery_crossing(&head, shard, at(parent), at(block)),
+                    !sched.crossing_block(&head, shard, at(parent), at(block)),
                     "pending {pending}: a block anchored in {block} over one in {parent}",
                 );
             }
