@@ -14,12 +14,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, FetchIds, ProtocolEvent};
+use hyperscale_core::{Action, FetchIds, ProtocolEvent, ProvisionRefusal};
 use hyperscale_storage::CommittedProvisions;
 use hyperscale_types::{
     Anchor, BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CommittedClock,
-    ForkFence, LocalTimestamp, ProvisionHash, Provisions, ProvisionsVerifyError, RETENTION_HORIZON,
-    ShardId, TopologySchedule, Verified,
+    ForkFence, LocalTimestamp, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId,
+    TopologySchedule, Verified,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -28,7 +28,7 @@ use crate::expected::ExpectedProvisionTracker;
 use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
-use crate::verification::build_verify_action;
+use crate::verification::{build_verify_action, judge_owed, refused};
 use crate::verified_headers::VerifiedHeaderBuffer;
 
 /// Default minimum dwell time verified provisions sit in the queue before
@@ -632,7 +632,7 @@ impl ProvisionCoordinator {
                     actions.extend(Self::retire_fetches_for(&provisions));
                     continue;
                 }
-                actions.extend(build_verify_action(
+                actions.push(build_verify_action(
                     self.local_shard,
                     provisions,
                     certified_header,
@@ -720,13 +720,16 @@ impl ProvisionCoordinator {
                 );
                 return Self::retire_fetches_for(&provisions);
             }
+            // This host built the bundle, but a proposer replaying its
+            // block after a restart skips transactions it never routed and
+            // builds it short, so it meets the header's root like any other.
+            let anchor = Anchor::of(&verified_header);
+            if let Err(refusal) = judge_owed(self.local_shard, &provisions, &verified_header) {
+                return vec![refused(provisions.into_inner(), refusal, anchor)];
+            }
             // Admit directly via the verified path; reuses the
             // tombstone, queue, and `ProvisionsAdmitted` emission logic.
-            return self.on_state_provisions_verified(
-                Ok(provisions),
-                Anchor::of(&verified_header),
-                now,
-            );
+            return self.on_state_provisions_verified(Ok(provisions), anchor, now);
         }
 
         // Header not yet verified — fall back to the raw buffer; the
@@ -842,9 +845,11 @@ impl ProvisionCoordinator {
                 );
                 return Self::retire_fetches_for(&provisions);
             }
-            return build_verify_action(self.local_shard, provisions, &verified_header)
-                .into_iter()
-                .collect();
+            return vec![build_verify_action(
+                self.local_shard,
+                provisions,
+                &verified_header,
+            )];
         }
 
         // No verified header yet — buffer the provisions
@@ -870,25 +875,27 @@ impl ProvisionCoordinator {
     /// Uses the verified header returned by the action handler directly (no re-lookup).
     pub fn on_state_provisions_verified(
         &mut self,
-        result: Result<Verified<Provisions>, (Provisions, ProvisionsVerifyError)>,
+        result: Result<Verified<Provisions>, (Provisions, ProvisionRefusal)>,
         anchor: Anchor,
         now: LocalTimestamp,
     ) -> Vec<Action> {
         let mut actions = vec![];
 
-        // A bundle that fails its proof satisfies nothing: the expectation
-        // stays armed, so a fallback fetch not yet sent still goes out on
-        // its timeout. The node releases an in-flight fetch for the bundle
-        // as failed on this same result, which retries it off the peer
-        // that answered.
+        // A refused bundle satisfies nothing, whether its transactions
+        // missed the header's root or its entries their proof: the
+        // expectation stays armed, so a fallback fetch not yet sent still
+        // goes out on its timeout. The node releases an in-flight fetch for
+        // the bundle as failed on this same result, which retries it off
+        // the peer that answered.
         let verified = match result {
             Ok(v) => v,
             Err((raw, err)) => {
                 warn!(
                     source_shard = raw.source_shard().inner(),
+                    block_height = raw.block_height().inner(),
                     tx_count = raw.transactions().len(),
                     error = ?err,
-                    "Provisions verification failed"
+                    "Provisions refused"
                 );
                 return actions;
             }
@@ -1019,9 +1026,9 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, Anchor, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
         Hash, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
-        ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield,
-        StateRoot, TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable,
-        WeightedTimestamp, WitnessSources, compute_merkle_root,
+        ProvisionTxRoot, ProvisionsVerifyError, QuorumCertificate, RETENTION_HORIZON, Round,
+        ShardId, SignerBitfield, StateRoot, TopologySnapshot, TxHash, ValidatorId, ValidatorSet,
+        Verifiable, WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -1783,7 +1790,10 @@ mod tests {
 
         // Verification fails — no certified_header returned
         let actions = coordinator.on_state_provisions_verified(
-            Err((provisions, ProvisionsVerifyError::BadInclusion)),
+            Err((
+                provisions,
+                ProvisionRefusal::Unproven(ProvisionsVerifyError::BadInclusion),
+            )),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -1933,33 +1943,168 @@ mod tests {
         );
         let actions = coordinator.on_state_provisions_received(&sched(), partial);
 
-        assert!(
-            actions.is_empty(),
-            "partial provisions must be rejected, not dispatched"
+        assert_eq!(
+            refusal_of(&actions),
+            Some(&ProvisionRefusal::ContentMismatch),
+            "partial provisions must be refused, not dispatched"
         );
     }
 
+    /// The refusal a single emitted verdict carries, if that is all
+    /// `actions` holds.
+    fn refusal_of(actions: &[Action]) -> Option<&ProvisionRefusal> {
+        match actions {
+            [
+                Action::Continuation(ProtocolEvent::StateProvisionsVerified {
+                    result: Err((_, refusal)),
+                    ..
+                }),
+            ] => Some(refusal),
+            _ => None,
+        }
+    }
+
+    /// A bundle parked for a header that owes this shard nothing is
+    /// refused as not owed once the header lands.
     #[test]
-    fn test_batch_with_missing_header_entry_rejected() {
-        // Source block has no provision_tx_roots entry for our shard, yet a
-        // provisions arrived claiming to target us — reject.
+    fn a_bundle_its_header_does_not_owe_is_refused() {
         let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
 
         let source_shard = ShardId::leaf(2, 1);
-        // Header targets our shard via ticks but has no provision_tx_roots
-        // entry for us — mismatched commitment shape.
-        let header = make_certified_header(source_shard, BlockHeight::new(10));
-        deliver_committed_header(&mut coordinator, &header);
-
         let provisions = make_provisions(
             TxHash::from(Hash::from_bytes(b"tx1")),
             source_shard,
             ShardId::leaf(2, 0),
             BlockHeight::new(10),
         );
-        let actions = coordinator.on_state_provisions_received(&sched(), provisions);
+        assert!(
+            coordinator
+                .on_state_provisions_received(&sched(), provisions)
+                .is_empty()
+        );
 
-        assert!(actions.is_empty());
+        let header =
+            make_certified_header_with_targets(source_shard, BlockHeight::new(10), Vec::new());
+        let actions = deliver_committed_header(&mut coordinator, &header);
+
+        assert_eq!(refusal_of(&actions), Some(&ProvisionRefusal::NotOwed));
+    }
+
+    /// A bundle whose transactions miss the header's root is refused with
+    /// a verdict that leaves the expectation armed, and the honest bundle
+    /// that follows is admitted.
+    #[test]
+    fn a_mismatching_bundle_is_refused_and_the_honest_one_admitted() {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+
+        let source_shard = ShardId::leaf(2, 1);
+        let tx_full = vec![
+            TxHash::from(Hash::from_bytes(b"tx_a")),
+            TxHash::from(Hash::from_bytes(b"tx_b")),
+        ];
+        let header = make_certified_header_committing(
+            source_shard,
+            BlockHeight::new(10),
+            ShardId::leaf(2, 0),
+            &tx_full,
+        );
+        deliver_committed_header(&mut coordinator, &header);
+        assert_eq!(coordinator.expected.len(), 1);
+
+        let short = make_provisions_multi(
+            tx_full[..1].to_vec(),
+            source_shard,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let mut actions = coordinator.on_state_provisions_received(&sched(), short);
+        assert_eq!(
+            refusal_of(&actions),
+            Some(&ProvisionRefusal::ContentMismatch)
+        );
+        let Some(Action::Continuation(ProtocolEvent::StateProvisionsVerified { result, anchor })) =
+            actions.pop()
+        else {
+            unreachable!("a refusal was matched above");
+        };
+        let after = coordinator.on_state_provisions_verified(result, anchor, LocalTimestamp::ZERO);
+        assert!(after.is_empty());
+        assert_eq!(coordinator.expected.len(), 1, "the expectation stays armed");
+
+        let honest = make_provisions_multi(
+            tx_full,
+            source_shard,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let actions = coordinator.on_state_provisions_received(&sched(), honest.clone());
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Provisions(ProvisionAction::VerifyProvisions { .. })]
+        ));
+        let admitted = coordinator.on_state_provisions_verified(
+            Ok(Verified::<Provisions>::new_unchecked_for_test(honest)),
+            Anchor::of(&header),
+            LocalTimestamp::ZERO,
+        );
+        assert!(admitted.iter().any(|a| matches!(
+            a,
+            Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
+        )));
+        assert_eq!(coordinator.expected.len(), 0);
+    }
+
+    /// A colocated host's bundle meets the header root too: a short one
+    /// is refused and admits nothing, and the whole one is admitted.
+    #[test]
+    fn a_colocated_bundle_missing_the_root_is_refused() {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+
+        let source_shard = ShardId::leaf(2, 1);
+        let tx_full = vec![
+            TxHash::from(Hash::from_bytes(b"tx_a")),
+            TxHash::from(Hash::from_bytes(b"tx_b")),
+        ];
+        let header = make_certified_header_committing(
+            source_shard,
+            BlockHeight::new(10),
+            ShardId::leaf(2, 0),
+            &tx_full,
+        );
+        deliver_committed_header(&mut coordinator, &header);
+
+        let short = make_provisions_multi(
+            tx_full[..1].to_vec(),
+            source_shard,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let actions = coordinator.on_verified_state_provisions_received(
+            &sched(),
+            Verified::<Provisions>::new_unchecked_for_test(short),
+            LocalTimestamp::ZERO,
+        );
+        assert_eq!(
+            refusal_of(&actions),
+            Some(&ProvisionRefusal::ContentMismatch)
+        );
+        assert_eq!(coordinator.expected.len(), 1);
+
+        let whole = make_provisions_multi(
+            tx_full,
+            source_shard,
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let actions = coordinator.on_verified_state_provisions_received(
+            &sched(),
+            Verified::<Provisions>::new_unchecked_for_test(whole),
+            LocalTimestamp::ZERO,
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
+        )));
     }
 
     #[test]
@@ -1990,7 +2135,10 @@ mod tests {
 
         // Entire provisions fails verification
         let actions = coordinator.on_state_provisions_verified(
-            Err((provisions, ProvisionsVerifyError::BadInclusion)),
+            Err((
+                provisions,
+                ProvisionRefusal::Unproven(ProvisionsVerifyError::BadInclusion),
+            )),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );
@@ -2457,7 +2605,10 @@ mod tests {
         );
         coordinator.on_state_provisions_received(&sched(), provisions.clone());
         coordinator.on_state_provisions_verified(
-            Err((provisions, ProvisionsVerifyError::BadInclusion)),
+            Err((
+                provisions,
+                ProvisionRefusal::Unproven(ProvisionsVerifyError::BadInclusion),
+            )),
             Anchor::of(&header),
             LocalTimestamp::ZERO,
         );

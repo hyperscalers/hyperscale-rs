@@ -9,7 +9,9 @@
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 
-use hyperscale_core::{ActionContext, ProtocolEvent, ProvisionAction, ProvisionsRequest};
+use hyperscale_core::{
+    ActionContext, ProtocolEvent, ProvisionAction, ProvisionRefusal, ProvisionsRequest,
+};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_metrics::{record_fetch_response_refused, record_signature_verification_latency};
 use hyperscale_network::Network;
@@ -97,7 +99,7 @@ where
                     // failure here is a responder that answered with values
                     // its own chain never held.
                     record_fetch_response_refused("provision", "unproven_entries");
-                    Err((provisions, err))
+                    Err((provisions, ProvisionRefusal::Unproven(err)))
                 }
             };
             record_signature_verification_latency(

@@ -205,9 +205,10 @@ where
     // a typed cache reference onto `ActionContext` per arm, with no
     // architectural payoff.
 
+    /// Fetch admission is not driven here: the event comes back through
+    /// [`Self::handle_protocol_passthrough`], which drives it once, and a
+    /// release driven twice holds the retry the first one sent.
     fn handle_continuation(&mut self, pe: ProtocolEvent) {
-        self.drive_fetch_admission(&pe);
-
         // Serving-cache insertion is `ShardLoop`'s own state, not an
         // instance concern — keep it here.
         if let ProtocolEvent::FinalizationsAdmitted { finalizations } = &pe {

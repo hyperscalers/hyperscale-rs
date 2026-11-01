@@ -191,8 +191,8 @@ where
                     )],
                 });
             }
-            // A bundle whose proof fails settles neither fetch that could
-            // have carried it, so both go out again, off the peer that
+            // A refused bundle settles neither fetch that could have
+            // carried it, so both go out again, off the peer that
             // answered. A gossiped bundle failing while a fetch for the
             // same key is out sends that fetch again early; the retry
             // hold bounds how often.
@@ -314,12 +314,13 @@ impl FetchTicker {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_core::{Action, ProvisionRefusal};
     use hyperscale_hbor::Capped;
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::GetProvisionsRequest;
     use hyperscale_types::{
         Anchor, BlockHash, BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions,
-        ProvisionsVerifyError, StateRoot, TxHash, WeightedTimestamp,
+        StateRoot, TxHash, WeightedTimestamp,
     };
 
     use super::*;
@@ -360,13 +361,15 @@ mod tests {
         ));
     }
 
-    /// A fetched bundle whose proof fails sends its fetch out again: the
-    /// coordinator emits nothing for it, and an answer left in flight is
-    /// one nothing would ever ask for again.
+    /// A refused bundle sends out again both fetches that could have
+    /// carried it: an answer left in flight is one nothing would ever ask
+    /// for again. The verdict the coordinator emits as a continuation
+    /// releases each once, so the retry goes out rather than being held
+    /// for the tick.
     #[test]
-    fn a_bundle_failing_its_proof_asks_for_it_again() {
+    fn a_refused_bundle_asks_both_fetches_again() {
         let fix = Fixture::new();
-        let mut host = fix.host(BlockHeight::GENESIS);
+        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
         let _ = host.network().drain_pending_requests();
         let source = ShardId::leaf(1, 1);
         let height = BlockHeight::new(10);
@@ -377,14 +380,6 @@ mod tests {
                 .filter(|pending| pending.request::<GetProvisionsRequest>().is_some())
                 .count()
         };
-
-        loop_of(&mut host).request_fetch(
-            FetchIds::RemoteProvisions(vec![(source, SHARD, height)]),
-            source,
-            None,
-            None,
-        );
-        assert_eq!(provisions_asked(&mut host), 1);
 
         let bundle = Provisions::new(
             source,
@@ -397,16 +392,48 @@ mod tests {
                 Capped::empty(),
             )]),
         );
-        loop_of(&mut host).drive_fetch_admission(&ProtocolEvent::StateProvisionsVerified {
-            result: Err((bundle, ProvisionsVerifyError::BadInclusion)),
-            anchor: Anchor {
-                shard: source,
-                height,
-                state_root: StateRoot::ZERO,
-                ts: WeightedTimestamp::ZERO,
+        let shard_loop = loop_of(&mut host);
+        shard_loop.request_fetch(
+            FetchIds::RemoteProvisions(vec![(source, SHARD, height)]),
+            source,
+            None,
+            None,
+        );
+        shard_loop.request_fetch(
+            FetchIds::LocalProvisions(vec![bundle.hash()]),
+            SHARD,
+            None,
+            None,
+        );
+        assert_eq!(provisions_asked(&mut host), 1);
+
+        loop_of(&mut host).drain_actions(vec![Action::Continuation(
+            ProtocolEvent::StateProvisionsVerified {
+                result: Err((bundle, ProvisionRefusal::ContentMismatch)),
+                anchor: Anchor {
+                    shard: source,
+                    height,
+                    state_root: StateRoot::ZERO,
+                    ts: WeightedTimestamp::ZERO,
+                },
             },
-        });
+        )]);
+        for event in events.try_iter() {
+            let _ = host.step(event);
+        }
+
         assert_eq!(provisions_asked(&mut host), 1, "the fetch goes out again");
+        let io = &mut loop_of(&mut host).io;
+        assert_eq!(
+            ProvisionBinding::fetch_mut(io).in_flight_count(),
+            1,
+            "the remote fetch is out again, not held"
+        );
+        assert_eq!(
+            LocalProvisionBinding::fetch_mut(io).in_flight_count(),
+            1,
+            "the fetch by hash is out again, not held"
+        );
     }
 
     fn is_set(op: Option<&TimerOp>) -> bool {

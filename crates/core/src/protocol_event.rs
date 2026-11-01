@@ -50,6 +50,18 @@ pub struct TickBatchOutcome {
     pub refusal_receipts: Vec<StoredReceipt>,
 }
 
+/// Why a provisions bundle was refused before admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProvisionRefusal {
+    /// The bundle's transactions do not compute the root its source
+    /// header commits for this shard.
+    ContentMismatch,
+    /// The source header commits no provisions to this shard.
+    NotOwed,
+    /// The bundle's entries fail its inclusion proof.
+    Unproven(ProvisionsVerifyError),
+}
+
 /// How a node learned about the certifying QC that commits a given block.
 ///
 /// Under the 2-chain rule, block N commits when the node observes QC_{N+1}.
@@ -506,13 +518,13 @@ pub enum ProtocolEvent {
     /// Batch-level provision verification completed.
     ///
     /// The QC was verified upstream as part of promoting the source
-    /// header to [`Verified<CertifiedBlockHeader>`]; merkle proofs are
-    /// checked against the verified state root. The certified header is
-    /// returned so the state machine can promote it without re-lookup.
+    /// header to [`Verified<CertifiedBlockHeader>`]; the bundle's
+    /// transactions are held to the header's `provision_tx_roots`, and
+    /// merkle proofs are checked against the verified state root.
     StateProvisionsVerified {
         /// Verified provisions on success; the raw bundle paired with
-        /// its error on failure.
-        result: Result<Verified<Provisions>, (Provisions, ProvisionsVerifyError)>,
+        /// why it was refused on failure.
+        result: Result<Verified<Provisions>, (Provisions, ProvisionRefusal)>,
         /// The source anchor whose `state_root` the merkle proof was
         /// checked against.
         anchor: Anchor,
