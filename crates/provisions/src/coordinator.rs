@@ -1029,7 +1029,7 @@ mod tests {
         Hash, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
         ProvisionTxRoot, ProvisionsVerifyError, QuorumCertificate, RETENTION_HORIZON, Round,
         ShardId, SignerBitfield, StateRoot, TopologySnapshot, TxHash, ValidatorId, ValidatorSet,
-        Verifiable, WeightedTimestamp, WitnessSources, compute_merkle_root,
+        Verifiable, WeightedTimestamp, WitnessSources, provision_leaf,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -1081,8 +1081,8 @@ mod tests {
         tx_hashes: &[TxHash],
     ) -> Verified<CertifiedBlockHeader> {
         let certified = make_certified_header_with_targets(shard, height, vec![local_shard]);
-        let raw: Vec<Hash> = tx_hashes.iter().map(|h| Hash::from(*h)).collect();
-        let root = ProvisionTxRoot::from_raw(compute_merkle_root(&raw));
+        let leaves: Vec<Hash> = tx_hashes.iter().map(|h| provision_leaf(*h)).collect();
+        let root = ProvisionTxRoot::over(&leaves);
         let (header, qc) = certified.into_inner().into_parts();
         let mut roots = header.provision_tx_roots().clone();
         roots

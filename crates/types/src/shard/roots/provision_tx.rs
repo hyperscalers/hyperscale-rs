@@ -1,14 +1,108 @@
-//! Per-target-shard [`ProvisionTxRoot`] verification.
+//! Per-target-shard [`ProvisionTxRoot`]: what it commits and how it is
+//! verified.
+//!
+//! A source block's root for a target wraps the binary merkle root over
+//! one tagged leaf per transaction it owes that target with the number
+//! of those leaves. A part carries its leaf's path and that count, and a
+//! receiver walks the path to the header's root: the count fixes the
+//! tree's depth, so a part verifies only at a real leaf position, never
+//! at an internal node, a padding slot or an index aliased past the end.
 
 use std::collections::BTreeMap;
 
-use hyperscale_hbor::Capped;
+use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
 use crate::{
     Hash, MAX_PROVISION_TARGET_SHARDS, ProvisionTxRoot, ShardId, TopologySnapshot, Transaction,
-    Verifiable, Verified, Verify, compute_merkle_root,
+    TxHash, Verifiable, Verified, Verify, compute_merkle_root,
 };
+
+/// Domain tag of a provision leaf's preimage.
+///
+/// Its length is not 32, so a leaf's preimage — the tag and a 32-byte
+/// transaction hash — is never 64 bytes long, which every internal
+/// node's preimage is.
+pub const PROVISION_LEAF_DOMAIN_TAG: &[u8] = b"hyperscale-provision-leaf-v1";
+
+/// Domain tag of the wrap committing a provision root's leaf count.
+pub const PROVISION_ROOT_DOMAIN_TAG: &[u8] = b"hyperscale-provision-root-v1";
+
+const _: () = assert!(PROVISION_LEAF_DOMAIN_TAG.len() != 32);
+
+/// The deepest tree a provision path walks: a block owes one target far
+/// fewer than `2^32` transactions.
+pub const MAX_PROVISION_PATH_DEPTH: usize = 32;
+
+/// The leaf a provision root holds for `tx_hash`.
+#[must_use]
+pub fn provision_leaf(tx_hash: TxHash) -> Hash {
+    Hash::from_parts(&[PROVISION_LEAF_DOMAIN_TAG, Hash::from(tx_hash).as_bytes()])
+}
+
+/// Where one part's leaf sits in its target's root: the leaf count the
+/// root commits, the leaf's index, and its siblings from the leaf level
+/// upward.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+pub struct LeafPath {
+    /// The number of leaves under the root.
+    pub count: u32,
+    /// This leaf's position among them.
+    pub index: u32,
+    /// The leaf's siblings, leaf level first.
+    pub siblings: Capped<Vec<Hash>, MAX_PROVISION_PATH_DEPTH>,
+}
+
+impl ProvisionTxRoot {
+    /// The root over `leaves`, in order.
+    ///
+    /// # Panics
+    ///
+    /// If `leaves` holds more than `u32::MAX` entries, which no block
+    /// owes a target.
+    #[must_use]
+    pub fn over(leaves: &[Hash]) -> Self {
+        let count = u32::try_from(leaves.len()).expect("a block owes a target few leaves");
+        Self::wrap(count, compute_merkle_root(leaves))
+    }
+
+    /// The root committing `count` leaves under `merkle_root`.
+    #[must_use]
+    pub fn wrap(count: u32, merkle_root: Hash) -> Self {
+        Self::from_raw(Hash::from_parts(&[
+            PROVISION_ROOT_DOMAIN_TAG,
+            &count.to_le_bytes(),
+            merkle_root.as_bytes(),
+        ]))
+    }
+
+    /// The root `leaf` walks to along `path`, or `None` where the path
+    /// cannot name a real leaf: a count of zero, an index at or past the
+    /// count, or a sibling list other than the exact depth of a tree of
+    /// `count` leaves.
+    #[must_use]
+    pub fn through(leaf: Hash, path: &LeafPath) -> Option<Self> {
+        if path.count == 0 || path.index >= path.count {
+            return None;
+        }
+        let depth = path.count.checked_next_power_of_two()?.trailing_zeros() as usize;
+        if path.siblings.len() != depth {
+            return None;
+        }
+        let merkle_root = path
+            .siblings
+            .iter()
+            .enumerate()
+            .fold(leaf, |node, (level, sibling)| {
+                if (path.index >> level) & 1 == 0 {
+                    Hash::from_parts(&[node.as_bytes(), sibling.as_bytes()])
+                } else {
+                    Hash::from_parts(&[sibling.as_bytes(), node.as_bytes()])
+                }
+            });
+        Some(Self::wrap(path.count, merkle_root))
+    }
+}
 
 /// Which shards commit a transaction: its participants, less any that
 /// only take delivery of its owed crossings, which never include it.
@@ -66,11 +160,12 @@ impl Verified<ProvisionTxRootsMap> {
     /// Compute the per-target-shard provision-tx roots from
     /// `transactions` under `topology`. Verified by construction.
     ///
-    /// For each cross-shard tx, the tx hash lands in the bucket of every
-    /// remote shard it touches. Each bucket is merkle-committed in that
-    /// order so the target shard can verify a received `Provisions`
-    /// carries the full set it was meant to receive, and the bundle
-    /// builder stages requests in the same order. Only emits an entry
+    /// For each cross-shard tx, its leaf lands in the bucket of every
+    /// remote shard it touches. Each bucket is committed in that order,
+    /// with its leaf count, so the target shard can hold every part it
+    /// receives to a real position in the full set it was meant to
+    /// receive, and the part builder stages requests in the same order.
+    /// Only emits an entry
     /// for targets with ≥1 tx. A block promises read sets only: a
     /// crossing record reaches its consumer as a state claim, never as
     /// a bundle. A shard that only takes delivery of the transaction
@@ -114,7 +209,7 @@ impl Verified<ProvisionTxRootsMap> {
                 per_target
                     .entry(payer_shard)
                     .or_default()
-                    .push(Hash::from(tx.hash()));
+                    .push(provision_leaf(tx.hash()));
                 continue;
             }
             for shard in committing(tx) {
@@ -124,19 +219,14 @@ impl Verified<ProvisionTxRootsMap> {
                 per_target
                     .entry(shard)
                     .or_default()
-                    .push(Hash::from(tx.hash()));
+                    .push(provision_leaf(tx.hash()));
             }
         }
 
         let map: ProvisionTxRootsMap = Capped::new(
             per_target
                 .into_iter()
-                .map(|(shard, hashes)| {
-                    (
-                        shard,
-                        ProvisionTxRoot::from_raw(compute_merkle_root(&hashes)),
-                    )
-                })
+                .map(|(shard, leaves)| (shard, ProvisionTxRoot::over(&leaves)))
                 .collect(),
         )
         .expect("a block exports one entry per other shard");
@@ -173,7 +263,7 @@ mod tests {
     use crate::test_utils::{
         TestCommittee, install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
     };
-    use crate::{PrincipalAddr, TimestampRange, WeightedTimestamp};
+    use crate::{PrincipalAddr, TimestampRange, WeightedTimestamp, merkle_paths};
 
     fn cross_shard_tx(payer: PrincipalAddr) -> Verifiable<Transaction> {
         install_stub_protocol_statics();
@@ -187,6 +277,147 @@ mod tests {
             1_000,
             validity,
         )))
+    }
+
+    fn leaves(n: u8) -> Vec<Hash> {
+        (0..n)
+            .map(|i| provision_leaf(TxHash::from(Hash::from_bytes(&[i]))))
+            .collect()
+    }
+
+    fn path(count: u32, index: u32, siblings: Vec<Hash>) -> LeafPath {
+        LeafPath {
+            count,
+            index,
+            siblings: Capped::new(siblings).expect("a path written out in a test"),
+        }
+    }
+
+    /// Every leaf of every small tree walks to the root over the whole
+    /// list, at its own index and the count of the whole list.
+    #[test]
+    fn every_real_leaf_walks_to_the_root() {
+        for n in 1..=9u8 {
+            let leaves = leaves(n);
+            let root = ProvisionTxRoot::over(&leaves);
+            for (index, siblings) in merkle_paths(&leaves).into_iter().enumerate() {
+                let index = u32::try_from(index).unwrap();
+                let walked = ProvisionTxRoot::through(
+                    leaves[index as usize],
+                    &path(u32::from(n), index, siblings),
+                );
+                assert_eq!(walked, Some(root), "leaf {index} of {n}");
+            }
+        }
+    }
+
+    /// A count the root does not commit walks to another root, so a lie
+    /// about the count fails the comparison with the header's.
+    #[test]
+    fn the_root_commits_its_leaf_count() {
+        let leaves = leaves(3);
+        let root = ProvisionTxRoot::over(&leaves);
+        let siblings = merkle_paths(&leaves).swap_remove(0);
+        assert_ne!(
+            ProvisionTxRoot::through(leaves[0], &path(4, 0, siblings)),
+            Some(root),
+            "three leaves padded to four is not four leaves"
+        );
+        assert_ne!(
+            ProvisionTxRoot::over(&leaves),
+            ProvisionTxRoot::from_raw(compute_merkle_root(&leaves)),
+            "the bare merkle root is not the provision root"
+        );
+    }
+
+    /// A path that cannot name a real leaf is refused before it is
+    /// walked: no leaves, an index at or past the count, or a sibling
+    /// list off the tree's exact depth either way.
+    #[test]
+    fn a_path_naming_no_real_leaf_is_refused() {
+        let leaves = leaves(5);
+        let siblings = merkle_paths(&leaves).swap_remove(4);
+        assert_eq!(siblings.len(), 3);
+        assert!(ProvisionTxRoot::through(leaves[4], &path(5, 4, siblings.clone())).is_some());
+
+        assert_eq!(
+            ProvisionTxRoot::through(leaves[4], &path(0, 0, Vec::new())),
+            None,
+            "zero leaves"
+        );
+        for index in [5, 6, 7, u32::MAX] {
+            assert_eq!(
+                ProvisionTxRoot::through(leaves[4], &path(5, index, siblings.clone())),
+                None,
+                "index {index} of five"
+            );
+        }
+        assert_eq!(
+            ProvisionTxRoot::through(leaves[4], &path(5, 4, siblings[..2].to_vec())),
+            None,
+            "a short path"
+        );
+        let mut long = siblings;
+        long.push(Hash::ZERO);
+        assert_eq!(
+            ProvisionTxRoot::through(leaves[4], &path(5, 4, long)),
+            None,
+            "a long path"
+        );
+    }
+
+    /// An internal node presented as a leaf with the path above it walks
+    /// to the right merkle root, but only on a sibling list one level
+    /// short, which the committed count refuses.
+    #[test]
+    fn an_internal_node_is_not_a_leaf() {
+        let leaves = leaves(4);
+        let root = ProvisionTxRoot::over(&leaves);
+        let node = Hash::from_parts(&[leaves[0].as_bytes(), leaves[1].as_bytes()]);
+        let above = vec![Hash::from_parts(&[
+            leaves[2].as_bytes(),
+            leaves[3].as_bytes(),
+        ])];
+        assert_eq!(
+            compute_merkle_root(&[node, above[0]]),
+            compute_merkle_root(&leaves),
+            "the node does sit under the merkle root"
+        );
+        assert_eq!(
+            ProvisionTxRoot::through(node, &path(4, 0, above.clone())),
+            None
+        );
+        assert_ne!(
+            ProvisionTxRoot::through(node, &path(2, 0, above)),
+            Some(root),
+            "claimed as one of two leaves, it walks to another count's root"
+        );
+    }
+
+    /// No leaf equals an internal node over the same leaves: a leaf's
+    /// preimage is the tag and a transaction hash, never the 64 bytes of
+    /// a node's.
+    #[test]
+    fn no_leaf_equals_an_internal_node() {
+        let txs: Vec<TxHash> = (0..8u8)
+            .map(|i| TxHash::from(Hash::from_bytes(&[i])))
+            .collect();
+        let leaves: Vec<Hash> = txs.iter().map(|tx| provision_leaf(*tx)).collect();
+        let mut level = leaves.clone();
+        let mut nodes = Vec::new();
+        while level.len() > 1 {
+            level = level
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[left, right]| Hash::from_parts(&[left.as_bytes(), right.as_bytes()]))
+                .collect();
+            nodes.extend_from_slice(&level);
+        }
+        for leaf in &leaves {
+            assert!(!nodes.contains(leaf));
+        }
+        assert_ne!(PROVISION_LEAF_DOMAIN_TAG.len() + 32, 64);
     }
 
     #[test]

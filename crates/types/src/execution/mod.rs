@@ -52,7 +52,7 @@ mod tests {
         ReceiptValidationError, ShardId, SignerBitfield, StateWrites, StoredReceipt, TickHalf,
         TickId, TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet,
         Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
-        compute_global_receipt_root_with_proof, compute_merkle_root, receipt_hash_of, tick_leader,
+        compute_global_receipt_root_with_proof, provision_leaf, receipt_hash_of, tick_leader,
         tx_outcome_leaf, verify_merkle_inclusion,
     };
 
@@ -168,10 +168,8 @@ mod tests {
         assert_eq!(roots.len(), 1);
         assert!(roots.contains_key(&ShardId::leaf(1, 1)));
 
-        let expected = ProvisionTxRoot::from_raw(compute_merkle_root(&[
-            Hash::from(tx_a.hash()),
-            Hash::from(tx_b.hash()),
-        ]));
+        let expected =
+            ProvisionTxRoot::over(&[provision_leaf(tx_a.hash()), provision_leaf(tx_b.hash())]);
         assert_eq!(roots[&ShardId::leaf(1, 1)], expected);
     }
 

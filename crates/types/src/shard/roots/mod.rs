@@ -43,7 +43,9 @@ pub use beacon_witness::{
 pub use body::{BodyRootContext, BodyRootVerifyError, SectionRoots, UnboundBody};
 pub use leaf::{LeafRoot, SetRoot};
 pub use provision_tx::{
-    CommittingShards, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
+    CommittingShards, LeafPath, MAX_PROVISION_PATH_DEPTH, PROVISION_LEAF_DOMAIN_TAG,
+    PROVISION_ROOT_DOMAIN_TAG, ProvisionTxRootsContext, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, provision_leaf,
 };
 pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal_chain};
 pub use settled_txs::{local_settled_tx_hashes, settled_txs_root_from_hashes};

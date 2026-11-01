@@ -15,7 +15,7 @@ use hyperscale_core::{Action, ProtocolEvent, ProvisionAction, ProvisionRefusal};
 use hyperscale_metrics::record_fetch_response_refused;
 use hyperscale_types::{
     Anchor, CertifiedBlockHeader, Hash, ProvisionTxRoot, Provisions, ShardId, Verified,
-    compute_merkle_root,
+    provision_leaf,
 };
 
 /// Hold `provisions`' transactions to the root `certified_header` commits
@@ -44,9 +44,9 @@ pub fn judge_owed(
     let leaves: Vec<Hash> = provisions
         .transactions()
         .iter()
-        .map(|t| Hash::from(t.tx_hash))
+        .map(|t| provision_leaf(t.tx_hash))
         .collect();
-    if ProvisionTxRoot::from_raw(compute_merkle_root(&leaves)) != expected_root {
+    if ProvisionTxRoot::over(&leaves) != expected_root {
         record_fetch_response_refused("provision", "content_mismatch");
         return Err(ProvisionRefusal::ContentMismatch);
     }

@@ -131,7 +131,7 @@ pub use primitives::identifiers::{
 };
 pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_range_proof, compute_sparse_proof,
-    verify_merkle_inclusion, verify_range_inclusion, verify_sparse_inclusion,
+    merkle_paths, verify_merkle_inclusion, verify_range_inclusion, verify_sparse_inclusion,
 };
 pub use primitives::positional_bundle::PositionalBundle;
 pub use primitives::randomness::{RANDOMNESS_BYTES, Randomness};
@@ -213,11 +213,12 @@ pub use shard::read_frontier::{
 pub use shard::reshape::{ReshapeKind, ReshapeThresholds, ReshapeTrigger, Settling};
 pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, BodyRootContext, BodyRootVerifyError,
-    CommittingShards, LeafRoot, ProvisionTxRootsContext, ProvisionTxRootsMap,
+    CommittingShards, LeafPath, LeafRoot, MAX_PROVISION_PATH_DEPTH, PROVISION_LEAF_DOMAIN_TAG,
+    PROVISION_ROOT_DOMAIN_TAG, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, REVEAL_CHAIN_DOMAIN_TAG, SectionRoots, SetRoot, SplitChildRoots,
     StateRootContext, StateRootVerifyError, UnboundBody, commit_witness_window, derive_leaves,
     derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
+    missed_proposals_since_prev_commit, next_reveal_chain, provision_leaf, ready_leaf_payload,
     settled_txs_root_from_hashes, settling_in,
 };
 pub use shard::state_claim::{
