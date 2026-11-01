@@ -1230,6 +1230,119 @@ fn a_consumer_completed_here_and_refused_elsewhere_writes_never() {
     );
 }
 
+/// A tick's baseline is the batch's: a list one member's dispatch
+/// carries is read by every member of the tick. So a core member reads
+/// its sibling's pool as its own source shipped it only while no
+/// batch-mate carries another source's list for those cells, such as a
+/// predecessor's whose block a successor committed the batch-mate again
+/// past.
+///
+/// The sibling ships the core member a state without its pool, so the
+/// stake into it fails. A batch-mate carrying that list too leaves the
+/// failure in place; one also carrying a predecessor's list, which holds
+/// the pool, lets the stake complete off cells its own source never
+/// shipped.
+#[test]
+fn a_core_member_reads_its_siblings_cells_off_its_own_sources_list() {
+    let divided = divided_stake();
+    let store = divided.store(&divided.seats);
+    let handed = divided.handed(&store);
+    let required = divided.provisioned(&divided.store(&divided.seats[..1]), divided.sibling);
+    let predecessor = divided.provisioned(&store, divided.sibling);
+
+    let raw = signed_double_stake(divided.payer, divided.seats, 400);
+    raw.try_derived(divided.executor.derivation().as_ref())
+        .expect("a fixture transaction derives");
+    let mate = Verified::<Transaction>::from_persisted(raw);
+    let mate_classified = Classified::freeze(
+        mate.legs(),
+        mate.fee_payer(),
+        mate.accounts(),
+        &divided.trie,
+    );
+    let reach = BTreeSet::from([divided.payer_shard, divided.core, divided.sibling]);
+    let ctx = TickBatchContext {
+        local_shard: divided.core,
+        shard_trie: &divided.trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
+    };
+    let run = |mate_carries: &[Arc<Vec<SubstateEntry>>]| {
+        let inputs = [
+            TickTxInput {
+                prices: PriceTable::GENESIS,
+                tx_hash: divided.tx.hash(),
+                transaction: &divided.tx,
+                provisions: &required,
+                clock: WeightedTimestamp::from_millis(1_000),
+                member: Member::of(divided.classified.clone(), divided.core, reach.clone()),
+                arrivals: &handed,
+            },
+            TickTxInput {
+                prices: PriceTable::GENESIS,
+                tx_hash: mate.hash(),
+                transaction: &mate,
+                provisions: mate_carries,
+                clock: WeightedTimestamp::from_millis(1_000),
+                member: Member::of(mate_classified.clone(), divided.core, reach.clone()),
+                arrivals: &[],
+            },
+        ];
+        divided
+            .executor
+            .execute_tick_batch(&ctx, &store, &inputs)
+            .expect("the harness engine holds every package it runs")
+            .into_iter()
+            .find(|ran| ran.tx_hash == divided.tx.hash())
+            .expect("the core member ran")
+    };
+
+    let own = run(&required);
+    assert!(
+        matches!(own.consensus, ConsensusReceipt::Failed),
+        "a stake into a pool its source does not ship fails: {:?}",
+        own.consensus,
+    );
+    let leaked = run(&[required.clone(), predecessor].concat());
+    assert!(
+        matches!(leaked.consensus, ConsensusReceipt::Succeeded { .. }),
+        "a batch-mate's predecessor list reaches the core member: {:?}",
+        leaked.metadata,
+    );
+}
+
+/// A member running only its own legs reads nothing of the core: its
+/// scope is its own shard. The core's shards ship it their content all
+/// the same, and its receipt is the one it gives with none of it, with
+/// the core's pools or without them.
+#[test]
+fn a_leg_only_member_runs_alike_with_or_without_the_cores_lists() {
+    let divided = divided_stake();
+    assert!(!divided.classified.core().contains(&divided.payer_shard));
+    let store = divided.store(&divided.seats);
+    let core_lists = |shipping: &MapDb| {
+        [
+            divided.provisioned(shipping, divided.core),
+            divided.provisioned(shipping, divided.sibling),
+        ]
+        .concat()
+    };
+
+    let alone = divided.run(&store, divided.payer_shard, &[], &[]);
+    assert!(
+        matches!(alone.consensus, ConsensusReceipt::Succeeded { .. }),
+        "the payer's legs complete: {:?}",
+        alone.metadata,
+    );
+    for shipping in [&store, &divided.store(&[])] {
+        let shipped = divided.run(&store, divided.payer_shard, &[], &core_lists(shipping));
+        assert_eq!(shipped.consensus, alone.consensus);
+        assert_eq!(shipped.refusal_receipt, alone.refusal_receipt);
+    }
+}
+
 /// A core member that aborts names a refusal receipt whose writes are
 /// one `Never` per escrowed crossing it consumes, whether the kernel
 /// refused it or the plan could not be built before the kernel ran.

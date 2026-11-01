@@ -542,6 +542,96 @@ mod tests {
         );
     }
 
+    /// Every member of a tick reads every list the tick's dispatches
+    /// carry, so each dispatch carries its required sources' lists and
+    /// no other. One member also holds a predecessor's part, off a block
+    /// its successor committed the transaction again past; neither it
+    /// nor its batch-mate carries that part.
+    #[test]
+    fn a_dispatch_carries_only_its_required_sources() {
+        use std::sync::Arc;
+
+        use hyperscale_engine::tick_select::Requirement;
+        use hyperscale_hbor::Bytes;
+        use hyperscale_types::test_utils::test_key;
+        use hyperscale_types::{
+            BlockHeight, LeafPath, MerkleInclusionProof, Provision, ProvisionParts, SubstateEntry,
+        };
+
+        use crate::fixtures::{leaf, payer, swap, trie};
+
+        let trie = trie();
+        let (home, venue) = (leaf(0), leaf(1));
+        let predecessor = ShardId::ROOT;
+        let classified = Classified::freeze(&swap(), payer(), &[], &trie);
+        let key = test_key(1);
+        let part = |source: ShardId, height: u64, tx: TxHash, value: u8| {
+            Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+                source_shard: source,
+                target_shard: venue,
+                block_height: BlockHeight::new(height),
+                source_block_ts: ms(height * 1_000),
+                tx_hash: tx,
+                entries: Capped::from_array([SubstateEntry::new(
+                    key,
+                    Some(Bytes::from_array([value])),
+                )]),
+                proof: MerkleInclusionProof::dummy(),
+                leaf: LeafPath {
+                    count: 1,
+                    index: 0,
+                    siblings: Capped::empty(),
+                },
+            }))
+        };
+
+        let mut candidates = TickCandidates::new(venue);
+        let mut provisioning = ProvisioningTracker::new();
+        let members = [tx(5), tx(6)].map(|member| {
+            let hash = member.hash();
+            candidates.register(
+                member,
+                BTreeSet::from([home, venue]),
+                ms(1_000),
+                PriceTable::GENESIS,
+                classified.clone(),
+            );
+            provisioning.record_required(hash, BTreeSet::from([Requirement::CommittedState(home)]));
+            provisioning.absorb_provisions(&part(home, 9, hash, 2));
+            hash
+        });
+        provisioning.absorb_provisions(&part(predecessor, 7, members[0], 1));
+
+        let line = |tx: TxHash| TickLine::Member {
+            staged: 0,
+            tx,
+            joins: Joins::ExecutesAborted,
+            settlement: Settlement::Awaited,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: stub_abort_charge(0),
+            share: 0,
+            reserves: Capped::empty(),
+            deadline: Deadline::of(ms(60_000)),
+            crossings: Capped::empty(),
+        };
+        let (admitted, _) =
+            candidates.take_named(&members.map(line), &provisioning, &trie, ms(10_000));
+        assert_eq!(admitted.len(), 2);
+        for seated in &admitted {
+            assert_eq!(
+                seated.request.provisions,
+                vec![Arc::new(vec![SubstateEntry::new(
+                    key,
+                    Some(Bytes::from_array([2]))
+                )])],
+                "only the required source's list rides with {:?}",
+                seated.request.tx_hash,
+            );
+        }
+    }
+
     /// A record key names its producer's intent and no transaction, so
     /// the arrival held at an edge's record key can be the record of
     /// another transaction carrying the same intent. A member is handed

@@ -378,18 +378,28 @@ impl ProvisioningTracker {
 
     // ─── Accessors ──────────────────────────────────────────────────────
 
-    /// What was absorbed for `tx_hash`, one entry list per source shard
-    /// in shard order — what a cross-shard execution request carries.
+    /// What was absorbed for `tx_hash` from the shards its candidate
+    /// requires, one entry list per source shard in shard order — what a
+    /// cross-shard execution request carries.
+    ///
+    /// Only a required source's list: the requirement was filed off the
+    /// committing block, so it names the sources the member's readiness
+    /// judged, by exact shard. A predecessor whose block a successor
+    /// re-committed the transaction past, or a shard shipping content
+    /// the member's scope never reads, would otherwise ride into a tick
+    /// baseline every member of the batch reads.
     #[must_use]
     pub(crate) fn provisions_for(&self, tx_hash: TxHash) -> Vec<Arc<Vec<SubstateEntry>>> {
-        self.absorbed
-            .get(&tx_hash)
-            .map_or_else(Vec::new, |by_shard| {
-                by_shard
-                    .values()
-                    .map(|absorbed| Arc::clone(&absorbed.entries))
-                    .collect()
-            })
+        let (Some(by_shard), Some((_, required))) =
+            (self.absorbed.get(&tx_hash), self.required.get(&tx_hash))
+        else {
+            return Vec::new();
+        };
+        by_shard
+            .iter()
+            .filter(|(shard, _)| required.contains(&Requirement::CommittedState(**shard)))
+            .map(|(_, absorbed)| Arc::clone(&absorbed.entries))
+            .collect()
     }
 
     /// Hand this shard a crossing, as a committed claim would.
@@ -487,6 +497,107 @@ mod tests {
         SourceAnchor {
             clock: WeightedTimestamp::from_millis(clock_ms),
         }
+    }
+
+    /// File `tx` as waiting on the committed state of `shards`.
+    fn require(t: &mut ProvisioningTracker, tx: TxHash, shards: &[ShardId]) {
+        t.record_required(
+            tx,
+            shards
+                .iter()
+                .copied()
+                .map(Requirement::CommittedState)
+                .collect(),
+        );
+    }
+
+    /// A list of `key` holding `value`, or absent.
+    fn list(entries: &[(SubstateKey, Option<u8>)]) -> Arc<Vec<SubstateEntry>> {
+        Arc::new(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    SubstateEntry::new(*key, value.map(|byte| Bytes::from_array([byte])))
+                })
+                .collect(),
+        )
+    }
+
+    /// A part from `source` at `height`, anchored at `clock_ms`, carrying
+    /// `entries` for `tx`.
+    fn part(
+        source: ShardId,
+        height: u64,
+        clock_ms: u64,
+        tx: TxHash,
+        entries: &[(SubstateKey, Option<u8>)],
+    ) -> Verified<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+            source_shard: source,
+            target_shard: ShardId::leaf(2, 0),
+            block_height: BlockHeight::new(height),
+            source_block_ts: anchor(clock_ms).clock,
+            tx_hash: tx,
+            entries: Capped::new(list(entries).to_vec()).expect("a list written out in a test"),
+            proof: MerkleInclusionProof::dummy(),
+            leaf: LeafPath {
+                count: 1,
+                index: 0,
+                siblings: Capped::empty(),
+            },
+        }))
+    }
+
+    /// A source re-committed past its predecessor's orphaned block: the
+    /// target holds both parts, and the dispatch carries the successor's
+    /// list alone. Neither a cell the predecessor read nor a value it
+    /// held for a cell the successor carries as absent reaches it.
+    #[test]
+    fn provisions_for_carries_only_the_required_sources() {
+        let s = ShardId::leaf(1, 0);
+        let s1 = s.children().1;
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let (a, b) = (test_key(1), test_key(2));
+        let mut t = ProvisioningTracker::new();
+        require(&mut t, tx, &[s1]);
+        t.absorb_provisions(&part(s, 7, 20_500, tx, &[(a, Some(1)), (b, Some(2))]));
+        t.absorb_provisions(&part(s1, 3, 41_000, tx, &[(a, None)]));
+
+        assert!(t.has_received_from(tx, s), "the orphaned part is held");
+        assert_eq!(t.provisions_for(tx), vec![list(&[(a, None)])]);
+    }
+
+    /// A shard the candidate does not wait on can ship it content, and
+    /// the dispatch leaves that out.
+    #[test]
+    fn an_unrequired_absorption_stays_out_of_the_dispatch() {
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let (a, b) = (test_key(1), test_key(2));
+        let mut t = ProvisioningTracker::new();
+        require(&mut t, tx, &[shard(1)]);
+        t.absorb_provisions(&part(shard(1), 5, 1_000, tx, &[(a, Some(1))]));
+        t.absorb_provisions(&part(shard(2), 5, 1_000, tx, &[(b, Some(2))]));
+
+        assert_eq!(t.provisions_for(tx), vec![list(&[(a, Some(1))])]);
+    }
+
+    /// A remote payer is required, so its list rides beside the read
+    /// set's and its anchor is the one the member runs under.
+    #[test]
+    fn a_remote_payer_stays_in_the_dispatch() {
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let (a, b) = (test_key(1), test_key(2));
+        let mut t = ProvisioningTracker::new();
+        require(&mut t, tx, &[shard(1), shard(2)]);
+        t.record_payer_shard(tx, shard(2));
+        t.absorb_provisions(&part(shard(1), 5, 7_000, tx, &[(a, Some(1))]));
+        t.absorb_provisions(&part(shard(2), 9, 9_500, tx, &[(b, Some(2))]));
+
+        assert_eq!(
+            t.provisions_for(tx),
+            vec![list(&[(a, Some(1))]), list(&[(b, Some(2))])],
+        );
+        assert_eq!(t.payer_anchor(tx), Some(anchor(9_500)));
     }
 
     #[test]
@@ -763,6 +874,7 @@ mod tests {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         let provisions = make_provisions(shard(1), BlockHeight::new(5), tx);
+        require(&mut t, tx, &[shard(1)]);
         t.absorb_provisions(&provisions);
 
         assert_eq!(t.absorbed_len(), 1);
@@ -777,6 +889,7 @@ mod tests {
     fn absorb_multiple_batches_for_same_tx_accumulates() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        require(&mut t, tx, &[shard(1), shard(2)]);
         t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), tx));
         t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), tx));
 
@@ -805,6 +918,7 @@ mod tests {
                 Capped::from_array([SubstateEntry::new(a, Some(Bytes::from_array([1])))]),
             )
         };
+        require(&mut t, tx, &[shard(1)]);
         t.absorb_provisions(&first());
         t.absorb_provisions(&first());
         t.absorb_provisions(&bundle_for(
@@ -856,6 +970,7 @@ mod tests {
         for (height, clock_ms) in [(9, 21_500), (7, 21_500)] {
             let mut t = ProvisioningTracker::new();
             let tx = first.tx_hash();
+            require(&mut t, tx, &[shard(1)]);
             t.record_payer_shard(tx, shard(1));
             t.absorb_provisions(&first);
             t.absorb_provisions(&off(height, clock_ms, vec![SubstateEntry::new(a, None)]));
