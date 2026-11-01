@@ -875,6 +875,46 @@ fn commit_windows_for(
     resolved
 }
 
+/// Whether this chain's blocks bear out where `entry` says its
+/// transaction committed; `None` when a block it reads is not held,
+/// which leaves the name unanswered as an unheld body does.
+///
+/// The block at the stated height carries the transaction under the
+/// anchor the name states. The block below it fixes the committee
+/// anchor: its parent-QC clock, which its hash pins and the carrying
+/// block's parent link pins in turn, is the anchor the commit froze its
+/// classification and price at. A name stating a committee anchor in
+/// any other window states figures under a table the commit never ran
+/// under, however exactly they restate there.
+///
+/// Both headers and the carrying manifest stay in the store for as long
+/// as the transaction's member row stands, however far beneath its
+/// chain floor.
+fn bears_out_commit<H: AsRef<CertifiedBlockHeader>>(
+    entry: &UnsettledTx,
+    windows: EpochWindows,
+    carries: impl Fn(BlockHeight, TxHash) -> Option<bool>,
+    certified_header: impl Fn(BlockHeight) -> Option<H>,
+) -> Option<bool> {
+    let committed = entry.committed;
+    if !carries(committed.height, entry.tx_hash)? {
+        return Some(false);
+    }
+    let Some(below) = committed.height.prev() else {
+        return Some(false);
+    };
+    let carrying = certified_header(committed.height)?;
+    let carrying = carrying.as_ref().header();
+    let parent = certified_header(below)?;
+    let parent = parent.as_ref().header();
+    Some(
+        carrying.parent_qc().weighted_timestamp() == committed.anchor
+            && carrying.parent_block_hash() == parent.hash()
+            && windows.epoch_for(parent.parent_qc().weighted_timestamp())
+                == windows.epoch_for(committed.committee_anchor),
+    )
+}
+
 fn absorb_finalized_cells(ticks: &[Verifiable<Finalization>], derivation: &dyn Derivation) {
     let receipts: Vec<Arc<ConsensusReceipt>> = ticks
         .iter()
@@ -1143,23 +1183,12 @@ where
                 .filter(|tx| tx.try_derived(derivation.as_ref()).is_ok())
                 .map(|tx| (tx.hash(), tx))
                 .collect();
-            // A name says where this chain committed its transaction,
-            // and the block at that height is what checks it: one this
-            // store holds either carries the transaction under the
-            // anchor the name states or refutes the name, and one it
-            // does not hold leaves the name unanswered, as a body it
-            // does not hold does. Its header and manifest are what is
-            // read, which the store holds for as long as the
-            // transaction's member row stands, however far beneath its
-            // chain floor.
             let committed_at = |entry: &UnsettledTx| -> Option<bool> {
-                let height = entry.committed.height;
-                let carried = ctx.pending_chain.carries(height, entry.tx_hash)?;
-                let header = ctx.pending_chain.certified_header(height)?;
-                Some(
-                    carried
-                        && header.header().parent_qc().weighted_timestamp()
-                            == entry.committed.anchor,
+                bears_out_commit(
+                    entry,
+                    windows,
+                    |height, tx| ctx.pending_chain.carries(height, tx),
+                    |height| ctx.pending_chain.certified_header(height),
                 )
             };
             let committed_windows = commit_windows_for(ctx.beacon_chain, windows, &entries);
@@ -2360,6 +2389,125 @@ mod tests {
         let resolved = commit_windows_for(&chain, windows, &[named_at(5_000, 5_000)]);
 
         assert!(resolved.is_empty());
+    }
+
+    /// The headers at heights 0 and 1 of a chain whose block 0 dates at
+    /// `committee_anchor` and whose block 1, extending it, at `anchor`.
+    fn committed_pair(committee_anchor: u64, anchor: u64) -> [Verified<CertifiedBlockHeader>; 2] {
+        let certify = |height: u64, parent: BlockHash, dated: u64| {
+            let height = BlockHeight::new(height);
+            let header = BlockHeader::new(BlockHeaderParts {
+                height,
+                parent_block_hash: parent,
+                parent_qc: Verifiable::from(QuorumCertificate::new(
+                    parent,
+                    ShardId::ROOT,
+                    height.prev().unwrap_or(height),
+                    BlockHash::ZERO,
+                    Round::INITIAL,
+                    SignerBitfield::empty(),
+                    AggregateSignature::ZERO,
+                    WeightedTimestamp::from_millis(dated),
+                )),
+                ..Default::default()
+            });
+            let qc = QuorumCertificate::new(
+                header.hash(),
+                ShardId::ROOT,
+                height,
+                parent,
+                Round::INITIAL,
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::ZERO,
+            );
+            Verified::<CertifiedBlockHeader>::from_persisted(CertifiedBlockHeader::new(header, qc))
+        };
+        let below = certify(0, BlockHash::ZERO, committee_anchor);
+        let carrying = certify(1, below.header().hash(), anchor);
+        [below, carrying]
+    }
+
+    /// Whether the chain `held` bears out `entry`, block 1 carrying it.
+    fn borne_out(
+        entry: &UnsettledTx,
+        held: &[Verified<CertifiedBlockHeader>],
+        windows: EpochWindows,
+    ) -> Option<bool> {
+        bears_out_commit(
+            entry,
+            windows,
+            |height, _| (height == BlockHeight::new(1)).then_some(true),
+            |height| held.get(usize::try_from(height.inner()).ok()?).cloned(),
+        )
+    }
+
+    /// A name pricing its commit in a window the chain does not fix for
+    /// it is refused, however exactly its figures restate there: the
+    /// window is the proposer's to choose otherwise, and the burn with it.
+    #[test]
+    fn a_name_stating_another_window_than_its_commit_ran_under_is_refused() {
+        let windows = EpochWindows::new(0, 1_000);
+        let chain = committed_pair(500, 600);
+
+        assert_eq!(borne_out(&named_at(500, 600), &chain, windows), Some(true));
+        assert_eq!(
+            borne_out(&named_at(1_500, 600), &chain, windows),
+            Some(false),
+            "a dearer window"
+        );
+        let later = committed_pair(1_500, 1_600);
+        assert_eq!(
+            borne_out(&named_at(500, 1_600), &later, windows),
+            Some(false),
+            "a cheaper window"
+        );
+    }
+
+    /// A commit straddling a cut is fixed at the window its parent's
+    /// anchor dates, not the one its own anchor opens, and its name
+    /// passes there however many windows later it is carried.
+    #[test]
+    fn a_name_committed_across_a_cut_is_borne_out_at_its_committee_window() {
+        let windows = EpochWindows::new(0, 1_000);
+        let chain = committed_pair(900, 1_100);
+
+        assert_eq!(
+            borne_out(&named_at(900, 1_100), &chain, windows),
+            Some(true)
+        );
+        assert_eq!(
+            borne_out(&named_at(1_100, 1_100), &chain, windows),
+            Some(false),
+            "the window the commit's own anchor opens"
+        );
+    }
+
+    /// A block below the carrying one that is not this chain's parent of
+    /// it fixes nothing, and a missing one leaves the name unanswered.
+    #[test]
+    fn a_committee_anchor_is_read_only_off_the_carrying_blocks_parent() {
+        let windows = EpochWindows::new(0, 1_000);
+        let [_, carrying] = committed_pair(500, 600);
+        let [unlinked, _] = committed_pair(1_500, 600);
+
+        assert_eq!(
+            borne_out(
+                &named_at(1_500, 600),
+                &[unlinked, carrying.clone()],
+                windows
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            bears_out_commit(
+                &named_at(500, 600),
+                windows,
+                |_, _| Some(true),
+                |height| (height == BlockHeight::new(1)).then(|| carrying.clone()),
+            ),
+            None
+        );
     }
 
     fn shard() -> ShardId {
