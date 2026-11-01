@@ -46,7 +46,8 @@ type Key = (ShardId, BlockHeight);
 /// Sized at a block's worth per legitimately in-flight source header, with
 /// room for several proposal rounds each: honest buffering only spans the
 /// headers a shard has not yet verified, which is normally none. Past the
-/// ceiling new parts are dropped, and a drop is recoverable — the
+/// ceiling new parts are dropped, and a drop is recoverable — a fetch the
+/// dropped part answered is released to be asked again, and the
 /// expectation tracker fetches what a commit-proven header says it is owed,
 /// which is the path a part that never arrived takes anyway.
 pub const MAX_PENDING_PROVISION_ENTRIES: usize = 64 * MAX_TXS_PER_BLOCK;

@@ -117,6 +117,7 @@ where
             }
             Action::Fetch(req) => self.process_fetch_request(req),
             Action::AbandonFetch(ids) => self.release_fetch(ids, Release::Abandoned),
+            Action::FailFetch(ids) => self.release_fetch(ids, Release::Failed),
 
             // ─── ShardLoop-internal effects ────────────────────────────────
             Action::SetTimer { id, duration } => {

@@ -474,6 +474,28 @@ impl ProvisionCoordinator {
             .then(|| Action::AbandonFetch(FetchIds::LocalProvisions(sweep.evicted_pending)))
     }
 
+    /// Buffer `part` until its header is commit-proven. One refused at
+    /// the buffer's ceiling releases the fetch ids it could answer as
+    /// failed, so a fetch it answered is asked again rather than left
+    /// waiting on a part that is gone.
+    fn park(&mut self, key: (ShardId, BlockHeight), part: &Provision) -> Vec<Action> {
+        if self
+            .pipeline
+            .buffer_pending(key, part.clone(), self.expected.local_ts())
+        {
+            return Vec::new();
+        }
+        vec![
+            Action::FailFetch(FetchIds::LocalProvisions(vec![part.hash()])),
+            Action::FailFetch(FetchIds::RemoteProvisions(vec![(
+                part.source_shard(),
+                part.target_shard(),
+                part.block_height(),
+                part.leaf().index,
+            )])),
+        ]
+    }
+
     /// Release every fetch a part this coordinator is dropping was wanted
     /// by.
     ///
@@ -808,13 +830,7 @@ impl ProvisionCoordinator {
                 block_height = block_height.inner(),
                 "Buffering verified part as raw (waiting for remote header)"
             );
-            // A refusal at the ceiling needs no cancellation: an in-flight
-            // fetch for this part is still wanted, and a part nobody
-            // fetched is re-acquired by the expectation the commit-proven
-            // header registers.
-            let _buffered =
-                self.pipeline
-                    .buffer_pending(key, part.into_inner(), self.expected.local_ts());
+            actions.extend(self.park(key, &part));
         }
         actions.extend(self.hold(&held));
         actions
@@ -881,14 +897,8 @@ impl ProvisionCoordinator {
                     count = parts.len(),
                     "Buffering provisions (waiting for remote header)"
                 );
-                // A refusal at the ceiling needs no cancellation: an
-                // in-flight fetch for a part is still wanted, and a part
-                // nobody fetched is re-acquired by the expectation the
-                // commit-proven header registers.
-                for part in parts {
-                    let _buffered =
-                        self.pipeline
-                            .buffer_pending(key, part, self.expected.local_ts());
+                for part in &parts {
+                    actions.extend(self.park(key, part));
                 }
                 continue;
             };
@@ -1153,6 +1163,7 @@ mod tests {
     use proptest::collection::vec as prop_vec;
 
     use super::*;
+    use crate::pipeline::MAX_PENDING_PROVISION_ENTRIES;
 
     /// A minimal head-only schedule with no pending recoveries — the
     /// unfenced ordinary case every non-fence test runs under.
@@ -3401,6 +3412,50 @@ mod tests {
             let actions = coordinator.on_committed_remote_header(&sched(), &header);
             assert_eq!(asked(&actions), vec![1, 2], "{arrivals:?}");
         }
+    }
+
+    /// A part refused at the pending buffer's ceiling, raw or verified,
+    /// releases the fetch ids it could have answered as failed, so a
+    /// fetch it answered is asked again rather than left waiting on it.
+    #[test]
+    fn a_part_dropped_at_the_pending_ceiling_fails_its_fetch() {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+        let filler = ShardId::leaf(2, 3);
+        for i in 0..MAX_PENDING_PROVISION_ENTRIES {
+            let height = BlockHeight::new(u64::try_from(i).expect("a small count"));
+            assert!(coordinator.pipeline.buffer_pending(
+                (filler, height),
+                make_provisions(TxHash::ZERO, filler, ShardId::leaf(2, 0), height),
+                WeightedTimestamp::ZERO,
+            ));
+        }
+        let parts = make_provisions_multi(
+            txs(2),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let failed = |actions: &[Action]| -> Vec<u32> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::FailFetch(FetchIds::RemoteProvisions(ids)) => {
+                        Some(ids.iter().map(|(.., index)| *index).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        };
+
+        let actions = coordinator.on_state_provisions_received(&sched(), vec![parts[0].clone()]);
+        assert_eq!(failed(&actions), vec![0]);
+        let actions = coordinator.on_verified_state_provisions_received(
+            &sched(),
+            vec![Verified::new_unchecked_for_test(parts[1].clone())],
+            LocalTimestamp::ZERO,
+        );
+        assert_eq!(failed(&actions), vec![1]);
     }
 
     /// An index whose part was committed before it was admitted here

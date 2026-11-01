@@ -640,6 +640,14 @@ pub enum Action {
     /// succeeded, retention-horizon orphan cleanup, deadline eviction).
     AbandonFetch(FetchIds),
 
+    /// Release in-flight fetches whose answer the coordinator could not
+    /// keep, to be asked again.
+    ///
+    /// The node feeds the ids through `FetchInput::Failed` on the binding
+    /// that fetches them, as it does for a refused answer: the ids are
+    /// still wanted, and nothing else would release them.
+    FailFetch(FetchIds),
+
     /// Offer transactions this chain never included to whatever holds
     /// their keys now.
     ///
