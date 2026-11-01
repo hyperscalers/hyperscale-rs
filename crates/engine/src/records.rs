@@ -1,4 +1,4 @@
-//! What a batch resolves its call targets through.
+//! What a batch member resolves its call targets through.
 //!
 //! Admission and execution ask the same question — which record serves
 //! this target — but they are owed different answers. Admission is a
@@ -12,7 +12,7 @@
 //! So execution answers from the block and the chain alone. Three
 //! sources, none of them node-local: the records genesis seated, the
 //! configuration leaves this shard holds committed, and the leaves its
-//! counterparts provisioned for the transactions in this batch. The
+//! counterparts provisioned for the transaction being resolved. The
 //! fence admission puts on every component call declares a read of the
 //! target's own leaf, and a declared read is provisioned to every shard
 //! the transaction routes to — so a counterpart's record arrives as
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use hyperscale_effects_bridge::records::{committed_instance, resource_issued_by};
 use hyperscale_effects_bridge::vm_statics::config_key;
-use hyperscale_types::{SubstateEntry, TxHash};
+use hyperscale_types::SubstateEntry;
 use hyperscale_vm_effects::{
     ChainRecords, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash,
     PackageMetadata, ResourceMeta,
@@ -31,7 +31,7 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_kernel::Substates;
 use hyperscale_vm_types::{CallTarget, ResourceAddr, SubstateKey};
 
-/// The records one batch answers a call target with.
+/// The records one member of a batch answers a call target with.
 ///
 /// Every source is a function of committed state or of the block, so two
 /// members of a shard resolve a target alike or neither does — which is
@@ -42,7 +42,7 @@ use hyperscale_vm_types::{CallTarget, ResourceAddr, SubstateKey};
 /// cannot run code it never acquired whatever else it resolves, so
 /// holding every published package is a condition of executing at all
 /// rather than something a lookup here might find missing.
-pub struct BatchRecords<'a> {
+pub struct MemberRecords<'a> {
     packages: Arc<MetadataCache>,
     /// The blueprint serving every principal, and the instances genesis
     /// seated — the records with no cell to read, and the same set on
@@ -55,23 +55,24 @@ pub struct BatchRecords<'a> {
     committed: &'a (dyn Substates + Sync),
 }
 
-impl<'a> BatchRecords<'a> {
-    /// The records for a batch executing against `committed`, with
-    /// whatever its transactions were provisioned layered beside them.
+impl<'a> MemberRecords<'a> {
+    /// The records one member of a batch executing against `committed`
+    /// resolves through, with what its own counterparts provisioned it
+    /// layered beside them.
+    ///
+    /// One member's lists and never a batch-mate's: a leaf one source
+    /// shipped a neighbour at another height could resolve a target this
+    /// member's own sources never certified, and the shards running a
+    /// transaction batch it with different neighbours.
     #[must_use]
     pub(crate) fn new(
         packages: Arc<MetadataCache>,
         seeded: Arc<InstanceRegistry>,
-        provisions: &'a BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
+        provisions: &'a [Arc<Vec<SubstateEntry>>],
         committed: &'a (dyn Substates + Sync),
     ) -> Self {
-        // Indexed across the whole batch rather than per transaction:
-        // the provisions are block content, so the same set is here on
-        // every member, and a record is the record its address derives
-        // whichever transaction carried it.
         let provisioned = provisions
-            .values()
-            .flatten()
+            .iter()
             .flat_map(|entries| entries.iter())
             .filter_map(|entry| Some((entry.key, entry.value.as_deref()?)))
             .collect();
@@ -84,7 +85,7 @@ impl<'a> BatchRecords<'a> {
     }
 }
 
-impl ChainRecords for BatchRecords<'_> {
+impl ChainRecords for MemberRecords<'_> {
     fn instance(&self, target: CallTarget) -> Option<Arc<InstanceMeta>> {
         if let Some(seeded) = self.seeded.record(target) {
             return Some(seeded);
@@ -189,15 +190,15 @@ mod tests {
         }
     }
 
-    fn provisioned(entries: Vec<SubstateEntry>) -> BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> {
-        BTreeMap::from([(TxHash(Hash32([7; 32])), vec![Arc::new(entries)])])
+    fn provisioned(entries: Vec<SubstateEntry>) -> Vec<Arc<Vec<SubstateEntry>>> {
+        vec![Arc::new(entries)]
     }
 
     fn records<'a>(
-        provisions: &'a BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
+        provisions: &'a [Arc<Vec<SubstateEntry>>],
         committed: &'a (dyn Substates + Sync),
-    ) -> BatchRecords<'a> {
-        BatchRecords::new(
+    ) -> MemberRecords<'a> {
+        MemberRecords::new(
             Arc::new(MetadataCache::new()),
             Arc::new(InstanceRegistry::new()),
             provisions,
@@ -242,8 +243,7 @@ mod tests {
             config_key(address),
             meta.leaf_bytes().expect("a record encodes"),
         );
-        let provisions = BTreeMap::new();
-        let chain = records(&provisions, &store);
+        let chain = records(&[], &store);
         assert_eq!(chain.instance(address.into()).as_deref(), Some(&meta));
     }
 
@@ -299,8 +299,7 @@ mod tests {
     /// resolves to nothing — the refusal every member reaches alike.
     #[test]
     fn a_component_neither_source_holds_resolves_to_nothing() {
-        let provisions = BTreeMap::new();
-        let chain = records(&provisions, &Barren);
+        let chain = records(&[], &Barren);
         assert!(
             chain
                 .instance(record(5).address(&ProtocolHasher).into())

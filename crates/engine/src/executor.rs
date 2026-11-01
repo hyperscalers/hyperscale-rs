@@ -42,8 +42,8 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_kernel::{
     AmountLedger, Baseline, BatchError, BatchTx, EnvInputs, ExecutionMode, FeeBurn, FeeHolds, Job,
-    LegPlan, ManifestWalk, OverlayStore, OwnerSet, Receipt, StoreError, Substates, WithheldCredits,
-    execute_batch,
+    LegPlan, ManifestWalk, MemoryStore, OverlayStore, OwnerSet, Receipt, StoreError, Substates,
+    WithheldCredits, execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -53,7 +53,7 @@ use hyperscale_vm_types::{
 use crate::backend::{Availability, EngineBackend};
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
 use crate::legs::{Member, never_answer};
-use crate::records::BatchRecords;
+use crate::records::MemberRecords;
 use crate::sharding::owned_by;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
 
@@ -264,6 +264,27 @@ pub fn materialize_declared(
             }
         }
     }
+}
+
+/// What one member's counterparts provisioned it, as the content its
+/// session reads beneath the batch's baseline.
+///
+/// A provisioned leaf is a cell or an ordered-collection entry, and the
+/// leaf says which: an entry re-derives its own key and lands where the
+/// kernel's range capabilities read. An absent leaf adds nothing.
+fn provisioned_reads(lists: &[Arc<Vec<SubstateEntry>>]) -> MemoryStore {
+    let mut reads = MemoryStore::new();
+    for entry in lists.iter().flat_map(|entries| entries.iter()) {
+        let Some(value) = entry.value.as_ref() else {
+            continue;
+        };
+        if let Some((key, value)) = entry_from_leaf(entry.key, value) {
+            reads.entry_write(key.owner, key.collection, key.order, value);
+        } else {
+            reads.write(entry.key, value.clone().into_inner());
+        }
+    }
+    reads
 }
 
 /// The VM engine: the genesis-static world, the compiled stdlib guests,
@@ -559,14 +580,14 @@ impl Executor {
     /// Deterministically only as far as `chain` is: a refusal is this
     /// member's contribution to a receipt root, so what answers a target
     /// on the commit path has to answer the same on every member. That
-    /// is [`BatchRecords`], which reads the block and committed state
+    /// is [`MemberRecords`], which reads the block and committed state
     /// and nothing a node accumulated on its own.
     ///
     /// Nothing of the engine enters it, which is the same statement from
     /// the other side: what an envelope declares is a function of the
     /// envelope and the records, and of no node running it.
     ///
-    /// [`BatchRecords`]: crate::records::BatchRecords
+    /// [`MemberRecords`]: crate::records::MemberRecords
     pub(crate) fn prepare(
         tx: &Transaction,
         chain: &dyn ChainRecords,
@@ -580,7 +601,7 @@ impl Executor {
     /// crossing cells declared.
     fn prepare_shape(
         tx: &Transaction,
-        records: &BatchRecords,
+        records: &MemberRecords,
         packages: &PackageCache,
         member: &Member,
         arrivals: &[EscrowedValue],
@@ -1248,27 +1269,74 @@ fn declare(
 
 /// What every transaction in a batch assembles against: the pre-read
 /// baseline its receipts fold over, the share of the world this shard
-/// applies, and what the witness lift needs to decide whether an emitted
-/// event is a beacon fact — what code each instance runs and how it is
-/// configured, and the code a pool must be running.
+/// applies, and the code a pool must be running, which the witness lift
+/// asks to decide whether an emitted event is a beacon fact.
 #[derive(Clone, Copy)]
 struct BatchInputs<'a> {
     base: &'a TickBaseline,
     locality: &'a OwnerSet,
-    instances: &'a dyn ChainRecords,
     staking_package: PackageHash,
 }
 
 /// What one member assembles from: the receipt the kernel ran it to, its
-/// payer and the charge set apart for it, the input its block froze, and
-/// the instance records its envelope carries.
+/// payer and the charge set apart for it, the input its block froze, what
+/// its own counterparts provisioned it, and the instance records it
+/// resolves through — its batch's and the ones its envelope carries.
 #[derive(Clone, Copy)]
 struct MemberInputs<'a> {
     vm_tx: TxHash,
     receipt: &'a Receipt,
     fee: Option<(PayerFee, u128)>,
     input: Option<&'a TickTxInput<'a>>,
+    own_reads: Option<&'a MemoryStore>,
+    instances: &'a dyn ChainRecords,
     presented: &'a [InstanceMeta],
+}
+
+/// The committed value `key` holds as one member reads it: the batch's
+/// baseline, and beneath it what that member alone was provisioned.
+fn member_cell(
+    base: &TickBaseline,
+    own_reads: Option<&MemoryStore>,
+    key: SubstateKey,
+) -> Option<Vec<u8>> {
+    base.cells
+        .get(&key)
+        .cloned()
+        .or_else(|| own_reads.and_then(|own| own.cell(key)))
+}
+
+/// What a member that ran is charged, and the charge its refusal receipt
+/// settles apart where it settles one.
+///
+/// A completed run burned its price in the kernel, judged against the
+/// vault with its own hold ended, so the figure is the price and a charge
+/// built beside it for an abort is judged too. Every other outcome
+/// settles the figure carried beside the payer: what the charge pass
+/// found the floor to leave of the price once the member's hold ended.
+fn member_charge(
+    fee: Option<(PayerFee, u128)>,
+    outcome: &Outcome,
+) -> (u128, Option<(SubstateKey, Movement)>) {
+    let completed = matches!(outcome, Outcome::Completed { .. });
+    let charged = fee.map_or(
+        0,
+        |(payer, apart)| {
+            if completed { payer.burned() } else { apart }
+        },
+    );
+    let charge = fee
+        .map(|(payer, _)| payer)
+        .filter(|payer| settled_apart(outcome, *payer))
+        .map(|payer| {
+            let charge = if completed {
+                Movement::debit(*PROTOCOL_RESOURCE, charged)
+            } else {
+                Movement::unjudged(*PROTOCOL_RESOURCE, charged)
+            };
+            (payer.vault, charge)
+        });
+    (charged, charge)
 }
 
 fn assemble_executed_tx(
@@ -1278,39 +1346,18 @@ fn assemble_executed_tx(
     member_inputs: MemberInputs<'_>,
 ) -> ExecutedTx {
     let MemberInputs {
-        vm_tx,
+        vm_tx: tx_hash,
         receipt,
         fee,
         input,
+        own_reads,
+        instances,
         presented,
     } = member_inputs;
     let member = input.map(|input| &input.member);
     let BatchInputs { base, locality, .. } = inputs;
-    let tx_hash = vm_tx;
     let completed = matches!(receipt.outcome, Outcome::Completed { .. });
-    // A completed run burned its price in the kernel, judged against the
-    // vault with its own hold ended, so the figure is the price and a
-    // charge built beside it for an abort is judged too. Every other
-    // outcome settles the figure carried beside the payer: what the
-    // charge pass found the floor to leave of the price once the
-    // member's hold ended.
-    let charged = fee.map_or(
-        0,
-        |(payer, apart)| {
-            if completed { payer.burned() } else { apart }
-        },
-    );
-    let charge = fee
-        .map(|(payer, _)| payer)
-        .filter(|payer| settled_apart(&receipt.outcome, *payer))
-        .map(|payer| {
-            let charge = if completed {
-                Movement::debit(*PROTOCOL_RESOURCE, charged)
-            } else {
-                Movement::unjudged(*PROTOCOL_RESOURCE, charged)
-            };
-            (payer.vault, charge)
-        });
+    let (charged, charge) = member_charge(fee, &receipt.outcome);
     // The member's answers where it can still be refused: here, by
     // its own outcome, or later, by a counterpart's verdict. A
     // multi-core consumer that completed here, holds no vault and is
@@ -1321,7 +1368,7 @@ fn assemble_executed_tx(
         never_answers(input, tx_hash, ctx.local_shard, locality, |key| {
             fold.running
                 .get(&key)
-                .map_or_else(|| base.cells.get(&key).cloned(), Clone::clone)
+                .map_or_else(|| member_cell(base, own_reads, key), Clone::clone)
         })
     };
     let refusal_receipt =
@@ -1372,7 +1419,7 @@ fn assemble_executed_tx(
         // derive: every participant holds the same envelope, so a pool
         // this transaction seals speaks here and is read alike
         // everywhere.
-        let records = Composed::new(inputs.instances, presented, &ProtocolHasher);
+        let records = Composed::new(instances, presented, &ProtocolHasher);
         let witnesses: Vec<(Address, BeaconWitnessEvent)> = events
             .iter()
             .filter_map(|event| {
@@ -1500,10 +1547,15 @@ impl Executor {
                 prices: i.prices,
             })
             .collect();
-        let provisions_by_tx: BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = inputs
+        // What each member reads beneath the batch's baseline: its own
+        // provisions and no batch-mate's. Two members can hold one remote
+        // cell at different heights of its source, and the shards running
+        // a transaction batch it with different neighbours, so a value
+        // read off a neighbour's list would split its receipt.
+        let own_reads: BTreeMap<TxHash, Arc<MemoryStore>> = inputs
             .iter()
             .filter(|i| !i.provisions.is_empty())
-            .map(|i| (i.tx_hash, i.provisions.to_vec()))
+            .map(|i| (i.tx_hash, Arc::new(provisioned_reads(i.provisions))))
             .collect();
         let env_by_tx: BTreeMap<TxHash, EnvInputs> = inputs
             .iter()
@@ -1533,17 +1585,27 @@ impl Executor {
             })
             .collect();
 
-        // What this batch resolves its targets through: genesis, this
-        // shard's committed leaves, and the ones its counterparts
-        // provisioned. Every member of the shard builds the same three
-        // from the same block, which is what makes a refusal below a
-        // property of the transaction rather than of the node.
-        let records = BatchRecords::new(
-            self.world.cache.load(),
-            self.world.instances.seeded(),
-            &provisions_by_tx,
-            snapshot,
-        );
+        // What each member resolves its targets through: genesis, this
+        // shard's committed leaves, and the ones its own counterparts
+        // provisioned it. Every replica of the shard builds the same
+        // three for a member from the same block, and every shard running
+        // the transaction reads the same provisioned leaves whatever its
+        // batch-mates, which is what makes a refusal below a property of
+        // the transaction rather than of the node or of its neighbours.
+        let packages = self.world.cache.load();
+        let seeded = self.world.instances.seeded();
+        let records: BTreeMap<TxHash, MemberRecords<'_>> = inputs
+            .iter()
+            .map(|input| {
+                let records = MemberRecords::new(
+                    Arc::clone(&packages),
+                    Arc::clone(&seeded),
+                    input.provisions,
+                    snapshot,
+                );
+                (input.tx_hash, records)
+            })
+            .collect();
 
         // Derive every transaction; refusals become deterministic
         // failures without touching the batch.
@@ -1554,6 +1616,9 @@ impl Executor {
             if publishes.contains_key(&vm_tx) {
                 continue;
             }
+            let records = records
+                .get(&vm_tx)
+                .expect("every input resolves through its own records");
             // What this shard runs of the member: the whole shape unless
             // the coordinator froze a division, and then the legs its
             // placement gives it. A plan that cannot be built is a
@@ -1561,7 +1626,7 @@ impl Executor {
             // every replica reads the same legs and the same arrivals.
             let planned = Self::prepare_shape(
                 input.transaction,
-                &records,
+                records,
                 &self.world.cache,
                 &input.member,
                 input.arrivals,
@@ -1578,29 +1643,10 @@ impl Executor {
             }
         }
 
-        // The committed baseline: provisioned remote cells first — a
-        // key's owner prefix routes it to exactly one source, so nothing
-        // arbitrates — then the locally owned declared content from the
-        // tick snapshot.
+        // The committed baseline every member shares: the locally owned
+        // declared content from the tick snapshot. Provisioned content is
+        // each member's own, beneath it.
         let mut base = TickBaseline::default();
-        for lists in provisions_by_tx.values() {
-            for entries in lists {
-                for entry in entries.iter() {
-                    if let Some(value) = entry.value.as_ref() {
-                        // A provisioned leaf is a cell or an
-                        // ordered-collection entry, and the leaf says
-                        // which: an entry re-derives its own key, and
-                        // lands in the interval map the kernel's range
-                        // capabilities read.
-                        if let Some((entry_key, entry_value)) = entry_from_leaf(entry.key, value) {
-                            base.entries.insert(entry_key, entry_value);
-                        } else {
-                            base.cells.insert(entry.key, value.clone().into_inner());
-                        }
-                    }
-                }
-            }
-        }
         for entry in prepared.values() {
             materialize_declared(snapshot, &entry.declaration.set, &locality, &mut base);
         }
@@ -1732,7 +1778,7 @@ impl Executor {
                     .get(vm_tx)
                     .cloned()
                     .expect("every prepared transaction has an environment");
-                batch_entry(
+                let batched = batch_entry(
                     *vm_tx,
                     entry,
                     env,
@@ -1748,7 +1794,11 @@ impl Executor {
                     shapes
                         .get(vm_tx)
                         .is_none_or(|input| input.member.abortable()),
-                )
+                );
+                match own_reads.get(vm_tx) {
+                    Some(own) => batched.with_own_reads(Arc::clone(own)),
+                    None => batched,
+                }
             })
             .collect();
         let walk = ManifestWalk {
@@ -1819,7 +1869,6 @@ impl Executor {
                 BatchInputs {
                     base: &base,
                     locality: &locality,
-                    instances: &records,
                     staking_package: self.world.staking_package,
                 },
                 &mut fold,
@@ -1828,6 +1877,10 @@ impl Executor {
                     receipt,
                     fee: fee_by_tx.get(vm_tx).map(|payer| (*payer, apart(vm_tx))),
                     input: shapes.get(vm_tx).copied(),
+                    own_reads: own_reads.get(vm_tx).map(AsRef::as_ref),
+                    instances: records
+                        .get(vm_tx)
+                        .expect("every receipt is an input's, which resolves through its own"),
                     presented: prepared
                         .get(vm_tx)
                         .map_or(&[][..], |entry| &entry.presented),
@@ -1927,12 +1980,13 @@ impl Executor {
                     // Refused before any of it ran, so nothing of this
                     // batch wrote its answers: the tick's baseline is
                     // what says whether one already stands.
+                    let own = own_reads.get(&vm_tx).map(AsRef::as_ref);
                     let nevers = never_answers(
                         shapes.get(&vm_tx).copied(),
                         vm_tx,
                         ctx.local_shard,
                         &locality,
-                        |key| base.cells.get(&key).cloned(),
+                        |key| member_cell(&base, own, key),
                     );
                     executed.refusal_receipt = build_refusal_receipt(
                         ctx.local_shard,

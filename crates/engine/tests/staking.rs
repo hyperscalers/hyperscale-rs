@@ -1230,20 +1230,18 @@ fn a_consumer_completed_here_and_refused_elsewhere_writes_never() {
     );
 }
 
-/// A tick's baseline is the batch's: a list one member's dispatch
-/// carries is read by every member of the tick. So a core member reads
-/// its sibling's pool as its own source shipped it only while no
-/// batch-mate carries another source's list for those cells, such as a
-/// predecessor's whose block a successor committed the batch-mate again
-/// past.
+/// A core member reads its sibling's pool as its own source shipped it,
+/// whatever a batch-mate carries. Every shard running the transaction
+/// batches it with different neighbours, so a list a neighbour carries —
+/// a predecessor's whose block a successor committed the neighbour again
+/// past — must not reach it.
 ///
 /// The sibling ships the core member a state without its pool, so the
-/// stake into it fails. A batch-mate carrying that list too leaves the
-/// failure in place; one also carrying a predecessor's list, which holds
-/// the pool, lets the stake complete off cells its own source never
-/// shipped.
+/// stake into it fails. A batch-mate carrying that list and a
+/// predecessor's, which holds the pool, leaves the failure exactly as it
+/// is.
 #[test]
-fn a_core_member_reads_its_siblings_cells_off_its_own_sources_list() {
+fn a_core_member_is_unaffected_by_a_batch_mates_lists() {
     let divided = divided_stake();
     let store = divided.store(&divided.seats);
     let handed = divided.handed(&store);
@@ -1305,11 +1303,174 @@ fn a_core_member_reads_its_siblings_cells_off_its_own_sources_list() {
         "a stake into a pool its source does not ship fails: {:?}",
         own.consensus,
     );
-    let leaked = run(&[required.clone(), predecessor].concat());
-    assert!(
-        matches!(leaked.consensus, ConsensusReceipt::Succeeded { .. }),
+    let beside = run(&[required.clone(), predecessor].concat());
+    assert_eq!(
+        beside.consensus, own.consensus,
         "a batch-mate's predecessor list reaches the core member: {:?}",
-        leaked.metadata,
+        beside.metadata,
+    );
+    assert_eq!(beside.refusal_receipt, own.refusal_receipt);
+    assert_eq!(beside.metadata, own.metadata);
+}
+
+/// A second delegation into the same two pools, paid for by another
+/// account off both core shards.
+fn another_stake(divided: &DividedStake) -> DividedStake {
+    let payer = (1..=u8::MAX)
+        .find(|seed| {
+            *seed != divided.payer
+                && ![divided.core, divided.sibling]
+                    .contains(&divided.trie.shard_for_prefix(account_of(*seed)))
+        })
+        .expect("another key's account sits off both core leaves");
+    stake_paid_by(payer)
+}
+
+impl DividedStake {
+    /// This delegation's member on `self.core`, handed `arrivals` and
+    /// `provisions`.
+    fn core_input<'a>(
+        &'a self,
+        arrivals: &'a [EscrowedValue],
+        provisions: &'a [Arc<Vec<SubstateEntry>>],
+    ) -> TickTxInput<'a> {
+        TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: self.tx.hash(),
+            transaction: &self.tx,
+            provisions,
+            clock: WeightedTimestamp::from_millis(1_000),
+            member: Member::of(
+                self.classified.clone(),
+                self.core,
+                BTreeSet::from([self.payer_shard, self.core, self.sibling]),
+            ),
+            arrivals,
+        }
+    }
+
+    /// Run `inputs` as one tick on `self.core` against `store` under
+    /// `executor`, each member's receipt by its transaction.
+    fn run_core_tick(
+        &self,
+        executor: &Executor,
+        store: &MapDb,
+        inputs: &[TickTxInput<'_>],
+    ) -> BTreeMap<TxHash, ExecutedTx> {
+        let ctx = TickBatchContext {
+            local_shard: self.core,
+            shard_trie: &self.trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
+        };
+        executor
+            .execute_tick_batch(&ctx, store, inputs)
+            .expect("the harness engine holds every package it runs")
+            .into_iter()
+            .map(|ran| (ran.tx_hash, ran))
+            .collect()
+    }
+}
+
+/// Two core members of one tick hold the sibling's pool at two heights of
+/// the sibling: one list holds the pool, the other predates it. Each
+/// stakes off its own, whichever of the two it holds.
+#[test]
+fn two_core_members_each_read_the_siblings_pool_off_their_own_list() {
+    let first = divided_stake();
+    let second = another_stake(&first);
+    let store = first.store(&first.seats);
+    let handed = [
+        first.handed(&store),
+        second.handed(&second.store(&second.seats)),
+    ];
+    let holding = first.provisioned(&store, first.sibling);
+    let predating = first.provisioned(&first.store(&first.seats[..1]), first.sibling);
+
+    for (lists, completes) in [
+        ([&holding, &predating], [true, false]),
+        ([&predating, &holding], [false, true]),
+    ] {
+        let inputs = [
+            first.core_input(&handed[0], lists[0]),
+            second.core_input(&handed[1], lists[1]),
+        ];
+        let ran = first.run_core_tick(&first.executor, &store, &inputs);
+        for (member, completes) in [&first, &second].into_iter().zip(completes) {
+            let executed = &ran[&member.tx.hash()];
+            assert_eq!(
+                matches!(executed.consensus, ConsensusReceipt::Succeeded { .. }),
+                completes,
+                "a member stakes off its own list alone: {:?}",
+                executed.metadata,
+            );
+        }
+    }
+}
+
+/// A core member resolves the sibling's pool off its own list and the
+/// genesis and committed records alone. Its source ships the pool's cells
+/// without its configuration leaf; a batch-mate's list carries the leaf,
+/// and the member is refused alike beside it and without it.
+#[test]
+fn a_core_member_resolves_targets_off_its_own_list_alone() {
+    let first = divided_stake();
+    let second = another_stake(&first);
+    // Seated with the member's own pool only, and run against a store
+    // holding nothing of the sibling's: the sibling's record reaches it
+    // through provisions or not at all.
+    let executor = seated(&[seat(first.seats[0])], ExecutionMode::Serial);
+    let store = first.store(&first.seats[..1]);
+    let full = first.store(&first.seats);
+    let handed = [
+        first.handed(&full),
+        second.handed(&second.store(&second.seats)),
+    ];
+    let pool = pool_address(
+        package_hash(&ProtocolHasher, staking_artifact()),
+        &seat(first.seats[1]),
+    );
+    let leafless: Vec<Arc<Vec<SubstateEntry>>> = first
+        .provisioned(&full, first.sibling)
+        .iter()
+        .map(|list| {
+            Arc::new(
+                list.iter()
+                    .filter(|entry| entry.key != config_key(pool))
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect();
+    let leafed = first.provisioned(&full, first.sibling);
+
+    let alone = first.run_core_tick(
+        &executor,
+        &store,
+        &[first.core_input(&handed[0], &leafless)],
+    );
+    let alone = &alone[&first.tx.hash()];
+    assert!(
+        matches!(alone.consensus, ConsensusReceipt::Failed),
+        "a pool whose record nothing resolves refuses the stake: {:?}",
+        alone.metadata,
+    );
+    let beside = first.run_core_tick(
+        &executor,
+        &store,
+        &[
+            first.core_input(&handed[0], &leafless),
+            second.core_input(&handed[1], &leafed),
+        ],
+    );
+    let beside = &beside[&first.tx.hash()];
+    assert_eq!(beside.consensus, alone.consensus);
+    assert_eq!(beside.refusal_receipt, alone.refusal_receipt);
+    assert_eq!(
+        beside.metadata, alone.metadata,
+        "a batch-mate's leaf resolves the member's target",
     );
 }
 
