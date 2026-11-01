@@ -45,14 +45,14 @@ use hyperscale_types::{
     Hash, LeafRoot, LocalReceiptRoot, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, ProposerTimestamp, Provision,
-    ProvisionHash, ProvisionTxRootsJudged, ProvisionsRoot, QcContext, QuorumCertificate,
-    ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, SectionRoots, SetRoot,
-    SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StandingAnswers, StateClaim,
-    StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim,
-    SubstateKey, SweepFrontier, TermsRoot, TermsSection, TickLine, TickManifest, TickManifestRoot,
-    Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
-    TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified,
-    Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
+    ProvisionHash, ProvisionTxRootsJudged, ProvisionTxRootsMap, ProvisionsRoot, QcContext,
+    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, SectionRoots,
+    SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StandingAnswers, StateClaim,
+    StateClaimsRoot, StateRoot, StateRootContext, StateRootVerifyError, Stopwatch, StoredReceipt,
+    SubstateClaim, SubstateKey, SweepFrontier, TermsRoot, TermsSection, TickLine, TickManifest,
+    TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction,
+    TransactionRoot, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind,
+    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
     absorb_committed_cells, commit_witness_window, derive_leaves, fees_over_certificates,
     local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
     shard_prefix_path, shard_reveal_sign, signed_bytes, tick_terms_admit_block,
@@ -884,6 +884,31 @@ fn absorb_finalized_cells(ticks: &[Verifiable<Finalization>], derivation: &dyn D
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref), derivation);
 }
 
+/// Name every target whose provision root a judged block's header claims
+/// otherwise than this voter computes, with both roots: an absent side is
+/// a target one of them owes nothing.
+fn warn_provision_root_differences(
+    block_hash: BlockHash,
+    block_height: BlockHeight,
+    claimed: &ProvisionTxRootsMap,
+    computed: &ProvisionTxRootsMap,
+) {
+    let targets: BTreeSet<ShardId> = claimed.keys().chain(computed.keys()).copied().collect();
+    for target in targets {
+        let (claimed, computed) = (claimed.get(&target), computed.get(&target));
+        if claimed != computed {
+            tracing::warn!(
+                ?block_hash,
+                height = block_height.inner(),
+                target = target.inner(),
+                ?claimed,
+                ?computed,
+                "Provision root claimed for a target differs from the one computed"
+            );
+        }
+    }
+}
+
 /// The cells the block built on `view`'s anchor removed, for the state
 /// root check of that block.
 ///
@@ -1504,6 +1529,19 @@ where
                         reason = %e,
                         "State root verification FAILED"
                     );
+                    if let (
+                        StateRootVerifyError::ProvisionTxRootsMismatch,
+                        Some(judgement),
+                        Some(computed),
+                    ) = (&e, &parent_judgement, &computed_provision_tx_roots)
+                    {
+                        warn_provision_root_differences(
+                            block_hash,
+                            block_height,
+                            &judgement.provisions.claimed,
+                            computed,
+                        );
+                    }
                     CheckOutcome::Refused
                 }
             };
