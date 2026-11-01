@@ -13,10 +13,11 @@ use hyperscale_vm_types::PriceTable;
 
 use crate::{
     Address, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey,
-    DeclaredKey, Epoch, EpochWindows, NetworkDefinition, NetworkParams, QuorumCertificate,
-    RecoveryBinding, RecoveryCause, ReshapeKind, ReshapeThresholds, Round, SeedRing,
-    SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
-    ValidatorSet, VoteCount, WeightedTimestamp,
+    DeclaredKey, Epoch, EpochWindows, MIN_EPOCH_DURATION, NetworkDefinition, NetworkParams,
+    QuorumCertificate, RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ReshapeKind,
+    ReshapeThresholds, Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie,
+    StateRoot, TERMINAL_EVIDENCE_EPOCHS, Transaction, ValidatorId, ValidatorSet, VoteCount,
+    WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -976,6 +977,14 @@ impl TopologySnapshot {
         anchor_wt: WeightedTimestamp,
         height: BlockHeight,
     ) -> bool {
+        // A binding leaves with its shard's terminal evidence, so that
+        // must outlast every transaction whose work the binding orphans.
+        const {
+            assert!(
+                TERMINAL_EVIDENCE_EPOCHS * MIN_EPOCH_DURATION.as_secs()
+                    > RETENTION_HORIZON.as_secs()
+            );
+        };
         self.recovery_bindings(shard)
             .any(|binding| binding.orphans(windows, height, anchor_wt))
     }
