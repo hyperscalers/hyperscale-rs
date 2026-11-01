@@ -10,6 +10,7 @@
 
 mod support;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -243,7 +244,30 @@ fn an_unbuildable_part_costs_only_its_own_transaction() {
     cluster.run_faultable(|c| {
         cut_gossip(c);
         let (handles, dropped) = unbuildable_everywhere(c, 1);
+        let hosts = c.committee_hosts(RECIPIENT_SHARD);
+        let pending = |c: &SimCluster| -> Vec<Option<usize>> {
+            hosts
+                .iter()
+                .map(|&host| c.provision_fetch_pending(host, RECIPIENT_SHARD))
+                .collect()
+        };
         let hashes = transfers.submit(c);
+
+        // The unbuildable index stays asked on the recipient's shard,
+        // rotating peers, while its transaction waits.
+        let asked = Cell::new(false);
+        c.run_until(epochs(3), |c| {
+            if pending(c).iter().any(|count| count.is_some_and(|n| n > 0)) {
+                asked.set(true);
+            }
+            hashes
+                .iter()
+                .all(|hash| c.tx_status(*hash).is_some_and(|s| s.is_final()))
+        });
+        assert!(
+            asked.get(),
+            "the unbuildable index was never asked, so the sweep shows nothing",
+        );
         let outcomes = settle(c, &hashes);
         assert!(handles.iter().any(|handle| handle.fired() > 0));
         let (hit, spared) = split(&outcomes, &dropped);
@@ -256,21 +280,8 @@ fn an_unbuildable_part_costs_only_its_own_transaction() {
             "the transfer whose part nobody builds does not: {outcomes:?}",
         );
 
-        // The unbuildable index is still asked on the recipient's shard,
-        // rotating peers; past the orphan sweep it is abandoned and no
-        // fetch id is left pending anywhere.
-        let hosts = c.committee_hosts(RECIPIENT_SHARD);
-        let pending = |c: &SimCluster| -> Vec<Option<usize>> {
-            hosts
-                .iter()
-                .map(|&host| c.provision_fetch_pending(host, RECIPIENT_SHARD))
-                .collect()
-        };
-        assert!(
-            pending(c).iter().any(|count| count.is_some_and(|n| n > 0)),
-            "the unbuildable index must still be asked, or the sweep shows nothing: {:?}",
-            pending(c),
-        );
+        // Past the orphan sweep it is abandoned, and no fetch id is left
+        // pending anywhere.
         let drained = c.run_until(epochs(4), |c| {
             pending(c).iter().all(|count| *count == Some(0))
         });
