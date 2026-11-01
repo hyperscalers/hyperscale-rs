@@ -471,6 +471,68 @@ mod tests {
         assert_eq!(one(&flight, 2, None), Flight::Cached(2));
     }
 
+    /// A production that panics with callers waiting on several of its
+    /// keys releases every one of them, and the waiter produces them all
+    /// itself.
+    #[test]
+    fn a_panicking_production_releases_every_key_it_held() {
+        let flight = Arc::new(flight(64, 4));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let producer = {
+            let flight = Arc::clone(&flight);
+            thread::spawn(move || {
+                flight.get_or_produce(&[1, 2, 3], |_| {
+                    started_tx.send(()).expect("started");
+                    release_rx.recv().expect("release");
+                    panic!("the production fails");
+                })
+            })
+        };
+        started_rx.recv().expect("producer started");
+        let waiter = {
+            let flight = Arc::clone(&flight);
+            thread::spawn(move || {
+                flight.get_or_produce(&[1, 2, 3], |keys| {
+                    assert_eq!(keys, [1, 2, 3], "every key the panic left");
+                    keys.iter().map(|key| (*key, *key)).collect()
+                })
+            })
+        };
+        while [1, 2, 3].iter().any(|key| flight.waiting(key) == 0) {
+            thread::yield_now();
+        }
+        release_tx.send(()).expect("release");
+
+        assert!(producer.join().is_err(), "the producer panicked");
+        assert_eq!(
+            waiter.join().expect("waiter"),
+            vec![
+                (1, Flight::Produced(1)),
+                (2, Flight::Produced(2)),
+                (3, Flight::Produced(3)),
+            ]
+        );
+        assert!(lock(&flight.state).in_flight.is_empty());
+    }
+
+    /// A key named twice in one call is produced once and answered once,
+    /// without the call waiting on its own production.
+    #[test]
+    fn a_key_named_twice_is_answered_once() {
+        let flight = flight(64, 4);
+        let started = Instant::now();
+        assert_eq!(
+            flight.get_or_produce(&[1, 2, 1], |keys| {
+                assert_eq!(keys, [1, 2]);
+                vec![(1, 1), (2, 2)]
+            }),
+            vec![(1, Flight::Produced(1)), (2, Flight::Produced(2))]
+        );
+        assert!(started.elapsed() < BUDGET, "it never waits on itself");
+        assert!(lock(&flight.state).in_flight.is_empty());
+    }
+
     #[test]
     fn a_guard_leaves_a_slot_it_does_not_hold() {
         let flight = flight(64, 4);
