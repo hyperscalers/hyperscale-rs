@@ -29,7 +29,8 @@ use hyperscale_types::network::request::beacon::{
 use hyperscale_types::network::request::{GetFinalizationsRequest, GetLocalProvisionsRequest};
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    BeaconProposal, ExecutionCertificate, HeaderSource, ShardId, Signed, Verifiable, signed_bytes,
+    BeaconProposal, ExecutionCertificate, HeaderSource, ShardId, Signed, Verifiable, Verified,
+    signed_bytes,
 };
 use tracing::warn;
 
@@ -1294,7 +1295,11 @@ pub fn register_shard_request_handlers<S, N, D>(
     let provision_store = Arc::clone(&io.caches.provision_store);
     let verified_headers = Arc::clone(&io.caches.verified_headers);
     register_served::<GetLocalProvisionsRequest, _>(&*process.network, shard, move |req| {
-        serve_local_provisions_request(&provision_store, &verified_headers, req)
+        serve_local_provisions_request(
+            &provision_store,
+            |block| verified_headers.get(block).map(Verified::into_inner),
+            req,
+        )
     });
 
     // ── finalization.request → cache lookup + pending_chain fallback ─

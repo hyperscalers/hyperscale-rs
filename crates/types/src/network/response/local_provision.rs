@@ -18,30 +18,32 @@ use crate::{
 /// the receiver verify and admit in one shot, skipping the pipeline
 /// buffer entirely.
 ///
-/// `source_header` is `Option` so a responder that has GC'd the header
-/// after admitting the batch can still serve the blob — the receiver
-/// gracefully falls back to the buffered path (which now correctly
-/// fails out on terminal drops).
+/// A response carries each source block's header once, with the first
+/// of that block's parts; the block's later parts carry `None`. A
+/// responder that has retired the header after admitting the part
+/// still serves it without one, and the receiver falls back to the
+/// buffered path.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct LocalProvisionEntry {
     /// The part.
     pub provision: Provision,
     /// The source-shard certified header at `provision.block_height()`,
-    /// if the responder still has it.
+    /// on the response's first part of that block, if the responder
+    /// still has it.
     pub source_header: Option<CertifiedBlockHeader>,
 }
 
 /// Response to a local provisions fetch request.
 ///
-/// `entries` holds the batches the responder has plus the matching source
-/// header for each. The requester knows the hashes it asked for, so missing
-/// hashes are computed client-side as `requested - returned`; the wire
-/// format does not duplicate that diff.
+/// `entries` holds the parts the responder has, as many as a fetch
+/// response's budget carries, with one source header per source block.
+/// The requester knows the hashes it asked for, so missing hashes are
+/// computed client-side as `requested - returned` and asked again; the
+/// wire format does not duplicate that diff.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetLocalProvisionsResponse {
-    /// Provision batches the responder had locally, each paired with the
-    /// source-shard header that proved its provisions root (when still
-    /// retained).
+    /// Parts the responder had locally, the first of each source block
+    /// carrying the header that proves its leaf (when still retained).
     ///
     /// Capped at [`MAX_PROVISIONS_PER_BLOCK`] — the natural ceiling since a
     /// single block can't reference more provisions than this, and the fetch

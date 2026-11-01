@@ -18,14 +18,15 @@ use hyperscale_jmt::{
     Blake3Hasher, Key as JmtKey, LeafValue, MAX_PROOF_CLAIMS, MAX_SINGLE_CLAIM_PROOF_BYTES,
     MemoryStore, MultiProof, NodeKey, Tree,
 };
+use hyperscale_types::network::response::{GetLocalProvisionsResponse, LocalProvisionEntry};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass,
     AggregateSignature, Anchor, BLOCK_RESPONSE_INLINE_BYTES, BlockHeader, BlockHeaderParts,
-    BlockHeight, CollectionId, CommittedAt, ConsensusReceipt, Crossings, Deadline, DeclaredKey,
-    DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock, Engagement,
-    ExecutionCertificate, ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash,
-    Hash, Joins, LeafPath, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK,
+    BlockHeight, CertifiedBlockHeader, CollectionId, CommittedAt, ConsensusReceipt, Crossings,
+    Deadline, DeclaredKey, DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock,
+    Engagement, ExecutionCertificate, ExecutionOutcome, Finalization, FinalizationHash,
+    GlobalReceiptHash, Hash, Joins, LeafPath, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK,
     MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FETCH_RESPONSE_BYTES,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_MERKLE_PROOF_LEN,
     MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_PART_BYTES,
@@ -467,6 +468,36 @@ fn deepest_path() -> LeafPath {
 /// every leaf is held to its slot's width at write.
 #[test]
 fn a_part_at_maximal_widths_fits_a_fetch_response() {
+    let encoded = hbor_to_vec(&maximal_part()).expect("a part encodes").len();
+    println!(
+        "maximal part: {encoded} bytes of {MAX_PROVISION_PART_BYTES}, in a response of \
+         {MAX_FETCH_RESPONSE_BYTES}",
+    );
+    assert!(encoded <= MAX_PROVISION_PART_BYTES);
+}
+
+/// A local-provision answer always keeps its first part, with the
+/// source header that part brings, whatever the two weigh. A part at
+/// maximal widths beside the widest header overruns the fetch response
+/// budget by no more than the envelope the frame already reserves for
+/// an answer's last item.
+#[test]
+fn a_lone_maximal_part_and_its_header_fit_the_frame() {
+    let (header, qc) = widest_header();
+    let response = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
+        provision: maximal_part(),
+        source_header: Some(CertifiedBlockHeader::new(header, qc)),
+    }]));
+    let encoded = hbor_to_vec(&response).expect("a response encodes").len();
+    println!(
+        "lone maximal local-provision answer: {encoded} bytes, budget \
+         {MAX_FETCH_RESPONSE_BYTES} plus an envelope's {MAX_ENVELOPE_BYTES}",
+    );
+    assert!(encoded <= MAX_FETCH_RESPONSE_BYTES + MAX_ENVELOPE_BYTES);
+}
+
+/// A part at every width its caps admit.
+fn maximal_part() -> Provision {
     let value_bytes = usize::try_from(MAX_TX_READ_BYTES).expect("a read budget fits memory");
     let per_value = value_bytes / MAX_PROVISION_WEIGHT;
     let entries: Vec<SubstateEntry> = (0..MAX_PROVISION_WEIGHT)
@@ -479,7 +510,7 @@ fn a_part_at_maximal_widths_fits_a_fetch_response() {
             SubstateEntry::new(key, Some(Bytes::new(vec![0xAB; per_value]).unwrap()))
         })
         .collect();
-    let part = Provision::new(ProvisionParts {
+    Provision::new(ProvisionParts {
         source_shard: ShardId::leaf(1, 0),
         target_shard: ShardId::leaf(1, 1),
         block_height: BlockHeight::new(u64::MAX),
@@ -488,13 +519,7 @@ fn a_part_at_maximal_widths_fits_a_fetch_response() {
         entries: Capped::new(entries).expect("the weight cap"),
         proof: MerkleInclusionProof::new(vec![0x5A; MAX_MERKLE_PROOF_LEN]),
         leaf: deepest_path(),
-    });
-    let encoded = hbor_to_vec(&part).expect("a part encodes").len();
-    println!(
-        "maximal part: {encoded} bytes of {MAX_PROVISION_PART_BYTES}, in a response of \
-         {MAX_FETCH_RESPONSE_BYTES}",
-    );
-    assert!(encoded <= MAX_PROVISION_PART_BYTES);
+    })
 }
 
 /// One transaction's part at the most cells a proof may claim, every
