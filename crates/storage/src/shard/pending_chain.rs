@@ -1220,6 +1220,15 @@ impl<S: SubstateStore + VersionedStore> SubstateView<S> {
     pub fn serves_at(&self, height: BlockHeight) -> bool {
         height.inner() >= self.base.retention_floor()
     }
+
+    /// Whether this view holds the state the block at `height` left: a
+    /// block of its own chain, or one the base has persisted. A read at
+    /// a height it does not hold answers the base's tip instead.
+    #[must_use]
+    pub fn holds(&self, height: BlockHeight) -> bool {
+        height <= (*self.base).jmt_height()
+            || self.versioned_settled.iter().any(|(at, _)| *at == height)
+    }
 }
 
 impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {

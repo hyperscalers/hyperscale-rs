@@ -95,7 +95,14 @@ pub fn provision_answer(
 /// Builds in leaf order and stops once what it built fills a fetch
 /// response, so one ask costs at most a response's worth of parts
 /// whatever it names; an index past that point is not built, and is
-/// asked again. An owed index that cannot be built is served as `None`.
+/// asked again.
+///
+/// Values and proofs both come from the view anchored at the block
+/// itself, so a block committed here but not yet persisted builds like
+/// any other, and no part pairs one height's values with another's
+/// proof. An owed index that view cannot build never will be, and is
+/// served as `None`. A block whose state this node does not hold yet
+/// builds nothing, which is not kept.
 ///
 /// Reads the source block through [`PendingChain`] so heights still inside
 /// the shard-committed / JMT-persisted window are reachable; reconstructs
@@ -151,7 +158,13 @@ pub fn build_served_parts<S: ShardStorage>(
             parts: Vec::new(),
         });
     };
-    let view = pending_chain.view_at_persisted_tip();
+    let view = pending_chain.view_at(block.hash(), height);
+    if !view.holds(height) {
+        return Some(BuiltParts {
+            count: Some(count),
+            parts: Vec::new(),
+        });
+    }
     let mut parts = Vec::new();
     let mut spent = 0usize;
     build_provisions_until(
@@ -207,22 +220,215 @@ pub fn outbound_answer(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Capped;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::test_helpers::{
         commit_settled_at, make_test_block, make_test_certified,
+    };
+    use hyperscale_storage::{
+        ChainEntry, ChainWrites, JmtSnapshot, MemberInputs, ParentAnchor, ShardChainWriter,
+        SubstateStore,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::Request;
     use hyperscale_types::test_utils::{
-        StubVmStatics, install_stub_protocol_statics, stub_transaction,
+        StubVmStatics, install_stub_protocol_statics, stub_transaction, stub_transaction_with_reads,
     };
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, Hash, PrincipalAddr,
-        ProvisionTxRoot, TimestampRange, Transaction, TxHash, Verifiable, WeightedTimestamp,
-        provision_leaf,
+        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
+        FrontierInputs, Hash, PrincipalAddr, ProvisionTxRoot, SubstateEntry, SubstateKey,
+        SweepFrontier, TimestampRange, Transaction, TxHash, Verifiable, Verified,
+        WeightedTimestamp, provision_leaf,
     };
 
     use super::*;
+
+    /// A live test block at `height` carrying `tx` as a store hands a
+    /// transaction back: decoded, with no derivation.
+    fn block_carrying(height: BlockHeight, tx: &Transaction) -> Block {
+        let decoded = Transaction::new(tx.body().clone());
+        assert!(!decoded.is_routed());
+        let Block::Live {
+            header,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+            ..
+        } = make_test_block(height)
+        else {
+            unreachable!("the fixture builds a live block")
+        };
+        Block::Live {
+            header,
+            transactions: Arc::new(Capped::from_array([Verifiable::from(decoded)])),
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+        }
+    }
+
+    fn validity() -> TimestampRange {
+        TimestampRange::new(
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::from_millis(60_000),
+        )
+    }
+
+    const HEIGHT: BlockHeight = BlockHeight::new(1);
+    const LOCAL: ShardId = ShardId::leaf(1, 0);
+    const PAYER_SHARD: ShardId = ShardId::leaf(1, 1);
+
+    /// A block at height 1 whose one transaction reads a cell here for a
+    /// payer on the other shard, and writes `value` to it, committed over
+    /// an empty store that has not persisted it.
+    struct Unpersisted {
+        trie: ShardTrie,
+        pending_chain: Arc<PendingChain<SimShardStorage>>,
+        certified: Arc<Verified<CertifiedBlock>>,
+        jmt_snapshot: Arc<JmtSnapshot>,
+        /// The cell the transaction reads here.
+        key: SubstateKey,
+    }
+
+    impl Unpersisted {
+        fn new(value: &[u8]) -> Self {
+            install_stub_protocol_statics();
+            let trie = ShardTrie::uniform(1);
+            let payer = PrincipalAddr::new([0x80; 31]);
+            let held = PrincipalAddr::new([0x10; 31]);
+            assert_eq!(trie.shard_for_prefix(held.address()), LOCAL);
+            assert_eq!(trie.shard_for_prefix(payer.address()), PAYER_SHARD);
+            let tx = stub_transaction_with_reads(
+                payer,
+                &[held.address()],
+                &[payer.address()],
+                1_000,
+                validity(),
+            );
+            let request = provision_request(&trie, &Verifiable::from(tx.clone()), LOCAL)
+                .expect("the transaction reads a cell here");
+            let [key] = request.local_keys[..] else {
+                panic!("one cell read here: {:?}", request.local_keys)
+            };
+            let storage = Arc::new(SimShardStorage::default());
+            let (_, jmt_snapshot, _) = storage.prepare_block_commit(
+                ParentAnchor {
+                    state_root: storage.state_root(),
+                    height: BlockHeight::GENESIS,
+                    state: &storage.snapshot(),
+                    pending: &[],
+                    base_reads: None,
+                },
+                &[],
+                ChainWrites {
+                    creations: &[(key, value.to_vec())],
+                    removals: &[],
+                    sweep_frontier: SweepFrontier::ZERO,
+                    frontier: &FrontierInputs::still(ShardId::ROOT),
+                    state_claims: &[],
+                    members: &MemberInputs::still(ShardId::ROOT),
+                },
+                HEIGHT,
+            );
+            Self {
+                trie,
+                pending_chain: Arc::new(PendingChain::new(storage, BlockHeight::GENESIS)),
+                certified: make_test_certified(block_carrying(HEIGHT, &tx)),
+                jmt_snapshot,
+                key,
+            }
+        }
+
+        /// Hold the block committed, its prepared state under `hash`.
+        fn hold_under(&self, hash: BlockHash) {
+            self.pending_chain.insert(
+                hash,
+                ChainEntry {
+                    parent_block_hash: self.certified.block().header().parent_block_hash(),
+                    height: HEIGHT,
+                    settled_txs: Vec::new(),
+                    jmt_snapshot: Arc::clone(&self.jmt_snapshot),
+                    certified_block: Some(Arc::clone(&self.certified)),
+                },
+            );
+        }
+
+        /// Hold the block committed with its prepared state.
+        fn hold(&self) {
+            self.hold_under(self.certified.block().hash());
+        }
+
+        /// Build the payer shard's part at index 0.
+        fn build(&self) -> BuiltParts {
+            build_served_parts(
+                &self.pending_chain,
+                &StubVmStatics,
+                LOCAL,
+                &self.trie,
+                HEIGHT,
+                PAYER_SHARD,
+                &[0],
+            )
+            .expect("the block is held")
+        }
+    }
+
+    /// A block committed here but not yet persisted serves the parts it
+    /// owes from its own state: the value it wrote, proven against its
+    /// own root.
+    #[test]
+    fn a_committed_block_not_yet_persisted_serves_its_parts() {
+        let block = Unpersisted::new(&[7]);
+        block.hold();
+        assert_eq!(
+            block.pending_chain.view_at_persisted_tip().anchor_height(),
+            BlockHeight::GENESIS,
+            "nothing is persisted",
+        );
+
+        let built = block.build();
+        let [(0, served)] = &built.parts[..] else {
+            panic!("index 0 is built")
+        };
+        let part = served
+            .part
+            .as_ref()
+            .expect("the block's own state builds the part");
+        assert_eq!(
+            part.entries(),
+            [SubstateEntry::new(
+                block.key,
+                Some(Bytes::new(vec![7]).expect("a small value"))
+            )],
+            "the value the block wrote, not the persisted tip's",
+        );
+    }
+
+    /// A committed block whose state this node does not hold yet builds
+    /// nothing, rather than an unbuildable part a serve cache would keep
+    /// after the state lands.
+    #[test]
+    fn a_block_whose_state_is_not_held_yet_builds_nothing() {
+        let block = Unpersisted::new(&[7]);
+        block.hold_under(BlockHash::from_raw(Hash::from_bytes(b"another prep")));
+
+        let early = block.build();
+        assert!(early.count.is_some(), "the count still rides");
+        assert!(early.parts.is_empty(), "no index is tried");
+
+        block.hold();
+        let [(0, served)] = &block.build().parts[..] else {
+            panic!("index 0 is built")
+        };
+        assert!(served.part.is_some(), "and it builds once the state lands");
+    }
 
     /// A committed block read back without its transactions' derivations
     /// still serves the provisions they owe.
@@ -240,46 +446,12 @@ mod tests {
         // A payer on the other shard: this shard owes it the engagement
         // its vote waits for.
         let payer = PrincipalAddr::new([0x80; 31]);
-        let routed = stub_transaction(
-            payer,
-            &[payer.address()],
-            1_000,
-            TimestampRange::new(
-                WeightedTimestamp::ZERO,
-                WeightedTimestamp::from_millis(60_000),
-            ),
-        );
+        let routed = stub_transaction(payer, &[payer.address()], 1_000, validity());
         assert_eq!(trie.shard_for_prefix(payer.address()), payer_shard);
         let hash = routed.hash();
-        let decoded = Transaction::new(routed.body().clone());
-        assert!(!decoded.is_routed());
 
         let height = BlockHeight::new(1);
-        let Block::Live {
-            header,
-            certificates,
-            provisions,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-            terms,
-            witness_sources,
-            ..
-        } = make_test_block(height)
-        else {
-            unreachable!("the fixture builds a live block")
-        };
-        let block = Block::Live {
-            header,
-            transactions: Arc::new(Capped::from_array([Verifiable::from(decoded)])),
-            certificates,
-            provisions,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-            terms,
-            witness_sources,
-        };
+        let block = block_carrying(height, &routed);
         let storage = Arc::new(SimShardStorage::default());
         commit_settled_at(
             &*storage,
