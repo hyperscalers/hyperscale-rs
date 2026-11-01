@@ -981,6 +981,16 @@ impl SimulationRunner {
             .then(|| &**host.shard_io(shard).storage())
     }
 
+    /// A shared handle on a host's storage for a hosted shard, for a
+    /// reader that outlives this borrow, such as a response rewrite.
+    #[must_use]
+    pub fn shard_storage(&self, host: NodeIndex, shard: ShardId) -> Option<Arc<SimShardStorage>> {
+        let host = self.hosts.get(host as usize)?;
+        host.hosted_shards()
+            .any(|s| s == shard)
+            .then(|| Arc::clone(host.shard_io(shard).storage()))
+    }
+
     /// The cluster's engine, for engine-side surfaces that are not part
     /// of tick execution, such as preview.
     #[must_use]

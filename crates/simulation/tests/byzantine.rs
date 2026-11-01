@@ -12,6 +12,7 @@
 
 mod support;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -25,15 +26,19 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
-    Cluster, FaultHandle, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig,
-    StockedVenue, VENUE_SHARD, committees_on_separate_hosts, epochs, grind_onto, stand_up_venue,
+    BOOK_SHARD, BOOK_VENUE_SHARD, BookRoute, Cluster, FaultHandle, FaultableCluster, SWAP_INPUT,
+    SWAPPER_SHARD, ScenarioConfig, StockedVenue, VENUE_SHARD, book_route_genesis_accounts,
+    committees_on_separate_hosts, departing_venue_split_bytes, epochs, grind_onto, stand_up_venue,
     venue_genesis_accounts,
 };
-use hyperscale_types::network::request::GetStateProofRequest;
-use hyperscale_types::network::response::GetStateProofResponse;
+use hyperscale_storage::entry_from_leaf;
+use hyperscale_storage::tree::proofs::generate_proof;
+use hyperscale_storage_memory::SimShardStorage;
+use hyperscale_types::network::request::{GetProvisionsRequest, GetStateProofRequest};
+use hyperscale_types::network::response::{GetProvisionResponse, GetStateProofResponse};
 use hyperscale_types::{
-    Ed25519PrivateKey, MerkleInclusionProof, PrincipalAddr, ShardId, TransactionDecision,
-    TransactionStatus,
+    BlockHeight, Ed25519PrivateKey, MerkleInclusionProof, PrincipalAddr, Provision, ProvisionParts,
+    ShardId, SubstateEntry, SubstateKey, TransactionDecision, TransactionStatus,
 };
 use support::SimCluster;
 
@@ -471,5 +476,167 @@ fn a_record_value_its_proof_does_not_cover_is_refused() {
             ) > refused_before,
             "the tampered value was never refused on its proof",
         );
+    });
+}
+
+/// The book route's four quarters, grown on dedicated pool hosts, with
+/// the reshape trigger armed above every quarter and never voted down:
+/// the venue's shard stays whole.
+fn book_route_cluster() -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            shard_size: 4,
+            vnodes_per_host: 1,
+            pool_surplus: 18,
+            num_shards: 4,
+            split_bytes: departing_venue_split_bytes(),
+            latency: std::time::Duration::from_millis(150),
+        },
+        42,
+        &book_route_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+/// `honest` with one range entry left out of every part serving two or
+/// more, each such part re-proved over what it keeps under the state
+/// root of its source height in `storage`. `None` where no part could be
+/// forged that way.
+fn drop_a_range_entry(storage: &SimShardStorage, honest: &[u8]) -> Option<Vec<u8>> {
+    let response = hbor_from_slice::<GetProvisionResponse>(honest).ok()?;
+    let mut forged = false;
+    let parts = response
+        .parts
+        .into_inner()
+        .into_iter()
+        .map(|part| {
+            let ranged: Vec<usize> = part
+                .entries()
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| entry_from_leaf(entry.key, value).is_some())
+                })
+                .map(|(at, _)| at)
+                .collect();
+            if ranged.len() < 2 {
+                return part;
+            }
+            let dropped = ranged[ranged.len() / 2];
+            let kept: Vec<SubstateEntry> = part
+                .entries()
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| *at != dropped)
+                .map(|(_, entry)| entry.clone())
+                .collect();
+            let keys: Vec<SubstateKey> = kept.iter().map(|entry| entry.key).collect();
+            let Some(proof) = generate_proof(storage, &keys, part.block_height()) else {
+                return part;
+            };
+            forged = true;
+            Provision::new(ProvisionParts {
+                source_shard: part.source_shard(),
+                target_shard: part.target_shard(),
+                block_height: part.block_height(),
+                source_block_ts: part.source_block_ts(),
+                tx_hash: part.tx_hash(),
+                entries: Capped::new(kept).expect("fewer entries than the honest part"),
+                proof,
+                leaf: part.leaf().clone(),
+            })
+        })
+        .collect();
+    forged.then(|| {
+        hbor_to_vec(&GetProvisionResponse {
+            parts: Capped::new(parts).expect("no more parts than the honest answer"),
+            count: response.count,
+        })
+        .expect("an answer encodes")
+    })
+}
+
+/// A part that drops one entry of its transaction's declared interval
+/// is refused, and the route it provisions completes on an honest
+/// peer's part.
+///
+/// The book's shard withholds its provision gossip, so the venue's shard
+/// fetches the route's part. The host first asked about each source
+/// block — the proposer, which the fetch prefers — answers every fetch
+/// for that block with the route's part missing one of the interval's
+/// entries, re-proved over what it keeps: its own proof checks, and the
+/// entries it carries are the source's. Only the leaf binding the keys a
+/// transaction is served to the header's root tells it apart. Taken,
+/// the venue's shard would walk one ask fewer than the book's own shard
+/// does, and the core would not agree; refused, the venue's shard asks
+/// another peer, and the route settles at the closed form over the asks
+/// the book's committing block left.
+#[test]
+fn a_served_part_dropping_a_range_entry_is_refused() {
+    let mut cluster = book_route_cluster();
+    cluster.run_faultable(|c| {
+        let mut route = BookRoute::stand_up(c);
+        let (books, venues) = committees_on_separate_hosts(c, BOOK_SHARD, BOOK_VENUE_SHARD);
+        let gossip = c.drop_type_between(&books, &venues, "provisions.broadcast");
+
+        let forged = Arc::new(AtomicUsize::new(0));
+        let liars: Arc<Mutex<BTreeMap<BlockHeight, usize>>> = Arc::default();
+        for host in c.committee_hosts(BOOK_SHARD) {
+            let storage = c
+                .runner()
+                .shard_storage(
+                    u32::try_from(host).expect("a host index fits a node index"),
+                    BOOK_SHARD,
+                )
+                .expect("a committee host stores its shard");
+            let forged = Arc::clone(&forged);
+            let liars = Arc::clone(&liars);
+            let _ = c.rewrite_responses(
+                host,
+                "provision.request",
+                Arc::new(move |asked: &[u8], honest: &[u8]| {
+                    let Ok(request) = hbor_from_slice::<GetProvisionsRequest>(asked) else {
+                        return honest.to_vec();
+                    };
+                    let liar = *liars
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .entry(request.height)
+                        .or_insert(host);
+                    if liar != host {
+                        return honest.to_vec();
+                    }
+                    drop_a_range_entry(&storage, honest).map_or_else(
+                        || honest.to_vec(),
+                        |lie| {
+                            forged.fetch_add(1, Ordering::Relaxed);
+                            lie
+                        },
+                    )
+                }),
+            );
+        }
+        let refused_before = c.metric(
+            "fetch_responses_refused",
+            Some("provision:content_mismatch"),
+        );
+
+        let fill = route.run(c, epochs(12), "byzantine");
+        assert!(
+            gossip.fired() > 0 && forged.load(Ordering::Relaxed) > 0,
+            "a part missing a range entry has to have been served, or nothing was attacked: \
+             {fill:?}",
+        );
+        assert!(
+            c.metric(
+                "fetch_responses_refused",
+                Some("provision:content_mismatch"),
+            ) > refused_before,
+            "no part was refused at its leaf, so the root check never ran",
+        );
+        route.assert_conserved(c, epochs(12));
     });
 }
