@@ -664,10 +664,15 @@ impl ProvisionCoordinator {
             }
         }
         actions.extend(self.hold(&held));
-        // A count witness that arrived first is checked now, past what the
-        // drained parts already hold.
-        if targets_us && let Some(count) = self.expected.take_parked_count(shard, height) {
-            actions.extend(self.check_count(certified_header, count));
+        // Count witnesses that arrived first are checked now, past what the
+        // drained parts already hold, until one teaches the count.
+        if targets_us {
+            for count in self.expected.take_parked_counts(shard, height) {
+                if !self.expected.wants_count(shard, height) {
+                    break;
+                }
+                actions.extend(self.check_count(certified_header, count));
+            }
         }
         actions.extend(build_verify_actions(
             self.local_shard,
@@ -3364,6 +3369,38 @@ mod tests {
         assert!(early.is_empty());
         let actions = coordinator.on_committed_remote_header(&sched(), &header);
         assert_eq!(asked(&actions), vec![1]);
+    }
+
+    /// A false witness parked before the header displaces no true one,
+    /// whichever lands first: the true one teaches the count when the
+    /// header commits.
+    #[test]
+    fn a_false_parked_witness_displaces_no_true_one() {
+        let txs = txs(3);
+        let honest = witness_of(&txs);
+        let lie = ProvisionCount { count: 2, ..honest };
+        for arrivals in [[honest, lie], [lie, honest]] {
+            let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+            let header = make_certified_header_committing(
+                ShardId::leaf(2, 1),
+                BlockHeight::new(10),
+                ShardId::leaf(2, 0),
+                &txs,
+            );
+            coordinator.on_verified_remote_header(&header);
+            let _ = coordinator.flush_expected_provisions();
+            for count in arrivals {
+                let early = coordinator.on_provision_count(
+                    ShardId::leaf(2, 1),
+                    ShardId::leaf(2, 0),
+                    BlockHeight::new(10),
+                    count,
+                );
+                assert!(early.is_empty());
+            }
+            let actions = coordinator.on_committed_remote_header(&sched(), &header);
+            assert_eq!(asked(&actions), vec![1, 2], "{arrivals:?}");
+        }
     }
 
     /// An index whose part was committed before it was admitted here

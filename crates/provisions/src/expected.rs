@@ -70,10 +70,24 @@ struct ExpectedProvision {
     held: BTreeSet<u32>,
     /// Every index a fetch was asked for. Only grows.
     asked: BTreeSet<u32>,
-    /// A count witness that arrived before the header it is checked
-    /// against was commit-proven, held for that check.
-    parked_count: Option<ProvisionCount>,
+    /// The distinct count witnesses that arrived before the header they
+    /// are checked against was commit-proven, held for that check in
+    /// arrival order, at most [`MAX_PARKED_COUNTS`].
+    parked_counts: Vec<ProvisionCount>,
 }
+
+/// How many distinct count witnesses one expectation holds for its
+/// header.
+///
+/// Nothing can tell a true witness from a false one before the header
+/// commits, so none displaces another. Each arrives in an answer to this
+/// node's own ask, and before the header commits only the index-0 ask
+/// and its retries are out, each to a peer the fetch rotates to: the
+/// first few distinct answers hold an honest one unless every one of
+/// them lies. One past the bound is dropped: until a part teaches the
+/// count, the ask is retried, and a retry answered after the header
+/// commits is checked at once.
+const MAX_PARKED_COUNTS: usize = 4;
 
 impl ExpectedProvision {
     /// Learn `count`, returning whether it was not known before.
@@ -241,7 +255,7 @@ impl ExpectedProvisionTracker {
                 count: None,
                 held: BTreeSet::new(),
                 asked: BTreeSet::new(),
-                parked_count: None,
+                parked_counts: Vec::new(),
             });
     }
 
@@ -335,7 +349,8 @@ impl ExpectedProvisionTracker {
 
     /// Hold a count witness until the header it is checked against is
     /// commit-proven. Only an expectation still missing its count keeps
-    /// one, and only the latest.
+    /// any, each distinct one beside those before it, up to
+    /// [`MAX_PARKED_COUNTS`].
     pub(crate) fn park_count(
         &mut self,
         source_shard: ShardId,
@@ -344,21 +359,23 @@ impl ExpectedProvisionTracker {
     ) {
         if let Some(expected) = self.expected.get_mut(&(source_shard, block_height))
             && expected.count.is_none()
+            && expected.parked_counts.len() < MAX_PARKED_COUNTS
+            && !expected.parked_counts.contains(&count)
         {
-            expected.parked_count = Some(count);
+            expected.parked_counts.push(count);
         }
     }
 
-    /// The count witness parked for `(source_shard, block_height)`, taken.
-    pub(crate) fn take_parked_count(
+    /// The count witnesses parked for `(source_shard, block_height)`, in
+    /// arrival order, taken.
+    pub(crate) fn take_parked_counts(
         &mut self,
         source_shard: ShardId,
         block_height: BlockHeight,
-    ) -> Option<ProvisionCount> {
+    ) -> Vec<ProvisionCount> {
         self.expected
-            .get_mut(&(source_shard, block_height))?
-            .parked_count
-            .take()
+            .get_mut(&(source_shard, block_height))
+            .map_or_default(|expected| std::mem::take(&mut expected.parked_counts))
     }
 
     /// Update the local committed anchor and retro-stamp pre-genesis
@@ -806,8 +823,9 @@ mod tests {
         assert_eq!(t.len(), 0);
     }
 
-    /// A witness parked before its header waits on the entry, the latest
-    /// one only, and is gone once the count is known.
+    /// Witnesses parked before their header wait on the entry, each
+    /// distinct one beside those before it up to the bound, and none is
+    /// kept once the count is known.
     #[test]
     fn a_parked_count_waits_for_its_header() {
         let mut t = one_expected();
@@ -815,12 +833,17 @@ mod tests {
             count,
             merkle_root: Hash::ZERO,
         };
-        t.park_count(SOURCE, HEIGHT, witness(2));
-        t.park_count(SOURCE, HEIGHT, witness(3));
-        assert_eq!(t.take_parked_count(SOURCE, HEIGHT), Some(witness(3)));
-        assert_eq!(t.take_parked_count(SOURCE, HEIGHT), None);
+        for count in [2, 3, 2, 4, 5, 6, 7] {
+            t.park_count(SOURCE, HEIGHT, witness(count));
+        }
+        assert_eq!(
+            t.take_parked_counts(SOURCE, HEIGHT),
+            [2, 3, 4, 5].map(witness),
+            "first come, each once, to the bound"
+        );
+        assert!(t.take_parked_counts(SOURCE, HEIGHT).is_empty());
         let _ = t.on_count_checked(SOURCE, HEIGHT, 3);
         t.park_count(SOURCE, HEIGHT, witness(3));
-        assert_eq!(t.take_parked_count(SOURCE, HEIGHT), None);
+        assert!(t.take_parked_counts(SOURCE, HEIGHT).is_empty());
     }
 }
