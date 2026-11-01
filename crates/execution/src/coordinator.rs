@@ -65,6 +65,7 @@ use hyperscale_metrics::{
     record_batch_unavailable, record_crossing_push_dropped, record_early_vote_refused,
     record_pushes_placed_on_carry, record_unresolvable_tx,
 };
+use hyperscale_provisions::build_provision_requests;
 use hyperscale_storage::{
     FeeTerms, ProvisionalTx, RecoveredState, TickResolution, declared_reservations,
 };
@@ -91,8 +92,8 @@ use crate::finalizations::FinalizationStore;
 use crate::gate::{Attested, Gate, gate_certificate};
 use crate::ledger::{Certified, Ledger, Unanswerable};
 use crate::lookups::{
-    assign_participants, attesting_committee, build_provision_requests, ec_has_shard_quorum_power,
-    peers_excluding_self, record_pushes,
+    assign_participants, attesting_committee, ec_has_shard_quorum_power, peers_excluding_self,
+    record_pushes,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};

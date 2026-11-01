@@ -2209,6 +2209,7 @@ dependencies = [
  "hyperscale-metrics",
  "hyperscale-metrics-memory",
  "hyperscale-network",
+ "hyperscale-provisions",
  "hyperscale-shard",
  "hyperscale-storage",
  "hyperscale-types",

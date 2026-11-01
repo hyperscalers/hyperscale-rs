@@ -4,8 +4,9 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
-use hyperscale_execution::provision_request;
-use hyperscale_provisions::{ProvisionStore, build_provisions_until, provision_count};
+use hyperscale_provisions::{
+    ProvisionStore, build_provisions_until, provision_count, provision_request,
+};
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::request::GetProvisionsRequest;
@@ -443,11 +444,13 @@ mod tests {
         install_stub_protocol_statics();
         let trie = ShardTrie::uniform(1);
         let (local, payer_shard) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
-        // A payer on the other shard: this shard owes it the engagement
-        // its vote waits for.
+        // A payer on the other shard, and a write here: this shard owes
+        // the payer the engagement its vote waits for.
         let payer = PrincipalAddr::new([0x80; 31]);
-        let routed = stub_transaction(payer, &[payer.address()], 1_000, validity());
+        let held = PrincipalAddr::new([0x10; 31]);
+        let routed = stub_transaction(payer, &[payer.address(), held.address()], 1_000, validity());
         assert_eq!(trie.shard_for_prefix(payer.address()), payer_shard);
+        assert_eq!(trie.shard_for_prefix(held.address()), local);
         let hash = routed.hash();
 
         let height = BlockHeight::new(1);
