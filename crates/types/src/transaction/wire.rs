@@ -595,6 +595,28 @@ impl Transaction {
         tx
     }
 
+    /// This transaction with its derived routing replaced by `routing`,
+    /// for a test that needs a declaration the stub derivation cannot
+    /// produce, such as a collection interval. Derives under
+    /// `derivation` first where nothing has yet.
+    ///
+    /// # Panics
+    ///
+    /// If `derivation` refuses the body.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_routing(self, derivation: &dyn Derivation, routing: Routing) -> Self {
+        let base = self
+            .try_derived(derivation)
+            .expect("a stub transaction derives")
+            .clone();
+        let tx = Self::new(self.body().clone());
+        let derived = Derived { routing, ..base };
+        let _ = tx.0.declared.set(Declared::from(&derived));
+        let _ = tx.0.derived.set(derived);
+        tx
+    }
+
     /// Derive (or fetch the cached) envelope derivation under this
     /// node's `derivation`.
     ///

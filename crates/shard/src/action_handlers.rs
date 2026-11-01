@@ -2055,7 +2055,10 @@ mod tests {
         Answerers, GossipHandler, NotificationHandler, RequestError, RequestHandler,
         ResponseVerdict,
     };
-    use hyperscale_storage::{PendingChain, TickChain};
+    use hyperscale_storage::test_helpers::{commit_writes, placeholder_local_ec};
+    use hyperscale_storage::{
+        ChainEntry, PendingChain, ShardChainReader, TickChain, committed_here,
+    };
     use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
     use hyperscale_types::test_utils::{
         StubVmStatics, TestCommittee, install_stub_protocol_statics, stating_half_on,
@@ -2063,13 +2066,15 @@ mod tests {
         test_principal,
     };
     use hyperscale_types::{
-        Address, AddressClass, BeaconBlockHash, BeaconChainConfig, BeaconState, BeaconWitnessEvent,
-        BodyRoot, BodyRootVerifyError, CertifiedBeaconBlock, CommittedAt, Deadline,
-        DerivationError, Derived, ExecutionOutcome, GlobalReceiptHash, GossipMessage, LocalKey,
-        MessageClass, NetworkMessage, PriceTable, PrincipalAddr, ProposerTimestamp,
-        ProvisionTxRoot, ProvisionTxRootsMap, ReadFence, Request, Role, RoutingCommittees,
-        ShardCommittee, ShardTrie, Signer, Stake, StateWrites, TickHalf, TimestampRange,
-        TransactionEnvelope, TxOutcome, provision_leaf, receipt_hash_of, served_digest,
+        Address, AddressClass, AggregateSignature, BeaconBlockHash, BeaconChainConfig, BeaconState,
+        BeaconWitnessEvent, BodyRoot, BodyRootVerifyError, CertifiedBeaconBlock, CollectionId,
+        CommittedAt, Deadline, DeclaredKey, DeclaredRange, DerivationError, Derived, EntryKey,
+        ExecutionOutcome, GlobalReceiptHash, GossipMessage, LocalKey, MessageClass, NetworkMessage,
+        PriceTable, PrincipalAddr, ProposerTimestamp, ProtocolHasher, ProvisionTxRoot,
+        ProvisionTxRootsMap, ReadFence, Request, Role, RoutingCommittees, SettledWrites,
+        ShardCommittee, ShardTrie, Signer, SignerBitfield, Stake, StateWrites, TickHalf, TickId,
+        TimestampRange, TransactionEnvelope, TxOutcome, entry_leaf_key, provision_leaf,
+        receipt_hash_of, served_digest,
     };
 
     use super::*;
@@ -3174,45 +3179,56 @@ mod tests {
                 parent_judgement: judgement,
                 state_claims: Vec::new(),
             };
-            let reported: Arc<Mutex<Vec<ProtocolEvent>>> = Arc::new(Mutex::new(Vec::new()));
-            let sink = Arc::clone(&reported);
-            let seated = Mutex::new(0usize);
-            let commit_prepared = |_: PreparedBlock| {
-                *seated.lock().expect("seated lock") += 1;
-            };
-            let executor = Executor::new(ExecutionMode::Serial);
-            let snapshot = TestCommittee::new(4, 7).topology_snapshot(2);
-            let tick_chain = Arc::new(TickChain::new(Arc::clone(&self.storage)));
-            let ctx = ActionContext {
-                executor: &executor,
-                topology_snapshot: &snapshot,
-                signing: None,
-                shard: LOCAL,
-                pending_chain: &self.pending_chain,
-                tick_chain: &tick_chain,
-                vote_registers: self.storage.as_ref(),
-                beacon_chain: &SimBeaconStorage::new(),
-                network: &Arc::new(Silent),
-                verifier: &BlsVerifier,
-                notify: Arc::new(move |event| sink.lock().expect("reported lock").push(event)),
-                commit_prepared: &commit_prepared,
-                par: Parallelism::Sequential,
-            };
-            handle_action(ConsensusAction::VerifyStateRoot(Box::new(check)), &ctx);
-            let reported = std::mem::take(&mut *reported.lock().expect("reported lock"));
-            let [
-                ProtocolEvent::BlockCheckCompleted {
-                    kind: VerificationKind::StateRoot,
-                    outcome,
-                    ..
-                },
-            ] = &reported[..]
-            else {
-                panic!("one state-root verdict: {reported:?}")
-            };
-            let seated = *seated.lock().expect("seated lock") > 0;
-            (outcome.clone(), seated)
+            state_root_verdict(&self.storage, &self.pending_chain, check)
         }
+    }
+
+    /// Run `check` through the state-root handler of a `LOCAL` replica
+    /// over `storage` and `pending_chain`: its outcome, and whether its
+    /// tree was seated.
+    fn state_root_verdict(
+        storage: &Arc<SimShardStorage>,
+        pending_chain: &Arc<PendingChain<SimShardStorage>>,
+        check: StateRootCheck,
+    ) -> (CheckOutcome, bool) {
+        let reported: Arc<Mutex<Vec<ProtocolEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&reported);
+        let seated = Mutex::new(0usize);
+        let commit_prepared = |_: PreparedBlock| {
+            *seated.lock().expect("seated lock") += 1;
+        };
+        let executor = Executor::new(ExecutionMode::Serial);
+        let snapshot = TestCommittee::new(4, 7).topology_snapshot(2);
+        let tick_chain = Arc::new(TickChain::new(Arc::clone(storage)));
+        let ctx = ActionContext {
+            executor: &executor,
+            topology_snapshot: &snapshot,
+            signing: None,
+            shard: LOCAL,
+            pending_chain,
+            tick_chain: &tick_chain,
+            vote_registers: storage.as_ref(),
+            beacon_chain: &SimBeaconStorage::new(),
+            network: &Arc::new(Silent),
+            verifier: &BlsVerifier,
+            notify: Arc::new(move |event| sink.lock().expect("reported lock").push(event)),
+            commit_prepared: &commit_prepared,
+            par: Parallelism::Sequential,
+        };
+        handle_action(ConsensusAction::VerifyStateRoot(Box::new(check)), &ctx);
+        let reported = std::mem::take(&mut *reported.lock().expect("reported lock"));
+        let [
+            ProtocolEvent::BlockCheckCompleted {
+                kind: VerificationKind::StateRoot,
+                outcome,
+                ..
+            },
+        ] = &reported[..]
+        else {
+            panic!("one state-root verdict: {reported:?}")
+        };
+        let seated = *seated.lock().expect("seated lock") > 0;
+        (outcome.clone(), seated)
     }
 
     /// The map a voter computes over the state an honest block leaves is
@@ -3294,5 +3310,300 @@ mod tests {
         let (outcome, seated) = block.check(underived(&block), None);
         assert!(matches!(outcome, CheckOutcome::Checked { .. }));
         assert!(seated);
+    }
+
+    /// The collection the ranged reader's interval sits in.
+    const COLLECTION: CollectionId = CollectionId([0xEE; 16]);
+
+    /// Entry changes in [`COLLECTION`] under `owner`: `(order, value)`, a
+    /// `None` value deleting.
+    fn entry_changes(owner: Address, changes: &[(u128, Option<u8>)]) -> SettledWrites {
+        SettledWrites::from_parts(
+            BTreeMap::new(),
+            changes
+                .iter()
+                .map(|(order, value)| {
+                    (
+                        EntryKey {
+                            owner,
+                            collection: COLLECTION,
+                            order: *order,
+                        },
+                        value.map(|byte| vec![byte]),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// A `LOCAL` tick at `height` settling `writes`.
+    fn settling(height: BlockHeight, writes: SettledWrites) -> Verifiable<Finalization> {
+        let receipt = StoredReceipt::new(
+            TxHash::from(Hash::from_bytes(&height.inner().to_le_bytes())),
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: writes.into(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        );
+        Verifiable::from(Finalization::new(
+            TickId::new(LOCAL, height),
+            TickHalf::Determined,
+            Some(placeholder_local_ec(LOCAL, height)),
+            Capped::from_array([receipt]),
+        ))
+    }
+
+    /// The parent a proposal below builds on.
+    struct Parent {
+        hash: BlockHash,
+        height: BlockHeight,
+        state_root: StateRoot,
+        sweep_frontier: SweepFrontier,
+    }
+
+    /// The block `LOCAL`'s proposer builds on `parent` over `chain`,
+    /// carrying `transactions` and `finalization`.
+    fn proposed(
+        chain: &Arc<PendingChain<SimShardStorage>>,
+        committee: &TopologySnapshot,
+        parent: &Parent,
+        transactions: &[Verified<Transaction>],
+        finalization: Verifiable<Finalization>,
+    ) -> ProposalResult {
+        let height = parent.height.next();
+        let parent_qc = QuorumCertificate::new(
+            parent.hash,
+            LOCAL,
+            parent.height,
+            BlockHash::ZERO,
+            Round::new(parent.height.inner()),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        build_proposal(
+            &chain.view_at(parent.hash, parent.height),
+            ValidatorId::new(0),
+            height,
+            Round::new(height.inner()),
+            parent.hash,
+            parent_qc,
+            ProposerTimestamp::from_millis(0),
+            false,
+            parent.state_root,
+            parent.height,
+            &Capped::new(transactions.to_vec()).expect("a list written out in a test"),
+            Capped::from_array([finalization]),
+            LOCAL,
+            WeightedTimestamp::ZERO,
+            committee,
+            Capped::empty(),
+            Capped::empty(),
+            Capped::empty(),
+            BlockHeight::GENESIS,
+            BlockSweep::of_child(parent.sweep_frontier, false),
+            None,
+            SubstateClaim::default(),
+            Capped::empty(),
+            None,
+            VrfProof::ZERO,
+            &[],
+            BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
+            Epoch::GENESIS,
+            Epoch::GENESIS,
+            false,
+            None,
+            &FrontierInputs::still(LOCAL),
+            &ManifestInputs::default(),
+            None,
+            Some(&StandingAnswers::default()),
+        )
+        .expect("nothing is persisted past the parent")
+    }
+
+    /// A proposal whose cross-shard transaction reads a declared interval
+    /// both it and its pipelined, unpersisted parent write into commits
+    /// the entries the interval holds after the block, read through the
+    /// persisted store, the parent's overlay and the block's own writes;
+    /// and a voter judging the header recomputes the same map and seats
+    /// the block.
+    #[test]
+    fn a_range_read_over_a_pipelined_parent_is_the_voters_own() {
+        install_stub_protocol_statics();
+        let committee = TestCommittee::new(4, 7).topology_snapshot(2);
+        let trie = committee.shard_trie().clone();
+        assert_eq!(trie, ShardTrie::uniform(1));
+        let payer = PrincipalAddr::new([0x80; 31]);
+        let held = PrincipalAddr::new([0x10; 31]).address();
+        assert_eq!(trie.shard_for_prefix(held), LOCAL);
+        assert_eq!(trie.shard_for_prefix(payer.address()), PAYER_SHARD);
+        let interval = DeclaredRange {
+            owner: held,
+            collection: COLLECTION,
+            lo: 0,
+            hi: 20,
+            cap: 8,
+        };
+        let stub = stub_transaction_with_reads(
+            payer,
+            &[held],
+            &[payer.address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let mut routing = stub.routing().clone();
+        routing.provision_keys.push(DeclaredKey::Range(interval));
+        let tx = stub.with_routing(&StubVmStatics, routing);
+
+        // The persisted store holds orders 0, 5 and 30; the parent adds
+        // 1 and 3 and deletes 5; the block adds 2 and 25 and deletes 3.
+        // The interval holds 0, 1 and 2 after the block.
+        let storage = Arc::new(SimShardStorage::default());
+        commit_writes(
+            &*storage,
+            &entry_changes(held, &[(0, Some(1)), (5, Some(1)), (30, Some(1))]),
+        );
+        let (base_height, Some(base_hash)) = storage.committed_head() else {
+            panic!("the store holds a committed block")
+        };
+        let chain = Arc::new(PendingChain::new(
+            Arc::clone(&storage),
+            BlockHeight::GENESIS,
+        ));
+        let base = Parent {
+            hash: base_hash,
+            height: base_height,
+            state_root: storage.state_root(),
+            sweep_frontier: SweepFrontier::ZERO,
+        };
+        let parent_built = proposed(
+            &chain,
+            &committee,
+            &base,
+            &[],
+            settling(
+                base_height.next(),
+                entry_changes(held, &[(1, Some(2)), (3, Some(2)), (5, None)]),
+            ),
+        );
+        let parent_header = parent_built.block.header();
+        chain.insert(
+            parent_built.block_hash,
+            ChainEntry {
+                parent_block_hash: base_hash,
+                height: parent_header.height(),
+                settled_txs: Vec::new(),
+                jmt_snapshot: Arc::clone(&parent_built.jmt_snapshot),
+                certified_block: None,
+            },
+        );
+        assert_eq!(storage.jmt_height(), base_height, "the parent is pending");
+        let parent = Parent {
+            hash: parent_built.block_hash,
+            height: parent_header.height(),
+            state_root: parent_header.state_root(),
+            sweep_frontier: parent_header.sweep_frontier(),
+        };
+        let built = proposed(
+            &chain,
+            &committee,
+            &parent,
+            &[Verified::new_unchecked_for_test(tx.clone())],
+            settling(
+                parent.height.next(),
+                entry_changes(held, &[(2, Some(3)), (3, None), (25, Some(3))]),
+            ),
+        );
+        assert_eq!(built.block.transactions().len(), 1, "the reader is carried");
+        assert_eq!(
+            built.block.header().provision_tx_roots(),
+            &owed_over(tx.hash(), held, &[0, 1, 2]),
+            "the proposer commits what the interval holds after the block",
+        );
+
+        let (outcome, seated) =
+            state_root_verdict(&storage, &chain, judged_check(&built, &parent, trie));
+        assert!(
+            matches!(outcome, CheckOutcome::Checked { .. }),
+            "the voter's map is the proposer's: {outcome:?}",
+        );
+        assert!(seated);
+    }
+
+    /// The map a block owes [`PAYER_SHARD`] for one transaction `tx_hash`
+    /// serving `held`'s stub cell and the [`COLLECTION`] entries at
+    /// `orders`.
+    fn owed_over(tx_hash: TxHash, held: Address, orders: &[u128]) -> ProvisionTxRootsMap {
+        let mut served: Vec<SubstateKey> = orders
+            .iter()
+            .map(|&order| {
+                entry_leaf_key(
+                    &ProtocolHasher,
+                    EntryKey {
+                        owner: held,
+                        collection: COLLECTION,
+                        order,
+                    },
+                )
+            })
+            .collect();
+        served.push(SubstateKey {
+            owner: held,
+            local: LocalKey([0; 16]),
+        });
+        served.sort_unstable();
+        ProvisionTxRootsMap::new(BTreeMap::from([(
+            PAYER_SHARD,
+            ProvisionTxRoot::over(&[provision_leaf(tx_hash, served_digest(served.into_iter()))]),
+        )]))
+        .expect("one target")
+    }
+
+    /// The state-root check a voter runs on `built` over `parent`, judged
+    /// under `trie` against the map its header claims: every input read
+    /// off the block as the coordinator reads it.
+    fn judged_check(built: &ProposalResult, parent: &Parent, trie: ShardTrie) -> StateRootCheck {
+        let block = &built.block;
+        let frontier = FrontierInputs::still(LOCAL);
+        StateRootCheck {
+            block_hash: built.block_hash,
+            transactions: Arc::clone(block.transactions()),
+            parent_block_hash: parent.hash,
+            parent_state_root: parent.state_root,
+            parent_block_height: parent.height,
+            expected_root: block.header().state_root(),
+            finalizations: block.certificates().iter().cloned().collect(),
+            creations: committed_here(
+                LOCAL,
+                WeightedTimestamp::ZERO,
+                block.transactions().iter().map(Verifiable::as_unverified),
+            ),
+            block_height: block.height(),
+            claimed_split_child_roots: None,
+            split_child_roots_required: false,
+            terminal_settled_txs_required: false,
+            claimed_terminal_settled_txs: None,
+            parent_weighted_timestamp: WeightedTimestamp::ZERO,
+            settled_txs_window_floor: None,
+            parent_sweep_frontier: parent.sweep_frontier,
+            claimed_sweep_frontier: block.header().sweep_frontier(),
+            members: MemberInputs::of(block, frontier.windows),
+            frontier,
+            parent_judgement: Some(ParentJudgement {
+                fence: ReadFence::default(),
+                coasting: false,
+                provisions: ProvisionJudgement {
+                    claimed: block.header().provision_tx_roots().clone(),
+                    trie,
+                },
+            }),
+            state_claims: block.state_claims().to_vec(),
+        }
     }
 }
