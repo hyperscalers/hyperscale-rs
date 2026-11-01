@@ -21,7 +21,7 @@ use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedSto
 use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
-    Anchor, BlockHeight, MAX_TXS_PER_BLOCK, MAX_WIRE_MESSAGE_BYTES, PROVISION_FRAMING_BYTES,
+    Anchor, BlockHeight, MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, PROVISION_FRAMING_BYTES,
     Provision, ProvisionContext, ProvisionsSenderMessage, ShardId, Stopwatch, ValidatorId,
     Verifiable, Verified, Verify, WeightedTimestamp, signed_bytes,
 };
@@ -38,9 +38,12 @@ pub(crate) struct ProvisionBatch {
     pub(crate) recipients: Vec<ValidatorId>,
 }
 
-/// The bytes of parts one notification packs, leaving its frame room for
-/// the scope, sender and signature around them.
-const PACK_BYTES: usize = MAX_WIRE_MESSAGE_BYTES - PROVISION_FRAMING_BYTES;
+/// The bytes of parts one notification packs, leaving room for the scope,
+/// sender and signature around them within a fetch response's budget. The
+/// frame caps the compressed length, and the slack that budget leaves
+/// under the frame covers what compression adds to bytes it cannot
+/// shrink.
+const PACK_BYTES: usize = MAX_FETCH_RESPONSE_BYTES - PROVISION_FRAMING_BYTES;
 
 /// `parts` in order, cut into packs of at most [`PACK_BYTES`] each. A part
 /// always fits alone: the builder refuses one past
@@ -255,13 +258,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_network::compression::compress;
     use hyperscale_types::{
-        Hash, LeafPath, MAX_MERKLE_PROOF_LEN, MerkleInclusionProof, ProvisionParts, TxHash,
+        Hash, LeafPath, MAX_WIRE_MESSAGE_BYTES, MerkleInclusionProof, ProvisionParts, TxHash,
     };
 
     use super::*;
 
-    /// A part carrying a proof at its decode cap.
+    /// A part carrying a three MiB proof: two fit one pack, three do not.
     fn heavy(index: u32) -> Provision {
         Provision::new(ProvisionParts {
             source_shard: ShardId::leaf(1, 0),
@@ -270,7 +274,7 @@ mod tests {
             source_block_ts: WeightedTimestamp::ZERO,
             tx_hash: TxHash::from(Hash::from_bytes(&index.to_le_bytes())),
             entries: Capped::empty(),
-            proof: MerkleInclusionProof::new(vec![0x5A; MAX_MERKLE_PROOF_LEN]),
+            proof: MerkleInclusionProof::new(vec![0x5A; 3 * 1024 * 1024]),
             leaf: LeafPath {
                 count: 3,
                 index,
@@ -294,5 +298,26 @@ mod tests {
             assert!(pack.iter().map(encoded_len).sum::<usize>() <= PACK_BYTES);
         }
         assert!(pack(Vec::new()).is_empty());
+    }
+
+    /// The frame caps a notification's compressed length, and compression
+    /// grows bytes it cannot shrink: a pack at its budget, framed, still
+    /// fits the frame once compressed, whatever its bytes.
+    #[test]
+    fn a_full_pack_fits_the_frame_compressed() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let incompressible: Vec<u8> = (0..PACK_BYTES + PROVISION_FRAMING_BYTES)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        let compressed = compress(&incompressible).len();
+        assert!(
+            compressed <= MAX_WIRE_MESSAGE_BYTES,
+            "{compressed} bytes compressed past the {MAX_WIRE_MESSAGE_BYTES} byte frame",
+        );
     }
 }
