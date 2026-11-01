@@ -1402,41 +1402,43 @@ where
             // A judged block's provision roots are recomputed over the
             // state it leaves, which its state root commits, and held to
             // its claim whether the claim is empty or not. A certified
-            // block's are not judged.
-            let computed_provision_tx_roots = match &parent_judgement {
+            // block's are not judged. Timed on its own and kept out of the
+            // state root's figure.
+            let provision_timer = Stopwatch::start();
+            let computed = parent_judgement.as_ref().map(|judgement| {
+                provision_tx_roots(
+                    &PreparedBlockView {
+                        parent: &anchored,
+                        block: &jmt_snapshot,
+                    },
+                    &judgement.provisions.trie,
+                    ctx.shard,
+                    &transactions,
+                )
+            });
+            let provision_elapsed = provision_timer.elapsed();
+            if computed.is_some() {
+                record_signature_verification_latency(
+                    "provision_tx_roots",
+                    provision_elapsed.as_secs_f64(),
+                );
+            }
+            let computed_provision_tx_roots = match computed {
                 None => None,
-                Some(judgement) => {
-                    let start = Stopwatch::start();
-                    let computed = provision_tx_roots(
-                        &PreparedBlockView {
-                            parent: &anchored,
-                            block: &jmt_snapshot,
-                        },
-                        &judgement.provisions.trie,
-                        ctx.shard,
-                        &transactions,
+                Some(Ok(computed)) => Some(computed),
+                Some(Err(unrouted)) => {
+                    tracing::warn!(
+                        ?block_hash,
+                        height = block_height.inner(),
+                        %unrouted,
+                        "Rejecting block whose provision roots this node cannot route"
                     );
-                    record_signature_verification_latency(
-                        "provision_tx_roots",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    match computed {
-                        Ok(computed) => Some(computed),
-                        Err(unrouted) => {
-                            tracing::warn!(
-                                ?block_hash,
-                                height = block_height.inner(),
-                                %unrouted,
-                                "Rejecting block whose provision roots this node cannot route"
-                            );
-                            ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
-                                block_hash,
-                                kind: VerificationKind::StateRoot,
-                                outcome: CheckOutcome::Refused,
-                            });
-                            return;
-                        }
-                    }
+                    ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
+                        block_hash,
+                        kind: VerificationKind::StateRoot,
+                        outcome: CheckOutcome::Refused,
+                    });
+                    return;
                 }
             };
             // A terminating shard's boundary header carries the settled
@@ -1492,7 +1494,13 @@ where
                         computed,
                     }),
             });
-            record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
+            record_signature_verification_latency(
+                "state_root",
+                start
+                    .elapsed()
+                    .saturating_sub(provision_elapsed)
+                    .as_secs_f64(),
+            );
             let bytes_delta = jmt_snapshot.bytes_delta;
             let answers = jmt_snapshot.answer_delta(&anchored, &shard_prefix_path(ctx.shard));
             let additions = answer_additions(
