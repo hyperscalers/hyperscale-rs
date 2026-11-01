@@ -6,9 +6,21 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// What one production publishes to the callers waiting on it. `None`
-/// while it runs; `Some(None)` once it ends having made nothing, a panic
-/// included.
+/// while it runs; `Some(None)` once it ends without making the key, a
+/// panic included, and the callers waiting ask for it again.
 type Waiter<V> = Arc<(Mutex<Option<Option<V>>>, Condvar)>;
+
+/// Keys beside the production each is answered by.
+type Held<K, V> = Vec<(K, Waiter<V>)>;
+
+/// What a joined production published by the joiner's deadline.
+enum Published<V> {
+    Made(V),
+    /// It ended without making the key, and the joiner asks again.
+    Unmade,
+    /// It was still running.
+    Late,
+}
 
 struct Slot<V> {
     waiter: Waiter<V>,
@@ -48,8 +60,8 @@ pub enum Flight<V> {
     Joined(V),
     /// By this caller's own production.
     Produced(V),
-    /// Not at all: the production made nothing for it, the wait ran out,
-    /// or the key already had `max_waiters` callers waiting.
+    /// Not at all: this caller's own production left it out, the wait
+    /// ran out, or the key already had `max_waiters` callers waiting.
     Unavailable,
 }
 
@@ -85,8 +97,11 @@ impl<K: Ord + Copy, V: Clone> SingleFlight<K, V> {
 
     /// Answer each of `keys` from the cache, from a production already
     /// running for it, or by running `produce` here over the keys nobody
-    /// holds. `produce` returns a value for each key it made; a key it
-    /// leaves out is unavailable, to this caller and to any waiting on it.
+    /// holds. `produce` returns a value for each key it made. A key it
+    /// leaves out was not made: it is unavailable to this caller, and a
+    /// caller that was waiting on it asks for it again, producing it
+    /// itself if nobody has taken it up meanwhile, while its wait budget
+    /// lasts. `produce` runs once per such round.
     ///
     /// The cache checks, the joins and the producer's reservations share
     /// one critical section, so at most one production runs per key. This
@@ -94,15 +109,52 @@ impl<K: Ord + Copy, V: Clone> SingleFlight<K, V> {
     pub fn get_or_produce(
         &self,
         keys: &[K],
-        produce: impl FnOnce(&[K]) -> Vec<(K, V)>,
+        mut produce: impl FnMut(&[K]) -> Vec<(K, V)>,
     ) -> Vec<(K, Flight<V>)> {
         let mut answers: BTreeMap<K, Flight<V>> = BTreeMap::new();
-        let mut joins = Vec::new();
-        let mut own = Vec::new();
         // A key named twice would otherwise wait on its own production.
         let mut seen = BTreeSet::new();
+        let mut asking: Vec<K> = keys
+            .iter()
+            .copied()
+            .filter(|key| seen.insert(*key))
+            .collect();
+        let mut deadline = None;
+        while !asking.is_empty() {
+            let (own, joins) = self.reserve(&asking, &mut answers);
+            if !own.is_empty() {
+                answers.extend(self.produce(own, &mut produce));
+            }
+            let deadline = *deadline.get_or_insert_with(|| Instant::now() + self.wait_budget);
+            asking.clear();
+            for (key, waiter) in joins {
+                match self.join(key, &waiter, deadline) {
+                    Published::Made(value) => {
+                        answers.insert(key, Flight::Joined(value));
+                    }
+                    Published::Unmade if Instant::now() < deadline => asking.push(key),
+                    Published::Unmade | Published::Late => {
+                        answers.insert(key, Flight::Unavailable);
+                    }
+                }
+            }
+        }
+        keys.iter()
+            .filter_map(|key| answers.remove(key).map(|flight| (*key, flight)))
+            .collect()
+    }
+
+    /// Answer each of `keys` from the cache or turn it away, and split the
+    /// rest into those this caller now produces and those it joins.
+    fn reserve(
+        &self,
+        keys: &[K],
+        answers: &mut BTreeMap<K, Flight<V>>,
+    ) -> (Held<K, V>, Held<K, V>) {
+        let mut joins = Vec::new();
+        let mut own = Vec::new();
         let mut state = lock(&self.state);
-        for &key in keys.iter().filter(|key| seen.insert(**key)) {
+        for &key in keys {
             if let Some((cached, _)) = state.cache.get(&key) {
                 answers.insert(key, Flight::Cached(cached.clone()));
             } else if let Some(slot) = state.in_flight.get_mut(&key) {
@@ -125,22 +177,13 @@ impl<K: Ord + Copy, V: Clone> SingleFlight<K, V> {
             }
         }
         drop(state);
-        if !own.is_empty() {
-            answers.extend(self.produce(own, produce));
-        }
-        let deadline = Instant::now() + self.wait_budget;
-        for (key, waiter) in joins {
-            answers.insert(key, self.join(key, &waiter, deadline));
-        }
-        keys.iter()
-            .filter_map(|key| answers.remove(key).map(|flight| (*key, flight)))
-            .collect()
+        (own, joins)
     }
 
     fn produce(
         &self,
-        own: Vec<(K, Waiter<V>)>,
-        produce: impl FnOnce(&[K]) -> Vec<(K, V)>,
+        own: Held<K, V>,
+        produce: &mut impl FnMut(&[K]) -> Vec<(K, V)>,
     ) -> Vec<(K, Flight<V>)> {
         let keys: Vec<K> = own.iter().map(|(key, _)| *key).collect();
         let guards: Vec<InFlightGuard<K, V>> = own
@@ -194,14 +237,29 @@ impl<K: Ord + Copy, V: Clone> SingleFlight<K, V> {
         }
     }
 
-    fn join(&self, key: K, waiter: &Waiter<V>, deadline: Instant) -> Flight<V> {
+    /// How many callers are waiting on the production running for `key`.
+    #[cfg(test)]
+    pub fn waiting(&self, key: &K) -> usize {
+        lock(&self.state)
+            .in_flight
+            .get(key)
+            .map_or(0, |slot| slot.waiters)
+    }
+
+    /// What the production `waiter` names published for `key` by
+    /// `deadline`.
+    fn join(&self, key: K, waiter: &Waiter<V>, deadline: Instant) -> Published<V> {
         let (answer, cvar) = &**waiter;
         let answer = {
             let left = deadline.saturating_duration_since(Instant::now());
             let (answer, _) = cvar
                 .wait_timeout_while(lock(answer), left, |answer| answer.is_none())
                 .unwrap_or_else(PoisonError::into_inner);
-            answer.clone().flatten()
+            match answer.clone() {
+                Some(Some(value)) => Published::Made(value),
+                Some(None) => Published::Unmade,
+                None => Published::Late,
+            }
         };
         // The producer's guard may already have cleared the slot, and a
         // later producer may hold the key by now: only the slot this call
@@ -211,14 +269,14 @@ impl<K: Ord + Copy, V: Clone> SingleFlight<K, V> {
         {
             slot.waiters = slot.waiters.saturating_sub(1);
         }
-        answer.map_or(Flight::Unavailable, Flight::Joined)
+        answer
     }
 }
 
 /// A production's hold on one key. Dropped on every exit from the
 /// production, a panicking one included, it clears the key's slot if the
 /// slot is still this production's, ends the production for its waiters
-/// if it published nothing, and wakes them.
+/// if it published nothing, so they ask again, and wakes them.
 struct InFlightGuard<K: Ord, V> {
     state: Arc<Mutex<State<K, V>>>,
     waiter: Waiter<V>,
@@ -365,27 +423,34 @@ mod tests {
         );
     }
 
+    /// A key the production leaves out was not made, not found to have
+    /// no value: the caller waiting on it produces it itself.
     #[test]
-    fn a_production_that_makes_nothing_releases_its_waiters_at_once() {
+    fn a_waiter_produces_what_the_production_left_out() {
         let flight = Arc::new(flight(64, 4));
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let producer = {
             let flight = Arc::clone(&flight);
             thread::spawn(move || {
-                flight.get_or_produce(&[1], |_| {
+                flight.get_or_produce(&[1, 2], |_| {
                     started_tx.send(()).expect("started");
                     release_rx.recv().expect("release");
-                    Vec::new()
+                    vec![(1, 1)]
                 })
             })
         };
         started_rx.recv().expect("producer started");
         let waiter = {
             let flight = Arc::clone(&flight);
-            thread::spawn(move || flight.get_or_produce(&[1], |_| panic!("the key is in flight")))
+            thread::spawn(move || {
+                flight.get_or_produce(&[1, 2], |keys| {
+                    assert_eq!(keys, [2], "only the key left out");
+                    vec![(2, 2)]
+                })
+            })
         };
-        while lock(&flight.state).in_flight[&1].waiters == 0 {
+        while flight.waiting(&2) == 0 {
             thread::yield_now();
         }
         let released = Instant::now();
@@ -393,15 +458,15 @@ mod tests {
 
         assert_eq!(
             producer.join().expect("producer"),
-            vec![(1, Flight::Unavailable)]
+            vec![(1, Flight::Produced(1)), (2, Flight::Unavailable)]
         );
         assert_eq!(
             waiter.join().expect("waiter"),
-            vec![(1, Flight::Unavailable)]
+            vec![(1, Flight::Joined(1)), (2, Flight::Produced(2))]
         );
         assert!(released.elapsed() < BUDGET);
         assert!(lock(&flight.state).in_flight.is_empty());
-        assert_eq!(one(&flight, 1, Some(3)), Flight::Produced(3));
+        assert_eq!(one(&flight, 2, None), Flight::Cached(2));
     }
 
     #[test]

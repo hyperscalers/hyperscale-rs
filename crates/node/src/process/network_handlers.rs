@@ -1094,11 +1094,12 @@ type ProvisionFlight = SingleFlight<(BlockHeight, ShardId, u32), ServedPart>;
 /// cache, from a build another ask is already running for it, or by
 /// `build` over the indices nobody holds. A block not held builds
 /// nothing and is not kept: it may yet commit here, and a cached miss
-/// would outlive that.
+/// would outlive that. A holder's answer states the count even when no
+/// part came of the ask.
 fn serve_provisions(
     flight: &ProvisionFlight,
     req: &GetProvisionsRequest,
-    build: impl FnOnce(&[u32]) -> Option<BuiltParts>,
+    mut build: impl FnMut(&[u32]) -> Option<BuiltParts>,
 ) -> GetProvisionResponse {
     let mut indices: Vec<u32> = req.indices.to_vec();
     indices.sort_unstable();
@@ -1119,11 +1120,14 @@ fn serve_provisions(
             .map(|(index, served)| ((req.height, req.target_shard, index), served))
             .collect()
     });
-    provision_answer(
-        req.indices.len(),
-        served.into_iter().filter_map(|(_, flight)| flight.value()),
-        count,
-    )
+    let served: Vec<ServedPart> = served
+        .into_iter()
+        .filter_map(|(_, flight)| flight.value())
+        .collect();
+    if served.is_empty() && count.is_none() {
+        count = build(&[]).and_then(|made| made.count);
+    }
+    provision_answer(req.indices.len(), served, count)
 }
 
 /// Register one shard's per-type request handlers with the network.
@@ -1448,6 +1452,7 @@ mod tests {
     use hyperscale_core::ProtocolEvent;
     use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
     use hyperscale_network::{HandlerRegistry, PeerId, Provenance, Verdict};
+    use hyperscale_types::network::Request;
     use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, TransactionGossip};
     use hyperscale_types::network::notification::{
         BlockHeaderNotification, ReadySignalNotification,
@@ -1843,6 +1848,150 @@ mod tests {
             },
         });
         ServedPart::new(Some(part), ProvisionCount::over(&[provision_leaf(tx_hash)]))
+    }
+
+    /// A source block at height 1 owing its one target ten parts.
+    const OWED: u32 = 10;
+
+    /// The ask for `indices` of the block at height 1.
+    fn ask_for(indices: impl IntoIterator<Item = u32>) -> GetProvisionsRequest {
+        GetProvisionsRequest::new(
+            BlockHeight::new(1),
+            ShardId::leaf(1, 1),
+            Capped::new(indices.into_iter().collect()).expect("within the cap"),
+        )
+    }
+
+    /// The block's count witness over its ten leaves.
+    fn owed_count() -> ProvisionCount {
+        let leaves: Vec<Hash> = (0..OWED)
+            .map(|index| provision_leaf(TxHash::from(Hash::from_bytes(&index.to_le_bytes()))))
+            .collect();
+        ProvisionCount::over(&leaves)
+    }
+
+    /// The block's part at `index`.
+    fn owed_part(index: u32) -> ServedPart {
+        let part = Provision::new(ProvisionParts {
+            source_shard: SHARD,
+            target_shard: ShardId::leaf(1, 1),
+            block_height: BlockHeight::new(1),
+            source_block_ts: WeightedTimestamp::ZERO,
+            tx_hash: TxHash::from(Hash::from_bytes(&index.to_le_bytes())),
+            entries: Capped::empty(),
+            proof: MerkleInclusionProof::new(Vec::new()),
+            leaf: LeafPath {
+                count: OWED,
+                index,
+                siblings: Capped::empty(),
+            },
+        });
+        ServedPart::new(Some(part), owed_count())
+    }
+
+    /// What the block's holder builds of `indices`, stopping after
+    /// `stop` parts as a full response would.
+    fn owed_build(indices: &[u32], stop: usize) -> BuiltParts {
+        BuiltParts {
+            count: Some(owed_count()),
+            parts: indices
+                .iter()
+                .filter(|index| **index < OWED)
+                .take(stop)
+                .map(|index| (*index, owed_part(*index)))
+                .collect(),
+        }
+    }
+
+    /// An ask that joins the indices another ask's build stopped short
+    /// of builds them itself, and states the count: the indices were
+    /// never tried, which says nothing about them.
+    #[test]
+    fn an_ask_builds_what_a_stopped_build_left_untried() {
+        let flight = Arc::new(ProvisionFlight::new(
+            PROVISION_CACHE_BYTES,
+            ServedPart::weight,
+            4,
+            Duration::from_secs(5),
+        ));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let flight = Arc::clone(&flight);
+            std::thread::spawn(move || {
+                serve_provisions(&flight, &ask_for(0..OWED), |indices| {
+                    started_tx.send(()).expect("started");
+                    release_rx.recv().expect("release");
+                    Some(owed_build(indices, OWED as usize / 2))
+                })
+            })
+        };
+        started_rx.recv().expect("the first build started");
+        let second = {
+            let flight = Arc::clone(&flight);
+            std::thread::spawn(move || {
+                serve_provisions(&flight, &ask_for(OWED / 2..OWED), |indices| {
+                    Some(owed_build(indices, OWED as usize))
+                })
+            })
+        };
+        let last = (BlockHeight::new(1), ShardId::leaf(1, 1), OWED - 1);
+        while flight.waiting(&last) == 0 {
+            std::thread::yield_now();
+        }
+        release_tx.send(()).expect("release");
+
+        let first = first.join().expect("first ask");
+        assert_eq!(first.parts.len(), OWED as usize / 2);
+        let second = second.join().expect("second ask");
+        assert_eq!(second.count, Some(owed_count()));
+        assert_eq!(
+            second
+                .parts
+                .iter()
+                .map(|part| part.leaf().index)
+                .collect::<Vec<_>>(),
+            (OWED / 2..OWED).collect::<Vec<_>>(),
+            "the second ask builds the indices the first left untried",
+        );
+    }
+
+    /// An ask none of whose indices this holder can answer now, every one
+    /// in another ask's build with no room left to wait on it, still
+    /// states the count: an answer with neither would strike an honest
+    /// holder from the fetch.
+    #[test]
+    fn an_ask_answered_nothing_still_states_the_count() {
+        let flight = Arc::new(ProvisionFlight::new(
+            PROVISION_CACHE_BYTES,
+            ServedPart::weight,
+            0,
+            Duration::from_secs(5),
+        ));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let flight = Arc::clone(&flight);
+            std::thread::spawn(move || {
+                serve_provisions(&flight, &ask_for(0..OWED), |indices| {
+                    started_tx.send(()).expect("started");
+                    release_rx.recv().expect("release");
+                    Some(owed_build(indices, OWED as usize))
+                })
+            })
+        };
+        started_rx.recv().expect("the first build started");
+
+        let turned_away = serve_provisions(&flight, &ask_for(0..OWED), |indices| {
+            assert!(indices.is_empty(), "every asked index is in flight");
+            Some(owed_build(indices, OWED as usize))
+        });
+        assert!(turned_away.parts.is_empty());
+        assert_eq!(turned_away.count, Some(owed_count()));
+        assert!(!GetProvisionsRequest::is_empty_response(&turned_away));
+
+        release_tx.send(()).expect("release");
+        assert_eq!(first.join().expect("first ask").parts.len(), OWED as usize);
     }
 
     /// A seat's provision serve keeps the parts it built within its byte
