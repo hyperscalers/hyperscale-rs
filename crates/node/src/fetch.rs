@@ -70,6 +70,16 @@ impl FetchConfig {
             chunks_per_dispatch,
         }
     }
+
+    /// This schedule with its batch clamped to `cap`, what one request
+    /// may carry.
+    #[must_use]
+    pub(crate) fn clamped(&self, cap: usize) -> Self {
+        Self {
+            max_ids_per_request: self.max_ids_per_request.min(cap),
+            ..self.clone()
+        }
+    }
 }
 
 impl Default for FetchConfig {

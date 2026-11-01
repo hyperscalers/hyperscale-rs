@@ -38,7 +38,7 @@ use tracing::warn;
 use crate::config::NodeConfig;
 use crate::event::{BeaconScopedInput, HostEvent};
 use crate::fetch::{
-    Fetch, FetchBinding, FetchConfig, FetchOwner, FetchReply, FetchedBy, HandsOver, Refusal, Route,
+    Fetch, FetchBinding, FetchOwner, FetchReply, FetchedBy, HandsOver, Refusal, Route,
     ScopedAnswer, defers_to_the_tick, dispatch_scoped, scored, transport_failed,
 };
 use crate::shard::SharedTopologySnapshot;
@@ -101,29 +101,20 @@ impl BeaconFetchState {
             ),
             instance_record: InstanceRecordFetch::new(
                 "instance_record",
-                clamped(
-                    &config.instance_record_fetch,
-                    MAX_INSTANCE_RECORDS_PER_REQUEST,
-                ),
+                config
+                    .instance_record_fetch
+                    .clamped(MAX_INSTANCE_RECORDS_PER_REQUEST),
             ),
             // The wire caps the batch far below the generic default: an
             // artifact runs to a transaction's whole byte budget.
             package_artifact: PackageArtifactFetch::new(
                 "package_artifact",
-                clamped(
-                    &config.package_artifact_fetch,
-                    MAX_PACKAGE_ARTIFACTS_PER_REQUEST,
-                ),
+                config
+                    .package_artifact_fetch
+                    .clamped(MAX_PACKAGE_ARTIFACTS_PER_REQUEST),
             ),
         }
     }
-}
-
-/// `config` with its batch clamped to what one request may carry.
-fn clamped(config: &FetchConfig, cap: usize) -> FetchConfig {
-    let mut config = config.clone();
-    config.max_ids_per_request = config.max_ids_per_request.min(cap);
-    config
 }
 
 impl FetchOwner for BeaconFetchState {

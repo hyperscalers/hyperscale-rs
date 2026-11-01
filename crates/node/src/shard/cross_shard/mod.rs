@@ -26,7 +26,7 @@ pub use fetch::{
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
-use hyperscale_types::LocalTimestamp;
+use hyperscale_types::{LocalTimestamp, MAX_TXS_PER_BLOCK};
 pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::{build_served_provisions, outbound_answer};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
@@ -100,7 +100,10 @@ impl CrossShardState {
     pub(crate) fn new(config: &NodeConfig) -> Self {
         Self {
             remote_header_sync: RemoteHeaderSync::new(remote_header_sync::default_config()),
-            provision: ProvisionFetch::new("provision", config.provision_fetch.clone()),
+            provision: ProvisionFetch::new(
+                "provision",
+                config.provision_fetch.clamped(MAX_TXS_PER_BLOCK),
+            ),
             finalization: FinalizationFetch::new(
                 "finalization",
                 FetchConfig {
@@ -165,14 +168,15 @@ mod tests {
 
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        Anchor, BlockHeight, ShardId, StateRoot, VerdictCells, WeightedTimestamp,
+        Anchor, BlockHeight, MAX_TXS_PER_BLOCK, ShardId, StateRoot, VerdictCells, WeightedTimestamp,
     };
 
     use super::{
-        MAX_VERDICT_ASKS_PER_SIBLING, STATE_PROOF_FETCH, StateProofFetch, VERDICT_PROOF_FETCH,
-        VerdictProofFetch,
+        CrossShardState, MAX_VERDICT_ASKS_PER_SIBLING, ProvisionBinding, STATE_PROOF_FETCH,
+        StateProofFetch, VERDICT_PROOF_FETCH, VerdictProofFetch,
     };
-    use crate::fetch::{Fetch, FetchInput, FetchOutput};
+    use crate::config::NodeConfig;
+    use crate::fetch::{Fetch, FetchConfig, FetchInput, FetchOutput, SolicitedAnswer};
 
     /// `shard`'s header at `height`.
     fn header(shard: ShardId, height: u64) -> Anchor {
@@ -216,6 +220,32 @@ mod tests {
             for FetchOutput::Send { ids, .. } in take(&mut sent) {
                 sent.extend(fetch.handle(FetchInput::Failed { ids }));
             }
+        }
+    }
+
+    /// However wide the configured batch, every chunk the provision fetch
+    /// sends fits the one request it rides in.
+    #[test]
+    fn a_wide_provision_batch_is_clamped_to_one_request() {
+        let config = NodeConfig {
+            provision_fetch: FetchConfig::new(2 * MAX_TXS_PER_BLOCK, 2 * MAX_TXS_PER_BLOCK, 4),
+            ..NodeConfig::default()
+        };
+        let mut state = CrossShardState::new(&config);
+        let (source, target) = (ShardId::leaf(1, 1), ShardId::leaf(1, 0));
+        let indices = 0..=u32::try_from(MAX_TXS_PER_BLOCK).expect("the cap fits a u32");
+        let sent = state.provision.handle(FetchInput::Request {
+            ids: indices
+                .map(|index| (source, target, BlockHeight::new(3), index))
+                .collect(),
+            shard: source,
+            preferred: None,
+            class: None,
+        });
+        assert_eq!(sent.len(), 2);
+        for FetchOutput::Send { ids, .. } in sent {
+            let request = ProvisionBinding::request(&ids);
+            assert!(request.indices.len() <= MAX_TXS_PER_BLOCK);
         }
     }
 
