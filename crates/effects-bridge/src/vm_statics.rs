@@ -20,7 +20,7 @@ use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
     ArtifactTerm, Attestation, Attested, Declared, DeclaredKey, DeclaredRange, Derivation,
     DerivationError, Derived, EnvelopeExt, Hash, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
-    MAX_STATE_ENTRIES_PER_TX, MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing,
+    MAX_PROVISION_WEIGHT, MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing,
     TimestampRange, TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, vault_cell};
@@ -853,13 +853,15 @@ fn classify_declared_access(declared: &EffectSet, fee_payer: PrincipalAddr) -> D
     access
 }
 
-/// Refuse a declaration whose provisions could outgrow one bundle.
+/// Refuse a declaration whose provisions could outgrow one part.
 ///
-/// The wire codec refuses a provision bundle past
-/// [`MAX_STATE_ENTRIES_PER_TX`], so a declaration that could ask for
-/// more is refused here — at admission, before an honest server does
-/// enumeration work a bundle it cannot encode would throw away. A cell
-/// serves one entry; a range serves at most its declared cap.
+/// A part carries one transaction's entries under one proof, and both
+/// the entry list a reader decodes and the claims one proof may carry
+/// are capped, so a declaration that could ask for more than
+/// [`MAX_PROVISION_WEIGHT`] is refused here — at admission, before an
+/// honest server does enumeration work a part it cannot build would
+/// throw away. A cell serves one entry; a range serves at most its
+/// declared cap.
 fn check_provision_weight(provision_keys: &BTreeSet<DeclaredKey>) -> Result<(), DerivationError> {
     let weight: usize = provision_keys
         .iter()
@@ -868,10 +870,10 @@ fn check_provision_weight(provision_keys: &BTreeSet<DeclaredKey>) -> Result<(), 
             DeclaredKey::Range(range) => usize::try_from(range.cap).unwrap_or(usize::MAX),
         })
         .fold(0, usize::saturating_add);
-    if weight > MAX_STATE_ENTRIES_PER_TX {
+    if weight > MAX_PROVISION_WEIGHT {
         return Err(DerivationError::Refused(format!(
             "declared provisions could serve {weight} entries, past the \
-             {MAX_STATE_ENTRIES_PER_TX} one bundle may carry"
+             {MAX_PROVISION_WEIGHT} one part may carry"
         )));
     }
     Ok(())
@@ -2747,11 +2749,80 @@ mod tests {
         let _typed: IntentHash = tree.root.members[0].signed.intent.hash(&ProtocolHasher);
     }
 
-    /// The provision-weight cap: cells count one, ranges count their
-    /// declared cap, and a set the wire codec could not carry as one
-    /// bundle is refused at admission.
+    /// Every provision key is a target of the declared set, so every
+    /// byte a part serves is priced by `read_bytes` at its slot's
+    /// declared width. The fee vault, the one key added beside the set,
+    /// is written and never provisioned.
     #[test]
-    fn a_declaration_past_one_bundles_weight_is_refused() {
+    fn every_provision_key_is_a_declared_target() {
+        let component = Address::new([0x53; 31], AddressClass::Component);
+        let collection = CollectionId([3; 16]);
+        let mut declared = declaring(&[
+            (protocol_vault(), Mode::Read),
+            (
+                vault_key(component, RES_X),
+                Mode::Write { moves: Moves::Both },
+            ),
+            (vault_key(component, *PROTOCOL_RESOURCE), OUT),
+            (protocol_vault(), Mode::Reserve { amount: 5 }),
+        ]);
+        for (target, mode) in [
+            (
+                EffectTarget::Entry {
+                    owner: component,
+                    collection,
+                    order: 7,
+                },
+                Mode::Read,
+            ),
+            (
+                EffectTarget::Range {
+                    owner: component,
+                    collection,
+                    lo: 10,
+                    hi: 20,
+                    cap: 4,
+                },
+                Mode::Read,
+            ),
+            (
+                EffectTarget::Range {
+                    owner: component,
+                    collection,
+                    lo: 30,
+                    hi: 40,
+                    cap: 2,
+                },
+                Mode::Write { moves: Moves::Both },
+            ),
+        ] {
+            declared
+                .insert_at_cap(Effect { target, mode })
+                .expect("the fixture's accesses fold");
+        }
+        let access = classify_declared_access(&declared, payer());
+        let targets: BTreeSet<DeclaredKey> = declared
+            .targets()
+            .map(|target| admission_key(&target))
+            .collect();
+        assert_eq!(access.provision_keys.len(), 5);
+        assert!(
+            access.provision_keys.is_subset(&targets),
+            "{:?} is not within {targets:?}",
+            access.provision_keys
+        );
+        assert!(
+            !access
+                .provision_keys
+                .contains(&DeclaredKey::Cell(vault_key(payer(), *PROTOCOL_RESOURCE)))
+        );
+    }
+
+    /// The provision-weight cap: cells count one, ranges count their
+    /// declared cap, and a set no one part could carry is refused at
+    /// admission.
+    #[test]
+    fn a_declaration_past_one_parts_weight_is_refused() {
         let owner = Address::new([9; 31], AddressClass::Component);
         let range = |cap: u32, salt: u128| {
             DeclaredKey::Range(DeclaredRange {
@@ -2762,7 +2833,7 @@ mod tests {
                 cap,
             })
         };
-        let cap_u32 = u32::try_from(MAX_STATE_ENTRIES_PER_TX).unwrap();
+        let cap_u32 = u32::try_from(MAX_PROVISION_WEIGHT).unwrap();
 
         let at_cap: BTreeSet<DeclaredKey> = [range(cap_u32, 0)].into();
         assert!(check_provision_weight(&at_cap).is_ok());

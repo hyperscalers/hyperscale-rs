@@ -138,7 +138,9 @@ pub use primitives::randomness::{RANDOMNESS_BYTES, Randomness};
 pub use primitives::seeds::{EpochSeed, SEED_WINDOW_EPOCHS, SeedRing, SeedSource};
 pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::entry::ProvisionEntry;
-pub use provisioning::limits::{MAX_MERKLE_PROOF_LEN, MAX_STATE_ENTRIES_PER_TX};
+pub use provisioning::limits::{
+    MAX_MERKLE_PROOF_LEN, MAX_PROVISION_WEIGHT, MAX_STATE_ENTRIES_PER_TX,
+};
 pub use provisioning::proof::{
     CheckedStateProof, Inclusion, MerkleInclusionProof, StateProofError,
 };
