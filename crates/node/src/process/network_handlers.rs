@@ -1117,8 +1117,8 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::beacon::witness_serve::serve_shard_witnesses_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        SettledTxsCache, outbound_parts, serve_cells_request, serve_finalizations_request,
-        serve_local_provisions_request, serve_provision_request, serve_remote_headers_request,
+        SettledTxsCache, build_served_provisions, outbound_answer, serve_cells_request,
+        serve_finalizations_request, serve_local_provisions_request, serve_remote_headers_request,
         serve_settled_txs_request, serve_state_proof_request,
     };
     use crate::shard::mempool::serve_transaction_request;
@@ -1257,32 +1257,32 @@ pub fn register_shard_request_handlers<S, N, D>(
         &*process.network,
         shard,
         move |req: &GetProvisionsRequest| {
-            let height = req.height;
-
-            // Outbound fast path: if we still hold every part we
-            // generated for this (source_block_height, target_shard),
-            // answer from memory — no RocksDB regeneration, no
-            // merkle-proof recomputation.
-            if let Some(parts) = outbound_parts(&outbound_cache, height, req.target_shard) {
-                return GetProvisionResponse { parts };
+            // Outbound fast path: if we still hold every part asked for
+            // that we generated as the block's proposer, answer from
+            // memory — no RocksDB regeneration, no merkle-proof
+            // recomputation.
+            if let Some(response) = outbound_answer(&outbound_cache, req) {
+                return response;
             }
 
-            let cache_key = (height.inner(), req.target_shard.inner());
-            // An answer with nothing in it is not kept: the block may
-            // yet commit here, and a cached miss would outlive that.
+            // The block's whole build is kept per (height, target), and
+            // each ask answered from it. A block not held is not kept:
+            // it may yet commit here, and a cached miss would outlive
+            // that.
+            let cache_key = (req.height.inner(), req.target_shard.inner());
             match provisions_flight.get_or_produce(cache_key, || {
-                let response = serve_provision_request(
+                build_served_provisions(
                     &pending_chain,
                     derivation.as_ref(),
                     shard,
                     topology_snapshot.load().shard_trie(),
-                    req,
-                );
-                (!response.parts.is_empty()).then_some(response)
+                    req.height,
+                    req.target_shard,
+                )
             }) {
-                Flight::Cached(response)
-                | Flight::Joined(response)
-                | Flight::Produced(response) => response,
+                Flight::Cached(served) | Flight::Joined(served) | Flight::Produced(served) => {
+                    served.answer(&req.indices)
+                }
                 Flight::Unavailable => GetProvisionResponse::empty(),
             }
         },

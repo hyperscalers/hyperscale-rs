@@ -53,6 +53,40 @@ pub struct LeafPath {
     pub siblings: Capped<Vec<Hash>, MAX_PROVISION_PATH_DEPTH>,
 }
 
+/// A target's leaf count and the bare merkle root over its leaves: what
+/// any holder of the source block can state, and what wraps to the
+/// header's root when it is true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct ProvisionCount {
+    /// The number of leaves the source block owes the target.
+    pub count: u32,
+    /// The merkle root over those leaves, before the count is wrapped in.
+    pub merkle_root: Hash,
+}
+
+impl ProvisionCount {
+    /// The count `leaves` makes.
+    ///
+    /// # Panics
+    ///
+    /// If `leaves` holds more than `u32::MAX` entries, which no block
+    /// owes a target.
+    #[must_use]
+    pub fn over(leaves: &[Hash]) -> Self {
+        Self {
+            count: u32::try_from(leaves.len()).expect("a block owes a target few leaves"),
+            merkle_root: compute_merkle_root(leaves),
+        }
+    }
+
+    /// The root this count wraps to: equal to the header's when the
+    /// count is true.
+    #[must_use]
+    pub fn root(&self) -> ProvisionTxRoot {
+        ProvisionTxRoot::wrap(self.count, self.merkle_root)
+    }
+}
+
 impl LeafPath {
     /// Every leaf's path under [`ProvisionTxRoot::over`] of `leaves`, in
     /// order.
@@ -85,8 +119,7 @@ impl ProvisionTxRoot {
     /// owes a target.
     #[must_use]
     pub fn over(leaves: &[Hash]) -> Self {
-        let count = u32::try_from(leaves.len()).expect("a block owes a target few leaves");
-        Self::wrap(count, compute_merkle_root(leaves))
+        ProvisionCount::over(leaves).root()
     }
 
     /// The root committing `count` leaves under `merkle_root`.
@@ -105,25 +138,35 @@ impl ProvisionTxRoot {
     /// `count` leaves.
     #[must_use]
     pub fn through(leaf: Hash, path: &LeafPath) -> Option<Self> {
-        if path.count == 0 || path.index >= path.count {
+        Some(Self::wrap(path.count, path.merkle_root(leaf)?))
+    }
+}
+
+impl LeafPath {
+    /// The bare merkle root `leaf` walks to along this path, under the
+    /// same refusals as [`ProvisionTxRoot::through`]: what a holder of
+    /// one checked part states as the count witness beside its count.
+    #[must_use]
+    pub fn merkle_root(&self, leaf: Hash) -> Option<Hash> {
+        if self.count == 0 || self.index >= self.count {
             return None;
         }
-        let depth = path.count.checked_next_power_of_two()?.trailing_zeros() as usize;
-        if path.siblings.len() != depth {
+        let depth = self.count.checked_next_power_of_two()?.trailing_zeros() as usize;
+        if self.siblings.len() != depth {
             return None;
         }
-        let merkle_root = path
-            .siblings
-            .iter()
-            .enumerate()
-            .fold(leaf, |node, (level, sibling)| {
-                if (path.index >> level) & 1 == 0 {
-                    Hash::from_parts(&[node.as_bytes(), sibling.as_bytes()])
-                } else {
-                    Hash::from_parts(&[sibling.as_bytes(), node.as_bytes()])
-                }
-            });
-        Some(Self::wrap(path.count, merkle_root))
+        Some(
+            self.siblings
+                .iter()
+                .enumerate()
+                .fold(leaf, |node, (level, sibling)| {
+                    if (self.index >> level) & 1 == 0 {
+                        Hash::from_parts(&[node.as_bytes(), sibling.as_bytes()])
+                    } else {
+                        Hash::from_parts(&[sibling.as_bytes(), node.as_bytes()])
+                    }
+                }),
+        )
     }
 }
 

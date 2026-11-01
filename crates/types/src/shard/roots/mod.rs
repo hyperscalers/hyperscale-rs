@@ -44,7 +44,7 @@ pub use body::{BodyRootContext, BodyRootVerifyError, SectionRoots, UnboundBody};
 pub use leaf::{LeafRoot, SetRoot};
 pub use provision_tx::{
     CommittingShards, LeafPath, MAX_PROVISION_PATH_DEPTH, PROVISION_LEAF_DOMAIN_TAG,
-    PROVISION_ROOT_DOMAIN_TAG, ProvisionTxRootsContext, ProvisionTxRootsMap,
+    PROVISION_ROOT_DOMAIN_TAG, ProvisionCount, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, provision_leaf,
 };
 pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal_chain};

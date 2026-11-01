@@ -2,17 +2,25 @@
 //!
 //! Anchors all liveness-driven decisions on the shard consensus-authenticated
 //! `weighted_timestamp` of locally committed blocks, not local wall-clock.
-//! Two distinct triggers fire fallback fetches:
 //!
-//! 1. **Timeout**: an entry has been outstanding for longer than
-//!    [`PROVISION_FALLBACK_TIMEOUT`] without arriving via gossip. Detected
-//!    on each block commit via [`Self::check_timeouts`].
-//! 2. **Eager flush**: the coordinator decides urgency overrides patience
-//!    (sync completion, execution advance gate stalled). Bypasses the
-//!    timeout via [`Self::flush_all`].
+//! An expectation is one commit-proven source block's parts for this
+//! shard. It holds the leaf indices already held, the leaf count once a
+//! checked part or a checked count witness teaches it, and a monotone set
+//! of the indices it has asked a fetch for. It asks on exactly two edges:
 //!
-//! Both produce [`TimeoutEffect`]s; the coordinator attaches peers from
-//! topology and lifts each effect into an `Action::Fetch` of remote provisions.
+//! 1. **Turning requested**: an entry has been outstanding for longer than
+//!    [`PROVISION_FALLBACK_TIMEOUT`] ([`Self::check_timeouts`]), or the
+//!    coordinator decides urgency overrides patience ([`Self::flush_all`]).
+//!    It asks for every index not held and not asked if the count is known,
+//!    and otherwise for index 0, whose answer also brings the count witness.
+//! 2. **Learning the count while requested**: it asks for every index not
+//!    held and not asked.
+//!
+//! Gossip still arriving asks nothing, and every retry of an asked index
+//! belongs to the fetch layer. The expectation completes when all of its
+//! leaves are held, and every way it ends lets go of every index it asked
+//! for, since the fetch layer keeps an id pending until it is admitted or
+//! abandoned.
 //!
 //! The tracker also owns `local_committed_ts` because every other consumer
 //! of that value reads it through here (deadline sweeps, receipt-time
@@ -23,7 +31,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest};
-use hyperscale_types::{BlockHeight, CommittedClock, ShardId, ValidatorId, WeightedTimestamp};
+use hyperscale_types::{
+    BlockHeight, CommittedClock, ProvisionCount, ShardId, ValidatorId, WeightedTimestamp,
+};
 use tracing::warn;
 
 /// How long to wait before falling back to peer-fetch for missing
@@ -52,21 +62,53 @@ struct ExpectedProvision {
     requested: bool,
     proposer: ValidatorId,
     /// The leaf count the source header's root commits for this shard,
-    /// once a checked part has taught it.
+    /// once a checked part or a checked count witness has taught it.
     count: Option<u32>,
     /// The leaf indices held: admitted, or retired as already committed
     /// or already verified.
     held: BTreeSet<u32>,
+    /// Every index a fetch was asked for. Only grows.
+    asked: BTreeSet<u32>,
+    /// A count witness that arrived before the header it is checked
+    /// against was commit-proven, held for that check.
+    parked_count: Option<ProvisionCount>,
 }
 
-/// Lifted into an `Action::Fetch` of remote provisions via
-/// [`Self::into_fetch_action`] once peers are attached from the topology
-/// snapshot.
+impl ExpectedProvision {
+    /// Learn `count`, returning whether it was not known before.
+    const fn learn(&mut self, count: u32) -> bool {
+        if self.count.is_some() {
+            return false;
+        }
+        self.count = Some(count);
+        true
+    }
+
+    /// Every index this entry still wants and has not asked for, marked
+    /// asked: every unheld index once the count is known, and index 0
+    /// before.
+    fn ask_unasked(&mut self) -> Vec<u32> {
+        let wanted: Vec<u32> = (0..self.count.unwrap_or(1))
+            .filter(|index| !self.held.contains(index) && !self.asked.contains(index))
+            .collect();
+        self.asked.extend(wanted.iter().copied());
+        wanted
+    }
+
+    fn is_complete(&self) -> bool {
+        self.count
+            .is_some_and(|count| self.held.len() >= count as usize)
+    }
+}
+
+/// An ask for the indices of one expectation, lifted into an
+/// `Action::Fetch` of remote provisions via [`Self::into_fetch_action`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeoutEffect {
     pub(crate) source_shard: ShardId,
     pub(crate) block_height: BlockHeight,
     pub(crate) proposer: ValidatorId,
+    pub(crate) indices: Vec<u32>,
 }
 
 impl TimeoutEffect {
@@ -74,20 +116,52 @@ impl TimeoutEffect {
     /// the rest of the source shard's committee is rotation fallback (picked
     /// by the network layer from the source shard's current committee).
     ///
-    /// The id names both ends — the shard the provisions come from and the
-    /// one they are owed to — so `for_shard` is this coordinator's own.
+    /// Each id names both ends — the shard the parts come from and the one
+    /// they are owed to — so `for_shard` is this coordinator's own.
     pub(crate) fn into_fetch_action(self, for_shard: ShardId) -> Action {
         Action::Fetch(FetchRequest::Ask {
-            ids: FetchIds::RemoteProvisions(vec![(
-                self.source_shard,
-                for_shard,
-                self.block_height,
-            )]),
+            ids: FetchIds::RemoteProvisions(
+                self.indices
+                    .into_iter()
+                    .map(|index| (self.source_shard, for_shard, self.block_height, index))
+                    .collect(),
+            ),
             shard: self.source_shard,
             preferred: Some(self.proposer),
             class: None,
         })
     }
+}
+
+/// The indices an expectation asked for, let go of as it ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Released {
+    pub(crate) source_shard: ShardId,
+    pub(crate) block_height: BlockHeight,
+    pub(crate) indices: Vec<u32>,
+}
+
+impl Released {
+    /// The fetch ids the asks named, for `for_shard`, this coordinator's
+    /// own shard.
+    pub(crate) fn ids(
+        &self,
+        for_shard: ShardId,
+    ) -> impl Iterator<Item = (ShardId, ShardId, BlockHeight, u32)> + '_ {
+        self.indices
+            .iter()
+            .map(move |index| (self.source_shard, for_shard, self.block_height, *index))
+    }
+}
+
+/// What holding one leaf did to its expectation.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    /// The expectation completed: what it asked for, let go of.
+    pub(crate) completed: Option<Released>,
+    /// The leaf taught the count while the entry was requested: the
+    /// indices to ask for now.
+    pub(crate) ask: Option<TimeoutEffect>,
 }
 
 /// Liveness tracker for cross-shard provisions we expect but haven't yet
@@ -143,35 +217,116 @@ impl ExpectedProvisionTracker {
                 proposer,
                 count: None,
                 held: BTreeSet::new(),
+                asked: BTreeSet::new(),
+                parked_count: None,
             });
     }
 
     /// Record leaf `index` of `count` as held for `(source_shard,
     /// block_height)`, off a part that has walked its path to the
-    /// header's root. Returns `true` when that completes the expectation,
-    /// which is then cleared: every one of the committed leaves is held.
+    /// header's root. Completes and clears the expectation once every
+    /// committed leaf is held.
     pub(crate) fn on_part_held(
         &mut self,
         source_shard: ShardId,
         block_height: BlockHeight,
         index: u32,
         count: u32,
-    ) -> bool {
+    ) -> Held {
         let key = (source_shard, block_height);
         let Some(expected) = self.expected.get_mut(&key) else {
-            return false;
+            return Held::default();
         };
-        expected.count.get_or_insert(count);
+        let learned = expected.learn(count);
         if index < count {
             expected.held.insert(index);
         }
-        let complete = expected
-            .count
-            .is_some_and(|count| expected.held.len() >= count as usize);
-        if complete {
+        if expected.is_complete() {
+            let asked = expected.asked.iter().copied().collect();
             self.expected.remove(&key);
+            return Held {
+                completed: Some(Released {
+                    source_shard,
+                    block_height,
+                    indices: asked,
+                }),
+                ask: None,
+            };
         }
-        complete
+        Held {
+            completed: None,
+            ask: Self::ask_on_learning(key, expected, learned),
+        }
+    }
+
+    /// Learn the count of `(source_shard, block_height)` off a count
+    /// witness checked against the header's root, asking for the rest if
+    /// the entry is requested.
+    pub(crate) fn on_count_checked(
+        &mut self,
+        source_shard: ShardId,
+        block_height: BlockHeight,
+        count: u32,
+    ) -> Option<TimeoutEffect> {
+        let key = (source_shard, block_height);
+        let expected = self.expected.get_mut(&key)?;
+        let learned = expected.learn(count);
+        Self::ask_on_learning(key, expected, learned)
+    }
+
+    /// The second edge: a count learned while requested asks for every
+    /// index not held and not asked.
+    fn ask_on_learning(
+        (source_shard, block_height): Key,
+        expected: &mut ExpectedProvision,
+        learned: bool,
+    ) -> Option<TimeoutEffect> {
+        if !learned || !expected.requested {
+            return None;
+        }
+        let indices = expected.ask_unasked();
+        (!indices.is_empty()).then_some(TimeoutEffect {
+            source_shard,
+            block_height,
+            proposer: expected.proposer,
+            indices,
+        })
+    }
+
+    /// Whether `(source_shard, block_height)` is expected and its count
+    /// not yet known: the one case a count witness is worth checking.
+    pub(crate) fn wants_count(&self, source_shard: ShardId, block_height: BlockHeight) -> bool {
+        self.expected
+            .get(&(source_shard, block_height))
+            .is_some_and(|expected| expected.count.is_none())
+    }
+
+    /// Hold a count witness until the header it is checked against is
+    /// commit-proven. Only an expectation still missing its count keeps
+    /// one, and only the latest.
+    pub(crate) fn park_count(
+        &mut self,
+        source_shard: ShardId,
+        block_height: BlockHeight,
+        count: ProvisionCount,
+    ) {
+        if let Some(expected) = self.expected.get_mut(&(source_shard, block_height))
+            && expected.count.is_none()
+        {
+            expected.parked_count = Some(count);
+        }
+    }
+
+    /// The count witness parked for `(source_shard, block_height)`, taken.
+    pub(crate) fn take_parked_count(
+        &mut self,
+        source_shard: ShardId,
+        block_height: BlockHeight,
+    ) -> Option<ProvisionCount> {
+        self.expected
+            .get_mut(&(source_shard, block_height))?
+            .parked_count
+            .take()
     }
 
     /// Update the local committed anchor and retro-stamp pre-genesis
@@ -205,8 +360,8 @@ impl ExpectedProvisionTracker {
 
     /// Drop expectations whose source block predates `cutoff` — past
     /// `RETENTION_HORIZON` every tx in that block has terminated, so its
-    /// provisions can never be needed again. Returns the keys evicted so
-    /// the coordinator can clean matching headers.
+    /// provisions can never be needed again. Returns what each asked for,
+    /// so the coordinator can abandon it and clean the matching headers.
     ///
     /// Keyed on the source block's authenticated `source_block_ts`, not the
     /// local `discovered_at`: a node that registered while its committed
@@ -215,48 +370,55 @@ impl ExpectedProvisionTracker {
     ///
     /// Under nominal operation a header is retained exactly while its
     /// provisions are outstanding; this catches entries that would
-    /// otherwise leak indefinitely.
-    pub(crate) fn cleanup_orphans(&mut self, cutoff: WeightedTimestamp) -> Vec<Key> {
-        let mut dropped = Vec::new();
-        self.expected.retain(|key, exp| {
-            if exp.source_block_ts >= cutoff {
-                true
-            } else {
-                dropped.push(*key);
-                false
-            }
-        });
-        dropped
+    /// otherwise leak indefinitely, an index nobody can build among them.
+    pub(crate) fn cleanup_orphans(&mut self, cutoff: WeightedTimestamp) -> Vec<Released> {
+        self.drop_where(|_, exp| exp.source_block_ts < cutoff)
     }
 
     /// Drop expectations keyed to `shard` strictly above a pending
-    /// recovery's attested frontier, returning the dropped keys so
+    /// recovery's attested frontier, returning what each asked for so
     /// in-flight fallback fetches can be abandoned. Nothing can fulfil
     /// them: the source content is rejected network-wide.
-    pub(crate) fn purge_fenced(&mut self, shard: ShardId, frontier: BlockHeight) -> Vec<Key> {
+    pub(crate) fn purge_fenced(&mut self, shard: ShardId, frontier: BlockHeight) -> Vec<Released> {
+        self.drop_where(|&(s, h), _| s == shard && h > frontier)
+    }
+
+    fn drop_where(&mut self, drop: impl Fn(&Key, &ExpectedProvision) -> bool) -> Vec<Released> {
         let mut dropped = Vec::new();
-        self.expected.retain(|&key, _| {
-            let (s, h) = key;
-            if s == shard && h > frontier {
-                dropped.push(key);
-                false
-            } else {
-                true
+        self.expected.retain(|key, exp| {
+            if !drop(key, exp) {
+                return true;
             }
+            dropped.push(Released {
+                source_shard: key.0,
+                block_height: key.1,
+                indices: exp.asked.iter().copied().collect(),
+            });
+            false
         });
         dropped
     }
 
-    /// Sweep timed-out expectations and emit a `TimeoutEffect` per entry
-    /// that crossed the threshold without being requested. Sets
-    /// `requested = true` on each effect so the next sweep skips it.
+    /// The first edge, for every timed-out expectation not yet requested:
+    /// turn it requested and ask for what it wants.
     pub(crate) fn check_timeouts(&mut self, now: WeightedTimestamp) -> Vec<TimeoutEffect> {
+        self.turn_requested(|expected| {
+            now.elapsed_since(expected.discovered_at) >= PROVISION_FALLBACK_TIMEOUT
+        })
+    }
+
+    /// The first edge for every outstanding expectation, bypassing the
+    /// normal timeout. Called when urgency overrides patience — sync
+    /// completion and the execution advance gate stalling on missing data.
+    pub(crate) fn flush_all(&mut self) -> Vec<TimeoutEffect> {
+        self.turn_requested(|_| true)
+    }
+
+    fn turn_requested(&mut self, due: impl Fn(&ExpectedProvision) -> bool) -> Vec<TimeoutEffect> {
+        let now = self.clock.now();
         let mut effects = Vec::new();
         for (&(source_shard, block_height), expected) in &mut self.expected {
-            if expected.requested {
-                continue;
-            }
-            if now.elapsed_since(expected.discovered_at) < PROVISION_FALLBACK_TIMEOUT {
+            if expected.requested || !due(expected) {
                 continue;
             }
             warn!(
@@ -264,33 +426,20 @@ impl ExpectedProvisionTracker {
                 block_height = block_height.inner(),
                 age_ms = u64::try_from(now.elapsed_since(expected.discovered_at).as_millis())
                     .unwrap_or(u64::MAX),
-                "Provision timeout — requesting missing provisions via fallback"
+                held = expected.held.len(),
+                count = ?expected.count,
+                "Requesting missing provisions via fallback"
             );
             expected.requested = true;
-            effects.push(TimeoutEffect {
-                source_shard,
-                block_height,
-                proposer: expected.proposer,
-            });
-        }
-        effects
-    }
-
-    /// Eager-fetch every outstanding expectation, bypassing the normal
-    /// timeout. Called when urgency overrides patience — sync completion
-    /// and the execution advance gate stalling on missing data.
-    pub(crate) fn flush_all(&mut self) -> Vec<TimeoutEffect> {
-        let mut effects = Vec::new();
-        for (&(source_shard, block_height), expected) in &mut self.expected {
-            if expected.requested {
-                continue;
+            let indices = expected.ask_unasked();
+            if !indices.is_empty() {
+                effects.push(TimeoutEffect {
+                    source_shard,
+                    block_height,
+                    proposer: expected.proposer,
+                    indices,
+                });
             }
-            expected.requested = true;
-            effects.push(TimeoutEffect {
-                source_shard,
-                block_height,
-                proposer: expected.proposer,
-            });
         }
         effects
     }
@@ -304,12 +453,32 @@ impl Default for ExpectedProvisionTracker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::RETENTION_HORIZON;
+    use hyperscale_types::{Hash, RETENTION_HORIZON};
 
     use super::*;
 
     fn ts(ms: u64) -> WeightedTimestamp {
         WeightedTimestamp::from_millis(ms)
+    }
+
+    const SOURCE: ShardId = ShardId::leaf(2, 1);
+    const HEIGHT: BlockHeight = BlockHeight::new(10);
+
+    /// A tracker with one expectation for [`SOURCE`] at [`HEIGHT`].
+    fn one_expected() -> ExpectedProvisionTracker {
+        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
+        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
+        t.register(SOURCE, HEIGHT, ValidatorId::new(3), ts(1_000));
+        t
+    }
+
+    fn ask(indices: &[u32]) -> TimeoutEffect {
+        TimeoutEffect {
+            source_shard: SOURCE,
+            block_height: HEIGHT,
+            proposer: ValidatorId::new(3),
+            indices: indices.to_vec(),
+        }
     }
 
     #[test]
@@ -337,63 +506,101 @@ mod tests {
     }
 
     #[test]
-    fn register_inserts_expectation() {
-        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            ts(1_000),
-        );
-        assert_eq!(t.len(), 1);
-    }
-
-    #[test]
     fn register_is_idempotent() {
-        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            ts(1_000),
-        );
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(7),
-            ts(1_000),
-        );
+        let mut t = one_expected();
+        t.register(SOURCE, HEIGHT, ValidatorId::new(7), ts(1_000));
         assert_eq!(t.len(), 1);
     }
 
-    /// The expectation completes on holding every committed leaf, and
-    /// not on the first part to verify.
+    /// The expectation completes on holding every committed leaf, not on
+    /// the first part to verify, and a part held before any ask lets go
+    /// of nothing.
     #[test]
     fn an_expectation_completes_on_holding_every_leaf() {
-        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        let (shard, height) = (ShardId::leaf(2, 1), BlockHeight::new(10));
-        t.register(shard, height, ValidatorId::new(3), ts(1_000));
-        assert!(!t.on_part_held(shard, height, 2, 3));
-        assert!(
-            !t.on_part_held(shard, height, 2, 3),
+        let mut t = one_expected();
+        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 2, 3), Held::default());
+        assert_eq!(
+            t.on_part_held(SOURCE, HEIGHT, 2, 3),
+            Held::default(),
             "a repeat adds nothing"
         );
-        assert!(!t.on_part_held(shard, height, 0, 3));
+        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 0, 3), Held::default());
         assert_eq!(t.len(), 1);
-        assert!(t.on_part_held(shard, height, 1, 3));
+        let held = t.on_part_held(SOURCE, HEIGHT, 1, 3);
+        assert_eq!(
+            held.completed,
+            Some(Released {
+                source_shard: SOURCE,
+                block_height: HEIGHT,
+                indices: Vec::new(),
+            })
+        );
         assert_eq!(t.len(), 0);
-        assert!(!t.on_part_held(shard, height, 1, 3));
+        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 1, 3), Held::default());
+    }
+
+    /// Turning requested asks for index 0 alone while the count is
+    /// unknown; learning it then asks for every index not held and not
+    /// asked, once.
+    #[test]
+    fn a_requested_entry_asks_index_zero_then_the_rest_once_counted() {
+        let mut t = one_expected();
+        assert_eq!(t.flush_all(), vec![ask(&[0])]);
+        assert!(
+            t.flush_all().is_empty(),
+            "a requested entry is not asked again"
+        );
+
+        // Index 3 of five arrives by gossip: the count is learned, and
+        // the rest is asked, leaving out 0 (asked) and 3 (held).
+        let held = t.on_part_held(SOURCE, HEIGHT, 3, 5);
+        assert_eq!(held.ask, Some(ask(&[1, 2, 4])));
+        assert_eq!(held.completed, None);
+
+        // Another learning teaches nothing new and asks nothing.
+        assert_eq!(t.on_count_checked(SOURCE, HEIGHT, 5), None);
+        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 1, 5), Held::default());
+
+        // Completion lets go of every index it ever asked for.
+        for index in [0, 2] {
+            assert_eq!(t.on_part_held(SOURCE, HEIGHT, index, 5), Held::default());
+        }
+        let done = t.on_part_held(SOURCE, HEIGHT, 4, 5);
+        assert_eq!(
+            done.completed.map(|released| released.indices),
+            Some(vec![0, 1, 2, 4])
+        );
+    }
+
+    /// A count known before the entry turns requested asks every index
+    /// not held at once.
+    #[test]
+    fn a_counted_entry_asks_what_it_lacks_when_it_turns_requested() {
+        let mut t = one_expected();
+        assert_eq!(
+            t.on_count_checked(SOURCE, HEIGHT, 4),
+            None,
+            "not yet requested"
+        );
+        assert_eq!(t.on_part_held(SOURCE, HEIGHT, 2, 4), Held::default());
+        assert_eq!(t.flush_all(), vec![ask(&[0, 1, 3])]);
+    }
+
+    /// A checked count witness teaches the count while index 0 itself is
+    /// never held, and the asks go out for every other index.
+    #[test]
+    fn a_count_witness_asks_the_rest_without_index_zero() {
+        let mut t = one_expected();
+        assert_eq!(t.flush_all(), vec![ask(&[0])]);
+        assert!(t.wants_count(SOURCE, HEIGHT));
+        assert_eq!(t.on_count_checked(SOURCE, HEIGHT, 3), Some(ask(&[1, 2])));
+        assert!(!t.wants_count(SOURCE, HEIGHT));
     }
 
     #[test]
     fn first_commit_retro_stamps_pregenesis_entries() {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            ts(1_000),
-        );
+        t.register(SOURCE, HEIGHT, ValidatorId::new(3), ts(1_000));
 
         // Before any commit, an immediate timeout sweep at a non-zero `now`
         // would fire — the entry's discovered_at is still ZERO. The
@@ -407,34 +614,15 @@ mod tests {
 
     #[test]
     fn timeout_emits_effect_after_threshold() {
-        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            ts(1_000),
-        );
+        let mut t = one_expected();
+        let timeout = u64::try_from(PROVISION_FALLBACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
 
         // Just under threshold: no firings.
-        let just_under = ts(1_000
-            + u64::try_from(PROVISION_FALLBACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
-            - 1);
-        assert!(t.check_timeouts(just_under).is_empty());
+        assert!(t.check_timeouts(ts(1_000 + timeout - 1)).is_empty());
 
-        // At threshold: one effect.
-        let at =
-            ts(1_000 + u64::try_from(PROVISION_FALLBACK_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
-        let effects = t.check_timeouts(at);
-        assert_eq!(effects.len(), 1);
-        assert_eq!(
-            effects[0],
-            TimeoutEffect {
-                source_shard: ShardId::leaf(2, 1),
-                block_height: BlockHeight::new(10),
-                proposer: ValidatorId::new(3),
-            }
-        );
+        // At threshold: one ask, for index 0.
+        let at = ts(1_000 + timeout);
+        assert_eq!(t.check_timeouts(at), vec![ask(&[0])]);
 
         // Subsequent sweep doesn't re-fire (already requested).
         assert!(t.check_timeouts(at).is_empty());
@@ -442,17 +630,8 @@ mod tests {
 
     #[test]
     fn verified_before_timeout_never_emits() {
-        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            ts(1_000),
-        );
-
-        // Verify before the timeout fires.
-        assert!(t.on_part_held(ShardId::leaf(2, 1), BlockHeight::new(10), 0, 1));
+        let mut t = one_expected();
+        assert!(t.on_part_held(SOURCE, HEIGHT, 0, 1).completed.is_some());
 
         let well_past =
             ts(1_000
@@ -462,14 +641,7 @@ mod tests {
 
     #[test]
     fn flush_all_bypasses_timeout() {
-        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            ts(1_000),
-        );
+        let mut t = one_expected();
         t.register(
             ShardId::leaf(2, 2),
             BlockHeight::new(5),
@@ -484,16 +656,13 @@ mod tests {
         assert!(t.flush_all().is_empty());
     }
 
+    /// The orphan sweep lets go of every index the dropped entry asked
+    /// for: an index nobody can build stays asked until here.
     #[test]
-    fn cleanup_orphans_drops_aged_entries() {
-        let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            ts(1_000),
-        );
+    fn cleanup_orphans_drops_aged_entries_and_releases_their_asks() {
+        let mut t = one_expected();
+        let _ = t.flush_all();
+        let _ = t.on_part_held(SOURCE, HEIGHT, 1, 2);
 
         // Advance well past RETENTION_HORIZON.
         let far_future =
@@ -502,7 +671,14 @@ mod tests {
 
         let cutoff = far_future.minus(RETENTION_HORIZON);
         let dropped = t.cleanup_orphans(cutoff);
-        assert_eq!(dropped, vec![(ShardId::leaf(2, 1), BlockHeight::new(10))]);
+        assert_eq!(
+            dropped,
+            vec![Released {
+                source_shard: SOURCE,
+                block_height: HEIGHT,
+                indices: vec![0],
+            }]
+        );
         assert_eq!(t.len(), 0);
     }
 
@@ -519,12 +695,7 @@ mod tests {
         t.record_block_committed(ts(1_000), WeightedTimestamp::ZERO);
         let recent_source =
             ts(1_000 + 2 * u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX));
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            recent_source,
-        );
+        t.register(SOURCE, HEIGHT, ValidatorId::new(3), recent_source);
 
         // Catch up: the cutoff now predates the stale `discovered_at` (1_000)
         // but not the recent source block.
@@ -548,14 +719,45 @@ mod tests {
     #[test]
     fn cleanup_orphans_no_op_when_cutoff_zero() {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            ts(1_000),
-        );
+        t.register(SOURCE, HEIGHT, ValidatorId::new(3), ts(1_000));
         let dropped = t.cleanup_orphans(WeightedTimestamp::ZERO);
         assert!(dropped.is_empty());
         assert_eq!(t.len(), 1);
+    }
+
+    /// A fenced shard's expectations go, each releasing what it asked.
+    #[test]
+    fn purge_fenced_releases_every_asked_index() {
+        let mut t = one_expected();
+        let _ = t.flush_all();
+        let _ = t.on_count_checked(SOURCE, HEIGHT, 3);
+        let dropped = t.purge_fenced(SOURCE, BlockHeight::new(9));
+        assert_eq!(
+            dropped,
+            vec![Released {
+                source_shard: SOURCE,
+                block_height: HEIGHT,
+                indices: vec![0, 1, 2],
+            }]
+        );
+        assert_eq!(t.len(), 0);
+    }
+
+    /// A witness parked before its header waits on the entry, the latest
+    /// one only, and is gone once the count is known.
+    #[test]
+    fn a_parked_count_waits_for_its_header() {
+        let mut t = one_expected();
+        let witness = |count| ProvisionCount {
+            count,
+            merkle_root: Hash::ZERO,
+        };
+        t.park_count(SOURCE, HEIGHT, witness(2));
+        t.park_count(SOURCE, HEIGHT, witness(3));
+        assert_eq!(t.take_parked_count(SOURCE, HEIGHT), Some(witness(3)));
+        assert_eq!(t.take_parked_count(SOURCE, HEIGHT), None);
+        let _ = t.on_count_checked(SOURCE, HEIGHT, 3);
+        t.park_count(SOURCE, HEIGHT, witness(3));
+        assert_eq!(t.take_parked_count(SOURCE, HEIGHT), None);
     }
 }

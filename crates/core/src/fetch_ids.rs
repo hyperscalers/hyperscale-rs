@@ -30,9 +30,10 @@ pub enum FetchIds {
     LocalProvisions(Vec<ProvisionHash>),
     /// Finalizations by identity.
     Finalizations(Vec<FinalizationHash>),
-    /// Cross-shard provision scopes as `(source_shard, target_shard,
-    /// block_height)` — the requester's own shard is the target.
-    RemoteProvisions(Vec<(ShardId, ShardId, BlockHeight)>),
+    /// Cross-shard provision parts as `(source_shard, target_shard,
+    /// block_height, leaf_index)` — the requester's own shard is the
+    /// target.
+    RemoteProvisions(Vec<(ShardId, ShardId, BlockHeight, u32)>),
     /// State-proof probes as `(anchor, key)`.
     StateProofs(Vec<(Anchor, SubstateKey)>),
     /// Verdict questions as `(anchor, cells)`: the three cells one

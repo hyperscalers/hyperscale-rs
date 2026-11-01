@@ -854,6 +854,16 @@ pub trait SolicitedAnswer: FetchBinding {
     /// One request for `ids`.
     fn request(ids: &[Self::Id]) -> Self::Request;
 
+    /// What an answer to a request for `requested` carries beside its
+    /// items, answering for none of the ids: handed over whatever the
+    /// items settle, before them. Nothing, unless the binding says.
+    fn beside(
+        _requested: &[Self::Id],
+        _response: &<Self::Request as Request>::Response,
+    ) -> Vec<Self::Input> {
+        Vec::new()
+    }
+
     /// The items an answer carries. One that carries nothing the asker
     /// can use is left out, which reads as the peer not holding it.
     fn items(response: <Self::Request as Request>::Response) -> Vec<Self::Item>;
@@ -905,6 +915,10 @@ where
         Ok(response) => response,
         Err(error) => return transport_failed::<B, R>(requested, &error, reply),
     };
+    let beside = B::beside(&requested, &response);
+    if !beside.is_empty() {
+        reply.hand_over(None, beside);
+    }
     let split = partition_solicited(B::items(response), &requested, B::answers_for);
     if !split.kept.is_empty() {
         let fulfilled = match B::SETTLES {

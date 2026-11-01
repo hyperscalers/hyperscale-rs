@@ -17,8 +17,8 @@ use hyperscale_storage::{SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::encoded_len;
 use hyperscale_types::{
     BlockHeight, EntryKey, Hash, LeafPath, MAX_PROVISION_PART_BYTES, MerkleInclusionProof,
-    ProtocolHasher, Provision, ProvisionParts, ShardId, SubstateEntry, WeightedTimestamp,
-    entry_leaf_key, provision_leaf,
+    ProtocolHasher, Provision, ProvisionCount, ProvisionParts, ShardId, SubstateEntry,
+    WeightedTimestamp, entry_leaf_key, provision_leaf,
 };
 use tracing::warn;
 
@@ -31,6 +31,22 @@ fn requests_for(
     requests
         .iter()
         .filter(move |req| req.targets.contains(&target_shard))
+}
+
+/// The count witness for what `requests` owe `target_shard`.
+///
+/// Their leaf count and the merkle root over their leaves, or `None`
+/// where they owe it nothing. Any holder of the block states it, whether
+/// or not it can build a single part.
+#[must_use]
+pub fn provision_count(
+    requests: &[ProvisionsRequest],
+    target_shard: ShardId,
+) -> Option<ProvisionCount> {
+    let leaves: Vec<Hash> = requests_for(requests, target_shard)
+        .map(|req| provision_leaf(req.tx_hash))
+        .collect();
+    (!leaves.is_empty()).then(|| ProvisionCount::over(&leaves))
 }
 
 /// Build the parts of a source → target pair whose leaf index `wanted`

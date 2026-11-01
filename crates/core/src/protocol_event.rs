@@ -20,13 +20,13 @@ use hyperscale_types::{
     CheckedStateProof, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
     Finalization, FinalizationVerifyError, Hash, HeaderSource, LeafIndex, PcVote1,
     PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provision,
-    ProvisionVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
-    RatifyVoteVerifyError, ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
-    ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
-    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    StandingAnswers, StateClaim, StoredReceipt, TickId, Timeout, TopologySchedule, Transaction,
-    TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells, Verifiable, VerificationKind,
-    Verified, WeightedTimestamp,
+    ProvisionCount, ProvisionVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase,
+    RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Round, ShardForkProof, ShardId,
+    ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
+    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
+    SpcView, StandingAnswers, StateClaim, StoredReceipt, TickId, Timeout, TopologySchedule,
+    Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells, Verifiable,
+    VerificationKind, Verified, WeightedTimestamp,
 };
 
 use crate::action::{CrossShardExecutionRequest, HeaderCommittee, QcSubject};
@@ -489,6 +489,21 @@ pub enum ProtocolEvent {
     UnverifiedProvisionsReceived {
         /// The parts one message carried.
         parts: Vec<Provision>,
+    },
+
+    /// A fetch answer's count witness for what the source block at
+    /// `block_height` owes `target_shard`, not yet held to the header's
+    /// root. It answers for no fetched part; it teaches how many there
+    /// are.
+    ProvisionCountReceived {
+        /// The shard whose block is counted.
+        source_shard: ShardId,
+        /// The shard the counted parts are owed to.
+        target_shard: ShardId,
+        /// The source block's height.
+        block_height: BlockHeight,
+        /// The stated count and the merkle root it wraps.
+        count: ProvisionCount,
     },
 
     /// A producer's pushed record readings, past ingress: routed to a

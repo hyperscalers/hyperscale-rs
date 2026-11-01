@@ -531,6 +531,17 @@ impl StateMachine for NodeStateMachine {
                 .shard
                 .provisions_coordinator
                 .on_state_provisions_received(sched, parts),
+            ProtocolEvent::ProvisionCountReceived {
+                source_shard,
+                target_shard,
+                block_height,
+                count,
+            } => self.shard.provisions_coordinator.on_provision_count(
+                source_shard,
+                target_shard,
+                block_height,
+                count,
+            ),
             ProtocolEvent::VerifiedProvisionsReceived { parts } => {
                 let now = self.shard.now;
                 self.shard

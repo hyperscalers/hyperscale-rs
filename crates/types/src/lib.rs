@@ -217,7 +217,7 @@ pub use shard::reshape::{ReshapeKind, ReshapeThresholds, ReshapeTrigger, Settlin
 pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, BodyRootContext, BodyRootVerifyError,
     CommittingShards, LeafPath, LeafRoot, MAX_PROVISION_PATH_DEPTH, PROVISION_LEAF_DOMAIN_TAG,
-    PROVISION_ROOT_DOMAIN_TAG, ProvisionTxRootsContext, ProvisionTxRootsMap,
+    PROVISION_ROOT_DOMAIN_TAG, ProvisionCount, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, REVEAL_CHAIN_DOMAIN_TAG, SectionRoots, SetRoot, SplitChildRoots,
     StateRootContext, StateRootVerifyError, UnboundBody, commit_witness_window, derive_leaves,
     derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,

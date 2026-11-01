@@ -15,16 +15,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, ProtocolEvent, ProvisionVerdict};
+use hyperscale_metrics::record_fetch_response_refused;
 use hyperscale_storage::CommittedProvisions;
 use hyperscale_types::{
     Anchor, BlockHeight, BlockManifest, CertifiedBlock, CertifiedBlockHeader, CommittedClock,
-    ForkFence, LocalTimestamp, Provision, ProvisionHash, RETENTION_HORIZON, ShardId,
-    TopologySchedule, Verified,
+    ForkFence, LocalTimestamp, Provision, ProvisionCount, ProvisionHash, RETENTION_HORIZON,
+    ShardId, TopologySchedule, Verified,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::expected::ExpectedProvisionTracker;
+use crate::expected::{ExpectedProvisionTracker, Held, Released};
 use crate::pipeline::ProvisionPipeline;
 use crate::queue::QueuedProvisionBuffer;
 use crate::store::ProvisionStore;
@@ -310,20 +311,15 @@ impl ProvisionCoordinator {
         // fallback fetch never resolved inside that span. Under normal
         // operation a header is retained exactly while its provisions
         // are outstanding; this only catches entries that would otherwise
-        // leak indefinitely. Each dropped key emits an `AbandonFetch` so
-        // the shard loop's `ProvisionBinding` clears the matching in-flight.
-        let orphaned: Vec<_> = self
-            .expected
-            .cleanup_orphans(retention_cutoff)
-            .into_iter()
-            .map(|(source_shard, block_height)| {
-                self.headers.remove((source_shard, block_height));
-                (source_shard, self.local_shard, block_height)
-            })
-            .collect();
-        if !orphaned.is_empty() {
-            actions.push(Action::AbandonFetch(FetchIds::RemoteProvisions(orphaned)));
+        // leak indefinitely, an index nobody can build among them. Each
+        // dropped key abandons every index it asked for, so the shard
+        // loop's `ProvisionBinding` clears the matching in-flight.
+        let orphaned = self.expected.cleanup_orphans(retention_cutoff);
+        for released in &orphaned {
+            self.headers
+                .remove((released.source_shard, released.block_height));
         }
+        actions.extend(self.abandon(&orphaned));
 
         // Drop provisions whose deadline has passed but never reached
         // commit. Without this, verified provisions whose source data has
@@ -389,14 +385,31 @@ impl ProvisionCoordinator {
         if !evicted.is_empty() {
             actions.push(Action::AbandonFetch(FetchIds::LocalProvisions(evicted)));
         }
-        let stranded: Vec<_> = self
-            .expected
-            .purge_fenced(shard, frontier)
-            .into_iter()
-            .map(|(source_shard, block_height)| (source_shard, self.local_shard, block_height))
+        let stranded = self.expected.purge_fenced(shard, frontier);
+        actions.extend(self.abandon(&stranded));
+        actions
+    }
+
+    /// The `AbandonFetch` letting go of every index `released` asked for,
+    /// if any.
+    fn abandon(&self, released: &[Released]) -> Option<Action> {
+        let ids: Vec<_> = released
+            .iter()
+            .flat_map(|released| released.ids(self.local_shard))
             .collect();
-        if !stranded.is_empty() {
-            actions.push(Action::AbandonFetch(FetchIds::RemoteProvisions(stranded)));
+        (!ids.is_empty()).then(|| Action::AbandonFetch(FetchIds::RemoteProvisions(ids)))
+    }
+
+    /// The fetch actions holding one leaf calls for: letting go of a
+    /// completed expectation's asks, and asking for the rest of one that
+    /// just learned its count.
+    fn follow(&self, held: Held) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if let Some(released) = held.completed {
+            actions.extend(self.abandon(&[released]));
+        }
+        if let Some(ask) = held.ask {
+            actions.push(ask.into_fetch_action(self.local_shard));
         }
         actions
     }
@@ -459,11 +472,11 @@ impl ProvisionCoordinator {
     ///
     /// A drop has to satisfy the asker. Admission releases two bindings —
     /// the local one keyed by content hash and the remote one keyed by
-    /// `(source, target, height)` — so a path that drops the part instead
-    /// has to release both, or the ids outlive every reason for them:
-    /// `Fetch::handle_request` keeps an unanswered id pending for the
-    /// process's life, and the matching remote header is pinned with it
-    /// until the orphan cleanup a full retention horizon later.
+    /// `(source, target, height, index)` — so a path that drops the part
+    /// instead has to release both, or the ids outlive every reason for
+    /// them: `Fetch::handle_request` keeps an unanswered id pending for
+    /// the process's life, and the matching remote header is pinned with
+    /// it until the orphan cleanup a full retention horizon later.
     fn retire_fetches_for(part: &Provision) -> Vec<Action> {
         vec![
             Action::AbandonFetch(FetchIds::LocalProvisions(vec![part.hash()])),
@@ -471,6 +484,7 @@ impl ProvisionCoordinator {
                 part.source_shard(),
                 part.target_shard(),
                 part.block_height(),
+                part.leaf().index,
             )])),
         ]
     }
@@ -481,13 +495,20 @@ impl ProvisionCoordinator {
     /// committed one through the voters that admitted it, a verified one
     /// through this node.
     fn retire_held(&mut self, part: &Provision) -> Vec<Action> {
+        let held = self.hold(part);
+        let mut actions = Self::retire_fetches_for(part);
+        actions.extend(self.follow(held));
+        actions
+    }
+
+    /// Count `part`'s leaf as held toward its expectation.
+    fn hold(&mut self, part: &Provision) -> Held {
         self.expected.on_part_held(
             part.source_shard(),
             part.block_height(),
             part.leaf().index,
             part.leaf().count,
-        );
-        Self::retire_fetches_for(part)
+        )
     }
 
     /// Immediately emit an `Action::Fetch` of remote provisions for all outstanding expected
@@ -606,17 +627,21 @@ impl ProvisionCoordinator {
             .provision_tx_roots()
             .contains_key(&self.local_shard);
 
+        let mut actions = vec![];
         if targets_us {
             // Store as verified (QC + commit proof already checked by the
             // remote-header coordinator).
             self.headers.insert(key, certified_header.clone());
+            // A count witness that arrived first is checked now.
+            if let Some(count) = self.expected.take_parked_count(shard, height) {
+                actions.extend(self.check_count(certified_header, count));
+            }
         }
 
         // Join with buffered provisions waiting for this header. Drop any
         // entries whose deadline has already passed — without this gate a
         // late header arrival can reanimate provisions the local commit
         // sweep already evicted and re-enqueue them for inclusion.
-        let mut actions = vec![];
         let drained = self.pipeline.drain_pending_for_key(key);
         if !drained.is_empty() {
             debug!(
@@ -921,6 +946,62 @@ impl ProvisionCoordinator {
         actions
     }
 
+    /// Handle a fetch answer's count witness for what the block at
+    /// `(source_shard, block_height)` owes `target_shard`.
+    ///
+    /// It teaches only the count, and only once checked: the stated count
+    /// and merkle root must wrap to the commit-proven header's root for
+    /// this shard. One arriving before that header is held for it. One
+    /// that wraps to anything else is refused and teaches nothing.
+    pub fn on_provision_count(
+        &mut self,
+        source_shard: ShardId,
+        target_shard: ShardId,
+        block_height: BlockHeight,
+        count: ProvisionCount,
+    ) -> Vec<Action> {
+        if target_shard != self.local_shard
+            || source_shard == self.local_shard
+            || !self.expected.wants_count(source_shard, block_height)
+        {
+            return Vec::new();
+        }
+        let Some(header) = self.headers.get((source_shard, block_height)) else {
+            self.expected.park_count(source_shard, block_height, count);
+            return Vec::new();
+        };
+        self.check_count(&header, count)
+    }
+
+    /// Hold `count` to `header`'s root for this shard, asking for what a
+    /// true one teaches is missing.
+    fn check_count(
+        &mut self,
+        header: &Verified<CertifiedBlockHeader>,
+        count: ProvisionCount,
+    ) -> Vec<Action> {
+        let owed = header
+            .header()
+            .provision_tx_roots()
+            .get(&self.local_shard)
+            .copied();
+        if owed != Some(count.root()) {
+            warn!(
+                source_shard = header.shard_id().inner(),
+                block_height = header.height().inner(),
+                count = count.count,
+                "Provision count witness refused: it does not wrap to the header's root"
+            );
+            record_fetch_response_refused("provision", "count_mismatch");
+            return Vec::new();
+        }
+        self.expected
+            .on_count_checked(header.shard_id(), header.height(), count.count)
+            .map(|ask| ask.into_fetch_action(self.local_shard))
+            .into_iter()
+            .collect()
+    }
+
     /// Admit one verified part.
     ///
     /// The in-flight fallback fetch (if any) drains on the
@@ -961,12 +1042,8 @@ impl ProvisionCoordinator {
             return self.retire_held(&verified);
         }
 
-        self.expected.on_part_held(
-            anchor.shard,
-            anchor.height,
-            verified.leaf().index,
-            verified.leaf().count,
-        );
+        let held = self.hold(&verified);
+        let mut actions = self.follow(held);
         let provision = self.pipeline.insert_verified(verified, source_block_ts);
 
         // Queue for inclusion in the next block proposal. Timestamp drives
@@ -985,10 +1062,11 @@ impl ProvisionCoordinator {
         // block timestamp anchors retention in the io-loop provision cache.
         // Wrap as verified so the marker rides through the event into the
         // in-process consumers.
-        vec![Action::Continuation(ProtocolEvent::ProvisionsAdmitted {
+        actions.push(Action::Continuation(ProtocolEvent::ProvisionsAdmitted {
             provision: provision.into(),
             source_block_ts,
-        })]
+        }));
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -2517,12 +2595,14 @@ mod tests {
                 ..
             }) if *shard == ShardId::leaf(2, 1)
                 // Both ends: the source the provisions come from, and
-                // this coordinator's own shard they are owed to.
+                // this coordinator's own shard they are owed to. The
+                // count is not yet known, so index 0 alone is asked.
                 && wanted.as_slice()
                     == [(
                         ShardId::leaf(2, 1),
                         ShardId::leaf(2, 0),
                         BlockHeight::new(10),
+                        0,
                     )]
                 && *preferred == Some(ValidatorId::new(0))
         ));
@@ -2974,10 +3054,262 @@ mod tests {
             actions.iter().any(|a| matches!(
                 a,
                 Action::AbandonFetch(FetchIds::RemoteProvisions(ids))
-                    if ids.iter().any(|(s, _, h)| *s == source_shard && *h == block_height)
+                    if ids.iter().any(|(s, _, h, index)| {
+                        *s == source_shard && *h == block_height && *index == 0
+                    })
             )),
             "Expected AbandonFetch from orphan cleanup, got: {actions:?}"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Per-index expectation tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// A coordinator holding a commit-proven header from leaf (2, 1) at
+    /// height 10 that owes leaf (2, 0) one part each for `txs`.
+    fn expecting(txs: &[TxHash]) -> (ProvisionCoordinator, Verified<CertifiedBlockHeader>) {
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+        let header = make_certified_header_committing(
+            ShardId::leaf(2, 1),
+            BlockHeight::new(10),
+            ShardId::leaf(2, 0),
+            txs,
+        );
+        deliver_committed_header(&mut coordinator, &header);
+        (coordinator, header)
+    }
+
+    fn txs(n: u8) -> Vec<TxHash> {
+        (0..n)
+            .map(|i| TxHash::from(Hash::from_bytes(&[i, 0x7E])))
+            .collect()
+    }
+
+    /// The indices every fetch ask in `actions` names.
+    fn asked(actions: &[Action]) -> Vec<u32> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::RemoteProvisions(ids),
+                    ..
+                }) => Some(ids.iter().map(|(.., index)| *index).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The indices every abandon in `actions` lets go of.
+    fn abandoned(actions: &[Action]) -> Vec<u32> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::RemoteProvisions(ids)) => {
+                    Some(ids.iter().map(|(.., index)| *index).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The count witness of `txs`, as a holder of the block states it.
+    fn witness_of(txs: &[TxHash]) -> ProvisionCount {
+        let leaves: Vec<Hash> = txs.iter().map(|tx| provision_leaf(*tx)).collect();
+        ProvisionCount::over(&leaves)
+    }
+
+    /// Parts arriving by gossip across several notifications ask for
+    /// nothing: the expectation completes on the last of them, and no
+    /// fetch goes out then or after the timeout.
+    #[test]
+    fn gossip_in_several_notifications_sends_no_fetch() {
+        let txs = txs(3);
+        let (mut coordinator, header) = expecting(&txs);
+        let parts = make_provisions_multi(
+            txs,
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let mut actions = Vec::new();
+        for pack in [&parts[..2], &parts[2..]] {
+            actions.extend(coordinator.on_state_provisions_received(&sched(), pack.to_vec()));
+            actions.extend(coordinator.on_state_provisions_verified(
+                verified(pack.to_vec()),
+                Anchor::of(&header),
+                LocalTimestamp::ZERO,
+            ));
+        }
+        assert!(asked(&actions).is_empty());
+        assert!(
+            abandoned(&actions).is_empty(),
+            "nothing was asked to let go of"
+        );
+        assert_eq!(coordinator.expected.len(), 0);
+        for h in 1..=30 {
+            let actions =
+                coordinator.on_block_committed(&sched(), &make_block(BlockHeight::new(h)));
+            assert!(asked(&actions).is_empty(), "no fetch at height {h}");
+        }
+    }
+
+    /// The witness teaches the count without index 0 ever arriving, and
+    /// the indices past it are asked; the expectation then waits on index
+    /// 0 alone, which the orphan sweep lets go of with every other ask.
+    #[test]
+    fn a_count_witness_teaches_the_count_when_index_zero_never_arrives() {
+        let txs = txs(4);
+        let (mut coordinator, header) = expecting(&txs);
+        assert_eq!(asked(&coordinator.flush_expected_provisions()), vec![0]);
+
+        let actions = coordinator.on_provision_count(
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+            witness_of(&txs),
+        );
+        assert_eq!(asked(&actions), vec![1, 2, 3]);
+
+        let parts = make_provisions_multi(
+            txs,
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let rest = parts[1..].to_vec();
+        coordinator.on_state_provisions_received(&sched(), rest.clone());
+        let admitted = coordinator.on_state_provisions_verified(
+            verified(rest),
+            Anchor::of(&header),
+            LocalTimestamp::ZERO,
+        );
+        assert_eq!(
+            admitted
+                .iter()
+                .filter(|a| matches!(
+                    a,
+                    Action::Continuation(ProtocolEvent::ProvisionsAdmitted { .. })
+                ))
+                .count(),
+            3
+        );
+        assert_eq!(coordinator.expected.len(), 1, "index 0 is still owed");
+
+        let orphan_after = u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
+            / TEST_BLOCK_INTERVAL_MS
+            + 1;
+        let actions =
+            coordinator.on_block_committed(&sched(), &make_block(BlockHeight::new(orphan_after)));
+        let mut released = abandoned(&actions);
+        released.sort_unstable();
+        assert_eq!(released, vec![0, 1, 2, 3]);
+        assert_eq!(coordinator.expected.len(), 0);
+    }
+
+    /// A witness that does not wrap to the header's root is refused and
+    /// teaches nothing; the true one, after it, does.
+    #[test]
+    fn a_count_witness_off_the_header_root_teaches_nothing() {
+        let txs = txs(3);
+        let (mut coordinator, _) = expecting(&txs);
+        let _ = coordinator.flush_expected_provisions();
+
+        let honest = witness_of(&txs);
+        for lie in [
+            ProvisionCount { count: 2, ..honest },
+            ProvisionCount { count: 5, ..honest },
+            ProvisionCount {
+                merkle_root: Hash::from_bytes(b"another root"),
+                ..honest
+            },
+        ] {
+            let actions = coordinator.on_provision_count(
+                ShardId::leaf(2, 1),
+                ShardId::leaf(2, 0),
+                BlockHeight::new(10),
+                lie,
+            );
+            assert!(actions.is_empty(), "{lie:?} teaches nothing");
+        }
+        let actions = coordinator.on_provision_count(
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+            honest,
+        );
+        assert_eq!(asked(&actions), vec![1, 2]);
+    }
+
+    /// A witness arriving before its header is commit-proven waits for
+    /// it, and is checked when it lands.
+    #[test]
+    fn a_count_witness_before_its_header_is_checked_when_it_lands() {
+        let txs = txs(2);
+        let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
+        let header = make_certified_header_committing(
+            ShardId::leaf(2, 1),
+            BlockHeight::new(10),
+            ShardId::leaf(2, 0),
+            &txs,
+        );
+        coordinator.on_verified_remote_header(&header);
+        let _ = coordinator.flush_expected_provisions();
+        let early = coordinator.on_provision_count(
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+            witness_of(&txs),
+        );
+        assert!(early.is_empty());
+        let actions = coordinator.on_committed_remote_header(&sched(), &header);
+        assert_eq!(asked(&actions), vec![1]);
+    }
+
+    /// An index whose part was committed before it was admitted here
+    /// counts as held, and the expectation completes on the rest,
+    /// letting go of every index it asked for.
+    #[test]
+    fn a_committed_index_counts_as_held() {
+        let txs = txs(2);
+        let (mut coordinator, header) = expecting(&txs);
+        let parts = make_provisions_multi(
+            txs,
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 0),
+            BlockHeight::new(10),
+        );
+        let _ = coordinator.flush_expected_provisions();
+        coordinator
+            .committed_provisions
+            .register([parts[0].hash()], WeightedTimestamp::from_millis(1_000));
+
+        let retired = coordinator.on_state_provisions_received(&sched(), vec![parts[0].clone()]);
+        assert!(
+            retired
+                .iter()
+                .all(|a| matches!(a, Action::AbandonFetch(_) | Action::Fetch(_))),
+            "a committed part dispatches no verification",
+        );
+        assert_eq!(
+            asked(&retired),
+            vec![1],
+            "the count it teaches asks for the rest"
+        );
+        assert_eq!(coordinator.expected.len(), 1);
+
+        coordinator.on_state_provisions_received(&sched(), vec![parts[1].clone()]);
+        let actions = coordinator.on_state_provisions_verified(
+            verified(vec![parts[1].clone()]),
+            Anchor::of(&header),
+            LocalTimestamp::ZERO,
+        );
+        assert_eq!(coordinator.expected.len(), 0, "the committed index counted");
+        let mut released = abandoned(&actions);
+        released.sort_unstable();
+        assert_eq!(released, vec![0, 1]);
     }
 
     // ═══════════════════════════════════════════════════════════════════════

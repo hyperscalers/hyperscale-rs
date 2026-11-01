@@ -27,7 +27,7 @@ mod store;
 mod verification;
 mod verified_headers;
 
-pub use build::build_provisions;
+pub use build::{build_provisions, provision_count};
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};
 pub use store::ProvisionStore;

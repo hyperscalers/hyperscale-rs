@@ -318,6 +318,7 @@ impl FetchTicker {
 #[cfg(test)]
 mod tests {
     use hyperscale_core::{Action, ProvisionRefusal};
+    use hyperscale_network_memory::PendingRequest;
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::GetProvisionsRequest;
     use hyperscale_types::{
@@ -362,6 +363,38 @@ mod tests {
         ));
     }
 
+    /// One route can carry the parts of two source blocks: the chunk is
+    /// split by scope, so each block's indices go out in a request of
+    /// their own, every index in one.
+    #[test]
+    fn a_route_carrying_two_heights_sends_two_requests() {
+        let fix = Fixture::new();
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let _ = host.network().drain_pending_requests();
+        let source = ShardId::leaf(1, 1);
+        let (low, high) = (BlockHeight::new(10), BlockHeight::new(11));
+        loop_of(&mut host).request_fetch(
+            FetchIds::RemoteProvisions(vec![
+                (source, SHARD, low, 0),
+                (source, SHARD, high, 0),
+                (source, SHARD, low, 2),
+                (source, SHARD, high, 1),
+            ]),
+            source,
+            None,
+            None,
+        );
+        let mut asked: Vec<(BlockHeight, Vec<u32>)> = host
+            .network()
+            .drain_pending_requests()
+            .iter()
+            .filter_map(PendingRequest::request::<GetProvisionsRequest>)
+            .map(|request| (request.height, request.indices.to_vec()))
+            .collect();
+        asked.sort();
+        assert_eq!(asked, vec![(low, vec![0, 2]), (high, vec![0, 1])]);
+    }
+
     /// A refused bundle sends out again both fetches that could have
     /// carried it: an answer left in flight is one nothing would ever ask
     /// for again. The verdict the coordinator emits as a continuation
@@ -385,7 +418,7 @@ mod tests {
         let bundle = Provision::dummy(source, SHARD, height, TxHash::from(Hash::from_bytes(b"tx")));
         let shard_loop = loop_of(&mut host);
         shard_loop.request_fetch(
-            FetchIds::RemoteProvisions(vec![(source, SHARD, height)]),
+            FetchIds::RemoteProvisions(vec![(source, SHARD, height, 0)]),
             source,
             None,
             None,
