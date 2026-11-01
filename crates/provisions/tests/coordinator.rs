@@ -144,6 +144,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     let ProvisionMemoryStats {
         verified_remote_headers,
         pending_provisions,
+        pending_provision_bytes,
         verified_provisions,
         expected_provisions,
         provisions_by_hash,
@@ -152,6 +153,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
 
     assert_eq!(verified_remote_headers, 0);
     assert_eq!(pending_provisions, 0);
+    assert_eq!(pending_provision_bytes, 0);
     assert_eq!(verified_provisions, 0);
     assert_eq!(expected_provisions, 0);
     assert_eq!(provisions_by_hash, 0);

@@ -69,6 +69,7 @@ impl Default for ProvisionConfig {
 pub struct ProvisionMemoryStats {
     pub verified_remote_headers: usize,
     pub pending_provisions: usize,
+    pub pending_provision_bytes: usize,
     pub verified_provisions: usize,
     pub expected_provisions: usize,
     pub provisions_by_hash: usize,
@@ -85,6 +86,7 @@ impl ProvisionMemoryStats {
         let Self {
             verified_remote_headers,
             pending_provisions,
+            pending_provision_bytes,
             verified_provisions,
             expected_provisions,
             provisions_by_hash,
@@ -93,6 +95,7 @@ impl ProvisionMemoryStats {
         vec![
             ("verified_remote_headers", verified_remote_headers),
             ("pending_provisions", pending_provisions),
+            ("pending_provision_bytes", pending_provision_bytes),
             ("verified_provisions", verified_provisions),
             ("expected_provisions", expected_provisions),
             ("provisions_by_hash", provisions_by_hash),
@@ -253,6 +256,7 @@ impl ProvisionCoordinator {
         ProvisionMemoryStats {
             verified_remote_headers: self.headers.len(),
             pending_provisions: self.pipeline.pending_len(),
+            pending_provision_bytes: self.pipeline.pending_bytes(),
             verified_provisions: self.pipeline.verified_len(),
             expected_provisions: self.expected.len(),
             provisions_by_hash: self.pipeline.store().len(),
@@ -1154,16 +1158,17 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, Anchor, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
-        Hash, LeafPath, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionParts,
-        ProvisionTxRoot, ProvisionVerifyError, QuorumCertificate, RETENTION_HORIZON, Round,
-        ShardId, SignerBitfield, StateRoot, TopologySnapshot, TxHash, ValidatorId, ValidatorSet,
-        Verifiable, WeightedTimestamp, WitnessSources, provision_leaf,
+        Hash, LeafPath, MAX_MERKLE_PROOF_LEN, MerkleInclusionProof, NetworkDefinition,
+        ProposerTimestamp, ProvisionParts, ProvisionTxRoot, ProvisionVerifyError,
+        QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield, StateRoot,
+        TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable, WeightedTimestamp,
+        WitnessSources, provision_leaf,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
 
     use super::*;
-    use crate::pipeline::MAX_PENDING_PROVISION_ENTRIES;
+    use crate::pipeline::MAX_PENDING_PROVISION_BYTES;
 
     /// A minimal head-only schedule with no pending recoveries — the
     /// unfenced ordinary case every non-fence test runs under.
@@ -3428,14 +3433,36 @@ mod tests {
     fn a_part_dropped_at_the_pending_ceiling_fails_its_fetch() {
         let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
         let filler = ShardId::leaf(2, 3);
-        for i in 0..MAX_PENDING_PROVISION_ENTRIES {
-            let height = BlockHeight::new(u64::try_from(i).expect("a small count"));
-            assert!(coordinator.pipeline.buffer_pending(
-                (filler, height),
-                make_provisions(TxHash::ZERO, filler, ShardId::leaf(2, 0), height),
-                WeightedTimestamp::ZERO,
-            ));
+        // Parts at the proof's decode cap, then empty ones into what is
+        // left, until the buffer takes nothing more.
+        let mut height = 0;
+        for proof_len in [MAX_MERKLE_PROOF_LEN, 0] {
+            loop {
+                height += 1;
+                let at = BlockHeight::new(height);
+                let part = Provision::new(ProvisionParts {
+                    source_shard: filler,
+                    target_shard: ShardId::leaf(2, 0),
+                    block_height: at,
+                    source_block_ts: WeightedTimestamp::ZERO,
+                    tx_hash: TxHash::ZERO,
+                    entries: Capped::empty(),
+                    proof: MerkleInclusionProof::new(vec![0x5A; proof_len]),
+                    leaf: LeafPath {
+                        count: 1,
+                        index: 0,
+                        siblings: Capped::empty(),
+                    },
+                });
+                if !coordinator
+                    .pipeline
+                    .buffer_pending((filler, at), part, WeightedTimestamp::ZERO)
+                {
+                    break;
+                }
+            }
         }
+        assert!(coordinator.pipeline.pending_bytes() <= MAX_PENDING_PROVISION_BYTES);
         let parts = make_provisions_multi(
             txs(2),
             ShardId::leaf(2, 1),
