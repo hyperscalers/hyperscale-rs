@@ -1,34 +1,34 @@
-//! Judge an inbound (provisions, header) pair before its proof is checked.
+//! Judge inbound (part, header) pairs before their proofs are checked.
 //!
 //! The source block's `provision_tx_roots[local_shard]` commits to the
-//! ordered tx hashes the target shard is meant to receive. A bundle whose
-//! transactions compute another root, or one from a header that owes this
-//! shard nothing, is refused with a verdict: the refusal releases every
-//! fetch that could have carried it as failed, so another peer is asked,
-//! and leaves the expectation armed.
+//! ordered leaves the target shard is meant to receive and to their
+//! count. A part whose leaf does not walk its path to that root, or one
+//! from a header that owes this shard nothing, is refused with a
+//! verdict: the refusal releases every fetch that could have carried it
+//! as failed, so another peer is asked, and leaves the expectation
+//! armed.
 //!
 //! The QC was already verified by `RemoteHeaderCoordinator`, so the
 //! emitted `VerifyProvisions` action only needs to check merkle proofs
 //! against the committed state root.
 
-use hyperscale_core::{Action, ProtocolEvent, ProvisionAction, ProvisionRefusal};
+use hyperscale_core::{Action, ProtocolEvent, ProvisionAction, ProvisionRefusal, ProvisionVerdict};
 use hyperscale_metrics::record_fetch_response_refused;
 use hyperscale_types::{
-    Anchor, CertifiedBlockHeader, Hash, ProvisionTxRoot, Provisions, ShardId, Verified,
-    provision_leaf,
+    Anchor, CertifiedBlockHeader, Provision, ProvisionTxRoot, ShardId, Verified,
 };
 
-/// Hold `provisions`' transactions to the root `certified_header` commits
-/// for `local_shard`.
+/// Hold `part`'s leaf to the root `certified_header` commits for
+/// `local_shard`.
 ///
 /// # Errors
 ///
 /// [`ProvisionRefusal::NotOwed`] when the header commits nothing to
-/// `local_shard`; [`ProvisionRefusal::ContentMismatch`] when the
-/// transactions compute another root.
+/// `local_shard`; [`ProvisionRefusal::ContentMismatch`] when the leaf
+/// does not walk its path to the committed root.
 pub fn judge_owed(
     local_shard: ShardId,
-    provisions: &Provisions,
+    part: &Provision,
     certified_header: &Verified<CertifiedBlockHeader>,
 ) -> Result<(), ProvisionRefusal> {
     let Some(expected_root) = certified_header
@@ -41,38 +41,48 @@ pub fn judge_owed(
         return Err(ProvisionRefusal::NotOwed);
     };
 
-    let leaves: Vec<Hash> = provisions
-        .transactions()
-        .iter()
-        .map(|t| provision_leaf(t.tx_hash))
-        .collect();
-    if ProvisionTxRoot::over(&leaves) != expected_root {
+    if ProvisionTxRoot::through(part.leaf_hash(), part.leaf()) != Some(expected_root) {
         record_fetch_response_refused("provision", "content_mismatch");
         return Err(ProvisionRefusal::ContentMismatch);
     }
     Ok(())
 }
 
-/// The verdict refusing `provisions` checked against `anchor`.
+/// The verdict refusing `refused` checked against `anchor`.
 #[must_use]
-pub const fn refused(provisions: Provisions, refusal: ProvisionRefusal, anchor: Anchor) -> Action {
+pub const fn refused(refused: Vec<ProvisionVerdict>, anchor: Anchor) -> Action {
     Action::Continuation(ProtocolEvent::StateProvisionsVerified {
-        result: Err((provisions, refusal)),
+        results: refused,
         anchor,
     })
 }
 
-/// Emit a `VerifyProvisions` action for a bundle its header owes, or the
-/// verdict refusing it.
+/// One `VerifyProvisions` action for the parts of `parts` their header
+/// owes, and the verdict refusing the rest.
 #[must_use]
-pub fn build_verify_action(
+pub fn build_verify_actions(
     local_shard: ShardId,
-    provisions: Provisions,
+    parts: Vec<Provision>,
     certified_header: &Verified<CertifiedBlockHeader>,
-) -> Action {
+) -> Vec<Action> {
     let anchor = Anchor::of(certified_header);
-    match judge_owed(local_shard, &provisions, certified_header) {
-        Ok(()) => Action::Provisions(ProvisionAction::VerifyProvisions { provisions, anchor }),
-        Err(refusal) => refused(provisions, refusal, anchor),
+    let mut owed = Vec::new();
+    let mut refusals = Vec::new();
+    for part in parts {
+        match judge_owed(local_shard, &part, certified_header) {
+            Ok(()) => owed.push(part),
+            Err(refusal) => refusals.push(Err((part, refusal))),
+        }
     }
+    let mut actions = Vec::with_capacity(2);
+    if !owed.is_empty() {
+        actions.push(Action::Provisions(ProvisionAction::VerifyProvisions {
+            parts: owed,
+            anchor,
+        }));
+    }
+    if !refusals.is_empty() {
+        actions.push(refused(refusals, anchor));
+    }
+    actions
 }

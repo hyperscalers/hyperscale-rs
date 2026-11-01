@@ -1,24 +1,33 @@
 //! `ProvisionsNotification` message for cross-shard provisions.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
-    ConsensusSignature, MessageClass, NetworkDefinition, NetworkMessage, Provisions,
-    ProvisionsSenderMessage, Signed, ValidatorId, Verifiable, signed_bytes,
+    BlockHeight, ConsensusSignature, MAX_TXS_PER_BLOCK, MessageClass, NetworkDefinition,
+    NetworkMessage, Provision, ProvisionsSenderMessage, ShardId, Signed, ValidatorId, Verifiable,
+    signed_bytes,
 };
 
-/// Cross-shard state provisions for one (`source_block`, `target_shard`) pair.
+/// Some of one source block's parts for one target shard, packed under
+/// one signature.
 ///
 /// Only the block proposer sends these. The sender signature authenticates
-/// the notification, allowing receivers to reject forged provisions before
-/// doing expensive merkle proof verification.
+/// the notification, allowing receivers to reject forged parts before
+/// doing expensive merkle proof verification. A block's parts for a
+/// target ride in as many notifications as the frame needs; each part
+/// stands on its own once it lands.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ProvisionsNotification {
-    /// The provisions bundle being sent (one bundle per target shard).
-    /// Wire bytes always land in `Verifiable::Unverified`;
-    /// local-dispatched sends from a colocated proposer preserve
-    /// `Verifiable::Verified`.
-    pub provisions: Verifiable<Provisions>,
+    /// The shard the parts were produced on.
+    pub source_shard: ShardId,
+    /// The shard the parts serve.
+    pub target_shard: ShardId,
+    /// The source block the parts were read at.
+    pub block_height: BlockHeight,
+    /// The packed parts, each naming the scope above. Wire bytes always
+    /// land in `Verifiable::Unverified`; local-dispatched sends from a
+    /// colocated proposer preserve `Verifiable::Verified`.
+    pub parts: Capped<Vec<Verifiable<Provision>>, MAX_TXS_PER_BLOCK>,
     /// The validator who sent this notification.
     pub(crate) sender: ValidatorId,
     /// Signature over the domain-separated signing message, by the sender.
@@ -28,16 +37,33 @@ pub struct ProvisionsNotification {
 impl ProvisionsNotification {
     /// Create a new signed provisions notification.
     #[must_use]
-    pub fn new(
-        provisions: impl Into<Verifiable<Provisions>>,
+    pub const fn new(
+        source_shard: ShardId,
+        target_shard: ShardId,
+        block_height: BlockHeight,
+        parts: Capped<Vec<Verifiable<Provision>>, MAX_TXS_PER_BLOCK>,
         sender: ValidatorId,
         sender_signature: ConsensusSignature,
     ) -> Self {
         Self {
-            provisions: provisions.into(),
+            source_shard,
+            target_shard,
+            block_height,
+            parts,
             sender,
             sender_signature,
         }
+    }
+
+    /// Whether every packed part names the notification's own scope.
+    #[must_use]
+    pub fn is_uniform(&self) -> bool {
+        self.parts.iter().all(|part| {
+            let part = part.as_unverified();
+            part.source_shard() == self.source_shard
+                && part.target_shard() == self.target_shard
+                && part.block_height() == self.block_height
+        })
     }
 }
 
@@ -52,7 +78,12 @@ impl Signed for ProvisionsNotification {
 
     fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(
-            &ProvisionsSenderMessage::new(self.provisions.as_unverified()),
+            &ProvisionsSenderMessage::new(
+                self.source_shard,
+                self.target_shard,
+                self.block_height,
+                self.parts.iter().map(Verifiable::as_unverified),
+            ),
             network,
         )
     }

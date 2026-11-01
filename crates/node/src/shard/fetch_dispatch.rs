@@ -11,7 +11,9 @@ use hyperscale_types::{LocalTimestamp, MessageClass, ShardId, ValidatorId};
 
 use super::{ShardIo, ShardLoop};
 use crate::event::{TimerOp, TimerOwner};
-use crate::fetch::{FetchInput, FetchOutput, FetchedBy, Intent, Release, ShardReply};
+use crate::fetch::{
+    FetchInput, FetchOutput, FetchedBy, Intent, Release, ShardReply, SolicitedAnswer,
+};
 use crate::shard::consensus::ProposalBinding;
 use crate::shard::cross_shard::{
     FinalizationBinding, LocalProvisionBinding, ProvisionBinding, SettledTxsBinding,
@@ -179,36 +181,37 @@ where
                     self.drive_fetch::<TransactionBinding>(FetchInput::Admitted { ids });
                 }
             }
-            ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
+            ProtocolEvent::ProvisionsAdmitted { provision, .. } => {
                 self.drive_fetch::<LocalProvisionBinding>(FetchInput::Admitted {
-                    ids: vec![provisions.hash()],
+                    ids: vec![provision.hash()],
                 });
                 self.drive_fetch::<ProvisionBinding>(FetchInput::Admitted {
-                    ids: vec![(
-                        provisions.source_shard(),
-                        provisions.target_shard(),
-                        provisions.block_height(),
-                    )],
+                    ids: ProvisionBinding::answers_for(provision)
+                        .into_iter()
+                        .collect(),
                 });
             }
-            // A refused bundle settles neither fetch that could have
+            // A refused part settles neither fetch that could have
             // carried it, so both go out again, off the peer that
-            // answered. A gossiped bundle failing while a fetch for the
-            // same key is out sends that fetch again early; the retry
+            // answered. A gossiped part failing while a fetch for the
+            // same id is out sends that fetch again early; the retry
             // hold bounds how often.
-            ProtocolEvent::StateProvisionsVerified {
-                result: Err((provisions, _)),
-                ..
-            } => {
+            ProtocolEvent::StateProvisionsVerified { results, .. } => {
+                let refused: Vec<_> = results
+                    .iter()
+                    .filter_map(|result| result.as_ref().err().map(|(part, _)| part))
+                    .collect();
+                if refused.is_empty() {
+                    return;
+                }
                 self.drive_fetch::<LocalProvisionBinding>(FetchInput::Failed {
-                    ids: vec![provisions.hash()],
+                    ids: refused.iter().map(|part| part.hash()).collect(),
                 });
                 self.drive_fetch::<ProvisionBinding>(FetchInput::Failed {
-                    ids: vec![(
-                        provisions.source_shard(),
-                        provisions.target_shard(),
-                        provisions.block_height(),
-                    )],
+                    ids: refused
+                        .iter()
+                        .flat_map(|part| ProvisionBinding::answers_for(part))
+                        .collect(),
                 });
             }
             ProtocolEvent::FinalizationsAdmitted { finalizations } => {
@@ -315,12 +318,10 @@ impl FetchTicker {
 #[cfg(test)]
 mod tests {
     use hyperscale_core::{Action, ProvisionRefusal};
-    use hyperscale_hbor::Capped;
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::GetProvisionsRequest;
     use hyperscale_types::{
-        Anchor, BlockHash, BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions,
-        StateRoot, TxHash, WeightedTimestamp,
+        Anchor, BlockHash, BlockHeight, Hash, Provision, StateRoot, TxHash, WeightedTimestamp,
     };
 
     use super::*;
@@ -381,17 +382,7 @@ mod tests {
                 .count()
         };
 
-        let bundle = Provisions::new(
-            source,
-            SHARD,
-            height,
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"tx")),
-                Capped::empty(),
-            )]),
-        );
+        let bundle = Provision::dummy(source, SHARD, height, TxHash::from(Hash::from_bytes(b"tx")));
         let shard_loop = loop_of(&mut host);
         shard_loop.request_fetch(
             FetchIds::RemoteProvisions(vec![(source, SHARD, height)]),
@@ -409,7 +400,7 @@ mod tests {
 
         loop_of(&mut host).drain_actions(vec![Action::Continuation(
             ProtocolEvent::StateProvisionsVerified {
-                result: Err((bundle, ProvisionRefusal::ContentMismatch)),
+                results: vec![Err((bundle, ProvisionRefusal::ContentMismatch))],
                 anchor: Anchor {
                     shard: source,
                     height,

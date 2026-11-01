@@ -14,7 +14,7 @@
 
 use std::ops::ControlFlow;
 
-use hyperscale_hbor::{Capped, DEFAULT_MAX_DEPTH, Encoder, HborEncode, Sink};
+use hyperscale_hbor::Capped;
 use hyperscale_types::network::Request;
 use hyperscale_types::network::request::{
     GetCellsRequest, GetFinalizationsRequest, GetInstanceRecordsRequest, GetLocalProvisionsRequest,
@@ -97,29 +97,6 @@ impl<T, const N: usize> Answer<T, N> {
     }
 }
 
-/// Bytes `value` encodes to, counted rather than written.
-///
-/// `usize::MAX` for a value that does not encode, which no budget
-/// admits past the first item.
-pub fn encoded_len<T: HborEncode + ?Sized>(value: &T) -> usize {
-    let mut count = 0;
-    let encoded = value.encode(&mut Encoder::new(Counting(&mut count), DEFAULT_MAX_DEPTH));
-    encoded.map_or(usize::MAX, |()| count)
-}
-
-/// A sink that keeps nothing but the count.
-struct Counting<'a>(&'a mut usize);
-
-impl Sink for Counting<'_> {
-    fn write(&mut self, bytes: &[u8]) {
-        *self.0 = self.0.saturating_add(bytes.len());
-    }
-
-    fn written(&self) -> usize {
-        *self.0
-    }
-}
-
 /// A request whose answers are counted as fetch responses sent.
 ///
 /// Recorded where the handler is registered, labelled by the request's
@@ -173,10 +150,7 @@ impl Served for GetWitnessHistoryRequest {
 
 impl Served for GetProvisionsRequest {
     fn served(&self, response: &Self::Response) -> usize {
-        response
-            .provisions
-            .as_ref()
-            .map_or(0, |provisions| provisions.transactions().len())
+        response.parts.len()
     }
 }
 
@@ -233,8 +207,6 @@ impl Served for GetCellsRequest {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::to_vec as hbor_to_vec;
-
     use super::*;
 
     /// A count past the cap is the cap; an ask of none is one.
@@ -267,13 +239,6 @@ mod tests {
         assert!(answer.offer(2, 0).is_break());
         assert!(answer.offer(3, 0).is_break());
         assert_eq!(answer.finish().into_inner(), vec![1, 2]);
-    }
-
-    /// The count is the encoding's length.
-    #[test]
-    fn an_encoded_length_is_counted_not_written() {
-        let value: Vec<u64> = (0..100).collect();
-        assert_eq!(encoded_len(&value), hbor_to_vec(&value).unwrap().len());
     }
 
     #[test]

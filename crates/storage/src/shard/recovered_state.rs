@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Anchor, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin,
-    CommittedTip, Hash, Provisions, QuorumCertificate, ReadFrontier, ShardAnchor, StateRoot,
+    CommittedTip, Hash, Provision, QuorumCertificate, ReadFrontier, ShardAnchor, StateRoot,
     Verified, WeightedTimestamp,
 };
 
@@ -89,7 +89,7 @@ pub struct RecoveredState {
     /// The provision bodies still held for the blocks that carried them.
     /// A stored block keeps only their hashes, so this is what puts them
     /// back in the shared store a restarted node reads them from.
-    pub retained_provisions: Vec<Provisions>,
+    pub retained_provisions: Vec<Provision>,
 
     /// Last committed block hash (None for fresh start).
     pub committed_hash: Option<BlockHash>,

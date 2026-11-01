@@ -9,7 +9,7 @@ use hyperscale_hbor::{HborDecode, HborEncode};
 use hyperscale_jmt::{Node, NodeKey};
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey,
-    Finalization, FinalizationHash, GlobalReceiptHash, Hash, ProvisionHash, Provisions,
+    Finalization, FinalizationHash, GlobalReceiptHash, Hash, Provision, ProvisionHash,
     SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, Transaction, TxHash,
     ValidatorId,
 };
@@ -165,17 +165,17 @@ pub const VOTED_BLOCKS_CF: &str = "voted_blocks";
 /// and clears this CF.
 pub const IMPORT_STAGING_CF: &str = "import_staging";
 
-/// Column family for the provision bundles a committed block carried.
+/// Column family for the provision parts a committed block carried.
 ///
 /// Key: `(committing_height_BE_8B, provision_hash_32B)`; value:
-/// HBOR-encoded [`Provisions`]. A stored block keeps only its bundles'
+/// HBOR-encoded [`Provision`]. A stored block keeps only its parts'
 /// hashes, so this is where the bodies live between the block that
 /// carried them and the finalization that resolves what they provisioned
 /// — the window a restart has to replay across.
 ///
 /// The committing height leads the key so the retention sweep is one
-/// range delete. It is the height of *our* block that carried the
-/// bundle, not `Provisions::block_height`, which is the source shard's.
+/// range delete. It is the height of *our* block that carried the part,
+/// not `Provision::block_height`, which is the source shard's.
 pub const PROVISIONS_CF: &str = "provisions";
 
 /// Column family indexing committed package artifacts by content address.
@@ -510,9 +510,9 @@ pub struct ProvisionsCf;
 impl TypedCf for ProvisionsCf {
     const NAME: &'static str = PROVISIONS_CF;
     type Key = (BlockHeight, ProvisionHash);
-    type Value = Provisions;
+    type Value = Provision;
     type KeyCodec = ProvisionKeyCodec;
-    type ValueCodec = HborCodec<Provisions>;
+    type ValueCodec = HborCodec<Provision>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.provisions

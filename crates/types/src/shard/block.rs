@@ -15,8 +15,8 @@ use thiserror::Error;
 use crate::{
     AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Demands, Derivation,
     Engagement, Engagements, Finalization, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, Provision,
+    ProvisionHash, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
     StateRoot, TermsSection, TickManifest, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
     Verified, WeightedTimestamp, WitnessSources,
 };
@@ -74,7 +74,7 @@ pub type SharedCertificates =
     Arc<Capped<Vec<Verifiable<Finalization>>, MAX_FINALIZED_TX_PER_BLOCK>>;
 
 /// Shared provision list — same rationale as [`SharedCertificates`].
-pub type SharedProvisions = Arc<Capped<Vec<Verifiable<Provisions>>, MAX_PROVISIONS_PER_BLOCK>>;
+pub type SharedProvisions = Arc<Capped<Vec<Verifiable<Provision>>, MAX_PROVISIONS_PER_BLOCK>>;
 
 /// What a shard charged across the ticks `certificates` settle, in
 /// quanta.
@@ -535,11 +535,11 @@ impl Block {
     /// they served has passed. Use `is_live()` when the variant itself
     /// matters — this accessor flattens both cases to a slice.
     ///
-    /// Elements are [`Verifiable<Provisions>`] — the in-process upstream's
+    /// Elements are [`Verifiable<Provision>`] — the in-process upstream's
     /// verification marker survives across the block boundary; consumers
     /// peek `.verified()` to skip re-verification when the marker is live.
     #[must_use]
-    pub fn provisions(&self) -> &[Verifiable<Provisions>] {
+    pub fn provisions(&self) -> &[Verifiable<Provision>] {
         match self {
             Self::Live { provisions, .. } => provisions,
             Self::Sealed { .. } => &[],

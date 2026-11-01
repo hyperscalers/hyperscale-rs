@@ -934,15 +934,12 @@ impl MempoolCoordinator {
         // for txs already in pool (gossip already won); per-(tx, source) dedup
         // is handled by `ExpectedTxs::record`.
         for provision in block.provisions() {
-            let source_shard = provision.source_shard();
-            for entry in provision.transactions() {
-                let tx_hash = entry.tx_hash;
-                if self.pool.contains_key(&tx_hash) {
-                    continue;
-                }
-                self.expected_txs
-                    .record(tx_hash, source_shard, self.clock.now());
+            let tx_hash = provision.tx_hash();
+            if self.pool.contains_key(&tx_hash) {
+                continue;
             }
+            self.expected_txs
+                .record(tx_hash, provision.source_shard(), self.clock.now());
         }
 
         // Fire fetches for entries whose grace window has elapsed. Re-emitted
@@ -1585,9 +1582,7 @@ mod tests {
     fn verified(tx: Transaction) -> Verified<Transaction> {
         Verified::new_unchecked_for_test(tx)
     }
-    use hyperscale_types::{
-        Block, Finalization, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId, ValidatorId,
-    };
+    use hyperscale_types::{Block, Finalization, Provision, ShardId, ValidatorId};
 
     use super::*;
 
@@ -1618,29 +1613,21 @@ mod tests {
         certify(block, height.inner() * TEST_BLOCK_INTERVAL_MS)
     }
 
-    /// Build a `CertifiedBlock` whose body carries one `Provisions` bundle
-    /// from `source_shard` referencing `tx_hashes`. No transactions in the
-    /// block body itself (the bundle is the cross-shard signal).
+    /// Build a `CertifiedBlock` whose body carries one provision part
+    /// from `source_shard` for each of `tx_hashes`. No transactions in
+    /// the block body itself (the parts are the cross-shard signal).
     fn certified_block_with_provisions(
         height: BlockHeight,
         source_shard: ShardId,
         tx_hashes: &[TxHash],
     ) -> CertifiedBlock {
-        let transactions = Capped::new(
+        let parts = Capped::new(
             tx_hashes
                 .iter()
-                .map(|h| ProvisionEntry::new(*h, Capped::from_array([])))
+                .map(|h| Provision::dummy(source_shard, ShardId::ROOT, height, *h).into())
                 .collect(),
         )
         .expect("a list written out in a test");
-        let provision = Provisions::new(
-            source_shard,
-            ShardId::ROOT,
-            height,
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            transactions,
-        );
         let block = match make_live_block(
             ShardId::ROOT,
             height,
@@ -1658,7 +1645,7 @@ mod tests {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(Capped::from_array([provision.into()])),
+                provisions: Arc::new(parts),
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
                 tick_manifest: Arc::new(Capped::empty()),

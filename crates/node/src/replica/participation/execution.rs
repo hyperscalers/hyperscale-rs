@@ -84,8 +84,8 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot,
-        Hash, LocalTimestamp, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
-        SignerBitfield, TickId, TxHash, TxOutcome, Verified, WeightedTimestamp,
+        Hash, LocalTimestamp, Provision, ShardId, SignerBitfield, TickId, TxHash, TxOutcome,
+        Verified, WeightedTimestamp,
     };
 
     use crate::replica::NodeStateMachine;
@@ -111,18 +111,16 @@ mod tests {
     /// `tx` to the leaf `target`.
     fn sent_one_batch(target: ShardId, tx: TxHash) -> NodeStateMachine {
         let TestNode { mut node, .. } = TestNode::builder().build();
-        let provisions = Verified::new_unchecked_for_test(Provisions::new(
+        let part = Verified::new_unchecked_for_test(Provision::dummy(
             ShardId::ROOT,
             target,
             BlockHeight::new(1),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(tx, Capped::empty())]),
+            tx,
         ));
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::OutboundProvisionBroadcast {
-                provisions,
+                parts: vec![part],
                 target_shard: target,
             },
         );

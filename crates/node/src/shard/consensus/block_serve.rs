@@ -18,7 +18,7 @@ use hyperscale_storage::{BlockForSync, PendingChain, ShardStorage};
 use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
-    ElidedCertifiedBlock, ProvisionHash, Provisions, RETENTION_HORIZON, Verifiable,
+    ElidedCertifiedBlock, Provision, ProvisionHash, RETENTION_HORIZON, Verifiable,
 };
 use tracing::{trace, warn};
 
@@ -128,7 +128,7 @@ pub fn serve_block_request<S: ShardStorage>(
         return GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory));
     }
 
-    let resolved: Vec<(ProvisionHash, Option<Provisions>)> = provision_hashes
+    let resolved: Vec<(ProvisionHash, Option<Provision>)> = provision_hashes
         .iter()
         .map(|h| (*h, provision_store.get(*h)))
         .collect();
@@ -154,7 +154,7 @@ pub fn serve_block_request<S: ShardStorage>(
     // `Block::Live.provisions`; encoding lands at `Verifiable::Unverified`
     // on the receiver and verification proceeds from there. Missing
     // entries returned `not_found` above, so every body resolves here.
-    let provisions: Vec<Verifiable<Provisions>> = resolved
+    let provisions: Vec<Verifiable<Provision>> = resolved
         .into_iter()
         .filter_map(|(_, p)| p.map(Verifiable::from))
         .collect();
@@ -178,8 +178,8 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::BlockIntent;
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, Hash,
-        MerkleInclusionProof, SettledWrites, ShardId, StateRoot, WeightedTimestamp,
+        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, Hash, SettledWrites,
+        ShardId, StateRoot, TxHash,
     };
 
     use super::*;
@@ -232,16 +232,14 @@ mod tests {
         storage
     }
 
-    /// A `Live` block at `height` carrying one provisions bundle
-    /// inline, as the pending window holds a block before it seals.
+    /// A `Live` block at `height` carrying one provision part inline, as
+    /// the pending window holds a block before it seals.
     fn live_block_with_a_provision(height: BlockHeight) -> Block {
-        let bundle = Provisions::new(
+        let bundle = Provision::dummy(
             ShardId::ROOT,
             ShardId::ROOT,
             height,
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::new(vec![]),
-            Capped::empty(),
+            TxHash::from(Hash::from_bytes(b"tx")),
         );
         let Block::Live {
             header,

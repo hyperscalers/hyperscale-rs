@@ -3,8 +3,8 @@
 //! Thin adapter between `hyperscale_jmt`'s `MultiProof` and the on-wire
 //! [`MerkleInclusionProof`] (opaque bytes wrapper). The wire format is
 //! owned by the JMT crate; this module wraps it in the hyperscale type
-//! system. Verification lives on `Verify<&ProvisionsContext<'_>> for
-//! Provisions` in `crates/types/src/provisioning/provisions.rs`.
+//! system. Verification lives on `Verify<&ProvisionContext> for
+//! Provision` in `crates/types/src/provisioning/provision.rs`.
 
 use hyperscale_jmt::{Key, MAX_PROOF_CLAIMS, MAX_PROOF_SIBLINGS, NodeKey, TreeReader};
 use hyperscale_types::{BlockHeight, MAX_MERKLE_PROOF_LEN, MerkleInclusionProof, SubstateKey};

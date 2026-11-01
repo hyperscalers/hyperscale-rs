@@ -23,7 +23,7 @@ use hyperscale_types::network::response::{
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BlockHeight, CheckedStateProof, Finalization, FinalizationHash, HeaderSource,
-    ProvisionHash, Provisions, ShardId, SubstateKey, TerminalEvidence, VerdictCells, Verifiable,
+    Provision, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, VerdictCells, Verifiable,
     settled_txs_root_from_hashes,
 };
 
@@ -106,14 +106,15 @@ impl SolicitedAnswer for LocalProvisionBinding {
     }
 
     fn answers_for(entry: &LocalProvisionEntry) -> impl IntoIterator<Item = ProvisionHash> + use<> {
-        [entry.provisions.hash()]
+        [entry.provision.hash()]
     }
 
-    /// The bundled source header goes ahead of its provisions, so the
-    /// verification pipeline has a chance to admit it first. The header
+    /// The bundled source headers go ahead of the parts, so the
+    /// verification pipeline has a chance to admit them first. A header
     /// is QC-self-authenticating.
     fn deliver(kept: Vec<LocalProvisionEntry>) -> Vec<ShardScopedInput> {
-        let mut inputs = Vec::with_capacity(kept.len() * 2);
+        let mut inputs = Vec::with_capacity(kept.len() + 1);
+        let mut parts = Vec::with_capacity(kept.len());
         for entry in kept {
             if let Some(certified_header) = entry.source_header {
                 inputs.push(ShardScopedInput::Protocol(Box::new(
@@ -123,12 +124,11 @@ impl SolicitedAnswer for LocalProvisionBinding {
                     },
                 )));
             }
-            inputs.push(ShardScopedInput::Protocol(Box::new(
-                ProtocolEvent::UnverifiedProvisionsReceived {
-                    provisions: entry.provisions,
-                },
-            )));
+            parts.push(entry.provision);
         }
+        inputs.push(ShardScopedInput::Protocol(Box::new(
+            ProtocolEvent::UnverifiedProvisionsReceived { parts },
+        )));
         inputs
     }
 }
@@ -469,15 +469,15 @@ impl<S: ShardStorage> FetchedBy<ShardIo<S>> for ProvisionBinding {
     }
 }
 
-/// A bundle answers for the `(source, target, height)` it names, so one
-/// for another scope is unsolicited. Its proof is checked on the
-/// coordinator against the commit-proven source header, and the
+/// A part answers for the `(source, target, height)` it names, so one
+/// for another scope is unsolicited. Its leaf and proof are checked on
+/// the coordinator against the commit-proven source header, and the
 /// expectation that asked does not ask again, so the id stays in flight
-/// until the coordinator admits the bundle or fails it: the fetch's own
+/// until the coordinator admits a part or fails it: the fetch's own
 /// retry is the only one there is.
 impl SolicitedAnswer for ProvisionBinding {
     type Request = GetProvisionsRequest;
-    type Item = Provisions;
+    type Item = Provision;
     type Input = ShardScopedInput;
 
     const SETTLES: Settles = Settles::OnVerdict;
@@ -491,32 +491,24 @@ impl SolicitedAnswer for ProvisionBinding {
         GetProvisionsRequest::new(block_height, target_shard)
     }
 
-    /// A bundle with no transactions is a source with nothing owed to
-    /// the asker at that height, which reads as not holding it.
-    fn items(response: GetProvisionResponse) -> Vec<Provisions> {
-        response
-            .provisions
-            .into_iter()
-            .filter(|provisions| !provisions.transactions().is_empty())
-            .collect()
+    /// Every part names exactly one transaction, so none is filtered: an
+    /// engagement echo with no entries is a part like any other.
+    fn items(response: GetProvisionResponse) -> Vec<Provision> {
+        response.parts.into_inner()
     }
 
-    fn answers_for(provisions: &Provisions) -> impl IntoIterator<Item = Self::Id> + use<> {
+    fn answers_for(part: &Provision) -> impl IntoIterator<Item = Self::Id> + use<> {
         [(
-            provisions.source_shard(),
-            provisions.target_shard(),
-            provisions.block_height(),
+            part.source_shard(),
+            part.target_shard(),
+            part.block_height(),
         )]
     }
 
-    fn deliver(kept: Vec<Provisions>) -> Vec<ShardScopedInput> {
-        kept.into_iter()
-            .map(|provisions| {
-                ShardScopedInput::Protocol(Box::new(ProtocolEvent::UnverifiedProvisionsReceived {
-                    provisions,
-                }))
-            })
-            .collect()
+    fn deliver(kept: Vec<Provision>) -> Vec<ShardScopedInput> {
+        vec![ShardScopedInput::Protocol(Box::new(
+            ProtocolEvent::UnverifiedProvisionsReceived { parts: kept },
+        ))]
     }
 }
 
@@ -772,7 +764,7 @@ mod solicited_tests {
     use crossbeam::channel::unbounded;
     use hyperscale_network::ResponseVerdict;
     use hyperscale_types::network::Request;
-    use hyperscale_types::{Hash, MerkleInclusionProof, ProvisionEntry, TxHash, WeightedTimestamp};
+    use hyperscale_types::{Hash, TxHash};
 
     use super::*;
     use crate::event::HostEvent;
@@ -781,21 +773,12 @@ mod solicited_tests {
     const LOCAL: ShardId = ShardId::leaf(2, 0);
     const SOURCE: ShardId = ShardId::leaf(2, 1);
 
-    fn bundle(target: ShardId, height: u64, txs: &[&[u8]]) -> Provisions {
-        Provisions::new(
+    fn bundle(target: ShardId, height: u64, tx: &[u8]) -> Provision {
+        Provision::dummy(
             SOURCE,
             target,
             BlockHeight::new(height),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::new(
-                txs.iter()
-                    .map(|tx| {
-                        ProvisionEntry::new(TxHash::from(Hash::from_bytes(tx)), Capped::empty())
-                    })
-                    .collect(),
-            )
-            .unwrap(),
+            TxHash::from(Hash::from_bytes(tx)),
         )
     }
 
@@ -836,12 +819,12 @@ mod solicited_tests {
     /// send reaches the coordinator and stays in flight for its verdict.
     #[test]
     fn a_trimmed_answer_releases_its_misses_without_blame() {
-        let sent = bundle(LOCAL, 10, &[b"a"]);
-        let left_out = bundle(LOCAL, 11, &[b"b"]).hash();
+        let sent = bundle(LOCAL, 10, b"a");
+        let left_out = bundle(LOCAL, 11, b"b").hash();
         let (verdict, inputs) = settle::<LocalProvisionBinding>(
             vec![sent.hash(), left_out],
             GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
-                provisions: sent.clone(),
+                provision: sent.clone(),
                 source_header: None,
             }])),
         );
@@ -850,8 +833,8 @@ mod solicited_tests {
         assert!(inputs.iter().any(|input| matches!(
             input,
             ShardScopedInput::Protocol(event)
-                if matches!(&**event, ProtocolEvent::UnverifiedProvisionsReceived { provisions }
-                    if provisions.hash() == sent.hash())
+                if matches!(&**event, ProtocolEvent::UnverifiedProvisionsReceived { parts }
+                    if parts.iter().map(Provision::hash).eq([sent.hash()]))
         )));
         assert!(inputs.iter().any(|input| matches!(
             input,
@@ -862,13 +845,13 @@ mod solicited_tests {
     /// An item nobody asked for is dropped and rejects the answer.
     #[test]
     fn an_unsolicited_item_rejects_the_answer() {
-        let asked = bundle(LOCAL, 10, &[b"a"]);
-        let extra = bundle(LOCAL, 12, &[b"c"]);
+        let asked = bundle(LOCAL, 10, b"a");
+        let extra = bundle(LOCAL, 12, b"c");
         let (verdict, inputs) = settle::<LocalProvisionBinding>(
             vec![asked.hash()],
             GetLocalProvisionsResponse::new(Capped::from_array([&asked, &extra].map(
-                |provisions| LocalProvisionEntry {
-                    provisions: provisions.clone(),
+                |provision| LocalProvisionEntry {
+                    provision: provision.clone(),
                     source_header: None,
                 },
             ))),
@@ -878,22 +861,23 @@ mod solicited_tests {
             .iter()
             .filter_map(|input| match input {
                 ShardScopedInput::Protocol(event) => match &**event {
-                    ProtocolEvent::UnverifiedProvisionsReceived { provisions } => {
-                        Some(provisions.hash())
+                    ProtocolEvent::UnverifiedProvisionsReceived { parts } => {
+                        Some(parts.iter().map(Provision::hash).collect::<Vec<_>>())
                     }
                     _ => None,
                 },
                 _ => None,
             })
+            .flatten()
             .collect();
         assert_eq!(delivered, vec![asked.hash()]);
     }
 
-    /// A source that does not hold the block, or owes the asker nothing
-    /// at it, answers honestly and is asked again elsewhere; a bundle for
-    /// another scope is no answer and rejects the peer.
+    /// A source that does not hold the block answers honestly and is
+    /// asked again elsewhere; a part for another scope is no answer and
+    /// rejects the peer.
     #[test]
-    fn a_remote_bundle_is_held_to_its_scope_and_a_miss_costs_nothing() {
+    fn a_remote_part_is_held_to_its_scope_and_a_miss_costs_nothing() {
         let id = (SOURCE, LOCAL, BlockHeight::new(10));
         let failed = |inputs: &[ShardScopedInput]| {
             inputs.iter().any(|input| {
@@ -902,24 +886,14 @@ mod solicited_tests {
             })
         };
 
-        for (response, what) in [
-            (GetProvisionResponse { provisions: None }, "not held"),
-            (
-                GetProvisionResponse {
-                    provisions: Some(bundle(LOCAL, 10, &[])),
-                },
-                "nothing owed",
-            ),
-        ] {
-            let (verdict, inputs) = settle::<ProvisionBinding>(vec![id], response);
-            assert_eq!(verdict, ResponseVerdict::Accept, "{what}");
-            assert!(failed(&inputs), "{what}: asked again");
-        }
+        let (verdict, inputs) = settle::<ProvisionBinding>(vec![id], GetProvisionResponse::empty());
+        assert_eq!(verdict, ResponseVerdict::Accept, "not held");
+        assert!(failed(&inputs), "not held: asked again");
 
         let (verdict, inputs) = settle::<ProvisionBinding>(
             vec![id],
             GetProvisionResponse {
-                provisions: Some(bundle(ShardId::leaf(2, 3), 10, &[b"a"])),
+                parts: Capped::from_array([bundle(ShardId::leaf(2, 3), 10, b"a")]),
             },
         );
         assert_eq!(verdict, ResponseVerdict::Reject, "another scope");
@@ -928,10 +902,37 @@ mod solicited_tests {
         let (verdict, inputs) = settle::<ProvisionBinding>(
             vec![id],
             GetProvisionResponse {
-                provisions: Some(bundle(LOCAL, 10, &[b"a"])),
+                parts: Capped::from_array([bundle(LOCAL, 10, b"a")]),
             },
         );
         assert_eq!(verdict, ResponseVerdict::Accept);
         assert!(!failed(&inputs) && !inputs.iter().any(is_fulfilled));
+    }
+
+    /// An engagement echo — a part carrying no entries — is an answer
+    /// like any other: kept, held to its scope, and handed over.
+    #[test]
+    fn an_empty_entry_part_passes_the_response_boundary() {
+        let id = (SOURCE, LOCAL, BlockHeight::new(10));
+        let echo = bundle(LOCAL, 10, b"echo");
+        assert!(echo.entries().is_empty());
+        let (verdict, inputs) = settle::<ProvisionBinding>(
+            vec![id],
+            GetProvisionResponse {
+                parts: Capped::from_array([echo.clone()]),
+            },
+        );
+        assert_eq!(verdict, ResponseVerdict::Accept);
+        assert!(inputs.iter().any(|input| matches!(
+            input,
+            ShardScopedInput::Protocol(event)
+                if matches!(&**event, ProtocolEvent::UnverifiedProvisionsReceived { parts }
+                    if parts.iter().map(Provision::hash).eq([echo.hash()]))
+        )));
+        assert!(
+            !inputs
+                .iter()
+                .any(|input| matches!(input, ShardScopedInput::FetchFailed(_)))
+        );
     }
 }

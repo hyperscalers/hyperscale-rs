@@ -546,11 +546,12 @@ impl BlockHeader {
     /// Per-target-shard merkle commitment over the tx hashes a target shard
     /// should receive provisions for from this block.
     ///
-    /// Key = target shard; value = `compute_merkle_root` over the
-    /// ordered tx hashes destined for that target (block order, already
-    /// hash-ascending). Lets the target verify a received `Provisions`
-    /// contains the full set it was meant to receive — catches silently
-    /// dropped txs on the broadcast path.
+    /// Key = target shard; value = [`ProvisionTxRoot::over`] the tagged
+    /// leaves of the transactions destined for that target, in block
+    /// order, which commits their count. Lets the target hold every part
+    /// it receives to a real leaf of the full set it was meant to receive.
+    ///
+    /// [`ProvisionTxRoot::over`]: crate::ProvisionTxRoot::over
     #[must_use]
     pub const fn provision_tx_roots(&self) -> &ProvisionTxRootsMap {
         &self.provision_tx_roots

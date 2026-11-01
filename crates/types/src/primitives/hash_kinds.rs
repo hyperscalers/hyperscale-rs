@@ -82,22 +82,23 @@ hash_newtype!(
 );
 
 hash_newtype!(
-    /// Identity hash of a [`Provisions`](crate::Provisions) batch.
+    /// Identity hash of a [`Provision`](crate::Provision) part.
     ///
-    /// Computed from the content fields (source shard, block height, proof,
-    /// transactions) at construction / deserialization. Used as the fetch
-    /// key, cache key, and manifest leaf for cross-shard provisions.
+    /// Computed from every content field — the part's scope, transaction,
+    /// entries, proof and leaf path. Used as the fetch key, cache key, and
+    /// manifest leaf for cross-shard provisions.
     pub ProvisionHash,
     "ProvisionHash"
 );
 
 hash_newtype!(
-    /// Per-target-shard merkle root over the tx hashes destined for that
-    /// target in a block's cross-shard provisions.
+    /// Per-target-shard root over the tagged leaves of the transactions
+    /// destined for that target in a block's cross-shard provisions,
+    /// wrapped with their count.
     ///
     /// Populated in [`BlockHeader::provision_tx_roots`](crate::BlockHeader)
-    /// and verified by target shards against their received `Provisions`
-    /// to detect a proposer omitting transactions.
+    /// and held by target shards against each part's leaf path, so a part
+    /// verifies only at a real leaf position.
     pub ProvisionTxRoot,
     "ProvisionTxRoot"
 );

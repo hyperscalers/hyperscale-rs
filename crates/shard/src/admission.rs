@@ -31,9 +31,9 @@ use hyperscale_types::{
     Finalization, FinalizationHash, MAX_CLAIMS_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_OWED_TOWARD_SHARD,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STAGED_RECEIPT_BYTES, MAX_STANDING_TOWARD_SHARD,
-    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
-    Provisions, Reshaping, Settlement, ShardId, ShardTrie, StandingToward, StateClaim, SubstateKey,
-    TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Provision,
+    ProvisionHash, Reshaping, Settlement, ShardId, ShardTrie, StandingToward, StateClaim,
+    SubstateKey, TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
     WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction, claims_admit_block,
     evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
@@ -211,7 +211,7 @@ impl ProvisionsFold {
 }
 
 impl Section for ProvisionsSection {
-    type Item = Provisions;
+    type Item = Provision;
     type Fold = ProvisionsFold;
 
     /// A batch the chain does not already carry, from a shard whose
@@ -226,7 +226,7 @@ impl Section for ProvisionsSection {
     /// every replica's verdict a pure function of the block's own
     /// anchor: a block anchored before the recovery folded resolves a
     /// snapshot without the record and stays valid.
-    fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, batch: &Provisions) -> Result<(), String> {
+    fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, batch: &Provision) -> Result<(), String> {
         let provision_hash = batch.hash();
         if ctx.chain.provisions.contains(&provision_hash) {
             return Err(format!(
@@ -259,7 +259,7 @@ impl Section for ProvisionsSection {
                  recovery's bridge above its frontier"
             ));
         }
-        let tx_count = fold.tx_count.saturating_add(batch.transactions().len());
+        let tx_count = fold.tx_count.saturating_add(1);
         if tx_count > MAX_ENGAGEMENTS_PER_BLOCK {
             return Err(format!(
                 "provisions batch {provision_hash:?} carries the block past \
@@ -267,7 +267,7 @@ impl Section for ProvisionsSection {
             ));
         }
         fold.tx_count = tx_count;
-        fold.engaged.extend(Engagement::of_batch(batch));
+        fold.engaged.insert(Engagement::of_part(batch));
         Ok(())
     }
 }
@@ -1871,9 +1871,9 @@ mod state_claim_tests {
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, Deadline, Epoch, EpochWindows,
         GlobalReceiptHash, Hash, Inclusion, MerkleInclusionProof, NetworkDefinition, Owes,
-        ProvisionEntry, Provisions, RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ShardId,
-        ShardRecovery, StateClaim, Stated, SubstateKey, TopologySchedule, TopologySnapshot, TxHash,
-        ValidatorSet, WeightedTimestamp, verdict_leaf,
+        Provision, RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ShardId, ShardRecovery,
+        StateClaim, Stated, SubstateKey, TopologySchedule, TopologySnapshot, TxHash, ValidatorSet,
+        WeightedTimestamp, verdict_leaf,
     };
     use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, ProtocolHasher, Terms};
     use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -2481,17 +2481,13 @@ mod state_claim_tests {
 
     /// A provision batch from the counterpart's block at `height`
     /// anchored at `anchor_ms`, naming one transaction.
-    fn batch_at(counterpart: ShardId, local: ShardId, height: u64, anchor_ms: u64) -> Provisions {
-        Provisions::new(
+    fn batch_at(counterpart: ShardId, local: ShardId, height: u64, anchor_ms: u64) -> Provision {
+        Provision::dummy_at(
             counterpart,
             local,
             BlockHeight::new(height),
             WeightedTimestamp::from_millis(anchor_ms),
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"provisioned")),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(b"provisioned")),
         )
     }
 

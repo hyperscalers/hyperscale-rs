@@ -57,9 +57,8 @@ const _: () = assert!(
 /// the `transactions` array inside [`Block`](crate::Block), the
 /// `tx_outcomes` array inside any one
 /// [`ExecutionCertificate`](crate::ExecutionCertificate) for a tick from
-/// this block, and the `transactions` (per-tx state-entry sets) inside
-/// any one [`Provisions`](crate::Provisions) batch sourced from this
-/// block.
+/// this block, and the [`Provision`](crate::Provision) parts this block
+/// owes any one target.
 pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 
 /// Hard cap on the sweepable cells one block's transactions may create
@@ -235,20 +234,16 @@ pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 /// than this outstanding asks across several requests.
 pub const MAX_PROOFS_PER_QUERY: usize = 256;
 
-/// Hard cap on the number of provision batches any single block can carry.
-///
-/// A [`Provisions`](crate::Provisions) batch is keyed on `(source_shard,
-/// target_shard, source_block_height)`. The count per local block scales
-/// with the number of remote shards we depend on for cross-shard work
-/// and the recent source-block-heights we still need state from. Sized
-/// for small-to-mid-shard topologies; widening the topology may require
-/// revisiting.
-pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
-
 /// Hard cap on the transactions one block's provisions name between
 /// them, and so on the [`Engagements`](crate::Engagements) a sealed block
 /// keeps of them: one entry per named transaction.
 pub const MAX_ENGAGEMENTS_PER_BLOCK: usize = MAX_TXS_PER_BLOCK;
+
+/// Hard cap on the number of provision parts any single block can carry.
+///
+/// A [`Provision`](crate::Provision) names one transaction, so a block
+/// takes as many parts as it names transactions.
+pub const MAX_PROVISIONS_PER_BLOCK: usize = MAX_ENGAGEMENTS_PER_BLOCK;
 /// The most leaves one cells query may be answered over, keys and
 /// range entries together.
 ///

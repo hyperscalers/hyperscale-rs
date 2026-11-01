@@ -6,7 +6,7 @@
 
 use hyperscale_core::Action;
 use hyperscale_metrics::record_crossing_push_dropped;
-use hyperscale_types::{Provisions, StateClaim, TopologySchedule, Verifiable};
+use hyperscale_types::{Provision, StateClaim, TopologySchedule, Verifiable};
 
 use super::ShardParticipation;
 
@@ -37,19 +37,19 @@ impl ShardParticipation {
         actions
     }
 
-    /// A verified bundle is engagement evidence: promote any parked
+    /// A verified part is engagement evidence: promote the parked
     /// cross-shard transaction it names, before the proposal latch
-    /// gathers ready transactions, so the bundle and its transactions
-    /// pair in one proposal.
+    /// gathers ready transactions, so the part and its transaction pair
+    /// in one proposal.
     pub(in crate::replica) fn on_provisions_admitted(
         &mut self,
         sched: &TopologySchedule,
-        provisions: Verifiable<Provisions>,
+        provisions: Verifiable<Provision>,
     ) -> Vec<Action> {
         self.mempool_coordinator.on_engagement_evidence(
             sched.head().shard_trie(),
             provisions.source_shard(),
-            provisions.transactions().iter().map(|entry| entry.tx_hash),
+            std::iter::once(provisions.tx_hash()),
         );
         let actions = self
             .shard_coordinator
@@ -62,10 +62,8 @@ impl ShardParticipation {
 #[cfg(test)]
 mod tests {
     use hyperscale_core::{Action, ConsensusAction, ProtocolEvent, StateMachine};
-    use hyperscale_hbor::Capped;
     use hyperscale_types::{
-        BlockHeight, LocalTimestamp, MerkleInclusionProof, Provisions, ShardId, Verified,
-        WeightedTimestamp,
+        BlockHeight, Hash, LocalTimestamp, Provision, ShardId, TxHash, Verified, WeightedTimestamp,
     };
 
     use crate::replica::test_support::TestNode;
@@ -81,20 +79,18 @@ mod tests {
         // so we are it.
         let TestNode { mut node, .. } = TestNode::builder().local_idx(1).build();
 
-        let provisions = Verified::new_unchecked_for_test(Provisions::new(
+        let provision = Verified::new_unchecked_for_test(Provision::dummy(
             ShardId::leaf(1, 1), // source
             ShardId::ROOT,       // target (local)
             BlockHeight::new(1),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([]),
+            TxHash::from(Hash::from_bytes(b"tx")),
         ))
         .into();
 
         let actions = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::ProvisionsAdmitted {
-                provisions,
+                provision,
                 source_block_ts: WeightedTimestamp::from_millis(0),
             },
         );

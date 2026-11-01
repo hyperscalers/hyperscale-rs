@@ -4,11 +4,15 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_execution::provision_request;
-use hyperscale_provisions::build_provisions;
+use hyperscale_hbor::Capped;
+use hyperscale_provisions::{ProvisionStore, build_provisions};
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetProvisionsRequest;
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{Derivation, ShardId, ShardTrie, derive_block_transactions};
+use hyperscale_types::{
+    BlockHeight, Derivation, MAX_TXS_PER_BLOCK, Provision, ShardId, ShardTrie,
+    derive_block_transactions,
+};
 use tracing::warn;
 
 /// Serve an inbound provision request from a target shard needing our state.
@@ -42,7 +46,7 @@ pub fn serve_provision_request<S: ShardStorage>(
             block_height = height.inner(),
             "Provision request: block not found"
         );
-        return GetProvisionResponse { provisions: None };
+        return GetProvisionResponse::empty();
     };
     let block = certified.block();
     // A block read back out of storage carries no derivations, and a
@@ -64,16 +68,36 @@ pub fn serve_provision_request<S: ShardStorage>(
         requests.push(request);
     }
     let view = pending_chain.view_at_persisted_tip();
-    let provisions = build_provisions(
+    let parts = build_provisions(
         &view,
         local_shard,
         req.target_shard,
         height,
         block.header().parent_qc().weighted_timestamp(),
         &requests,
+        |_| true,
     );
 
-    GetProvisionResponse { provisions }
+    GetProvisionResponse {
+        parts: Capped::new(parts).expect("a block owes a target at most its transactions"),
+    }
+}
+
+/// Every part this node built for `(height, target_shard)` as the source
+/// block's proposer, if it still holds them all.
+#[must_use]
+pub fn outbound_parts(
+    store: &ProvisionStore,
+    height: BlockHeight,
+    target_shard: ShardId,
+) -> Option<Capped<Vec<Provision>, MAX_TXS_PER_BLOCK>> {
+    let first = store.get_outbound(height, target_shard, 0)?;
+    let count = first.leaf().count;
+    let mut parts = vec![first];
+    for index in 1..count {
+        parts.push(store.get_outbound(height, target_shard, index)?);
+    }
+    Capped::new(parts).ok()
 }
 
 #[cfg(test)]
@@ -167,8 +191,12 @@ mod tests {
             &GetProvisionsRequest::new(height, payer_shard),
         );
         assert_eq!(
-            served.provisions.map(|provisions| provisions.tx_hashes()),
-            Some(vec![hash]),
+            served
+                .parts
+                .iter()
+                .map(Provision::tx_hash)
+                .collect::<Vec<_>>(),
+            vec![hash],
             "the stored block's transaction owes the payer shard its engagement",
         );
     }

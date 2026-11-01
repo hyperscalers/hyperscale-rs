@@ -1655,7 +1655,6 @@ mod tests {
 mod partition_tests {
     use std::sync::Arc;
 
-    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{Transaction, TxHash};
 
@@ -1770,31 +1769,18 @@ mod partition_tests {
         // UnverifiedProvisionsReceived event, which buffers in the provision pipeline
         // before signature/merkle verification — so unsolicited deliveries
         // must be dropped at the response boundary.
-        use hyperscale_types::{
-            BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId, TxHash,
-            WeightedTimestamp,
-        };
-        let asked = Arc::new(Provisions::new(
+        use hyperscale_types::{BlockHeight, Hash, Provision, ShardId, TxHash};
+        let asked = Arc::new(Provision::dummy(
             ShardId::leaf(2, 1),
             ShardId::leaf(2, 2),
             BlockHeight::new(10),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"asked")),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(b"asked")),
         ));
-        let extra = Arc::new(Provisions::new(
+        let extra = Arc::new(Provision::dummy(
             ShardId::leaf(2, 3),
             ShardId::leaf(2, 2),
             BlockHeight::new(11),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"extra")),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(b"extra")),
         ));
         let asked_hash = asked.hash();
         let split = partition_solicited(vec![asked, extra], &[asked_hash], |p| [p.hash()]);

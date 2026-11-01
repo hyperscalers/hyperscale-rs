@@ -137,14 +137,15 @@ pub use primitives::positional_bundle::PositionalBundle;
 pub use primitives::randomness::{RANDOMNESS_BYTES, Randomness};
 pub use primitives::seeds::{EpochSeed, SEED_WINDOW_EPOCHS, SeedRing, SeedSource};
 pub use primitives::signer_bitfield::SignerBitfield;
-pub use provisioning::entry::ProvisionEntry;
 pub use provisioning::limits::{
-    MAX_MERKLE_PROOF_LEN, MAX_PROVISION_WEIGHT, MAX_STATE_ENTRIES_PER_TX,
+    MAX_MERKLE_PROOF_LEN, MAX_PROVISION_PART_BYTES, MAX_PROVISION_WEIGHT, PROVISION_FRAMING_BYTES,
 };
 pub use provisioning::proof::{
     CheckedStateProof, Inclusion, MerkleInclusionProof, StateProofError,
 };
-pub use provisioning::provisions::{Provisions, ProvisionsContext, ProvisionsVerifyError};
+pub use provisioning::provision::{
+    Provision, ProvisionContext, ProvisionParts, ProvisionVerifyError,
+};
 pub use provisioning::substate::{SubstateEntry, SubstateLeaf};
 pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH, absorb_committed_cells};
 pub use receipt::event::{

@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::{
     Hash, MAX_PROVISION_TARGET_SHARDS, ProvisionTxRoot, ShardId, TopologySnapshot, Transaction,
-    TxHash, Verifiable, Verified, Verify, compute_merkle_root,
+    TxHash, Verifiable, Verified, Verify, compute_merkle_root, merkle_paths,
 };
 
 /// Domain tag of a provision leaf's preimage.
@@ -51,6 +51,29 @@ pub struct LeafPath {
     pub index: u32,
     /// The leaf's siblings, leaf level first.
     pub siblings: Capped<Vec<Hash>, MAX_PROVISION_PATH_DEPTH>,
+}
+
+impl LeafPath {
+    /// Every leaf's path under [`ProvisionTxRoot::over`] of `leaves`, in
+    /// order.
+    ///
+    /// # Panics
+    ///
+    /// If `leaves` holds more than `u32::MAX` entries, which no block
+    /// owes a target.
+    #[must_use]
+    pub fn all(leaves: &[Hash]) -> Vec<Self> {
+        let count = u32::try_from(leaves.len()).expect("a block owes a target few leaves");
+        merkle_paths(leaves)
+            .into_iter()
+            .zip(0..)
+            .map(|(siblings, index)| Self {
+                count,
+                index,
+                siblings: Capped::new(siblings).expect("a tree of u32 leaves is 32 deep"),
+            })
+            .collect()
+    }
 }
 
 impl ProvisionTxRoot {
@@ -263,7 +286,7 @@ mod tests {
     use crate::test_utils::{
         TestCommittee, install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
     };
-    use crate::{PrincipalAddr, TimestampRange, WeightedTimestamp, merkle_paths};
+    use crate::{PrincipalAddr, TimestampRange, WeightedTimestamp};
 
     fn cross_shard_tx(payer: PrincipalAddr) -> Verifiable<Transaction> {
         install_stub_protocol_statics();

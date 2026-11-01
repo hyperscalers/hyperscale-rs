@@ -2,11 +2,12 @@
 
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::cache::BoundedCache;
+use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::request::GetFinalizationsRequest;
 use hyperscale_types::network::response::GetFinalizationsResponse;
 use hyperscale_types::{Finalization, FinalizationHash, MAX_FETCH_RESPONSE_BYTES, Verifiable};
 
-use crate::serve::{Answer, encoded_len};
+use crate::serve::Answer;
 
 /// The prefix of `found` an answer to an ask of `asked` carries.
 ///

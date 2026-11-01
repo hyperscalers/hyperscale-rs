@@ -23,16 +23,16 @@ pub fn serve_local_provisions_request(
 ) -> GetLocalProvisionsResponse {
     let mut entries = Answer::of(req.batch_hashes.len());
     for h in &req.batch_hashes {
-        let Some(provisions) = provision_store.get(*h) else {
+        let Some(provision) = provision_store.get(*h) else {
             continue;
         };
         // The buffer holds Verified handles; the wire form takes the raw
         // header.
         let source_header = verified_headers
-            .get((provisions.source_shard(), provisions.block_height()))
+            .get((provision.source_shard(), provision.block_height()))
             .map(Verified::into_inner);
         let entry = LocalProvisionEntry {
-            provisions,
+            provision,
             source_header,
         };
         if entries.offer(entry, 0).is_break() {

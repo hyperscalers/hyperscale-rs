@@ -3,10 +3,10 @@
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
-    CertifiedBlockHeader, MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage, Provisions,
+    CertifiedBlockHeader, MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage, Provision,
 };
 
-/// One returned batch plus the source-shard header that proved its
+/// One returned part plus the source-shard header that proved its
 /// provisions root.
 ///
 /// The follower fetching a local provision is reacting to the block
@@ -24,9 +24,9 @@ use crate::{
 /// fails out on terminal drops).
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct LocalProvisionEntry {
-    /// The provisions batch.
-    pub provisions: Provisions,
-    /// The source-shard certified header at `provisions.block_height()`,
+    /// The part.
+    pub provision: Provision,
+    /// The source-shard certified header at `provision.block_height()`,
     /// if the responder still has it.
     pub source_header: Option<CertifiedBlockHeader>,
 }
@@ -108,23 +108,18 @@ mod tests {
     fn entry_with_bundled_header_roundtrips() {
         use crate::{
             BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlockHeader,
-            ChainOrigin, Hash, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,
-            QuorumCertificate, Round, ShardId, SignerBitfield, TxHash, WeightedTimestamp,
+            ChainOrigin, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardId,
+            SignerBitfield, TxHash, WeightedTimestamp,
         };
 
         let source_shard = ShardId::leaf(1, 1);
         let target_shard = ShardId::leaf(1, 0);
         let source_height = BlockHeight::new(7);
-        let provisions = Provisions::new(
+        let provision = Provision::dummy(
             source_shard,
             target_shard,
             source_height,
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"tx")),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(b"tx")),
         );
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: source_shard,
@@ -153,13 +148,13 @@ mod tests {
         let source_header = CertifiedBlockHeader::new(header, qc);
 
         let original = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
-            provisions: provisions.clone(),
+            provision: provision.clone(),
             source_header: Some(source_header.clone()),
         }]));
         let bytes = hbor_to_vec(&original).unwrap();
         let decoded: GetLocalProvisionsResponse = hbor_from_slice(&bytes).unwrap();
         assert_eq!(decoded.entries.len(), 1);
-        assert_eq!(decoded.entries[0].provisions.hash(), provisions.hash());
+        assert_eq!(decoded.entries[0].provision.hash(), provision.hash());
         let decoded_header = decoded.entries[0]
             .source_header
             .as_ref()
@@ -171,7 +166,7 @@ mod tests {
 
         // Same shape with `None` header — the responder GC'd it after admit.
         let stripped = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
-            provisions,
+            provision,
             source_header: None,
         }]));
         let bytes = hbor_to_vec(&stripped).unwrap();

@@ -3,7 +3,7 @@
 //! Both the gossip emit path ([`fetch_and_broadcast_provision`]) and the
 //! fetch serve path (`serve_provision_request` in the node crate) flow
 //! through [`build_provisions`]. Keeping a single function means a
-//! receiver absorbs byte-identical bundles regardless of which transport
+//! receiver absorbs byte-identical parts regardless of which transport
 //! delivered them — any future field-ordering leak gets caught in one
 //! place rather than drifting between two near-identical loops.
 //!
@@ -14,27 +14,36 @@ use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{SubstateStore, SubstateView, VersionedStore};
+use hyperscale_types::network::encoded_len;
 use hyperscale_types::{
-    BlockHeight, EntryKey, MerkleInclusionProof, ProtocolHasher, ProvisionEntry, Provisions,
-    ShardId, SubstateEntry, SubstateKey, TxHash, WeightedTimestamp, entry_leaf_key,
+    BlockHeight, EntryKey, Hash, LeafPath, MAX_PROVISION_PART_BYTES, MerkleInclusionProof,
+    ProtocolHasher, Provision, ProvisionParts, ShardId, SubstateEntry, WeightedTimestamp,
+    entry_leaf_key, provision_leaf,
 };
 use tracing::warn;
 
-/// Build a `Provisions` bundle for a single source → target shard pair.
+/// The requests among `requests` that name `target_shard`, in order: one
+/// leaf each under the source header's root for that target.
+fn requests_for(
+    requests: &[ProvisionsRequest],
+    target_shard: ShardId,
+) -> impl Iterator<Item = &ProvisionsRequest> {
+    requests
+        .iter()
+        .filter(move |req| req.targets.contains(&target_shard))
+}
+
+/// Build the parts of a source → target pair whose leaf index `wanted`
+/// names, in index order.
 ///
-/// Returns `None` if the JMT version at `source_block_height` is no
-/// longer available for the cell reads or proof generation — callers
-/// treat this as "block not found" and surface a fetch-side retry.
-/// Returns `Some(Provisions { ... transactions: empty })` when no request
-/// targets `target_shard`; receivers handle empty transactions in the
-/// verify path.
+/// Each part stands alone: one whose reads are unavailable at
+/// `source_block_height`, whose proof passes a decode cap, or whose
+/// encoding passes [`MAX_PROVISION_PART_BYTES`] is left out, and costs
+/// only its own transaction. An empty result is a height the view no
+/// longer holds, or a pair owing nothing.
 ///
 /// `requests` may name several target shards. Only those naming
-/// `target_shard` participate in this build.
-///
-/// # Panics
-///
-/// If a list written out here is past the cap its type states.
+/// `target_shard` participate, and their order is the leaf order.
 #[must_use]
 pub fn build_provisions<S>(
     view: &SubstateView<S>,
@@ -43,57 +52,79 @@ pub fn build_provisions<S>(
     source_block_height: BlockHeight,
     source_block_ts: WeightedTimestamp,
     requests: &[ProvisionsRequest],
-) -> Option<Provisions>
+    wanted: impl Fn(u32) -> bool,
+) -> Vec<Provision>
 where
     S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
 {
-    let mut staged: Vec<(TxHash, Vec<SubstateEntry>)> = Vec::with_capacity(requests.len());
-    let mut all_keys: Vec<SubstateKey> = Vec::new();
-
-    for req in requests {
-        if !req.targets.contains(&target_shard) {
+    let owed: Vec<&ProvisionsRequest> = requests_for(requests, target_shard).collect();
+    let leaves: Vec<Hash> = owed.iter().map(|req| provision_leaf(req.tx_hash)).collect();
+    let mut parts = Vec::new();
+    for (req, leaf) in owed.into_iter().zip(LeafPath::all(&leaves)) {
+        if !wanted(leaf.index) {
             continue;
         }
-        let entries = read_declared(view, source_shard, target_shard, source_block_height, req)?;
-        all_keys.extend(entries.iter().map(|entry| entry.key));
-        staged.push((req.tx_hash, entries));
+        let index = leaf.index;
+        let Some(part) = build_part(
+            view,
+            source_shard,
+            target_shard,
+            source_block_height,
+            source_block_ts,
+            req,
+            leaf,
+        ) else {
+            warn!(
+                source_shard = source_shard.inner(),
+                target_shard = target_shard.inner(),
+                block_height = source_block_height.inner(),
+                tx_hash = %req.tx_hash,
+                index,
+                "build_provisions: part unbuildable"
+            );
+            continue;
+        };
+        parts.push(part);
     }
+    parts
+}
 
-    let proof = if all_keys.is_empty() {
+/// One transaction's part at `leaf`, or `None` where it cannot be built.
+fn build_part<S>(
+    view: &SubstateView<S>,
+    source_shard: ShardId,
+    target_shard: ShardId,
+    source_block_height: BlockHeight,
+    source_block_ts: WeightedTimestamp,
+    req: &ProvisionsRequest,
+    leaf: LeafPath,
+) -> Option<Provision>
+where
+    S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
+{
+    let entries = read_declared(view, source_shard, target_shard, source_block_height, req)?;
+    let proof = if entries.is_empty() {
         MerkleInclusionProof::new(Vec::new())
     } else {
         // The view is the proof walk's tree reader: pending snapshots'
         // nodes over the base store, one root lookup for persisted and
         // unpersisted heights alike. `None` — the root or a node pruned
-        // mid-walk — surfaces as the same fetch-side retry as any other
-        // unavailable height, never as a wrong proof.
-        generate_proof(view, &all_keys, source_block_height)?
+        // mid-walk, or a proof past a decode cap — leaves this part out,
+        // never a wrong proof.
+        let keys: Vec<_> = entries.iter().map(|entry| entry.key).collect();
+        generate_proof(view, &keys, source_block_height)?
     };
-
-    // One entry per staged transaction, which the block's own cap
-    // already bounded; a bundle past it is one no peer would decode, so
-    // there is nothing to send.
-    let transactions = Capped::new(
-        staged
-            .into_iter()
-            .map(|(tx_hash, entries)| {
-                ProvisionEntry::new(
-                    tx_hash,
-                    Capped::new(entries).expect("a transaction's reads divide its call budget"),
-                )
-            })
-            .collect(),
-    )
-    .ok()?;
-
-    Some(Provisions::new(
+    let part = Provision::new(ProvisionParts {
         source_shard,
         target_shard,
-        source_block_height,
+        block_height: source_block_height,
         source_block_ts,
+        tx_hash: req.tx_hash,
+        entries: Capped::new(entries).ok()?,
         proof,
-        transactions,
-    ))
+        leaf,
+    });
+    (encoded_len(&part) <= MAX_PROVISION_PART_BYTES).then_some(part)
 }
 
 /// One transaction's declared local reads at `source_block_height`,
@@ -104,9 +135,9 @@ where
 /// keying made ownership maps structurally absent — and nothing naming
 /// what the receiver needs: it re-derives that from the envelope. A
 /// keyless request reads nothing, and its transaction still stages: the
-/// payer shard's empty-entry bundle is the engagement evidence. A
-/// declared cell absent at the source height is carried as `None` and
-/// proven absent, so a receiver can tell it from one left out.
+/// payer shard's empty part is the engagement evidence. A declared cell
+/// absent at the source height is carried as `None` and proven absent,
+/// so a receiver can tell it from one left out.
 fn read_declared<S>(
     view: &SubstateView<S>,
     source_shard: ShardId,
@@ -175,7 +206,7 @@ where
                 // The index enumerated this order at this height, so its
                 // leaf must exist — the "index ≡ leaves" invariant.
                 // Serving without it would ship an under-provisioned
-                // bundle whose failure surfaces as untraceable receipt
+                // part whose failure surfaces as untraceable receipt
                 // divergence on the target shard; refusing keeps the
                 // defect at its source.
                 warn!(

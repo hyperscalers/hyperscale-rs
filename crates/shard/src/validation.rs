@@ -648,15 +648,15 @@ pub mod tests {
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_TERMS_BYTES,
         MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MemberTerms,
         MerkleInclusionProof, NetworkDefinition, Owes, PriceTable, PrincipalAddr,
-        ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate,
-        RETENTION_HORIZON, Reshaping, Round, RoutePrefix, SectionRoots, SetRoot, Settlement,
-        ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot,
-        StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickId, TickManifest,
-        TickManifestRoot, Timeout, TimeoutCertificate, TimestampRange, TopologySchedule,
-        Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, Verify, VoteCount,
-        WeightedTimestamp, Window, WitnessSources, claims_admit_block, receipt_hash_of,
-        state_claims_admit_block, test_utils, verdict_leaf,
+        ProposerTimestamp, Provision, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON,
+        Reshaping, Round, RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId, ShardLoad,
+        Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites, StatedTerms,
+        StoredReceipt, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
+        TimeoutCertificate, TimestampRange, TopologySchedule, Transaction, TransactionDecision,
+        TransactionEnvelope, TxHash, TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo,
+        ValidatorSet, Verifiable, Verified, Verify, VoteCount, WeightedTimestamp, Window,
+        WitnessSources, claims_admit_block, receipt_hash_of, state_claims_admit_block, test_utils,
+        verdict_leaf,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
 
@@ -5302,16 +5302,11 @@ pub mod tests {
     /// the shallow tier over-admits per item rather than stalling.
     #[test]
     fn a_shallow_committee_still_commits() {
-        let bundle = Provisions::new(
+        let bundle = Provision::dummy(
             ShardId::leaf(1, 1),
             ShardId::ROOT,
             BlockHeight::new(3),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"carried before")),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(b"carried before")),
         );
         let fresh = plain();
         assert!(!fresh.dedup.is_complete(fresh.anchor));
@@ -5376,8 +5371,8 @@ pub mod tests {
     // validate_no_duplicate_provisions
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn block_with_provisions(height: BlockHeight, provisions: Vec<Provisions>) -> Block {
-        let wrapped: Vec<Verifiable<Provisions>> =
+    fn block_with_provisions(height: BlockHeight, provisions: Vec<Provision>) -> Block {
+        let wrapped: Vec<Verifiable<Provision>> =
             provisions.into_iter().map(Verifiable::from).collect();
         Block::Live {
             header: header_at_height(height, 100_000),
@@ -5392,15 +5387,12 @@ pub mod tests {
         }
     }
 
-    fn provisions_with_seed(seed: u8) -> Provisions {
-        let tx_hash = TxHash::from(Hash::from_bytes(&[seed; 32]));
-        Provisions::new(
+    fn provisions_with_seed(seed: u8) -> Provision {
+        Provision::dummy(
             ShardId::leaf(1, 0),
             ShardId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
+            TxHash::from(Hash::from_bytes(&[seed; 32])),
         )
     }
 
@@ -5606,7 +5598,7 @@ pub mod tests {
 
     fn block_with_tx(
         tx: &Verifiable<Transaction>,
-        provisions: Vec<Verifiable<Provisions>>,
+        provisions: Vec<Verifiable<Provision>>,
     ) -> Block {
         Block::Live {
             header: header_at_height(BlockHeight::new(1), 100_000),
@@ -5638,16 +5630,10 @@ pub mod tests {
         assert!(err.contains("payer bundle"), "{err}");
 
         // The payer's empty-entry bundle in the same block: engaged.
-        let bundle: Verifiable<Provisions> =
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                ShardId::leaf(1, 1),
-                local,
-                BlockHeight::new(1),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-            ))
-            .into();
+        let bundle: Verifiable<Provision> = Verified::<Provision>::new_unchecked_for_test(
+            Provision::dummy(ShardId::leaf(1, 1), local, BlockHeight::new(1), tx_hash),
+        )
+        .into();
         let paired = block_with_tx(&tx, vec![bundle]);
         assert!(admit(&engaged(&topo, local), &paired).is_ok());
 
@@ -5669,16 +5655,10 @@ pub mod tests {
         assert!(admit(&engaged_with(&topo, local, dedup), &bare).is_ok());
 
         // A bundle from the wrong source shard is not engagement evidence.
-        let wrong_source: Verifiable<Provisions> =
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                local,
-                ShardId::leaf(1, 1),
-                BlockHeight::new(1),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-            ))
-            .into();
+        let wrong_source: Verifiable<Provision> = Verified::<Provision>::new_unchecked_for_test(
+            Provision::dummy(local, ShardId::leaf(1, 1), BlockHeight::new(1), tx_hash),
+        )
+        .into();
         let mispaired = block_with_tx(&tx, vec![wrong_source]);
         let err = admit(&engaged(&topo, local), &mispaired).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
@@ -5691,14 +5671,12 @@ pub mod tests {
         local: ShardId,
         height: u64,
         tx_hash: TxHash,
-    ) -> Verifiable<Provisions> {
-        Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+    ) -> Verifiable<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::dummy(
             payer,
             local,
             BlockHeight::new(height),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
+            tx_hash,
         ))
         .into()
     }
@@ -5828,14 +5806,13 @@ pub mod tests {
             },
         );
         let carrying = |height: u64, source_anchor: u64| -> Block {
-            let batch: Verifiable<Provisions> =
-                Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+            let batch: Verifiable<Provision> =
+                Verified::<Provision>::new_unchecked_for_test(Provision::dummy_at(
                     source,
                     local,
                     BlockHeight::new(height),
                     WeightedTimestamp::from_millis(source_anchor),
-                    MerkleInclusionProof::dummy(),
-                    Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
+                    tx_hash,
                 ))
                 .into();
             Block::Live {
@@ -6450,16 +6427,10 @@ pub mod tests {
         // bundle in hand: carried. What the ceiling covers is not this
         // chain's question, and asking it here is what would fork the
         // two verdicts across a fold.
-        let bundle: Verifiable<Provisions> =
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                payer_shard,
-                local,
-                BlockHeight::new(1),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-            ))
-            .into();
+        let bundle: Verifiable<Provision> = Verified::<Provision>::new_unchecked_for_test(
+            Provision::dummy(payer_shard, local, BlockHeight::new(1), tx_hash),
+        )
+        .into();
         assert!(admit(&engaged(&topo, local), &block_with_tx(&tx, vec![bundle])).is_ok());
     }
 

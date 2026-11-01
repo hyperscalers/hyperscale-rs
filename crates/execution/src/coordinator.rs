@@ -74,7 +74,7 @@ use hyperscale_types::{
     CheckedStateProof, CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation,
     DiscardCause, EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
-    GlobalReceiptRoot, Hash, Joins, Mode, Movement, ProvenAnchors, Provisions, REATTESTATION_STEP,
+    GlobalReceiptRoot, Hash, Joins, Mode, Movement, ProvenAnchors, Provision, REATTESTATION_STEP,
     ScheduleLookup, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim, StateWrites,
     StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
     Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
@@ -1857,22 +1857,21 @@ impl ExecutionCoordinator {
     ///
     /// Each batch is peeked for its [`Verifiable::verified`] marker before
     /// re-wrapping. Same-process upstream paths leave the marker live, so
-    /// we borrow the existing [`Verified<Provisions>`] without a body
+    /// we borrow the existing [`Verified<Provision>`] without a body
     /// clone. Wire-decoded blocks land at `Unverified`; the
-    /// [`Verified::<Provisions>::from_committed_block`] gate then carries
+    /// [`Verified::<Provision>::from_committed_block`] gate then carries
     /// the BFT-transitive trust source via a re-wrap (one body clone).
-    fn apply_committed_provisions(&mut self, batches: &[Verifiable<Provisions>]) {
+    fn apply_committed_provisions(&mut self, parts: &[Verifiable<Provision>]) {
         // Sort for deterministic iteration (logs, action vector order).
-        let mut ordered: Vec<&Verifiable<Provisions>> = batches.iter().collect();
+        let mut ordered: Vec<&Verifiable<Provision>> = parts.iter().collect();
         ordered.sort_by_key(|b| b.hash());
 
-        for provisions in &ordered {
-            if let Some(v) = provisions.verified() {
+        for part in &ordered {
+            if let Some(v) = part.verified() {
                 self.provisioning.absorb_provisions(v);
             } else {
-                let verified = Verified::<Provisions>::from_committed_block(
-                    provisions.as_unverified().clone(),
-                );
+                let verified =
+                    Verified::<Provision>::from_committed_block(part.as_unverified().clone());
                 self.provisioning.absorb_provisions(&verified);
             }
         }

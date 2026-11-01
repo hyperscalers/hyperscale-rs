@@ -39,7 +39,7 @@
 //! 5. **Bulk** — High-volume best-effort with fetch fallback
 //!    (`TransactionGossip`).
 
-use hyperscale_hbor::{Hbor, HborDecode, HborEncode};
+use hyperscale_hbor::{DEFAULT_MAX_DEPTH, Encoder, Hbor, HborDecode, HborEncode, Sink};
 
 use crate::ShardId;
 
@@ -50,6 +50,29 @@ pub mod response;
 mod signed;
 
 pub use signed::{Signed, SignedContext, SignedVerifyError};
+
+/// Bytes `value` encodes to, counted rather than written.
+///
+/// `usize::MAX` for a value that does not encode, which no budget
+/// admits.
+pub fn encoded_len<T: HborEncode + ?Sized>(value: &T) -> usize {
+    let mut count = 0;
+    let encoded = value.encode(&mut Encoder::new(Counting(&mut count), DEFAULT_MAX_DEPTH));
+    encoded.map_or(usize::MAX, |()| count)
+}
+
+/// A sink that keeps nothing but the count.
+struct Counting<'a>(&'a mut usize);
+
+impl Sink for Counting<'_> {
+    fn write(&mut self, bytes: &[u8]) {
+        *self.0 = self.0.saturating_add(bytes.len());
+    }
+
+    fn written(&self) -> usize {
+        *self.0
+    }
+}
 
 /// Network message class.
 ///
@@ -257,5 +280,19 @@ pub trait Request: NetworkMessage {
     #[must_use]
     fn is_empty_response(_response: &Self::Response) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_hbor::to_vec as hbor_to_vec;
+
+    use super::*;
+
+    /// The count is the encoding's length.
+    #[test]
+    fn an_encoded_length_is_counted_not_written() {
+        let value: Vec<u64> = (0..100).collect();
+        assert_eq!(encoded_len(&value), hbor_to_vec(&value).unwrap().len());
     }
 }

@@ -19,8 +19,8 @@ use hyperscale_types::{
     CertifiedBlock, CertifiedBlockHeader, CertifiedHeaderVerifyError, CheckOutcome,
     CheckedStateProof, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
     Finalization, FinalizationVerifyError, Hash, HeaderSource, LeafIndex, PcVote1,
-    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provisions,
-    ProvisionsVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, Provision,
+    ProvisionVerifyError, QcVerifyError, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
     RatifyVoteVerifyError, ReadySignal, Round, ShardForkProof, ShardId, ShardVoteEquivocation,
     ShardWitnessPayload, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
     SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
@@ -50,17 +50,20 @@ pub struct TickBatchOutcome {
     pub refusal_receipts: Vec<StoredReceipt>,
 }
 
-/// Why a provisions bundle was refused before admission.
+/// Why a provision part was refused before admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProvisionRefusal {
-    /// The bundle's transactions do not compute the root its source
+    /// The part's leaf does not walk its path to the root its source
     /// header commits for this shard.
     ContentMismatch,
     /// The source header commits no provisions to this shard.
     NotOwed,
-    /// The bundle's entries fail its inclusion proof.
-    Unproven(ProvisionsVerifyError),
+    /// The part's entries fail its inclusion proof.
+    Unproven(ProvisionVerifyError),
 }
+
+/// One part's verdict: verified, or the raw part and why it was refused.
+pub type ProvisionVerdict = Result<Verified<Provision>, (Provision, ProvisionRefusal)>;
 
 /// How a node learned about the certifying QC that commits a given block.
 ///
@@ -473,22 +476,19 @@ pub enum ProtocolEvent {
         /// crossings, which the build held to the cap.
         additions: AnswerAdditions,
         /// Provisions included in the block.
-        provisions: Vec<Verifiable<Provisions>>,
+        provisions: Vec<Verifiable<Provision>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provision
     // ═══════════════════════════════════════════════════════════════════════
-    /// Received provisions from a source shard whose merkle proof still
-    /// needs to be checked. Produced by the gossip handler (wire decode
-    /// always lands in `Verifiable::Unverified`) and by fetch-response
-    /// drains.
-    ///
-    /// All transactions share the same `(source_shard, block_height)`
-    /// because they originate from a single `FetchAndBroadcastProvisions` action.
+    /// Received parts from a source shard whose leaf paths and merkle
+    /// proofs still need to be checked. Produced by the gossip handler
+    /// (wire decode always lands in `Verifiable::Unverified`) and by
+    /// fetch-response drains, one event per message.
     UnverifiedProvisionsReceived {
-        /// Provisions batch received from a source shard.
-        provisions: Provisions,
+        /// The parts one message carried.
+        parts: Vec<Provision>,
     },
 
     /// A producer's pushed record readings, past ingress: routed to a
@@ -510,49 +510,48 @@ pub enum ProtocolEvent {
     ///
     /// [`ProvisionAction::VerifyProvisions`]: crate::ProvisionAction::VerifyProvisions
     VerifiedProvisionsReceived {
-        /// Verified provisions batch sealed via
-        /// [`Verified::<Provisions>::from_local`].
-        provisions: Verified<Provisions>,
+        /// The parts one notification carried, each sealed via
+        /// [`Verified::<Provision>::from_local`].
+        parts: Vec<Verified<Provision>>,
     },
 
-    /// Batch-level provision verification completed.
+    /// Part verification completed for parts checked against one anchor.
     ///
     /// The QC was verified upstream as part of promoting the source
-    /// header to [`Verified<CertifiedBlockHeader>`]; the bundle's
-    /// transactions are held to the header's `provision_tx_roots`, and
-    /// merkle proofs are checked against the verified state root.
+    /// header to [`Verified<CertifiedBlockHeader>`]; each part's leaf
+    /// path is held to the header's `provision_tx_roots`, and merkle
+    /// proofs are checked against the verified state root.
     StateProvisionsVerified {
-        /// Verified provisions on success; the raw bundle paired with
-        /// why it was refused on failure.
-        result: Result<Verified<Provisions>, (Provisions, ProvisionRefusal)>,
-        /// The source anchor whose `state_root` the merkle proof was
+        /// One verdict per part.
+        results: Vec<ProvisionVerdict>,
+        /// The source anchor whose `state_root` the merkle proofs were
         /// checked against.
         anchor: Anchor,
     },
 
-    /// A provisions has been verified — ready for downstream consumption.
+    /// A part has been verified — ready for downstream consumption.
     ///
     /// `source_block_ts` is the shard consensus-authenticated weighted timestamp of the
     /// source shard's committing QC. Downstream consumers (notably the
     /// io-loop provision cache) anchor retention on this so eviction is
     /// deterministic across validators.
     ProvisionsAdmitted {
-        /// Verified provisions batch.
-        provisions: Verifiable<Provisions>,
+        /// The verified part.
+        provision: Verifiable<Provision>,
         /// BFT-authenticated weighted timestamp of the source shard's committing QC.
         source_block_ts: WeightedTimestamp,
     },
 
-    /// Provisions our proposer generated were broadcast to a target shard.
+    /// Parts our proposer generated were broadcast to a target shard.
     /// Routed to the `OutboundProvisionTracker` so they can be retained
     /// (and served from cache) until the target shard's execution
     /// certificates acknowledge every transaction in them.
     OutboundProvisionBroadcast {
-        /// Provisions batch we just broadcast. Wrapped as `Verified` —
-        /// the emitter built the bundle from a local JMT view so the
-        /// merkle-proof predicate holds by construction.
-        provisions: Verified<Provisions>,
-        /// Shard the batch was broadcast to.
+        /// The parts just broadcast. Wrapped as `Verified` — the emitter
+        /// built each from a local JMT view so the merkle-proof
+        /// predicate holds by construction.
+        parts: Vec<Verified<Provision>>,
+        /// Shard the parts were broadcast to.
         target_shard: ShardId,
     },
 

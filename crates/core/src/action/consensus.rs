@@ -11,7 +11,7 @@ use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlockHeader, ConsensusPublicKey,
     Epoch, EpochWindows, Finalization, FrontierInputs, Hash, HeaderSource, ProposerTimestamp,
-    ProvisionTxRootsMap, Provisions, QuorumCertificate, ReadFence, ReadySignal, ReshapeKind,
+    Provision, ProvisionTxRootsMap, QuorumCertificate, ReadFence, ReadySignal, ReshapeKind,
     ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round, Settling,
     ShardForkProof, ShardId, ShardLoad, SharedTransactions, SharedWitnessSources, StandingAnswers,
     StateClaim, StateRoot, SubstateClaim, Timeout, TimeoutCertificate, TopologySnapshot,
@@ -488,7 +488,7 @@ pub enum ConsensusAction {
         /// Finalizations to include in the block (carries certs + receipts + ECs).
         finalizations: Vec<Verifiable<Finalization>>,
         /// Provisions from remote shards, included in this block.
-        provisions: Vec<Verifiable<Provisions>>,
+        provisions: Vec<Verifiable<Provision>>,
         /// What departed shards left unresolved of this chain's business
         /// — written down here while the settled sets they were read
         /// from can still be checked against.

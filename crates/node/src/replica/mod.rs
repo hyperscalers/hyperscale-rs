@@ -527,35 +527,32 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ── Provisions ───────────────────────────────────────────────
-            ProtocolEvent::UnverifiedProvisionsReceived { provisions } => self
+            ProtocolEvent::UnverifiedProvisionsReceived { parts } => self
                 .shard
                 .provisions_coordinator
-                .on_state_provisions_received(sched, provisions),
-            ProtocolEvent::VerifiedProvisionsReceived { provisions } => {
+                .on_state_provisions_received(sched, parts),
+            ProtocolEvent::VerifiedProvisionsReceived { parts } => {
                 let now = self.shard.now;
                 self.shard
                     .provisions_coordinator
-                    .on_verified_state_provisions_received(sched, provisions, now)
+                    .on_verified_state_provisions_received(sched, parts, now)
             }
-            ProtocolEvent::StateProvisionsVerified { result, anchor } => {
+            ProtocolEvent::StateProvisionsVerified { results, anchor } => {
                 let now = self.shard.now;
                 self.shard
                     .provisions_coordinator
-                    .on_state_provisions_verified(result, anchor, now)
+                    .on_state_provisions_verified(results, anchor, now)
             }
             ProtocolEvent::CrossingReadingsReceived { claims } => {
                 self.shard.on_crossing_readings(sched, claims)
             }
-            ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
-                self.shard.on_provisions_admitted(sched, provisions)
+            ProtocolEvent::ProvisionsAdmitted { provision, .. } => {
+                self.shard.on_provisions_admitted(sched, provision)
             }
-            ProtocolEvent::OutboundProvisionBroadcast {
-                provisions,
-                target_shard,
-            } => {
-                self.shard
-                    .outbound_provisions
-                    .on_broadcast(&provisions, target_shard);
+            ProtocolEvent::OutboundProvisionBroadcast { parts, .. } => {
+                for part in &parts {
+                    self.shard.outbound_provisions.on_broadcast(part);
+                }
                 Vec::new()
             }
 

@@ -440,18 +440,22 @@ where
             .network
             .register_notification_handler::<ProvisionsNotification>(
                 move |notification: ProvisionsNotification, provenance: Provenance| -> Verdict {
-                    let target_shard = notification.provisions.target_shard();
+                    let target_shard = notification.target_shard;
                     // Drop provisions not destined for any hosted shard before
                     // paying the signature verification cost.
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
-                            source_shard = notification.provisions.source_shard().inner(),
+                            source_shard = notification.source_shard.inner(),
                             target_shard = target_shard.inner(),
                             "Dropping provisions notification: target_shard not hosted"
                         );
                         return Verdict::Ignore;
                     };
+                    // Every packed part names the scope it was signed under.
+                    if !notification.is_uniform() {
+                        return Verdict::Reject;
+                    }
 
                     let verdict = provenance.check(|| {
                         let topo = topology_snapshot.load();
@@ -459,7 +463,7 @@ where
                             verifier.as_ref(),
                             &topo,
                             &topo,
-                            notification.provisions.source_shard(),
+                            notification.source_shard,
                             &notification,
                             "state_provisions",
                             "state provision",
@@ -468,13 +472,30 @@ where
                     if verdict != Verdict::Accept {
                         return verdict;
                     }
-                    let event = match notification.provisions.into_verified() {
-                        Ok(provisions) => ProtocolEvent::VerifiedProvisionsReceived { provisions },
-                        Err(provisions) => {
-                            ProtocolEvent::UnverifiedProvisionsReceived { provisions }
+                    // A colocated proposer's own parts arrive sealed; a
+                    // peer's arrive raw.
+                    let mut sealed = Vec::new();
+                    let mut raw = Vec::new();
+                    for part in notification.parts {
+                        match part.into_verified() {
+                            Ok(part) => sealed.push(part),
+                            Err(part) => raw.push(part),
                         }
-                    };
-                    offer_network_event(tx, target_shard, event, provenance).verdict()
+                    }
+                    let mut verdict = Verdict::Accept;
+                    for event in [
+                        (!sealed.is_empty())
+                            .then_some(ProtocolEvent::VerifiedProvisionsReceived { parts: sealed }),
+                        (!raw.is_empty())
+                            .then_some(ProtocolEvent::UnverifiedProvisionsReceived { parts: raw }),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        verdict =
+                            offer_network_event(tx, target_shard, event, provenance).verdict();
+                    }
+                    verdict
                 },
             );
 
@@ -1096,7 +1117,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::beacon::witness_serve::serve_shard_witnesses_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        SettledTxsCache, serve_cells_request, serve_finalizations_request,
+        SettledTxsCache, outbound_parts, serve_cells_request, serve_finalizations_request,
         serve_local_provisions_request, serve_provision_request, serve_remote_headers_request,
         serve_settled_txs_request, serve_state_proof_request,
     };
@@ -1238,33 +1259,32 @@ pub fn register_shard_request_handlers<S, N, D>(
         move |req: &GetProvisionsRequest| {
             let height = req.height;
 
-            // Outbound fast path: if we still hold the exact batch we
+            // Outbound fast path: if we still hold every part we
             // generated for this (source_block_height, target_shard),
-            // rebuild the response from memory — no RocksDB regeneration,
-            // no merkle-proof recomputation.
-            if let Some(provisions) = outbound_cache.get_outbound(height, req.target_shard) {
-                return GetProvisionResponse {
-                    provisions: Some(provisions),
-                };
+            // answer from memory — no RocksDB regeneration, no
+            // merkle-proof recomputation.
+            if let Some(parts) = outbound_parts(&outbound_cache, height, req.target_shard) {
+                return GetProvisionResponse { parts };
             }
 
             let cache_key = (height.inner(), req.target_shard.inner());
-            let provisions = match provisions_flight.get_or_produce(cache_key, || {
-                serve_provision_request(
+            // An answer with nothing in it is not kept: the block may
+            // yet commit here, and a cached miss would outlive that.
+            match provisions_flight.get_or_produce(cache_key, || {
+                let response = serve_provision_request(
                     &pending_chain,
                     derivation.as_ref(),
                     shard,
                     topology_snapshot.load().shard_trie(),
                     req,
-                )
-                .provisions
+                );
+                (!response.parts.is_empty()).then_some(response)
             }) {
-                Flight::Cached(provisions)
-                | Flight::Joined(provisions)
-                | Flight::Produced(provisions) => Some(provisions),
-                Flight::Unavailable => None,
-            };
-            GetProvisionResponse { provisions }
+                Flight::Cached(response)
+                | Flight::Joined(response)
+                | Flight::Produced(response) => response,
+                Flight::Unavailable => GetProvisionResponse::empty(),
+            }
         },
     );
 

@@ -9,7 +9,7 @@ use hyperscale_storage::{
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash,
-    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
+    Hash, Provision, ProvisionHash, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
     TxHash, Verifiable, Verified,
 };
 
@@ -22,7 +22,7 @@ impl ShardChainReader for SimShardStorage {
             .certified()
     }
 
-    fn provisions_at(&self, height: BlockHeight) -> Vec<Verifiable<Provisions>> {
+    fn provisions_at(&self, height: BlockHeight) -> Vec<Verifiable<Provision>> {
         read_or_recover(&self.consensus)
             .provisions
             .range((height, ProvisionHash::from_raw(Hash::ZERO))..)

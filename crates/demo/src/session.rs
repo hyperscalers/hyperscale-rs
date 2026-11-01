@@ -9,7 +9,7 @@ use hyperscale_storage::ShardChainReader;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE, NetworkDefinition,
-    NetworkId, PrincipalAddr, Provisions, ReshapeThresholds, ShardId, SharedCertificates,
+    NetworkId, PrincipalAddr, Provision, ReshapeThresholds, ShardId, SharedCertificates,
     StateClaim, TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash,
     ValidatorId, Verifiable, WeightedTimestamp,
 };
@@ -200,23 +200,29 @@ fn settlement_events(
     wt: u64,
     shard: ShardId,
     height: BlockHeight,
-    provisions: &[Verifiable<Provisions>],
+    provisions: &[Verifiable<Provision>],
     state_claims: &[StateClaim],
     certificates: &SharedCertificates,
 ) {
-    for bundle in provisions {
-        let bundle = bundle.as_unverified();
-        let delivered: Vec<TxHash> = bundle
-            .transactions()
-            .iter()
-            .filter(|entry| !entry.entries.is_empty())
-            .map(|entry| entry.tx_hash)
-            .collect();
-        if !delivered.is_empty() {
-            events.push(TraceEvent::provisions_verified(
-                wt, bundle, shard, height, delivered,
-            ));
+    // One arc per source block, over the parts that carried state.
+    let mut delivered: BTreeMap<(ShardId, BlockHeight), Vec<TxHash>> = BTreeMap::new();
+    for part in provisions {
+        if !part.entries().is_empty() {
+            delivered
+                .entry((part.source_shard(), part.block_height()))
+                .or_default()
+                .push(part.tx_hash());
         }
+    }
+    for ((source, source_height), txs) in delivered {
+        events.push(TraceEvent::provisions_verified(
+            wt,
+            source,
+            source_height,
+            shard,
+            height,
+            txs,
+        ));
     }
     // A named, valued reading of an owed record is what the fold credits
     // its consumer off.

@@ -166,7 +166,7 @@ use hyperscale_types::{
     AnswerAdditions, AnswerDelta, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader,
     BlockHeight, BlockManifest, BlockVote, CarriedClaims, CertifiedBlock, CertifiedBlockHeader,
     ChainOrigin, CommittedTip, Decision, Finalization, HALT_HARVEST_WAIT, HALT_THRESHOLD_EPOCHS,
-    IDLE_PROPOSAL_INTERVAL, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext,
+    IDLE_PROPOSAL_INTERVAL, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provision, QcContext,
     QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters,
     SiblingView, Source, StandingAnswers, StandingToward, StateRoot, TickLine, Timeout,
     TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction,
@@ -4311,7 +4311,7 @@ impl ShardCoordinator {
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Verifiable<Transaction>>,
         lookup_finalization: impl Fn(&FinalizationHash) -> Option<Verifiable<Finalization>>,
-        lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provisions>>,
+        lookup_provision: impl Fn(&ProvisionHash) -> Option<Verifiable<Provision>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height();
@@ -6746,7 +6746,7 @@ impl ShardCoordinator {
         block: &Block,
         block_hash: BlockHash,
         finalizations: Vec<Verifiable<Finalization>>,
-        provisions: Vec<Verifiable<Provisions>>,
+        provisions: Vec<Verifiable<Provision>>,
         bytes_delta: i64,
         answers: AnswerDelta,
         additions: AnswerAdditions,
@@ -9622,7 +9622,7 @@ impl ShardCoordinator {
     pub fn on_provisions_admitted(
         &mut self,
         topology_schedule: &TopologySchedule,
-        provisions: &[Verifiable<Provisions>],
+        provisions: &[Verifiable<Provision>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for batch in provisions {
@@ -10288,16 +10288,16 @@ mod tests {
         MAX_HOLDS_PER_MEMBER, MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD,
         MAX_TICK_MANIFEST_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK,
         MAX_UNSETTLED_TXS, MemberTerms, MerkleInclusionProof, Mode, NetworkDefinition, NetworkId,
-        NetworkParams, Owes, PROGRESS_WAIT_MULTIPLIER, PrincipalAddr, ProvisionEntry,
-        ProvisionTxRoot, RETENTION_HORIZON, ReadFence, ReadMark, Reading, RevealChain, Role,
-        RoutePrefix, Routing, Said, SectionRoots, SettledTxSet, SettledTxsRoot, SettledWrites,
-        Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
-        StateWrites, StatedTerms, SubstateClaim, SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS,
-        TICK_LINE_BYTES, TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine, TimestampRange,
-        TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxOutcome,
-        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId,
-        ValidatorInfo, ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp, WindowLookup,
-        WitnessSources, decide, encode_amount, read_amount, receipt_hash_of, said_at, test_utils,
+        NetworkParams, Owes, PROGRESS_WAIT_MULTIPLIER, PrincipalAddr, ProvisionTxRoot,
+        RETENTION_HORIZON, ReadFence, ReadMark, Reading, RevealChain, Role, RoutePrefix, Routing,
+        Said, SectionRoots, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor,
+        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, StateWrites, StatedTerms,
+        SubstateClaim, SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES,
+        TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule,
+        TopologySnapshot, Transaction, TransactionEnvelope, TxOutcome, Unresolved, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, ValidatorInfo,
+        ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp, WindowLookup, WitnessSources,
+        decide, encode_amount, read_amount, receipt_hash_of, said_at, test_utils,
         tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
@@ -10826,20 +10826,21 @@ mod tests {
     fn engaging_chain(from: BlockHash) -> Vec<Block> {
         let half = u64::try_from(RETENTION_HORIZON.as_millis() / 2).expect("fits");
         let bundle = |height: u64, seeds: &[u8]| {
-            Verifiable::from(Provisions::new(
-                ENGAGING_PAYER,
-                ShardId::ROOT,
-                BlockHeight::new(height),
-                WeightedTimestamp::from_millis(height * 1_000),
-                MerkleInclusionProof::dummy(),
-                Capped::new(
-                    seeds
-                        .iter()
-                        .map(|seed| ProvisionEntry::new(engaged_tx(*seed), Capped::empty()))
-                        .collect(),
-                )
-                .expect("a list written out in a test"),
-            ))
+            Capped::new(
+                seeds
+                    .iter()
+                    .map(|seed| {
+                        Verifiable::from(Provision::dummy_at(
+                            ENGAGING_PAYER,
+                            ShardId::ROOT,
+                            BlockHeight::new(height),
+                            WeightedTimestamp::from_millis(height * 1_000),
+                            engaged_tx(*seed),
+                        ))
+                    })
+                    .collect(),
+            )
+            .expect("a list written out in a test")
         };
         let mut parent = from;
         (1..=4u8)
@@ -10862,7 +10863,7 @@ mod tests {
                     header,
                     transactions,
                     certificates,
-                    provisions: Arc::new(Capped::from_array([bundle(10 + height, seeds)])),
+                    provisions: Arc::new(bundle(10 + height, seeds)),
                     abandonment_records,
                     state_claims,
                     tick_manifest: Arc::new(Capped::empty()),
@@ -14141,14 +14142,7 @@ mod tests {
         else {
             unreachable!("a chained block is live")
         };
-        let engaging = Provisions::new(
-            sibling,
-            local,
-            BlockHeight::new(7),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(tx.hash(), Capped::empty())]),
-        );
+        let engaging = Provision::dummy(sibling, local, BlockHeight::new(7), tx.hash());
         let leaving_out = Block::Live {
             header,
             transactions,
@@ -14800,24 +14794,24 @@ mod tests {
         else {
             unreachable!("a chained block is live")
         };
-        let bundle = Verifiable::from(Provisions::new(
-            ENGAGING_PAYER,
-            ShardId::ROOT,
-            header.height(),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::new(
-                txs.iter()
-                    .map(|&tx| ProvisionEntry::new(tx, Capped::empty()))
-                    .collect(),
-            )
-            .expect("a list written out in a test"),
-        ));
+        let parts = Capped::new(
+            txs.iter()
+                .map(|&tx| {
+                    Verifiable::from(Provision::dummy(
+                        ENGAGING_PAYER,
+                        ShardId::ROOT,
+                        header.height(),
+                        tx,
+                    ))
+                })
+                .collect(),
+        )
+        .expect("a list written out in a test");
         Block::Live {
             header,
             transactions,
             certificates,
-            provisions: Arc::new(Capped::from_array([bundle])),
+            provisions: Arc::new(parts),
             abandonment_records,
             state_claims,
             tick_manifest,
@@ -15180,14 +15174,12 @@ mod tests {
             header,
             transactions,
             certificates,
-            provisions: Arc::new(Capped::from_array([(Verifiable::from(Provisions::new(
+            provisions: Arc::new(Capped::from_array([Verifiable::from(Provision::dummy(
                 ENGAGING_PAYER,
                 local,
                 BlockHeight::new(7),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx.hash(), Capped::empty())]),
-            )))])),
+                tx.hash(),
+            ))])),
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),

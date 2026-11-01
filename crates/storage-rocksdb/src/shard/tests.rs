@@ -48,7 +48,7 @@ use hyperscale_types::test_utils::{finalization_of, make_finalization};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
     ConsensusReceipt, DiscardCause, ExecutionOutcome, Finalization, FinalizationHash,
-    FrontierInputs, GlobalReceiptHash, Hash, Provisions, QuorumCertificate, Role, Round, ShardId,
+    FrontierInputs, GlobalReceiptHash, Hash, Provision, QuorumCertificate, Role, Round, ShardId,
     StateWrites, StoredReceipt, SweepFrontier, SyncHint, TickHalf, TickId, TickLine, TickManifest,
     TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, WeightedTimestamp,
     WitnessSources,
@@ -1364,7 +1364,7 @@ fn a_committed_bundle_survives_a_reopen() {
             .load_recovered_state(ShardId::ROOT)
             .retained_provisions
             .iter()
-            .map(Provisions::hash)
+            .map(Provision::hash)
             .collect::<Vec<_>>(),
         vec![hash],
     );

@@ -48,7 +48,7 @@ impl Request for GetProvisionsRequest {
     type Response = GetProvisionResponse;
 
     fn is_empty_response(response: &Self::Response) -> bool {
-        response.provisions.is_none()
+        response.parts.is_empty()
     }
 }
 

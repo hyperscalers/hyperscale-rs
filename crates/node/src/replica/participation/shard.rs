@@ -329,10 +329,9 @@ mod tests {
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest,
         BlockManifestParts, BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-        ConsensusSignature, Hash, LocalTimestamp, MerkleInclusionProof, ProposerTimestamp,
-        ProvisionEntry, ProvisionTxRoot, Provisions, QuorumCertificate, RETENTION_HORIZON, Round,
-        ShardForkProof, ShardId, Transaction, TransactionDecision, TransactionStatus, TxHash,
-        ValidatorId, Verified, WeightedTimestamp,
+        ConsensusSignature, Hash, LocalTimestamp, ProposerTimestamp, Provision, ProvisionTxRoot,
+        QuorumCertificate, RETENTION_HORIZON, Round, ShardForkProof, ShardId, Transaction,
+        TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified, WeightedTimestamp,
     };
 
     use crate::replica::NodeStateMachine;
@@ -714,21 +713,16 @@ mod tests {
 
         // Register an outbound batch (local root shard → remote leaf shard).
         // Deadline = self.now (ZERO) + RETENTION_HORIZON.
-        let provisions = Verified::new_unchecked_for_test(Provisions::new(
+        let part = Verified::new_unchecked_for_test(Provision::dummy(
             ShardId::ROOT,
             ShardId::leaf(1, 1),
             BlockHeight::new(1),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"outbound-tx")),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(b"outbound-tx")),
         ));
         let _ = node.handle(
             LocalTimestamp::ZERO,
             ProtocolEvent::OutboundProvisionBroadcast {
-                provisions,
+                parts: vec![part],
                 target_shard: ShardId::leaf(1, 1),
             },
         );

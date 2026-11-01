@@ -30,16 +30,16 @@ use hyperscale_types::{
     GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LocalKey,
     MAX_SWEEP_PER_BLOCK, MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths,
     PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable, ProposerTimestamp,
-    ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate,
-    RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
-    Reading, Role, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement,
-    ShardAnchor, ShardId, ShardTrie, ShardWitnessPayload, SiblingView, SignerBitfield, Source,
-    SpcCert, SpcView, SplitChildRoots, Stake, StateClaim, StateRoot, StateWrites, Stated,
-    StatedTerms, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
-    TickHalf, TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
-    UnsettledTx, ValidatorId, Value, Verifiable, Verified, VotePosition, WeightedTimestamp,
-    WitnessSources, compute_global_receipt_root, compute_merkle_root, decide, encode_amount,
-    entry_leaf_key, read_amount, receipt_hash_of, shard_prefix_path, value_of, verdict_leaf,
+    ProtocolHasher, Provision, ProvisionHash, QuorumCertificate, RETENTION_HORIZON, Randomness,
+    RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark, Reading, Role, Round,
+    SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement, ShardAnchor, ShardId,
+    ShardTrie, ShardWitnessPayload, SiblingView, SignerBitfield, Source, SpcCert, SpcView,
+    SplitChildRoots, Stake, StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt,
+    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, TickLine,
+    Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId,
+    Value, Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
+    compute_global_receipt_root, compute_merkle_root, decide, encode_amount, entry_leaf_key,
+    read_amount, receipt_hash_of, shard_prefix_path, value_of, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingId, CrossingLeaf, FeeHold, Hash32, IntentHash, Terms,
@@ -2061,18 +2061,11 @@ where
     );
 }
 
-/// Attach a provisions bundle for `tx_hash` to a live block, preserving
+/// Attach a provision part for `tx_hash` to a live block, preserving
 /// everything else.
 #[must_use]
 pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block {
-    let bundle = Provisions::new(
-        source,
-        ShardId::ROOT,
-        BlockHeight::new(1),
-        WeightedTimestamp::ZERO,
-        MerkleInclusionProof::dummy(),
-        Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-    );
+    let bundle = Provision::dummy(source, ShardId::ROOT, BlockHeight::new(1), tx_hash);
     match block {
         Block::Live {
             header,
@@ -4717,7 +4710,7 @@ pub fn test_committed_bundle_outlives_sealing(
         recovered()
             .retained_provisions
             .iter()
-            .map(Provisions::hash)
+            .map(Provision::hash)
             .collect::<Vec<_>>(),
         vec![hash],
         "and the body it dropped is recovered from storage",

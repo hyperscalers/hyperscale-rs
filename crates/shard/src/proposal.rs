@@ -28,7 +28,7 @@ use hyperscale_types::{
     BoundaryOffer, CarriedClaims, Epoch, EpochWindows, Finalization, FrontierInputs, Hash,
     Inclusion, IntakeView, LocalTimestamp, MAX_CLAIMS_PER_BLOCK, MAX_HELD_VALUE_BYTES,
     MAX_HOLDS_PER_MEMBER, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-    MemberCollection, ProposerTimestamp, Provisions, ReadFence, ReadMark, ReadySignal,
+    MemberCollection, ProposerTimestamp, Provision, ReadFence, ReadMark, ReadySignal,
     ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
     STATE_CLAIM_CROSSING_BYTES, ShardId, StandingAnswers, StateClaim, SubstateClaim, SubstateKey,
     TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId,
@@ -133,7 +133,7 @@ pub struct ProposalInputs {
     /// Finalizations execution holds ready to commit.
     pub finalizations: Vec<Verifiable<Finalization>>,
     /// Provision bundles queued from remote shards.
-    pub provisions: Vec<Verifiable<Provisions>>,
+    pub provisions: Vec<Verifiable<Provision>>,
     /// What departed counterparts left of this chain's business.
     pub abandonment_records: Vec<AbandonmentRecord>,
     /// Proofs of counterparts' cells this validator's fetches answered.
@@ -213,7 +213,7 @@ impl ProposalKind {
 pub struct ProposalPayload {
     pub(crate) transactions: Vec<Verified<Transaction>>,
     pub(crate) finalizations: Vec<Verifiable<Finalization>>,
-    pub(crate) provisions: Vec<Verifiable<Provisions>>,
+    pub(crate) provisions: Vec<Verifiable<Provision>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
     /// The crossings whose ends share this shard, and those whose record
@@ -1441,8 +1441,8 @@ fn trim_parent_reads((places, spent): (usize, usize), mut offered: ParentReads) 
 pub fn select_provisions(
     ctx: &Committed<'_>,
     fold: &mut ProvisionsFold,
-    provisions: Vec<Verifiable<Provisions>>,
-) -> Vec<Verifiable<Provisions>> {
+    provisions: Vec<Verifiable<Provision>>,
+) -> Vec<Verifiable<Provision>> {
     admit_each::<ProvisionsSection, _>(ctx, fold, provisions, Verifiable::as_unverified).0
 }
 

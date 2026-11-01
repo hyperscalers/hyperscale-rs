@@ -28,7 +28,7 @@ pub use finalization_serve::serve_finalizations_request;
 use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
 use hyperscale_types::LocalTimestamp;
 pub use local_provision_serve::serve_local_provisions_request;
-pub use provision_serve::serve_provision_request;
+pub use provision_serve::{outbound_parts, serve_provision_request};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
 pub use remote_header_sync::RemoteHeaderSyncInput;
 use remote_header_sync::{RemoteHeaderSync, RemoteHeaderSyncOutput};

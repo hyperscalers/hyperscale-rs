@@ -1,25 +1,32 @@
 //! Provision fetch response for fallback recovery.
 
-use hyperscale_hbor::Hbor;
+use hyperscale_hbor::{Capped, Hbor};
 
-use crate::{MessageClass, NetworkMessage, Provisions};
+use crate::{MAX_TXS_PER_BLOCK, MessageClass, NetworkMessage, Provision};
 
-/// Response to a provision fetch request containing the provisions bundle.
+/// Response to a provision fetch request: the parts the source could
+/// build of what the requested block owes the asker.
 ///
-/// The source shard builds the same `Provisions` bundle the proposer would
-/// have broadcast for the requested (block, `target_shard`) pair. The target
-/// shard feeds it into the normal verification pipeline (QC + merkle proof
-/// checks).
+/// The source shard builds the same parts the proposer would have
+/// gossiped for the requested (block, `target_shard`) pair. The target
+/// shard feeds each into the normal verification pipeline (leaf path,
+/// QC and merkle proof checks). No parts means the source does not hold
+/// the block or could build none of them; the requester asks another
+/// peer.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetProvisionResponse {
-    /// The provisions bundle for the requested block and target shard.
-    ///
-    /// - `Some(provisions)` — successfully built bundle (may be empty if no
-    ///   matching transactions target the requesting shard).
-    /// - `None` — the source shard cannot serve this request (block not
-    ///   found, or the historical state version has been garbage-collected).
-    ///   The requester should try a different peer.
-    pub provisions: Option<Provisions>,
+    /// The parts built, in leaf order.
+    pub parts: Capped<Vec<Provision>, MAX_TXS_PER_BLOCK>,
+}
+
+impl GetProvisionResponse {
+    /// An answer carrying nothing.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            parts: Capped::empty(),
+        }
+    }
 }
 
 impl NetworkMessage for GetProvisionResponse {
@@ -40,7 +47,7 @@ mod tests {
 
     #[test]
     fn test_hbor_roundtrip_unavailable() {
-        let response = GetProvisionResponse { provisions: None };
+        let response = GetProvisionResponse::empty();
 
         let encoded = hbor_to_vec(&response).unwrap();
         let decoded: GetProvisionResponse = hbor_from_slice(&encoded).unwrap();

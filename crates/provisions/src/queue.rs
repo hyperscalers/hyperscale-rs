@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, ProvisionHash, Provisions, ShardId, Verified, WeightedTimestamp,
+    BlockHeight, LocalTimestamp, Provision, ProvisionHash, ShardId, Verified, WeightedTimestamp,
 };
 
 /// A queued provisions entry awaiting block inclusion. `added_at` drives
@@ -23,7 +23,7 @@ use hyperscale_types::{
 /// via [`Provision::deadline`].
 #[derive(Debug, Clone)]
 struct QueuedProvision {
-    provisions: Verified<Provisions>,
+    provisions: Verified<Provision>,
     added_at: LocalTimestamp,
     source_block_ts: WeightedTimestamp,
 }
@@ -46,7 +46,7 @@ impl QueuedProvisionBuffer {
     /// Push verified provisions onto the proposal queue.
     pub(crate) fn enqueue(
         &mut self,
-        provisions: Verified<Provisions>,
+        provisions: Verified<Provision>,
         source_block_ts: WeightedTimestamp,
         added_at: LocalTimestamp,
     ) {
@@ -92,7 +92,7 @@ impl QueuedProvisionBuffer {
         &self,
         now: LocalTimestamp,
         weighted_now: WeightedTimestamp,
-    ) -> Vec<Verified<Provisions>> {
+    ) -> Vec<Verified<Provision>> {
         self.queue
             .iter()
             .filter(|q| now.saturating_sub(q.added_at) >= self.min_dwell_time)
@@ -124,10 +124,7 @@ impl QueuedProvisionBuffer {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Capped;
-    use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardId, TxHash,
-    };
+    use hyperscale_types::{BlockHeight, Hash, ShardId, TxHash};
 
     use super::*;
 
@@ -143,17 +140,12 @@ mod tests {
         seed: u8,
         source_shard: ShardId,
         height: BlockHeight,
-    ) -> Verified<Provisions> {
-        Verified::new_unchecked_for_test(Provisions::new(
+    ) -> Verified<Provision> {
+        Verified::new_unchecked_for_test(Provision::dummy(
             source_shard,
             ShardId::leaf(1, 0),
             height,
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(&[seed])),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(&[seed])),
         ))
     }
 

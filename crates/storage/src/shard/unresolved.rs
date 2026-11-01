@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, EPOCH_DURATION, Provisions, TERMINAL_EVIDENCE_EPOCHS,
+    BlockHeight, CertifiedBlock, EPOCH_DURATION, Provision, TERMINAL_EVIDENCE_EPOCHS,
     TRANSACTION_EVIDENCE_HORIZON, TxHash, Verifiable, Verified, WeightedTimestamp,
 };
 
@@ -375,7 +375,7 @@ fn settled_reach<R: ShardChainReader + ?Sized>(
 /// still owe their transactions an outcome.
 fn rehydrate(
     certified: Verified<CertifiedBlock>,
-    provisions: Vec<Verifiable<Provisions>>,
+    provisions: Vec<Verifiable<Provision>>,
 ) -> Verified<CertifiedBlock> {
     let (block, qc) = certified.into_inner().into_parts();
     // Sealing keeps the header, and the header is what the hash and the

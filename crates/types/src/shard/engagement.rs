@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
-    BlockHeight, EpochWindows, MAX_ENGAGEMENTS_PER_BLOCK, Provisions, ShardId, TopologySnapshot,
+    BlockHeight, EpochWindows, MAX_ENGAGEMENTS_PER_BLOCK, Provision, ShardId, TopologySnapshot,
     TxHash, Verifiable, WeightedTimestamp,
 };
 
@@ -24,7 +24,7 @@ pub struct Engagement {
     /// The height of the source block the batch was read at.
     pub source_height: BlockHeight,
     /// The source block's anchor, its parent-QC weighted timestamp
-    /// ([`Provisions::source_block_ts`]): what places the entry inside
+    /// ([`Provision::source_block_ts`]): what places the entry inside
     /// or outside a recovery's band once the recovery is no longer
     /// pending.
     pub source_anchor: WeightedTimestamp,
@@ -35,28 +35,23 @@ pub struct Engagement {
 pub type Engagements = Capped<Vec<Engagement>, MAX_ENGAGEMENTS_PER_BLOCK>;
 
 impl Engagement {
-    /// One entry per transaction `batch` names, empty entries included:
-    /// a payer holding none of a transaction's reads sends an empty one,
-    /// and it is still the payer's word that the transaction committed.
-    pub fn of_batch(batch: &Provisions) -> impl Iterator<Item = Self> + '_ {
-        let source = batch.source_shard();
-        let source_height = batch.block_height();
-        let source_anchor = batch.source_block_ts();
-        batch.transactions().iter().map(move |entry| Self {
-            source,
-            tx_hash: entry.tx_hash,
-            source_height,
-            source_anchor,
-        })
+    /// The entry `part` names, an empty part included: a payer holding
+    /// none of a transaction's reads sends an empty one, and it is still
+    /// the payer's word that the transaction committed.
+    #[must_use]
+    pub fn of_part(part: &Provision) -> Self {
+        Self {
+            source: part.source_shard(),
+            tx_hash: part.tx_hash(),
+            source_height: part.block_height(),
+            source_anchor: part.source_block_ts(),
+        }
     }
 
     /// The set a block's provisions engage, whatever order they ride in.
     #[must_use]
-    pub fn of_provisions(batches: &[Verifiable<Provisions>]) -> BTreeSet<Self> {
-        batches
-            .iter()
-            .flat_map(|batch| Self::of_batch(batch))
-            .collect()
+    pub fn of_provisions(parts: &[Verifiable<Provision>]) -> BTreeSet<Self> {
+        parts.iter().map(|part| Self::of_part(part)).collect()
     }
 
     /// Every entry of `set` naming `tx_hash` from `source`, whatever

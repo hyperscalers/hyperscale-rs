@@ -19,7 +19,7 @@
 //! stamping, etc.) — keeping it co-located with the timestamp-driven
 //! sweeps that update it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use hyperscale_core::{Action, FetchIds, FetchRequest};
@@ -51,6 +51,12 @@ struct ExpectedProvision {
     source_block_ts: WeightedTimestamp,
     requested: bool,
     proposer: ValidatorId,
+    /// The leaf count the source header's root commits for this shard,
+    /// once a checked part has taught it.
+    count: Option<u32>,
+    /// The leaf indices held: admitted, or retired as already committed
+    /// or already verified.
+    held: BTreeSet<u32>,
 }
 
 /// Lifted into an `Action::Fetch` of remote provisions via
@@ -135,21 +141,37 @@ impl ExpectedProvisionTracker {
                 source_block_ts,
                 requested: false,
                 proposer,
+                count: None,
+                held: BTreeSet::new(),
             });
     }
 
-    /// Clear an expectation once provisions verify successfully. Returns
-    /// `true` if an entry was removed — the coordinator uses that to drop
-    /// the matching header and emit `Action::AbandonFetch` so the in-flight
-    /// remote-provision fetch is cancelled.
-    pub(crate) fn on_provisions_verified(
+    /// Record leaf `index` of `count` as held for `(source_shard,
+    /// block_height)`, off a part that has walked its path to the
+    /// header's root. Returns `true` when that completes the expectation,
+    /// which is then cleared: every one of the committed leaves is held.
+    pub(crate) fn on_part_held(
         &mut self,
         source_shard: ShardId,
         block_height: BlockHeight,
+        index: u32,
+        count: u32,
     ) -> bool {
-        self.expected
-            .remove(&(source_shard, block_height))
-            .is_some()
+        let key = (source_shard, block_height);
+        let Some(expected) = self.expected.get_mut(&key) else {
+            return false;
+        };
+        expected.count.get_or_insert(count);
+        if index < count {
+            expected.held.insert(index);
+        }
+        let complete = expected
+            .count
+            .is_some_and(|count| expected.held.len() >= count as usize);
+        if complete {
+            self.expected.remove(&key);
+        }
+        complete
     }
 
     /// Update the local committed anchor and retro-stamp pre-genesis
@@ -344,18 +366,23 @@ mod tests {
         assert_eq!(t.len(), 1);
     }
 
+    /// The expectation completes on holding every committed leaf, and
+    /// not on the first part to verify.
     #[test]
-    fn on_provisions_verified_clears_entry() {
+    fn an_expectation_completes_on_holding_every_leaf() {
         let mut t = ExpectedProvisionTracker::new(CommittedClock::default());
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(10),
-            ValidatorId::new(3),
-            ts(1_000),
+        let (shard, height) = (ShardId::leaf(2, 1), BlockHeight::new(10));
+        t.register(shard, height, ValidatorId::new(3), ts(1_000));
+        assert!(!t.on_part_held(shard, height, 2, 3));
+        assert!(
+            !t.on_part_held(shard, height, 2, 3),
+            "a repeat adds nothing"
         );
-        assert!(t.on_provisions_verified(ShardId::leaf(2, 1), BlockHeight::new(10)));
-        assert!(!t.on_provisions_verified(ShardId::leaf(2, 1), BlockHeight::new(10)));
+        assert!(!t.on_part_held(shard, height, 0, 3));
+        assert_eq!(t.len(), 1);
+        assert!(t.on_part_held(shard, height, 1, 3));
         assert_eq!(t.len(), 0);
+        assert!(!t.on_part_held(shard, height, 1, 3));
     }
 
     #[test]
@@ -425,7 +452,7 @@ mod tests {
         );
 
         // Verify before the timeout fires.
-        assert!(t.on_provisions_verified(ShardId::leaf(2, 1), BlockHeight::new(10)));
+        assert!(t.on_part_held(ShardId::leaf(2, 1), BlockHeight::new(10), 0, 1));
 
         let well_past =
             ts(1_000

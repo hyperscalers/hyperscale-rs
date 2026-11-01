@@ -447,11 +447,10 @@ impl CommitDedupIndex {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::make_finalization;
     use hyperscale_types::{
-        Address, AddressClass, BlockHeight, Hash, LocalKey, MerkleInclusionProof,
-        NetworkDefinition, ProvisionEntry, Provisions, ShardId, TransactionDecision, ValidatorSet,
+        Address, AddressClass, BlockHeight, Hash, LocalKey, NetworkDefinition, Provision, ShardId,
+        TransactionDecision, ValidatorSet,
     };
 
     use super::*;
@@ -503,15 +502,12 @@ mod tests {
         .into()
     }
 
-    fn make_provisions(seed: u8) -> Provisions {
-        let tx_hash = TxHash::from(Hash::from_bytes(&[seed; 32]));
-        Provisions::new(
+    fn make_provisions(seed: u8) -> Provision {
+        Provision::dummy(
             ShardId::leaf(1, 0),
             ShardId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
+            TxHash::from(Hash::from_bytes(&[seed; 32])),
         )
     }
 

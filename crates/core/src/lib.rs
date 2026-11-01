@@ -52,6 +52,8 @@ pub use fetch_ids::{BeaconFetchIds, FetchIds};
 pub use fetch_request::FetchRequest;
 pub use gate::{Gate, GateEntry};
 pub use hyperscale_dispatch::Parallelism;
-pub use protocol_event::{CommitSource, ProtocolEvent, ProvisionRefusal, TickBatchOutcome};
+pub use protocol_event::{
+    CommitSource, ProtocolEvent, ProvisionRefusal, ProvisionVerdict, TickBatchOutcome,
+};
 pub use timer::TimerId;
 pub use traits::StateMachine;

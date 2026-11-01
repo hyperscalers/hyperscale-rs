@@ -6,7 +6,7 @@ use hyperscale_storage::{
     recent_headers, replay_window,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CommittedTip, Hash, Provisions,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CommittedTip, Hash, Provision,
     ShardId, ShardWitnessPayload, WeightedTimestamp,
 };
 
@@ -174,7 +174,7 @@ impl RocksDbShardStorage {
     ///
     /// A full scan rather than a seek: the commit-path sweep is what
     /// bounds the CF, so everything present is everything wanted.
-    fn load_retained_provisions(&self) -> Vec<Provisions> {
+    fn load_retained_provisions(&self) -> Vec<Provision> {
         let cf = self.cf();
         let provisions_cf = ProvisionsCf::handle(&cf);
         iter_all::<ProvisionsCf>(&self.db, provisions_cf)

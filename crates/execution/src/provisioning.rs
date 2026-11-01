@@ -20,7 +20,7 @@ use std::sync::Arc;
 use hyperscale_engine::tick_select::Requirement;
 use hyperscale_storage::live_record;
 use hyperscale_types::{
-    MAX_FINALIZATION_DELAY, Provisions, RETENTION_HORIZON, ShardId, StateClaim, SubstateEntry,
+    MAX_FINALIZATION_DELAY, Provision, RETENTION_HORIZON, ShardId, StateClaim, SubstateEntry,
     SubstateKey, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingCell;
@@ -342,31 +342,24 @@ impl ProvisioningTracker {
 
     // ─── Batch absorption ───────────────────────────────────────────────
 
-    /// Absorb a committed bundle: what it carries for each transaction
-    /// is folded into the source shard's absorption for it, so a
+    /// Absorb a committed part: what it carries for its transaction is
+    /// folded into the source shard's absorption for it, so a
     /// re-broadcast restates what is held rather than doubling it.
     ///
-    /// Returns the `tx_hash`es touched — the caller uses these to compute
+    /// Returns the `tx_hash` touched — the caller uses it to compute
     /// which local ticks are affected and to drive the dispatch check.
-    /// Preserves iteration order of `provisions.transactions` (callers sort
-    /// batches upstream for determinism).
-    pub(crate) fn absorb_provisions(&mut self, provisions: &Verified<Provisions>) -> Vec<TxHash> {
-        let mut touched = Vec::with_capacity(provisions.transactions().len());
-        let source_shard = provisions.source_shard();
+    pub(crate) fn absorb_provisions(&mut self, part: &Verified<Provision>) -> TxHash {
+        let tx_hash = part.tx_hash();
         let anchor = SourceAnchor {
-            clock: provisions.source_block_ts(),
+            clock: part.source_block_ts(),
         };
-        for tx_entry in provisions.transactions() {
-            let tx_hash = tx_entry.tx_hash;
-            self.absorbed
-                .entry(tx_hash)
-                .or_default()
-                .entry(source_shard)
-                .and_modify(|absorbed| absorbed.absorb(self.now, anchor, &tx_entry.entries))
-                .or_insert_with(|| Absorbed::new(self.now, anchor, &tx_entry.entries));
-            touched.push(tx_hash);
-        }
-        touched
+        self.absorbed
+            .entry(tx_hash)
+            .or_default()
+            .entry(part.source_shard())
+            .and_modify(|absorbed| absorbed.absorb(self.now, anchor, part.entries()))
+            .or_insert_with(|| Absorbed::new(self.now, anchor, part.entries()));
+        tx_hash
     }
 
     // ─── Retention ──────────────────────────────────────────────────────
@@ -449,7 +442,7 @@ mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        BlockHeight, Hash, MAX_STATE_ENTRIES_PER_TX, MerkleInclusionProof, ProvisionEntry,
+        BlockHeight, Hash, LeafPath, MAX_PROVISION_WEIGHT, MerkleInclusionProof, ProvisionParts,
         ShardTrie,
     };
     use hyperscale_vm_types::{LegShape, ProtocolHasher};
@@ -465,43 +458,44 @@ mod tests {
         source: ShardId,
         block_height: BlockHeight,
         anchor: SourceAnchor,
-        tx_hashes: Vec<TxHash>,
-    ) -> Verified<Provisions> {
-        let transactions: Vec<ProvisionEntry> = tx_hashes
-            .into_iter()
-            .map(|tx_hash| ProvisionEntry::new(tx_hash, Capped::from_array([])))
-            .collect();
-        Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+        tx_hash: TxHash,
+    ) -> Verified<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::dummy_at(
             source,
             ShardId::leaf(2, 0),
             block_height,
             anchor.clock,
-            MerkleInclusionProof::dummy(),
-            Capped::new(transactions).expect("a list written out in a test"),
+            tx_hash,
         ))
     }
 
     fn make_provisions(
         source: ShardId,
         block_height: BlockHeight,
-        tx_hashes: Vec<TxHash>,
-    ) -> Verified<Provisions> {
-        make_provisions_at(source, block_height, anchor(0), tx_hashes)
+        tx_hash: TxHash,
+    ) -> Verified<Provision> {
+        make_provisions_at(source, block_height, anchor(0), tx_hash)
     }
 
     fn bundle_for(
         source: ShardId,
         tx_hash: TxHash,
-        entries: Capped<Vec<SubstateEntry>, MAX_STATE_ENTRIES_PER_TX>,
-    ) -> Verified<Provisions> {
-        Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-            source,
-            ShardId::leaf(2, 0),
-            BlockHeight::new(5),
-            anchor(0).clock,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(tx_hash, entries)]),
-        ))
+        entries: Capped<Vec<SubstateEntry>, MAX_PROVISION_WEIGHT>,
+    ) -> Verified<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+            source_shard: source,
+            target_shard: ShardId::leaf(2, 0),
+            block_height: BlockHeight::new(5),
+            source_block_ts: anchor(0).clock,
+            tx_hash,
+            entries,
+            proof: MerkleInclusionProof::dummy(),
+            leaf: LeafPath {
+                count: 1,
+                index: 0,
+                siblings: Capped::empty(),
+            },
+        }))
     }
 
     fn anchor(clock_ms: u64) -> SourceAnchor {
@@ -527,7 +521,7 @@ mod tests {
         // An empty-entry bundle — the payer shard's engagement evidence
         // for a commutative leg — counts exactly like a state-carrying
         // one: absorption is the commitment axis.
-        let batch = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
+        let batch = make_provisions(shard(1), BlockHeight::new(5), tx);
         t.absorb_provisions(&batch);
         assert!(t.has_received_from(tx, shard(1)));
         assert!(!t.has_received_from(tx, shard(2)));
@@ -548,12 +542,12 @@ mod tests {
         assert!(!t.is_fully_provisioned(tx));
 
         // Only shard 1 landed.
-        let batch1 = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
+        let batch1 = make_provisions(shard(1), BlockHeight::new(5), tx);
         t.absorb_provisions(&batch1);
         assert!(!t.is_fully_provisioned(tx));
 
         // Shard 2 lands → fully provisioned.
-        let batch2 = make_provisions(shard(2), BlockHeight::new(5), vec![tx]);
+        let batch2 = make_provisions(shard(2), BlockHeight::new(5), tx);
         t.absorb_provisions(&batch2);
         assert!(t.is_fully_provisioned(tx));
     }
@@ -636,7 +630,7 @@ mod tests {
         );
         both.fold_record_readings(&[claim_of(6, held(cell_of(tx, Terms::Owed)))]);
         assert!(!both.is_fully_provisioned(tx));
-        both.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), vec![tx]));
+        both.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), tx));
         assert!(both.is_fully_provisioned(tx));
 
         // The want names what arms it: the commit that filed it.
@@ -766,26 +760,24 @@ mod tests {
         // Absorbed provisions records `received[tx]` but there's no `required` —
         // the query must not report fully-provisioned just because
         // anything landed.
-        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), tx);
         t.absorb_provisions(&provisions);
         assert!(!t.is_fully_provisioned(tx));
     }
 
     #[test]
-    fn absorb_provisions_returns_touched_tx_hashes_in_order() {
+    fn absorb_provisions_returns_the_touched_tx_hash() {
         let mut t = ProvisioningTracker::new();
         let tx_a = TxHash::from(Hash::from_bytes(b"a"));
-        let tx_b = TxHash::from(Hash::from_bytes(b"b"));
-        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx_a, tx_b]);
-        let touched = t.absorb_provisions(&provisions);
-        assert_eq!(touched, vec![tx_a, tx_b]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), tx_a);
+        assert_eq!(t.absorb_provisions(&provisions), tx_a);
     }
 
     #[test]
     fn absorb_provisions_records_the_source_once() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), tx);
         t.absorb_provisions(&provisions);
 
         assert_eq!(t.absorbed_len(), 1);
@@ -800,8 +792,8 @@ mod tests {
     fn absorb_multiple_batches_for_same_tx_accumulates() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), vec![tx]));
-        t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), vec![tx]));
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), tx));
+        t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), tx));
 
         assert_eq!(
             t.provisions_for(tx).len(),
@@ -873,7 +865,7 @@ mod tests {
             shard(1),
             BlockHeight::new(5),
             anchor(7_000),
-            vec![tx],
+            tx,
         ));
         assert_eq!(t.payer_anchor(tx), None);
 
@@ -884,7 +876,7 @@ mod tests {
             shard(2),
             BlockHeight::new(9),
             anchor(9_500),
-            vec![tx],
+            tx,
         ));
         assert_eq!(t.payer_anchor(tx), Some(anchor(9_500)));
     }
@@ -901,7 +893,7 @@ mod tests {
             tx,
             std::iter::once(Requirement::CommittedState(shard(1))).collect(),
         );
-        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), vec![tx]));
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), tx));
         assert!(t.is_fully_provisioned(tx));
 
         let long_after = WeightedTimestamp::from_millis(1_000)
@@ -949,17 +941,10 @@ mod tests {
         let tx_fresh = TxHash::from(Hash::from_bytes(b"fresh"));
 
         t.advance_clock(WeightedTimestamp::from_millis(1_000));
-        t.absorb_provisions(&make_provisions(
-            shard(1),
-            BlockHeight::new(5),
-            vec![tx_old, tx_fresh],
-        ));
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), tx_old));
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), tx_fresh));
         t.advance_clock(WeightedTimestamp::from_millis(60_000));
-        t.absorb_provisions(&make_provisions(
-            shard(2),
-            BlockHeight::new(6),
-            vec![tx_fresh],
-        ));
+        t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(6), tx_fresh));
 
         // Past the first bundle's horizon but not the second's.
         let now = WeightedTimestamp::from_millis(1_001).plus(RETENTION_HORIZON);

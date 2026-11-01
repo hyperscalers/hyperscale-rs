@@ -25,15 +25,17 @@ use hyperscale_types::{
     BlockHeight, CollectionId, CommittedAt, ConsensusReceipt, Crossings, Deadline, DeclaredKey,
     DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock, Engagement,
     ExecutionCertificate, ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash,
-    Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK, MAX_ENGAGEMENTS_PER_BLOCK,
-    MAX_ENVELOPE_BYTES, MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
-    MAX_HOLDS_PER_MEMBER, MAX_MERKLE_PROOF_LEN, MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STAGED_RECEIPT_BYTES,
-    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK,
-    MAX_TICK_MANIFEST_BYTES, MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK,
+    Hash, Joins, LeafPath, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK,
+    MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FETCH_RESPONSE_BYTES,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_MERKLE_PROOF_LEN,
+    MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_PART_BYTES,
+    MAX_PROVISION_PATH_DEPTH, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISION_WEIGHT,
+    MAX_PROVISIONS_PER_BLOCK, MAX_STAGED_RECEIPT_BYTES, MAX_STATE_CLAIMS_BYTES,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES,
+    MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TX_READ_BYTES, MAX_TXS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms,
-    MerkleInclusionProof, Movement, ProvisionEntry, ProvisionHash, ProvisionTxRoot, Provisions,
-    ProvisionsContext, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach, Reserves, Role, RoutePrefix,
+    MerkleInclusionProof, Movement, Provision, ProvisionContext, ProvisionHash, ProvisionParts,
+    ProvisionTxRoot, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach, Reserves, Role, RoutePrefix,
     SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
     STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, Settlement, ShardId,
     SignerBitfield, StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt,
@@ -442,16 +444,69 @@ fn a_single_cell_claims_p99_is_what_the_budget_is_derived_from() {
             .expect("a claim's proof decodes");
 }
 
-/// One transaction's bundle at the most cells a proof may claim, every
+/// The deepest leaf path a part carries.
+fn deepest_path() -> LeafPath {
+    LeafPath {
+        count: u32::MAX,
+        index: u32::MAX - 1,
+        siblings: Capped::new(
+            (0..MAX_PROVISION_PATH_DEPTH)
+                .map(hash_at)
+                .collect::<Vec<_>>(),
+        )
+        .expect("the path cap"),
+    }
+}
+
+/// A part at every width its caps admit fits what a fetch response
+/// leaves it: the proof at its decode cap, the weight cap's keys, values
+/// at the read bytes a declaration may price, and the deepest path.
+///
+/// The values are bounded by the declaration's read bytes, not by the
+/// raw cell cap, because every provision key is a declared target and
+/// every leaf is held to its slot's width at write.
+#[test]
+fn a_part_at_maximal_widths_fits_a_fetch_response() {
+    let value_bytes = usize::try_from(MAX_TX_READ_BYTES).expect("a read budget fits memory");
+    let per_value = value_bytes / MAX_PROVISION_WEIGHT;
+    let entries: Vec<SubstateEntry> = (0..MAX_PROVISION_WEIGHT)
+        .map(|at| {
+            let seed = at.to_le_bytes();
+            let key = SubstateKey {
+                owner: Address::new([0x11; 31], AddressClass::Component),
+                local: LocalKey(Hash::from_bytes(&seed).as_bytes()[..16].try_into().unwrap()),
+            };
+            SubstateEntry::new(key, Some(Bytes::new(vec![0xAB; per_value]).unwrap()))
+        })
+        .collect();
+    let part = Provision::new(ProvisionParts {
+        source_shard: ShardId::leaf(1, 0),
+        target_shard: ShardId::leaf(1, 1),
+        block_height: BlockHeight::new(u64::MAX),
+        source_block_ts: WeightedTimestamp::from_millis(u64::MAX),
+        tx_hash: TxHash::from(hash_at(0)),
+        entries: Capped::new(entries).expect("the weight cap"),
+        proof: MerkleInclusionProof::new(vec![0x5A; MAX_MERKLE_PROOF_LEN]),
+        leaf: deepest_path(),
+    });
+    let encoded = hbor_to_vec(&part).expect("a part encodes").len();
+    println!(
+        "maximal part: {encoded} bytes of {MAX_PROVISION_PART_BYTES}, in a response of \
+         {MAX_FETCH_RESPONSE_BYTES}",
+    );
+    assert!(encoded <= MAX_PROVISION_PART_BYTES);
+}
+
+/// One transaction's part at the most cells a proof may claim, every
 /// cell present and then every cell absent, proven against a spread
 /// tree.
 ///
 /// An absent cell's claim ends at a leaf for another key or an empty
 /// slot, which encodes wider than a leaf at the key, while its entry
-/// carries no value. The bundle carrying every declared cell explicitly
+/// carries no value. The part carrying every declared cell explicitly
 /// verifies and stays within a fetch response either way.
 #[test]
-fn a_bundle_of_absent_cells_at_the_claim_cap_fits_a_fetch_response() {
+fn a_part_of_absent_cells_at_the_claim_cap_fits_a_fetch_response() {
     let shard = ShardId::leaf(1, 0);
     let (store, root, held) = spread_tree(shard, 2 * MAX_PROOF_CLAIMS, 11);
     let (_, _, missing) = spread_tree(shard, MAX_PROOF_CLAIMS, 13);
@@ -478,37 +533,35 @@ fn a_bundle_of_absent_cells_at_the_claim_cap_fits_a_fetch_response() {
             })
             .collect();
         entries.sort_by_key(|entry| entry.key);
-        Provisions::new(
-            shard,
-            ShardId::leaf(1, 1),
-            anchor.height,
-            anchor.ts,
-            MerkleInclusionProof::new(proof),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(hash_at(0)),
-                Capped::new(entries).expect("the claim cap is under the entry cap"),
-            )]),
-        )
+        Provision::new(ProvisionParts {
+            source_shard: shard,
+            target_shard: ShardId::leaf(1, 1),
+            block_height: anchor.height,
+            source_block_ts: anchor.ts,
+            tx_hash: TxHash::from(hash_at(0)),
+            entries: Capped::new(entries).expect("the claim cap is the weight cap"),
+            proof: MerkleInclusionProof::new(proof),
+            leaf: deepest_path(),
+        })
     };
     let present = bundle_over(&held[..MAX_PROOF_CLAIMS], true);
     let absent = bundle_over(&missing, false);
-    for (label, bundle) in [("present", &present), ("absent", &absent)] {
-        bundle
-            .verify(&ProvisionsContext { anchor })
-            .unwrap_or_else(|error| panic!("the {label} bundle verifies: {error}"));
-        let proof = bundle.proof().as_bytes().len();
-        let encoded = hbor_to_vec(bundle).expect("a bundle encodes").len();
+    for (label, part) in [("present", &present), ("absent", &absent)] {
+        part.verify(&ProvisionContext { anchor })
+            .unwrap_or_else(|error| panic!("the {label} part verifies: {error}"));
+        let proof = part.proof().as_bytes().len();
+        let encoded = hbor_to_vec(part).expect("a part encodes").len();
         println!(
-            "{MAX_PROOF_CLAIMS} {label} cells: proof {proof} bytes, bundle {encoded} bytes, of \
-             {MAX_MERKLE_PROOF_LEN} and {MAX_FETCH_RESPONSE_BYTES}",
+            "{MAX_PROOF_CLAIMS} {label} cells: proof {proof} bytes, part {encoded} bytes, of \
+             {MAX_MERKLE_PROOF_LEN} and {MAX_PROVISION_PART_BYTES}",
         );
         assert!(
             proof <= MAX_MERKLE_PROOF_LEN,
             "the {label} proof is buildable"
         );
         assert!(
-            encoded <= MAX_FETCH_RESPONSE_BYTES,
-            "the {label} bundle fits a fetch response",
+            encoded <= MAX_PROVISION_PART_BYTES,
+            "the {label} part fits a fetch response",
         );
     }
 }
@@ -909,7 +962,7 @@ struct ResponseWire {
 /// The provisions payload of [`ResponseWire`], in both forms.
 #[derive(Hbor)]
 enum ProvisionsWire {
-    Live(Vec<(ProvisionHash, Option<Verifiable<Provisions>>)>),
+    Live(Vec<(ProvisionHash, Option<Verifiable<Provision>>)>),
     Sealed {
         hashes: Vec<ProvisionHash>,
         engagements: Vec<Engagement>,

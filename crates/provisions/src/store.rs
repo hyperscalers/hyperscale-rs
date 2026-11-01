@@ -11,8 +11,8 @@
 //!   provisions received from remote shards via [`Self::insert`] and
 //!   evicts them via the post-commit retention sweep.
 //! - Outbound path ([`crate::outbound::OutboundProvisionTracker`]) inserts
-//!   provisions our proposer generated via [`Self::insert_outbound`],
-//!   which also populates a `(source_block_height, target_shard)` index
+//!   parts our proposer generated via [`Self::insert_outbound`], which
+//!   also populates a `(source_block_height, target_shard, index)` index
 //!   used by the cross-shard `provision.request` fast path. Eviction is
 //!   gated on terminal execution certificates from the target shard.
 //!
@@ -22,20 +22,19 @@
 //! writer.
 //!
 //! The outbound index is single-slot per `(source_block_height,
-//! target_shard)`: the protocol guarantees exactly one [`Provisions`]
-//! batch per such key (the proposer commits to one set at the source
-//! block, attested in the source block header). Repeated inserts for
-//! the same key are idempotent.
+//! target_shard, index)`: the source block header commits one leaf per
+//! index, so one part answers each. Repeated inserts for the same key
+//! are idempotent.
 
 use std::collections::HashSet;
 
-use hyperscale_types::{BlockHeight, BloomFilter, DEFAULT_FPR, ProvisionHash, Provisions, ShardId};
+use hyperscale_types::{BlockHeight, BloomFilter, DEFAULT_FPR, Provision, ProvisionHash, ShardId};
 use papaya::HashMap;
 
-/// Shared content-addressed store of `Provisions` bodies.
+/// Shared content-addressed store of provision parts.
 pub struct ProvisionStore {
-    inner: HashMap<ProvisionHash, Provisions>,
-    outbound_index: HashMap<(BlockHeight, ShardId), Provisions>,
+    inner: HashMap<ProvisionHash, Provision>,
+    outbound_index: HashMap<(BlockHeight, ShardId, u32), Provision>,
 }
 
 impl ProvisionStore {
@@ -48,49 +47,52 @@ impl ProvisionStore {
         }
     }
 
-    /// Insert provisions. Idempotent: re-inserting the same hash is a no-op.
+    /// Insert a part. Idempotent: re-inserting the same hash is a no-op.
     ///
     /// Inbound callers use this; the secondary outbound index is not
     /// touched.
-    pub fn insert(&self, provisions: Provisions) {
-        let hash = provisions.hash();
-        self.inner.pin().get_or_insert_with(hash, || provisions);
+    pub fn insert(&self, provision: Provision) {
+        let hash = provision.hash();
+        self.inner.pin().get_or_insert_with(hash, || provision);
     }
 
-    /// Insert provisions our proposer generated for `target_shard`.
-    /// Populates the `(source_block_height, target_shard)` slot so
-    /// cross-shard `provision.request` handlers can serve from the cache
-    /// before regenerating from `RocksDB`. Idempotent on the
-    /// `(height, shard)` slot — first writer wins, repeated inserts of
-    /// the same content are no-ops.
-    pub(crate) fn insert_outbound(&self, provisions: Provisions, target_shard: ShardId) {
-        let hash = provisions.hash();
-        let block_height = provisions.block_height();
+    /// Insert a part our proposer generated. Populates its
+    /// `(source_block_height, target_shard, index)` slot so cross-shard
+    /// `provision.request` handlers can serve from the cache before
+    /// regenerating from `RocksDB`. Idempotent on the slot — first writer
+    /// wins, repeated inserts of the same content are no-ops.
+    pub(crate) fn insert_outbound(&self, provision: Provision) {
+        let hash = provision.hash();
+        let slot = (
+            provision.block_height(),
+            provision.target_shard(),
+            provision.leaf().index,
+        );
         self.inner
             .pin()
-            .get_or_insert_with(hash, || provisions.clone());
+            .get_or_insert_with(hash, || provision.clone());
         self.outbound_index
             .pin()
-            .get_or_insert_with((block_height, target_shard), || provisions);
+            .get_or_insert_with(slot, || provision);
     }
 
-    /// Look up provisions by content hash.
-    pub fn get(&self, hash: ProvisionHash) -> Option<Provisions> {
+    /// Look up a part by content hash.
+    pub fn get(&self, hash: ProvisionHash) -> Option<Provision> {
         self.inner.pin().get(&hash).cloned()
     }
 
-    /// Fetch the outbound provisions registered for
-    /// `(block_height, target_shard)`, if any. Returns `None` if nothing
-    /// is cached — the caller should fall through to `RocksDB`
-    /// regeneration.
+    /// The outbound part registered for `(block_height, target_shard,
+    /// index)`, if any. `None` if nothing is cached — the caller falls
+    /// through to regeneration.
     pub fn get_outbound(
         &self,
         block_height: BlockHeight,
         target_shard: ShardId,
-    ) -> Option<Provisions> {
+        index: u32,
+    ) -> Option<Provision> {
         self.outbound_index
             .pin()
-            .get(&(block_height, target_shard))
+            .get(&(block_height, target_shard, index))
             .cloned()
     }
 
@@ -107,7 +109,7 @@ impl ProvisionStore {
             hashes.iter().filter(|h| g.remove(*h).is_some()).count()
         };
         let idx = self.outbound_index.pin();
-        idx.retain(|_, provisions| !hashes.contains(&provisions.hash()));
+        idx.retain(|_, provision| !hashes.contains(&provision.hash()));
         removed
     }
 
@@ -147,22 +149,16 @@ impl Default for ProvisionStore {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Capped;
-    use hyperscale_types::{Hash, MerkleInclusionProof, ProvisionEntry, TxHash, WeightedTimestamp};
+    use hyperscale_types::{Hash, TxHash};
 
     use super::*;
 
-    fn make_provisions(tx_seed: u8, height: u64) -> Provisions {
-        Provisions::new(
+    fn make_provisions(tx_seed: u8, height: u64) -> Provision {
+        Provision::dummy(
             ShardId::leaf(1, 1),
             ShardId::leaf(1, 0),
             BlockHeight::new(height),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(&[tx_seed])),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(&[tx_seed])),
         )
     }
 

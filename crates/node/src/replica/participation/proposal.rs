@@ -15,7 +15,7 @@ use hyperscale_mempool::MempoolCoordinator;
 use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_shard::{ProposalAsk, ProposalInputs, ShardCoordinator};
 use hyperscale_types::{
-    LocalTimestamp, MAX_TXS_PER_BLOCK, Provisions, ShardId, TopologySchedule, Transaction, TxHash,
+    LocalTimestamp, MAX_TXS_PER_BLOCK, Provision, ShardId, TopologySchedule, Transaction, TxHash,
     Verifiable, Verified,
 };
 
@@ -108,24 +108,17 @@ impl ProposalSources<'_> {
         }
     }
 
-    /// What the queued bundles name, as a set: `(payer shard, tx)` for
+    /// What the queued parts name, as a set: `(payer shard, tx)` for
     /// every transaction whose evidence would ride this proposal.
     ///
     /// Indexed once rather than rescanned, because selection asks the
     /// question of every pending entry in the pool and the queue is
     /// bounded only by what commit prunes — a scan per ask would be the
-    /// pool times the queue times each bundle's list, for a question
-    /// each bundle can answer once.
-    fn riding_this_proposal(queued: &[Verified<Provisions>]) -> HashSet<(ShardId, TxHash)> {
+    /// pool times the queue, for a question each part can answer once.
+    fn riding_this_proposal(queued: &[Verified<Provision>]) -> HashSet<(ShardId, TxHash)> {
         queued
             .iter()
-            .flat_map(|bundle| {
-                let source = bundle.source_shard();
-                bundle
-                    .transactions()
-                    .iter()
-                    .map(move |entry| (source, entry.tx_hash))
-            })
+            .map(|part| (part.source_shard(), part.tx_hash()))
             .collect()
     }
 }

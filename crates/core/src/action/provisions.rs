@@ -6,8 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_types::{
-    Anchor, BlockHash, BlockHeight, Provisions, ShardId, SubstateKey, ValidatorId,
-    WeightedTimestamp,
+    Anchor, BlockHash, BlockHeight, Provision, ShardId, SubstateKey, ValidatorId, WeightedTimestamp,
 };
 
 use super::{Delegated, ProvisionsRequest};
@@ -65,17 +64,20 @@ pub enum ProvisionAction {
         signer: ValidatorId,
     },
 
-    /// Verify provisions' merkle inclusion proofs.
+    /// Verify parts' merkle inclusion proofs.
     ///
     /// The QC was already verified by `RemoteHeaderCoordinator` when the header
-    /// was promoted to verified, so this only checks merkle proofs against the
+    /// was promoted to verified, and each part's leaf path was held to the
+    /// header's root, so this only checks merkle proofs against the
     /// certified header's state root.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::StateProvisionsVerified` when complete.
+    /// Returns one `ProtocolEvent::StateProvisionsVerified` carrying a
+    /// result per part, so event-loop traffic scales with messages rather
+    /// than transactions.
     VerifyProvisions {
-        /// The provisions to verify (all from the same source block).
-        provisions: Provisions,
+        /// The parts to verify, all from the same source block.
+        parts: Vec<Provision>,
         /// The source anchor whose `state_root` the proof is checked
         /// against — off the producing header for a pushed bundle, off
         /// this node's own mirror of what it has commit-proven for a

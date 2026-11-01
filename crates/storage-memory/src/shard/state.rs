@@ -17,7 +17,7 @@ use hyperscale_storage::{
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, EntryKey, Finalization, FinalizationHash,
-    GlobalReceiptHash, Hash, ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters,
+    GlobalReceiptHash, Hash, Provision, ProvisionHash, QuorumCertificate, SafeVoteRegisters,
     SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash,
     ValidatorId, Verified, WeightedTimestamp,
 };
@@ -349,7 +349,7 @@ pub struct ConsensusState {
     /// Provision bodies keyed by their committing height and hash.
     /// Mirrors the production `provisions` CF: a stored block keeps only
     /// the hashes, so this is what a replay reads the bodies back from.
-    pub(crate) provisions: OrdMap<(BlockHeight, ProvisionHash), Provisions>,
+    pub(crate) provisions: OrdMap<(BlockHeight, ProvisionHash), Provision>,
     /// The origin a reshape successor's adopted store records, where
     /// recovery must reconstruct the continued height line and clock.
     /// `None` for a chain born at network genesis.

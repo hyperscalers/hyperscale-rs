@@ -26,8 +26,8 @@ use hyperscale_hbor::{Capped, Hbor};
 use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
     Engagements, Finalization, FinalizationHash, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, StateClaim, TermsSection, TickManifest, Transaction, TxHash,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, Provision,
+    ProvisionHash, QuorumCertificate, StateClaim, TermsSection, TickManifest, Transaction, TxHash,
     Verifiable, WitnessSources,
 };
 
@@ -93,7 +93,7 @@ type ElidedCertificates =
 
 /// One row per provision, on the same terms as [`ElidedTransactions`].
 pub type ElidedProvisionBodies =
-    Capped<Vec<(ProvisionHash, Option<Verifiable<Provisions>>)>, MAX_PROVISIONS_PER_BLOCK>;
+    Capped<Vec<(ProvisionHash, Option<Verifiable<Provision>>)>, MAX_PROVISIONS_PER_BLOCK>;
 
 /// Per-collection caps mirror [`Block`]'s caps one-to-one — the elided
 /// form is a structural transformation of `Block` and inherits its
@@ -346,7 +346,7 @@ impl ElidedCertifiedBlock {
     where
         FTx: FnMut(&TxHash) -> Option<Verifiable<Transaction>>,
         FCert: FnMut(&FinalizationHash) -> Option<Verifiable<Finalization>>,
-        FProv: FnMut(&ProvisionHash) -> Option<Verifiable<Provisions>>,
+        FProv: FnMut(&ProvisionHash) -> Option<Verifiable<Provision>>,
     {
         // Header + QC are always inline, so the pairing can be checked
         // before resolving any bodies. A peer that sends a mismatched
@@ -909,35 +909,25 @@ mod tests {
     fn the_engagement_list_survives_every_block_form() {
         use std::collections::BTreeSet;
 
-        use crate::{
-            BlockMetadata, Engagement, EngagementRoot, MerkleInclusionProof, ProvisionEntry,
-            SetRoot,
-        };
+        use crate::{BlockMetadata, Engagement, EngagementRoot, SetRoot};
 
         let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
-        let batch = |source: ShardId, height: u64, seeds: &[u8]| {
-            Verifiable::from(Provisions::new(
+        let part = |source: ShardId, height: u64, seed: u8| {
+            Verifiable::from(Provision::dummy_at(
                 source,
                 ShardId::ROOT,
                 BlockHeight::new(height),
                 WeightedTimestamp::from_millis(height * 1_000),
-                MerkleInclusionProof::dummy(),
-                Capped::new(
-                    seeds
-                        .iter()
-                        .map(|seed| ProvisionEntry::new(tx(*seed), Capped::empty()))
-                        .collect(),
-                )
-                .expect("a list written out in a test"),
+                tx(seed),
             ))
         };
         let left = ShardId::leaf(1, 0);
         let right = ShardId::leaf(1, 1);
         let batches = vec![
-            batch(right, 4, &[2]),
-            batch(right, 3, &[1, 2]),
-            batch(left, 9, &[]),
-            batch(left, 7, &[3]),
+            part(right, 4, 2),
+            part(right, 3, 1),
+            part(right, 3, 2),
+            part(left, 7, 3),
         ];
         let expected: Vec<Engagement> = [(left, 3, 7), (right, 1, 3), (right, 2, 3), (right, 2, 4)]
             .into_iter()
@@ -951,7 +941,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let live_with = |provisions: Vec<Verifiable<Provisions>>| Block::Live {
+        let live_with = |provisions: Vec<Verifiable<Provision>>| Block::Live {
             header: BlockHeader::new(BlockHeaderParts::default()),
             transactions: Arc::new(Capped::empty()),
             certificates: Arc::new(Capped::empty()),

@@ -50,12 +50,11 @@ use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
     ConsensusReceipt, CounterpartMirror, DeclaredRange, Epoch, EpochWindows, EventRoot,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt,
-    LocalKey, MerkleInclusionProof, Movement, ProvenAnchors, ProvisionEntry, Provisions,
-    RecoveryCause, ResourceAddr, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield,
-    StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, compute_global_receipt_root, encode_amount, read_amount,
-    shard_prefix_path, writes_root,
+    LocalKey, Movement, ProvenAnchors, Provision, RecoveryCause, ResourceAddr, SettledWrites,
+    ShardId, ShardRecovery, ShardTrie, SignerBitfield, StateRoot, StateWrites, StatedTerms,
+    StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    compute_global_receipt_root, encode_amount, read_amount, shard_prefix_path, writes_root,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -542,20 +541,21 @@ impl ExecutionSim {
     /// transaction. A payer's leg waits for this before executing, since
     /// the tick that runs it is the tick that attests it.
     pub fn engage(&mut self, from: ShardId, tx_hashes: &[TxHash]) {
-        let bundle = Provisions::new(
-            from,
-            self.local_shard,
-            self.height,
-            WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS),
-            MerkleInclusionProof::dummy(),
-            Capped::new(
-                tx_hashes
-                    .iter()
-                    .map(|h| ProvisionEntry::new(*h, Capped::from_array([])))
-                    .collect(),
-            )
-            .expect("a list written out in a test"),
-        );
+        let parts = Capped::new(
+            tx_hashes
+                .iter()
+                .map(|h| {
+                    Verifiable::from(Provision::dummy_at(
+                        from,
+                        self.local_shard,
+                        self.height,
+                        WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS),
+                        *h,
+                    ))
+                })
+                .collect(),
+        )
+        .expect("a list written out in a test");
         self.height = self.height.next();
         let block = match make_live_block(
             self.local_shard,
@@ -577,7 +577,7 @@ impl ExecutionSim {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(Capped::from_array([Verifiable::from(bundle)])),
+                provisions: Arc::new(parts),
                 abandonment_records,
                 state_claims,
                 tick_manifest: Arc::new(Capped::empty()),
