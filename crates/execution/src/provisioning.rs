@@ -2,9 +2,9 @@
 //! transactions.
 //!
 //! One absorption per source shard and transaction —
-//! [`absorbed`](ProvisioningTracker::absorbed) — holds what that shard's
-//! committed bundles carried: the environment its earliest bundle stated
-//! and every leaf, by key. It is what a cross-shard dispatch carries and
+//! [`absorbed`](ProvisioningTracker::absorbed) — holds the part that
+//! shard's committing block sent: the environment it stated and its
+//! leaves, by key. It is what a cross-shard dispatch carries and
 //! the evidence that the shard committed the transaction. Beside it,
 //! `required` is what each candidate waits for, as one set of
 //! [`Requirement`]s, and `arrived` the crossing records committed
@@ -20,8 +20,8 @@ use std::sync::Arc;
 use hyperscale_engine::tick_select::Requirement;
 use hyperscale_storage::live_record;
 use hyperscale_types::{
-    MAX_FINALIZATION_DELAY, Provision, RETENTION_HORIZON, ShardId, StateClaim, SubstateEntry,
-    SubstateKey, TxHash, Verified, WeightedTimestamp,
+    BlockHeight, MAX_FINALIZATION_DELAY, Provision, RETENTION_HORIZON, ShardId, StateClaim,
+    SubstateEntry, SubstateKey, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -56,17 +56,15 @@ pub struct SourceAnchor {
     pub(crate) clock: WeightedTimestamp,
 }
 
-/// What one source shard's committed bundles carried for a transaction.
+/// What one source shard's committed part carried for a transaction:
+/// the part read off the source block that committed it.
 #[derive(Debug, Clone)]
 pub struct Absorbed {
-    /// The environment the shard's earliest bundle carried.
+    /// The height of the source block the part was read off.
+    height: BlockHeight,
+    /// The environment that block fixes for the transaction.
     anchor: SourceAnchor,
-    /// Every leaf the shard's bundles carried, sorted by key. A shard
-    /// sends a transaction bundles off several of its blocks — its
-    /// committed state when the transaction commits there, the record
-    /// cells its certificate wrote when that commits, and those cells
-    /// again off any later block that offers the crossing anew — and
-    /// each restates or adds keys, never taking one away.
+    /// The leaves the part carried, sorted by key.
     entries: Arc<Vec<SubstateEntry>>,
     /// The commit clock at the latest absorption, which bounds an
     /// absorption no candidate here has filed for.
@@ -74,61 +72,46 @@ pub struct Absorbed {
 }
 
 impl Absorbed {
-    fn new(at: WeightedTimestamp, anchor: SourceAnchor, entries: &[SubstateEntry]) -> Self {
+    fn new(
+        at: WeightedTimestamp,
+        height: BlockHeight,
+        anchor: SourceAnchor,
+        entries: &[SubstateEntry],
+    ) -> Self {
         let mut entries = entries.to_vec();
         entries.sort_by_key(|entry| entry.key);
         entries.dedup_by_key(|entry| entry.key);
         Self {
+            height,
             anchor,
             entries: Arc::new(entries),
             at,
         }
     }
 
-    /// Fold another bundle from the same shard in. A bundle restating
-    /// what is held adds nothing.
+    /// Fold another part from the same shard in.
     ///
-    /// The anchor kept is the earliest a bundle from this shard carried,
-    /// never the latest. It is the environment the transaction runs
-    /// under, which the block that committed it on the source shard
-    /// fixes — and that block is the earliest of that shard's that can
-    /// name the transaction at all. Taking the latest instead would let
-    /// a shard offering a crossing anew restamp the clock its consumer
-    /// executes under, so two consumers reached by different bundles
-    /// would run one transaction in two environments; and it would make
-    /// the answer turn on the order two bundles happened to arrive in,
-    /// where the earliest does not.
-    ///
-    /// The merge is anchor blind — one anchor over the whole held set —
-    /// and what makes that sound is that the bundle kinds a shard sends
-    /// carry **disjoint keys**, so a key is added by one kind or
-    /// restated by a re-broadcast of the same kind, never carried by
-    /// both at two anchors with two values. Were they to overlap, the
-    /// held set would mix anchors while `anchor` named only one, and a
-    /// consumer proving a reading against that anchor would be proving
-    /// it against a value taken at another.
-    ///
-    /// Stated rather than enforced, deliberately: the bundles are a
-    /// counterpart's committed content, so refusing a contradiction here
-    /// would let one shard halt another.
-    fn absorb(&mut self, at: WeightedTimestamp, anchor: SourceAnchor, entries: &[SubstateEntry]) {
-        self.at = at;
-        self.anchor.clock = self.anchor.clock.min(anchor.clock);
-        let restated = entries.iter().all(|entry| {
-            self.entries
-                .binary_search_by_key(&entry.key, |held| held.key)
-                .is_ok_and(|index| self.entries[index].value == entry.value)
-        });
-        if restated {
-            return;
+    /// A part off the block already held restates it and adds nothing:
+    /// one source block reads one transaction once. A part off another
+    /// block replaces the entries and the anchor whole. A source commits
+    /// a transaction in a second block only once a recovery has let go
+    /// of the first, and admission takes the second block's part only
+    /// under an anchor that orphans the first, so the part committed
+    /// later is the one that stands. Its entries are a reading of the
+    /// recovered chain's state, so none of the first block's are kept
+    /// beside them, an absent cell included.
+    fn absorb(
+        &mut self,
+        at: WeightedTimestamp,
+        height: BlockHeight,
+        anchor: SourceAnchor,
+        entries: &[SubstateEntry],
+    ) {
+        if self.height == height && self.anchor == anchor {
+            self.at = at;
+        } else {
+            *self = Self::new(at, height, anchor, entries);
         }
-        let mut merged: BTreeMap<SubstateKey, SubstateEntry> = self
-            .entries
-            .iter()
-            .map(|entry| (entry.key, entry.clone()))
-            .collect();
-        merged.extend(entries.iter().map(|entry| (entry.key, entry.clone())));
-        self.entries = Arc::new(merged.into_values().collect());
     }
 }
 
@@ -343,13 +326,15 @@ impl ProvisioningTracker {
     // ─── Batch absorption ───────────────────────────────────────────────
 
     /// Absorb a committed part: what it carries for its transaction is
-    /// folded into the source shard's absorption for it, so a
-    /// re-broadcast restates what is held rather than doubling it.
+    /// folded into the source shard's absorption for it
+    /// ([`Absorbed::absorb`]), so a re-broadcast restates what is held
+    /// rather than doubling it.
     ///
     /// Returns the `tx_hash` touched — the caller uses it to compute
     /// which local ticks are affected and to drive the dispatch check.
     pub(crate) fn absorb_provisions(&mut self, part: &Verified<Provision>) -> TxHash {
         let tx_hash = part.tx_hash();
+        let height = part.block_height();
         let anchor = SourceAnchor {
             clock: part.source_block_ts(),
         };
@@ -357,8 +342,8 @@ impl ProvisioningTracker {
             .entry(tx_hash)
             .or_default()
             .entry(part.source_shard())
-            .and_modify(|absorbed| absorbed.absorb(self.now, anchor, part.entries()))
-            .or_insert_with(|| Absorbed::new(self.now, anchor, part.entries()));
+            .and_modify(|absorbed| absorbed.absorb(self.now, height, anchor, part.entries()))
+            .or_insert_with(|| Absorbed::new(self.now, height, anchor, part.entries()));
         tx_hash
     }
 
@@ -804,11 +789,11 @@ mod tests {
         assert!(t.has_received_from(tx, shard(2)));
     }
 
-    /// A re-broadcast restates what is held: the dispatch carries the
-    /// bundle once, and a second bundle from the same shard adds its
-    /// cells beside the first's rather than beneath a second copy.
+    /// A part off the block already held restates it: the dispatch
+    /// carries the part once, and another part off the same block adds
+    /// nothing beside it.
     #[test]
-    fn a_shards_later_bundle_restates_or_adds_and_never_doubles() {
+    fn a_part_off_the_held_block_restates_it() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         let a = test_key(1);
@@ -822,29 +807,65 @@ mod tests {
         };
         t.absorb_provisions(&first());
         t.absorb_provisions(&first());
-        assert_eq!(
-            t.provisions_for(tx).len(),
-            1,
-            "a re-broadcast is absorbed once"
-        );
-        let value_of = |t: &ProvisioningTracker, key: SubstateKey| {
-            t.provisions_for(tx)[0]
-                .iter()
-                .find(|entry| entry.key == key)
-                .and_then(|entry| entry.value.as_ref().map(|v| v.to_vec()))
-        };
-        assert_eq!(value_of(&t, a), Some(vec![1]));
-
         t.absorb_provisions(&bundle_for(
             shard(1),
             tx,
             Capped::from_array([SubstateEntry::new(b, Some(Bytes::from_array([2])))]),
         ));
-        let carried = t.provisions_for(tx);
-        assert_eq!(carried.len(), 1, "still one absorption for the shard");
-        assert_eq!(carried[0].len(), 2, "holding both bundles' cells");
-        assert_eq!(value_of(&t, a), Some(vec![1]));
-        assert_eq!(value_of(&t, b), Some(vec![2]));
+        assert_eq!(
+            t.provisions_for(tx),
+            vec![Arc::new(vec![SubstateEntry::new(
+                a,
+                Some(Bytes::from_array([1]))
+            )])],
+        );
+    }
+
+    /// A part off another block of the same shard replaces what is held
+    /// whole: the dispatch carries the later block's entries and the
+    /// environment it fixes, and a cell it carries as absent stays
+    /// absent whatever the first block read. A block at the held height
+    /// under another anchor is another block.
+    #[test]
+    fn a_part_off_another_block_replaces_entries_and_anchor_whole() {
+        let (a, b) = (test_key(1), test_key(2));
+        let off = |height: u64, clock_ms: u64, entries: Vec<SubstateEntry>| {
+            Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+                source_shard: shard(1),
+                target_shard: ShardId::leaf(2, 0),
+                block_height: BlockHeight::new(height),
+                source_block_ts: anchor(clock_ms).clock,
+                tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
+                entries: Capped::new(entries).expect("a list written out in a test"),
+                proof: MerkleInclusionProof::dummy(),
+                leaf: LeafPath {
+                    count: 1,
+                    index: 0,
+                    siblings: Capped::empty(),
+                },
+            }))
+        };
+        let first = off(
+            7,
+            20_500,
+            vec![
+                SubstateEntry::new(a, Some(Bytes::from_array([1]))),
+                SubstateEntry::new(b, Some(Bytes::from_array([2]))),
+            ],
+        );
+        for (height, clock_ms) in [(9, 21_500), (7, 21_500)] {
+            let mut t = ProvisioningTracker::new();
+            let tx = first.tx_hash();
+            t.record_payer_shard(tx, shard(1));
+            t.absorb_provisions(&first);
+            t.absorb_provisions(&off(height, clock_ms, vec![SubstateEntry::new(a, None)]));
+            assert_eq!(
+                t.provisions_for(tx),
+                vec![Arc::new(vec![SubstateEntry::new(a, None)])],
+                "at height {height}",
+            );
+            assert_eq!(t.payer_anchor(tx), Some(anchor(clock_ms)));
+        }
     }
 
     #[test]
