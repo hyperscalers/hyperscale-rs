@@ -871,8 +871,9 @@ impl ProvisionCoordinator {
 
     /// Handle the verification result for a provisions entry.
     ///
-    /// If valid: store, queue, emit events.
-    /// Uses the verified header returned by the action handler directly (no re-lookup).
+    /// If valid: store, queue, emit events, keyed by the `anchor` the
+    /// bundle was checked against (no re-lookup). A refusal leaves the
+    /// expectation armed so another peer's bundle can still satisfy it.
     pub fn on_state_provisions_verified(
         &mut self,
         result: Result<Verified<Provisions>, (Provisions, ProvisionRefusal)>,
