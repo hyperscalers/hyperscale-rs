@@ -992,6 +992,29 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// The committee `certified`'s provision roots were computed under:
+    /// the one that certified it, resolved at `committee_anchor` with its
+    /// QC's timestamp in hand. A block a halt recovery's fresh committee
+    /// built over the halted tip resolves the window that committee was
+    /// seated in, as its proposer did, while the halted suffix resolves
+    /// its own windows. `anchored`, the block's classification, where the
+    /// certified window is not held here.
+    fn provisioned_committee<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        anchored: &'t TopologySnapshot,
+        certified: &CertifiedBlock,
+        committee_anchor: WeightedTimestamp,
+    ) -> &'t TopologySnapshot {
+        topology_schedule
+            .at_for_shard_certified(
+                self.local_shard,
+                committee_anchor,
+                certified.qc().weighted_timestamp(),
+            )
+            .map_or(anchored, |(snapshot, _)| snapshot.as_ref())
+    }
+
     /// The trie that says who was party to a transaction, off the latest
     /// committed block's anchored committee; `None` while that window is
     /// not committed here.
@@ -3401,10 +3424,13 @@ impl ExecutionCoordinator {
         actions.extend(self.drain_ready_tick_resolutions());
 
         let mut named = Vec::new();
+        let provisioned =
+            self.provisioned_committee(topology_schedule, anchored, certified, committee_anchor);
         actions.extend(self.on_block_committed(
             &mut named,
             topology_schedule,
             anchored,
+            provisioned,
             block,
             match naming {
                 Naming::Manifest => Named::Lines(block.tick_manifest()),
@@ -3427,9 +3453,14 @@ impl ExecutionCoordinator {
     /// broadcasts, the crossing readings the parent's commit made go with
     /// it, and the pushes queued for the next. Nothing on a block this
     /// replica cannot run.
+    ///
+    /// The provisions route under `provisioned`, the committee the
+    /// header's roots were computed under, so each part walks to its
+    /// target's root; the crossing pushes route under `anchored`.
     fn pushes(
         &mut self,
         anchored: &TopologySnapshot,
+        provisioned: &TopologySnapshot,
         committed: &Block,
         runnable: bool,
     ) -> Vec<Action> {
@@ -3450,7 +3481,7 @@ impl ExecutionCoordinator {
         if runnable && self.signers.contains(&proposer) {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
-                build_provision_requests(anchored, transactions, &self.signers, local_shard)
+                build_provision_requests(provisioned, transactions, &self.signers, local_shard)
             {
                 actions.push(Action::Provisions(
                     ProvisionAction::FetchAndBroadcastProvisions {
@@ -3528,6 +3559,7 @@ impl ExecutionCoordinator {
         seated: &mut Vec<TickLine>,
         topology_schedule: &TopologySchedule,
         anchored: &TopologySnapshot,
+        provisioned: &TopologySnapshot,
         committed: &Block,
         named: Named<'_>,
     ) -> Vec<Action> {
@@ -3546,7 +3578,7 @@ impl ExecutionCoordinator {
         // hold.
         let runnable = committed.is_live() && height >= self.dispatch_from;
 
-        actions.extend(self.pushes(anchored, committed, runnable));
+        actions.extend(self.pushes(anchored, provisioned, committed, runnable));
 
         let block = CommittingBlock {
             hash: block_hash,
@@ -5021,11 +5053,12 @@ mod tests {
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
-        StubVmStatics, certify as test_certify, genesis_charge,
+        StubVmStatics, certify as test_certify, genesis_charge, install_stub_protocol_statics,
         make_finalization as helpers_make_finalization, make_finalization_leaving,
         make_leg_finalization, make_live_block as helpers_make_live_block, naming, proven_claim,
-        state_and_proof, state_and_proof_holding, stating_half_on, stub_abort_charge, test_prefix,
-        test_transaction, test_transaction_running, test_transaction_with_prefixes,
+        state_and_proof, state_and_proof_holding, stating_half_on, stub_abort_charge,
+        stub_transaction_with_reads, test_prefix, test_transaction, test_transaction_running,
+        test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
@@ -5033,12 +5066,12 @@ mod tests {
         Crossings, Deadline, Epoch, EpochSeed, EpochWindows, ExecutionCertificateContext,
         ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash, Hash, Inclusion, LocalKey,
         MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof,
-        NetworkDefinition, PriceTable, QuorumCertificate, RETENTION_HORIZON, Randomness,
-        RecoveryBinding, RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot, Settlement,
-        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated,
-        StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TransactionDecision, TxResolution,
-        UnsettledTx, ValidatorInfo, ValidatorSet, Verify, VoteCount, Window,
-        compute_global_receipt_root, receipt_hash_of, signed_bytes,
+        NetworkDefinition, PriceTable, PrincipalAddr, QuorumCertificate, RETENTION_HORIZON,
+        Randomness, RecoveryBinding, RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot,
+        Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot,
+        Stated, StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TimestampRange,
+        TransactionDecision, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Verify,
+        VoteCount, Window, compute_global_receipt_root, receipt_hash_of, signed_bytes,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, CrossingId, Hash32, IntentHash, Kind, ProtocolHasher, Terms,
@@ -17656,6 +17689,98 @@ mod tests {
                 if pushes { vec![proposer] } else { vec![] },
                 "signing for {signers:?}",
             );
+        }
+    }
+
+    /// The first block past a halt recovery extends the halted tip, so
+    /// its committee anchor sits below the bridge, and its proposer
+    /// classified it under the window the fresh committee was seated in,
+    /// where the payer's shard has grown. The proposer's commit asks its
+    /// provisions of the target the header's roots name, not the one the
+    /// committee anchor's own window routes the payer to.
+    #[test]
+    fn a_block_past_a_recovery_bridge_gossips_under_the_bridged_committee() {
+        install_stub_protocol_statics();
+        let local = ShardId::leaf(1, 0);
+        let grown = ShardTrie::from_leaves([local, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
+        let window = |trie: &ShardTrie| {
+            Arc::new(
+                TopologySnapshot::from_explicit_committees(
+                    NetworkDefinition::simulator(),
+                    &ValidatorSet::new(Vec::new()),
+                    trie.leaves().map(|shard| (shard, Vec::new())).collect(),
+                    HashMap::new(),
+                    BTreeMap::new(),
+                    HashMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeSet::new(),
+                )
+                .with_pending_recoveries(BTreeMap::from([(
+                    local,
+                    ShardRecovery {
+                        cause: RecoveryCause::Halt,
+                        rotated_at: Epoch::new(20),
+                        retained: Vec::new(),
+                        attested_frontier: BlockHeight::GENESIS,
+                    },
+                )])),
+            )
+        };
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(2),
+            window(&ShardTrie::uniform(1)),
+        );
+        schedule.insert(Epoch::new(21), window(&grown));
+        let head = window(&ShardTrie::uniform(1));
+        schedule.insert(Epoch::new(22), Arc::clone(&head));
+        schedule.set_head(head);
+
+        let payer = PrincipalAddr::new([0x80; 31]);
+        let target = ShardId::leaf(2, 2);
+        assert_eq!(grown.shard_for_prefix(payer.address()), target);
+        let tx = stub_transaction_with_reads(
+            payer,
+            &[PrincipalAddr::new([0x10; 31]).address()],
+            &[payer.address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let proposer = ValidatorId::new(0);
+        // A block of the halted suffix, certified below the bridge by the
+        // committee that halted, routes under its own window.
+        for (certified_ms, routed) in [(22_500, target), (3_500, ShardId::leaf(1, 1))] {
+            let mut state = make_test_state_for_shard(proposer, local);
+            let block = make_live_block_on_shard(
+                local,
+                BlockHeight::new(1),
+                certified_ms,
+                proposer,
+                vec![tx.clone()],
+            );
+            let effects = state.commit_block_composing(
+                &schedule,
+                &test_certify(block, certified_ms),
+                WeightedTimestamp::from_millis(2_500),
+            );
+            let targets: Vec<ShardId> = effects
+                .actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Provisions(ProvisionAction::FetchAndBroadcastProvisions {
+                        shard_recipients,
+                        ..
+                    }) => Some(shard_recipients.keys().copied()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(targets, vec![routed], "certified at {certified_ms}ms");
         }
     }
 
