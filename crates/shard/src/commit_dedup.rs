@@ -398,20 +398,34 @@ impl CommitDedupIndex {
         snapshot: &TopologySnapshot,
         windows: EpochWindows,
     ) -> bool {
+        self.standing(source, tx_hash, at, snapshot, windows)
+            .next()
+            .is_some()
+    }
+
+    /// Every committed engagement of `tx_hash` from `source` that
+    /// [`Self::engaged`] answers on: one per source block, each live at
+    /// `at` and standing under `snapshot` on the grid `windows`.
+    pub(crate) fn standing<'a>(
+        &'a self,
+        source: ShardId,
+        tx_hash: TxHash,
+        at: WeightedTimestamp,
+        snapshot: &'a TopologySnapshot,
+        windows: EpochWindows,
+    ) -> impl Iterator<Item = Engagement> + 'a {
         self.engagements
             .get(&(source, tx_hash))
-            .is_some_and(|blocks| {
-                blocks.iter().any(|block| {
-                    block.deadline > at
-                        && Engagement {
-                            source,
-                            tx_hash,
-                            source_height: block.height,
-                            source_anchor: block.anchor,
-                        }
-                        .stands_under(snapshot, windows)
-                })
+            .into_iter()
+            .flatten()
+            .filter(move |block| block.deadline > at)
+            .map(move |block| Engagement {
+                source,
+                tx_hash,
+                source_height: block.height,
+                source_anchor: block.anchor,
             })
+            .filter(move |engagement| engagement.stands_under(snapshot, windows))
     }
 
     /// Every engagement the tier holds, with its deadline, in one order

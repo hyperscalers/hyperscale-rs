@@ -9,9 +9,9 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockManifestParts, Finalization,
-    FinalizationHash, LocalTimestamp, Provision, ProvisionHash, Round, ShardId, TimeoutCertificate,
-    Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockManifestParts, Engagement,
+    Finalization, FinalizationHash, LocalTimestamp, Provision, ProvisionHash, Round, ShardId,
+    TimeoutCertificate, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
 use tracing::{debug, warn};
 
@@ -775,6 +775,13 @@ impl PendingBlock {
     /// Get the missing finalization identities as a Vec.
     pub fn missing_finalizations(&self) -> Vec<FinalizationHash> {
         self.missing_finalization_hashes.iter().copied().collect()
+    }
+
+    /// What the provisions received so far engage.
+    pub fn engagements(&self) -> impl Iterator<Item = Engagement> + '_ {
+        self.received_provisions
+            .values()
+            .map(|part| Engagement::of_part(part))
     }
 
     /// Get all received finalizations.

@@ -668,7 +668,9 @@ pub mod tests {
     };
     use crate::commit_dedup::CommitDedupIndex;
     use crate::precut::Precut;
-    use crate::proposal::{Prefilter, select_finalizations, select_transactions};
+    use crate::proposal::{
+        Prefilter, select_finalizations, select_provisions, select_transactions,
+    };
 
     /// The body root check the vote path dispatches, run in place, and
     /// the tick manifest's budget beside it.
@@ -5877,6 +5879,224 @@ pub mod tests {
         );
         assert_eq!(engages(&carrying(9, 3_000)), [true; 3]);
         assert_eq!(engages(&carrying(4, 1_500)), [true; 3]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // One source block per transaction
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// The payer shard of [`TwoBlocks`] and the shard admitting its parts.
+    const TWO_BLOCKS_PAYER: ShardId = ShardId::leaf(1, 1);
+    const TWO_BLOCKS_LOCAL: ShardId = ShardId::leaf(1, 0);
+
+    /// A transaction the payer commits in two blocks across a recovery
+    /// recorded for it, rotated at epoch 20 on a 1,000 ms grid above a
+    /// frontier of 1, so the bridge is epoch 21: `first` at height 7
+    /// anchored below the bridge, `second` at height 9 anchored past it.
+    struct TwoBlocks {
+        tx: Verifiable<Transaction>,
+        first: Verifiable<Provision>,
+        second: Verifiable<Provision>,
+    }
+
+    /// The admitting block's own anchor, past the bridge.
+    const TWO_BLOCKS_ANCHOR_MS: u64 = 22_000;
+
+    impl TwoBlocks {
+        fn new() -> Self {
+            let tx = stub_tx(
+                test_principal(0x81),
+                &[
+                    test_principal(0x01).address(),
+                    test_principal(0x81).address(),
+                ],
+            );
+            let first = payer_part_at(7, 20_500, tx.hash());
+            let second = payer_part_at(9, 21_500, tx.hash());
+            Self { tx, first, second }
+        }
+
+        /// Admission at [`TWO_BLOCKS_ANCHOR_MS`] over `dedup`, with the
+        /// payer's recovery recorded as completed or not recorded at
+        /// all.
+        fn against(recorded: bool, dedup: CommitDedupIndex) -> Against {
+            use hyperscale_types::RecoveryBinding;
+
+            let mut snapshot = TestCommittee::new(4, 42).topology_snapshot(2);
+            if recorded {
+                snapshot = snapshot.with_recoveries(BTreeMap::from([(
+                    TWO_BLOCKS_PAYER,
+                    vec![RecoveryBinding {
+                        rotated_at: Epoch::new(20),
+                        attested_frontier: BlockHeight::new(1),
+                        completed: true,
+                    }],
+                )]));
+            }
+            let mut schedule = TopologySchedule::new(
+                EpochWindows::new(0, 1_000),
+                Epoch::GENESIS,
+                Arc::new(snapshot.clone()),
+            );
+            for epoch in 1..=60 {
+                schedule.insert(Epoch::new(epoch), Arc::new(snapshot.clone()));
+            }
+            let mut against = Against::schedule(snapshot, schedule);
+            against.local_shard = TWO_BLOCKS_LOCAL;
+            against.dedup = dedup;
+            against.anchor = WeightedTimestamp::from_millis(TWO_BLOCKS_ANCHOR_MS);
+            against
+        }
+
+        /// A dedup index holding `part` committed by a block anchored
+        /// just after it.
+        fn committed(&self, part: &Verifiable<Provision>) -> CommitDedupIndex {
+            let mut dedup = CommitDedupIndex::new();
+            dedup.register_committed_engagements(
+                &block_with_tx(&self.tx, vec![part.clone()]).engagements(),
+                part.source_block_ts().plus(Duration::from_millis(100)),
+            );
+            dedup
+        }
+
+        /// What a voter says of a block carrying `parts` beside the
+        /// transaction, and what a proposer selects of `parts` offered
+        /// in that order.
+        fn judged(
+            &self,
+            against: &Against,
+            parts: &[&Verifiable<Provision>],
+        ) -> (Result<(), String>, Vec<Verifiable<Provision>>) {
+            let parts: Vec<Verifiable<Provision>> = parts.iter().map(|&p| p.clone()).collect();
+            let voted = admit(against, &block_with_tx(&self.tx, parts.clone()));
+            let selected = select_provisions(&against.ctx(), &mut ProvisionsFold::default(), parts);
+            (voted, selected)
+        }
+    }
+
+    /// The payer's empty part for `tx_hash`, read off its block at
+    /// `height` anchored at `anchor_ms`.
+    fn payer_part_at(height: u64, anchor_ms: u64, tx_hash: TxHash) -> Verifiable<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::dummy_at(
+            TWO_BLOCKS_PAYER,
+            TWO_BLOCKS_LOCAL,
+            BlockHeight::new(height),
+            WeightedTimestamp::from_millis(anchor_ms),
+            tx_hash,
+        ))
+        .into()
+    }
+
+    fn refused_for_standing(voted: &Result<(), String>) -> bool {
+        voted
+            .as_ref()
+            .is_err_and(|err| err.contains("which still stands"))
+    }
+
+    fn refused_as_orphaned(voted: &Result<(), String>) -> bool {
+        voted
+            .as_ref()
+            .is_err_and(|err| err.contains("anchored below a recovery's bridge"))
+    }
+
+    /// With the first block committed, the second's part is admitted
+    /// once the anchor records the recovery that orphans the first.
+    #[test]
+    fn a_second_source_block_replaces_one_a_completed_recovery_orphans() {
+        let two = TwoBlocks::new();
+        let (voted, selected) = two.judged(
+            &TwoBlocks::against(true, two.committed(&two.first)),
+            &[&two.second],
+        );
+        assert_eq!(voted, Ok(()));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hash(), two.second.hash());
+    }
+
+    /// The second block's part offered before the anchor records any
+    /// recovery is refused, and stays offerable: under an anchor that
+    /// records the completed recovery the same part is admitted.
+    #[test]
+    fn a_second_source_block_waits_for_an_anchor_that_records_the_recovery() {
+        let two = TwoBlocks::new();
+        let (voted, selected) = two.judged(
+            &TwoBlocks::against(false, two.committed(&two.first)),
+            &[&two.second],
+        );
+        assert!(refused_for_standing(&voted), "{voted:?}");
+        assert!(selected.is_empty());
+
+        let (voted, selected) = two.judged(
+            &TwoBlocks::against(true, two.committed(&two.first)),
+            &[&two.second],
+        );
+        assert_eq!(voted, Ok(()));
+        assert_eq!(selected.len(), 1);
+    }
+
+    /// The first block's part offered once the recovery has completed,
+    /// with nothing held, is refused as orphaned on its own.
+    #[test]
+    fn an_orphaned_first_block_is_refused_with_nothing_held() {
+        let two = TwoBlocks::new();
+        let (voted, selected) = two.judged(
+            &TwoBlocks::against(true, CommitDedupIndex::new()),
+            &[&two.first],
+        );
+        assert!(refused_as_orphaned(&voted), "{voted:?}");
+        assert!(selected.is_empty());
+    }
+
+    /// With the second block's part in a QC-chain ancestor, the first
+    /// block's part is refused in the child, whether or not the anchor
+    /// records the recovery.
+    #[test]
+    fn a_first_block_is_refused_below_an_ancestor_holding_the_second() {
+        let two = TwoBlocks::new();
+        for recorded in [false, true] {
+            let mut against = TwoBlocks::against(recorded, CommitDedupIndex::new());
+            against.chain.engaged = BTreeSet::from([Engagement::of_part(&two.second)]);
+            let (voted, selected) = two.judged(&against, &[&two.first]);
+            if recorded {
+                assert!(refused_as_orphaned(&voted), "{voted:?}");
+            } else {
+                assert!(refused_for_standing(&voted), "{voted:?}");
+            }
+            assert!(selected.is_empty(), "recorded {recorded}");
+        }
+    }
+
+    /// Two blocks' parts for one transaction in one block: whichever is
+    /// folded second is refused.
+    #[test]
+    fn two_source_blocks_in_one_block_admit_only_the_first_folded() {
+        let two = TwoBlocks::new();
+        let against = TwoBlocks::against(false, CommitDedupIndex::new());
+        for (earlier, later) in [(&two.first, &two.second), (&two.second, &two.first)] {
+            let (voted, selected) = two.judged(&against, &[earlier, later]);
+            assert!(refused_for_standing(&voted), "{voted:?}");
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].hash(), earlier.hash());
+        }
+    }
+
+    /// A second block is refused where the recovery recorded does not
+    /// orphan the first: one at or below the frontier, or one anchored
+    /// past the bridge.
+    #[test]
+    fn a_second_source_block_is_refused_while_the_first_stands() {
+        let two = TwoBlocks::new();
+        for first in [
+            payer_part_at(1, 20_500, two.tx.hash()),
+            payer_part_at(7, 21_200, two.tx.hash()),
+        ] {
+            let (voted, selected) = two.judged(
+                &TwoBlocks::against(true, two.committed(&first)),
+                &[&two.second],
+            );
+            assert!(refused_for_standing(&voted), "{voted:?}");
+            assert!(selected.is_empty());
+        }
     }
 
     /// The header's body root commits what the block's provisions name:

@@ -48,17 +48,21 @@ use crate::commit_dedup::CommitDedupIndex;
 /// Transactions, provisions and certificate identities are read off each
 /// ancestor's manifest, which names them whether or not the body has
 /// assembled here; the transactions those certificates decide are read
-/// off the finalizations themselves, so an ancestor whose finalizations
-/// this node is still fetching contributes none — a node that
-/// under-reports can only fail to refuse, and the rule needs a quorum of
-/// enforcers rather than every node. The just-committed block is
-/// covered by the [`CommitDedupIndex`] instead.
+/// off the finalizations themselves, and engagements off the parts
+/// themselves, so an ancestor whose finalizations or parts this node is
+/// still fetching contributes none of them — a node that under-reports
+/// can only fail to refuse, and the rule needs a quorum of enforcers
+/// rather than every node. The just-committed block is covered by the
+/// [`CommitDedupIndex`] instead.
 #[derive(Debug, Default)]
 pub(crate) struct QcChainSets {
     /// Transactions an ancestor carries.
     pub(crate) txs: HashSet<TxHash>,
     /// Provision batches an ancestor carries.
     pub(crate) provisions: HashSet<ProvisionHash>,
+    /// What an ancestor's provisions engage, a sealed ancestor's kept
+    /// list included.
+    pub(crate) engaged: BTreeSet<Engagement>,
     /// Transactions an ancestor's finalizations decided.
     pub(crate) resolved: HashSet<TxHash>,
     /// Finalizations an ancestor carries.
@@ -91,6 +95,7 @@ impl QcChainSets {
                 sets.txs.extend(manifest.tx_hashes().iter().copied());
                 sets.provisions
                     .extend(manifest.provision_hashes().iter().copied());
+                sets.engaged.extend(pending.engagements());
                 sets.finalizations
                     .extend(manifest.cert_ids().iter().copied());
                 for fw in pending.finalizations() {
@@ -100,6 +105,7 @@ impl QcChainSets {
                 sets.txs
                     .extend(block.transactions().iter().map(|tx| tx.hash()));
                 sets.provisions.extend(block.provision_hashes());
+                sets.engaged.extend(block.engagements().iter().copied());
                 for fw in block.certificates().iter() {
                     sets.finalizations.insert(fw.receipt_hash());
                     sets.resolved.extend(fw.deciding_tx_hashes());
@@ -225,6 +231,20 @@ impl Section for ProvisionsSection {
     /// batch from its band, above the frontier and anchored below the
     /// bridge, whose ticks the recovered chain lets go of at its
     /// crossing block, a halt recovery's harvested tail included.
+    ///
+    /// **One source block per transaction.** A batch is refused while
+    /// the chain holds its transaction from another block of the same
+    /// source that still stands under the block's anchor
+    /// ([`Engagement::stands_under`]): committed, in a QC-chain ancestor,
+    /// or earlier in this block. A recovery can let go of the block that
+    /// committed a transaction and the recovered chain commit it again,
+    /// and only then is the second block's batch admitted. Anchors only
+    /// grow along the chain and what a snapshot records only grows with
+    /// its anchor, so a second block reaches commit only after the first
+    /// is orphaned, and the second is the one that stands. A second
+    /// block's batch offered before the anchor knows the recovery stays
+    /// queued for a later block.
+    ///
     /// Folding the checks into admission keeps
     /// every replica's verdict a pure function of the block's own
     /// anchor: a block anchored before the recovery folded resolves a
@@ -267,6 +287,26 @@ impl Section for ProvisionsSection {
                  recovery's bridge above its frontier"
             ));
         }
+        let engagement = Engagement::of_part(batch);
+        let tx_hash = engagement.tx_hash;
+        let other = ctx
+            .dedup
+            .standing(source_shard, tx_hash, ctx.anchor, ctx.snapshot, ctx.windows)
+            .chain(
+                Engagement::of_pair(&ctx.chain.engaged, source_shard, tx_hash)
+                    .chain(Engagement::of_pair(&fold.engaged, source_shard, tx_hash))
+                    .copied()
+                    .filter(|held| held.stands_under(ctx.snapshot, ctx.windows)),
+            )
+            .find(|held| *held != engagement);
+        if let Some(held) = other {
+            return Err(format!(
+                "provisions batch {provision_hash:?} from {source_shard:?} at height {:?} \
+                 while the chain holds {tx_hash} from its block at height {:?}, which still \
+                 stands",
+                engagement.source_height, held.source_height,
+            ));
+        }
         let tx_count = fold.tx_count.saturating_add(1);
         if tx_count > MAX_ENGAGEMENTS_PER_BLOCK {
             return Err(format!(
@@ -275,7 +315,7 @@ impl Section for ProvisionsSection {
             ));
         }
         fold.tx_count = tx_count;
-        fold.engaged.insert(Engagement::of_part(batch));
+        fold.engaged.insert(engagement);
         fold.admitted.insert(provision_hash);
         Ok(())
     }
