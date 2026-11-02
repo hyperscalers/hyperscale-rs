@@ -925,8 +925,7 @@ mod tests {
 
     use crossbeam::channel::Receiver;
     use hyperscale_core::{
-        Action, CommitSource, ConsensusAction, ExecutionAction, Gate, HeaderCommittee,
-        ProtocolEvent, StateMachine,
+        Action, CommitSource, ConsensusAction, ExecutionAction, Gate, ProtocolEvent, StateMachine,
     };
     use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
     use hyperscale_network::HandlerRegistry;
@@ -1516,7 +1515,6 @@ mod tests {
             certified_header: certified.clone(),
             source: HeaderSource::Gossip(fix.committee.validator_id(2)),
             result: Box::new(Ok(Verified::new_unchecked_for_test(certified))),
-            committee: HeaderCommittee::Resolved,
         });
         let fetches = remote_fetches(&host);
         assert_eq!(fetches.first(), Some(&BlockHeight::new(11)), "{fetches:?}");

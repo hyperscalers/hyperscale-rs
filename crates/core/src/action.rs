@@ -45,25 +45,6 @@ pub enum QcSubject {
     SyncClaim(SyncClaimId),
 }
 
-/// How a [`ConsensusAction::VerifyRemoteHeaderQc`] came by the committee it
-/// checks the header's QC against, echoed back on
-/// [`ProtocolEvent::RemoteHeaderQcVerified`].
-///
-/// A block's QC is signed by the committee its parent anchors. When neither
-/// a held parent nor the beacon's attested boundary names the parent, the
-/// header's own anchor stands in, which names a different window across an
-/// epoch cut, so a failure there says nothing against the header or the
-/// peer that sent it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeaderCommittee {
-    /// The parent named the committee, held or attested by the beacon: a
-    /// failure is the header's own.
-    Resolved,
-    /// The header's own anchor named it: a failure waits for the parent
-    /// and a check under the committee it names.
-    Guessed,
-}
-
 /// The number the shard coordinator gives a sync claim, so a verification
 /// result reaches the claim that dispatched it and not a later one from
 /// the same peer.

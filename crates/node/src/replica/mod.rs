@@ -400,11 +400,10 @@ impl StateMachine for NodeStateMachine {
                 certified_header,
                 source,
                 result,
-                committee,
             } => self
                 .shard
                 .remote_headers_coordinator
-                .on_remote_header_qc_verified(sched, &certified_header, source, *result, committee),
+                .on_remote_header_qc_verified(sched, &certified_header, source, *result),
             ProtocolEvent::CommitProofNeeded {
                 source_shard,
                 block_height,

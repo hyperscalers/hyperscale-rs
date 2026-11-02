@@ -13,14 +13,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
-use hyperscale_core::{Action, ConsensusAction, HeaderCommittee, ProtocolEvent};
+use hyperscale_core::{Action, ConsensusAction, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, CommitProof, CommittedClock, ConsensusPublicKey, ForkFence,
     HeaderFetchCount, HeaderSource, QcAdmission, REMOTE_HEADER_RETENTION, RETENTION_HORIZON,
-    ScheduleLookup, ShardForkProof, ShardId, TRANSACTION_EVIDENCE_HORIZON, TopologySchedule,
-    TopologySnapshot, TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
+    ScheduleLookup, ShardForkProof, ShardId, SigningAnchor, TRANSACTION_EVIDENCE_HORIZON,
+    TopologySchedule, TopologySnapshot, TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -407,12 +407,11 @@ impl RemoteHeaderCoordinator {
         // cohort forged extending the halted tip; drop it rather than
         // admit a forged header into the routing view. A header refused
         // under a guessed anchor may be honest and waits for its parent.
-        let (anchor, named_by) =
-            self.committee_anchor_wt(topology_schedule, shard, certified_header.header());
-        // A copy identical to one parked for its parent would fail the same
-        // guessed check. The parked copy's check under its parent settles
-        // this one's verdict too, since both name the same item.
-        if named_by == HeaderCommittee::Guessed && self.parked_for_parent(&certified_header) {
+        let anchor = self.signing_anchor(topology_schedule, shard, certified_header.header());
+        // A copy identical to one parked for its parent would be refused
+        // under the same guess. The parked copy's check under its parent
+        // settles this one's verdict too, since both name the same item.
+        if !anchor.names_parent() && self.parked_for_parent(&certified_header) {
             trace!(
                 shard = shard.inner(),
                 height = height.inner(),
@@ -436,7 +435,7 @@ impl RemoteHeaderCoordinator {
                 self.awaiting.push(shard, (source, certified_header));
                 return vec![];
             }
-            QcAdmission::Refuse if named_by == HeaderCommittee::Guessed => {
+            QcAdmission::Refuse if !anchor.names_parent() => {
                 return self.await_parent(shard, source, certified_header);
             }
             QcAdmission::Refuse => {
@@ -472,7 +471,7 @@ impl RemoteHeaderCoordinator {
         // The first candidate at a (shard, height) triggers QC verification.
         if candidate == Candidate::First {
             // Emit QC verification for the first header at this (shard, height).
-            Self::emit_verify_qc(committee, named_by, source, certified_header)
+            Self::emit_verify_qc(committee, source, certified_header)
         } else {
             vec![]
         }
@@ -486,17 +485,15 @@ impl RemoteHeaderCoordinator {
     ///
     /// On success: promotes to verified, emits `RemoteHeaderAdmitted` continuation.
     /// On failure: removes the failed candidate and every copy identical to
-    /// it, and tries the next source's header. One that failed under a
-    /// guessed `committee` is checked again under the committee its parent
-    /// names: at once if the parent is held by now, otherwise once it
-    /// arrives.
+    /// it, and tries the next source's header. A failure is final whatever
+    /// anchor admitted the header: every anchor that admits the window its
+    /// signers name resolves that window's committee.
     pub fn on_remote_header_qc_verified(
         &mut self,
         topology_schedule: &TopologySchedule,
         certified_header: &CertifiedBlockHeader,
         source: HeaderSource,
         result: Result<Verified<CertifiedBlockHeader>, CertifiedHeaderVerifyError>,
-        committee: HeaderCommittee,
     ) -> Vec<Action> {
         let shard = certified_header.shard_id();
         let height = certified_header.height();
@@ -515,24 +512,10 @@ impl RemoteHeaderCoordinator {
                 // retention pruned while in flight leaves nothing to drop,
                 // and whatever the height holds since has a check of its
                 // own in flight.
-                let mut actions = if self.drop_identical_candidates(certified_header) {
-                    self.dispatch_next_candidate(topology_schedule, shard, height)
-                } else {
-                    Vec::new()
-                };
-                // A header that failed under a guess may be honest: it is
-                // checked again under its parent's committee, even when the
-                // retention has already pruned its pending entry. The next
-                // candidate goes first, so a re-offer lands behind it rather
-                // than dispatching the same height twice.
-                if committee == HeaderCommittee::Guessed {
-                    actions.extend(self.retry_under_parent(
-                        topology_schedule,
-                        source,
-                        certified_header.clone(),
-                    ));
+                if self.drop_identical_candidates(certified_header) {
+                    return self.dispatch_next_candidate(topology_schedule, shard, height);
                 }
-                return actions;
+                return Vec::new();
             }
         };
 
@@ -1028,10 +1011,8 @@ impl RemoteHeaderCoordinator {
     }
 
     /// Drop every candidate identical to `failed`, whose check just failed:
-    /// they are one item, which that check settled for all of them. One
-    /// that failed under a guessed committee is checked again on `failed`
-    /// itself once its parent names the committee. False if no candidate
-    /// is identical to `failed`: its check was stale.
+    /// they are one item, which that check settled for all of them. False
+    /// if no candidate is identical to `failed`: its check was stale.
     fn drop_identical_candidates(&mut self, failed: &CertifiedBlockHeader) -> bool {
         let height = failed.height();
         let Some(store) = self.shards.get_mut(&failed.shard_id()) else {
@@ -1629,22 +1610,21 @@ impl RemoteHeaderCoordinator {
     }
 
     /// Anchor selecting the committee that signed the QC over `header`'s
-    /// block, and whether the parent named it. A block's committee
-    /// anchors on its parent, so the window that signed this QC is the one
-    /// the parent dates itself in. Without the parent held, the beacon's
-    /// attested boundary names it for the boundary block, and otherwise the
-    /// header's own anchor stands in — the same window except across an
-    /// epoch cut. A header resolved on its own anchor that fails
-    /// verification waits for the parent ([`Self::await_parent`]) rather
+    /// block. A block's committee anchors on its parent, so the window
+    /// that signed this QC is the one the parent dates itself in. Without
+    /// the parent held, the beacon's attested boundary names it for the
+    /// boundary block, and otherwise the header's own anchor stands in —
+    /// the same window except across an epoch cut. A header its own
+    /// anchor refuses waits for the parent ([`Self::await_parent`]) rather
     /// than being dropped. Both the first dispatch and the failed-candidate
     /// retry drain resolve through here, so a buffered sibling verifies
     /// under the same committee its predecessor did.
-    fn committee_anchor_wt(
+    fn signing_anchor(
         &self,
         topology_schedule: &TopologySchedule,
         shard: ShardId,
         header: &BlockHeader,
-    ) -> (WeightedTimestamp, HeaderCommittee) {
+    ) -> SigningAnchor {
         let parent_anchor = header
             .height()
             .prev()
@@ -1652,15 +1632,7 @@ impl RemoteHeaderCoordinator {
                 self.held_header(shard, parent_height, header.parent_block_hash())
             })
             .map(|parent| parent.parent_qc().weighted_timestamp());
-        let anchor = topology_schedule.signing_anchor(shard, header, parent_anchor);
-        (
-            anchor.weighted_timestamp(),
-            if anchor.names_parent() {
-                HeaderCommittee::Resolved
-            } else {
-                HeaderCommittee::Guessed
-            },
-        )
+        topology_schedule.signing_anchor(shard, header, parent_anchor)
     }
 
     /// What the schedule makes of `certified_header`'s QC at committee
@@ -1669,7 +1641,7 @@ impl RemoteHeaderCoordinator {
     /// admit is the fresh committee's. A QC with no signers is refused.
     fn admit_header<'t>(
         topology_schedule: &'t TopologySchedule,
-        anchor: WeightedTimestamp,
+        anchor: SigningAnchor,
         certified_header: &CertifiedBlockHeader,
     ) -> QcAdmission<'t> {
         let qc = certified_header.qc();
@@ -1678,7 +1650,7 @@ impl RemoteHeaderCoordinator {
         }
         topology_schedule.admits_fenced(
             certified_header.shard_id(),
-            anchor,
+            anchor.weighted_timestamp(),
             qc.weighted_timestamp(),
             qc.committee_epoch(),
         )
@@ -1706,8 +1678,7 @@ impl RemoteHeaderCoordinator {
             let Some((next_source, next_header)) = next else {
                 return fetches;
             };
-            let (anchor, named_by) =
-                self.committee_anchor_wt(topology_schedule, shard, next_header.header());
+            let anchor = self.signing_anchor(topology_schedule, shard, next_header.header());
             // A recovery folded (or advanced) after this header buffered can
             // turn it into an orphan the signed-epoch fence refuses; drop it
             // and drain the next candidate.
@@ -1715,7 +1686,6 @@ impl RemoteHeaderCoordinator {
                 QcAdmission::Admit(committee) => {
                     fetches.extend(Self::emit_verify_qc(
                         committee.snapshot,
-                        named_by,
                         next_source,
                         next_header,
                     ));
@@ -1735,7 +1705,7 @@ impl RemoteHeaderCoordinator {
                     self.drop_candidate(shard, height, next_source);
                     self.awaiting.push(shard, (next_source, next_header));
                 }
-                QcAdmission::Refuse if named_by == HeaderCommittee::Guessed => {
+                QcAdmission::Refuse if !anchor.names_parent() => {
                     self.drop_candidate(shard, height, next_source);
                     fetches.extend(self.await_parent(shard, next_source, next_header));
                 }
@@ -1753,29 +1723,8 @@ impl RemoteHeaderCoordinator {
         }
     }
 
-    /// Check `certified_header`, which failed under a guessed committee,
-    /// again under the one its parent names: re-offered at once when the
-    /// parent is held or attested by now, parked for it otherwise.
-    fn retry_under_parent(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        source: HeaderSource,
-        certified_header: CertifiedBlockHeader,
-    ) -> Vec<Action> {
-        let shard = certified_header.shard_id();
-        match self
-            .committee_anchor_wt(topology_schedule, shard, certified_header.header())
-            .1
-        {
-            HeaderCommittee::Resolved => {
-                self.on_remote_header_received(topology_schedule, certified_header, source)
-            }
-            HeaderCommittee::Guessed => self.await_parent(shard, source, certified_header),
-        }
-    }
-
-    /// Park `certified_header`, which failed verification under a committee
-    /// no held parent named, until its parent is held, and fetch the gap
+    /// Park `certified_header`, whose QC the anchor its own header guessed
+    /// does not admit, until its parent is held, and fetch the gap
     /// from the shard's walked frontier up to that parent unless one went
     /// out within [`COMMIT_PROOF_RETRY`].
     fn await_parent(
@@ -1822,8 +1771,8 @@ impl RemoteHeaderCoordinator {
 
     /// Re-offer the headers of `shard` whose parent is now held or attested
     /// at the beacon's boundary, keeping the rest parked. A re-offered
-    /// header resolves under its parent, so one that fails again is dropped
-    /// rather than parked: each is checked at most once more.
+    /// header resolves under its parent, so one refused again is dropped
+    /// rather than parked: each is offered at most once more.
     fn reoffer_awaiting_parent(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1832,9 +1781,8 @@ impl RemoteHeaderCoordinator {
         let mut actions = Vec::new();
         for (source, header) in self.awaiting_parent.drain_shard(shard) {
             if self
-                .committee_anchor_wt(topology_schedule, shard, header.header())
-                .1
-                == HeaderCommittee::Resolved
+                .signing_anchor(topology_schedule, shard, header.header())
+                .names_parent()
             {
                 actions.extend(self.on_remote_header_received(topology_schedule, header, source));
             } else {
@@ -2038,7 +1986,6 @@ impl RemoteHeaderCoordinator {
     /// Emit a `VerifyRemoteHeaderQc` action for the given header.
     fn emit_verify_qc(
         topology_snapshot: &TopologySnapshot,
-        committee: HeaderCommittee,
         source: HeaderSource,
         certified_header: CertifiedBlockHeader,
     ) -> Vec<Action> {
@@ -2059,7 +2006,6 @@ impl RemoteHeaderCoordinator {
             source,
             committee_public_keys,
             quorum_threshold,
-            committee,
         })]
     }
 
@@ -2405,85 +2351,6 @@ mod tests {
         );
     }
 
-    /// A header checked under a guessed committee fails, and the retention
-    /// can prune its pending entry before the failure lands. It still waits
-    /// for its parent: the failure carries the header, so parking needs no
-    /// entry in the store.
-    #[test]
-    fn a_failed_header_pruned_while_in_flight_still_waits_for_its_parent() {
-        const ED: u64 = 100_000;
-        let remote = ShardId::leaf(1, 1);
-        let ids = [0u64, 1, 2, 3];
-        let epoch0 = Arc::new(shard_snapshot(2, &ids, 0));
-        let epoch1 = Arc::new(shard_snapshot(2, &ids, 1));
-        let expected1: Vec<ConsensusPublicKey> = epoch1
-            .committee_for_shard(remote)
-            .iter()
-            .map(|v| epoch1.public_key(*v).unwrap())
-            .collect();
-
-        let mut schedule =
-            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&epoch0));
-        schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
-
-        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
-
-        let parent = chained_remote_header_signed(
-            remote,
-            BlockHeight::new(5),
-            BlockHash::ZERO,
-            Epoch::new(1),
-            ED + 1,
-        );
-        let child = chained_remote_header_signed(
-            remote,
-            BlockHeight::new(6),
-            parent.header().hash(),
-            Epoch::new(1),
-            ED + 2,
-        );
-        let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
-
-        // The shard's tip lands far past the retention while the child's
-        // verification is in flight, pruning its pending entry.
-        let tip = chained_remote_header_signed(
-            remote,
-            BlockHeight::new(50),
-            BlockHash::ZERO,
-            Epoch::new(1),
-            2 * ED - 1,
-        );
-        let _ = coord.on_remote_header_received(&schedule, tip, gossip(1));
-        assert!(coord.get_pending(remote, BlockHeight::new(6)).is_none());
-
-        let actions = coord.on_remote_header_qc_verified(
-            &schedule,
-            &child,
-            gossip(1),
-            Err(CertifiedHeaderVerifyError::LinkageMismatch),
-            HeaderCommittee::Guessed,
-        );
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::FetchCommitProof { source_shard, from_height, .. }
-                    if *source_shard == remote && *from_height <= BlockHeight::new(5)
-            )),
-            "the gap up to the parent is fetched",
-        );
-
-        let actions = coord.on_verified_remote_header_received(
-            &schedule,
-            Verified::new_unchecked_for_test(parent),
-            ValidatorId::new(1),
-        );
-        assert_eq!(
-            verify_qc_keys(&actions),
-            Some(&expected1),
-            "the waiting header re-dispatches under the window its parent anchors",
-        );
-    }
-
     /// The failed-candidate retry drain resolves a buffered sibling's
     /// committee by the same rule as the first dispatch — via the held
     /// parent. Keying the retry on the sibling's own anchor re-verifies an
@@ -2529,7 +2396,6 @@ mod tests {
             &child,
             gossip(1),
             Err(CertifiedHeaderVerifyError::LinkageMismatch),
-            HeaderCommittee::Resolved,
         );
 
         let keys = verify_qc_keys(&retried).expect("the buffered sibling re-dispatches");
@@ -2538,15 +2404,6 @@ mod tests {
             "the retried sibling's QC must verify under the window its parent anchors, not the \
              one it dates itself into",
         );
-    }
-
-    fn verify_qc_committee(actions: &[Action]) -> Option<HeaderCommittee> {
-        actions.iter().find_map(|a| match a {
-            Action::Consensus(ConsensusAction::VerifyRemoteHeaderQc { committee, .. }) => {
-                Some(*committee)
-            }
-            _ => None,
-        })
     }
 
     /// A header whose parent is not held guesses its committee anchor from
@@ -2577,8 +2434,8 @@ mod tests {
 
         let actions = coord.on_remote_header_received(&schedule, child, gossip(1));
         assert_eq!(
-            verify_qc_committee(&actions),
-            None,
+            verify_qc_count(&actions),
+            0,
             "nothing checked under the guess"
         );
         assert!(
@@ -2600,10 +2457,6 @@ mod tests {
             Some(&expected0),
             "the header is checked under the window its parent anchors",
         );
-        assert_eq!(
-            verify_qc_committee(&actions),
-            Some(HeaderCommittee::Resolved)
-        );
     }
 
     fn verify_qc_keys(actions: &[Action]) -> Option<&Vec<ConsensusPublicKey>> {
@@ -2616,13 +2469,13 @@ mod tests {
         })
     }
 
-    /// A header that fails verification under a committee its own anchor
-    /// guessed — no parent held — is not dropped: the guess may be wrong
-    /// for the signers where the epoch is not. It waits, the gap up to its
-    /// parent is fetched, and once the parent is held it verifies under
-    /// the parent's window.
+    /// A header checked under the anchor its own header guessed, with no
+    /// parent held, was checked under the committee of the window its
+    /// signers name, the one its parent's anchor would resolve too. So a
+    /// failure there is final: nothing waits for the parent, and the
+    /// parent's arrival checks nothing again.
     #[test]
-    fn a_header_that_failed_without_its_parent_waits_and_fetches_it() {
+    fn a_failure_under_a_guessed_anchor_is_final() {
         const ED: u64 = 1_000;
         let remote = ShardId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3];
@@ -2660,24 +2513,17 @@ mod tests {
             Some(&expected1),
             "without its parent the header tries its own window",
         );
-        assert_eq!(
-            verify_qc_committee(&actions),
-            Some(HeaderCommittee::Guessed)
-        );
         let actions = coord.on_remote_header_qc_verified(
             &schedule,
             &child,
             gossip(1),
-            Err(CertifiedHeaderVerifyError::LinkageMismatch),
-            HeaderCommittee::Guessed,
+            Err(CertifiedHeaderVerifyError::Qc(
+                QcVerifyError::InvalidSignature,
+            )),
         );
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::FetchCommitProof { source_shard, from_height, .. }
-                    if *source_shard == remote && *from_height <= BlockHeight::new(5)
-            )),
-            "the gap up to the parent is fetched",
+            actions.is_empty(),
+            "nothing waits on the parent: {actions:?}"
         );
 
         let actions = coord.on_verified_remote_header_received(
@@ -2686,13 +2532,9 @@ mod tests {
             ValidatorId::new(1),
         );
         assert_eq!(
-            verify_qc_keys(&actions),
-            Some(&expected1),
-            "the waiting header re-dispatches under the window its parent anchors",
-        );
-        assert_eq!(
-            verify_qc_committee(&actions),
-            Some(HeaderCommittee::Resolved)
+            verify_qc_count(&actions),
+            0,
+            "the parent checks nothing again"
         );
     }
 
@@ -2732,10 +2574,8 @@ mod tests {
         let child = chained_remote_header(remote, BlockHeight::new(6), boundary_hash, ED + 1);
         let actions = coord.on_remote_header_received(&schedule, child, gossip(1));
         let keys = verify_qc_keys(&actions).expect("anchored on the boundary");
-        assert_eq!(*keys, expected0);
         assert_eq!(
-            verify_qc_committee(&actions),
-            Some(HeaderCommittee::Resolved),
+            *keys, expected0,
             "the beacon's boundary names the committee as a held parent would",
         );
     }
@@ -2776,16 +2616,16 @@ mod tests {
         let child = chained_remote_header(remote, BlockHeight::new(6), boundary_hash, ED + 1);
         let actions = coord.on_remote_header_received(&before, child, gossip(1));
         assert_eq!(
-            verify_qc_committee(&actions),
-            None,
+            verify_qc_count(&actions),
+            0,
             "the guess across the cut admits nothing, so the header parks",
         );
 
         let actions = coord.on_beacon_block_persisted(&after);
         assert_eq!(
-            verify_qc_committee(&actions),
-            Some(HeaderCommittee::Resolved),
-            "the parked header is checked again under the boundary's committee",
+            verify_qc_count(&actions),
+            1,
+            "the parked header is checked under the boundary's committee",
         );
     }
 
@@ -2801,10 +2641,48 @@ mod tests {
             .count()
     }
 
-    /// A copy identical to one parked for its parent is not checked again
-    /// under the same guess, while another copy of the block is.
+    /// A copy identical to one parked for its parent is not parked again
+    /// under the same guess: once the parent lands, the block is checked
+    /// once.
     #[test]
-    fn a_copy_identical_to_a_parked_header_is_not_checked_again() {
+    fn a_copy_identical_to_a_parked_header_is_not_parked_again() {
+        const ED: u64 = 1_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(0),
+            Arc::new(shard_snapshot(2, &ids, 0)),
+        );
+        schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+
+        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
+        let child =
+            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+        let actions = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
+        assert_eq!(verify_qc_count(&actions), 0, "the guess parks the header");
+        assert!(coord.parked_for_parent(&child));
+
+        let actions = coord.on_remote_header_received(&schedule, child, gossip(2));
+        assert!(
+            actions.is_empty(),
+            "the parked copy stands for it: {actions:?}"
+        );
+
+        let actions = coord.on_verified_remote_header_received(
+            &schedule,
+            Verified::new_unchecked_for_test(parent),
+            ValidatorId::new(1),
+        );
+        assert_eq!(verify_qc_count(&actions), 1, "the block is checked once");
+    }
+
+    /// Identical copies queued behind a check that fails are settled by it
+    /// and dropped with it, under a guessed anchor as under a held parent:
+    /// the parent's arrival checks nothing again.
+    #[test]
+    fn identical_copies_fail_as_one() {
         const ED: u64 = 1_000;
         let remote = ShardId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3];
@@ -2830,59 +2708,17 @@ mod tests {
             Epoch::new(1),
             ED + 2,
         );
-        let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
-        let _ = coord.on_remote_header_qc_verified(
+
+        let actions = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
+        assert_eq!(verify_qc_count(&actions), 1, "checked under the guess");
+        let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(2));
+        let actions = coord.on_remote_header_qc_verified(
             &schedule,
             &child,
             gossip(1),
             Err(CertifiedHeaderVerifyError::Qc(
                 QcVerifyError::InvalidSignature,
             )),
-            HeaderCommittee::Guessed,
-        );
-
-        let actions = coord.on_remote_header_received(&schedule, child.clone(), gossip(2));
-        assert_eq!(
-            verify_qc_count(&actions),
-            0,
-            "the parked copy stands for it"
-        );
-        let actions = coord.on_remote_header_received(&schedule, recertified(&child), gossip(3));
-        assert_eq!(verify_qc_count(&actions), 1, "another copy is its own item");
-    }
-
-    /// Identical copies queued behind a check that fails are settled by it
-    /// and dropped with it, and park as one: once the parent names the
-    /// committee, the block is checked once, and a failure there leaves no
-    /// identical copy to check after it.
-    #[test]
-    fn identical_copies_fail_and_park_as_one() {
-        const ED: u64 = 1_000;
-        let remote = ShardId::leaf(1, 1);
-        let ids = [0u64, 1, 2, 3];
-        let mut schedule = TopologySchedule::new(
-            EpochWindows::new(0, ED),
-            Epoch::new(0),
-            Arc::new(shard_snapshot(2, &ids, 0)),
-        );
-        schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
-        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
-
-        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
-        let child =
-            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
-        let forged = Err(CertifiedHeaderVerifyError::Qc(
-            QcVerifyError::InvalidSignature,
-        ));
-
-        let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
-        let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(2));
-        let actions = coord.on_remote_header_qc_verified(
-            &schedule,
-            &child,
-            gossip(1),
-            forged.clone(),
-            HeaderCommittee::Guessed,
         );
         assert_eq!(
             verify_qc_count(&actions),
@@ -2895,23 +2731,7 @@ mod tests {
             Verified::new_unchecked_for_test(parent),
             ValidatorId::new(1),
         );
-        assert_eq!(
-            verify_qc_count(&actions),
-            1,
-            "the parent re-offers the block once"
-        );
-        let actions = coord.on_remote_header_qc_verified(
-            &schedule,
-            &child,
-            gossip(1),
-            forged,
-            HeaderCommittee::Resolved,
-        );
-        assert_eq!(
-            verify_qc_count(&actions),
-            0,
-            "no identical copy is left to check"
-        );
+        assert_eq!(verify_qc_count(&actions), 0, "nothing is left to check");
     }
 
     /// A check's result is about the copy it checked. A copy whose
@@ -2985,7 +2805,6 @@ mod tests {
             &checked,
             HeaderSource::Fetched,
             forged.clone(),
-            HeaderCommittee::Resolved,
         );
         assert_eq!(
             verify_qc_count(&actions),
@@ -3000,13 +2819,7 @@ mod tests {
             "the source's unchecked copy stays queued",
         );
 
-        let actions = coord.on_remote_header_qc_verified(
-            &schedule,
-            &in_flight,
-            gossip(2),
-            forged,
-            HeaderCommittee::Resolved,
-        );
+        let actions = coord.on_remote_header_qc_verified(&schedule, &in_flight, gossip(2), forged);
         assert_eq!(
             verify_qc_count(&actions),
             1,
@@ -3596,7 +3409,6 @@ mod tests {
             &header,
             gossip(1),
             Err(CertifiedHeaderVerifyError::LinkageMismatch),
-            HeaderCommittee::Resolved,
         );
         assert!(
             verify_qc_keys(&after_fail).is_none(),
@@ -5384,7 +5196,6 @@ mod tests {
                 &unverified(header),
                 gossip(1),
                 Ok(header.clone()),
-                HeaderCommittee::Resolved,
             );
             committed.extend(committed_heights(&verified));
         }
