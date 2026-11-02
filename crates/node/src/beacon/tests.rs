@@ -14,8 +14,8 @@ use hyperscale_network_memory::{
     BroadcastTarget, HostLayout, LinkStreams, NetworkConfig, PendingRequest, SimNetworkAdapter,
     SimulatedNetwork,
 };
-use hyperscale_storage::RecoveredState;
 use hyperscale_storage::test_helpers::commit_one;
+use hyperscale_storage::{RecoveredState, ReplayWindow};
 use hyperscale_storage_memory::{SimShardStorage, crash_point};
 use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
 use hyperscale_types::network::notification::beacon::BeaconProposalNotification;
@@ -42,12 +42,12 @@ use hyperscale_vm_effects::{Hash32, InstanceMeta, PackageHash, ProtocolHasher};
 
 use super::records::InstanceRecordBinding;
 use super::*;
-use crate::HostedChain;
 use crate::event::{BeaconInput, FetchFailureKind, ShardScopedInput, TimerOwner};
 use crate::fetch::settle_solicited;
 use crate::shard::ThreadShardLoop;
 use crate::shard::mempool::DeferredTransaction;
 use crate::shard::test_host::{Fixture, Host, SHARD, loop_of};
+use crate::{HostedChain, chain_anchors};
 
 type Loop = BeaconLoop<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 
@@ -1391,6 +1391,216 @@ fn a_runtime_join_builds_its_replica_from_the_registration_reply() {
         "the replica resolves its tip's committee from its first schedule",
     );
     assert_eq!(replica.schedule_epoch(), Epoch::new(8));
+}
+
+/// A block of `shard`'s at `height`, anchored at `anchor`, as a restart
+/// replays it: certified by a quorum that signed `epoch`.
+fn replayed(
+    shard: ShardId,
+    height: u64,
+    anchor: WeightedTimestamp,
+    epoch: u64,
+) -> Verified<CertifiedBlock> {
+    let block = make_live_block(
+        shard,
+        BlockHeight::new(height),
+        anchor.as_millis(),
+        ValidatorId::new(0),
+        vec![],
+        vec![],
+    );
+    let (block, qc) = certify(block, anchor.as_millis()).into_parts();
+    let qc = qc.as_unverified();
+    let mut signers = SignerBitfield::new(2);
+    signers.set(0);
+    signers.set(1);
+    let signed = QuorumCertificate::new(
+        qc.block_hash(),
+        shard,
+        qc.height(),
+        qc.parent_block_hash(),
+        qc.round(),
+        Epoch::new(epoch),
+        signers,
+        qc.aggregated_signature(),
+        qc.weighted_timestamp(),
+    );
+    Verified::new_unchecked_for_test(CertifiedBlock::new_unchecked(
+        block,
+        Verified::new_unchecked_for_test(signed),
+    ))
+}
+
+/// A chain restarted at `tip` whose replay commits one block in each of
+/// `replayed_epochs`, each signed in its own window.
+fn restarted_at(
+    fix: &Fixture,
+    shard: ShardId,
+    tip: u64,
+    replayed_epochs: std::ops::RangeInclusive<u64>,
+) -> RecoveredState {
+    RecoveredState {
+        committed_height: BlockHeight::new(*replayed_epochs.end()),
+        committed_block_anchor_wt: Some(in_epoch(fix, tip)),
+        committed_committee_anchor_wt: Some(in_epoch(fix, tip)),
+        replay: ReplayWindow {
+            blocks: replayed_epochs
+                .map(|epoch| replayed(shard, epoch, in_epoch(fix, epoch), epoch))
+                .collect(),
+            dispatch_from: BlockHeight::GENESIS,
+            anchor_wt: None,
+        },
+        ..RecoveredState::default()
+    }
+}
+
+/// A restart whose replay reaches five epochs below its tip holds every
+/// window a replayed block was signed in, for the replica the fold
+/// hands back and across the fold's next eviction, so the replay folds
+/// each block under the committee its QC signed rather than parking or
+/// reading the head.
+#[test]
+fn a_replay_below_the_tip_floor_classifies_as_the_live_fold_did() {
+    let fix = Fixture::new();
+    let history = advanced_history(&fix, 8);
+    let tip = history.last().expect("a tip").0.clone();
+    let (mut host, events) = fix.host_over_history(history, far_future());
+    // The history seats the root alone.
+    let shard = ShardId::ROOT;
+    let unheld = |schedule: &TopologySchedule, epochs: &mut dyn Iterator<Item = Epoch>| {
+        epochs
+            .filter(|epoch| {
+                schedule
+                    .signed_committee(shard, *epoch)
+                    .committee()
+                    .is_none_or(|committee| committee.epoch != *epoch)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        unheld(host.beacon.fold().schedule(), &mut (2..=8).map(Epoch::new)),
+        (2..=6).map(Epoch::new).collect::<Vec<_>>(),
+        "the fold resumed past the replay's windows",
+    );
+    let recovered = restarted_at(&fix, shard, 7, 2..=7);
+    let replayed_epochs = || {
+        recovered
+            .replay
+            .blocks
+            .iter()
+            .map(|certified| certified.qc().committee_epoch())
+    };
+    let (sender, inbox) = unbounded();
+    host.add_shard(
+        &fix.replica_config(),
+        HostedChain {
+            shard,
+            storage: SimShardStorage::new(shard_prefix_path(shard)),
+            recovered: &recovered,
+            signers: vec![fix.identity(0)],
+            inbox: sender.into(),
+        },
+    );
+    assert_eq!(
+        unheld(host.replica(shard).schedule(), &mut replayed_epochs()),
+        Vec::<Epoch>::new(),
+        "every replayed window is held"
+    );
+
+    let _ = host.step(fold_outcome(ProtocolEvent::BeaconBlockVerified {
+        result: Ok(skip_block(&tip, Epoch::new(9))),
+    }));
+    for event in events.try_iter().chain(inbox.try_iter()) {
+        let _ = host.step(event);
+    }
+    assert_eq!(host.replica(shard).schedule_epoch(), Epoch::new(9));
+    assert_eq!(
+        unheld(host.replica(shard).schedule(), &mut replayed_epochs()),
+        Vec::<Epoch>::new(),
+        "and stays held until the chain commits past its restart",
+    );
+
+    let _ = host.resume_shard_committed(shard, &recovered);
+    assert_eq!(
+        host.replica(shard)
+            .execution_coordinator()
+            .committed_height(),
+        recovered.committed_height,
+        "the replay folds every block, none parked",
+    );
+}
+
+/// A chain registered past its terminal drops out of retention at
+/// once, and still hands its replay every window a replayed block was
+/// signed in.
+#[test]
+fn a_terminated_chain_replays_under_its_signed_windows() {
+    let fix = Fixture::new();
+    let (left, right) = ShardId::ROOT.children();
+    let genesis = fix.genesis_state();
+    let mut history = vec![(fix.genesis_block(), genesis.clone())];
+    for epoch in 1..=8u64 {
+        let (parent, _) = history.last().expect("genesis is first").clone();
+        let mut state = genesis.clone();
+        state.current_epoch = Epoch::new(epoch);
+        for boundary in state.boundaries.values_mut() {
+            boundary.last_live_epoch = Epoch::new(epoch);
+        }
+        if epoch <= 6 {
+            let committee = state
+                .shard_committees
+                .remove(&ShardId::ROOT)
+                .expect("genesis seats the root");
+            state.shard_committees =
+                BTreeMap::from([(left, committee.clone()), (right, committee)]);
+            state.next_shard_committees = state.shard_committees.clone();
+            state.shard_consensus_members = state.ready_consensus_members(&state.shard_committees);
+        } else {
+            // The lingering terminal record, which pins the windows from
+            // the one below the cut.
+            let mut terminal = state.boundaries[&ShardId::ROOT].clone();
+            terminal.last_live_epoch = Epoch::new(6);
+            terminal.terminal_epoch = Some(Epoch::new(6));
+            state.boundaries.insert(left, terminal);
+        }
+        history.push((skip_block(&parent, Epoch::new(epoch)), state));
+    }
+    let (mut host, _events) = fix.host_over_history(history, far_future());
+    assert_eq!(
+        host.beacon
+            .fold()
+            .schedule()
+            .retained_epochs()
+            .map(|(oldest, _)| oldest),
+        Some(Epoch::new(5)),
+        "the terminal record pins the windows from the one below the cut",
+    );
+    let recovered = restarted_at(&fix, left, 7, 1..=6);
+    let (sender, _receiver) = unbounded();
+    let registration = host.beacon.register(
+        left,
+        chain_anchors(&recovered, fix.genesis_state().chain_config.epoch_windows()),
+        recovered.committed_height,
+        sender,
+    );
+    assert!(
+        host.beacon
+            .fold()
+            .chain(registration.token)
+            .is_some_and(|chain| chain.terminal_committed),
+        "the chain registers past its terminal",
+    );
+    for epoch in 1..=6 {
+        assert_eq!(
+            registration
+                .schedule
+                .signed_committee(left, Epoch::new(epoch))
+                .committee()
+                .map(|committee| committee.epoch),
+            Some(Epoch::new(epoch)),
+            "the replay's window {epoch} is held",
+        );
+    }
 }
 
 /// A host restarted from its stores holds the schedule the next

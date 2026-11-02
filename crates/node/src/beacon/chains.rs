@@ -28,7 +28,15 @@ where
     ///
     /// A chain anchored below the oldest window the fold retains widens
     /// the schedule from beacon storage first, so the replica built from
-    /// the returned schedule resolves its tip's committee.
+    /// the returned schedule resolves its tip's committee and, with the
+    /// committee anchor floored as [`chain_anchors`] floors it, every
+    /// window its restart replays. The widening comes before the chain
+    /// registers, so a chain past its terminal, whose term the latch
+    /// drops from retention at once, still hands its replay those
+    /// windows: later evictions copy the schedule rather than touch the
+    /// one returned.
+    ///
+    /// [`chain_anchors`]: crate::host::chain_anchors
     pub(crate) fn register(
         &mut self,
         shard: ShardId,

@@ -30,8 +30,9 @@ use hyperscale_storage::{
     BeaconChainReader, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
 };
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, Derivation, Epoch, LocalTimestamp, ShardId, Signer,
-    Transaction, TransactionStatus, TxHash, ValidatorId, Verified,
+    Block, BlockHeight, CertifiedBlock, Derivation, Epoch, EpochWindows, LocalTimestamp,
+    QuorumCertificate, ShardId, Signer, Transaction, TransactionStatus, TxHash, ValidatorId,
+    Verified,
 };
 
 use crate::NodeStateMachine;
@@ -231,7 +232,7 @@ where
         );
         let registration = self.beacon.register(
             shard,
-            chain_anchors(chain.recovered),
+            chain_anchors(chain.recovered, self.process.topology_schedule().windows()),
             chain.recovered.committed_height,
             chain.inbox.internal().clone(),
         );
@@ -658,11 +659,30 @@ fn reseed_code<S: ShardStorage>(
     }
 }
 
-/// The anchors a recovered chain's committed tip carries.
+/// The anchors a recovered chain's committed tip carries, the committee
+/// anchor floored at the start of the oldest window a block its restart
+/// replays was signed in.
+///
+/// The replay folds each block under the committee its stored QC signed,
+/// and reaches far below the tip, so retention keyed on the tip alone
+/// would evict windows it still reads. Floored here, registration widens
+/// the schedule to those windows before the chain's terminal latch can
+/// drop its term, and the schedule the replay runs on holds them. The
+/// chain's first commit after the restart lifts the floor back to its
+/// tip.
 #[must_use]
-pub fn chain_anchors(recovered: &RecoveredState) -> LocalChainAnchors {
+pub fn chain_anchors(recovered: &RecoveredState, windows: EpochWindows) -> LocalChainAnchors {
+    let tip = recovered.committee_anchor_wt();
+    let replayed = recovered
+        .replay
+        .blocks
+        .iter()
+        .map(|certified| certified.qc())
+        .filter(|qc| qc.signer_count() > 0)
+        .map(QuorumCertificate::committee_epoch)
+        .min();
     LocalChainAnchors {
-        committee: recovered.committee_anchor_wt(),
+        committee: replayed.map_or(tip, |epoch| tip.min(windows.window_of(epoch).start)),
         block: recovered.block_anchor_wt(),
     }
 }

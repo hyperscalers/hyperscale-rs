@@ -373,7 +373,7 @@ impl ShardSupervisor {
         let _ = self.process.beacon_event_sender().send(HostEvent::Beacon(
             BeaconScopedInput::Register {
                 shard,
-                anchors: chain_anchors(recovered),
+                anchors: chain_anchors(recovered, self.process.topology_schedule().windows()),
                 height: recovered.committed_height,
                 sender: callback_tx.internal().clone(),
                 reply,

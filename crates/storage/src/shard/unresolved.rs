@@ -211,14 +211,16 @@ pub struct ReplayWindow {
     /// replay.
     pub dispatch_from: BlockHeight,
     /// The parent-QC weighted timestamp of the block *below* the first
-    /// one replayed — the clock execution resumes at, so the block above
-    /// it stays on the exact carry path and classifies its ticks under
-    /// the window they committed in.
+    /// one replayed — the clock execution resumes at, and so the first
+    /// replayed block's committee anchor. The fold reads a block's
+    /// committee anchor against its own to tell a halt recovery's
+    /// crossing block from the coasting block before it, which its
+    /// signed epoch cannot: both state the bridge.
     ///
     /// `None` when that block is not held: the floor is the chain's
     /// first block, or its predecessor has aged out. The first block
-    /// replayed then classifies under its own anchor, the same fallback
-    /// a chain with no history behind it takes.
+    /// replayed then carries its own anchor in that place, the same
+    /// fallback a chain with no history behind it takes.
     pub anchor_wt: Option<WeightedTimestamp>,
 }
 

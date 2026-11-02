@@ -579,6 +579,11 @@ pub struct ExecutionCoordinator {
     /// Folded as the windows land, and every later commit queues behind
     /// the first, so the fold never runs out of order.
     awaiting_window: VecDeque<(CertifiedBlock, WeightedTimestamp, Naming)>,
+    /// The height of the commit at the front of
+    /// [`awaiting_window`](Self::awaiting_window) whose signed window the
+    /// schedule has evicted, once that park is reported, so it is
+    /// reported once.
+    parked_evicted: Option<BlockHeight>,
 
     /// The lowest height a tick may be *dispatched* at.
     ///
@@ -745,9 +750,9 @@ impl ExecutionCoordinator {
         // Execution resumes below the first block it replays, so the
         // replay carries the frontier up to the tip rather than starting
         // from it. Without the block under the floor there is no clock to
-        // carry, and the first block replayed classifies under its own
-        // anchor — the same fallback a chain with no history takes, which
-        // a genesis frontier is what selects.
+        // carry, and the first block replayed takes its own anchor as its
+        // committee anchor — the same fallback a chain with no history
+        // takes, which a genesis frontier is what selects.
         let resume = recovered
             .replay
             .blocks
@@ -792,6 +797,7 @@ impl ExecutionCoordinator {
                 .last()
                 .map_or(BlockHeight::GENESIS, |certified| certified.block().height()),
             awaiting_window: VecDeque::new(),
+            parked_evicted: None,
             dispatch_from: recovered.replay.dispatch_from,
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
@@ -958,43 +964,20 @@ impl ExecutionCoordinator {
     /// A chain's genesis block carries no signed QC; its committee anchor
     /// is its own, the chain origin's.
     ///
-    /// `None` while that window is newer than this node's beacon has
-    /// committed: the commit waits for it rather than read the head.
-    ///
-    /// A restart's replay can reach a block whose signed window the
-    /// schedule no longer retains. That block folds under its own
-    /// anchor's window, and where that is gone too — a split child
-    /// replaying the window it inherited, whose content predates its own
-    /// cut — under the head, still stating the epoch its QC signed.
+    /// A miss is either a window newer than this node's beacon has
+    /// committed, which the commit waits for rather than read the head,
+    /// or an evicted one, which parks it.
     fn certified_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
         certified: &CertifiedBlock,
-    ) -> Option<BlockCommittee<'t>> {
+    ) -> BlockResolution<'t> {
         let block = certified.block();
-        let own_anchor = block.header().parent_qc().weighted_timestamp();
         if block.is_genesis() {
-            return topology_schedule
-                .live_committee(self.local_shard, own_anchor)
-                .committee();
+            let own_anchor = block.header().parent_qc().weighted_timestamp();
+            return topology_schedule.live_committee(self.local_shard, own_anchor);
         }
-        let epoch = certified.qc().committee_epoch();
-        let stand_in = |snapshot| BlockCommittee {
-            snapshot,
-            epoch,
-            past_terminal: false,
-        };
-        match topology_schedule.signed_committee(self.local_shard, epoch) {
-            BlockResolution::Committee(committee) => Some(committee),
-            BlockResolution::NotYetCommitted => None,
-            BlockResolution::Evicted => {
-                match topology_schedule.resolve_for_shard(self.local_shard, own_anchor) {
-                    BlockResolution::Committee(committee) => Some(stand_in(committee.snapshot)),
-                    BlockResolution::NotYetCommitted => None,
-                    BlockResolution::Evicted => Some(stand_in(topology_schedule.head())),
-                }
-            }
-        }
+        topology_schedule.signed_committee(self.local_shard, certified.qc().committee_epoch())
     }
 
     /// The trie that says who was party to a transaction, off the latest
@@ -3192,11 +3175,33 @@ impl ExecutionCoordinator {
     /// window this node's beacon has not committed stays at the front,
     /// and every later one queues behind it, so the fold still runs in
     /// commit order.
+    ///
+    /// A commit whose window the schedule has evicted stays at the front
+    /// too, for good: retention keeps every window a live commit or a
+    /// restart's replay is signed in, so the miss is this node's own
+    /// fault, and folding under any other window would classify and
+    /// price the block unlike every replica that held it. Consensus
+    /// carries on; a snapshot restore or a resync recovers the fold.
     fn drain_awaiting_window(&mut self, topology_schedule: &TopologySchedule) -> CommitEffects {
         let mut effects = CommitEffects::default();
         while let Some((certified, _, _)) = self.awaiting_window.front() {
-            let Some(committee) = self.certified_committee(topology_schedule, certified) else {
-                break;
+            let committee = match self.certified_committee(topology_schedule, certified) {
+                BlockResolution::Committee(committee) => committee,
+                BlockResolution::NotYetCommitted => break,
+                BlockResolution::Evicted => {
+                    let height = certified.block().height();
+                    if self.parked_evicted != Some(height) {
+                        tracing::error!(
+                            shard = %self.local_shard,
+                            height = height.inner(),
+                            epoch = %certified.qc().committee_epoch(),
+                            retained = ?topology_schedule.retained_epochs(),
+                            "A commit's signed window is evicted; the execution fold parks on it",
+                        );
+                        self.parked_evicted = Some(height);
+                    }
+                    break;
+                }
             };
             let (certified, committee_anchor, naming) = self
                 .awaiting_window
@@ -9902,24 +9907,27 @@ mod tests {
             unsigned.aggregated_signature(),
             unsigned.weighted_timestamp(),
         );
-        let mut state = ExecutionCoordinator::with_shared_stores(
-            ShardId::ROOT,
-            Arc::new(TestCode::default()),
-            Arc::new(CrossingIndexSlot::default()),
-            &RecoveredState {
-                committed_height: BlockHeight::new(5),
-                committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
-                committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(800)),
-                latest_qc: Some(Verified::new_unchecked_for_test(tip_qc)),
-                ..RecoveredState::default()
-            },
-            Arc::new(ExecCertStore::new()),
-            Arc::new(FinalizationStore::new()),
-            Arc::new(ProvenAnchors::new()),
-            Arc::new(CounterpartMirror::new()),
-            BlockHeight::GENESIS,
-        )
-        .signed_by(ValidatorId::new(0));
+        let restarted = |recovered: &RecoveredState| {
+            ExecutionCoordinator::with_shared_stores(
+                ShardId::ROOT,
+                Arc::new(TestCode::default()),
+                Arc::new(CrossingIndexSlot::default()),
+                recovered,
+                Arc::new(ExecCertStore::new()),
+                Arc::new(FinalizationStore::new()),
+                Arc::new(ProvenAnchors::new()),
+                Arc::new(CounterpartMirror::new()),
+                BlockHeight::GENESIS,
+            )
+            .signed_by(ValidatorId::new(0))
+        };
+        let mut state = restarted(&RecoveredState {
+            committed_height: BlockHeight::new(5),
+            committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
+            committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(800)),
+            latest_qc: Some(Verified::new_unchecked_for_test(tip_qc)),
+            ..RecoveredState::default()
+        });
         assert_eq!(state.committed_committee_epoch, Some(Epoch::new(0)));
 
         let block = make_live_block_on_shard(
@@ -9936,39 +9944,60 @@ mod tests {
         assert_eq!(state.committed_ts, WeightedTimestamp::from_millis(1_100));
     }
 
-    /// A replayed commit whose signed window the schedule no longer
-    /// retains folds under its own anchor's window, still stating the
-    /// epoch its QC signed, rather than wedging the fold.
+    /// A commit whose signed window the schedule has evicted parks the
+    /// fold: it folds under no other window, composes nothing, and
+    /// every later commit queues behind it, though its own anchor's
+    /// window is held.
     #[test]
-    fn an_evicted_signed_window_folds_under_the_blocks_own_window() {
+    fn an_evicted_signed_window_parks_the_fold() {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
         let mut sched = windows_of(1);
         sched.evict_below(Epoch::new(1));
-        let certified = certify_signed(
-            make_live_block_on_shard(
-                ShardId::ROOT,
-                BlockHeight::new(1),
+        let block_at = |height: u64, epoch: u64, seed: u8| {
+            certify_signed(
+                make_live_block_on_shard(
+                    ShardId::ROOT,
+                    BlockHeight::new(height),
+                    1_500,
+                    ValidatorId::new(0),
+                    vec![test_transaction(seed)],
+                ),
                 1_500,
-                ValidatorId::new(0),
-                vec![],
-            ),
-            1_500,
-            0,
+                epoch,
+            )
+        };
+        let evicted = block_at(1, 0, 1);
+        assert!(
+            sched
+                .resolve_for_shard(ShardId::ROOT, WeightedTimestamp::from_millis(1_500))
+                .committee()
+                .is_some(),
+            "the block's own anchor's window is held",
         );
-        let own = sched
-            .signed_committee(ShardId::ROOT, Epoch::new(1))
-            .committee()
-            .expect("the own anchor's window is held");
+        assert!(matches!(
+            state.certified_committee(&sched, &evicted),
+            BlockResolution::Evicted
+        ));
 
-        let committee = state
-            .certified_committee(&sched, &certified)
-            .expect("an evicted window stands in its block's own");
-        assert!(std::ptr::eq(committee.snapshot, own.snapshot));
-        assert_eq!(committee.epoch, Epoch::new(0));
-
-        let _ =
-            state.commit_block_composing(&sched, &certified, WeightedTimestamp::from_millis(500));
-        assert_eq!(state.committed_height, BlockHeight::new(1));
+        let parked =
+            state.commit_block_composing(&sched, &evicted, WeightedTimestamp::from_millis(500));
+        let behind = state.commit_block_composing(
+            &sched,
+            &block_at(2, 1, 2),
+            WeightedTimestamp::from_millis(1_500),
+        );
+        assert!(parked.actions.is_empty() && behind.actions.is_empty());
+        assert_eq!(
+            state.committed_height,
+            BlockHeight::GENESIS,
+            "the fold parks"
+        );
+        assert!(tick_members(&state, 1).is_empty() && tick_members(&state, 2).is_empty());
+        assert_eq!(
+            state.awaiting_window.len(),
+            2,
+            "the later commit queues behind"
+        );
     }
 
     /// A commit whose signed window this node's beacon has not committed
@@ -10055,6 +10084,7 @@ mod tests {
         );
         let committee = state
             .certified_committee(&sched, &certified)
+            .committee()
             .expect("the fixture holds the window");
         assert_eq!(
             committee.snapshot.num_shards(),
