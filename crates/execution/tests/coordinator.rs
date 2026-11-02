@@ -56,6 +56,8 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
         outbound_certs,
         proven_remote_blocks,
         unproven_ecs,
+        awaiting_window,
+        parked_fold,
     } = coord.memory_stats();
 
     assert_eq!(tick_execution_receipts, 0);
@@ -74,6 +76,8 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     assert_eq!(outbound_certs, 0);
     assert_eq!(proven_remote_blocks, 0);
     assert_eq!(unproven_ecs, 0);
+    assert_eq!(awaiting_window, 0);
+    assert_eq!(parked_fold, 0);
 }
 
 #[test]

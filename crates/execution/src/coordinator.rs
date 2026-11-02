@@ -67,7 +67,8 @@ use hyperscale_metrics::{
 };
 use hyperscale_provisions::build_provision_requests;
 use hyperscale_storage::{
-    FeeTerms, ProvisionalTx, RecoveredState, TickResolution, declared_reservations,
+    FeeTerms, ProvisionalTx, RECENT_HEADER_REPLAY, RecoveredState, TickResolution,
+    declared_reservations,
 };
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
@@ -365,6 +366,18 @@ impl CommitEffects {
     }
 }
 
+/// How many commits may queue behind one parked on an evicted signed
+/// window before the fold gives up until a restart.
+///
+/// Each one is a whole block held in memory, and nothing but another
+/// chain registering on this host lifts the park, so the bound is
+/// memory's rather than the protocol's: the commits of one leader
+/// rotation of the largest committee, which is what a restart reads back
+/// into its delay estimate. A park that outlasts it is one a restart
+/// lifts, and the restart replays every commit dropped here from the
+/// store.
+const MAX_AWAITING_EVICTED: usize = RECENT_HEADER_REPLAY;
+
 /// Execution memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutionMemoryStats {
@@ -402,6 +415,13 @@ pub struct ExecutionMemoryStats {
     /// sustained rise means a source shard certifies without proving
     /// commits — the fork/withholding signature.
     pub unproven_ecs: usize,
+    /// Commits queued behind one whose signed window the schedule does
+    /// not hold, the queued one included.
+    pub awaiting_window: usize,
+    /// One while the fold is parked on an evicted signed window or has
+    /// given up on one, zero otherwise. Either way the replica keeps
+    /// voting with no execution behind it; a restart recovers it.
+    pub parked_fold: usize,
 }
 
 impl ExecutionMemoryStats {
@@ -428,6 +448,8 @@ impl ExecutionMemoryStats {
             outbound_certs,
             proven_remote_blocks,
             unproven_ecs,
+            awaiting_window,
+            parked_fold,
         } = *self;
         vec![
             ("tick_execution_receipts", tick_execution_receipts),
@@ -446,6 +468,8 @@ impl ExecutionMemoryStats {
             ("outbound_certs", outbound_certs),
             ("proven_remote_blocks", proven_remote_blocks),
             ("unproven_ecs", unproven_ecs),
+            ("awaiting_window", awaiting_window),
+            ("parked_fold", parked_fold),
         ]
     }
 }
@@ -581,9 +605,12 @@ pub struct ExecutionCoordinator {
     awaiting_window: VecDeque<(CertifiedBlock, WeightedTimestamp, Naming)>,
     /// The height of the commit at the front of
     /// [`awaiting_window`](Self::awaiting_window) whose signed window the
-    /// schedule has evicted, once that park is reported, so it is
-    /// reported once.
+    /// schedule has evicted, while it parks there; it is reported once.
     parked_evicted: Option<BlockHeight>,
+    /// Set, never cleared, once a park on an evicted window outgrew
+    /// [`MAX_AWAITING_EVICTED`]: the commits it dropped leave a gap no
+    /// later fold can step over, so every commit after is dropped too.
+    fold_abandoned: bool,
 
     /// The lowest height a tick may be *dispatched* at.
     ///
@@ -800,6 +827,7 @@ impl ExecutionCoordinator {
                 .map_or(BlockHeight::GENESIS, |certified| certified.block().height()),
             awaiting_window: VecDeque::new(),
             parked_evicted: None,
+            fold_abandoned: false,
             dispatch_from: recovered.replay.dispatch_from,
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
@@ -3167,9 +3195,31 @@ impl ExecutionCoordinator {
         committee_anchor: WeightedTimestamp,
         naming: Naming,
     ) -> CommitEffects {
+        if self.fold_abandoned {
+            return CommitEffects::default();
+        }
         self.awaiting_window
             .push_back((certified.clone(), committee_anchor, naming));
-        self.drain_awaiting_window(topology_schedule)
+        let effects = self.drain_awaiting_window(topology_schedule);
+        if self.parked_evicted.is_some() && self.awaiting_window.len() > MAX_AWAITING_EVICTED {
+            let (front, _, _) = self
+                .awaiting_window
+                .front()
+                .expect("a parked fold holds the commit it parks on");
+            tracing::error!(
+                shard = %self.local_shard,
+                height = front.block().height().inner(),
+                epoch = %front.qc().committee_epoch(),
+                retained = ?topology_schedule.retained_epochs(),
+                queued = self.awaiting_window.len(),
+                "The execution fold gives up on an evicted signed window and drops every \
+                 commit until a restart, which widens the schedule back to this window \
+                 and replays them from the store",
+            );
+            self.awaiting_window.clear();
+            self.fold_abandoned = true;
+        }
+        effects
     }
 
     /// Fold the commits waiting on their windows, oldest first, for as
@@ -3179,11 +3229,15 @@ impl ExecutionCoordinator {
     /// commit order.
     ///
     /// A commit whose window the schedule has evicted stays at the front
-    /// too, for good: retention keeps every window a live commit or a
-    /// restart's replay is signed in, so the miss is this node's own
-    /// fault, and folding under any other window would classify and
-    /// price the block unlike every replica that held it. Consensus
-    /// carries on; a snapshot restore or a resync recovers the fold.
+    /// too: retention keeps every window a live commit or a restart's
+    /// replay is signed in, so the miss is this node's own fault, and
+    /// folding under any other window would classify and price the block
+    /// unlike every replica that held it. Consensus carries on. Another
+    /// chain registering on this host can widen the shared schedule back
+    /// over the window, so the park waits, but behind at most
+    /// [`MAX_AWAITING_EVICTED`] commits; past that the fold gives up
+    /// until a restart, whose registration widens the schedule to every
+    /// window its replay reads.
     fn drain_awaiting_window(&mut self, topology_schedule: &TopologySchedule) -> CommitEffects {
         let mut effects = CommitEffects::default();
         while let Some((certified, _, _)) = self.awaiting_window.front() {
@@ -3198,13 +3252,16 @@ impl ExecutionCoordinator {
                             height = height.inner(),
                             epoch = %certified.qc().committee_epoch(),
                             retained = ?topology_schedule.retained_epochs(),
-                            "A commit's signed window is evicted; the execution fold parks on it",
+                            "A commit's signed window is evicted; the execution fold parks on \
+                             it until the schedule holds the window again, which a restart \
+                             brings about",
                         );
                         self.parked_evicted = Some(height);
                     }
                     break;
                 }
             };
+            self.parked_evicted = None;
             let (certified, committee_anchor, naming) = self
                 .awaiting_window
                 .pop_front()
@@ -4966,6 +5023,8 @@ impl ExecutionCoordinator {
             outbound_certs: self.outbound_certs.memory_stats().tracked_certificates,
             proven_remote_blocks: self.counterparts.proven_anchors.len(),
             unproven_ecs: self.parked.waiting_on(|w| matches!(w, Waiting::Proof(_))),
+            awaiting_window: self.awaiting_window.len(),
+            parked_fold: usize::from(self.parked_evicted.is_some() || self.fold_abandoned),
         }
     }
 
@@ -10061,6 +10120,56 @@ mod tests {
             2,
             "the later commit queues behind"
         );
+    }
+
+    /// A park on an evicted window shows on the gauges and holds at most
+    /// [`MAX_AWAITING_EVICTED`] commits. Past that the fold drops them
+    /// and every commit after, even once the schedule holds the window
+    /// again, since a fold resumed over the gap would skip what it
+    /// dropped.
+    #[test]
+    fn a_park_on_an_evicted_window_is_bounded_and_reported() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let mut sched = windows_of(1);
+        sched.evict_below(Epoch::new(1));
+        let block_at = |height: u64, epoch: u64| {
+            certify_signed(
+                make_live_block_on_shard(
+                    ShardId::ROOT,
+                    BlockHeight::new(height),
+                    1_500,
+                    ValidatorId::new(0),
+                    vec![],
+                ),
+                1_500,
+                epoch,
+            )
+        };
+        let anchor = WeightedTimestamp::from_millis(1_500);
+        assert_eq!(state.memory_stats().parked_fold, 0);
+
+        let _ = state.commit_block_composing(&sched, &block_at(1, 0), anchor);
+        assert_eq!(state.memory_stats().parked_fold, 1, "the park is reported");
+        let cap = MAX_AWAITING_EVICTED as u64;
+        for height in 2..=cap {
+            let _ = state.commit_block_composing(&sched, &block_at(height, 1), anchor);
+        }
+        let full = state.memory_stats();
+        assert_eq!(full.awaiting_window, MAX_AWAITING_EVICTED);
+        assert_eq!(full.parked_fold, 1);
+
+        let _ = state.commit_block_composing(&sched, &block_at(cap + 1, 1), anchor);
+        let dropped = state.memory_stats();
+        assert_eq!(
+            dropped.awaiting_window, 0,
+            "the queue is dropped at its cap"
+        );
+        assert_eq!(dropped.parked_fold, 1, "and the fold stays reported");
+
+        let held = windows_of(1);
+        let _ = state.commit_block_composing(&held, &block_at(cap + 2, 1), anchor);
+        assert_eq!(state.committed_height, BlockHeight::GENESIS);
+        assert_eq!(state.memory_stats().awaiting_window, 0);
     }
 
     /// A commit whose signed window this node's beacon has not committed
