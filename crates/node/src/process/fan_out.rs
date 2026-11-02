@@ -236,6 +236,12 @@ fn fold_attested(
 }
 
 /// The header, if its quorum certificate is `shard`'s committee's.
+///
+/// Checked against `topology`'s committee alone, with no admission of the
+/// epoch the signers name: a preview moves no consensus state, and a
+/// quorum of the committee it asks proving the root is all it reads. An
+/// anchor that committee did not sign fails here, and the preview names
+/// the shard as unanswered.
 fn verify_anchor(
     shard: ShardId,
     anchor: &CertifiedBlockHeader,
