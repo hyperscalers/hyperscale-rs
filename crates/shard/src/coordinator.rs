@@ -485,8 +485,8 @@ pub struct ShardCoordinator {
     committed_committee_anchor_wt: WeightedTimestamp,
 
     /// The epoch the QC certifying the committed tip signed, read off the
-    /// copy its child pins (or, after a snap sync, the anchor QC, dropped
-    /// with it if it fails verification): the window a QC over the tip
+    /// copy its child pins (or, after a snap sync, the anchor QC once it
+    /// verifies, and unset until then): the window a QC over the tip
     /// verifies under, with no anchor to
     /// resolve. A store seated at a snap-synced anchor holds no parent to
     /// read the tip's committee anchor off, and this needs none. The tip
@@ -917,7 +917,9 @@ impl ShardCoordinator {
         // to two blocks ahead.
         let committed_block_anchor_wt = recovered.block_anchor_wt();
         let committed_committee_anchor_wt = recovered.committee_anchor_wt();
-        let committed_committee_epoch = recovered.committed_committee_epoch();
+        // Never off a snap-synced anchor QC, which `adopt_anchor_qc` sets
+        // the epoch from once the QC verifies.
+        let committed_committee_epoch = recovered.verified_committee_epoch();
         let high_qc = recovered.latest_qc;
         // Seeded from the chain the store kept, not constructed empty: an
         // empty index refuses no duplicate, so a coordinator resuming a
@@ -1364,8 +1366,8 @@ impl ShardCoordinator {
 
     /// [`Self::committee_of_qc`] for a QC over a committed tip whose
     /// signed epoch this replica does not know: a snap-seated tip whose
-    /// anchor QC failed verification or whose window is evicted, or a
-    /// genesis tip, which no quorum signs over.
+    /// anchor QC has not verified, or a genesis tip, which no quorum
+    /// signs over.
     ///
     /// A snap-seated store holds no parent to read the tip's committee
     /// anchor off, and stands in the tip's own anchor. That names the
@@ -4899,8 +4901,9 @@ impl ShardCoordinator {
         let Some(verified) = verified else {
             // Either the window is not committed here yet (beacon behind —
             // keep the QC and retry) or it is evicted or the signature
-            // failed (discard). Split the cases so a forgery cannot pin
-            // retries forever.
+            // failed (discard). A kept QC decides nothing while it waits:
+            // the tip's epoch stays unset, so a QC over the tip admits
+            // through the stand-in, and any QC adopted first discards it.
             if !matches!(signed, BlockResolution::NotYetCommitted) {
                 warn!(
                     signers = ?self.signers.keys(),
@@ -4908,14 +4911,12 @@ impl ShardCoordinator {
                     "Snap-synced anchor QC failed verification — discarding"
                 );
                 self.anchor_qc = None;
-                // The tip's epoch was read off this copy; it states
-                // nothing a quorum is known to have signed.
-                if qc.block_hash() == self.committed_hash {
-                    self.committed_committee_epoch = None;
-                }
             }
             return Vec::new();
         };
+        if qc.block_hash() == self.committed_hash {
+            self.committed_committee_epoch = Some(qc.committee_epoch());
+        }
         info!(
             signers = ?self.signers.keys(),
             height = qc.height().inner(),
@@ -19912,6 +19913,56 @@ mod tests {
         }
     }
 
+    /// A snap-synced anchor QC stating a window the beacon has yet to
+    /// commit is kept for a later verify and decides nothing meanwhile:
+    /// the seated tip states no epoch, so an honest QC over the tip still
+    /// admits through the stand-in. The tip's epoch is the anchor QC's
+    /// only once that QC verifies.
+    #[test]
+    fn a_pending_anchor_qc_does_not_refuse_an_honest_qc_over_the_tip() {
+        let (_, schedule, keys, epochs) = claim_epochs();
+        let honest = qc_signed_by(&keys, &epochs[1], Epoch::new(1), 12, 2 * CLAIM_ED + 100);
+        let forged = qc_signed_by(&keys, &epochs[1], Epoch::new(9), 12, 2 * CLAIM_ED + 100);
+        let seat = |anchor_qc: QuorumCertificate| {
+            let mut state = ShardCoordinator::new(
+                Arc::new(BlsVerifier),
+                ShardId::ROOT,
+                ShardConsensusConfig::default(),
+                RecoveredState {
+                    committed_height: BlockHeight::new(12),
+                    committed_hash: Some(honest.block_hash()),
+                    anchor_qc: Some(anchor_qc),
+                    committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(
+                        2 * CLAIM_ED + 50,
+                    )),
+                    ..RecoveredState::default()
+                },
+                WeightedTimestamp::ZERO,
+            )
+            .signed_by(ValidatorId::new(0));
+            state.set_time(LocalTimestamp::from_millis(3 * CLAIM_ED));
+            state
+        };
+
+        let mut state = seat(forged);
+        let _ = state.adopt_anchor_qc(&schedule);
+        assert!(
+            state.anchor_qc.is_some(),
+            "a window the beacon has yet to commit is retried",
+        );
+        assert!(
+            state
+                .committee_of_qc(&schedule, &honest)
+                .is_some_and(|snapshot| std::ptr::eq(snapshot, epochs[1].as_ref())),
+            "the honest QC over the tip is admitted",
+        );
+
+        let mut state = seat(honest.clone());
+        assert_eq!(state.committed_committee_epoch, None);
+        let _ = state.adopt_anchor_qc(&schedule);
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(1)));
+    }
+
     /// A snap-seated tip that opens an epoch, whose anchor QC fails
     /// verification, knows no signed epoch and holds no parent: a QC over
     /// it is admitted at the stand-in anchor's window or the one below,
@@ -19924,7 +19975,6 @@ mod tests {
         state.committed_height = BlockHeight::new(12);
         state.committed_hash = tip.block_hash();
         state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(2 * CLAIM_ED + 50);
-        state.committed_committee_epoch = Some(Epoch::new(1));
         state.anchor_qc = Some(qc_signed_by(
             &keys,
             &epochs[0],
@@ -19934,10 +19984,7 @@ mod tests {
         ));
         let _ = state.adopt_anchor_qc(&schedule);
         assert_eq!(state.anchor_qc, None, "the forged anchor QC is discarded");
-        assert_eq!(
-            state.committed_committee_epoch, None,
-            "and the epoch with it"
-        );
+        assert_eq!(state.committed_committee_epoch, None, "and states no epoch");
 
         for (window, stamp, admitted) in [
             (1usize, 2 * CLAIM_ED + 100, true),

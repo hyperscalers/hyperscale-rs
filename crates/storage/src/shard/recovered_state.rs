@@ -325,24 +325,10 @@ impl RecoveredState {
     }
 
     /// The epoch the committee that certified the recovered tip signed,
-    /// read off the tip's stored QC: the copy its child's header pinned
-    /// on an ordinary restart, the anchor QC after a snap sync. `None`
-    /// for a fresh start, and for a tip no committee signed — a chain's
-    /// genesis block.
-    #[must_use]
-    pub fn committed_committee_epoch(&self) -> Option<Epoch> {
-        self.verified_committee_epoch().or_else(|| {
-            self.anchor_qc
-                .as_ref()
-                .filter(|qc| qc.signer_count() > 0)
-                .map(QuorumCertificate::committee_epoch)
-        })
-    }
-
-    /// [`Self::committed_committee_epoch`] off a QC some check has
-    /// passed: the copy the store kept for its tip, never the snap-synced
-    /// anchor QC, which the shard has yet to verify. What a reader that
-    /// does not wait on that check seeds from.
+    /// read off the copy of its QC the store kept, which its child's
+    /// header pinned. Never off a snap-synced anchor QC, which the shard
+    /// has yet to verify. `None` for a fresh start, after a snap sync, and
+    /// for a tip no committee signed — a chain's genesis block.
     #[must_use]
     pub fn verified_committee_epoch(&self) -> Option<Epoch> {
         self.latest_qc
@@ -379,33 +365,27 @@ mod tests {
     }
 
     /// The tip's window is the one its stored QC signed: the persisted
-    /// copy on a restart, the anchor QC after a snap sync, and none for a
-    /// tip no committee signed.
+    /// copy on a restart, none after a snap sync, whose anchor QC the
+    /// shard alone checks, and none for a tip no committee signed.
     #[test]
     fn the_tips_committee_epoch_is_read_off_its_stored_qc() {
         let restarted = RecoveredState {
             latest_qc: Some(Verified::new_unchecked_for_test(qc_stating(21, 3))),
             ..RecoveredState::default()
         };
-        assert_eq!(restarted.committed_committee_epoch(), Some(Epoch::new(21)));
+        assert_eq!(restarted.verified_committee_epoch(), Some(Epoch::new(21)));
 
         let snapped = RecoveredState {
             anchor_qc: Some(qc_stating(9, 3)),
             ..RecoveredState::default()
         };
-        assert_eq!(snapped.committed_committee_epoch(), Some(Epoch::new(9)));
-        assert_eq!(
-            snapped.verified_committee_epoch(),
-            None,
-            "the anchor QC is checked by the shard alone",
-        );
-        assert_eq!(restarted.verified_committee_epoch(), Some(Epoch::new(21)));
+        assert_eq!(snapped.verified_committee_epoch(), None);
 
         let genesis = RecoveredState {
             latest_qc: Some(Verified::new_unchecked_for_test(qc_stating(0, 0))),
             ..RecoveredState::default()
         };
-        assert_eq!(genesis.committed_committee_epoch(), None);
-        assert_eq!(RecoveredState::default().committed_committee_epoch(), None);
+        assert_eq!(genesis.verified_committee_epoch(), None);
+        assert_eq!(RecoveredState::default().verified_committee_epoch(), None);
     }
 }
