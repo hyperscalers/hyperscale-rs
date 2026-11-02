@@ -961,11 +961,14 @@ impl TopologySchedule {
     /// the first anchored at or past the newest bridge `committee` records
     /// for it. Its parent, a coast block, is anchored below that bridge.
     ///
-    /// `committee` is the block's own: the snapshot
-    /// [`live_committee`](Self::live_committee) resolves at the parent's
-    /// anchor, which is the block's committee anchor. Read off that
-    /// snapshot rather than the head, so the proposer, every voter and
-    /// execution ask this one question of one record, and the block whose
+    /// `committee` is the block's own. The proposer and every voter pass
+    /// the snapshot [`live_committee`](Self::live_committee) resolves at
+    /// the parent's anchor, which is the block's committee anchor;
+    /// execution passes the window the block's QC signed, which is that
+    /// same snapshot because honest voters sign the epoch they validated
+    /// the block under. Read off that snapshot rather than the head, so
+    /// the proposer, every voter and execution ask this one question of
+    /// one record, and the block whose
     /// manifest names the recovery's discard is the block whose commit
     /// raises the tick chain floor. Bridges increase along a shard's
     /// history, so a block past an older bridge and below a newer one

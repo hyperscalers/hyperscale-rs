@@ -380,7 +380,9 @@ impl ExecutionSim {
     /// height is the shard's crossing block and every block below it is
     /// anchored below the bridge. The windows from the bridge on carry
     /// the recovery and every window below it the snapshot as it stood,
-    /// as the beacon stamps it.
+    /// as the beacon stamps it. The bridge's window is held at once, as
+    /// the fold that seats the recovery holds the window after its own,
+    /// so the coast blocks below it are signed under it.
     pub fn recover(&mut self, frontier: BlockHeight, bridge: Epoch) {
         let before = Arc::clone(&self.snapshot);
         let recorded = (*self.snapshot)
@@ -405,6 +407,7 @@ impl ExecutionSim {
         for epoch in 0..self.height.inner() {
             self.open_window(Epoch::new(epoch));
         }
+        self.open_window(bridge);
         self.open_windows();
     }
 

@@ -721,7 +721,12 @@ pub fn certify_signed(block: Block, weighted_timestamp_ms: u64, epoch: Epoch) ->
 
 /// [`certify`] with the certifying QC stating the epoch an honest quorum
 /// signs for `block`: its live committee's at `committee_anchor`, the
-/// parent's anchor. [`Epoch::GENESIS`] where `schedule` resolves none.
+/// parent's anchor.
+///
+/// # Panics
+///
+/// Where `schedule` resolves no committee there: no quorum signs a block
+/// it cannot place.
 #[must_use]
 pub fn certify_live(
     schedule: &TopologySchedule,
@@ -732,7 +737,8 @@ pub fn certify_live(
     let epoch = schedule
         .live_committee(block.header().shard_id(), committee_anchor)
         .committee()
-        .map_or(Epoch::GENESIS, |committee| committee.epoch);
+        .expect("the schedule places the block's committee")
+        .epoch;
     certify_signed(block, weighted_timestamp_ms, epoch)
 }
 

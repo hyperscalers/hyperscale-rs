@@ -3277,7 +3277,9 @@ impl ExecutionCoordinator {
         // for timeout calculations and pruning even when there are no new
         // transactions.
         if height > self.committed_height {
-            self.committed_committee_epoch = Some(window.epoch);
+            // A genesis block carries no signed QC, so its window is no
+            // epoch a quorum signed: the shard and a restart say the same.
+            self.committed_committee_epoch = (!block.is_genesis()).then_some(window.epoch);
             self.committed_height = height;
             self.committed_ts = block.header().parent_qc().weighted_timestamp();
         }
@@ -5053,16 +5055,17 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
-        Crossings, Deadline, Epoch, EpochSeed, EpochWindows, ExecutionCertificateContext,
-        ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash, Hash, Inclusion, LocalKey,
-        MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof,
-        NetworkDefinition, PriceTable, PrincipalAddr, QuorumCertificate, RETENTION_HORIZON,
-        Randomness, RecoveryBinding, RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot,
-        Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot,
-        Stated, StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TimestampRange,
-        TransactionDecision, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Verify,
-        VoteCount, Window, compute_global_receipt_root, receipt_hash_of, signed_bytes,
+        BeaconWitnessLeafCount, BlockHeader, BlockHeaderParts, ChainOrigin, ConsensusPublicKey,
+        ConsensusReceipt, ConsensusSignature, Crossings, Deadline, Epoch, EpochSeed, EpochWindows,
+        ExecutionCertificateContext, ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash,
+        Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
+        MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr,
+        QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryBinding, RecoveryCause, Role,
+        SeedRing, SeedSource, SettledTxsRoot, Settlement, ShardAnchor, ShardRecovery, Signer,
+        SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt, SubstateKey,
+        TerminalEvidence, TickHalf, TimestampRange, TransactionDecision, TxResolution, UnsettledTx,
+        ValidatorInfo, ValidatorSet, Verify, VoteCount, Window, compute_global_receipt_root,
+        receipt_hash_of, signed_bytes,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, CrossingId, Hash32, IntentHash, Kind, ProtocolHasher, Terms,
@@ -9954,6 +9957,54 @@ mod tests {
 
         assert_eq!(state.committed_committee_epoch, Some(Epoch::new(1)));
         assert_eq!(state.committed_ts, WeightedTimestamp::from_millis(1_100));
+    }
+
+    /// A chain's genesis block, which no quorum signed, folds under the
+    /// window its origin anchors and leaves the tip stating no signed
+    /// epoch, as the shard's genesis and a restart's recovered state do.
+    #[test]
+    fn a_committed_genesis_states_no_signed_epoch() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let sched = windows_of(1);
+        let signed = certify_signed(
+            make_live_block_on_shard(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                1_100,
+                ValidatorId::new(0),
+                vec![],
+            ),
+            1_100,
+            1,
+        );
+        let _ =
+            state.commit_block_composing(&sched, &signed, WeightedTimestamp::from_millis(1_100));
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(1)));
+
+        let origin = ChainOrigin {
+            genesis_height: BlockHeight::new(5),
+            anchor_wt: WeightedTimestamp::from_millis(1_500),
+        };
+        let mut genesis = make_live_block_on_shard(
+            ShardId::ROOT,
+            origin.genesis_height,
+            1_500,
+            ValidatorId::new(0),
+            vec![],
+        );
+        if let Block::Live { header, .. } = &mut genesis {
+            *header = BlockHeader::new(BlockHeaderParts {
+                shard_id: ShardId::ROOT,
+                height: origin.genesis_height,
+                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, origin).into(),
+                ..Default::default()
+            });
+        }
+        assert!(genesis.is_genesis());
+        let genesis = Verified::<CertifiedBlock>::genesis_certified(genesis);
+        let _ = state.commit_block_composing(&sched, &genesis, origin.anchor_wt);
+        assert_eq!(state.committed_height, origin.genesis_height);
+        assert_eq!(state.committed_committee_epoch, None);
     }
 
     /// A commit whose signed window the schedule has evicted parks the
