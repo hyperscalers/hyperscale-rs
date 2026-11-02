@@ -487,9 +487,9 @@ pub struct ShardCoordinator {
     /// The committed tip whose `committed_committee_anchor_wt` is a
     /// stand-in, not read off its parent. A store seated at a snap-synced
     /// anchor holds no such parent and stands in the tip's own anchor,
-    /// which names another window when the tip opens an epoch; a QC over
-    /// that tip is then verified under the window it signed rather than
-    /// admitted at the stand-in anchor. The tip is committed history, so no
+    /// which names the window after the parent's when the tip opens an
+    /// epoch; a QC over that tip is then admitted at the stand-in anchor
+    /// or in the window below it. The tip is committed history, so no
     /// recovery's fence applies to it. The next commit clears this.
     stand_in_anchor_tip: Option<BlockHash>,
 
@@ -1333,19 +1333,39 @@ impl ShardCoordinator {
         qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
         if self.stand_in_anchor_tip == Some(qc.block_hash()) {
-            if qc.is_genesis() {
-                return None;
-            }
-            return self
-                .signed_committee_of(topology_schedule, qc)
-                .committee()
-                .map(|committee| committee.snapshot.as_ref());
+            return self.stand_in_tip_committee(topology_schedule, qc);
         }
         self.committee_certified_at(
             topology_schedule,
             self.committee_anchor(qc.block_hash())?,
             qc,
         )
+    }
+
+    /// [`Self::committee_of_qc`] for a QC over the committed tip whose
+    /// committee anchor is a stand-in. The tip's real committee anchor is
+    /// its parent's, which lies in the stand-in's window or the one below,
+    /// so the QC is admitted at either and nowhere else. Unfenced: the tip
+    /// is committed history.
+    fn stand_in_tip_committee<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> Option<&'t TopologySnapshot> {
+        let stand_in = self.committed_committee_anchor_wt;
+        let below = topology_schedule
+            .epoch_for(stand_in)
+            .inner()
+            .checked_sub(1)
+            .map(|epoch| {
+                topology_schedule
+                    .windows()
+                    .window_of(Epoch::new(epoch))
+                    .start
+            });
+        std::iter::once(stand_in)
+            .chain(below)
+            .find_map(|anchor| self.committee_certified_at(topology_schedule, anchor, qc))
     }
 
     /// [`Self::committee_of_qc`] with the certified block's committee anchor
@@ -19790,6 +19810,36 @@ mod tests {
         assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
         let (_, verifications) = answer_sync_claims_counted(&mut state, &schedule, &actions);
         assert_eq!(verifications, 1);
+    }
+
+    /// A snap-seated tip anchors on a stand-in, and a QC over it is
+    /// admitted under the stand-in's window or the one below, where the
+    /// tip's parent anchors. A quorum of any other window the schedule
+    /// holds is refused, at any stamp.
+    #[test]
+    fn a_stand_in_tip_admits_only_the_windows_its_parent_can_anchor() {
+        let (mut state, schedule, keys, epochs) = claim_epochs();
+        let tip = qc_signed_by(&keys, &epochs[2], Epoch::new(2), 12, 2 * CLAIM_ED + 100);
+        state.committed_height = BlockHeight::new(12);
+        state.committed_hash = tip.block_hash();
+        state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(2 * CLAIM_ED + 50);
+        state.stand_in_anchor_tip = Some(tip.block_hash());
+
+        for (window, stamp, admitted) in [
+            (2usize, 2 * CLAIM_ED + 100, true),
+            (1, 2 * CLAIM_ED + 100, true),
+            (3, 3 * CLAIM_ED + 100, false),
+            (0, 2 * CLAIM_ED + 100, false),
+        ] {
+            let epoch = Epoch::new(window as u64);
+            let qc = qc_signed_by(&keys, &epochs[window], epoch, 12, stamp);
+            let resolved = state.committee_of_qc(&schedule, &qc);
+            assert_eq!(
+                resolved.is_some_and(|snapshot| std::ptr::eq(snapshot, epochs[window].as_ref())),
+                admitted,
+                "a quorum of window {window}",
+            );
+        }
     }
 
     /// The last two blocks an outgoing committee signs carry QCs stamped
