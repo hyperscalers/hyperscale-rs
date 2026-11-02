@@ -2195,15 +2195,15 @@ mod a_commit_past_the_replay {
         );
         cluster.run_faultable(|c| {
             let (hash, committed) = commit_a_swap_the_counterpart_never_certifies(c);
-            let below = committed.prev().expect("a commit above genesis");
+            let above = committed.next();
             let restarted = restart_two_past_the_floor(c, hash, committed);
             for host in restarted {
                 assert!(
                     holds_commit(c, host, hash, committed)
                         && home_store(c, host)
-                            .is_some_and(|store| store.get_block_metadata(below).is_some()),
+                            .is_some_and(|store| store.get_block_metadata(above).is_some()),
                     "restarted host {host} must still hold the swap's body and the rows at \
-                     {committed:?} and {below:?}",
+                     {committed:?} and {above:?}",
                 );
             }
 
