@@ -90,7 +90,8 @@ pub struct BeaconWitnessRootContext<'a> {
     /// caller: the kind and admission the block's committee window names
     /// the shard draining under, and whether the rows at the block's
     /// parent are quiet. `None` where that window names no draining for
-    /// the shard, or the parent sits in a recovery's suffix band. Read
+    /// the shard, or the parent was certified by a committee a recovery
+    /// replaced. Read
     /// before the byte total and without it, so a draining shard asserts
     /// whatever its load and whatever the thresholds.
     pub settling: Option<(ReshapeKind, Settling)>,
@@ -302,9 +303,9 @@ pub fn derive_reshape_trigger(
 /// `quiet`, whether no row at the block's parent hears.
 ///
 /// `None` where the window names no draining for the shard, and `banded`
-/// and `quiet` are not read then; or where the parent lies in a
-/// recovery's suffix band (`banded`), whose rows are QC-attested history
-/// a replica may not have folded, and `quiet` is not read.
+/// and `quiet` are not read then; or where the parent was certified by a
+/// committee a recovery replaced (`banded`), whose rows are QC-attested
+/// history a replica may not have folded, and `quiet` is not read.
 ///
 /// A latch shows in every window after the one it first shows in until
 /// its record clears, and a block's own anchor is never earlier than its

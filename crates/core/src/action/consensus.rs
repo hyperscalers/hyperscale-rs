@@ -373,8 +373,8 @@ pub enum ConsensusAction {
         /// What the block must assert of its shard's latched reshape: the
         /// kind and admission its committee window names the shard
         /// draining under, and whether the rows at its parent are quiet.
-        /// `None` where no draining is named, or the parent lies in a
-        /// recovery's suffix band.
+        /// `None` where no draining is named, or the parent was certified
+        /// by a committee a recovery replaced.
         settling: Option<(ReshapeKind, Settling)>,
         /// Reshape thresholds in force for this network.
         thresholds: ReshapeThresholds,

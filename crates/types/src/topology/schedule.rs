@@ -3696,9 +3696,9 @@ mod tests {
 
     /// A recovery whose fresh committee stalls is followed by a second.
     /// The first recovery's bridge blocks keep resolving the committee it
-    /// seated while the second is pending and after it completes; they sit
-    /// in the second recovery's suffix band; and live work at any stale
-    /// anchor binds the newest fresh committee.
+    /// seated while the second is pending and after it completes; their
+    /// committee is one the second recovery replaced; and live work at any
+    /// stale anchor binds the newest fresh committee.
     #[test]
     fn a_chained_recovery_keeps_the_first_bridge_bound() {
         use crate::ValidatorInfo;

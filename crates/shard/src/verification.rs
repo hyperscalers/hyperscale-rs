@@ -1380,8 +1380,9 @@ impl SubstateCountSource<'_> {
     /// (or, for a frontier lagging the tip, the tip awaiting its
     /// persistence reconcile). A sync-admitted parent's delta lands when
     /// its state-root fold completes; one that commits first is resolved
-    /// by the frontier reconciled from storage. Inside a recovery's
-    /// suffix band the callers answer `None` before walking at all.
+    /// by the frontier reconciled from storage. Over a parent certified by
+    /// a committee a recovery replaced the callers answer `None` before
+    /// walking at all.
     pub(crate) fn count_behind(
         &self,
         committed_hash: BlockHash,

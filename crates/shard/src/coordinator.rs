@@ -2764,8 +2764,9 @@ impl ShardCoordinator {
     /// shard's latched reshape: the kind and admission the committee's
     /// window names the shard draining under, and whether the rows at
     /// `parent` are quiet. `None` where that window names no draining
-    /// here, or the parent sits in a recovery's suffix band, where the
-    /// rows are QC-attested history a replica may not have folded yet. The
+    /// here, or the parent was certified by a committee a recovery
+    /// replaced, where the rows are QC-attested history a replica may not
+    /// have folded yet. The
     /// proposer fills the assertion from it and every voter recomputes it,
     /// outside the byte count, so a draining shard asserts whatever its
     /// load and thresholds.
@@ -19533,8 +19534,8 @@ mod tests {
     }
 
     /// A certificate a header carries while a halt recovery is pending,
-    /// signed by the retained committee and stamped in the suffix band,
-    /// starts no sync: a retained committee beyond f signs such a
+    /// signed by the retained committee under a window the recovery
+    /// replaced, starts no sync: a retained committee beyond f signs such a
     /// certificate at any height, and the halted suffix is the harvest's
     /// to fetch.
     #[test]

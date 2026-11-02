@@ -477,8 +477,9 @@ const ANSWERED_SUFFIX_CLOSING_EIGHTHS: u64 = 6;
 /// and freezes before the epoch's next boundary: the blocks writing the
 /// answers sit above the frontier the beacon last attested, in the
 /// suffix. A fresh member commits that suffix as certified, never
-/// judging the cap on it, and the first block it builds on it stands in
-/// the recovery's suffix band, where the cap is out of play; every
+/// judging the cap on it, and the first block it builds on it extends a
+/// block certified by the committee the recovery replaced, where the cap
+/// is out of play; every
 /// later block is judged against the count the suffix left. The
 /// recovered shard resumes, its replicas agree on one state root, each
 /// transfer is credited once, a transfer each way settles after the

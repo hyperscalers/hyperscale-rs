@@ -4867,8 +4867,9 @@ mod tests {
         assert!(coord.has_commit_proof(remote, BlockHeight::new(5)));
     }
 
-    /// The fresh committee's bridge block above the frontier, certified
-    /// in the window before the bridge, is admitted after the clear.
+    /// The fresh committee's bridge block above the frontier, signed under
+    /// the bridge's window with a stamp in the window before it, is
+    /// admitted after the clear: the signed epoch places it, not the stamp.
     #[test]
     fn a_fresh_header_certified_before_the_bridge_is_admitted() {
         let local = ShardId::leaf(1, 0);
