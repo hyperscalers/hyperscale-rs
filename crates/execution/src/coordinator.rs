@@ -780,8 +780,10 @@ impl ExecutionCoordinator {
             stall_retry_periods: 0,
             // A replay commits from its first block before anything
             // probes, and each replayed commit reseats this off its own
-            // stored QC.
-            committed_committee_epoch: recovered.committed_committee_epoch(),
+            // stored QC. A snap-seated tip's anchor QC is not read: until
+            // the first commit, a probe places its questions under the
+            // live committee at the tip's clock.
+            committed_committee_epoch: recovered.verified_committee_epoch(),
             pending_ticks: VecDeque::new(),
             held: BTreeMap::new(),
             code,
@@ -9921,6 +9923,16 @@ mod tests {
             )
             .signed_by(ValidatorId::new(0))
         };
+        let snapped = restarted(&RecoveredState {
+            committed_height: BlockHeight::new(5),
+            committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
+            anchor_qc: Some(tip_qc.clone()),
+            ..RecoveredState::default()
+        });
+        assert_eq!(
+            snapped.committed_committee_epoch, None,
+            "a snap-seated tip's anchor QC, unverified, seeds no window",
+        );
         let mut state = restarted(&RecoveredState {
             committed_height: BlockHeight::new(5),
             committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),

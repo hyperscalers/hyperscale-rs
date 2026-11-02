@@ -331,9 +331,22 @@ impl RecoveredState {
     /// genesis block.
     #[must_use]
     pub fn committed_committee_epoch(&self) -> Option<Epoch> {
+        self.verified_committee_epoch().or_else(|| {
+            self.anchor_qc
+                .as_ref()
+                .filter(|qc| qc.signer_count() > 0)
+                .map(QuorumCertificate::committee_epoch)
+        })
+    }
+
+    /// [`Self::committed_committee_epoch`] off a QC some check has
+    /// passed: the copy the store kept for its tip, never the snap-synced
+    /// anchor QC, which the shard has yet to verify. What a reader that
+    /// does not wait on that check seeds from.
+    #[must_use]
+    pub fn verified_committee_epoch(&self) -> Option<Epoch> {
         self.latest_qc
             .as_deref()
-            .or(self.anchor_qc.as_ref())
             .filter(|qc| qc.signer_count() > 0)
             .map(QuorumCertificate::committee_epoch)
     }
@@ -381,6 +394,12 @@ mod tests {
             ..RecoveredState::default()
         };
         assert_eq!(snapped.committed_committee_epoch(), Some(Epoch::new(9)));
+        assert_eq!(
+            snapped.verified_committee_epoch(),
+            None,
+            "the anchor QC is checked by the shard alone",
+        );
+        assert_eq!(restarted.verified_committee_epoch(), Some(Epoch::new(21)));
 
         let genesis = RecoveredState {
             latest_qc: Some(Verified::new_unchecked_for_test(qc_stating(0, 0))),
