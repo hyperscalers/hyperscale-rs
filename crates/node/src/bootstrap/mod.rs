@@ -401,8 +401,14 @@ impl ShardBootstrap {
                 self.anchor.state_root,
             ));
         }
+        let anchor_qc = self
+            .witness
+            .as_ref()
+            .map(|window| (*window.qc).clone())
+            .expect("the import finalized off a verified witness window");
         self.phase = Phase::History(Box::new(HistoryBackfill::new(
             &self.anchor,
+            anchor_qc,
             self.history_floor,
         )));
         Ok(())
@@ -589,7 +595,10 @@ mod tests {
     use hyperscale_storage::{BoundaryRetention, ImportCursor, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_key;
-    use hyperscale_types::{LEAF_KEY_BYTES, ShardWitnessPayload};
+    use hyperscale_types::{
+        AggregateSignature, ElidedCertifiedBlock, Epoch, Inventory, LEAF_KEY_BYTES,
+        ShardWitnessPayload, SignerBitfield,
+    };
 
     use super::*;
     use crate::shard::consensus::serve_block_request;
@@ -648,6 +657,20 @@ mod tests {
         pending_chain: &PendingChain<SimShardStorage>,
         fresh: &SimShardStorage,
     ) {
+        drive_serving(bootstrap, serving, pending_chain, fresh, |response| {
+            response
+        });
+    }
+
+    /// [`drive`] with every history block answer passed through `serve`
+    /// on its way to the joiner.
+    fn drive_serving(
+        bootstrap: &mut ShardBootstrap,
+        serving: &Arc<SimShardStorage>,
+        pending_chain: &PendingChain<SimShardStorage>,
+        fresh: &SimShardStorage,
+        serve: impl Fn(GetBlockResponse) -> GetBlockResponse,
+    ) {
         let provisions = ProvisionStore::new();
         for _ in 0..1_000 {
             if bootstrap.is_complete() {
@@ -674,7 +697,8 @@ mod tests {
                         );
                     }
                     BootstrapRequest::History(height, request) => {
-                        let response = serve_block_request(pending_chain, &provisions, &request);
+                        let response =
+                            serve(serve_block_request(pending_chain, &provisions, &request));
                         if let HistoryOutcome::Verified(blocks) =
                             bootstrap.on_history_block(height, &response)
                         {
@@ -695,6 +719,60 @@ mod tests {
 
     fn witness_leaves() -> Vec<ShardWitnessPayload> {
         (1u64..=5).map(stake_deposit).collect()
+    }
+
+    /// A history server answering the right blocks with QCs of its own,
+    /// each stating an epoch no quorum signed, leaves no trace: the
+    /// anchor block is recorded with the anchor QC the import seated,
+    /// which is the one the recovery hands the shard to verify.
+    #[test]
+    fn a_served_qc_never_reaches_the_store() {
+        let leaves = witness_leaves();
+        let (serving, anchor) = replica(&leaves);
+        let fresh = Arc::new(SimShardStorage::default());
+        let forged = Epoch::new(9);
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, None, GENESIS_FLOOR);
+        drive_serving(
+            &mut bootstrap,
+            &serving,
+            &PendingChain::new(Arc::clone(&serving), BlockHeight::GENESIS),
+            &fresh,
+            |response| {
+                let Some(elided) = response.block() else {
+                    return response;
+                };
+                let certified = elided
+                    .try_rehydrate(|_| None, |_| None, |_| None)
+                    .expect("the fixture's blocks carry their bodies");
+                let qc = certified.qc();
+                let mut signers = SignerBitfield::new(4);
+                signers.set(0);
+                signers.set(1);
+                signers.set(2);
+                let swapped = QuorumCertificate::new(
+                    qc.block_hash(),
+                    qc.shard_id(),
+                    qc.height(),
+                    qc.parent_block_hash(),
+                    qc.round(),
+                    forged,
+                    signers,
+                    AggregateSignature::ZERO,
+                    qc.weighted_timestamp(),
+                );
+                GetBlockResponse::found(ElidedCertifiedBlock::elide(
+                    certified.block(),
+                    swapped,
+                    &Inventory::empty(),
+                ))
+            },
+        );
+        let recorded = fresh
+            .get_block(anchor.height)
+            .expect("the walk records the anchor block");
+        let recovered = bootstrap.into_recovered_state(&*fresh);
+        assert_eq!(Some(recorded.qc()), recovered.anchor_qc.as_ref());
+        assert_ne!(recorded.qc().committee_epoch(), forged);
     }
 
     /// A store that snap-synced serves the next joiner as one that

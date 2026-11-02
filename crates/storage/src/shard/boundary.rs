@@ -425,10 +425,12 @@ pub trait BoundaryStore {
     ///
     /// The block arrives unverified, and the caller's tie is the hash
     /// line: each block is the one the block above it names as its
-    /// parent, up to the beacon-attested anchor. That settles which block
-    /// stands at the height — which is the whole question here — and no
-    /// signature check could add to it, so this takes the pairing as it
-    /// comes rather than asking for a marker the walk does not produce.
+    /// parent, up to the beacon-attested anchor, and is paired with the
+    /// parent QC that block's header carries — or, for the anchor block,
+    /// with the anchor QC the import seated. That settles which block
+    /// stands at the height and which QC certifies it, so this takes the
+    /// pairing as it comes rather than asking for a marker the walk does
+    /// not produce.
     fn import_historical_block(&self, certified: &CertifiedBlock);
 
     /// Apply the subset of a followed chain's block that falls under
