@@ -1372,8 +1372,11 @@ impl ShardCoordinator {
     /// A snap-seated store holds no parent to read the tip's committee
     /// anchor off, and stands in the tip's own anchor. That names the
     /// window after the parent's when the tip opens an epoch, so the QC
-    /// is admitted at the stand-in or in the window below it, and
-    /// nowhere else. Unfenced: the tip is committed history.
+    /// is tried as [`TopologySchedule::admits`] places it at the
+    /// stand-in, then at the start of the window below: the raw window
+    /// at either anchor, or a window a recovery bridging that anchor
+    /// seated, where the QC's stamp falls in that committee's term.
+    /// Unfenced: the tip is committed history.
     fn unsigned_tip_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
