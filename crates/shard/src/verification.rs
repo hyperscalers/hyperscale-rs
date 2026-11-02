@@ -721,7 +721,9 @@ impl VerificationPipeline {
 
     // ─── State root ──────────────────────────────────────────────────────
 
-    /// Check if a block needs state root verification before voting.
+    /// Whether a block's state-root stage has not started: not in flight
+    /// or done, not deferred on its parent's tree, and not parked for its
+    /// window.
     ///
     /// Always returns true for blocks that haven't been verified yet —
     /// even cert-less blocks verify (trivially) so their `PreparedCommit`
@@ -730,6 +732,9 @@ impl VerificationPipeline {
         let block_hash = block.hash();
 
         !self.is_root_tracked(block_hash, VerificationKind::StateRoot)
+            && !self
+                .synced_state_roots_awaiting_window
+                .contains(&block_hash)
             && !self
                 .deferred_state_root_verifications
                 .values()

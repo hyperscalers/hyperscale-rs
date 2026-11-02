@@ -5288,9 +5288,13 @@ impl ShardCoordinator {
             // header that fails it is dropped as that check drops it: left
             // pending, every vote redrive would check it again. A header the
             // fresh committee of a recovery not yet folded here proposed comes
-            // back through block sync once a child names it.
-            if let BlockResolution::Committee(committee) =
-                topology_schedule.live_committee(self.local_shard, committee_anchor_wt)
+            // back through block sync once a child names it. A certified
+            // header is not checked: its quorum checked the proposer under
+            // the schedule it voted under, and a recovery folded here since
+            // can bind its anchor to a committee that names another.
+            if !self.certified(block_hash)
+                && let BlockResolution::Committee(committee) =
+                    topology_schedule.live_committee(self.local_shard, committee_anchor_wt)
                 && let Err(e) =
                     validate_proposer(committee.snapshot.as_ref(), self.local_shard, &header)
             {
@@ -5481,6 +5485,44 @@ impl ShardCoordinator {
         actions
     }
 
+    /// Whether a QC over `block_hash` itself is verified here.
+    fn certified(&self, block_hash: BlockHash) -> bool {
+        self.verification.cached_qc(&block_hash).is_some()
+    }
+
+    /// Prepare a pending block a verified QC certifies: seat its tree for
+    /// its children as a synced block's is, and hand the QC its handle.
+    ///
+    /// The block is not judged. An honest voter judges a block before it
+    /// votes, so the QC already carries a quorum's judgement, and the
+    /// judgement may not be repeatable here: a recovery folded since the
+    /// block was voted can make its own anchor coast, which refuses any
+    /// content it carries. No vote goes out, since the block already has
+    /// its QC. A block whose body has not arrived waits for it; once its
+    /// state-root stage has started, a re-drive does nothing.
+    fn prepare_certified(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+    ) -> Vec<Action> {
+        let Some(block) = self.pending_blocks.get_block(block_hash).map(Arc::clone) else {
+            return vec![];
+        };
+        if !self.verification.needs_state_root_verification(&block) {
+            return vec![];
+        }
+        let Some(qc) = self.verification.cached_qc(&block_hash).cloned() else {
+            return vec![];
+        };
+        let mut actions = self.populate_certified_for(&qc);
+        if !self.pending_blocks.contains_key(block_hash) {
+            return actions;
+        }
+        self.initiate_synced_state_root_verification(topology_schedule, &block);
+        actions.extend(self.retry_pending_children(topology_schedule, block_hash));
+        actions
+    }
+
     /// Whether `block_hash`'s committee seats the tip committee's members
     /// under the same keys, so a certificate verified under one verifies
     /// under the other.
@@ -5535,6 +5577,10 @@ impl ShardCoordinator {
         round: Round,
         justified: bool,
     ) -> Vec<Action> {
+        if self.certified(block_hash) {
+            return self.prepare_certified(topology_schedule, block_hash);
+        }
+
         // Safe-vote rule, per eligible signer. A block every signer's rule
         // declines still runs verification — so its `PreparedCommit` is
         // ready if a quorum forms it elsewhere — but no vote goes out for it.
@@ -30324,6 +30370,177 @@ mod tests {
             AnswerAdditions::default(),
         );
         assert_eq!(voters(&actions), ids(&[7]), "{actions:?}");
+    }
+
+    /// Block 2 of the halted committee of
+    /// [`before_and_after_a_seated_halt_recovery`], over committed block 1
+    /// at `round`, proposed by that round's halted proposer and carrying
+    /// `transactions` under a body root that commits them, with its QC:
+    /// what a voter holding block 1 committed held before the fold, the
+    /// block's parent QC verified and no state-root check started.
+    fn halted_certified_block(
+        round: u64,
+        transactions: Vec<Verified<Transaction>>,
+    ) -> (
+        ShardCoordinator,
+        TopologySchedule,
+        TopologySchedule,
+        Block,
+        Verified<QuorumCertificate>,
+    ) {
+        let (mut state, _, parent) = committed_on_a_count(1, Some(StandingAnswers::default()));
+        let (halted, seated) = before_and_after_a_seated_halt_recovery();
+        let round = Round::new(round);
+        let header = BlockHeader::new(BlockHeaderParts {
+            round,
+            proposer: halted.head().proposer_for(ShardId::ROOT, round),
+            ..header_on(parent.hash(), 2, 99_000).into_parts()
+        });
+        let transactions = Arc::new(
+            Capped::new(transactions.into_iter().map(Verifiable::from).collect())
+                .expect("one transaction fits"),
+        );
+        let carrying = |header: BlockHeader| Block::Live {
+            header,
+            transactions: Arc::clone(&transactions),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let header = BlockHeader::new(BlockHeaderParts {
+            body_root: SectionRoots::of(&carrying(header.clone())).root(),
+            ..header.into_parts()
+        });
+        let block = carrying(header);
+        // SAFETY: synthetic test fixture, no real signature.
+        let parent_qc = Verified::new_unchecked_for_test(block.header().parent_qc().clone());
+        state.verification.cache_verified_qc(parent_qc);
+        let own = Verified::new_unchecked_for_test(QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            block.height(),
+            parent.hash(),
+            round,
+            Epoch::GENESIS,
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(99_500),
+        ));
+        state.latest_qc = Some(own.clone());
+        let _ = state.verification.take_ready_state_root_verifications();
+        (state, halted, seated, block, own)
+    }
+
+    /// The state-root checks of `block_hash` ready to dispatch, each as
+    /// whether it runs without a parent judgement.
+    fn prepared(state: &mut ShardCoordinator, block_hash: BlockHash) -> Vec<bool> {
+        state
+            .verification
+            .take_ready_state_root_verifications()
+            .into_iter()
+            .filter(|ready| ready.block_hash == block_hash)
+            .map(|ready| ready.parent_judgement.is_none())
+            .collect()
+    }
+
+    fn admits_finalizations(actions: &[Action]) -> bool {
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::Continuation(ProtocolEvent::FinalizationsAdmitted { .. })
+            )
+        })
+    }
+
+    fn starts_sync(actions: &[Action]) -> bool {
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::StartBlockSync { .. }))
+    }
+
+    /// A block the halted committee certified, still pending with its
+    /// checks outstanding when the fold seats the recovery, is not judged
+    /// again under the fresh committee: whether it carries content (which
+    /// a coast block may not) or none, and whether or not the fresh
+    /// committee names another proposer at its round, re-driving it keeps
+    /// it pending, starts no sync, admits no finalizations, and prepares
+    /// its tree once, without a parent judgement.
+    #[test]
+    fn a_certified_suffix_block_redriven_after_the_fold_commits_on_its_qc() {
+        let proposed_by = |schedule: &TopologySchedule, round: u64| {
+            schedule
+                .head()
+                .proposer_for(ShardId::ROOT, Round::new(round))
+        };
+        let (halted, seated) = before_and_after_a_seated_halt_recovery();
+        assert_eq!(proposed_by(&halted, 2), proposed_by(&seated, 2));
+        assert_ne!(proposed_by(&halted, 3), proposed_by(&seated, 3));
+
+        for round in [2, 3] {
+            let carrying = Verified::new_unchecked_for_test(test_transaction(7));
+            for transactions in [vec![], vec![carrying]] {
+                let content = !transactions.is_empty();
+                let (mut state, halted, seated, block, own) =
+                    halted_certified_block(round, transactions);
+                install_complete_block(&mut state, &block);
+                state.verification.cache_verified_qc(own);
+                state.set_time(LocalTimestamp::from_millis(101_500));
+                let mut actions = state.on_schedule_replaced(&halted, &seated);
+                assert!(
+                    seated.coasting(
+                        ShardId::ROOT,
+                        block.header().parent_qc().weighted_timestamp()
+                    ),
+                    "the fold makes the block's own anchor coast"
+                );
+
+                actions.extend(state.redrive_pending_votes(&seated));
+                actions.extend(state.redrive_pending_votes(&seated));
+
+                let case = format!("round {round}, content {content}");
+                assert!(
+                    state.pending_blocks.contains_key(block.hash()),
+                    "{case}: the block stays pending: {actions:?}"
+                );
+                assert!(!starts_sync(&actions), "{case}: {actions:?}");
+                assert!(!admits_finalizations(&actions), "{case}: {actions:?}");
+                assert_eq!(
+                    prepared(&mut state, block.hash()),
+                    vec![true],
+                    "{case}: one preparation on the QC"
+                );
+            }
+        }
+    }
+
+    /// A certified block whose body has not arrived prepares nothing on
+    /// a re-drive, and prepares once, on its QC, when the body lands.
+    #[test]
+    fn a_certified_block_prepares_only_once_assembled() {
+        let tx = Verified::new_unchecked_for_test(test_transaction(7));
+        let (mut state, halted, seated, block, own) = halted_certified_block(2, vec![tx.clone()]);
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            block.header().clone(),
+            BlockManifest::from_block(&block),
+            LocalTimestamp::ZERO,
+        ));
+        state.verification.cache_verified_qc(own);
+        state.set_time(LocalTimestamp::from_millis(101_500));
+        let _ = state.on_schedule_replaced(&halted, &seated);
+
+        let actions = state.redrive_pending_votes(&seated);
+        assert!(prepared(&mut state, block.hash()).is_empty(), "{actions:?}");
+
+        let actions = state.on_transactions_admitted(&seated, &[tx]);
+        assert!(!admits_finalizations(&actions), "{actions:?}");
+        assert!(state.pending_blocks.contains_key(block.hash()));
+        assert_eq!(prepared(&mut state, block.hash()), vec![true]);
+        let _ = state.redrive_pending_votes(&seated);
+        assert!(prepared(&mut state, block.hash()).is_empty());
     }
 
     /// A signer attached to a store a forked rebuild replaced, which
