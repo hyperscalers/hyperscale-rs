@@ -376,6 +376,20 @@ fn recover_committee(
     }
     retained.sort_unstable();
     retained.dedup();
+    // The fresh committee signs from the bridge on, so every epoch below
+    // it is the replaced committee's: a terminal before the bridge would
+    // give the fresh committee a window it shares with the one it
+    // replaces.
+    let bridge = state.current_epoch.next();
+    debug_assert!(
+        state
+            .live_scheduled_terminals()
+            .get(&shard)
+            .copied()
+            .or_else(|| state.boundaries.get(&shard)?.terminal_epoch)
+            .is_none_or(|terminal| terminal >= bridge),
+        "a recovery of {shard:?} seated with its terminal before its bridge {bridge:?}"
+    );
     tracing::info!(
         ?shard,
         fresh = ?fresh,

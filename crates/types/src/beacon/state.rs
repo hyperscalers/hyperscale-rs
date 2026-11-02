@@ -736,9 +736,20 @@ impl RecoveryBinding {
         self.rotated_at.next()
     }
 
+    /// Whether work whose QC's committee signed `committee_epoch` was
+    /// signed by a committee this recovery took the shard from: below the
+    /// bridge. The fresh committee signs the bridge's window or a later
+    /// one, since a recovery is seated only on a shard whose scheduled
+    /// terminal, if any, is no earlier than the bridge.
+    #[must_use]
+    pub const fn replaced(self, committee_epoch: Epoch) -> bool {
+        committee_epoch.inner() < self.bridge().inner()
+    }
+
     /// Whether a block at `height`, whose QC's committee signed
     /// `committee_epoch`, has the shape of one this recovery discarded:
-    /// signed below the bridge, at a height above the frontier.
+    /// signed below the bridge ([`Self::replaced`]), at a height above
+    /// the frontier.
     ///
     /// Every block the fresh committee certifies above the frontier is
     /// signed under the bridge's window or a later one: its committee is
@@ -749,15 +760,9 @@ impl RecoveryBinding {
     /// chain can extend the halted tail it harvested, which has this shape
     /// too, so for a halt recovery the shape is a discard only where no
     /// fresh-certified block descends from the block.
-    ///
-    /// Where the bridge lies past the shard's terminal cut, the fresh
-    /// committee signs the terminal window too, below the bridge; the
-    /// schedule's [`replaced_by`](crate::TopologySchedule::replaced_by)
-    /// carves that window out, and this does not.
     #[must_use]
     pub const fn discards(self, height: BlockHeight, committee_epoch: Epoch) -> bool {
-        committee_epoch.inner() < self.bridge().inner()
-            && height.inner() > self.attested_frontier.inner()
+        self.replaced(committee_epoch) && height.inner() > self.attested_frontier.inner()
     }
 
     /// Whether work of the shard at `height` anchored at `anchor` is in

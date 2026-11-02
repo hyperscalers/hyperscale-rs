@@ -1067,19 +1067,17 @@ impl TopologySchedule {
     /// Whether `certified`'s block has the shape
     /// [`RecoveryBinding::discards`] names under one of its shard's
     /// recoveries, the pending one included: above that recovery's
-    /// frontier, certified by a committee it replaced
-    /// ([`replaced_by`](Self::replaced_by)). Such a block is a replaced
-    /// committee's. It is off the recovered chain unless a fresh-certified
-    /// block descends from it, as one does from the tail a halt recovery
-    /// harvests.
+    /// frontier, certified by a committee it replaced. Such a block is a
+    /// replaced committee's. It is off the recovered chain unless a
+    /// fresh-certified block descends from it, as one does from the tail
+    /// a halt recovery harvests.
     #[must_use]
     pub fn recovery_discard_shaped(&self, certified: &CertifiedBlockHeader) -> bool {
         let (shard, qc) = (certified.shard_id(), certified.qc());
         !qc.is_genesis()
-            && self.bindings(shard).any(|binding| {
-                binding.discards(certified.height(), qc.committee_epoch())
-                    && self.replaced_by(shard, binding, qc.committee_epoch())
-            })
+            && self
+                .bindings(shard)
+                .any(|binding| binding.discards(certified.height(), qc.committee_epoch()))
     }
 
     /// Whether `anchor` is a boundary the beacon recorded for its shard,
@@ -1143,7 +1141,7 @@ impl TopologySchedule {
 
     /// The signed-epoch fence: `false` for a QC of `shard` whose committee
     /// signed `epoch` while a recovery of the shard is pending and that
-    /// recovery replaced the work ([`Self::replaced_by`]).
+    /// recovery replaced the work ([`RecoveryBinding::replaced`]).
     ///
     /// For the sites that see only *new* production during a recovery:
     /// the beacon's boundary fold, remote headers, sync claims, the reshape
@@ -1161,54 +1159,17 @@ impl TopologySchedule {
     #[must_use]
     pub fn fence_admits(&self, shard: ShardId, epoch: Epoch) -> bool {
         self.recovery_bridge(shard)
-            .is_none_or(|bridge| !self.replaced_at(shard, bridge, epoch))
-    }
-
-    /// Whether a QC of `shard` signed under `epoch` is work `binding`
-    /// replaced: signed below its bridge, by a committee the recovery
-    /// took the shard from.
-    ///
-    /// One exception: where the bridge lies past the shard's terminal cut,
-    /// the fresh committee's window clamps to the shard's terminal window,
-    /// so that epoch is the fresh committee's as much as the retained
-    /// one's, and is not counted replaced. The signed epoch cannot tell
-    /// the two apart there; nothing else can either.
-    #[must_use]
-    pub fn replaced_by(&self, shard: ShardId, binding: RecoveryBinding, epoch: Epoch) -> bool {
-        self.replaced_at(shard, binding.bridge(), epoch)
-    }
-
-    /// [`Self::replaced_by`] for the recovery whose bridge is `bridge`.
-    fn replaced_at(&self, shard: ShardId, bridge: Epoch, epoch: Epoch) -> bool {
-        epoch < bridge && self.clamped_bridge(shard, bridge) != Some(epoch)
+            .is_none_or(|bridge| epoch >= bridge)
     }
 
     /// Whether any recovery the shard's history keeps replaced work signed
-    /// under `epoch` ([`Self::replaced_by`]): the committee that signed it
-    /// is one a recovery took the shard from, so its block is the halted
-    /// suffix, an orphan extending it, or history no later block reads as
-    /// the recovered chain's own.
+    /// under `epoch` ([`RecoveryBinding::replaced`]): the committee that
+    /// signed it is one a recovery took the shard from, so its block is
+    /// the halted suffix, an orphan extending it, or history no later
+    /// block reads as the recovered chain's own.
     #[must_use]
     pub fn replaced(&self, shard: ShardId, epoch: Epoch) -> bool {
-        self.bindings(shard)
-            .any(|binding| self.replaced_by(shard, binding, epoch))
-    }
-
-    /// The shard's terminal window, when `bridge` lies past it: the window
-    /// the bridged committee clamps to. Read off the frozen windows'
-    /// scheduled terminal while the head still runs the shard, and off the
-    /// newest window carrying it once the head does not.
-    fn clamped_bridge(&self, shard: ShardId, bridge: Epoch) -> Option<Epoch> {
-        let terminal = if self.head.shard_trie().contains(shard) {
-            self.head.scheduled_terminal(shard)?
-        } else {
-            self.by_epoch
-                .iter()
-                .rev()
-                .find(|(_, snapshot)| snapshot.shard_trie().contains(shard))
-                .map(|(epoch, _)| *epoch)?
-        };
-        (terminal < bridge).then_some(terminal)
+        self.bindings(shard).any(|binding| binding.replaced(epoch))
     }
 
     /// The committee entry the recovery bridge resolves: the bridge
@@ -1295,9 +1256,8 @@ impl TopologySchedule {
     /// fresh committee that certified there before folding the next
     /// re-draw is still admitted after it.
     ///
-    /// Admitted when some candidate resolves to `epoch`. Two candidates
-    /// that clamp to one terminal window both resolve to it, and either
-    /// admits it. Otherwise the QC waits where this schedule may yet learn
+    /// Admitted when some candidate resolves to `epoch`. Otherwise the QC
+    /// waits where this schedule may yet learn
     /// what places it: a candidate window not committed here, or a head
     /// behind `e`, which may not have folded a binding seated by then. A
     /// binding this head has not folded was seated past it, so its bridge
@@ -3070,64 +3030,6 @@ mod tests {
         assert_eq!(admits(&two, 39, 41), None);
         assert_eq!(admits(&two, 40, 41), Some(41));
         assert_eq!(admits(&two, 45, 41), Some(41));
-    }
-
-    /// A raw and a bridged candidate that clamp to one terminal window
-    /// both admit it, and neither is counted replaced or fenced: the
-    /// signed epoch cannot tell the fresh committee from the retained one
-    /// there.
-    #[test]
-    fn a_bridge_past_the_terminal_cut_admits_the_clamped_window() {
-        let (set, old, fresh) = recovery_committees();
-        let shard = BOUNDED;
-        let carrying = |committee: &[ValidatorId]| seating(&set, committee, None);
-        // The shard runs through epoch 5 and has left the trie by 6; a
-        // recovery seated at 9 bridges to 10, past the cut.
-        let gone = || TopologySnapshot::new(NetworkDefinition::simulator(), 1, set.clone());
-        let head = Arc::new(
-            gone()
-                .with_recoveries(
-                    std::iter::once((
-                        shard,
-                        vec![RecoveryBinding {
-                            rotated_at: Epoch::new(9),
-                            attested_frontier: BlockHeight::GENESIS,
-                            completed: false,
-                        }],
-                    ))
-                    .collect(),
-                )
-                .with_pending_recoveries(
-                    std::iter::once((shard, halt_recovery(9, &old))).collect(),
-                ),
-        );
-        let mut sched = TopologySchedule::new(
-            EpochWindows::new(0, 1000),
-            Epoch::new(5),
-            Arc::new(carrying(&fresh)),
-        );
-        sched.insert(Epoch::new(6), Arc::new(gone()));
-        sched.insert(Epoch::new(10), Arc::clone(&head));
-        sched.set_head(Epoch::new(10), head);
-        let anchor = WeightedTimestamp::from_millis(5_500);
-        for stamp in [5_800, 9_500] {
-            assert_eq!(
-                admitted(
-                    &sched,
-                    shard,
-                    sched.admits_fenced(
-                        shard,
-                        anchor,
-                        WeightedTimestamp::from_millis(stamp),
-                        Epoch::new(5)
-                    )
-                ),
-                fresh,
-            );
-        }
-        assert!(sched.fence_admits(shard, Epoch::new(5)));
-        assert!(!sched.fence_admits(shard, Epoch::new(4)));
-        assert!(!sched.replaced(shard, Epoch::new(5)));
     }
 
     /// A verifier whose beacon has not reached a QC's stamp waits rather

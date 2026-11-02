@@ -8093,12 +8093,9 @@ impl ShardCoordinator {
             .pending_recoveries()
             .get(&self.local_shard)
             && recovery.cause == RecoveryCause::Fork
-            && certified.block().height() > recovery.attested_frontier
-            && topology_schedule.replaced_by(
-                self.local_shard,
-                recovery.binding(),
-                certified.qc().committee_epoch(),
-            )
+            && recovery
+                .binding()
+                .discards(certified.block().height(), certified.qc().committee_epoch())
         {
             warn!(
                 height = certified.block().height().inner(),
@@ -8897,12 +8894,9 @@ impl ShardCoordinator {
             .get(&self.local_shard)
             .is_some_and(|recovery| {
                 recovery.cause == RecoveryCause::Fork
-                    && qc.height() > recovery.attested_frontier
-                    && topology_schedule.replaced_by(
-                        self.local_shard,
-                        recovery.binding(),
-                        qc.committee_epoch(),
-                    )
+                    && recovery
+                        .binding()
+                        .discards(qc.height(), qc.committee_epoch())
             })
     }
 
