@@ -215,7 +215,7 @@ mod tests {
         let mut schedule =
             TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(2), snap(&old));
         schedule.insert(Epoch::new(21), snap(&fresh));
-        schedule.set_head(snap(&fresh));
+        schedule.set_head(Epoch::new(21), snap(&fresh));
         let keys_of = |committee: &[ValidatorId]| -> Vec<ConsensusPublicKey> {
             committee
                 .iter()

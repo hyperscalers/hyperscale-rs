@@ -435,8 +435,8 @@ pub(super) fn terminal_commit(
     // foot is the only thing tying it back down; checked before the
     // signature work, which is the expensive half.
     let check = if terminal_proof.proof.proven_block_hash() == sighting.header.hash() {
-        terminal_proof.check(verifier, view.network(), |anchor_wt, qc_wt| {
-            view.certifying_committee(shard, anchor_wt, qc_wt)
+        terminal_proof.check(verifier, view.network(), |window| {
+            view.certifying_committee(shard, window)
         })
     } else {
         TwoChainCheck::Refuted("the commit proof commits a block other than the terminal")

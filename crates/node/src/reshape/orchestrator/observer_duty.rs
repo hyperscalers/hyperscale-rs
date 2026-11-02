@@ -329,8 +329,8 @@ impl ObserverDuty {
                 // Release whatever the fetched run now proves committed,
                 // each QC verified against the parent committee of its own
                 // window.
-                let proved = tail.prove(verifier, view.network(), |anchor_wt, qc_wt| {
-                    view.certifying_committee(parent, anchor_wt, qc_wt)
+                let proved = tail.prove(verifier, view.network(), |window| {
+                    view.certifying_committee(parent, window)
                 });
                 if let ProveOutcome::Refuted(reason) = proved {
                     tracing::warn!(?child, reason, "dropped an unproven run of parent blocks");
@@ -479,8 +479,8 @@ mod tests {
         StubVmStatics, TestCommittee, signed_child_block, signed_split_terminal, test_key,
     };
     use hyperscale_types::{
-        Block, BlockHash, BlockHeight, ElidedCertifiedBlock, Hash, Inventory, Round, ShardId,
-        SplitChildRoots, StateRoot, ValidatorId, WeightedTimestamp,
+        Block, BlockHash, BlockHeight, ElidedCertifiedBlock, Epoch, Hash, Inventory, Round,
+        ShardId, SplitChildRoots, StateRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -510,16 +510,33 @@ mod tests {
 
         let wt = WeightedTimestamp::from_millis;
         let (anchor_block, anchor) = anchored_block();
-        let b2 = signed_child_block(&committee, &anchor_block, Round::new(2), wt(100));
-        let sibling = signed_child_block(&committee, &anchor_block, Round::new(3), wt(150));
-        let b3 = signed_child_block(&committee, &b2, Round::new(3), wt(200));
+        let b2 = signed_child_block(
+            &committee,
+            &anchor_block,
+            Round::new(2),
+            Epoch::GENESIS,
+            wt(100),
+        );
+        let sibling = signed_child_block(
+            &committee,
+            &anchor_block,
+            Round::new(3),
+            Epoch::GENESIS,
+            wt(150),
+        );
+        let b3 = signed_child_block(&committee, &b2, Round::new(3), Epoch::GENESIS, wt(200));
         let served = |block: &Block| ReshapeEvent::Fetched {
             duty: child,
             from: parent,
             kind: FetchedKind::Block {
                 response: Box::new(GetBlockResponse::found(ElidedCertifiedBlock::elide(
                     block,
-                    committee.sign_qc(block.header(), &committee.quorum_indices(), wt(900)),
+                    committee.sign_qc(
+                        block.header(),
+                        &committee.quorum_indices(),
+                        Epoch::GENESIS,
+                        wt(900),
+                    ),
                     &Inventory::empty(),
                 ))),
             },
@@ -611,15 +628,27 @@ mod tests {
             left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
             right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
         };
-        let b2 = signed_split_terminal(&committee, &anchor_block, Round::new(2), wt(100), pair);
-        let b3 = signed_child_block(&committee, &b2, Round::new(3), wt(200));
+        let b2 = signed_split_terminal(
+            &committee,
+            &anchor_block,
+            Round::new(2),
+            Epoch::GENESIS,
+            wt(100),
+            pair,
+        );
+        let b3 = signed_child_block(&committee, &b2, Round::new(3), Epoch::GENESIS, wt(200));
         let served = |block: &Block| ReshapeEvent::Fetched {
             duty: child,
             from: parent,
             kind: FetchedKind::Block {
                 response: Box::new(GetBlockResponse::found(ElidedCertifiedBlock::elide(
                     block,
-                    committee.sign_qc(block.header(), &committee.quorum_indices(), wt(900)),
+                    committee.sign_qc(
+                        block.header(),
+                        &committee.quorum_indices(),
+                        Epoch::GENESIS,
+                        wt(900),
+                    ),
                     &Inventory::empty(),
                 ))),
             },
@@ -692,16 +721,22 @@ mod tests {
             &committee,
             &anchor_block,
             Round::new(2),
+            Epoch::GENESIS,
             wt(100),
         ));
-        let b3 = signed_child_block(&committee, &b2, Round::new(3), wt(200));
+        let b3 = signed_child_block(&committee, &b2, Round::new(3), Epoch::GENESIS, wt(200));
         let served = |block: &Block| ReshapeEvent::Fetched {
             duty: child,
             from: parent,
             kind: FetchedKind::Block {
                 response: Box::new(GetBlockResponse::found(ElidedCertifiedBlock::elide(
                     block,
-                    committee.sign_qc(block.header(), &committee.quorum_indices(), wt(900)),
+                    committee.sign_qc(
+                        block.header(),
+                        &committee.quorum_indices(),
+                        Epoch::GENESIS,
+                        wt(900),
+                    ),
                     &Inventory::empty(),
                 ))),
             },
@@ -757,6 +792,7 @@ mod tests {
             &committee,
             &anchor_block,
             Round::new(2),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(100),
         );
         let answer = |response: GetBlockResponse| ReshapeEvent::Fetched {
@@ -810,6 +846,7 @@ mod tests {
             committee.sign_qc(
                 b2.header(),
                 &committee.quorum_indices(),
+                Epoch::GENESIS,
                 WeightedTimestamp::from_millis(900),
             ),
             &Inventory::empty(),

@@ -1588,6 +1588,7 @@ pub mod tests {
             BlockHeight::new(reported),
             BlockHash::ZERO,
             Round::new(reported),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -1686,6 +1687,7 @@ pub mod tests {
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(weighted_ms),
@@ -1816,6 +1818,7 @@ pub mod tests {
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(weighted_ms),
@@ -3602,7 +3605,7 @@ pub mod tests {
         for epoch in 6..=20u64 {
             deep.insert(Epoch::new(epoch), Arc::clone(&dropped));
         }
-        deep.set_head(Arc::clone(&dropped));
+        deep.set_head(Epoch::new(20), Arc::clone(&dropped));
         let mut shallow = deep.clone();
         shallow.evict_below(Epoch::new(6));
 

@@ -2541,12 +2541,15 @@ fn shard_fork_resumed() -> (SimCluster, ForkRun) {
         let tip = storage
             .get_certified_header(storage.committed_height())
             .expect("committed tip header");
+        // The proof's blocks anchor their committees at the tip's own
+        // anchor, so they sign the window it resolves for a block built
+        // there.
         let wt = tip.header().parent_qc().weighted_timestamp();
-        let snapshot = schedule
-            .certified_committee(shard, wt, wt)
+        let committee = schedule
+            .live_committee(shard, wt)
             .committee()
-            .expect("the committed tip's committee resolves")
-            .snapshot;
+            .expect("the committed tip's anchor resolves a committee");
+        let (epoch, snapshot) = (committee.epoch, committee.snapshot);
         let keys: Vec<_> = snapshot
             .consensus_committee_for_shard(shard)
             .iter()
@@ -2562,6 +2565,7 @@ fn shard_fork_resumed() -> (SimCluster, ForkRun) {
             &keys,
             shard,
             BlockHeight::new(frozen + 1),
+            epoch,
             wt,
         );
         proof

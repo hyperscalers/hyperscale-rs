@@ -13,9 +13,11 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    BlockResolution, NetworkDefinition, ReshapeSeat, ResolvedCommittee, ShardAnchor, ShardId,
+    NetworkDefinition, QcAdmission, ReshapeSeat, ResolvedCommittee, ShardAnchor, ShardId,
     TopologySchedule, TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
+
+use crate::reshape::observer::QcWindow;
 
 /// The committee that signed one QC, as the schedule resolves it.
 #[derive(Debug, Clone)]
@@ -126,29 +128,24 @@ impl<'a> ReshapeView<'a> {
         self.topology_snapshot().boundary(shard)
     }
 
-    /// The committee that signed a QC of `shard`'s over a block whose
-    /// parent is anchored at `anchor_wt`, the QC itself stamping `qc_wt`.
+    /// The committee that signed a QC of `shard`'s in `window`.
     ///
-    /// Resolved from the schedule's windows rather than the head, so a
-    /// block certified in an earlier window verifies against the set that
-    /// signed it, and a terminating shard's coast QCs clamp to its final
-    /// window. Fenced: a halt recovery's retained cohort, which is beyond
-    /// f, resolves nothing.
+    /// The window the QC's signers signed, admitted at the certified
+    /// block's committee anchor and the QC's stamp, so a block certified in
+    /// an earlier window verifies against the set that signed it, and a
+    /// terminating shard's coast QCs against its final window. Fenced: a
+    /// halt recovery's retained cohort, which is beyond f, resolves
+    /// nothing.
     #[must_use]
-    pub(crate) fn certifying_committee(
-        &self,
-        shard: ShardId,
-        anchor_wt: WeightedTimestamp,
-        qc_wt: WeightedTimestamp,
-    ) -> CommitteeLookup {
+    pub(crate) fn certifying_committee(&self, shard: ShardId, window: QcWindow) -> CommitteeLookup {
         match self
             .schedule
-            .certified_committee_fenced(shard, anchor_wt, qc_wt)
+            .admits_fenced(shard, window.anchor, window.qc_wt, window.epoch)
         {
-            Some(BlockResolution::Committee(committee)) => resolve(committee.snapshot, shard)
+            QcAdmission::Admit(committee) => resolve(committee.snapshot, shard)
                 .map_or(CommitteeLookup::Unresolvable, CommitteeLookup::Resolved),
-            Some(BlockResolution::NotYetCommitted) => CommitteeLookup::Pending,
-            Some(BlockResolution::Evicted) | None => CommitteeLookup::Unresolvable,
+            QcAdmission::Wait => CommitteeLookup::Pending,
+            QcAdmission::Refuse | QcAdmission::Fenced => CommitteeLookup::Unresolvable,
         }
     }
 

@@ -16,11 +16,11 @@ use std::time::Duration;
 use hyperscale_core::{Action, ConsensusAction, HeaderCommittee, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockResolution, CertifiedBlock, CertifiedBlockHeader,
+    BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, CommitProof, CommittedClock, ConsensusPublicKey, ForkFence,
-    HeaderFetchCount, HeaderSource, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup,
-    ShardForkProof, ShardId, TRANSACTION_EVIDENCE_HORIZON, TopologySchedule, TopologySnapshot,
-    TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
+    HeaderFetchCount, HeaderSource, QcAdmission, REMOTE_HEADER_RETENTION, RETENTION_HORIZON,
+    ScheduleLookup, ShardForkProof, ShardId, TRANSACTION_EVIDENCE_HORIZON, TopologySchedule,
+    TopologySnapshot, TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -401,12 +401,12 @@ impl RemoteHeaderCoordinator {
         // the terminal block's canonical QC off the first coast header, so
         // dropping these would blind the fold to the crossing.
         // Recovery-bridged: a halt recovery's bridge header is anchored
-        // below the bridge window but certified at or past it, and
-        // verifies against the fresh committee. A header the fenced lookup
-        // rejects instead resolves the retained committee through the
-        // suffix band — the orphan a beyond-f cohort forged extending the
-        // halted tip; drop it rather than admit a forged header into the
-        // routing view.
+        // below the bridge window but signs it, and verifies against the
+        // fresh committee. A header the signed-epoch fence refuses signs a
+        // window the pending recovery replaced — the orphan a beyond-f
+        // cohort forged extending the halted tip; drop it rather than
+        // admit a forged header into the routing view. A header refused
+        // under a guessed anchor may be honest and waits for its parent.
         let (anchor, named_by) =
             self.committee_anchor_wt(topology_schedule, shard, certified_header.header());
         // A copy identical to one parked for its parent would fail the same
@@ -421,31 +421,30 @@ impl RemoteHeaderCoordinator {
             );
             return vec![];
         }
-        let committee = match topology_schedule.certified_committee_fenced(
-            shard,
-            anchor,
-            certified_header.qc().weighted_timestamp(),
-        ) {
-            None => {
+        let committee = match Self::admit_header(topology_schedule, anchor, &certified_header) {
+            QcAdmission::Admit(committee) => committee.snapshot,
+            QcAdmission::Fenced => {
                 warn!(
                     shard = shard.inner(),
                     height = height.inner(),
                     source = ?source,
-                    "Dropping remote header that resolves the retained committee during a halt recovery"
+                    "Dropping remote header signed under a committee a pending recovery replaced"
                 );
                 return vec![];
             }
-            Some(BlockResolution::Committee(committee)) => committee.snapshot,
-            Some(BlockResolution::NotYetCommitted) => {
+            QcAdmission::Wait => {
                 self.awaiting.push(shard, (source, certified_header));
                 return vec![];
             }
-            Some(BlockResolution::Evicted) => {
+            QcAdmission::Refuse if named_by == HeaderCommittee::Guessed => {
+                return self.await_parent(shard, source, certified_header);
+            }
+            QcAdmission::Refuse => {
                 warn!(
                     shard = shard.inner(),
                     height = height.inner(),
                     source = ?source,
-                    "Remote header's committee epoch is below the schedule floor — dropping"
+                    "Remote header's QC names no committee its parent admits — dropping"
                 );
                 return vec![];
             }
@@ -1664,6 +1663,27 @@ impl RemoteHeaderCoordinator {
         )
     }
 
+    /// What the schedule makes of `certified_header`'s QC at committee
+    /// anchor `anchor`, behind the signed-epoch fence: a remote header is
+    /// new production, and during a recovery the only new production to
+    /// admit is the fresh committee's. A QC with no signers is refused.
+    fn admit_header<'t>(
+        topology_schedule: &'t TopologySchedule,
+        anchor: WeightedTimestamp,
+        certified_header: &CertifiedBlockHeader,
+    ) -> QcAdmission<'t> {
+        let qc = certified_header.qc();
+        if qc.is_genesis() {
+            return QcAdmission::Refuse;
+        }
+        topology_schedule.admits_fenced(
+            certified_header.shard_id(),
+            anchor,
+            qc.weighted_timestamp(),
+            qc.committee_epoch(),
+        )
+    }
+
     /// Dispatch the next candidate at `(shard, height)` whose committee
     /// resolves, once the one in flight there failed. Buffer any whose
     /// epoch the beacon hasn't reached yet so a catch-up retries them, and
@@ -1677,50 +1697,55 @@ impl RemoteHeaderCoordinator {
         shard: ShardId,
         height: BlockHeight,
     ) -> Vec<Action> {
+        let mut fetches = Vec::new();
         loop {
             let next = self
                 .shards
                 .get(&shard)
                 .and_then(|store| store.first_candidate(height));
             let Some((next_source, next_header)) = next else {
-                return Vec::new();
+                return fetches;
             };
             let (anchor, named_by) =
                 self.committee_anchor_wt(topology_schedule, shard, next_header.header());
-            let qc_wt = next_header.qc().weighted_timestamp();
             // A recovery folded (or advanced) after this header buffered can
-            // turn it into a suffix-band orphan the fenced lookup rejects;
-            // drop it and drain the next candidate.
-            match topology_schedule.certified_committee_fenced(shard, anchor, qc_wt) {
-                None => {
-                    warn!(
-                        shard = shard.inner(),
-                        height = height.inner(),
-                        source = ?next_source,
-                        "Dropping buffered remote header that resolves the retained \
-                         committee during a halt recovery"
-                    );
-                    self.drop_candidate(shard, height, next_source);
-                }
-                Some(BlockResolution::Committee(committee)) => {
-                    return Self::emit_verify_qc(
+            // turn it into an orphan the signed-epoch fence refuses; drop it
+            // and drain the next candidate.
+            match Self::admit_header(topology_schedule, anchor, &next_header) {
+                QcAdmission::Admit(committee) => {
+                    fetches.extend(Self::emit_verify_qc(
                         committee.snapshot,
                         named_by,
                         next_source,
                         next_header,
-                    );
+                    ));
+                    return fetches;
                 }
-                Some(BlockResolution::NotYetCommitted) => {
-                    self.drop_candidate(shard, height, next_source);
-                    self.awaiting.push(shard, (next_source, next_header));
-                }
-                Some(BlockResolution::Evicted) => {
+                QcAdmission::Fenced => {
                     warn!(
                         shard = shard.inner(),
                         height = height.inner(),
                         source = ?next_source,
-                        "Pending remote header's committee epoch fell below the \
-                         schedule floor — dropping"
+                        "Dropping buffered remote header signed under a committee a \
+                         pending recovery replaced"
+                    );
+                    self.drop_candidate(shard, height, next_source);
+                }
+                QcAdmission::Wait => {
+                    self.drop_candidate(shard, height, next_source);
+                    self.awaiting.push(shard, (next_source, next_header));
+                }
+                QcAdmission::Refuse if named_by == HeaderCommittee::Guessed => {
+                    self.drop_candidate(shard, height, next_source);
+                    fetches.extend(self.await_parent(shard, next_source, next_header));
+                }
+                QcAdmission::Refuse => {
+                    warn!(
+                        shard = shard.inner(),
+                        height = height.inner(),
+                        source = ?next_source,
+                        "Pending remote header's QC names no committee its parent \
+                         admits — dropping"
                     );
                     self.drop_candidate(shard, height, next_source);
                 }
@@ -2136,6 +2161,7 @@ mod tests {
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -2223,12 +2249,25 @@ mod tests {
         parent_hash: BlockHash,
         parent_qc_wt: u64,
     ) -> CertifiedBlockHeader {
+        chained_remote_header_signed(shard, height, parent_hash, Epoch::GENESIS, parent_qc_wt)
+    }
+
+    /// [`chained_remote_header`] whose QC states `committee_epoch` as the
+    /// window its signers signed.
+    fn chained_remote_header_signed(
+        shard: ShardId,
+        height: BlockHeight,
+        parent_hash: BlockHash,
+        committee_epoch: Epoch,
+        parent_qc_wt: u64,
+    ) -> CertifiedBlockHeader {
         let parent_qc = QuorumCertificate::new(
             parent_hash,
             shard,
             BlockHeight::new(height.inner().saturating_sub(1)),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_qc_wt),
@@ -2247,6 +2286,7 @@ mod tests {
             height,
             BlockHash::ZERO,
             Round::INITIAL,
+            committee_epoch,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_qc_wt),
@@ -2266,6 +2306,7 @@ mod tests {
                 qc.height(),
                 BlockHash::ZERO,
                 Round::new(1),
+                qc.committee_epoch(),
                 SignerBitfield::empty(),
                 AggregateSignature::ZERO,
                 qc.weighted_timestamp(),
@@ -2364,10 +2405,10 @@ mod tests {
         );
     }
 
-    /// A header guessed onto the wrong side of a cut fails, and the
-    /// retention can prune its pending entry before the failure lands. It
-    /// still waits for its parent: the failure carries the header, so
-    /// parking needs no entry in the store.
+    /// A header checked under a guessed committee fails, and the retention
+    /// can prune its pending entry before the failure lands. It still waits
+    /// for its parent: the failure carries the header, so parking needs no
+    /// entry in the store.
     #[test]
     fn a_failed_header_pruned_while_in_flight_still_waits_for_its_parent() {
         const ED: u64 = 100_000;
@@ -2375,10 +2416,10 @@ mod tests {
         let ids = [0u64, 1, 2, 3];
         let epoch0 = Arc::new(shard_snapshot(2, &ids, 0));
         let epoch1 = Arc::new(shard_snapshot(2, &ids, 1));
-        let expected0: Vec<ConsensusPublicKey> = epoch0
+        let expected1: Vec<ConsensusPublicKey> = epoch1
             .committee_for_shard(remote)
             .iter()
-            .map(|v| epoch0.public_key(*v).unwrap())
+            .map(|v| epoch1.public_key(*v).unwrap())
             .collect();
 
         let mut schedule =
@@ -2387,14 +2428,31 @@ mod tests {
 
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
 
-        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
-        let child =
-            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+        let parent = chained_remote_header_signed(
+            remote,
+            BlockHeight::new(5),
+            BlockHash::ZERO,
+            Epoch::new(1),
+            ED + 1,
+        );
+        let child = chained_remote_header_signed(
+            remote,
+            BlockHeight::new(6),
+            parent.header().hash(),
+            Epoch::new(1),
+            ED + 2,
+        );
         let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
 
         // The shard's tip lands far past the retention while the child's
         // verification is in flight, pruning its pending entry.
-        let tip = chained_remote_header(remote, BlockHeight::new(50), BlockHash::ZERO, 2 * ED - 1);
+        let tip = chained_remote_header_signed(
+            remote,
+            BlockHeight::new(50),
+            BlockHash::ZERO,
+            Epoch::new(1),
+            2 * ED - 1,
+        );
         let _ = coord.on_remote_header_received(&schedule, tip, gossip(1));
         assert!(coord.get_pending(remote, BlockHeight::new(6)).is_none());
 
@@ -2421,7 +2479,7 @@ mod tests {
         );
         assert_eq!(
             verify_qc_keys(&actions),
-            Some(&expected0),
+            Some(&expected1),
             "the waiting header re-dispatches under the window its parent anchors",
         );
     }
@@ -2491,13 +2549,14 @@ mod tests {
         })
     }
 
-    /// A header checked under a guessed committee can fail after its parent
-    /// arrives. The failure is judged by the committee it was checked
-    /// under, not the one the coordinator could resolve by then: the header
-    /// is checked again at once under its parent's window rather than
-    /// dropped as though its own certificate were false.
+    /// A header whose parent is not held guesses its committee anchor from
+    /// its own, which across an epoch cut names a window its signed epoch
+    /// is not admitted in. That refusal is the guess's, not the header's:
+    /// nothing is checked under the guess, the gap up to the parent is
+    /// fetched, and once the parent lands the header is checked under the
+    /// parent's window.
     #[test]
-    fn a_header_whose_parent_lands_during_a_guessed_check_is_checked_again() {
+    fn a_guessed_anchor_across_a_cut_waits_for_the_parent() {
         const ED: u64 = 1_000;
         let remote = ShardId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3];
@@ -2516,30 +2575,30 @@ mod tests {
         let child =
             chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
 
-        let actions = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
+        let actions = coord.on_remote_header_received(&schedule, child, gossip(1));
         assert_eq!(
             verify_qc_committee(&actions),
-            Some(HeaderCommittee::Guessed)
+            None,
+            "nothing checked under the guess"
         );
-        let _ = coord.on_verified_remote_header_received(
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::FetchCommitProof { source_shard, from_height, .. }
+                    if *source_shard == remote && *from_height <= BlockHeight::new(5)
+            )),
+            "the gap up to the parent is fetched",
+        );
+
+        let actions = coord.on_verified_remote_header_received(
             &schedule,
             Verified::new_unchecked_for_test(parent),
             ValidatorId::new(1),
         );
-
-        let actions = coord.on_remote_header_qc_verified(
-            &schedule,
-            &child,
-            gossip(1),
-            Err(CertifiedHeaderVerifyError::Qc(
-                QcVerifyError::InvalidSignature,
-            )),
-            HeaderCommittee::Guessed,
-        );
         assert_eq!(
             verify_qc_keys(&actions),
             Some(&expected0),
-            "the header is checked again under the window its parent anchors",
+            "the header is checked under the window its parent anchors",
         );
         assert_eq!(
             verify_qc_committee(&actions),
@@ -2558,10 +2617,10 @@ mod tests {
     }
 
     /// A header that fails verification under a committee its own anchor
-    /// guessed — no parent held — is not dropped: across an epoch cut the
-    /// guess names the wrong window. It waits, the gap up to its parent is
-    /// fetched, and once the parent is held it verifies under the parent's
-    /// window.
+    /// guessed — no parent held — is not dropped: the guess may be wrong
+    /// for the signers where the epoch is not. It waits, the gap up to its
+    /// parent is fetched, and once the parent is held it verifies under
+    /// the parent's window.
     #[test]
     fn a_header_that_failed_without_its_parent_waits_and_fetches_it() {
         const ED: u64 = 1_000;
@@ -2575,14 +2634,25 @@ mod tests {
                 .map(|v| snap.public_key(*v).unwrap())
                 .collect()
         };
-        let (expected0, expected1) = (keys_of(&epoch0), keys_of(&epoch1));
+        let expected1 = keys_of(&epoch1);
         let mut schedule = TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), epoch0);
         schedule.insert(Epoch::new(1), epoch1);
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
 
-        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
-        let child =
-            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+        let parent = chained_remote_header_signed(
+            remote,
+            BlockHeight::new(5),
+            BlockHash::ZERO,
+            Epoch::new(1),
+            ED + 1,
+        );
+        let child = chained_remote_header_signed(
+            remote,
+            BlockHeight::new(6),
+            parent.header().hash(),
+            Epoch::new(1),
+            ED + 2,
+        );
 
         let actions = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
         assert_eq!(
@@ -2617,7 +2687,7 @@ mod tests {
         );
         assert_eq!(
             verify_qc_keys(&actions),
-            Some(&expected0),
+            Some(&expected1),
             "the waiting header re-dispatches under the window its parent anchors",
         );
         assert_eq!(
@@ -2704,19 +2774,11 @@ mod tests {
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
 
         let child = chained_remote_header(remote, BlockHeight::new(6), boundary_hash, ED + 1);
-        let actions = coord.on_remote_header_received(&before, child.clone(), gossip(1));
+        let actions = coord.on_remote_header_received(&before, child, gossip(1));
         assert_eq!(
             verify_qc_committee(&actions),
-            Some(HeaderCommittee::Guessed)
-        );
-        let _ = coord.on_remote_header_qc_verified(
-            &before,
-            &child,
-            gossip(1),
-            Err(CertifiedHeaderVerifyError::Qc(
-                QcVerifyError::InvalidSignature,
-            )),
-            HeaderCommittee::Guessed,
+            None,
+            "the guess across the cut admits nothing, so the header parks",
         );
 
         let actions = coord.on_beacon_block_persisted(&after);
@@ -2754,9 +2816,20 @@ mod tests {
         schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
 
-        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
-        let child =
-            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+        let parent = chained_remote_header_signed(
+            remote,
+            BlockHeight::new(5),
+            BlockHash::ZERO,
+            Epoch::new(1),
+            ED + 1,
+        );
+        let child = chained_remote_header_signed(
+            remote,
+            BlockHeight::new(6),
+            parent.header().hash(),
+            Epoch::new(1),
+            ED + 2,
+        );
         let _ = coord.on_remote_header_received(&schedule, child.clone(), gossip(1));
         let _ = coord.on_remote_header_qc_verified(
             &schedule,
@@ -2864,7 +2937,9 @@ mod tests {
             QcVerifyError::InvalidSignature,
         ));
 
-        let in_flight = chained_remote_header(remote, height, BlockHash::ZERO, 2 * ED - 2);
+        let window = Epoch::new(1);
+        let in_flight =
+            chained_remote_header_signed(remote, height, BlockHash::ZERO, window, 2 * ED - 2);
         let checked = CertifiedBlockHeader::new(
             in_flight.header().clone(),
             QuorumCertificate::new(
@@ -2873,6 +2948,7 @@ mod tests {
                 height,
                 BlockHash::ZERO,
                 Round::INITIAL,
+                window,
                 SignerBitfield::empty(),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(ED + 1),
@@ -2882,13 +2958,20 @@ mod tests {
             coord.on_remote_header_received(&schedule, checked.clone(), HeaderSource::Fetched);
         assert_eq!(verify_qc_count(&actions), 1);
 
-        let tip = chained_remote_header(remote, BlockHeight::new(50), BlockHash::ZERO, 2 * ED - 1);
+        let tip = chained_remote_header_signed(
+            remote,
+            BlockHeight::new(50),
+            BlockHash::ZERO,
+            window,
+            2 * ED - 1,
+        );
         let _ = coord.on_remote_header_received(&schedule, tip, gossip(1));
         assert!(coord.get_pending(remote, height).is_none());
 
         let actions = coord.on_remote_header_received(&schedule, in_flight.clone(), gossip(2));
         assert_eq!(verify_qc_count(&actions), 1);
-        let unchecked = chained_remote_header(remote, height, BlockHash::ZERO, 2 * ED - 3);
+        let unchecked =
+            chained_remote_header_signed(remote, height, BlockHash::ZERO, window, 2 * ED - 3);
         let actions =
             coord.on_remote_header_received(&schedule, unchecked.clone(), HeaderSource::Fetched);
         assert_eq!(
@@ -3083,7 +3166,7 @@ mod tests {
         let mut sched =
             TopologySchedule::new(EpochWindows::new(0, ED), Epoch::new(0), Arc::clone(&pre));
         sched.insert(Epoch::new(1), Arc::clone(&post));
-        sched.set_head(post);
+        sched.set_head(Epoch::new(1), post);
 
         let mut coord = RemoteHeaderCoordinator::new(left);
         coord.refresh_expected(&sched);
@@ -3552,12 +3635,26 @@ mod tests {
         chain_header_dated(shard, height, round, parent, height * 1_000)
     }
 
-    /// [`chain_header`] with its anchor and certificate dated `ms`.
+    /// [`chain_header`] with its anchor and certificate dated `ms`, signed
+    /// under the second-long window `ms` falls in: the committee an
+    /// unbridged block anchored there is certified by.
     fn chain_header_dated(
         shard: ShardId,
         height: u64,
         round: u64,
         parent: Option<&Verified<CertifiedBlockHeader>>,
+        ms: u64,
+    ) -> Verified<CertifiedBlockHeader> {
+        chain_header_signed(shard, height, round, parent, Epoch::new(ms / 1_000), ms)
+    }
+
+    /// [`chain_header_dated`] signed under `committee_epoch`.
+    fn chain_header_signed(
+        shard: ShardId,
+        height: u64,
+        round: u64,
+        parent: Option<&Verified<CertifiedBlockHeader>>,
+        committee_epoch: Epoch,
         ms: u64,
     ) -> Verified<CertifiedBlockHeader> {
         let parent_hash = parent.map_or_else(
@@ -3570,6 +3667,7 @@ mod tests {
             BlockHeight::new(height.saturating_sub(1)),
             BlockHash::ZERO,
             Round::new(round.saturating_sub(1)),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(ms),
@@ -3589,6 +3687,7 @@ mod tests {
             BlockHeight::new(height),
             parent_hash,
             Round::new(round),
+            committee_epoch,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(ms),
@@ -4602,6 +4701,58 @@ mod tests {
         )
     }
 
+    /// The seating-epoch forgery at remote-header intake. A header anchored
+    /// on the halted tip (epoch 2), whose QC signs that window and is
+    /// stamped in the epoch the recovery was seated (9, bridge 10), is
+    /// admitted by the stamp's interval and verifies under the replaced
+    /// committee's keys: the signed-epoch fence drops it, with no check and
+    /// no fetch for its parent, since no parent changes the verdict. The
+    /// fresh committee's bridge header, signed under 10 at the same stamp,
+    /// is checked.
+    #[test]
+    fn a_retained_quorum_stamped_in_the_seating_epoch_is_fenced() {
+        let remote = ShardId::leaf(1, 1);
+        let schedule = schedule_under(recovery_head(remote, Recovery::Pending));
+        let stamped = |epoch: u64, stamp: u64| {
+            let anchored = chained_remote_header_signed(
+                remote,
+                BlockHeight::new(9),
+                BlockHash::from_raw(Hash::from_bytes(b"halted tip")),
+                Epoch::new(epoch),
+                2_500,
+            );
+            let qc = anchored.qc();
+            CertifiedBlockHeader::new(
+                anchored.header().clone(),
+                QuorumCertificate::new(
+                    qc.block_hash(),
+                    qc.shard_id(),
+                    qc.height(),
+                    qc.parent_block_hash(),
+                    qc.round(),
+                    qc.committee_epoch(),
+                    SignerBitfield::empty(),
+                    AggregateSignature::ZERO,
+                    WeightedTimestamp::from_millis(stamp),
+                ),
+            )
+        };
+        for stamp in [9_100, 9_900] {
+            let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+            let actions = coord.on_remote_header_received(&schedule, stamped(2, stamp), gossip(1));
+            assert_eq!(verify_qc_count(&actions), 0, "fenced at {stamp}");
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::FetchCommitProof { .. })),
+                "a fenced header waits for no parent",
+            );
+        }
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+        let actions = coord.on_remote_header_received(&schedule, stamped(10, 9_100), gossip(1));
+        assert_eq!(verify_qc_count(&actions), 1, "the bridge header is checked");
+    }
+
     /// A schedule of second-long epochs headed by `head` at epoch 11,
     /// every earlier epoch seating the same committee.
     fn schedule_under(head: TopologySnapshot) -> TopologySchedule {
@@ -4914,7 +5065,7 @@ mod tests {
         let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
         commit_local(&mut coord, &cleared, 1);
 
-        let bridge = chain_header_dated(remote, 5, 5, None, 9_500);
+        let bridge = chain_header_signed(remote, 5, 5, None, Epoch::new(10), 9_500);
         let child = chain_header_dated(remote, 6, 6, Some(&bridge), 10_100);
         coord.on_verified_remote_header_received(&cleared, bridge.clone(), ValidatorId::new(1));
         let actions =
@@ -5166,6 +5317,7 @@ mod tests {
             BlockHeight::new(height - 1),
             BlockHash::ZERO,
             Round::new(round.saturating_sub(1)),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_ms),
@@ -5185,6 +5337,7 @@ mod tests {
             BlockHeight::new(height),
             parent.block_hash(),
             Round::new(round),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(qc_ms),

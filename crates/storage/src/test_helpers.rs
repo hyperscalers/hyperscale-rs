@@ -326,6 +326,7 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
         block.height(),
         block.header().parent_block_hash(),
         Round::INITIAL,
+        Epoch::GENESIS,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),

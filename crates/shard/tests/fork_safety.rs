@@ -25,8 +25,8 @@ use common::{HoldFilter, ShardCoordinatorSim, build_genesis_block, perturb_heade
 use hyperscale_core::ConsensusAction;
 use hyperscale_storage::SafeVoteRegisterStore;
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, ProposerTimestamp, Round,
-    SafeVoteRegisters, ShardId, ValidatorId, VotePosition,
+    BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, Epoch, ProposerTimestamp,
+    Round, SafeVoteRegisters, ShardId, ValidatorId, VotePosition,
 };
 
 const MAX_STEPS: usize = 5_000;
@@ -374,6 +374,7 @@ fn a_header_signs_after_its_position_is_durable_and_its_self_vote_writes_nothing
             parent_block_hash: header.parent_block_hash(),
             height: header.height(),
             round: header.round(),
+            committee_epoch: Epoch::GENESIS,
             timestamp: ProposerTimestamp::ZERO,
             next_proposers: Vec::new(),
             position,

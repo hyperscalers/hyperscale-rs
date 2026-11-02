@@ -1254,11 +1254,11 @@ mod tests {
         }
     }
 
-    /// A block whose parent sits in a recovery's suffix band asserts no
-    /// trigger, draining or not: its settling is not read, and its byte
-    /// total is out of play.
+    /// A block whose parent a committee a recovery replaced certified
+    /// asserts no trigger, draining or not: its settling is not read, and
+    /// its byte total is out of play.
     #[test]
-    fn a_suffix_band_block_asserts_no_trigger() {
+    fn a_block_over_a_replaced_committees_parent_asserts_no_trigger() {
         let shard = ShardId::leaf(1, 0);
         let draining =
             snapshot_with_base(shard, 0).with_draining(BTreeMap::from([(shard, Epoch::new(2))]));

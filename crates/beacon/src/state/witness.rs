@@ -1307,9 +1307,11 @@ mod tests {
             round: Round::new(2),
             block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
             parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
+            committee_epoch_a: Epoch::GENESIS,
             sig_a: ConsensusSignature::ZERO,
             block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
             parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
+            committee_epoch_b: Epoch::GENESIS,
             sig_b: ConsensusSignature::ZERO,
         };
         let target_epoch = state.current_epoch.next();
@@ -2591,6 +2593,7 @@ mod tests {
                 shard,
                 height,
                 round,
+                Epoch::GENESIS,
                 voter,
                 &sk,
                 ProposerTimestamp::ZERO,
@@ -2607,9 +2610,11 @@ mod tests {
             round,
             block_hash_a,
             parent_block_hash_a,
+            committee_epoch_a: Epoch::GENESIS,
             sig_a,
             block_hash_b,
             parent_block_hash_b,
+            committee_epoch_b: Epoch::GENESIS,
             sig_b,
         }
     }

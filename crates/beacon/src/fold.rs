@@ -627,7 +627,7 @@ impl BeaconFold {
         let head = Arc::new(self.state.derive_topology_snapshot(self.network.clone()));
         let epoch = self.state.current_epoch;
         let schedule = Arc::make_mut(&mut self.topology_schedule);
-        schedule.set_head(Arc::clone(&head));
+        schedule.set_head(epoch, Arc::clone(&head));
         schedule.insert(epoch, head);
         let lookahead = Arc::new(
             self.state

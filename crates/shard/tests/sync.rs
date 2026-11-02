@@ -6,8 +6,8 @@ use common::{HoldFilter, ShardCoordinatorSim};
 use hyperscale_types::test_utils::verified_test_transaction;
 use hyperscale_types::{
     AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest,
-    CertifiedBlock, Hash, ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, ValidatorId,
-    WeightedTimestamp,
+    CertifiedBlock, Epoch, Hash, ProposerTimestamp, QuorumCertificate, Round, SignerBitfield,
+    ValidatorId, WeightedTimestamp,
 };
 
 const MAX_STEPS: usize = 10_000;
@@ -197,6 +197,7 @@ fn a_forged_parent_certificate_starts_no_sync() {
         claimed_height,
         BlockHash::ZERO,
         claimed_round,
+        Epoch::GENESIS,
         signers,
         AggregateSignature::ZERO,
         WeightedTimestamp::ZERO,

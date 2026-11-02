@@ -1938,7 +1938,7 @@ pub(crate) mod fixtures {
         for epoch in 1..=20u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&after));
         }
-        sched.set_head(after);
+        sched.set_head(Epoch::new(20), after);
         sched
     }
 }
@@ -2669,7 +2669,7 @@ mod state_claim_tests {
             let snapshot = if epoch < LATER_LIFE { &earlier } else { &later };
             schedule.insert(Epoch::new(epoch), Arc::clone(snapshot));
         }
-        schedule.set_head(Arc::clone(&later));
+        schedule.set_head(Epoch::new(20), Arc::clone(&later));
         let mut against = Against::schedule((*later).clone(), schedule);
         against.local_shard = local;
         against.anchor = WeightedTimestamp::from_millis(10_000);

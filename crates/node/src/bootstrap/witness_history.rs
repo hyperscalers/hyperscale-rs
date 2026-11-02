@@ -305,6 +305,7 @@ mod tests {
             anchor.height,
             BlockHash::from_raw(Hash::from_bytes(b"attested parent")),
             served.round(),
+            served.committee_epoch(),
             served.signers().clone(),
             served.aggregated_signature(),
             served.weighted_timestamp(),

@@ -704,6 +704,7 @@ mod tests {
             &committee,
             &make_test_block(BlockHeight::new(6)),
             Round::new(2),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(100),
             pair,
         )

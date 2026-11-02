@@ -480,7 +480,10 @@ mod tests {
         for (at, boundary) in boundaries.iter().enumerate() {
             schedule.insert(Epoch::new(at as u64 + 1), snapshot(Some(boundary)));
         }
-        schedule.set_head(snapshot(boundaries.last()));
+        schedule.set_head(
+            Epoch::new(boundaries.len() as u64),
+            snapshot(boundaries.last()),
+        );
         schedule
     }
 
@@ -492,6 +495,7 @@ mod tests {
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::new(5),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(anchor_ms),

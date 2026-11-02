@@ -491,7 +491,7 @@ const ANSWERED_SUFFIX_CLOSING_EIGHTHS: u64 = 6;
 /// re-bases one, so its leaders build blocks that add nothing. Biting
 /// on the band needs a fresh leader holding a count over voters that
 /// hold none, which no harness seam arranges; the band's rule is the
-/// coordinator's `a_block_with_its_parent_in_a_suffix_band_is_not_capped`.
+/// coordinator's `a_block_over_a_replaced_committees_parent_is_not_capped`.
 ///
 /// Requires [`halt_straddler_setup`] at genesis and two committees'
 /// worth of pool surplus, as [`halted_shard_recovers_by_committee_redraw`]

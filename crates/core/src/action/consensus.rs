@@ -60,6 +60,9 @@ pub enum ConsensusAction {
         height: BlockHeight,
         /// Round at which the vote is being cast.
         round: Round,
+        /// The epoch keying the window whose committee the voter judged
+        /// the block under, bound into the vote signature.
+        committee_epoch: Epoch,
         /// Voter's local timestamp at vote time. Aggregated stake-weighted
         /// across votes into the QC's `weighted_timestamp` — the BFT clock.
         timestamp: ProposerTimestamp,
@@ -192,6 +195,9 @@ pub enum ConsensusAction {
         height: BlockHeight,
         /// Round number.
         round: Round,
+        /// The committee epoch the block's vote set latched: every vote
+        /// batched here signed it, and so does the QC.
+        committee_epoch: Epoch,
         /// Parent block hash (from the block's header).
         parent_block_hash: BlockHash,
         /// Parent QC's `weighted_timestamp` — monotonicity floor applied to

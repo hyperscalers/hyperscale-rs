@@ -616,7 +616,7 @@ mod settled_txs_tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ConsensusReceipt,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ConsensusReceipt, Epoch,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
         ProposerTimestamp, QuorumCertificate, Role, Round, SectionRoots, SettledTxsRoot,
         SignerBitfield, StateWrites, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome, Verified,
@@ -686,6 +686,7 @@ mod settled_txs_tests {
                 BlockHeight::new(h.saturating_sub(1)),
                 BlockHash::ZERO,
                 Round::INITIAL,
+                Epoch::GENESIS,
                 SignerBitfield::new(4),
                 AggregateSignature::new([0u8; 96]),
                 WeightedTimestamp::from_millis(1_000 * h),

@@ -47,7 +47,7 @@ use hyperscale_storage::{
 use hyperscale_types::test_utils::{finalization_of, make_finalization};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
-    ConsensusReceipt, DiscardCause, ExecutionOutcome, Finalization, FinalizationHash,
+    ConsensusReceipt, DiscardCause, Epoch, ExecutionOutcome, Finalization, FinalizationHash,
     FrontierInputs, GlobalReceiptHash, Hash, Provision, QuorumCertificate, Role, Round, ShardId,
     StateWrites, StoredReceipt, SweepFrontier, SyncHint, TickHalf, TickId, TickLine, TickManifest,
     TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, WeightedTimestamp,
@@ -347,6 +347,7 @@ fn test_recovery_with_qc() {
             BlockHeight::new(100),
             BlockHash::from_raw(Hash::from_bytes(&[98; 32])),
             Round::new(5),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),

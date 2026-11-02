@@ -950,7 +950,7 @@ mod tests {
 
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
-        AggregateSignature, Block, BlockHeader, BlockHeaderParts, ChainOrigin, Hash,
+        AggregateSignature, Block, BlockHeader, BlockHeaderParts, ChainOrigin, Epoch, Hash,
         ProposerTimestamp, Round, ShardId, SignerBitfield, WeightedTimestamp, WitnessSources,
     };
 
@@ -998,6 +998,7 @@ mod tests {
             height,
             BlockHash::ZERO,
             Round::new(height.inner()),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -1664,6 +1665,7 @@ mod tests {
             height,
             BlockHash::ZERO,
             Round::new(height.inner()),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

@@ -277,9 +277,9 @@ pub use time::timestamp::{CommittedClock, LocalTimestamp, ProposerTimestamp, Wei
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
-    BlockCommittee, BlockResolution, BoundaryAttestation, Formed, Reshaping, RoutingCommittees,
-    ScheduleLookup, SigningAnchor, SplitAtBoundary, Terminating, TopologySchedule, Unpublished,
-    WindowLookup, WindowView,
+    BlockCommittee, BlockResolution, BoundaryAttestation, Formed, QcAdmission, Reshaping,
+    RoutingCommittees, ScheduleLookup, SigningAnchor, SplitAtBoundary, Terminating,
+    TopologySchedule, Unpublished, WindowLookup, WindowView,
 };
 pub use topology::settled_set::{Evidence, SettledTxSet, TerminalEvidence, partner_evidence};
 pub use topology::shard_prefix::shard_prefix_path;

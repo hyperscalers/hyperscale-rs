@@ -992,30 +992,6 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// The committee `certified`'s provision roots were computed under:
-    /// the one that certified it, resolved at `committee_anchor` with its
-    /// QC's timestamp in hand. A block a halt recovery's fresh committee
-    /// built over the halted tip resolves the window that committee was
-    /// seated in, as its proposer did, while the halted suffix resolves
-    /// its own windows. `anchored`, the block's classification, where the
-    /// certified window is not held here.
-    fn provisioned_committee<'t>(
-        &self,
-        topology_schedule: &'t TopologySchedule,
-        anchored: &'t TopologySnapshot,
-        certified: &CertifiedBlock,
-        committee_anchor: WeightedTimestamp,
-    ) -> &'t TopologySnapshot {
-        topology_schedule
-            .certified_committee(
-                self.local_shard,
-                committee_anchor,
-                certified.qc().weighted_timestamp(),
-            )
-            .committee()
-            .map_or(anchored, |committee| committee.snapshot.as_ref())
-    }
-
     /// The trie that says who was party to a transaction, off the latest
     /// committed block's anchored committee; `None` while that window is
     /// not committed here.
@@ -3425,13 +3401,24 @@ impl ExecutionCoordinator {
         actions.extend(self.drain_ready_tick_resolutions());
 
         let mut named = Vec::new();
-        let provisioned =
-            self.provisioned_committee(topology_schedule, anchored, certified, committee_anchor);
+        // The committee the block was certified under, whose window its
+        // proposer computed the provision roots in: the one the QC its
+        // child pins signed. A block a halt recovery's fresh committee
+        // built over the halted tip signs the window that committee was
+        // seated in, while the halted suffix signs its own windows.
+        let signed = Some(certified.qc())
+            .filter(|qc| !qc.is_genesis())
+            .and_then(|qc| {
+                topology_schedule
+                    .signed_committee(self.local_shard, qc.committee_epoch())
+                    .committee()
+            })
+            .map_or(anchored, |committee| committee.snapshot.as_ref());
         actions.extend(self.on_block_committed(
             &mut named,
             topology_schedule,
             anchored,
-            provisioned,
+            signed,
             block,
             match naming {
                 Naming::Manifest => Named::Lines(block.tick_manifest()),
@@ -3455,13 +3442,14 @@ impl ExecutionCoordinator {
     /// it, and the pushes queued for the next. Nothing on a block this
     /// replica cannot run.
     ///
-    /// The provisions route under `provisioned`, the committee the
-    /// header's roots were computed under, so each part walks to its
-    /// target's root; the crossing pushes route under `anchored`.
+    /// The provisions route under `signed`, the committee the block's QC
+    /// signed, under which the header's roots were computed, so each part
+    /// walks to its target's root; the crossing pushes route under
+    /// `anchored`.
     fn pushes(
         &mut self,
         anchored: &TopologySnapshot,
-        provisioned: &TopologySnapshot,
+        signed: &TopologySnapshot,
         committed: &Block,
         runnable: bool,
     ) -> Vec<Action> {
@@ -3482,7 +3470,7 @@ impl ExecutionCoordinator {
         if runnable && self.signers.contains(&proposer) {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
-                build_provision_requests(provisioned, transactions, &self.signers, local_shard)
+                build_provision_requests(signed, transactions, &self.signers, local_shard)
             {
                 actions.push(Action::Provisions(
                     ProvisionAction::FetchAndBroadcastProvisions {
@@ -3560,7 +3548,7 @@ impl ExecutionCoordinator {
         seated: &mut Vec<TickLine>,
         topology_schedule: &TopologySchedule,
         anchored: &TopologySnapshot,
-        provisioned: &TopologySnapshot,
+        signed: &TopologySnapshot,
         committed: &Block,
         named: Named<'_>,
     ) -> Vec<Action> {
@@ -3579,7 +3567,7 @@ impl ExecutionCoordinator {
         // hold.
         let runnable = committed.is_live() && height >= self.dispatch_from;
 
-        actions.extend(self.pushes(anchored, provisioned, committed, runnable));
+        actions.extend(self.pushes(anchored, signed, committed, runnable));
 
         let block = CommittingBlock {
             hash: block_hash,
@@ -8904,7 +8892,7 @@ mod tests {
         let mut schedule =
             TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(2), snap(&old));
         schedule.insert(Epoch::new(21), Arc::clone(&fresh_snap));
-        schedule.set_head(fresh_snap);
+        schedule.set_head(Epoch::new(21), fresh_snap);
         (schedule, old, fresh)
     }
 
@@ -9311,12 +9299,15 @@ mod tests {
         }
         // The same windows before this replica folded the recovery.
         let mut unfolded = schedule.clone();
-        unfolded.set_head(Arc::new(
-            (**schedule.head())
-                .clone()
-                .with_pending_recoveries(BTreeMap::new())
-                .with_recoveries(BTreeMap::new()),
-        ));
+        unfolded.set_head(
+            Epoch::new(21),
+            Arc::new(
+                (**schedule.head())
+                    .clone()
+                    .with_pending_recoveries(BTreeMap::new())
+                    .with_recoveries(BTreeMap::new()),
+            ),
+        );
         for me in [old[0], fresh[0]] {
             for (height, anchor_ms) in [(frontier.next(), 2_500), (frontier, 2_400)] {
                 let mut seated = make_test_state_for(me);
@@ -9775,7 +9766,7 @@ mod tests {
             Epoch::new(0),
             Arc::clone(&one_shard),
         );
-        sched.set_head(two_shards);
+        sched.set_head(Epoch::new(0), two_shards);
 
         let block_at = |height: u64, anchor_ms: u64| {
             test_certify(
@@ -9840,7 +9831,7 @@ mod tests {
             Arc::clone(&pre_split),
         );
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
-        sched.set_head(post_split);
+        sched.set_head(Epoch::new(1), post_split);
 
         let at = WeightedTimestamp::from_millis(500);
         let anchored = state
@@ -9897,7 +9888,7 @@ mod tests {
         // carried, and what a node further along the fold holds.
         let mut sched =
             TopologySchedule::new(EpochWindows::new(0, ED), Epoch::GENESIS, seeded(0xA1));
-        sched.set_head(seeded(0xB2));
+        sched.set_head(Epoch::GENESIS, seeded(0xB2));
 
         let block = make_live_block(
             BlockHeight::new(1),
@@ -12138,6 +12129,7 @@ mod tests {
             qc.height(),
             qc.parent_block_hash(),
             qc.round(),
+            qc.committee_epoch(),
             qc.signers().clone(),
             qc.aggregated_signature(),
             WeightedTimestamp::from_millis(qc_ms),
@@ -12225,7 +12217,7 @@ mod tests {
         for epoch in 1..=12u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&post));
         }
-        sched.set_head(post);
+        sched.set_head(Epoch::new(12), post);
         sched
     }
 
@@ -14815,7 +14807,7 @@ mod tests {
         for epoch in 1..=12u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&post));
         }
-        sched.set_head(post);
+        sched.set_head(Epoch::new(12), post);
         sched
     }
 
@@ -14841,7 +14833,7 @@ mod tests {
         for epoch in 1..=12u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&post));
         }
-        sched.set_head(post);
+        sched.set_head(Epoch::new(12), post);
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state.committed_ts = WeightedTimestamp::from_millis(1_500);
         (state, sched)
@@ -15078,7 +15070,7 @@ mod tests {
         for epoch in 2..=12u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&post));
         }
-        sched.set_head(post);
+        sched.set_head(Epoch::new(12), post);
         sched
     }
 
@@ -17743,7 +17735,7 @@ mod tests {
         schedule.insert(Epoch::new(21), window(&grown));
         let head = window(&ShardTrie::uniform(1));
         schedule.insert(Epoch::new(22), Arc::clone(&head));
-        schedule.set_head(head);
+        schedule.set_head(Epoch::new(22), head);
 
         let payer = PrincipalAddr::new([0x80; 31]);
         let target = ShardId::leaf(2, 2);
@@ -17761,7 +17753,10 @@ mod tests {
         let proposer = ValidatorId::new(0);
         // A block of the halted suffix, certified below the bridge by the
         // committee that halted, routes under its own window.
-        for (certified_ms, routed) in [(22_500, target), (3_500, ShardId::leaf(1, 1))] {
+        for (certified_ms, signed, routed) in [
+            (22_500, Epoch::new(21), target),
+            (3_500, Epoch::new(2), ShardId::leaf(1, 1)),
+        ] {
             let mut state = make_test_state_for_shard(proposer, local);
             let block = make_live_block_on_shard(
                 local,
@@ -17770,9 +17765,26 @@ mod tests {
                 proposer,
                 vec![tx.clone()],
             );
+            let certified = test_certify(block, certified_ms);
+            let qc = certified.qc();
+            let qc = QuorumCertificate::new(
+                qc.block_hash(),
+                qc.shard_id(),
+                qc.height(),
+                qc.parent_block_hash(),
+                qc.round(),
+                signed,
+                qc.signers().clone(),
+                qc.aggregated_signature(),
+                qc.weighted_timestamp(),
+            );
+            let certified = CertifiedBlock::new_unchecked(
+                certified.block().clone(),
+                Verified::new_unchecked_for_test(qc),
+            );
             let effects = state.commit_block_composing(
                 &schedule,
-                &test_certify(block, certified_ms),
+                &certified,
                 WeightedTimestamp::from_millis(2_500),
             );
             let targets: Vec<ShardId> = effects

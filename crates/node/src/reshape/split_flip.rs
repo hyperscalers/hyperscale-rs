@@ -60,7 +60,7 @@ pub fn split_genesis_from_terminal(
 mod tests {
 
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin, Hash,
+        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin, Epoch, Hash,
         QuorumCertificate, Round, ShardId, SignerBitfield, SplitChildRoots, StateRoot, ValidatorId,
         WeightedTimestamp,
     };
@@ -94,6 +94,7 @@ mod tests {
             terminal.height(),
             terminal.parent_block_hash(),
             Round::new(9),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(wt),

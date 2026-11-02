@@ -24,7 +24,7 @@ use crate::{
     BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVoteMessage, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt,
     ConsensusSignature, Deadline, DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt,
-    ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins,
+    Epoch, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins,
     MemberTerms, MerkleInclusionProof, NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp,
     ProtocolStatics, QuorumCertificate, Role, Round, Routing, SectionRoots, SettledTxsRoot,
     Settlement, ShardForkProof, ShardId, ShardLoad, SignerBitfield, SplitChildRoots, StakePoolId,
@@ -340,8 +340,8 @@ impl TestCommittee {
     }
 
     /// A genuine QC over `header`, signed by the seats at `signers`
-    /// (committee indices) under [`NetworkDefinition::simulator`] and
-    /// stamping `weighted_timestamp`.
+    /// (committee indices) under [`NetworkDefinition::simulator`] for the
+    /// window keyed `committee_epoch`, and stamping `weighted_timestamp`.
     ///
     /// # Panics
     ///
@@ -351,6 +351,7 @@ impl TestCommittee {
         &self,
         header: &BlockHeader,
         signers: &[usize],
+        committee_epoch: Epoch,
         weighted_timestamp: WeightedTimestamp,
     ) -> QuorumCertificate {
         let msg = signed_bytes(
@@ -360,6 +361,7 @@ impl TestCommittee {
                 round: header.round(),
                 block_hash: header.hash(),
                 parent_block_hash: header.parent_block_hash(),
+                committee_epoch,
             },
             &NetworkDefinition::simulator(),
         );
@@ -377,6 +379,7 @@ impl TestCommittee {
             header.height(),
             header.parent_block_hash(),
             header.round(),
+            committee_epoch,
             signer_bits,
             BlsVerifier.aggregate(&sigs).expect("aggregate"),
             weighted_timestamp,
@@ -448,15 +451,16 @@ pub fn make_live_block(
 
 /// An empty `Block::Live` extending `parent` at `round`, its `parent_qc`
 /// a genuine certificate over `parent` from a quorum of `committee`,
-/// stamping `pred_wt`.
+/// signed under the window keyed `epoch` and stamping `pred_wt`.
 #[must_use]
 pub fn signed_child_block(
     committee: &TestCommittee,
     parent: &Block,
     round: Round,
+    epoch: Epoch,
     pred_wt: WeightedTimestamp,
 ) -> Block {
-    signed_child_with(committee, parent, round, pred_wt, |_| {})
+    signed_child_with(committee, parent, round, (epoch, pred_wt), |_| {})
 }
 
 /// [`signed_child_block`] as a splitting shard's terminal: it carries the
@@ -466,10 +470,11 @@ pub fn signed_split_terminal(
     committee: &TestCommittee,
     parent: &Block,
     round: Round,
+    epoch: Epoch,
     pred_wt: WeightedTimestamp,
     pair: SplitChildRoots,
 ) -> Block {
-    signed_child_with(committee, parent, round, pred_wt, |parts| {
+    signed_child_with(committee, parent, round, (epoch, pred_wt), |parts| {
         parts.state_root = pair.composed_root();
         parts.split_child_roots = Some(pair);
         parts.terminal_settled_txs = Some(SettledTxsRoot::ZERO);
@@ -483,9 +488,10 @@ pub fn signed_terminal(
     committee: &TestCommittee,
     parent: &Block,
     round: Round,
+    epoch: Epoch,
     pred_wt: WeightedTimestamp,
 ) -> Block {
-    signed_child_with(committee, parent, round, pred_wt, |parts| {
+    signed_child_with(committee, parent, round, (epoch, pred_wt), |parts| {
         parts.terminal_settled_txs = Some(SettledTxsRoot::ZERO);
     })
 }
@@ -494,10 +500,10 @@ fn signed_child_with(
     committee: &TestCommittee,
     parent: &Block,
     round: Round,
-    pred_wt: WeightedTimestamp,
+    (epoch, pred_wt): (Epoch, WeightedTimestamp),
     shape: impl FnOnce(&mut BlockHeaderParts),
 ) -> Block {
-    let parent_qc = committee.sign_qc(parent.header(), &committee.quorum_indices(), pred_wt);
+    let parent_qc = committee.sign_qc(parent.header(), &committee.quorum_indices(), epoch, pred_wt);
     let mut parts = BlockHeaderParts {
         shard_id: parent.header().shard_id(),
         height: parent.height().next(),
@@ -681,6 +687,7 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
             __qc.height(),
             __qc.parent_block_hash(),
             __qc.round(),
+            __qc.committee_epoch(),
             __qc.signers().clone(),
             __qc.aggregated_signature(),
             WeightedTimestamp::from_millis(weighted_timestamp_ms),
@@ -836,7 +843,7 @@ pub(crate) fn certify_header(
     signers: &[usize],
 ) -> CertifiedBlockHeader {
     let wt = WeightedTimestamp::from_millis(header.height().inner() * 1_000);
-    let qc = committee.sign_qc(&header, signers, wt);
+    let qc = committee.sign_qc(&header, signers, Epoch::GENESIS, wt);
     CertifiedBlockHeader::new(header, qc)
 }
 
@@ -846,9 +853,9 @@ pub(crate) fn certify_header(
 /// `committee_keys` are the private keys of the shard's
 /// `consensus_committee_for_shard`, in bitfield order (`committee_keys[p]` is
 /// the seat at bitfield position `p`); every seat signs each branch's
-/// two-chain. Every QC — and both headers' `parent_qc` — carries weighted
-/// timestamp `wt`, so the fork verifier resolves the seated committee
-/// (committee resolution keys on the anchor `parent_qc().weighted_timestamp()`).
+/// two-chain under the window keyed `committee_epoch`. Every QC — and both
+/// headers' `parent_qc` — carries weighted timestamp `wt`, so the fork
+/// verifier admits the seated committee's epoch at one anchor and stamp.
 /// The branches sit at distinct rounds: a round-invariant proof with no
 /// same-round sub-pair.
 ///
@@ -856,57 +863,53 @@ pub(crate) fn certify_header(
 /// [`TestCommittee`], this signs with caller-supplied keys — so a harness can
 /// forge a proof that authenticates against a *running* committee, whose keys
 /// a `TestCommittee` cannot reproduce. `verifier` must be the harness's own
-/// scheme (its aggregation builds the QCs the harness will re-verify). `wt`
-/// must resolve that committee in the verifier's schedule; sourcing it from
-/// the shard's committed-tip anchor timestamp guarantees it.
+/// scheme (its aggregation builds the QCs the harness will re-verify).
+/// `committee_epoch` must key that committee's window in the verifier's
+/// schedule, and `wt` must admit it there; the epoch the shard's committed
+/// tip was signed under, and that tip's anchor timestamp, do both.
 #[must_use]
 pub fn shard_fork_proof_signed_by(
     verifier: &dyn Verifier,
     committee_keys: &[Arc<dyn Signer>],
     shard: ShardId,
     height: BlockHeight,
+    committee_epoch: Epoch,
     wt: WeightedTimestamp,
 ) -> ShardForkProof {
     let parent = BlockHash::from_raw(Hash::from_bytes(b"shard-fork-live-parent"));
     let round_a = Round::new(height.inner().saturating_add(4));
     let round_b = Round::new(height.inner().saturating_add(6));
+    let signing = LiveSigning {
+        verifier,
+        committee_keys,
+        committee_epoch,
+        wt,
+    };
     ShardForkProof::ConflictingCommits {
-        a: live_commit_proof(
-            verifier,
-            committee_keys,
-            shard,
-            height,
-            round_a,
-            parent,
-            wt,
-            1,
-        ),
-        b: live_commit_proof(
-            verifier,
-            committee_keys,
-            shard,
-            height,
-            round_b,
-            parent,
-            wt,
-            2,
-        ),
+        a: live_commit_proof(&signing, shard, height, round_a, parent, 1),
+        b: live_commit_proof(&signing, shard, height, round_b, parent, 2),
     }
 }
 
-/// A direct-commit [`CommitProof`] whose two-chain is signed by
-/// `committee_keys` (all seats) at `wt`.
-#[allow(clippy::too_many_arguments)] // fixture internals; mirrors the proof's fields
+/// Who signs a live fork fixture's QCs, under which window, and at which
+/// stamp.
+struct LiveSigning<'a> {
+    verifier: &'a dyn Verifier,
+    committee_keys: &'a [Arc<dyn Signer>],
+    committee_epoch: Epoch,
+    wt: WeightedTimestamp,
+}
+
+/// A direct-commit [`CommitProof`] whose two-chain `signing` signs.
 fn live_commit_proof(
-    verifier: &dyn Verifier,
-    committee_keys: &[Arc<dyn Signer>],
+    signing: &LiveSigning<'_>,
     shard: ShardId,
     height: BlockHeight,
     round: Round,
     parent: BlockHash,
-    wt: WeightedTimestamp,
     salt: u64,
 ) -> CommitProof {
+    let wt = signing.wt;
     // The proof carries the certified block's parent, so build it first and
     // hang the two-chain off it; `parent` becomes the grandparent hash. It
     // anchors at `wt` like the rest, so the whole proof resolves one window.
@@ -919,14 +922,11 @@ fn live_commit_proof(
         salt + 900,
     );
     let block = live_certify(
-        verifier,
-        committee_keys,
+        signing,
         live_fork_header(shard, height, round, parent_header.hash(), wt, salt),
-        wt,
     );
     let child = live_certify(
-        verifier,
-        committee_keys,
+        signing,
         live_fork_header(
             shard,
             height.next(),
@@ -935,7 +935,6 @@ fn live_commit_proof(
             wt,
             salt + 500,
         ),
-        wt,
     );
     CommitProof::direct(block, child, Some(parent_header))
 }
@@ -975,21 +974,17 @@ pub(crate) fn anchor_qc(shard: ShardId, wt: WeightedTimestamp) -> QuorumCertific
         BlockHeight::new(0),
         zero,
         Round::new(0),
+        Epoch::GENESIS,
         SignerBitfield::new(0),
         AggregateSignature::new([0u8; 96]),
         wt,
     )
 }
 
-/// Pair a header with a genuine QC signed by every key in `committee_keys`
-/// (bitfield position `p` set to `committee_keys[p]`'s signature), stamped at
-/// `wt`, so the two-chain verifies against the seated committee.
-fn live_certify(
-    verifier: &dyn Verifier,
-    committee_keys: &[Arc<dyn Signer>],
-    header: BlockHeader,
-    wt: WeightedTimestamp,
-) -> CertifiedBlockHeader {
+/// Pair a header with a genuine QC signed by every key in `signing`
+/// (bitfield position `p` set to the `p`th key's signature), so the
+/// two-chain verifies against the seated committee.
+fn live_certify(signing: &LiveSigning<'_>, header: BlockHeader) -> CertifiedBlockHeader {
     let net = NetworkDefinition::simulator();
     let block_hash = header.hash();
     let msg = signed_bytes(
@@ -999,16 +994,18 @@ fn live_certify(
             round: header.round(),
             block_hash,
             parent_block_hash: header.parent_block_hash(),
+            committee_epoch: signing.committee_epoch,
         },
         &net,
     );
-    let sigs: Vec<ConsensusSignature> = committee_keys
+    let sigs: Vec<ConsensusSignature> = signing
+        .committee_keys
         .iter()
         .map(|k| k.sign(&msg).expect("sign"))
         .collect();
-    let agg = verifier.aggregate(&sigs).expect("aggregate");
-    let mut signer_bits = SignerBitfield::new(committee_keys.len());
-    for p in 0..committee_keys.len() {
+    let agg = signing.verifier.aggregate(&sigs).expect("aggregate");
+    let mut signer_bits = SignerBitfield::new(signing.committee_keys.len());
+    for p in 0..signing.committee_keys.len() {
         signer_bits.set(p);
     }
     let qc = QuorumCertificate::new(
@@ -1017,9 +1014,10 @@ fn live_certify(
         header.height(),
         header.parent_block_hash(),
         header.round(),
+        signing.committee_epoch,
         signer_bits,
         agg,
-        wt,
+        signing.wt,
     );
     CertifiedBlockHeader::new(header, qc)
 }
@@ -1038,6 +1036,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             pqc.height(),
             pqc.parent_block_hash(),
             pqc.round(),
+            pqc.committee_epoch(),
             pqc.signers().clone(),
             pqc.aggregated_signature(),
             WeightedTimestamp::from_millis(weighted_timestamp_ms),
@@ -2291,6 +2290,7 @@ mod tests {
                 round: Round::new(0),
                 block_hash: BlockHash::ZERO,
                 parent_block_hash: BlockHash::ZERO,
+                committee_epoch: Epoch::GENESIS,
             },
             &network,
         );

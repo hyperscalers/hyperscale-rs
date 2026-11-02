@@ -237,7 +237,7 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ConsensusReceipt,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ConsensusReceipt, Epoch,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
         ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Role, Round, SectionRoots,
         SettledTxsRoot, ShardId, SignerBitfield, StateWrites, StoredReceipt, TickHalf, TickId,
@@ -306,6 +306,7 @@ mod tests {
             BlockHeight::new(height.saturating_sub(1)),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::new([0u8; 96]),
             WeightedTimestamp::from_millis(pred_wt),
@@ -440,6 +441,7 @@ mod tests {
             BlockHeight::new(0),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::new([0u8; 96]),
             WeightedTimestamp::from_millis(1_000),

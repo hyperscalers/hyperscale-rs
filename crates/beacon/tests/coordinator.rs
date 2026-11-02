@@ -577,6 +577,7 @@ fn gossiped_vote_equivocation_convicts_through_a_committed_proposal() {
             shard,
             height,
             round,
+            Epoch::GENESIS,
             accused,
             sim.sk_of(accused_idx),
             ProposerTimestamp::ZERO,
@@ -593,9 +594,11 @@ fn gossiped_vote_equivocation_convicts_through_a_committed_proposal() {
         round,
         block_hash_a,
         parent_block_hash_a,
+        committee_epoch_a: Epoch::GENESIS,
         sig_a,
         block_hash_b,
         parent_block_hash_b,
+        committee_epoch_b: Epoch::GENESIS,
         sig_b,
     };
     sim.inject_vote_equivocations(Epoch::new(1), vec![pair]);
@@ -636,9 +639,11 @@ fn forged_vote_equivocation_cannot_convict() {
         round: Round::new(2),
         block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
         parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
+        committee_epoch_a: Epoch::GENESIS,
         sig_a: ConsensusSignature::ZERO,
         block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
         parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
+        committee_epoch_b: Epoch::GENESIS,
         sig_b: ConsensusSignature::ZERO,
     };
     sim.inject_vote_equivocations(Epoch::new(1), vec![forged]);

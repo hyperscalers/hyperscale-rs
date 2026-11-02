@@ -96,7 +96,7 @@ impl VerifiedHeaderBuffer {
 mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
+        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Epoch,
         ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, WeightedTimestamp,
     };
 
@@ -123,6 +123,7 @@ mod tests {
             height,
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

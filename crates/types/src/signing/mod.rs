@@ -86,7 +86,9 @@ mod tests {
     use hyperscale_hbor::HborSigned as _;
 
     use super::*;
-    use crate::{BlockHash, BlockHeight, Hash, ReadySignal, Round, ShardId, TransactionEnvelope};
+    use crate::{
+        BlockHash, BlockHeight, Epoch, Hash, ReadySignal, Round, ShardId, TransactionEnvelope,
+    };
 
     /// The context is covered: the same message signed for two networks
     /// commits to two byte strings, which is what makes a cross-network
@@ -100,6 +102,7 @@ mod tests {
             round: Round::INITIAL,
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
             parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            committee_epoch: Epoch::GENESIS,
         };
         assert_ne!(
             signed_bytes(&message, &NetworkDefinition::mainnet()),

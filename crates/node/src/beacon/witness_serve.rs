@@ -158,8 +158,8 @@ mod tests {
     use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
-        BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, ChainOrigin, Hash,
-        LeafIndex, ProposerTimestamp, QuorumCertificate, Round, ShardId, ShardWitnessPayload,
+        BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, ChainOrigin, Epoch,
+        Hash, LeafIndex, ProposerTimestamp, QuorumCertificate, Round, ShardId, ShardWitnessPayload,
         SignerBitfield, Stake, Verified, WeightedTimestamp, WitnessSources, compute_merkle_root,
         verify_range_inclusion,
     };
@@ -203,6 +203,7 @@ mod tests {
             block.height(),
             block.header().parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),

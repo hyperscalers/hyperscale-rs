@@ -470,7 +470,7 @@ impl ShardHeaders {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ProposerTimestamp,
+        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, Epoch, ProposerTimestamp,
         QuorumCertificate, Round, ShardId, SignerBitfield, ValidatorId,
     };
 
@@ -489,6 +489,7 @@ mod tests {
             BlockHeight::new(height.inner().saturating_sub(1)),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_qc_wt),
@@ -506,6 +507,7 @@ mod tests {
             height,
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_qc_wt),

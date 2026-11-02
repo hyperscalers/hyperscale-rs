@@ -446,7 +446,7 @@ mod tests {
     use hyperscale_types::network::request::CellRange;
     use hyperscale_types::test_utils::{TestCommittee, test_key};
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeaderParts,
+        BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeaderParts, Epoch,
         GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ValidatorId,
         WeightedTimestamp, WitnessSources,
     };
@@ -567,6 +567,7 @@ mod tests {
         let qc = committee.sign_qc(
             &header,
             &committee.quorum_indices(),
+            Epoch::GENESIS,
             WeightedTimestamp::ZERO,
         );
         response.anchor = Some(Box::new(CertifiedBlockHeader::new(header, qc)));

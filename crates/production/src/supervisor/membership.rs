@@ -459,7 +459,6 @@ impl ShardSupervisor {
             return;
         }
         let placed = vnodes.iter().map(|vnode| vnode.validator_id).collect();
-        let schedule = self.process.topology_schedule();
         let running = self.running_seats();
         let storages = self.storages.lock().expect("storages lock");
         let Some(view) = hosted_views(running, &storages)
@@ -469,7 +468,7 @@ impl ShardSupervisor {
             return;
         };
         let head = self.process.topology_snapshot().load_full();
-        let changes = seat_running(&view, &head, schedule.windows(), placed);
+        let changes = seat_running(&view, &head, placed);
         drop(storages);
         for change in changes {
             self.apply_seat_change(change);

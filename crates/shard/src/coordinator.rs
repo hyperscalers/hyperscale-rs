@@ -162,16 +162,16 @@ use hyperscale_storage::{
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::{Signed, SignedContext};
 use hyperscale_types::{
-    AnswerAdditions, AnswerDelta, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader,
-    BlockHeight, BlockManifest, BlockVote, CarriedClaims, CertifiedBlock, CertifiedBlockHeader,
-    ChainOrigin, CommittedTip, Decision, Finalization, HALT_HARVEST_WAIT, HALT_THRESHOLD_EPOCHS,
-    IDLE_PROPOSAL_INTERVAL, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provision, QcContext,
-    QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters,
-    SiblingView, Source, StandingAnswers, StandingToward, StateRoot, TickLine, Timeout,
-    TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, ValidatorId, VerdictQuestion, Verifiable, Verified, Verifier, Verify, VoteCount,
-    VotePosition, asks, counts, derive_leaves, missed_proposals_since_prev_commit,
-    ready_leaf_payload,
+    AnswerAdditions, AnswerDelta, BeaconWitnessCommit, BeaconWitnessLeafCount, Block,
+    BlockCommittee, BlockHeader, BlockHeight, BlockManifest, BlockVote, CarriedClaims,
+    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Decision, Finalization,
+    HALT_HARVEST_WAIT, IDLE_PROPOSAL_INTERVAL, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
+    Provision, QcAdmission, QcContext, QcVerifyError, QuorumCertificate, RecoveryCause,
+    RevealChain, Round, SafeVoteRegisters, SiblingView, Source, StandingAnswers, StandingToward,
+    StateRoot, TickLine, Timeout, TimeoutCertificate, TimeoutCertificateContext, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, ValidatorId, VerdictQuestion, Verifiable, Verified,
+    Verifier, Verify, VoteCount, VotePosition, asks, counts, derive_leaves,
+    missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -204,7 +204,7 @@ use crate::proposal::{
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::standing_answers::HeldAnswers;
-use crate::sync_claims::{Carrier, ClaimOutcome, EpochWalk, SyncClaims};
+use crate::sync_claims::{Carrier, ClaimOutcome, SyncClaims};
 use crate::tick_members::{
     Ancestry, OfferedLegs, OwnContent, committed_sets, derived_terms, ends_licensed, hearing_rows,
     legs_licensed, legs_that_stand, sibling_view, sibling_views, stated_terms,
@@ -215,7 +215,8 @@ use crate::validation::{
     validate_coast_block_for_vote, validate_header, validate_proposer,
 };
 use crate::verification::{
-    InFlightCheck, SubstateCountSource, VerificationPipeline, committed_cells_for,
+    InFlightCheck, SubstateCountSource, VerificationPipeline, certified_by_a_replaced_committee,
+    committed_cells_for,
 };
 use crate::view_change::ViewChangeController;
 use crate::vote_keeper::VoteKeeper;
@@ -247,24 +248,6 @@ enum Abandonment {
     /// A certificate assembled elsewhere.
     Certified,
 }
-
-/// How many windows below a cited certificate's own a sync claim walks
-/// looking for its signer.
-///
-/// The QC over a block is signed by the committee at its grandparent's QC
-/// stamp, so a signer `d` windows below the stamp means the chain certified
-/// nothing in the `d - 2` whole windows between: a stall. A stall of more
-/// than [`HALT_THRESHOLD_EPOCHS`] missed boundary folds flags the shard
-/// halted at the fold of the window after the last one it certified in,
-/// at the earliest, which seats a recovery whose bridge is the window after
-/// that. From then every QC stamped at or past one window below the bridge
-/// resolves the fresh committee, so a QC the stalled committee signs can
-/// be stamped at most `HALT_THRESHOLD_EPOCHS + 2` windows above its signer
-/// and still verify. A recovery the pool cannot seat at once leaves the
-/// stalled committee able to resume further up; the walk then misses the
-/// first two QCs it certifies, and the third, signed in its own window,
-/// starts the sync.
-const SYNC_CLAIM_WALK_DEPTH: u64 = HALT_THRESHOLD_EPOCHS + 2;
 
 /// Cap on distinct pending headers retained per `(height, round)`. An honest
 /// proposer signs exactly one block per round, so anything beyond a small
@@ -500,6 +483,15 @@ pub struct ShardCoordinator {
     /// committed tip's own parent is pruned too, so the committee that signed
     /// the tip could not otherwise be resolved when verifying the QC over it.
     committed_committee_anchor_wt: WeightedTimestamp,
+
+    /// The committed tip whose `committed_committee_anchor_wt` is a
+    /// stand-in, not read off its parent. A store seated at a snap-synced
+    /// anchor holds no such parent and stands in the tip's own anchor,
+    /// which names another window when the tip opens an epoch; a QC over
+    /// that tip is then verified under the window it signed rather than
+    /// admitted at the stand-in anchor. The tip is committed history, so no
+    /// recovery's fence applies to it. The next commit clears this.
+    stand_in_anchor_tip: Option<BlockHash>,
 
     /// Set, never cleared, once a schedule this replica held reads it
     /// quiescent. The fold lets a terminated chain's windows leave the
@@ -924,6 +916,9 @@ impl ShardCoordinator {
         // to two blocks ahead.
         let committed_block_anchor_wt = recovered.block_anchor_wt();
         let committed_committee_anchor_wt = recovered.committee_anchor_wt();
+        let stand_in_anchor_tip = recovered
+            .committed_hash
+            .filter(|_| recovered.committed_committee_anchor_wt.is_none());
         let high_qc = recovered.latest_qc;
         // Seeded from the chain the store kept, not constructed empty: an
         // empty index refuses no duplicate, so a coordinator resuming a
@@ -958,6 +953,7 @@ impl ShardCoordinator {
             quiescent_latched: false,
             dissolved_latched: false,
             committed_committee_anchor_wt,
+            stand_in_anchor_tip,
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
@@ -1243,12 +1239,24 @@ impl ShardCoordinator {
         topology_schedule: &'t TopologySchedule,
         anchor: WeightedTimestamp,
     ) -> Option<&'t Arc<TopologySnapshot>> {
+        self.block_committee_at(topology_schedule, anchor)
+            .map(|committee| committee.snapshot)
+    }
+
+    /// [`Self::committee_at`] with the epoch its window is keyed by: the
+    /// epoch a voter signs, and a vote set latches, for a block whose
+    /// committee anchor is `anchor`.
+    fn block_committee_at<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        anchor: WeightedTimestamp,
+    ) -> Option<BlockCommittee<'t>> {
         topology_schedule
             .live_committee(self.local_shard, anchor)
             .committee()
-            .map(|committee| committee.snapshot)
-            .filter(|snapshot| {
-                !snapshot
+            .filter(|committee| {
+                !committee
+                    .snapshot
                     .consensus_committee_for_shard(self.local_shard)
                     .is_empty()
             })
@@ -1298,21 +1306,41 @@ impl ShardCoordinator {
         topology_schedule: &'t TopologySchedule,
         block_hash: BlockHash,
     ) -> Option<&'t TopologySnapshot> {
-        self.committee_at(topology_schedule, self.committee_anchor(block_hash)?)
-            .map(Arc::as_ref)
+        self.block_committee(topology_schedule, block_hash)
+            .map(|committee| committee.snapshot.as_ref())
     }
 
-    /// Committee that signed `qc` — the certified binding. Unlike
-    /// [`Self::committee_of_block`] this resolves with the QC's own
-    /// timestamp in hand, so a halt recovery's bridge applies exactly to
-    /// blocks certified at or past the bridge window: the halted suffix
-    /// keeps verifying against the windows that produced it, while a
-    /// recovery bridge block verifies against the fresh committee.
+    /// [`Self::committee_of_block`] with the epoch its window is keyed by.
+    fn block_committee<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        block_hash: BlockHash,
+    ) -> Option<BlockCommittee<'t>> {
+        self.block_committee_at(topology_schedule, self.committee_anchor(block_hash)?)
+    }
+
+    /// Committee that signed `qc`: the window its signers signed, admitted
+    /// at its block's committee anchor and its stamp
+    /// ([`TopologySchedule::admits`]). Unlike [`Self::committee_of_block`]
+    /// this reads what the quorum stated, so a halt recovery's suffix
+    /// verifies against the windows that produced it and a bridge block
+    /// against the fresh committee, however late a replica reads either.
+    /// `None` while the block's parent is not held, while the schedule
+    /// cannot yet decide, or when the QC is refused.
     fn committee_of_qc<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
         qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
+        if self.stand_in_anchor_tip == Some(qc.block_hash()) {
+            if qc.is_genesis() {
+                return None;
+            }
+            return self
+                .signed_committee_of(topology_schedule, qc)
+                .committee()
+                .map(|committee| committee.snapshot.as_ref());
+        }
         self.committee_certified_at(
             topology_schedule,
             self.committee_anchor(qc.block_hash())?,
@@ -1329,10 +1357,43 @@ impl ShardCoordinator {
         committee_anchor: WeightedTimestamp,
         qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
-        topology_schedule
-            .certified_committee(self.local_shard, committee_anchor, qc.weighted_timestamp())
-            .committee()
-            .map(|committee| committee.snapshot.as_ref())
+        match self.admit_qc(topology_schedule, committee_anchor, qc) {
+            QcAdmission::Admit(committee) => Some(committee.snapshot.as_ref()),
+            QcAdmission::Wait | QcAdmission::Refuse | QcAdmission::Fenced => None,
+        }
+    }
+
+    /// What this replica's schedule makes of `qc`, signed over a block
+    /// whose committee anchor is `committee_anchor`. The genesis QC, which
+    /// no committee signed, is refused.
+    fn admit_qc<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        committee_anchor: WeightedTimestamp,
+        qc: &QuorumCertificate,
+    ) -> QcAdmission<'t> {
+        if qc.is_genesis() {
+            return QcAdmission::Refuse;
+        }
+        topology_schedule.admits(
+            self.local_shard,
+            committee_anchor,
+            qc.weighted_timestamp(),
+            qc.committee_epoch(),
+        )
+    }
+
+    /// The committee a committed or committing block was certified under:
+    /// the window its QC's signers signed. `qc` is the copy its child's
+    /// header pins, which the commit stores, so every replica reads one
+    /// epoch for the block however its own copies were stamped and
+    /// whatever recoveries it has folded since.
+    fn signed_committee_of<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> BlockResolution<'t> {
+        topology_schedule.signed_committee(self.local_shard, qc.committee_epoch())
     }
 
     /// Committee for the height in progress / our next proposal (extends
@@ -2293,6 +2354,7 @@ impl ShardCoordinator {
         self.clock.advance(genesis_anchor);
         self.committed_block_anchor_wt = genesis_anchor;
         self.committed_committee_anchor_wt = genesis_anchor;
+        self.stand_in_anchor_tip = None;
         self.substate_bytes_frontier = (genesis.height(), genesis_bytes);
         // No commit precedes the chain's first blocks to mark them, and a
         // split child or merged parent opens on business its predecessor
@@ -2375,24 +2437,21 @@ impl ShardCoordinator {
     /// What the cap says of a vote on `block_hash`, a received block
     /// every check has passed and the safe-vote rule admits.
     ///
-    /// A block whose parent sits in a recovery's suffix band, or which
-    /// adds nothing, is voted for whatever stands. One adding something
-    /// is voted for where the count behind its parent admits it under
-    /// its committee's trie, and refused where it does not; where this
-    /// voter holds no count, or no measure of the block, the vote is
+    /// A block whose parent a recovery's committee replaced certified, or
+    /// which adds nothing, is voted for whatever stands. One adding
+    /// something is voted for where the count behind its parent admits it
+    /// under its committee's trie, and refused where it does not; where
+    /// this voter holds no count, or no measure of the block, the vote is
     /// held, and a count taken off the store re-drives it.
     fn vote_within_cap(&self, topology_schedule: &TopologySchedule, block_hash: BlockHash) -> Cap {
         let header = self.pending_blocks.get_header(block_hash);
-        let banded =
-            header
-                .zip(self.committee_anchor(block_hash))
-                .is_some_and(|(header, anchor)| {
-                    topology_schedule.recovery_suffix_band(
-                        self.local_shard,
-                        anchor,
-                        header.parent_qc().weighted_timestamp(),
-                    )
-                });
+        let banded = header.is_some_and(|header| {
+            certified_by_a_replaced_committee(
+                topology_schedule,
+                self.local_shard,
+                header.parent_qc(),
+            )
+        });
         if banded {
             return Cap::Admitted;
         }
@@ -2701,17 +2760,16 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         committee: &TopologySnapshot,
         parent: BlockHash,
-        parent_qc_wt: WeightedTimestamp,
+        parent_qc: &QuorumCertificate,
     ) -> Result<Option<(ReshapeKind, Settling)>, BlockHash> {
         settling_in(
             committee,
             self.local_shard,
             || {
-                let committee_anchor = self.block_anchor(parent).ok_or(parent)?;
-                Ok(topology_schedule.recovery_suffix_band(
+                Ok(certified_by_a_replaced_committee(
+                    topology_schedule,
                     self.local_shard,
-                    committee_anchor,
-                    parent_qc_wt,
+                    parent_qc,
                 ))
             },
             || {
@@ -3333,9 +3391,9 @@ impl ShardCoordinator {
         None
     }
 
-    /// Whether anything is on offer for the block on `parent`, built
-    /// under `topology_snapshot` at `proposal_wt` with `payload`: `Err`
-    /// names what forces it out at once, a selected section or an
+    /// Whether anything is on offer for the block on `parent`, certified
+    /// by `parent_qc` and built under `topology_snapshot` with `payload`:
+    /// `Err` names what forces it out at once, a selected section or an
     /// eligible ready signal outside the parent's window, or a window
     /// that does not resolve. `Ok` holds that window.
     ///
@@ -3345,15 +3403,16 @@ impl ShardCoordinator {
         &self,
         topology_schedule: &TopologySchedule,
         topology_snapshot: &TopologySnapshot,
-        proposal_wt: WeightedTimestamp,
+        parent_qc: &QuorumCertificate,
         parent: BlockHash,
         payload: &ProposalPayload,
     ) -> Result<Vec<Hash>, EagerReason> {
         if !payload.is_empty() {
             return Err(EagerReason::Offered);
         }
+        let proposal_wt = parent_qc.weighted_timestamp();
         let window = self
-            .parent_witness_window(topology_schedule, topology_snapshot, proposal_wt, parent)
+            .parent_witness_window(topology_schedule, topology_snapshot, parent_qc, parent)
             .map_err(|_| EagerReason::Walk)?;
         let held = self.ready_signal_held(topology_snapshot, &window);
         if self
@@ -3386,7 +3445,7 @@ impl ShardCoordinator {
                 self.on_offer(
                     topology_schedule,
                     frame.committee,
-                    proposal_wt,
+                    &frame.parent_qc,
                     frame.parent_block_hash,
                     payload,
                 )
@@ -3773,11 +3832,11 @@ impl ShardCoordinator {
 
     /// Substate count behind the proposal parent's post-state for the
     /// reshape predicate, or `None` when the predicate is out of play —
-    /// reshaping disabled (it can never fire), or the parent, anchored at
-    /// `parent_anchor_wt` and certified under `parent_qc_wt`, sits in a
-    /// halt recovery's suffix band. The band is the verifier's test on the
-    /// same two stamps, so the header's absent assertion stays byte-agreed
-    /// whether or not either side has executed the suffix. `Err` names the
+    /// reshaping disabled (it can never fire), or the parent was certified
+    /// by `parent_qc` under a committee a halt recovery replaced. The
+    /// verifier tests the same hash-pinned QC, so the header's absent
+    /// assertion stays byte-agreed whether or not either side has executed
+    /// the suffix. `Err` names the
     /// ancestor whose delta — or, for a frontier lagging the committed tip,
     /// the tip's persistence reconcile — is still outstanding; the caller
     /// defers the build and retries, mirroring the verifier's park on the
@@ -3793,16 +3852,11 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         topology_snapshot: &TopologySnapshot,
         parent_block_hash: BlockHash,
-        parent_anchor_wt: WeightedTimestamp,
-        parent_qc_wt: WeightedTimestamp,
+        parent_qc: &QuorumCertificate,
     ) -> Result<SubstateClaim, BlockHash> {
         let thresholds = topology_snapshot.reshape_thresholds();
         if thresholds == ReshapeThresholds::DISABLED
-            || topology_schedule.recovery_suffix_band(
-                self.local_shard,
-                parent_anchor_wt,
-                parent_qc_wt,
-            )
+            || certified_by_a_replaced_committee(topology_schedule, self.local_shard, parent_qc)
         {
             return Ok(SubstateClaim::default());
         }
@@ -3887,11 +3941,12 @@ impl ShardCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
         topology_snapshot: &TopologySnapshot,
-        proposal_wt: WeightedTimestamp,
+        parent_qc: &QuorumCertificate,
         parent_block_hash: BlockHash,
         substate_bytes: Option<u64>,
         committee_anchor_epoch: Epoch,
     ) -> Option<WitnessCommitmentPreview> {
+        let proposal_wt = parent_qc.weighted_timestamp();
         // A draining shard's assertion reads the rows at the parent, and
         // the build waits for them as its member lines do, before the
         // ready-signal pool is drained.
@@ -3899,7 +3954,7 @@ impl ShardCoordinator {
             topology_schedule,
             topology_snapshot,
             parent_block_hash,
-            proposal_wt,
+            parent_qc,
         ) {
             Ok(settling) => settling,
             Err(blocking) => {
@@ -3922,7 +3977,7 @@ impl ShardCoordinator {
             .parent_witness_window(
                 topology_schedule,
                 topology_snapshot,
-                proposal_wt,
+                parent_qc,
                 parent_block_hash,
             )
             .unwrap_or_else(|blocking| {
@@ -3983,15 +4038,14 @@ impl ShardCoordinator {
         &self,
         topology_schedule: &TopologySchedule,
         topology_snapshot: &TopologySnapshot,
-        proposal_wt: WeightedTimestamp,
+        parent_qc: &QuorumCertificate,
         parent_block_hash: BlockHash,
     ) -> Result<Vec<Hash>, BlockHash> {
         let (start, leaves) = prospective_parent_witness_leaves(
             &self.beacon_witness_accumulator,
             self.committed_hash,
-            self.committed_block_anchor_wt,
             parent_block_hash,
-            proposal_wt,
+            parent_qc,
             &self.pending_blocks,
             self.verification.verified_certified_blocks(),
             self.local_shard,
@@ -4129,8 +4183,7 @@ impl ShardCoordinator {
             topology_schedule,
             committee,
             parent_block_hash,
-            committee_anchor_wt,
-            parent_qc.weighted_timestamp(),
+            &parent_qc,
         );
         let timeout_cert = substate
             .as_ref()
@@ -4207,7 +4260,7 @@ impl ShardCoordinator {
         let Some(preview) = self.preview_witness_commitment(
             topology_schedule,
             committee,
-            parent_qc.weighted_timestamp(),
+            &parent_qc,
             parent_block_hash,
             substate.bytes,
             committee_anchor_epoch,
@@ -4468,7 +4521,22 @@ impl ShardCoordinator {
         // resolves for any child that deferred its parent-QC verification
         // awaiting this parent. Re-trigger them.
         actions.extend(self.retry_pending_children(topology_schedule, block_hash));
+        actions.extend(self.on_certified_header_landed(block_hash));
         actions
+    }
+
+    /// The header of `block_hash` landed. When `latest_qc` certifies it,
+    /// it pins the QC the commit `latest_qc` completes stores, and a commit
+    /// deferred for want of it goes ahead now.
+    fn on_certified_header_landed(&mut self, block_hash: BlockHash) -> Vec<Action> {
+        if self
+            .latest_qc
+            .as_ref()
+            .is_some_and(|latest| latest.block_hash() == block_hash)
+        {
+            return self.drive_deferred_commit_for();
+        }
+        Vec::new()
     }
 
     /// If `header.parent_qc()` moves the chain forward, adopt it: claim a
@@ -4538,14 +4606,11 @@ impl ShardCoordinator {
     /// Until it verifies the certified height is a claim, and block sync
     /// has no exit for a target the network cannot serve: a sync toward a
     /// fabricated height holds this replica in sync mode, proposing empty
-    /// blocks, until it restarts. So the signature is checked first. The
-    /// committee that signed `qc` resolves off its block's parent, which
-    /// is not held either, so it is checked against the committees
-    /// [`Self::sync_claim_candidates`] names, and the first that verifies
-    /// it starts the sync. A claim none of them verifies is dropped. A
-    /// certificate already verified, by an earlier claim, by the QC cache,
-    /// or by a local sender that hands it over verified, starts the sync
-    /// at once.
+    /// blocks, until it restarts. So the signature is checked first, under
+    /// the committee [`Self::sync_claim_committee`] names, and a claim that
+    /// fails it is dropped. A certificate already verified, by an earlier
+    /// claim, by the QC cache, or by a local sender that hands it over
+    /// verified, starts the sync at once.
     fn sync_to_certified_block(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -4579,165 +4644,50 @@ impl ShardCoordinator {
         {
             return Vec::new();
         }
-        let (mut committees, mut walk) = self.sync_claim_candidates(topology_schedule, qc);
-        let mut tried: Vec<Hash> = committees
-            .iter()
-            .map(|committee| self.committee_digest(committee))
-            .collect();
-        if committees.is_empty()
-            && let Some((committee, digest)) = self.walk_committee(
-                topology_schedule,
-                qc.weighted_timestamp(),
-                &mut walk,
-                &tried,
-            )
-        {
-            committees.push(committee);
-            tried.push(digest);
-        }
-        if committees.is_empty() {
+        let Some(committee) = self.sync_claim_committee(topology_schedule, qc) else {
             debug!(
                 signers = ?self.signers.keys(),
                 ?carrier,
                 target_height = qc.height().inner(),
-                "No committee resolves for a cited certificate yet — not syncing toward it"
+                epoch = qc.committee_epoch().inner(),
+                "No committee this replica admits signed a cited certificate — not syncing toward it"
             );
             return Vec::new();
-        }
-        let id = self
-            .sync_claims
-            .track(carrier, (**qc).clone(), tried, walk, self.now);
-        committees
-            .into_iter()
-            .map(|committee| self.sync_claim_verification(committee, qc.clone(), id))
-            .collect()
+        };
+        let id = self.sync_claims.track(carrier, (**qc).clone(), self.now);
+        vec![self.sync_claim_verification(committee, qc.clone(), id)]
     }
 
-    /// The committees that can have signed `qc`, a certificate over a block
-    /// above this replica's tip, and the windows to walk once they all
-    /// refute.
+    /// The committee a sync claim's `qc`, a certificate over a block above
+    /// this replica's tip, is checked against: the window its signers
+    /// signed. The claim's block and its parent are not held, so no anchor
+    /// places it, and none needs to: a claim only triggers a fetch, and
+    /// every synced block is verified in full on arrival. A committee that
+    /// signs a claim under a stale window it once held gets a fetch that
+    /// fails then.
     ///
-    /// A QC over block `b` is signed by the committee at the timestamp of
-    /// the QC over `b`'s grandparent, which lies between this replica's tip
-    /// anchor and `qc`'s own timestamp. The candidates are the tip
-    /// committee and the committee of `qc`'s own window. They cover every
-    /// signer but the outgoing committee of a cut, whose last two blocks
-    /// carry QCs stamped in the incoming window, and, after a stall of a
-    /// whole window or more, the committee that resumes the chain, whose
-    /// first two QCs are stamped windows above it. So once both refute, the
-    /// windows between are walked from `qc`'s down, one pairing at a time,
-    /// skipping a committee already tried. The common case costs at most
-    /// two pairings.
+    /// Behind the signed-epoch fence ([`TopologySchedule::fence_admits`]):
+    /// during a pending recovery a certificate signed under a window the
+    /// recovery replaced resolves nothing, since a retained committee
+    /// beyond f can sign one at any height. That also refuses an honest
+    /// one, so a continuing member whose tip lags below the halted tip
+    /// cannot reach it through a claim; the halt harvest is what carries it
+    /// there, from the retained ex-members' timeouts.
     ///
-    /// The walk stops at the window above the tip's, at the oldest window
-    /// the schedule holds, and [`SYNC_CLAIM_WALK_DEPTH`] windows below
-    /// `qc`'s, whichever is highest, so a stamp a forger chose costs at
-    /// most that many pairings however far behind this replica is. It also
-    /// stays below the newest window the schedule holds.
-    ///
-    /// A tip on a certified sibling the chain abandoned can anchor one
-    /// window above the canonical chain's, when the two siblings' parent
-    /// QCs straddle a cut; the canonical chain's next two QCs are then
-    /// signed below the floor. That is transient: the QCs after them are
-    /// signed at or above the tip's window, and a refutation lapses within
-    /// one retry interval.
-    ///
-    /// A committee the beacon has not committed yet is left out until it
-    /// has, an evicted one for good, and one that seats nobody here always:
-    /// its quorum is empty.
-    ///
-    /// During a pending recovery a certificate the retained committee
-    /// signed in the suffix band resolves nothing: a retained committee
-    /// beyond f can sign such a certificate at any height. That also
-    /// refuses an honest one, so a continuing member whose tip lags below
-    /// the halted tip cannot reach it through a claim; the halt harvest is
-    /// what carries it there, from the retained ex-members' timeouts.
-    fn sync_claim_candidates<'t>(
-        &self,
-        topology_schedule: &'t TopologySchedule,
-        qc: &QuorumCertificate,
-    ) -> (Vec<&'t TopologySnapshot>, Option<EpochWalk>) {
-        let qc_wt = qc.weighted_timestamp();
-        let qc_epoch = topology_schedule.epoch_for(qc_wt);
-        let tip_anchor = self.next_proposal_committee_anchor_wt();
-        let tip_epoch = tip_anchor.map(|anchor| topology_schedule.epoch_for(anchor));
-        let above_tip = |epoch: Epoch| tip_epoch.is_none_or(|tip| epoch > tip);
-        let mut committees: Vec<&'t TopologySnapshot> = Vec::new();
-        for anchor in tip_anchor
-            .into_iter()
-            .chain(above_tip(qc_epoch).then_some(qc_wt))
-        {
-            if let Some(committee) = self.sync_claim_committee(topology_schedule, anchor, qc_wt)
-                && !committees
-                    .iter()
-                    .any(|held| self.committee_digest(held) == self.committee_digest(committee))
-            {
-                committees.push(committee);
-            }
-        }
-        let walk = topology_schedule
-            .retained_epochs()
-            .zip(qc_epoch.inner().checked_sub(1))
-            .and_then(|((oldest, newest), below)| {
-                let floor = tip_epoch
-                    .map_or(oldest, |tip| tip.next().max(oldest))
-                    .max(qc_epoch.saturating_sub(SYNC_CLAIM_WALK_DEPTH));
-                EpochWalk::down(Epoch::new(below).min(newest), floor)
-            });
-        (committees, walk)
-    }
-
-    /// What verifying a QC against `committee` reads, as one digest: its
-    /// keys in seat order and its quorum threshold. Two committees with one
-    /// digest answer every verification alike.
-    fn committee_digest(&self, committee: &TopologySnapshot) -> Hash {
-        let keys = committee_public_keys(committee, self.local_shard);
-        let threshold = committee
-            .quorum_threshold_for_shard(self.local_shard)
-            .inner()
-            .to_le_bytes();
-        let mut parts: Vec<&[u8]> = keys.iter().map(|key| key.as_bytes().as_slice()).collect();
-        parts.push(&threshold);
-        Hash::from_parts(&parts)
-    }
-
-    /// The next committee down `walk` whose digest is not in `tried`,
-    /// advancing `walk` past every window it passes.
-    fn walk_committee<'t>(
-        &self,
-        topology_schedule: &'t TopologySchedule,
-        qc_wt: WeightedTimestamp,
-        walk: &mut Option<EpochWalk>,
-        tried: &[Hash],
-    ) -> Option<(&'t TopologySnapshot, Hash)> {
-        while let Some(step) = *walk {
-            let (epoch, rest) = step.step();
-            *walk = rest;
-            let anchor = topology_schedule.windows().window_of(epoch).start;
-            if let Some(committee) = self.sync_claim_committee(topology_schedule, anchor, qc_wt) {
-                let digest = self.committee_digest(committee);
-                if !tried.contains(&digest) {
-                    return Some((committee, digest));
-                }
-            }
-        }
-        None
-    }
-
-    /// The committee at `anchor` that can have signed a certificate
-    /// stamped `qc_wt`, for a sync claim. See
-    /// [`Self::sync_claim_candidates`].
+    /// A window the beacon has not committed yet is left out until it has,
+    /// an evicted one for good, and one that seats nobody here always: its
+    /// quorum is empty.
     fn sync_claim_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
-        anchor: WeightedTimestamp,
-        qc_wt: WeightedTimestamp,
+        qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
-        let Some(BlockResolution::Committee(committee)) =
-            topology_schedule.certified_committee_fenced(self.local_shard, anchor, qc_wt)
-        else {
+        if !topology_schedule.fence_admits(self.local_shard, qc.committee_epoch()) {
             return None;
-        };
+        }
+        let committee = self
+            .signed_committee_of(topology_schedule, qc)
+            .committee()?;
         (!committee
             .snapshot
             .consensus_committee_for_shard(self.local_shard)
@@ -4760,7 +4710,7 @@ impl ShardCoordinator {
         })
     }
 
-    /// One committee answered sync claim `id`.
+    /// The committee answered sync claim `id`.
     fn on_sync_claim_verified(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -4772,35 +4722,14 @@ impl ShardCoordinator {
             .on_result(id, result, self.view_change.view, self.now)
         {
             ClaimOutcome::Verified(qc) => self.start_verified_claim_sync(topology_schedule, &qc),
-            ClaimOutcome::Retry(id) => {
-                let Some((qc, mut walk, tried)) = self.sync_claims.walk_of(id) else {
-                    return Vec::new();
-                };
-                let next = self.walk_committee(
-                    topology_schedule,
-                    qc.weighted_timestamp(),
-                    &mut walk,
-                    &tried,
-                );
-                self.sync_claims.resume_walk(
-                    id,
-                    walk,
-                    next.as_ref().map(|(_, digest)| *digest),
-                    self.now,
-                );
-                match next {
-                    Some((committee, _)) => {
-                        vec![self.sync_claim_verification(committee, qc.into(), id)]
-                    }
-                    None => self.on_sync_claim_verified(topology_schedule, id, None),
-                }
-            }
             ClaimOutcome::Refuted { carrier, qc } => {
                 warn!(
                     signers = ?self.signers.keys(),
                     ?carrier,
                     target_height = qc.height().inner(),
-                    "A cited certificate verifies under no committee — not syncing toward it"
+                    epoch = qc.committee_epoch().inner(),
+                    "A cited certificate does not verify under the committee it names — \
+                     not syncing toward it"
                 );
                 Vec::new()
             }
@@ -4883,13 +4812,17 @@ impl ShardCoordinator {
 
     /// Verify and adopt the snap-synced anchor QC once the schedule
     /// resolves its committee. A crossing anchor's QC is the one the
-    /// beacon fold recorded, so no serving peer chose it; this still
-    /// checks its aggregate signature before the QC becomes `latest_qc` —
-    /// and thereby the parent QC the fresh committee's first block past
-    /// the anchor extends. An unresolvable committee retries on a later
-    /// call; a verification failure discards the QC (a higher adopted QC
-    /// or the halt harvest routes around it); any QC adopted first makes
-    /// it moot.
+    /// beacon fold recorded, so no serving peer chose it, and the fold
+    /// admitted its signed epoch at the anchor block's committee anchor;
+    /// this still checks its aggregate signature, under the window that
+    /// epoch keys, before the QC becomes `latest_qc` — and thereby the
+    /// parent QC the fresh committee's first block past the anchor
+    /// extends. It is checked under the signed window directly, since a
+    /// snap-seated store does not hold the anchor block's parent, which
+    /// alone dates its committee. A window not committed here retries on
+    /// a later call; an evicted one, or a verification failure, discards
+    /// the QC (a higher adopted QC or the halt harvest routes around it);
+    /// any QC adopted first makes it moot.
     fn adopt_anchor_qc(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         if self.latest_qc.is_some() {
             self.anchor_qc = None;
@@ -4904,11 +4837,16 @@ impl ShardCoordinator {
             self.anchor_qc = None;
             return Vec::new();
         }
-        let Some(verified) = self.verify_qc_sync(topology_schedule, &qc) else {
-            // Either the committee is unresolvable (beacon behind — keep
-            // the QC and retry) or the signature failed (discard). Split
-            // the cases so a forgery cannot pin retries forever.
-            if self.committee_of_qc(topology_schedule, &qc).is_some() {
+        let signed = self.signed_committee_of(topology_schedule, &qc);
+        let verified = signed
+            .committee()
+            .and_then(|committee| self.verify_qc_against(committee.snapshot, &qc));
+        let Some(verified) = verified else {
+            // Either the window is not committed here yet (beacon behind —
+            // keep the QC and retry) or it is evicted or the signature
+            // failed (discard). Split the cases so a forgery cannot pin
+            // retries forever.
+            if !matches!(signed, BlockResolution::NotYetCommitted) {
                 warn!(
                     signers = ?self.signers.keys(),
                     height = qc.height().inner(),
@@ -5104,7 +5042,7 @@ impl ShardCoordinator {
         block_hash: BlockHash,
         header: &BlockHeader,
     ) -> Vec<Action> {
-        let Some(committee) = self.committee_of_block(topology_schedule, block_hash) else {
+        let Some(committee) = self.block_committee(topology_schedule, block_hash) else {
             return vec![];
         };
         let buffered = self.votes.take_unanchored_votes(block_hash);
@@ -5774,7 +5712,7 @@ impl ShardCoordinator {
                 topology_schedule,
                 committee,
                 block.header().parent_block_hash(),
-                block.header().parent_qc().weighted_timestamp(),
+                block.header().parent_qc(),
             );
             let verification_actions = self.verification.initiate_block_verifications(
                 committee,
@@ -5855,6 +5793,14 @@ impl ShardCoordinator {
         round: Round,
     ) -> Vec<Action> {
         let Some(position) = self.signers.get(&voter).copied() else {
+            return vec![];
+        };
+        // The voter signs the epoch of the committee it judged the block
+        // under, the one `safe_voters` placed it in.
+        let Some(committee_epoch) = self
+            .block_committee(topology_schedule, block_hash)
+            .map(|committee| committee.epoch)
+        else {
             return vec![];
         };
         // Advance the voter's safe-vote lock (Rule 1). `last_voted_round`
@@ -5949,6 +5895,7 @@ impl ShardCoordinator {
                 parent_block_hash,
                 height,
                 round,
+                committee_epoch,
                 timestamp,
                 next_proposers,
                 position: self.vote_position(position, Some(block_hash)),
@@ -5996,7 +5943,7 @@ impl ShardCoordinator {
             return vec![];
         }
         // Anchor resolvable but committee `None` ⇒ beacon-behind stall.
-        let Some(committee) = self.committee_of_block(topology_schedule, vote.block_hash()) else {
+        let Some(committee) = self.block_committee(topology_schedule, vote.block_hash()) else {
             return vec![];
         };
         let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
@@ -6044,7 +5991,7 @@ impl ShardCoordinator {
             self.votes.buffer_unanchored_vote(vote);
             return actions;
         }
-        let Some(committee) = self.committee_of_block(topology_schedule, vote.block_hash()) else {
+        let Some(committee) = self.block_committee(topology_schedule, vote.block_hash()) else {
             return vec![];
         };
         let header_for_vote = self.pending_blocks.get_header(vote.block_hash());
@@ -6554,11 +6501,12 @@ impl ShardCoordinator {
         actions
     }
 
-    /// If `latest_qc.committable_hash()` now has an assembled handle in
-    /// the verification cache, drive the 2-chain commit. `try_two_chain_commit`
+    /// Drive the 2-chain commit `latest_qc` completes, once whatever it
+    /// deferred on is held: the committable block's assembled handle, or
+    /// the header of the block `latest_qc` certifies. `try_two_chain_commit`
     /// is idempotent against `committed_height`, so calling it on every
     /// completion is safe.
-    fn drive_deferred_commit_for(&self) -> Vec<Action> {
+    fn drive_deferred_commit_for(&mut self) -> Vec<Action> {
         let Some(qc) = self.latest_qc.clone() else {
             return vec![];
         };
@@ -6721,7 +6669,7 @@ impl ShardCoordinator {
             topology_schedule,
             committee,
             block.header().parent_block_hash(),
-            block.header().parent_qc().weighted_timestamp(),
+            block.header().parent_qc(),
         );
         self.verification.initiate_beacon_witness_root_verification(
             block_hash,
@@ -7312,8 +7260,19 @@ impl ShardCoordinator {
     /// `on_block_header` (when we learn about a QC via the next block's
     /// `parent_qc`). This ensures all validators commit regardless of whether
     /// they received votes directly.
+    ///
+    /// Every committed block carries the QC its child's header pins over
+    /// it ([`Verified::<CertifiedBlock>::pinned_by`]), the one copy every
+    /// replica holds alike, so what a commit derives from its QC — the
+    /// committee it was certified under — does not turn on which copy
+    /// reached this replica. The committable block's child is the block
+    /// `qc` certifies; while its header is not held the commit defers.
+    /// When `qc` is the adopted high QC, nothing else brings that header
+    /// once the chain stops above it, so the deferral fetches it through
+    /// block sync, the path that also serves a dissolved chain, and its
+    /// arrival drives the commit again.
     fn try_two_chain_commit(
-        &self,
+        &mut self,
         qc: &Verified<QuorumCertificate>,
         source: CommitSource,
     ) -> Vec<Action> {
@@ -7383,10 +7342,28 @@ impl ShardCoordinator {
             return vec![];
         }
 
+        let Some(child) = self.chain_view().get_header(qc.block_hash()).cloned() else {
+            debug!(
+                signers = ?self.signers.keys(),
+                qc_block_hash = ?qc.block_hash(),
+                committable_height = committable_height.inner(),
+                "Committable block's child header not held — deferring commit"
+            );
+            return self.fetch_committing_child(qc);
+        };
+        // SAFETY: attestation source is `qc`, a verified QC over this header.
+        let Ok(child) = Verified::<CertifiedBlockHeader>::from_qc_attestation(child, qc.clone())
+        else {
+            return vec![];
+        };
+
         // Commit the whole prefix from the committed tip up to the committable
         // block. Steady state this is just the committable block itself; after
         // a view change it also flushes the deferred non-contiguous ancestors.
         let Some(prefix) = self.collect_commit_prefix(&committable) else {
+            return vec![];
+        };
+        let Some(prefix) = Self::pinned_prefix(prefix, child) else {
             return vec![];
         };
 
@@ -7396,6 +7373,23 @@ impl ShardCoordinator {
                 Action::Continuation(ProtocolEvent::BlockReadyToCommit { certified, source })
             })
             .collect()
+    }
+
+    /// Fetch the block `qc` certifies, whose header a commit is waiting
+    /// on, when `qc` is the adopted high QC. A QC formed or relayed ahead
+    /// of its block's header is adopted, or driven again, when the header
+    /// lands; one adopted without it — from a store, an announcement or a
+    /// timeout — has nothing behind it that brings the header if no block
+    /// follows.
+    fn fetch_committing_child(&mut self, qc: &Verified<QuorumCertificate>) -> Vec<Action> {
+        let adopted = self
+            .latest_qc
+            .as_ref()
+            .is_some_and(|latest| latest.block_hash() == qc.block_hash());
+        if !adopted {
+            return Vec::new();
+        }
+        self.start_block_sync(qc.height())
     }
 
     /// Walk down from `committable` through its parent links, collecting the
@@ -7449,6 +7443,30 @@ impl ShardCoordinator {
         }
         chain.reverse();
         Some(chain)
+    }
+
+    /// `prefix`, ascending, with each block carrying the QC its child pins:
+    /// the next block's header for each but the last, and `child`'s for
+    /// the last. A block already holding that copy is kept as it is.
+    /// `None` when a link does not extend the block below it, which the
+    /// prefix walk has already ruled out.
+    fn pinned_prefix(
+        prefix: Vec<Arc<Verified<CertifiedBlock>>>,
+        child: Verified<CertifiedBlockHeader>,
+    ) -> Option<Vec<Arc<Verified<CertifiedBlock>>>> {
+        let mut child = child;
+        let mut pinned = Vec::with_capacity(prefix.len());
+        for certified in prefix.into_iter().rev() {
+            let block = if certified.qc() == child.header().parent_qc() {
+                certified
+            } else {
+                Arc::new(certified.pinned_by(&child).ok()?)
+            };
+            child = block.certified_header();
+            pinned.push(block);
+        }
+        pinned.reverse();
+        Some(pinned)
     }
 
     /// Handle block ready to commit.
@@ -7553,6 +7571,7 @@ impl ShardCoordinator {
         // the committee of the block extending it, and the one its parent
         // carried, which anchors the committee that signed the tip itself.
         self.committed_committee_anchor_wt = self.committed_block_anchor_wt;
+        self.stand_in_anchor_tip = None;
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
@@ -7607,25 +7626,29 @@ impl ShardCoordinator {
             .flat_map(|fw| fw.settling_receipts())
             .collect();
         // The committed block's missed-proposal leaves resolve against the
-        // committee that produced it — the certified binding of its anchor
-        // and certifying QC. That binding is a pure function of folded
-        // chain content: a halt recovery's sync-admitted suffix keeps
-        // deriving under the old committee its headers committed, a bridge
-        // block under the fresh committee that proposed it, and every
-        // replica derives the same leaves however late it commits (the
-        // completed recovery keeps the bridge answering after the pending
-        // record clears). `commit_one_buffered_block` parks any commit
-        // whose committee this replica's schedule does not resolve, so it
-        // always resolves here. If it ever doesn't, local state is
-        // corrupt: deriving leaves under a different committee would fork
-        // the beacon-witness accumulator across the committee, so fail
-        // fast rather than fork, mirroring the commit-linkage assert above.
-        let Some(committee) = self.committee_of_qc(topology_schedule, certifying_qc) else {
+        // committee that produced it — the window its certifying QC
+        // signed. `certifying_qc` is the copy the block's child pins, so
+        // every replica reads the one epoch the chain records: a halt
+        // recovery's sync-admitted suffix keeps deriving under the old
+        // committee its headers committed, a bridge block under the fresh
+        // committee that proposed it, and every replica derives the same
+        // leaves however late it commits and whatever it has folded since.
+        // `commit_one_buffered_block` parks any commit whose window this
+        // replica's schedule does not hold, so it always resolves here. If
+        // it ever doesn't, local state is corrupt: deriving leaves under a
+        // different committee would fork the beacon-witness accumulator
+        // across the committee, so fail fast rather than fork, mirroring
+        // the commit-linkage assert above.
+        let Some(committee) = self
+            .signed_committee_of(topology_schedule, certifying_qc)
+            .committee()
+            .map(|committee| committee.snapshot.as_ref())
+        else {
             panic!(
                 "commit-time committee unresolved at height {} for block {block_hash:?} \
-                 (anchor {:?}) — beacon-witness accumulator would diverge",
+                 (epoch {}) — beacon-witness accumulator would diverge",
                 height.inner(),
-                self.committee_anchor(block_hash),
+                certifying_qc.committee_epoch().inner(),
             );
         };
         let missed = missed_proposals_since_prev_commit(
@@ -7686,10 +7709,10 @@ impl ShardCoordinator {
     /// estimate, once, ahead of the first commit since this replica
     /// started. Only headers the live committee certified count: a member
     /// the committee change seated holds none of the others, and the
-    /// estimate has to be built from what every member holds. A block's
-    /// committee anchors at its parent's parent QC and is certified at its
-    /// own QC, pinned in its child, so each header is attributed from its
-    /// neighbours; the tip's child is the block committing now.
+    /// estimate has to be built from what every member holds. A block was
+    /// certified under the window its QC signed, pinned in its child, so
+    /// each header is attributed from the one after it; the tip's child is
+    /// the block committing now.
     fn replay_recent_headers(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -7698,20 +7721,20 @@ impl ShardCoordinator {
     ) {
         let headers = std::mem::take(&mut self.recent_headers);
         let chain: Vec<&BlockHeader> = headers.iter().chain(std::iter::once(live)).collect();
-        for i in 1..chain.len().saturating_sub(1) {
-            let anchor = chain[i - 1].parent_qc().weighted_timestamp();
-            let certified = chain[i + 1].parent_qc().weighted_timestamp();
-            let by_live_committee = topology_schedule
-                .certified_committee(self.local_shard, anchor, certified)
-                .committee()
-                .is_some_and(|committee| {
-                    committee
-                        .snapshot
-                        .consensus_committee_for_shard(self.local_shard)
-                        == members
-                });
+        for pair in chain.windows(2) {
+            let (header, child) = (pair[0], pair[1]);
+            let by_live_committee = !child.parent_qc().is_genesis()
+                && self
+                    .signed_committee_of(topology_schedule, child.parent_qc())
+                    .committee()
+                    .is_some_and(|committee| {
+                        committee
+                            .snapshot
+                            .consensus_committee_for_shard(self.local_shard)
+                            == members
+                    });
             if by_live_committee {
-                self.view_change.observe_commit(chain[i], members);
+                self.view_change.observe_commit(header, members);
             }
         }
     }
@@ -7889,11 +7912,8 @@ impl ShardCoordinator {
             return None;
         }
         if self
-            .committee_certified_at(
-                topology_schedule,
-                self.committed_block_anchor_wt,
-                certified.qc(),
-            )
+            .signed_committee_of(topology_schedule, certified.qc())
+            .committee()
             .is_none()
         {
             warn!(
@@ -8050,22 +8070,23 @@ impl ShardCoordinator {
 
         // A fork-caused recovery pins the seed to the beacon-attested
         // frontier: the replaced committee provably committed two branches,
-        // so any of its certified blocks above the frontier — anchored and
-        // certified below the recovery bridge — may be either branch, and
+        // so any of its certified blocks above the frontier — signed under
+        // a window below the recovery bridge — may be either branch, and
         // admitting one seeds this replica onto an unattestable chain.
         // Blocks at or below the frontier are common attested history and
-        // stay admissible, as do the fresh committee's own blocks (certified
-        // past the bridge). A halt's unique suffix keeps today's admission.
+        // stay admissible, as do the fresh committee's own blocks (signed
+        // under the bridge or later). A halt's unique suffix keeps today's
+        // admission.
         if let Some(recovery) = topology_schedule
             .head()
             .pending_recoveries()
             .get(&self.local_shard)
             && recovery.cause == RecoveryCause::Fork
             && certified.block().height() > recovery.attested_frontier
-            && topology_schedule.recovery_suffix_band(
+            && topology_schedule.replaced_by(
                 self.local_shard,
-                certified.block().header().parent_qc().weighted_timestamp(),
-                certified.qc().weighted_timestamp(),
+                recovery.binding(),
+                certified.qc().committee_epoch(),
             )
         {
             warn!(
@@ -8083,40 +8104,37 @@ impl ShardCoordinator {
         // moves keys the signature check fails and sync wedges at that height
         // rather than crossing the boundary.
         //
-        // A not-yet-committed epoch defers: the block goes back to the buffer
-        // and `on_beacon_block_persisted` re-drains it once the beacon catches
+        // An undecidable QC defers: the block goes back to the buffer and
+        // `on_beacon_block_persisted` re-drains it once the beacon catches
         // up — discarding it here would leave a hole the drain can never
-        // refill without a network re-fetch. An evicted epoch rejects: the
-        // schedule's floor retains every epoch the local chain can still
-        // verify against, so a synced block keyed below it carries a forged
-        // weighted timestamp (it rides outside the signed message) or sits on
-        // a stale fork — no amount of retrying resolves it. Certified
-        // resolution: a halt recovery's bridge block — anchored below the
-        // bridge, certified at or past it — verifies against the fresh
+        // refill without a network re-fetch. A refused one rejects: its
+        // signed epoch is not one honest voters can have signed for the
+        // block at its stamp, or its window is below the schedule floor,
+        // which retains every epoch the local chain can still verify
+        // against — no amount of retrying resolves it. A halt recovery's
+        // bridge block signs the bridge and verifies against the fresh
         // committee.
         let Some(committee_anchor_wt) = self.synced_committee_anchor_wt(certified.block().header())
         else {
             return self.await_synced_parent(topology_schedule, certified);
         };
-        let committee = match topology_schedule.certified_committee(
-            self.local_shard,
-            committee_anchor_wt,
-            certified.qc().weighted_timestamp(),
-        ) {
-            BlockResolution::Committee(committee) => committee.snapshot,
-            BlockResolution::NotYetCommitted => {
+        let committee = match self.admit_qc(topology_schedule, committee_anchor_wt, certified.qc())
+        {
+            QcAdmission::Admit(committee) => committee.snapshot,
+            QcAdmission::Wait => {
                 warn!(
                     height = certified.block().height().inner(),
-                    "No committee for synced block's epoch yet — beacon behind, re-buffering"
+                    "Synced block's committee epoch not decidable yet — beacon behind, re-buffering"
                 );
                 let height = certified.block().height();
                 self.block_sync.defer_block(height, certified);
                 return vec![];
             }
-            BlockResolution::Evicted => {
+            QcAdmission::Refuse | QcAdmission::Fenced => {
                 warn!(
                     height = certified.block().height().inner(),
-                    "Synced block's committee epoch is below the schedule floor — rejecting"
+                    epoch = certified.qc().committee_epoch().inner(),
+                    "Synced block's QC names no committee this replica admits — rejecting"
                 );
                 return vec![];
             }
@@ -8851,19 +8869,17 @@ impl ShardCoordinator {
 
     /// Whether a fork-caused recovery refuses `qc` as a sync source: the
     /// QC names a block above the beacon-attested frontier that the
-    /// replaced committee certified before the re-draw (its weighted
-    /// timestamp resolves below the recovery bridge). A forked retained
-    /// committee provably committed two branches, so such a block may be
-    /// either branch and must not seed this replica; the fresh chain's
-    /// own blocks certify at post-bridge timestamps and pass. Halt
-    /// recoveries keep the full suffix admissible — their retained tip is
-    /// unique.
+    /// replaced committee certified (it signed a window below the recovery
+    /// bridge). A forked retained committee provably committed two
+    /// branches, so such a block may be either branch and must not seed
+    /// this replica; the fresh chain's own blocks sign the bridge or later
+    /// and pass. Halt recoveries keep the full suffix admissible — their
+    /// retained tip is unique.
     fn fork_refuses_retained_suffix(
         &self,
         topology_schedule: &TopologySchedule,
         qc: &QuorumCertificate,
     ) -> bool {
-        let wt = qc.weighted_timestamp();
         topology_schedule
             .head()
             .pending_recoveries()
@@ -8871,7 +8887,11 @@ impl ShardCoordinator {
             .is_some_and(|recovery| {
                 recovery.cause == RecoveryCause::Fork
                     && qc.height() > recovery.attested_frontier
-                    && topology_schedule.recovery_suffix_band(self.local_shard, wt, wt)
+                    && topology_schedule.replaced_by(
+                        self.local_shard,
+                        recovery.binding(),
+                        qc.committee_epoch(),
+                    )
             })
     }
 
@@ -10325,10 +10345,10 @@ mod tests {
         SubstateClaim, SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES,
         TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule,
         TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxOutcome,
-        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId,
-        ValidatorInfo, ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp, WindowLookup,
-        WitnessSources, decide, encode_amount, read_amount, receipt_hash_of, said_at, test_utils,
-        tick_terms_admit_block, verdict_leaf,
+        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, ValidatorInfo, ValidatorSet,
+        Value, VoteCount, VrfProof, WeightedTimestamp, WindowLookup, WitnessSources, decide,
+        encode_amount, read_amount, receipt_hash_of, said_at, test_utils, tick_terms_admit_block,
+        verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{
@@ -10519,6 +10539,7 @@ mod tests {
             BlockHeight::new(10),
             BlockHash::ZERO,
             Round::new(1),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             now,
@@ -10690,7 +10711,7 @@ mod tests {
             live(&[PARENT], BTreeMap::new()),
         );
         sched.insert(Epoch::new(1), Arc::clone(&head));
-        sched.set_head(head);
+        sched.set_head(Epoch::new(1), head);
         sched
     }
 
@@ -11397,6 +11418,7 @@ mod tests {
             state.committed_height,
             BlockHash::ZERO,
             Round::new(0),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             anchor,
@@ -11817,6 +11839,7 @@ mod tests {
                 state.committed_height,
                 BlockHash::ZERO,
                 Round::new(0),
+                Epoch::GENESIS,
                 signers,
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(anchor_ms),
@@ -13069,6 +13092,7 @@ mod tests {
                 state.committed_height,
                 BlockHash::ZERO,
                 Round::new(0),
+                Epoch::GENESIS,
                 signers,
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(2_500),
@@ -15018,6 +15042,7 @@ mod tests {
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::new(0),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(anchor_ms),
@@ -15130,9 +15155,19 @@ mod tests {
         state.committed_hash = from;
         state.committed_block_anchor_wt = WeightedTimestamp::from_millis(50_000);
         let block = block_chained_on(BlockHeight::new(1), from, 51_000);
-        let qc = make_test_qc(block.hash(), block.height());
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            block.height(),
+            from,
+            block.header().round(),
+            Epoch::new(10),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(51_000),
+        );
         let certified = Arc::new(Verified::new_unchecked_for_test(
-            CertifiedBlock::new_unchecked(block, qc),
+            CertifiedBlock::new_unchecked(block, Verified::new_unchecked_for_test(qc)),
         ));
         let commits = |actions: &[Action]| {
             actions
@@ -15287,6 +15322,7 @@ mod tests {
             BlockHeight::new(height.inner() - 1),
             BlockHash::ZERO,
             Round::new(0),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_weighted_ms),
@@ -15365,6 +15401,7 @@ mod tests {
                     BlockHeight::new(5),
                     BlockHash::ZERO,
                     Round::new(5),
+                    Epoch::GENESIS,
                     SignerBitfield::empty(),
                     AggregateSignature::ZERO,
                     WeightedTimestamp::from_millis(weighted_ms),
@@ -15554,6 +15591,7 @@ mod tests {
                     block.height(),
                     block.header().parent_block_hash(),
                     block.header().round(),
+                    Epoch::GENESIS,
                     signers,
                     AggregateSignature::ZERO,
                     WeightedTimestamp::from_millis(weighted_ms),
@@ -15718,6 +15756,7 @@ mod tests {
             BlockHeight::new(9),
             BlockHash::ZERO,
             Round::new(9),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             anchor,
@@ -16078,6 +16117,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(7),
             Round::new(1),
+            Epoch::GENESIS,
             ValidatorId::new(1),
             ConsensusSignature::ZERO,
             ProposerTimestamp::from_millis(100_000),
@@ -16105,6 +16145,7 @@ mod tests {
             ShardId::ROOT,
             block.height(),
             block.header().round(),
+            Epoch::GENESIS,
             ValidatorId::new(voter as u64),
             &keys[voter],
             ProposerTimestamp::ZERO,
@@ -16119,6 +16160,7 @@ mod tests {
             ShardId::ROOT,
             block.height(),
             block.header().round(),
+            Epoch::GENESIS,
             ValidatorId::new(voter),
             ConsensusSignature::ZERO,
             ProposerTimestamp::ZERO,
@@ -16388,6 +16430,7 @@ mod tests {
                 BlockHeight::new(5),
                 parent.header().parent_block_hash(),
                 Round::new(5),
+                Epoch::GENESIS,
                 signers,
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(weighted_ms),
@@ -16463,6 +16506,7 @@ mod tests {
             BlockHeight::new(5),
             parent.header().parent_block_hash(),
             Round::new(5),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(5_000),
@@ -16542,6 +16586,7 @@ mod tests {
             height,
             BlockHash::ZERO,
             Round::new(height.inner()),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
@@ -16574,6 +16619,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 signers,
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(99_000),
@@ -16631,6 +16677,7 @@ mod tests {
             BlockHeight::new(MAX_HEADER_HEIGHT_LOOKAHEAD),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(9),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(50_000),
@@ -16951,6 +16998,7 @@ mod tests {
                 BlockHeight::new(height - 1),
                 BlockHash::ZERO,
                 Round::new(round),
+                Epoch::GENESIS,
                 signers,
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(now_ms - 5_000),
@@ -17027,6 +17075,7 @@ mod tests {
             BlockHeight::new(5),
             grandparent.hash(),
             Round::new(7),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(99_000),
@@ -17079,6 +17128,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 signers,
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(99_000),
@@ -17146,6 +17196,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 signers,
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(99_000),
@@ -17236,6 +17287,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 signers,
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(99_000),
@@ -17331,7 +17383,7 @@ mod tests {
             Epoch::new(0),
             Arc::clone(&snapshot),
         );
-        topology_schedule.set_head(Arc::clone(&snapshot));
+        topology_schedule.set_head(Epoch::new(0), Arc::clone(&snapshot));
         state.set_time(LocalTimestamp::from_millis(100_000));
 
         let parent_block = Block::Live {
@@ -17362,6 +17414,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 signers,
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(99_000),
@@ -17481,6 +17534,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 signers,
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(99_000),
@@ -17791,6 +17845,7 @@ mod tests {
                 BlockHeight::new(4),
                 BlockHash::ZERO,
                 Round::new(5),
+                Epoch::GENESIS,
                 SignerBitfield::empty(),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(100_000),
@@ -17920,6 +17975,7 @@ mod tests {
                     ShardId::ROOT,
                     BlockHeight::new(1),
                     Round::new(1),
+                    Epoch::GENESIS,
                     ValidatorId::new(idx as u64),
                     &keys[idx],
                     ProposerTimestamp::from_millis(100_000),
@@ -17934,6 +17990,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(1),
             Round::new(1),
+            Epoch::GENESIS,
             state.committed_hash,
             WeightedTimestamp::ZERO,
             &votes,
@@ -18556,6 +18613,7 @@ mod tests {
                 BlockHeight::new(5),
                 BlockHash::ZERO,
                 Round::new(5),
+                Epoch::GENESIS,
                 SignerBitfield::empty(),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(CUT_ED - 1),
@@ -18575,6 +18633,7 @@ mod tests {
                         shard,
                         BlockHeight::new(6),
                         Round::new(6),
+                        Epoch::new(0),
                         ValidatorId::new(id),
                         &keys[&id],
                         ProposerTimestamp::from_millis(q_anchor + 1),
@@ -18592,6 +18651,7 @@ mod tests {
                 shard,
                 BlockHeight::new(6),
                 Round::new(6),
+                Epoch::new(0),
                 p.hash(),
                 WeightedTimestamp::from_millis(q_anchor + 1),
                 &votes,
@@ -19382,6 +19442,7 @@ mod tests {
             BlockHeight::new(1),
             real.parent_block_hash(),
             real.round(),
+            real.committee_epoch(),
             signers,
             AggregateSignature::ZERO,
             real.weighted_timestamp(),
@@ -19517,10 +19578,11 @@ mod tests {
     }
 
     /// A QC at `height` stamped `stamp_ms`, signed by three of
-    /// `committee`'s members.
+    /// `committee`'s members under `epoch`.
     fn qc_signed_by(
         keys: &BTreeMap<u64, BlsSigner>,
         committee: &TopologySnapshot,
+        epoch: Epoch,
         height: u64,
         stamp_ms: u64,
     ) -> QuorumCertificate {
@@ -19538,6 +19600,7 @@ mod tests {
                     ShardId::ROOT,
                     BlockHeight::new(height),
                     Round::new(height),
+                    epoch,
                     *voter,
                     &keys[&voter.inner()],
                     ProposerTimestamp::from_millis(stamp_ms),
@@ -19555,6 +19618,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(height),
             Round::new(height),
+            epoch,
             BlockHash::ZERO,
             WeightedTimestamp::from_millis(stamp_ms),
             &votes,
@@ -19571,19 +19635,54 @@ mod tests {
     }
 
     /// A certificate stamped two windows above the tip, signed by the
-    /// committee of the window it is stamped in, verifies under it.
+    /// committee of the window it names, verifies under it alone.
     #[test]
-    fn a_claim_verifies_under_the_window_its_certificate_is_stamped_in() {
+    fn a_claim_verifies_under_the_window_its_certificate_names() {
         let (mut state, schedule, keys, epochs) = claim_epochs();
-        let qc = qc_signed_by(&keys, &epochs[2], 12, 2 * CLAIM_ED + 100);
+        let qc = qc_signed_by(&keys, &epochs[2], Epoch::new(2), 12, 2 * CLAIM_ED + 100);
 
         let actions = state.sync_to_certified_block(
             &schedule,
             &Verifiable::from(qc),
             Carrier::Proposer(ValidatorId::new(8)),
         );
-        assert_eq!(sync_claim_count(&actions), 2, "{actions:?}");
+        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
         let answered = answer_sync_claims(&mut state, &schedule, &actions);
+        assert!(
+            starts_sync_to(&answered, BlockHeight::new(12)),
+            "{answered:?}"
+        );
+    }
+
+    /// The seating-epoch forgery as a sync claim. With a recovery seated at
+    /// 2 (bridge 3) pending, a certificate the replaced committee of epoch
+    /// 1 signs under its own window, stamped in the seating epoch, resolves
+    /// no committee and starts no check: the signed-epoch fence refuses it
+    /// whatever its stamp. One signed under the bridge is checked and
+    /// starts the sync.
+    #[test]
+    fn a_retained_quorum_stamped_in_the_seating_epoch_is_fenced() {
+        let (mut state, schedule, keys, epochs) = claim_epochs();
+        let mut recovering = schedule.clone();
+        let head = with_pending_halt_recovery(&schedule, Vec::new(), Epoch::new(2));
+        recovering.set_head(Epoch::new(3), head);
+
+        let forged = qc_signed_by(&keys, &epochs[1], Epoch::new(1), 12, 2 * CLAIM_ED + 100);
+        let actions = state.sync_to_certified_block(
+            &recovering,
+            &Verifiable::from(forged),
+            Carrier::Proposer(ValidatorId::new(4)),
+        );
+        assert_eq!(sync_claim_count(&actions), 0, "{actions:?}");
+
+        let fresh = qc_signed_by(&keys, &epochs[3], Epoch::new(3), 12, 2 * CLAIM_ED + 100);
+        let actions = state.sync_to_certified_block(
+            &recovering,
+            &Verifiable::from(fresh),
+            Carrier::Proposer(ValidatorId::new(12)),
+        );
+        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
+        let answered = answer_sync_claims(&mut state, &recovering, &actions);
         assert!(
             starts_sync_to(&answered, BlockHeight::new(12)),
             "{answered:?}"
@@ -19591,14 +19690,14 @@ mod tests {
     }
 
     /// A replica that cannot resolve its tip's anchor still checks a claim
-    /// against the committees the certificate's own stamp names.
+    /// against the committee the certificate names.
     #[test]
-    fn a_claim_without_a_tip_anchor_still_tries_the_stamped_window() {
+    fn a_claim_without_a_tip_anchor_still_tries_the_named_window() {
         let (mut state, schedule, keys, epochs) = claim_epochs();
-        let unheld = qc_signed_by(&keys, &epochs[0], 5, 100);
+        let unheld = qc_signed_by(&keys, &epochs[0], Epoch::new(0), 5, 100);
         state.latest_qc = Some(Verified::new_unchecked_for_test(unheld));
         assert_eq!(state.next_proposal_committee_anchor_wt(), None);
-        let qc = qc_signed_by(&keys, &epochs[2], 12, 2 * CLAIM_ED + 100);
+        let qc = qc_signed_by(&keys, &epochs[2], Epoch::new(2), 12, 2 * CLAIM_ED + 100);
 
         let actions = state.sync_to_certified_block(
             &schedule,
@@ -19613,35 +19712,12 @@ mod tests {
         );
     }
 
-    /// After a stall of a whole window, the committee that resumes the
-    /// chain signs its first QCs stamped two windows above its own. A
-    /// replica whose tip anchors below it walks the windows down from the
-    /// stamp's, one pairing at a time, until one verifies.
+    /// A certificate naming a window this replica's beacon has not
+    /// committed is not checked until the beacon holds it, and verifies at
+    /// once then, in the same view: a lagging replica's view does not move
+    /// while it cannot verify the network's certificates.
     #[test]
-    fn a_claim_walks_down_past_a_stalled_window_to_its_signer() {
-        let (mut state, schedule, keys, epochs) = claim_epochs();
-        let qc = qc_signed_by(&keys, &epochs[1], 20, 3 * CLAIM_ED + 5);
-
-        let actions = state.sync_to_certified_block(
-            &schedule,
-            &Verifiable::from(qc),
-            Carrier::Proposer(ValidatorId::new(4)),
-        );
-        assert_eq!(sync_claim_count(&actions), 2, "{actions:?}");
-        let answered = answer_sync_claims(&mut state, &schedule, &actions);
-        assert!(
-            starts_sync_to(&answered, BlockHeight::new(20)),
-            "{answered:?}"
-        );
-    }
-
-    /// An honest certificate refuted while this replica's beacon lacks its
-    /// signer's window is checked again once the beacon holds it, or once
-    /// the retry interval passes, in the same view: a lagging replica's
-    /// view does not move while it cannot verify the network's
-    /// certificates.
-    #[test]
-    fn a_claim_refuted_while_the_beacon_lags_is_retried_once_it_catches_up() {
+    fn a_claim_naming_a_window_the_beacon_lacks_is_checked_once_it_catches_up() {
         let (mut state, full, keys, epochs) = claim_epochs();
         let mut partial = TopologySchedule::new(
             EpochWindows::new(0, CLAIM_ED),
@@ -19649,44 +19725,17 @@ mod tests {
             Arc::clone(&epochs[0]),
         );
         partial.insert(Epoch::new(1), Arc::clone(&epochs[1]));
-        let qc = qc_signed_by(&keys, &epochs[2], 12, 2 * CLAIM_ED + 100);
+        let qc = qc_signed_by(&keys, &epochs[2], Epoch::new(2), 12, 2 * CLAIM_ED + 100);
         let view = state.view();
-
-        let refute = |state: &mut ShardCoordinator, carrier: Carrier| {
-            let actions =
-                state.sync_to_certified_block(&partial, &Verifiable::from(qc.clone()), carrier);
-            assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
-            let answered = answer_sync_claims(state, &partial, &actions);
-            assert!(
-                !starts_sync_to(&answered, BlockHeight::new(12)),
-                "{answered:?}"
-            );
-        };
-
-        // Retried once the interval passes, with the schedule unchanged.
-        let waiting = Carrier::Proposer(ValidatorId::new(9));
-        refute(&mut state, waiting);
-        assert_eq!(
-            sync_claim_count(&state.sync_to_certified_block(
-                &partial,
-                &Verifiable::from(qc.clone()),
-                waiting
-            )),
-            0,
-            "a refuted carrier waits out the interval"
-        );
-        state.set_time(state.now.plus(VIEW_CHANGE_TIMEOUT_DEFAULT));
-        let actions =
-            state.sync_to_certified_block(&partial, &Verifiable::from(qc.clone()), waiting);
-        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
-        let _ = answer_sync_claims(&mut state, &partial, &actions);
-
-        // Retried at once when the beacon gains the signer's window.
         let lagging = Carrier::Proposer(ValidatorId::new(8));
-        refute(&mut state, lagging);
+
+        let actions =
+            state.sync_to_certified_block(&partial, &Verifiable::from(qc.clone()), lagging);
+        assert_eq!(sync_claim_count(&actions), 0, "{actions:?}");
         assert_eq!(state.view(), view);
-        let actions = state.sync_to_certified_block(&full, &Verifiable::from(qc.clone()), lagging);
-        assert!(sync_claim_count(&actions) > 0, "{actions:?}");
+
+        let actions = state.sync_to_certified_block(&full, &Verifiable::from(qc), lagging);
+        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
         let answered = answer_sync_claims(&mut state, &full, &actions);
         assert!(
             starts_sync_to(&answered, BlockHeight::new(12)),
@@ -19695,82 +19744,21 @@ mod tests {
         assert_eq!(state.view(), view);
     }
 
-    /// A window that seats a committee already tried is skipped: here the
-    /// stalled window seats the stamp's committee again, so the walk spends
-    /// no pairing on it and goes on to the signer below.
+    /// A certificate the committee it names did not sign is refuted after
+    /// one pairing, and its carrier held off.
     #[test]
-    fn a_walk_skips_a_window_seating_a_committee_already_tried() {
-        let (mut state, _, keys, epochs) = claim_epochs();
-        let mut schedule = TopologySchedule::new(
-            EpochWindows::new(0, CLAIM_ED),
-            Epoch::new(0),
-            Arc::clone(&epochs[0]),
-        );
-        schedule.insert(Epoch::new(1), Arc::clone(&epochs[1]));
-        schedule.insert(Epoch::new(2), Arc::clone(&epochs[3]));
-        schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
-        let qc = qc_signed_by(&keys, &epochs[1], 20, 3 * CLAIM_ED + 5);
-
-        let actions = state.sync_to_certified_block(
-            &schedule,
-            &Verifiable::from(qc),
-            Carrier::Proposer(ValidatorId::new(4)),
-        );
-        let (answered, verifications) = answer_sync_claims_counted(&mut state, &schedule, &actions);
-        assert_eq!(verifications, 3, "tip, stamp and the signer's window");
-        assert!(
-            starts_sync_to(&answered, BlockHeight::new(20)),
-            "{answered:?}"
-        );
-    }
-
-    /// With no tip anchor the walk runs down to the oldest window the
-    /// schedule holds.
-    #[test]
-    fn a_walk_without_a_tip_anchor_reaches_the_oldest_retained_window() {
-        let (mut state, _, keys, epochs) = claim_epochs();
-        let mut schedule = TopologySchedule::new(
-            EpochWindows::new(0, CLAIM_ED),
-            Epoch::new(1),
-            Arc::clone(&epochs[1]),
-        );
-        schedule.insert(Epoch::new(2), Arc::clone(&epochs[2]));
-        schedule.insert(Epoch::new(3), Arc::clone(&epochs[3]));
-        let unheld = qc_signed_by(&keys, &epochs[0], 5, 100);
-        state.latest_qc = Some(Verified::new_unchecked_for_test(unheld));
-        assert_eq!(state.next_proposal_committee_anchor_wt(), None);
-        let qc = qc_signed_by(&keys, &epochs[1], 20, 3 * CLAIM_ED + 5);
-
-        let actions = state.sync_to_certified_block(
-            &schedule,
-            &Verifiable::from(qc),
-            Carrier::Proposer(ValidatorId::new(4)),
-        );
-        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
-        let (answered, verifications) = answer_sync_claims_counted(&mut state, &schedule, &actions);
-        assert_eq!(verifications, 3, "the stamp's window, then 2 and 1");
-        assert!(
-            starts_sync_to(&answered, BlockHeight::new(20)),
-            "{answered:?}"
-        );
-    }
-
-    /// A certificate no retained committee signed walks every window down
-    /// to the floor, one pairing each, then is refuted and its carrier
-    /// held off.
-    #[test]
-    fn a_walk_that_finds_no_signer_is_refuted_after_every_window() {
+    fn a_claim_its_named_committee_did_not_sign_is_refuted_after_one_pairing() {
         let (mut state, schedule, _, _) = claim_epochs();
         let stranger: BTreeMap<u64, BlsSigner> =
             (0u64..4).map(|id| (id, BlsSigner::generate())).collect();
         let outsiders = committee_snapshot_over(&stranger, &[0, 1, 2, 3]);
-        let qc = qc_signed_by(&stranger, &outsiders, 20, 3 * CLAIM_ED + 5);
+        let qc = qc_signed_by(&stranger, &outsiders, Epoch::new(1), 20, 3 * CLAIM_ED + 5);
         let carrier = Carrier::Proposer(ValidatorId::new(4));
 
         let actions =
             state.sync_to_certified_block(&schedule, &Verifiable::from(qc.clone()), carrier);
         let (answered, verifications) = answer_sync_claims_counted(&mut state, &schedule, &actions);
-        assert_eq!(verifications, 4, "tip, stamp, then windows 2 and 1");
+        assert_eq!(verifications, 1, "the named window alone");
         assert!(
             !answered
                 .iter()
@@ -19782,12 +19770,12 @@ mod tests {
     }
 
     /// A certificate stamped far past every window the schedule holds is
-    /// checked against the tip committee alone: its own window is not
-    /// committed, and the walk stays within the windows held.
+    /// checked against the committee it names alone: its stamp's window
+    /// is not committed, and the stamp chooses no committee.
     #[test]
-    fn a_far_future_stamp_walks_no_further_than_the_schedule_holds() {
+    fn a_far_future_stamp_is_checked_under_the_named_window_alone() {
         let (mut state, schedule, keys, epochs) = claim_epochs();
-        let qc = qc_signed_by(&keys, &epochs[1], 20, u64::MAX / 2);
+        let qc = qc_signed_by(&keys, &epochs[1], Epoch::new(1), 20, u64::MAX / 2);
 
         let actions = state.sync_to_certified_block(
             &schedule,
@@ -19800,20 +19788,19 @@ mod tests {
     }
 
     /// The last two blocks an outgoing committee signs carry QCs stamped
-    /// in the incoming window. For a replica whose tip anchors a window
-    /// before both, they verify under the window before the stamp, tried
-    /// once the tip's and the stamp's committees refute.
+    /// in the incoming window. They name the window before the stamp, and
+    /// verify under it at once.
     #[test]
     fn an_outgoing_committees_last_two_blocks_verify_under_the_window_before() {
         let (mut state, schedule, keys, epochs) = claim_epochs();
         for (height, stamp) in [(10, 2 * CLAIM_ED + 5), (11, 2 * CLAIM_ED + 50)] {
-            let qc = qc_signed_by(&keys, &epochs[1], height, stamp);
+            let qc = qc_signed_by(&keys, &epochs[1], Epoch::new(1), height, stamp);
             let actions = state.sync_to_certified_block(
                 &schedule,
                 &Verifiable::from(qc),
                 Carrier::Proposer(ValidatorId::new(height)),
             );
-            assert_eq!(sync_claim_count(&actions), 2, "{actions:?}");
+            assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
             let answered = answer_sync_claims(&mut state, &schedule, &actions);
             assert!(
                 starts_sync_to(&answered, BlockHeight::new(height)),
@@ -19839,6 +19826,7 @@ mod tests {
                     ShardId::ROOT,
                     BlockHeight::new(1),
                     Round::new(1),
+                    Epoch::GENESIS,
                     ValidatorId::new(idx as u64),
                     &keys[idx],
                     ProposerTimestamp::from_millis(100_000),
@@ -19853,6 +19841,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(1),
             Round::new(1),
+            Epoch::GENESIS,
             state.committed_hash,
             WeightedTimestamp::ZERO,
             &votes,
@@ -20122,6 +20111,7 @@ mod tests {
                 BlockHeight::new(5),
                 BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
                 Round::new(1),
+                Epoch::GENESIS,
                 SignerBitfield::new(4),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::ZERO,
@@ -20179,6 +20169,7 @@ mod tests {
             BlockHeight::new(5),
             BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
             Round::new(1),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -20442,6 +20433,7 @@ mod tests {
             BlockHeight::new(5),
             BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
             Round::new(1),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -20478,6 +20470,7 @@ mod tests {
             height,
             BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
             Round::new(1),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -20573,6 +20566,7 @@ mod tests {
                 BlockHeight::new(2),
                 BlockHash::ZERO,
                 Round::new(3),
+                Epoch::GENESIS,
                 SignerBitfield::new(4),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(ms),
@@ -20637,6 +20631,7 @@ mod tests {
                     ShardId::ROOT,
                     header.height(),
                     header.round(),
+                    Epoch::GENESIS,
                     ValidatorId::new(idx as u64),
                     &keys[idx],
                     ProposerTimestamp::from_millis(stamp_ms),
@@ -20651,6 +20646,7 @@ mod tests {
             ShardId::ROOT,
             header.height(),
             header.round(),
+            Epoch::GENESIS,
             state.committed_hash,
             WeightedTimestamp::ZERO,
             &votes,
@@ -20823,6 +20819,7 @@ mod tests {
                 qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 qc.round(),
+                qc.committee_epoch(),
                 qc.signers().clone(),
                 qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(50_000),
@@ -21034,8 +21031,10 @@ mod tests {
                 &schedule,
                 &snapshot,
                 genesis.hash(),
-                WeightedTimestamp::ZERO,
-                WeightedTimestamp::ZERO,
+                &QuorumCertificate::genesis(
+                    state.local_shard,
+                    ChainOrigin::root(WeightedTimestamp::ZERO),
+                ),
             ),
             Ok(SubstateClaim {
                 bytes: Some(4_096),
@@ -21065,14 +21064,9 @@ mod tests {
         let parent = block_chained_on(BlockHeight::new(4), state.committed_hash, 100);
         assert_eq!(parent.header().load().substate_bytes, None);
         install_complete_block(&mut state, &parent);
+        let parent_qc = make_test_qc(parent.hash(), BlockHeight::new(4));
         let claim = |state: &ShardCoordinator| {
-            state.proposal_substate_bytes(
-                &schedule,
-                &snapshot,
-                parent.hash(),
-                WeightedTimestamp::from_millis(100),
-                WeightedTimestamp::from_millis(200),
-            )
+            state.proposal_substate_bytes(&schedule, &snapshot, parent.hash(), &parent_qc)
         };
 
         assert_eq!(claim(&state), Ok(SubstateClaim::default()));
@@ -21088,9 +21082,9 @@ mod tests {
     }
 
     /// A proposal on a synced suffix block claims no substate total,
-    /// whether or not this member has executed that block yet: the
-    /// suffix band decides it, read off the parent's anchor and the QC
-    /// over it, which every verifier reads too. A delta landing mid-build
+    /// whether or not this member has executed that block yet: the epoch
+    /// the QC over the parent signed decides it, which every verifier
+    /// reads too. A delta landing mid-build
     /// must not turn the claim into a count its voters cannot derive.
     #[test]
     fn a_suffix_parent_claims_no_substate_total_with_or_without_its_delta() {
@@ -21123,26 +21117,15 @@ mod tests {
             ..NetworkParams::default()
         }));
         let schedule = TopologySchedule::single(Arc::clone(&snapshot));
-        let parent_anchor = state.block_anchor(five.hash()).expect("five is held");
         let parent_qc = make_test_qc(five.hash(), BlockHeight::new(5));
-        assert!(schedule.recovery_suffix_band(
-            state.local_shard,
-            parent_anchor,
-            parent_qc.weighted_timestamp()
-        ));
+        assert!(schedule.replaced(state.local_shard, parent_qc.committee_epoch()));
 
         for delta in [None, Some(64)] {
             if let Some(delta) = delta {
                 state.pending_bytes_deltas.insert(five.hash(), delta);
             }
             assert_eq!(
-                state.proposal_substate_bytes(
-                    &schedule,
-                    &snapshot,
-                    five.hash(),
-                    parent_anchor,
-                    parent_qc.weighted_timestamp(),
-                ),
+                state.proposal_substate_bytes(&schedule, &snapshot, five.hash(), &parent_qc),
                 Ok(SubstateClaim::default()),
                 "delta {delta:?}",
             );
@@ -21188,9 +21171,8 @@ mod tests {
         );
         assert_eq!(state.committed_height, BlockHeight::new(3));
         assert!(state.pending_blocks.get(four_hash).is_none());
-        let anchor = state.block_anchor(four_hash).expect("four is held");
         let qc = make_test_qc(four_hash, BlockHeight::new(4));
-        assert!(!schedule.recovery_suffix_band(state.local_shard, anchor, qc.weighted_timestamp()));
+        assert!(!schedule.replaced(state.local_shard, qc.committee_epoch()));
 
         let _ = state.on_block_check_completed(
             &schedule,
@@ -21471,16 +21453,17 @@ mod tests {
     }
 
     /// A sync-delivered certified block above the fork recovery's attested
-    /// frontier — anchored and certified below the recovery bridge — is
+    /// frontier — signed under a window below the recovery bridge — is
     /// rejected at admission: the forked retained committee's suffix may
     /// be either branch. The same block admits for QC verification under a
-    /// halt recovery, whose retained suffix is unique.
+    /// halt recovery, whose retained suffix is unique, and under the fork
+    /// recovery once it sits at the frontier: history every chain keeps.
     #[test]
     fn sync_admission_rejects_the_retained_suffix_above_the_fork_frontier() {
         use hyperscale_types::test_utils::make_live_block;
         use hyperscale_types::{CertifiedBlock, RecoveryCause, ShardRecovery};
 
-        let admit = |cause: RecoveryCause| {
+        let admit_at = |cause: RecoveryCause, frontier: u64| {
             let (mut state, schedule) = make_test_state();
             let head = schedule.head().as_ref().clone().with_pending_recoveries(
                 std::iter::once((
@@ -21489,7 +21472,7 @@ mod tests {
                         cause,
                         rotated_at: Epoch::new(2),
                         retained: vec![ValidatorId::new(9)],
-                        attested_frontier: BlockHeight::GENESIS,
+                        attested_frontier: BlockHeight::new(frontier),
                     },
                 ))
                 .collect(),
@@ -21513,6 +21496,7 @@ mod tests {
                 block.height(),
                 block.header().parent_block_hash(),
                 Round::new(5),
+                Epoch::GENESIS,
                 signers,
                 AggregateSignature::ZERO,
                 WeightedTimestamp::ZERO,
@@ -21520,7 +21504,15 @@ mod tests {
             let certified = CertifiedBlock::new_unchecked(block, qc);
             state.submit_synced_block_for_verification(&schedule, certified)
         };
+        let admit = |cause: RecoveryCause| admit_at(cause, 0);
 
+        assert!(
+            admit_at(RecoveryCause::Fork, 5).iter().any(|a| matches!(
+                a,
+                Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+            )),
+            "a block at the fork recovery's frontier is admitted",
+        );
         assert!(
             admit(RecoveryCause::Halt).iter().any(|a| matches!(
                 a,
@@ -21597,6 +21589,7 @@ mod tests {
             ShardId::ROOT,
             height,
             Round::new(0),
+            Epoch::GENESIS,
             voter,
             ConsensusSignature::ZERO,
             ProposerTimestamp::from_millis(100_000),
@@ -21632,14 +21625,14 @@ mod tests {
                     public_key: BlsSigner::generate().public_key(),
                 })
                 .collect();
-            TopologySnapshot::new(
+            Arc::new(TopologySnapshot::new(
                 NetworkDefinition::simulator(),
                 1,
                 ValidatorSet::new(validators),
-            )
+            ))
         };
-        let replaced = snapshot([0, 1, 2, 3]);
-        let fresh = snapshot([4, 5, 6, 7]);
+        let replaced = (snapshot([0, 1, 2, 3]), Epoch::new(1));
+        let fresh = (snapshot([4, 5, 6, 7]), Epoch::new(2));
         let height = BlockHeight::new(1);
         let header = BlockHeader::new(BlockHeaderParts {
             height,
@@ -21648,15 +21641,22 @@ mod tests {
             ..Default::default()
         });
         let block_hash = header.hash();
-        let vote = |state: &mut ShardCoordinator, committee: &TopologySnapshot, voter: u64| {
+        let vote = |state: &mut ShardCoordinator,
+                    (committee, epoch): &(Arc<TopologySnapshot>, Epoch),
+                    voter: u64| {
             state.votes.accept_unverified_vote(
-                committee,
+                BlockCommittee {
+                    snapshot: committee,
+                    epoch: *epoch,
+                    past_terminal: false,
+                },
                 ShardId::ROOT,
                 BlockVote::from_parts(
                     block_hash,
                     ShardId::ROOT,
                     height,
                     Round::new(1),
+                    *epoch,
                     ValidatorId::new(voter),
                     ConsensusSignature::ZERO,
                     ProposerTimestamp::from_millis(1_000),
@@ -21814,6 +21814,7 @@ mod tests {
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 __qc.weighted_timestamp(),
@@ -21888,6 +21889,7 @@ mod tests {
                 header.height(),
                 header.parent_block_hash(),
                 header.round(),
+                Epoch::GENESIS,
                 SignerBitfield::empty(),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(10_000 * header.height().inner()),
@@ -22146,6 +22148,7 @@ mod tests {
                 header.height(),
                 header.parent_block_hash(),
                 header.round(),
+                Epoch::GENESIS,
                 SignerBitfield::empty(),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(10_000 * header.height().inner()),
@@ -22347,6 +22350,7 @@ mod tests {
             BlockHeight::new(3),
             BlockHash::from_raw(Hash::from_bytes(b"block_2")),
             Round::new(3),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
@@ -22409,6 +22413,7 @@ mod tests {
                 BlockHeight::new(3),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 Round::new(2),
+                Epoch::GENESIS,
                 signers,
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(100_000),
@@ -22494,6 +22499,7 @@ mod tests {
             base.height(),
             BlockHash::from_raw(Hash::from_bytes(b"block_2")),
             base.round(),
+            base.committee_epoch(),
             base.signers().clone(),
             base.aggregated_signature(),
             WeightedTimestamp::from_millis(now.as_millis() + envelope_ms + 1),
@@ -22520,7 +22526,7 @@ mod tests {
         // assembly is still in flight), we must defer — a later root
         // completion drives the deferred commit via
         // `drive_deferred_commit_for`.
-        let (state, _topology) = make_test_state();
+        let (mut state, _topology) = make_test_state();
 
         let committable_hash = BlockHash::from_raw(Hash::from_bytes(b"parent"));
         let child_hash = BlockHash::from_raw(Hash::from_bytes(b"child"));
@@ -22530,6 +22536,7 @@ mod tests {
             BlockHeight::new(4),
             committable_hash,
             Round::new(0),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
@@ -22714,6 +22721,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 signers,
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(99_000),
@@ -22824,6 +22832,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 signers.clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(99_000),
@@ -22851,6 +22860,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(101_000),
@@ -22942,6 +22952,7 @@ mod tests {
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 __qc.weighted_timestamp(),
@@ -23005,6 +23016,7 @@ mod tests {
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(old_timestamp),
@@ -23064,7 +23076,9 @@ mod tests {
             state.proposal.take_matching(height, round),
             TakeResult::Matched
         ));
-        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"own_block_4"));
+        let own = block_chained_on(height, state.committed_hash, 100_000);
+        install_complete_block(&mut state, &own);
+        let block_hash = own.hash();
         let vote = state.create_vote(
             &topology_schedule,
             state.sole_signer(),
@@ -23108,6 +23122,7 @@ mod tests {
                 __qc.height(),
                 BlockHash::ZERO,
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(500),
@@ -23142,7 +23157,7 @@ mod tests {
             Arc::clone(&pre_split),
         );
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
-        sched.set_head(post_split);
+        sched.set_head(Epoch::new(1), post_split);
 
         let actions = state.try_propose(&sched, |_| ProposalInputs::default());
         let classification = actions
@@ -23359,6 +23374,7 @@ mod tests {
             BlockHeight::new(4),
             block.header().parent_block_hash(),
             block.header().round(),
+            Epoch::new(5),
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(5 * ED),
@@ -23490,6 +23506,7 @@ mod tests {
             BlockHeight::new(4),
             block.header().parent_block_hash(),
             block.header().round(),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100),
@@ -23528,6 +23545,7 @@ mod tests {
             BlockHeight::new(4),
             block.header().parent_block_hash(),
             block.header().round(),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100),
@@ -23605,6 +23623,7 @@ mod tests {
             BlockHeight::new(3),
             BlockHash::ZERO,
             Round::new(3),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
@@ -23706,6 +23725,7 @@ mod tests {
                     block.height(),
                     block.header().parent_block_hash(),
                     block.header().round(),
+                    Epoch::GENESIS,
                     signers,
                     AggregateSignature::ZERO,
                     WeightedTimestamp::from_millis(2_000),
@@ -23759,6 +23779,7 @@ mod tests {
             BlockHeight::new(1),
             BlockHash::ZERO,
             Round::new(0),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1_600),
@@ -23835,6 +23856,7 @@ mod tests {
         let binding = state.votes.bind(
             forged.header(),
             schedule.head().consensus_committee_for_shard(ShardId::ROOT),
+            Epoch::GENESIS,
         );
         let actions = state.on_qc_result(block_hash, binding, Some(qc.clone()), vec![]);
 
@@ -24039,6 +24061,7 @@ mod tests {
                 BlockHeight::new(height),
                 block.header().parent_block_hash(),
                 block.header().round(),
+                Epoch::GENESIS,
                 signers,
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(ts),
@@ -24116,6 +24139,7 @@ mod tests {
             block.height(),
             block.header().parent_block_hash(),
             block.header().round(),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100),
@@ -24141,6 +24165,7 @@ mod tests {
             block.height(),
             block.header().parent_block_hash(),
             block.header().round(),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(110),
@@ -24204,6 +24229,7 @@ mod tests {
             &committee,
             &winner,
             Round::new(5),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(110),
         );
         let child_qc = qc_on(&child);
@@ -24279,6 +24305,7 @@ mod tests {
             &strangers,
             &winner,
             Round::new(5),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(110),
         );
         let (child_hash, actions) = deliver_synced(&mut state, &topology_schedule, child);
@@ -24400,6 +24427,146 @@ mod tests {
         );
     }
 
+    /// A commit stores the QC its block's child pins, so a replica that
+    /// adopted the QC over that child without its header defers the
+    /// commit. When the chain stops right after the child — halted, or
+    /// dissolved and ingesting no header — no later block brings the child
+    /// as a missing parent, so the deferral fetches it through block sync,
+    /// and the parent commits once it lands, carrying the pinned copy.
+    #[test]
+    fn a_commit_deferred_on_an_announced_child_lands_when_the_chain_stops() {
+        for dissolved in [false, true] {
+            let (mut state, topology_schedule) = make_test_state();
+            state.set_time(LocalTimestamp::from_millis(100_000));
+            state.committed_height = BlockHeight::new(3);
+            state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+            state.dissolved_latched = dissolved;
+
+            let (parent, _) = deliver_synced(
+                &mut state,
+                &topology_schedule,
+                block_with_parent_qc_ts(BlockHeight::new(4), 100),
+            );
+            let _ = state.on_qc_signature_verified(
+                &topology_schedule,
+                QcSubject::SyncedBlock(parent),
+                Ok(make_test_qc(parent, BlockHeight::new(4))),
+            );
+            state.set_block_syncing(false);
+
+            let child = block_chained_on(BlockHeight::new(5), parent, 110);
+            let child_qc = qc_on(&child);
+            let actions = state.try_adopt_verified_qc(&topology_schedule, &child_qc);
+            assert!(
+                !actions.iter().any(|a| matches!(
+                    a,
+                    Action::Continuation(ProtocolEvent::BlockReadyToCommit { .. })
+                )),
+                "dissolved={dissolved}: nothing commits without the child's header; got {actions:?}"
+            );
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    Action::StartBlockSync { target } if *target == BlockHeight::new(5)
+                )),
+                "dissolved={dissolved}: the child is fetched; got {actions:?}"
+            );
+
+            let pinned = child.header().parent_qc().clone();
+            let (child_hash, _) = deliver_synced(&mut state, &topology_schedule, child);
+            let actions = state.on_qc_signature_verified(
+                &topology_schedule,
+                QcSubject::SyncedBlock(child_hash),
+                Ok(child_qc),
+            );
+            let committed =
+                actions.iter().find_map(|a| match a {
+                    Action::Continuation(ProtocolEvent::BlockReadyToCommit {
+                        certified, ..
+                    }) if certified.block().hash() == parent => Some(certified),
+                    _ => None,
+                });
+            let committed = committed.unwrap_or_else(|| {
+                panic!("dissolved={dissolved}: the parent commits once its child lands; got {actions:?}")
+            });
+            assert_eq!(
+                committed.qc(),
+                &pinned,
+                "the commit carries the child-pinned QC"
+            );
+        }
+    }
+
+    /// The header the high QC certifies drives the commit it deferred the
+    /// moment it lands, ahead of any block naming it as a parent.
+    #[test]
+    fn a_deferred_commit_runs_when_the_certified_header_lands() {
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+        let (parent, _) = deliver_synced(
+            &mut state,
+            &topology_schedule,
+            block_with_parent_qc_ts(BlockHeight::new(4), 100),
+        );
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(parent),
+            Ok(make_test_qc(parent, BlockHeight::new(4))),
+        );
+        let chained = block_chained_on(BlockHeight::new(5), parent, 110);
+        let child = BlockHeader::new(BlockHeaderParts {
+            proposer: topology_schedule
+                .head()
+                .proposer_for(ShardId::ROOT, chained.header().round()),
+            parent_qc: QuorumCertificate::new(
+                parent,
+                ShardId::ROOT,
+                BlockHeight::new(4),
+                BlockHash::ZERO,
+                Round::new(4),
+                Epoch::GENESIS,
+                chained.header().parent_qc().signers().clone(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(110),
+            )
+            .into(),
+            timestamp: ProposerTimestamp::from_millis(100_000),
+            ..chained.header().clone().into_parts()
+        });
+        let child = Block::Live {
+            header: child,
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let _ = state.try_adopt_verified_qc(&topology_schedule, &qc_on(&child));
+
+        let actions = state.on_block_header(
+            &topology_schedule,
+            child.header(),
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Continuation(ProtocolEvent::BlockReadyToCommit { certified, .. })
+                    if certified.block().hash() == parent
+                        && certified.qc() == child.header().parent_qc()
+            )),
+            "the parent commits under the pinned copy; got {actions:?}"
+        );
+    }
+
     #[test]
     fn parent_qc_result_leaves_a_synced_block_of_the_same_hash_waiting() {
         // One block is in flight on both QC paths: its header arrived
@@ -24423,6 +24590,7 @@ mod tests {
             BlockHeight::new(3),
             BlockHash::ZERO,
             Round::new(3),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(99_000),
@@ -24641,6 +24809,7 @@ mod tests {
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_4")),
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(1000),
@@ -24703,6 +24872,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 sub_quorum_signers,
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(1000),
@@ -24900,6 +25070,7 @@ mod tests {
                 __qc.height(),
                 __qc.parent_block_hash(),
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(1000),
@@ -24932,6 +25103,7 @@ mod tests {
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 __qc.weighted_timestamp(),
@@ -24973,6 +25145,7 @@ mod tests {
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 WeightedTimestamp::from_millis(parent_timestamp),
@@ -25052,6 +25225,7 @@ mod tests {
                 __qc.height(),
                 BlockHash::from_raw(Hash::from_bytes(b"block_2")),
                 __qc.round(),
+                __qc.committee_epoch(),
                 __qc.signers().clone(),
                 __qc.aggregated_signature(),
                 __qc.weighted_timestamp(),
@@ -25629,7 +25803,7 @@ mod tests {
         advanced.insert(right);
         let live_head = TopologySnapshot::new(NetworkDefinition::simulator(), 2, validators)
             .with_advanced(advanced);
-        sched.set_head(Arc::new(live_head));
+        sched.set_head(Epoch::new(1), Arc::new(live_head));
         sched
     }
 
@@ -25722,6 +25896,7 @@ mod tests {
                 BlockHeight::new(10),
                 BlockHash::ZERO,
                 Round::new(parent_round),
+                Epoch::GENESIS,
                 SignerBitfield::new(4),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(committee_anchor_ms),
@@ -25926,6 +26101,7 @@ mod tests {
                     BlockHeight::new(0),
                     BlockHash::ZERO,
                     Round::new(0),
+                    Epoch::GENESIS,
                     SignerBitfield::empty(),
                     AggregateSignature::ZERO,
                     WeightedTimestamp::from_millis(anchor_ms),
@@ -27194,6 +27370,16 @@ mod tests {
     /// seats signed at `parent_ms`, proposed in its own round by the seat
     /// that round rotates to.
     fn header_on(parent: BlockHash, height: u64, parent_ms: u64) -> BlockHeader {
+        header_on_under(parent, height, parent_ms, Epoch::GENESIS)
+    }
+
+    /// [`header_on`], its parent QC signed under the window keyed `epoch`.
+    fn header_on_under(
+        parent: BlockHash,
+        height: u64,
+        parent_ms: u64,
+        epoch: Epoch,
+    ) -> BlockHeader {
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -27205,6 +27391,7 @@ mod tests {
             qc.height(),
             qc.parent_block_hash(),
             qc.round(),
+            epoch,
             signers,
             qc.aggregated_signature(),
             WeightedTimestamp::from_millis(parent_ms),
@@ -27272,7 +27459,7 @@ mod tests {
             Epoch::new(0),
             Arc::clone(&snapshot),
         );
-        schedule.set_head(Arc::clone(&snapshot));
+        schedule.set_head(Epoch::new(100), Arc::clone(&snapshot));
         for epoch in 1..=100 {
             schedule.insert(Epoch::new(epoch), Arc::clone(&snapshot));
         }
@@ -27591,11 +27778,11 @@ mod tests {
         );
     }
 
-    /// A block whose parent sits in a recovery's suffix band is voted for
-    /// whatever it adds, with no count; outside the band the same block
+    /// A block whose parent a committee a recovery replaced certified is
+    /// voted for whatever it adds, with no count; otherwise the same block
     /// waits on one.
     #[test]
-    fn a_block_with_its_parent_in_a_suffix_band_is_not_capped() {
+    fn a_block_over_a_replaced_committees_parent_is_not_capped() {
         let (mut state, banded, _, five) = harvested_unexecuted_suffix();
         let six = block_chained_on(BlockHeight::new(6), five.hash(), 120);
         install_complete_block(&mut state, &six);
@@ -27603,11 +27790,9 @@ mod tests {
             .answers
             .measured(six.hash(), AnswerDelta::default(), adding(1));
         assert_eq!(state.standing_answers_at(five.hash()), None);
-        let anchor = state.committee_anchor(six.hash()).expect("five is held");
-        assert!(banded.recovery_suffix_band(
+        assert!(banded.replaced(
             state.local_shard,
-            anchor,
-            six.header().parent_qc().weighted_timestamp()
+            six.header().parent_qc().committee_epoch()
         ));
         assert_eq!(state.vote_within_cap(&banded, six.hash()), Cap::Admitted);
 
@@ -27811,6 +27996,7 @@ mod tests {
             tip.height(),
             tip.parent_block_hash(),
             tip.round(),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(20_000),
@@ -27832,6 +28018,7 @@ mod tests {
             block.height(),
             tip.hash(),
             block.header().round(),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(30_000),
@@ -28148,23 +28335,22 @@ mod tests {
     fn an_offer_or_an_unwalkable_window_forces_the_block_out() {
         let (mut state, schedule, qc) = leading_after(|_| {}, WitnessSources::empty());
         let head = Arc::clone(schedule.head());
-        let wt = qc.weighted_timestamp();
         let tip = qc.block_hash();
         let empty = ProposalPayload::default();
-        assert!(state.on_offer(&schedule, &head, wt, tip, &empty).is_ok());
+        assert!(state.on_offer(&schedule, &head, &qc, tip, &empty).is_ok());
 
         let carrying = ProposalPayload {
             rowless: vec![test_transaction(1).hash()],
             ..ProposalPayload::default()
         };
         assert_eq!(
-            state.on_offer(&schedule, &head, wt, tip, &carrying),
+            state.on_offer(&schedule, &head, &qc, tip, &carrying),
             Err(EagerReason::Offered)
         );
 
         let unheld = BlockHash::from_raw(Hash::from_bytes(b"an unheld parent"));
         assert_eq!(
-            state.on_offer(&schedule, &head, wt, unheld, &empty),
+            state.on_offer(&schedule, &head, &qc, unheld, &empty),
             Err(EagerReason::Walk)
         );
 
@@ -28172,7 +28358,7 @@ mod tests {
             .ready_signal_pool
             .admit(ready_from_one(), state.now.minus(MIN_READY_SIGNAL_DWELL));
         assert_eq!(
-            state.on_offer(&schedule, &head, wt, tip, &empty),
+            state.on_offer(&schedule, &head, &qc, tip, &empty),
             Err(EagerReason::Offered)
         );
     }
@@ -28213,6 +28399,7 @@ mod tests {
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::new(0),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(anchor_ms),
@@ -28547,6 +28734,7 @@ mod tests {
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::new(1),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
@@ -28790,6 +28978,7 @@ mod tests {
                 BlockHeight::new(round),
                 BlockHash::ZERO,
                 Round::new(round),
+                Epoch::GENESIS,
                 SignerBitfield::empty(),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(100_000),
@@ -28920,6 +29109,7 @@ mod tests {
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::new(5),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
@@ -29585,11 +29775,21 @@ mod tests {
             Epoch::new(0),
             Arc::clone(&snapshot),
         );
-        recovering.set_head(Arc::clone(&snapshot));
+        recovering.set_head(Epoch::new(100), Arc::clone(&snapshot));
         for epoch in 1..=100 {
             recovering.insert(Epoch::new(epoch), Arc::clone(&snapshot));
         }
         recovering
+    }
+
+    /// The epoch the fresh committee of [`under_recovery`] signs block 1
+    /// under: its committee anchor rides the recovery's bridge.
+    fn bridged_epoch(schedule: &TopologySchedule) -> Epoch {
+        schedule
+            .live_committee(ShardId::ROOT, WeightedTimestamp::ZERO)
+            .committee()
+            .expect("the bridge window is held")
+            .epoch
     }
 
     /// A fresh committee member attached to a retained replica, beside a
@@ -29609,7 +29809,7 @@ mod tests {
         let _ = state.attach_signer(&schedule, ValidatorId::new(1), None, Round::new(1));
         assert_eq!(position_of(&state, 1).locked_round, Round::new(1));
 
-        let header = header_on(parent.hash(), 2, 99_000);
+        let header = header_on_under(parent.hash(), 2, 99_000, bridged_epoch(&schedule));
         delivered(&mut state, &schedule, &header);
         let actions = state_root_checked(
             &mut state,
@@ -29673,8 +29873,8 @@ mod tests {
             let seated = if epoch < 101 { &halted } else { &fresh };
             after.insert(Epoch::new(epoch), Arc::clone(seated));
         }
-        before.set_head(halted);
-        after.set_head(fresh);
+        before.set_head(Epoch::new(110), halted);
+        after.set_head(Epoch::new(110), fresh);
         (before, after)
     }
 
@@ -29728,7 +29928,7 @@ mod tests {
         let _ = state.attach_signer(&schedule, ValidatorId::new(1), None, Round::new(1));
         assert_eq!(position_of(&state, 1).last_voted_round, Round::new(1));
 
-        let header = header_on(parent.hash(), 2, 99_000);
+        let header = header_on_under(parent.hash(), 2, 99_000, bridged_epoch(&schedule));
         delivered(&mut state, &schedule, &header);
         let actions = state_root_checked(
             &mut state,
@@ -29756,6 +29956,7 @@ mod tests {
                 BlockHeight::new(i - 1),
                 BlockHash::ZERO,
                 Round::new(i - 1),
+                Epoch::GENESIS,
                 SignerBitfield::empty(),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis((i - 1) * 1_000 + 6_000),
@@ -29787,7 +29988,7 @@ mod tests {
             Epoch::new(0),
             Arc::clone(&head),
         );
-        schedule.set_head(Arc::clone(&head));
+        schedule.set_head(Epoch::new(300), Arc::clone(&head));
         for epoch in 1..=300 {
             schedule.insert(Epoch::new(epoch), Arc::clone(&head));
         }
@@ -29802,6 +30003,7 @@ mod tests {
             BlockHeight::new(5),
             p.header().parent_block_hash(),
             Round::new(5),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1_600),
@@ -30061,6 +30263,7 @@ mod tests {
             BlockHeight::new(6),
             p,
             Round::new(7),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1_700),

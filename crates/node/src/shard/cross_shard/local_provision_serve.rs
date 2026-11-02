@@ -59,9 +59,9 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_network::ResponseVerdict;
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Hash, LeafPath,
-        MAX_MERKLE_PROOF_LEN, MerkleInclusionProof, Provision, ProvisionHash, ProvisionParts,
-        QuorumCertificate, Round, SignerBitfield, TxHash, WeightedTimestamp,
+        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Epoch, Hash,
+        LeafPath, MAX_MERKLE_PROOF_LEN, MerkleInclusionProof, Provision, ProvisionHash,
+        ProvisionParts, QuorumCertificate, Round, SignerBitfield, TxHash, WeightedTimestamp,
     };
 
     use super::*;
@@ -108,6 +108,7 @@ mod tests {
             height,
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

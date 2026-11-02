@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hyperscale_types::{
-    BeaconState, BlockHash, BlockHeight, BlockResolution, CertifiedBlockHeader, Epoch,
-    GenesisConfigHash, Round, ScheduleLookup, ShardId, ShardWitnessPayload, SlotEffects,
+    BeaconState, BlockHash, BlockHeight, CertifiedBlockHeader, Epoch, GenesisConfigHash,
+    QcAdmission, Round, ScheduleLookup, ShardId, ShardWitnessPayload, SlotEffects,
     TopologySchedule, ValidatorId, Verified, WeightedTimestamp, missed_proposals_since_prev_commit,
 };
 use tokio::sync::watch;
@@ -335,10 +335,15 @@ fn summarise(
     let anchor = schedule
         .signing_anchor(shard, header, parent_anchor)
         .weighted_timestamp();
-    let committee = schedule
-        .certified_committee_fenced(shard, anchor, qc.weighted_timestamp())
-        .and_then(BlockResolution::committee)
-        .map(|committee| Arc::clone(committee.snapshot));
+    let committee = match schedule.admits_fenced(
+        shard,
+        anchor,
+        qc.weighted_timestamp(),
+        qc.committee_epoch(),
+    ) {
+        QcAdmission::Admit(committee) if !qc.is_genesis() => Some(Arc::clone(committee.snapshot)),
+        _ => None,
+    };
     let signers = committee.as_ref().map(|snapshot| {
         let members = snapshot.consensus_committee_for_shard(shard);
         qc.signers()
@@ -405,6 +410,7 @@ mod tests {
             committee,
             &parent(),
             round,
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(5),
         )
     }
@@ -414,7 +420,12 @@ mod tests {
         block: &Block,
         seats: &[usize],
     ) -> Verified<CertifiedBlockHeader> {
-        let qc = committee.sign_qc(block.header(), seats, WeightedTimestamp::from_millis(10));
+        let qc = committee.sign_qc(
+            block.header(),
+            seats,
+            Epoch::GENESIS,
+            WeightedTimestamp::from_millis(10),
+        );
         Verified::new_unchecked_for_test(CertifiedBlockHeader::new(block.header().clone(), qc))
     }
 

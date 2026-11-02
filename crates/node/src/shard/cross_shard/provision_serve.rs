@@ -787,7 +787,7 @@ mod tests {
         );
         let head = snapshot_of(&after);
         schedule.insert(Epoch::new(1), Arc::clone(&head));
-        schedule.set_head(head);
+        schedule.set_head(Epoch::new(1), head);
         schedule
     }
 
@@ -934,7 +934,7 @@ mod tests {
         schedule.insert(Epoch::new(21), recovering(&grown));
         let head = recovering(&ShardTrie::uniform(1));
         schedule.insert(Epoch::new(22), Arc::clone(&head));
-        schedule.set_head(head);
+        schedule.set_head(Epoch::new(22), head);
         let target = ShardId::leaf(2, 2);
         assert_eq!(grown.shard_for_prefix(PAYER.address()), target);
 

@@ -1736,6 +1736,7 @@ fn linked_header(
             BlockHeight::new(height),
             parent,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_ms),
@@ -1833,6 +1834,7 @@ fn a_commit_proof_one_participant_asked_for_releases_its_proposal_on_the_loop() 
         })
     };
     let qc_over = |header: &BlockHeader, wt: u64| {
+        let committee_epoch = Epoch::new(header.parent_qc().weighted_timestamp().as_millis() / cut);
         let votes: Vec<(usize, Verified<BlockVote>)> = (0..3)
             .map(|seat| {
                 let vote = BlockVote::new(
@@ -1842,6 +1844,7 @@ fn a_commit_proof_one_participant_asked_for_releases_its_proposal_on_the_loop() 
                     shard,
                     header.height(),
                     header.round(),
+                    committee_epoch,
                     fix.committee.validator_id(seat),
                     fix.committee.signer(seat).as_ref(),
                     ProposerTimestamp::from_millis(wt),
@@ -1856,6 +1859,7 @@ fn a_commit_proof_one_participant_asked_for_releases_its_proposal_on_the_loop() 
             shard,
             header.height(),
             header.round(),
+            committee_epoch,
             header.parent_block_hash(),
             header.parent_qc().weighted_timestamp(),
             &votes,
@@ -1875,6 +1879,7 @@ fn a_commit_proof_one_participant_asked_for_releases_its_proposal_on_the_loop() 
         BlockHeight::new(3),
         BlockHash::ZERO,
         Round::INITIAL,
+        Epoch::GENESIS,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(cut - 2),

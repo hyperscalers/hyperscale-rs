@@ -928,8 +928,8 @@ mod tests {
     use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
     use hyperscale_types::test_utils::{TestCommittee, signed_child_block};
     use hyperscale_types::{
-        Block, BlockHeight, CertifiedBlockHeader, ElidedCertifiedBlock, Inventory, Round, ShardId,
-        ValidatorId, WeightedTimestamp, shard_prefix_path,
+        Block, BlockHeight, CertifiedBlockHeader, ElidedCertifiedBlock, Epoch, Inventory, Round,
+        ShardId, ValidatorId, WeightedTimestamp, shard_prefix_path,
     };
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
@@ -949,12 +949,14 @@ mod tests {
             committee,
             &base,
             Round::new(2),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(100),
         );
         let b3 = signed_child_block(
             committee,
             &b2,
             Round::new(3),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(200),
         );
         (b2, b3)
@@ -966,6 +968,7 @@ mod tests {
             committee.sign_qc(
                 block.header(),
                 &committee.quorum_indices(),
+                Epoch::GENESIS,
                 WeightedTimestamp::from_millis(900),
             ),
         )

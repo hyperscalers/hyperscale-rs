@@ -531,7 +531,7 @@ mod tests {
     use crate::test_utils::{rebound, stating, stub_stated_terms, test_transaction};
     use crate::{
         AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, BloomFilter, ChainOrigin,
-        ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+        Epoch, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot, Hash,
         ProposerTimestamp, ShardId, SignerBitfield, TickHalf, TickId, TxOutcome, WeightedTimestamp,
     };
 
@@ -665,6 +665,7 @@ mod tests {
             block.height(),
             block.header().parent_block_hash(),
             block.header().round(),
+            Epoch::GENESIS,
             SignerBitfield::new(0),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -784,6 +785,7 @@ mod tests {
             qc.height(),
             qc.parent_block_hash(),
             qc.round(),
+            qc.committee_epoch(),
             qc.signers().clone(),
             qc.aggregated_signature(),
             qc.weighted_timestamp(),

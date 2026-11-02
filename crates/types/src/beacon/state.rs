@@ -689,6 +689,19 @@ pub struct ShardRecovery {
     pub attested_frontier: BlockHeight,
 }
 
+impl ShardRecovery {
+    /// The binding this recovery stamps at its seating, before its first
+    /// crossing completes it.
+    #[must_use]
+    pub const fn binding(&self) -> RecoveryBinding {
+        RecoveryBinding {
+            rotated_at: self.rotated_at,
+            attested_frontier: self.attested_frontier,
+            completed: false,
+        }
+    }
+}
+
 /// One halt recovery of a shard in its [`BeaconState::recoveries`]
 /// history: the committee binding it established, kept for as long as
 /// the history keeps it.
@@ -723,29 +736,27 @@ impl RecoveryBinding {
         self.rotated_at.next()
     }
 
-    /// Whether a block at `height`, certified at `certified`, has the
-    /// shape of one this recovery discarded: certified below the window
-    /// before the bridge, at a height above the frontier.
+    /// Whether a block at `height`, whose QC's committee signed
+    /// `committee_epoch`, has the shape of one this recovery discarded:
+    /// signed below the bridge, at a height above the frontier.
     ///
     /// Every block the fresh committee certifies above the frontier is
-    /// certified at or past the window before the bridge: its bridge
-    /// crossing there, since its committee resolves through the bridge
-    /// only from that window on, and every later block past it. A block
-    /// above the frontier certified earlier is a replaced committee's, and
-    /// its certificate verifies under that committee's keys once the
-    /// recovery is no longer pending. A fork recovery's chain extends none
-    /// of those. A halt recovery's fresh chain can extend the halted tail
-    /// it harvested, which has this shape too, so for a halt recovery the
-    /// shape is a discard only where no fresh-certified block descends
-    /// from the block.
+    /// signed under the bridge's window or a later one: its committee is
+    /// the one the bridge seated. A block above the frontier signed below
+    /// it is a replaced committee's, and its certificate verifies under
+    /// that committee's keys once the recovery is no longer pending. A fork
+    /// recovery's chain extends none of those. A halt recovery's fresh
+    /// chain can extend the halted tail it harvested, which has this shape
+    /// too, so for a halt recovery the shape is a discard only where no
+    /// fresh-certified block descends from the block.
+    ///
+    /// Where the bridge lies past the shard's terminal cut, the fresh
+    /// committee signs the terminal window too, below the bridge; the
+    /// schedule's [`replaced_by`](crate::TopologySchedule::replaced_by)
+    /// carves that window out, and this does not.
     #[must_use]
-    pub const fn discards(
-        self,
-        windows: EpochWindows,
-        height: BlockHeight,
-        certified: WeightedTimestamp,
-    ) -> bool {
-        windows.epoch_for(certified).next().inner() < self.bridge().inner()
+    pub const fn discards(self, height: BlockHeight, committee_epoch: Epoch) -> bool {
+        committee_epoch.inner() < self.bridge().inner()
             && height.inner() > self.attested_frontier.inner()
     }
 

@@ -298,8 +298,9 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeaderParts,
-        ChainOrigin, ElidedCertifiedBlock, Inventory, ProposerTimestamp, QuorumCertificate, Round,
-        ShardId, SignerBitfield, StateRoot, ValidatorId, Verifiable, Verified, WitnessSources,
+        ChainOrigin, ElidedCertifiedBlock, Epoch, Inventory, ProposerTimestamp, QuorumCertificate,
+        Round, ShardId, SignerBitfield, StateRoot, ValidatorId, Verifiable, Verified,
+        WitnessSources,
     };
 
     use super::*;
@@ -319,6 +320,7 @@ mod tests {
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::new(1),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(wt_ms),

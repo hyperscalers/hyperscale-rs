@@ -757,8 +757,8 @@ mod tests {
             let seated = if epoch < 101 { &halted } else { &fresh };
             after.insert(Epoch::new(epoch), Arc::clone(seated));
         }
-        before.set_head(halted);
-        after.set_head(fresh);
+        before.set_head(Epoch::new(110), halted);
+        after.set_head(Epoch::new(110), fresh);
         (before, after)
     }
 
@@ -904,6 +904,7 @@ mod tests {
                 ShardId::ROOT,
                 height,
                 round,
+                Epoch::GENESIS,
                 test.committee.validator_id(member),
                 ConsensusSignature::ZERO,
                 ProposerTimestamp::from_millis(1_000),
@@ -937,6 +938,7 @@ mod tests {
             height,
             BlockHash::ZERO,
             round,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1_000),

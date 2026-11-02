@@ -769,7 +769,8 @@ impl ShardCoordinatorSim {
     }
 
     /// Sign a genuine [`BlockVote`] from `signer` over `block_hash` /
-    /// `parent_block_hash` at `(height, round)` on this sim's shard. Used to
+    /// `parent_block_hash` at `(height, round)` on this sim's shard, under
+    /// the genesis committee. Used to
     /// mint the two conflicting votes of a shard double-vote, each a real BLS
     /// signature under the signer's key so the assembled evidence verifies.
     #[must_use]
@@ -789,6 +790,7 @@ impl ShardCoordinatorSim {
             self.shard,
             height,
             round,
+            Epoch::GENESIS,
             signer,
             self.sks[idx].as_ref(),
             ProposerTimestamp::ZERO,
@@ -1596,6 +1598,7 @@ impl ShardCoordinatorSim {
                 parent_block_hash,
                 height,
                 round,
+                committee_epoch,
                 timestamp,
                 next_proposers,
                 position,
@@ -1624,6 +1627,7 @@ impl ShardCoordinatorSim {
                     self.shard,
                     height,
                     round,
+                    committee_epoch,
                     me,
                     self.sks[emitter_idx].as_ref(),
                     timestamp,
@@ -1846,6 +1850,7 @@ impl ShardCoordinatorSim {
                             parent_qc.height(),
                             BlockHash::ZERO,
                             parent_qc.round(),
+                            Epoch::GENESIS,
                             SignerBitfield::empty(),
                             AggregateSignature::ZERO,
                             anchor,
@@ -1977,6 +1982,7 @@ impl ShardCoordinatorSim {
                 shard_id,
                 height,
                 round,
+                committee_epoch,
                 parent_block_hash,
                 parent_weighted_timestamp,
                 votes_to_verify,
@@ -1991,6 +1997,7 @@ impl ShardCoordinatorSim {
                     shard_id,
                     height,
                     round,
+                    committee_epoch,
                     parent_block_hash,
                     parent_weighted_timestamp,
                     votes_to_verify,

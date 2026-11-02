@@ -22,9 +22,9 @@ use hyperscale_storage::{
     BeaconStorage, BoundaryStore, RecoveryAnchor, ShardChainReader, SubstateStore, holds_state,
 };
 use hyperscale_types::{
-    BeaconState, BlockHeight, EpochWindows, LocalTimestamp, NetworkDefinition, RecoveryBinding,
-    RecoveryCause, RoutingCommittees, ShardBoundary, ShardId, ShardRecovery, Signer,
-    TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus,
+    BeaconState, BlockHeight, LocalTimestamp, NetworkDefinition, RecoveryBinding, RecoveryCause,
+    RoutingCommittees, ShardBoundary, ShardId, ShardRecovery, Signer, TopologySchedule,
+    TopologySnapshot, ValidatorId, ValidatorStatus,
 };
 use tracing::info;
 
@@ -159,7 +159,6 @@ where
         .copied()
         .chain(routed.keys().copied().filter(|&shard| on_disk(shard)))
         .collect();
-    let windows = head.chain_config.epoch_windows();
     let mut resumed = BTreeMap::new();
     let mut joins = BTreeMap::new();
     for shard in shards {
@@ -172,7 +171,6 @@ where
                 &*store,
                 head.recoveries.get(&shard).map_or(&[], Vec::as_slice),
                 pending,
-                windows,
             );
         let unanchored =
             !vnodes.is_empty() && unanchored_past_fork_frontier(&*store, shard, pending);
@@ -228,30 +226,26 @@ where
 /// committee's stores hold what the harvest reads, so its band is read as
 /// nobody's verdict yet; a superseded recovery shares its successor's
 /// frontier and lies inside its band. A tip the fresh committee
-/// certified, a coast block included, is certified no earlier than the
-/// window before the bridge and never reads as discarded.
+/// certified, a coast block included, carries a QC signed under the
+/// bridge's window or a later one and never reads as discarded.
 fn committed_on_discarded_tail<R: ShardChainReader + ?Sized>(
     store: &R,
     history: &[RecoveryBinding],
     pending: Option<&ShardRecovery>,
-    windows: EpochWindows,
 ) -> bool {
     let pending_fork = pending
         .filter(|recovery| recovery.cause == RecoveryCause::Fork)
-        .map(|recovery| RecoveryBinding {
-            rotated_at: recovery.rotated_at,
-            attested_frontier: recovery.attested_frontier,
-            completed: false,
-        });
+        .map(ShardRecovery::binding);
     let height = store.committed_height();
     store.get_certified_header(height).is_some_and(|certified| {
-        let at = certified.qc().weighted_timestamp();
-        history
-            .iter()
-            .copied()
-            .filter(|binding| binding.completed)
-            .chain(pending_fork)
-            .any(|binding| binding.discards(windows, height, at))
+        let signed = certified.qc().committee_epoch();
+        !certified.qc().is_genesis()
+            && history
+                .iter()
+                .copied()
+                .filter(|binding| binding.completed)
+                .chain(pending_fork)
+                .any(|binding| binding.discards(height, signed))
     })
 }
 
@@ -375,8 +369,8 @@ pub enum Replaced {
 /// Whether `shard`'s running loop is rebuilt at its attested anchor
 /// before it carries the validators `placed` there, and why.
 ///
-/// `store` is the loop's and `head` the committed snapshot read on the
-/// epoch grid `windows`. With nothing placed, the loop is left to the
+/// `store` is the loop's and `head` the committed snapshot. With nothing
+/// placed, the loop is left to the
 /// teardown. A store on a tail a recovery discarded for good
 /// ([`committed_on_discarded_tail`]) is rebuilt as [`Replaced::Forked`]:
 /// the loop cannot move. Under a pending fork every placed validator
@@ -390,14 +384,13 @@ fn rebuild_due<R: ShardChainReader + BoundaryStore + ?Sized>(
     store: &R,
     shard: ShardId,
     head: &TopologySnapshot,
-    windows: EpochWindows,
     placed: &[ValidatorId],
 ) -> Option<Replaced> {
     if placed.is_empty() {
         return None;
     }
     let pending = head.pending_recoveries().get(&shard);
-    if committed_on_discarded_tail(store, head.recoveries(shard), pending, windows) {
+    if committed_on_discarded_tail(store, head.recoveries(shard), pending) {
         return Some(Replaced::Forked);
     }
     let recovery = pending?;
@@ -734,7 +727,7 @@ where
     }
     for view in staying.into_iter().filter(|view| view.seatable) {
         let placed = placed_validators(view.shard, schedule, is_local);
-        changes.extend(seat_running(view, head, schedule.windows(), placed));
+        changes.extend(seat_running(view, head, placed));
     }
     for shard in head.shard_trie().leaves() {
         if hosted.iter().any(|view| view.shard == shard) || !joinable(shard) {
@@ -749,7 +742,7 @@ where
 }
 
 /// The changes that seat `placed` on a running loop, read against the
-/// committed `head` on the epoch grid `windows`.
+/// committed `head`.
 ///
 /// A loop whose store [`rebuild_due`] says cannot carry them is rebuilt at
 /// the attested anchor; otherwise each one the loop neither carries nor is
@@ -758,7 +751,6 @@ where
 pub fn seat_running<R>(
     view: &HostedView<'_, R>,
     head: &TopologySnapshot,
-    windows: EpochWindows,
     placed: Vec<ValidatorId>,
 ) -> Vec<SeatChange>
 where
@@ -767,7 +759,7 @@ where
     let shard = view.shard;
     if let Some(replaced) = view
         .store
-        .and_then(|store| rebuild_due(store, shard, head, windows, &placed))
+        .and_then(|store| rebuild_due(store, shard, head, &placed))
     {
         return vec![SeatChange::Rebuild {
             shard,
@@ -821,14 +813,15 @@ mod tests {
     use std::convert::Infallible;
 
     use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_storage::test_helpers::{commit_one, commit_writes_at, make_settled_writes};
+    use hyperscale_storage::test_helpers::{commit_one, commit_settled_at, make_test_block};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{TestCommittee, test_pool};
     use hyperscale_types::{
-        BeaconChainConfig, BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, EpochWindows,
-        JailReason, RecoveryCause, ReshapeSeat, ShardAnchor, ShardCommittee, ShardRecovery,
-        StateRoot, ValidatorInfo, ValidatorRecord, ValidatorSet, WeightedTimestamp,
-        shard_prefix_path,
+        AggregateSignature, BeaconChainConfig, BeaconWitnessCommit, BeaconWitnessLeafCount,
+        BlockHash, CertifiedBlock, DeclaredWork, Epoch, EpochWindows, JailReason,
+        QuorumCertificate, RecoveryCause, ReshapeSeat, Round, ShardAnchor, ShardCommittee,
+        ShardRecovery, SignerBitfield, StateRoot, ValidatorInfo, ValidatorRecord, ValidatorSet,
+        Verified, WeightedTimestamp, shard_prefix_path,
     };
 
     use super::*;
@@ -1063,13 +1056,29 @@ mod tests {
     }
 
     /// The root's store holding one block of its own chain, certified at
-    /// `certified_ms`.
+    /// `certified_ms` by the committee of the epoch that instant falls in.
     fn root_store_certified_at(certified_ms: u64) -> Arc<SimShardStorage> {
         let store = SimShardStorage::new(shard_prefix_path(ShardId::ROOT));
-        commit_writes_at(
+        let block = make_test_block(BlockHeight::new(1));
+        let certified_at = WeightedTimestamp::from_millis(certified_ms);
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            block.height(),
+            block.header().parent_block_hash(),
+            Round::INITIAL,
+            WINDOWS.epoch_for(certified_at),
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            certified_at,
+        );
+        let certified = CertifiedBlock::new_unchecked(block, Verified::new_unchecked_for_test(qc));
+        commit_settled_at(
             &store,
-            &make_settled_writes(1, 1, vec![1]),
-            WeightedTimestamp::from_millis(certified_ms),
+            &Arc::new(Verified::new_unchecked_for_test(certified)),
+            &[],
+            &[],
+            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
         );
         Arc::new(store)
     }
@@ -1080,11 +1089,11 @@ mod tests {
 
     /// A recovery of the root seated at epoch 3 above the genesis
     /// frontier: its bridge is epoch 4, so a block certified in epoch 0
-    /// has the shape it discards and one certified in epoch 3, the window
-    /// before the bridge, is the fresh committee's.
+    /// has the shape it discards and one certified in epoch 4, the
+    /// bridge's window, is the fresh committee's.
     const ROTATED_AT: Epoch = Epoch::new(3);
     const DISCARDED_MS: u64 = 500;
-    const FRESH_MS: u64 = 3 * EPOCH_MS + 500;
+    const FRESH_MS: u64 = 4 * EPOCH_MS + 500;
 
     fn binding(completed: bool) -> RecoveryBinding {
         RecoveryBinding {
@@ -1182,11 +1191,10 @@ mod tests {
         assert_eq!(ids(&plan.joins[&ShardId::ROOT]), vec![validator(0)]);
     }
 
-    /// Past a pending fork's frontier, a block the fresh committee
-    /// certified in the window the recovery rotated in and one of the
-    /// replaced committee's other branch read alike, so a store there
-    /// resumes only if it was seated at the anchor under that same fork;
-    /// one seated under another recovery, or another shard's, is a join.
+    /// Past a pending fork's frontier, a store holding the fresh
+    /// committee's block resumes only if it was seated at the anchor under
+    /// that same fork; one seated under another recovery, or another
+    /// shard's, is a join.
     #[test]
     fn a_store_past_a_pending_forks_frontier_resumes_only_if_seated_under_it() {
         let restart = |anchor: Option<RecoveryAnchor>| {
@@ -1285,7 +1293,7 @@ mod tests {
         let fresh = root_store_certified_at(FRESH_MS);
         let at_frontier = SimShardStorage::new(shard_prefix_path(ShardId::ROOT));
         let due = |store: &SimShardStorage, schedule: &TopologySchedule, placed: &[ValidatorId]| {
-            rebuild_due(store, ShardId::ROOT, schedule.head(), WINDOWS, placed)
+            rebuild_due(store, ShardId::ROOT, schedule.head(), placed)
         };
 
         let completed = recovering(vec![HOST], vec![binding(true)], None);

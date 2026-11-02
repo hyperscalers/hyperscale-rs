@@ -256,7 +256,7 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, Inclusion, ProposerTimestamp,
+        BlockHeader, BlockHeaderParts, BlockHeight, Epoch, Inclusion, ProposerTimestamp,
         QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield, StateRoot,
         SubstateKey, Transaction, Verifiable, WeightedTimestamp, WitnessSources,
     };
@@ -288,6 +288,7 @@ mod tests {
                 BlockHeight::new(height - 1),
                 BlockHash::ZERO,
                 Round::INITIAL,
+                Epoch::GENESIS,
                 SignerBitfield::new(4),
                 AggregateSignature::new([0u8; 96]),
                 WeightedTimestamp::from_millis(*ts_ms),

@@ -1431,7 +1431,7 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{test_prefix, test_transaction};
     use hyperscale_types::{
-        Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
+        Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader, Epoch,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
         Hash, LocalKey, Provision, Role, Round, SettledWrites, SignerBitfield, StateWrites,
         TickHalf, TickId, Transaction, TxHash, TxOutcome, WitnessSources,
@@ -2350,6 +2350,7 @@ mod tests {
             height,
             block.header().parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::new([0u8; 96]),
             WeightedTimestamp::from_millis(wt_ms.saturating_add(1_000_000)),
@@ -2490,6 +2491,7 @@ mod tests {
             height,
             block.header().parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::new([0u8; 96]),
             WeightedTimestamp::from_millis(wt_ms.saturating_add(1_000_000)),

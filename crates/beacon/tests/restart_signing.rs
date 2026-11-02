@@ -370,9 +370,11 @@ fn vote_equivocation() -> ShardVoteEquivocation {
         round: Round::INITIAL,
         block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
         parent_block_hash_a: BlockHash::ZERO,
+        committee_epoch_a: Epoch::GENESIS,
         sig_a: ConsensusSignature::ZERO,
         block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
         parent_block_hash_b: BlockHash::ZERO,
+        committee_epoch_b: Epoch::GENESIS,
         sig_b: ConsensusSignature::ZERO,
     }
 }

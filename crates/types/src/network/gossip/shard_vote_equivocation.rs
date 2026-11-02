@@ -58,7 +58,7 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::{BlockHash, BlockHeight, ConsensusSignature, Hash, Round, ValidatorId};
+    use crate::{BlockHash, BlockHeight, ConsensusSignature, Epoch, Hash, Round, ValidatorId};
 
     fn sample() -> ShardVoteEquivocation {
         ShardVoteEquivocation {
@@ -68,9 +68,11 @@ mod tests {
             round: Round::new(2),
             block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
             parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
+            committee_epoch_a: Epoch::new(3),
             sig_a: ConsensusSignature::ZERO,
             block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
             parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
+            committee_epoch_b: Epoch::new(3),
             sig_b: ConsensusSignature::ZERO,
         }
     }

@@ -39,10 +39,10 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, CommitProof, LocalTimestamp,
-    MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate, ReadySignal, ShardAnchor,
-    ShardId, Signer, StateRoot, ValidatorId, Verifier, WeightedTimestamp, ready_signal_window,
-    shard_prefix_path,
+    Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, CommitProof, Epoch,
+    LocalTimestamp, MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate, ReadySignal,
+    ShardAnchor, ShardId, Signer, StateRoot, ValidatorId, Verifier, WeightedTimestamp,
+    ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::{
@@ -319,10 +319,35 @@ pub struct TerminalCommitProof {
     /// The two-chain at or above the terminal, its ancestry link
     /// bottoming out at the terminal.
     pub proof: CommitProof,
-    /// For each QC in `[certified, child]` order, the anchor of the
-    /// certified block's parent and the QC's own stamp: the window key
-    /// the schedule resolves that QC's committee from.
-    pub windows: [(WeightedTimestamp, WeightedTimestamp); 2],
+    /// For each QC in `[certified, child]` order, what the schedule
+    /// resolves that QC's committee from.
+    pub windows: [QcWindow; 2],
+}
+
+/// What selects the committee a QC verifies against: the anchor of the
+/// certified block's parent, and the QC's own stamp and signed epoch,
+/// which the schedule admits at that anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QcWindow {
+    /// The certified block's committee anchor: its parent's own anchor.
+    pub anchor: WeightedTimestamp,
+    /// The QC's stamp.
+    pub qc_wt: WeightedTimestamp,
+    /// The epoch the QC's signers signed.
+    pub epoch: Epoch,
+}
+
+impl QcWindow {
+    /// The window of `qc`, over a block whose committee anchor is
+    /// `anchor`.
+    #[must_use]
+    pub const fn of(anchor: WeightedTimestamp, qc: &QuorumCertificate) -> Self {
+        Self {
+            anchor,
+            qc_wt: qc.weighted_timestamp(),
+            epoch: qc.committee_epoch(),
+        }
+    }
 }
 
 impl TerminalCommitProof {
@@ -333,7 +358,7 @@ impl TerminalCommitProof {
         &self,
         verifier: &dyn Verifier,
         network: &NetworkDefinition,
-        committee: impl Fn(WeightedTimestamp, WeightedTimestamp) -> CommitteeLookup,
+        committee: impl Fn(QcWindow) -> CommitteeLookup,
     ) -> TwoChainCheck {
         check_two_chain(&self.proof, self.windows, verifier, network, committee)
     }
@@ -356,12 +381,12 @@ pub enum TwoChainCheck {
 /// committees `committee` resolves for `windows`.
 fn check_two_chain(
     proof: &CommitProof,
-    windows: [(WeightedTimestamp, WeightedTimestamp); 2],
+    windows: [QcWindow; 2],
     verifier: &dyn Verifier,
     network: &NetworkDefinition,
-    committee: impl Fn(WeightedTimestamp, WeightedTimestamp) -> CommitteeLookup,
+    committee: impl Fn(QcWindow) -> CommitteeLookup,
 ) -> TwoChainCheck {
-    let committees = match windows.map(|(anchor_wt, qc_wt)| committee(anchor_wt, qc_wt)) {
+    let committees = match windows.map(committee) {
         [
             CommitteeLookup::Resolved(first),
             CommitteeLookup::Resolved(second),
@@ -782,15 +807,14 @@ impl ObserverTail {
     /// pair's upper block — the pair's lower block is directly committed,
     /// and the run below it is its hash-linked prefix.
     ///
-    /// `committee` takes the anchor of the certified block's parent and the
-    /// QC's own weighted timestamp. A committee not yet resolvable leaves
-    /// the run for a later pass; a QC that fails, or a window no honest QC
-    /// resolves to, drops it.
+    /// `committee` takes each QC's [`QcWindow`]. A committee not yet
+    /// resolvable leaves the run for a later pass; a QC that fails, or a
+    /// window no honest QC resolves to, drops it.
     pub fn prove(
         &mut self,
         verifier: &dyn Verifier,
         network: &NetworkDefinition,
-        committee: impl Fn(WeightedTimestamp, WeightedTimestamp) -> CommitteeLookup,
+        committee: impl Fn(QcWindow) -> CommitteeLookup,
     ) -> ProveOutcome {
         let pair = (1..self.unproven.len()).rev().find(|&upper| {
             self.unproven[upper].block.header().round()
@@ -821,10 +845,10 @@ impl ObserverTail {
         };
         let lower_qc = child.block.header().parent_qc();
         let windows = [
-            (lower_parent_anchor, lower_qc.weighted_timestamp()),
-            (
+            QcWindow::of(lower_parent_anchor, lower_qc),
+            QcWindow::of(
                 lower.block.header().parent_qc().weighted_timestamp(),
-                child.qc.weighted_timestamp(),
+                &child.qc,
             ),
         ];
         let proof = CommitProof::direct(
@@ -909,14 +933,8 @@ impl ObserverTail {
             run[i].parent_qc().weighted_timestamp()
         });
         let windows = [
-            (
-                certified_parent_anchor,
-                header.parent_qc().weighted_timestamp(),
-            ),
-            (
-                prev.parent_qc().weighted_timestamp(),
-                qc.weighted_timestamp(),
-            ),
+            QcWindow::of(certified_parent_anchor, header.parent_qc()),
+            QcWindow::of(prev.parent_qc().weighted_timestamp(), qc),
         ];
         // Descending from `prev`'s parent to the terminal, which the proof
         // requires as the link's last element. Empty when `prev` is the
@@ -1184,6 +1202,7 @@ mod tests {
             header.height(),
             header.parent_block_hash(),
             Round::new(header.round().inner()),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(wt),
@@ -1222,6 +1241,7 @@ mod tests {
             BlockHeight::new(height.saturating_sub(1)),
             BlockHash::ZERO,
             Round::new(round.saturating_sub(1)),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
@@ -1608,6 +1628,7 @@ mod tests {
                 &self.committee,
                 parent,
                 Round::new(round),
+                Epoch::GENESIS,
                 WeightedTimestamp::from_millis(pred_wt),
             )
         }
@@ -1647,7 +1668,7 @@ mod tests {
 
         /// One proving pass against this committee.
         fn prove(&self, tail: &mut ObserverTail) -> ProveOutcome {
-            tail.prove(&BlsVerifier, &NetworkDefinition::simulator(), |_, _| {
+            tail.prove(&BlsVerifier, &NetworkDefinition::simulator(), |_| {
                 self.resolved()
             })
         }
@@ -1657,6 +1678,7 @@ mod tests {
         committee.sign_qc(
             header,
             &committee.quorum_indices(),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(wt),
         )
     }
@@ -1885,7 +1907,7 @@ mod tests {
         }
 
         assert_eq!(
-            tail.prove(&BlsVerifier, &network, |_, _| CommitteeLookup::Pending),
+            tail.prove(&BlsVerifier, &network, |_| CommitteeLookup::Pending),
             ProveOutcome::Unproven,
         );
         assert_eq!(chain.prove(&mut tail), ProveOutcome::Released(1));
@@ -1893,7 +1915,7 @@ mod tests {
         let b4 = chain.child(&b3, 4, 4_300);
         assert_eq!(feed(&mut tail, &chain.served(&b4)), TailOutcome::Accepted);
         assert!(matches!(
-            tail.prove(&BlsVerifier, &network, |_, _| CommitteeLookup::Unresolvable),
+            tail.prove(&BlsVerifier, &network, |_| CommitteeLookup::Unresolvable),
             ProveOutcome::Refuted(_),
         ));
     }
@@ -2044,7 +2066,7 @@ mod tests {
     /// The walked sighting's commit proof, checked against `committee`.
     fn check_sighting(
         tail: &ObserverTail,
-        committee: impl Fn(WeightedTimestamp, WeightedTimestamp) -> CommitteeLookup,
+        committee: impl Fn(QcWindow) -> CommitteeLookup,
     ) -> TwoChainCheck {
         tail.settled_terminal()
             .expect("recognised")
@@ -2066,6 +2088,7 @@ mod tests {
             &chain.committee,
             &anchor_block,
             Round::new(2),
+            Epoch::GENESIS,
             wt(CUT_MS + 250),
             split_pair(),
         );
@@ -2086,11 +2109,22 @@ mod tests {
             .expect("the successor pairs with the terminal");
         assert_eq!(
             proof.windows,
-            [(wt(4_000), wt(CUT_MS + 500)), (wt(CUT_MS + 250), wt(9_999))],
+            [
+                QcWindow {
+                    anchor: wt(4_000),
+                    qc_wt: wt(CUT_MS + 500),
+                    epoch: Epoch::GENESIS,
+                },
+                QcWindow {
+                    anchor: wt(CUT_MS + 250),
+                    qc_wt: wt(9_999),
+                    epoch: Epoch::GENESIS,
+                },
+            ],
         );
         let network = NetworkDefinition::simulator();
-        let keyed = |anchor_wt, qc_wt| {
-            if proof.windows.contains(&(anchor_wt, qc_wt)) {
+        let keyed = |window| {
+            if proof.windows.contains(&window) {
                 chain.resolved()
             } else {
                 CommitteeLookup::Unresolvable
@@ -2101,7 +2135,7 @@ mod tests {
             TwoChainCheck::Verified
         );
         assert_eq!(
-            proof.check(&BlsVerifier, &network, |_, _| CommitteeLookup::Pending),
+            proof.check(&BlsVerifier, &network, |_| CommitteeLookup::Pending),
             TwoChainCheck::Pending,
             "a window the beacon has not folded defers rather than refutes",
         );
@@ -2120,10 +2154,17 @@ mod tests {
             &chain.committee,
             &anchor_block,
             Round::new(2),
+            Epoch::GENESIS,
             wt(CUT_MS + 250),
             split_pair(),
         );
-        let fabricated = signed_child_block(&impostors, &terminal, Round::new(3), wt(CUT_MS + 500));
+        let fabricated = signed_child_block(
+            &impostors,
+            &terminal,
+            Round::new(3),
+            Epoch::GENESIS,
+            wt(CUT_MS + 500),
+        );
         let genuine = chain.child(&terminal, 3, CUT_MS + 500);
         for (successor, qc) in [
             (&fabricated, sign_by(&impostors, fabricated.header(), 9_999)),
@@ -2136,7 +2177,7 @@ mod tests {
             );
             assert_eq!(walk_served(&mut tail, successor, qc), TailOutcome::Accepted);
             assert!(matches!(
-                check_sighting(&tail, |_, _| chain.resolved()),
+                check_sighting(&tail, |_| chain.resolved()),
                 TwoChainCheck::Refuted(_),
             ));
         }
@@ -2155,6 +2196,7 @@ mod tests {
             &chain.committee,
             &anchor_block,
             Round::new(2),
+            Epoch::GENESIS,
             wt(CUT_MS + 250),
             split_pair(),
         );
@@ -2174,7 +2216,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                check_sighting(&tail, |_, _| chain.resolved()),
+                check_sighting(&tail, |_| chain.resolved()),
                 TwoChainCheck::Verified,
             );
             let sighting = tail.settled_terminal().expect("recognised");

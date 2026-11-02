@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, CertifiedBlock, Hash, ShardId,
-    ShardWitnessPayload, StoredReceipt, TopologySchedule, Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, CertifiedBlock, Epoch, Hash,
+    QuorumCertificate, ShardId, ShardWitnessPayload, StoredReceipt, TopologySchedule, Verified,
     commit_witness_window, compute_merkle_root, derive_leaves, missed_proposals_since_prev_commit,
 };
 
@@ -136,18 +136,16 @@ impl BeaconWitnessAccumulator {
 /// the committed tip, re-deriving each ancestor's witness-leaf delta
 /// from its receipts + carried witness sources + missed-round scan,
 /// then prepends the committed accumulator's retained window. Each
-/// ancestor's leaves resolve against *its own* committee — the certified
-/// binding of its committee anchor (its parent's
-/// `parent_qc.weighted_timestamp()`, or `committed_block_anchor_wt` for the
-/// ancestor extending the committed tip) and its certifying QC
-/// (`parent_qc_wt` for the first ancestor, then each successor's
-/// `parent_qc` down the chain), matching the commit-time
-/// derivation. A pending chain that straddles an epoch boundary
-/// therefore reproduces exactly what each block committed, rather than
-/// re-deriving an older epoch's missed-proposal leaves under the tip's
-/// committee — and a halt recovery's sync-admitted suffix keeps deriving
-/// under the old committee its headers committed, while the bridge
-/// blocks derive under the fresh committee that proposed them. The
+/// ancestor's leaves resolve against *its own* committee — the window the
+/// QC over it signed, read off the copy its child pins (`parent_qc` for
+/// the first ancestor, then each successor's own `parent_qc` down the
+/// chain), which is the copy its commit stores and derives under. A
+/// pending chain that straddles an epoch boundary therefore reproduces
+/// exactly what each block committed, rather than re-deriving an older
+/// epoch's missed-proposal leaves under the tip's committee — and a halt
+/// recovery's sync-admitted suffix keeps deriving under the old committee
+/// its headers committed, while the bridge blocks derive under the fresh
+/// committee that proposed them. The
 /// result is the input the verifier applies the block's own new leaves
 /// to.
 ///
@@ -175,9 +173,8 @@ impl BeaconWitnessAccumulator {
 pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
     accumulator: &BeaconWitnessAccumulator,
     committed_hash: BlockHash,
-    committed_block_anchor_wt: WeightedTimestamp,
     parent_block_hash: BlockHash,
-    parent_qc_wt: WeightedTimestamp,
+    parent_qc: &QuorumCertificate,
     pending_blocks: &PendingBlocks,
     certified_blocks: &HashMap<BlockHash, Arc<Verified<CertifiedBlock>>, S>,
     local_shard: ShardId,
@@ -188,14 +185,14 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
     if parent_block_hash == committed_hash {
         return Ok((start_index, committed_leaves.to_vec()));
     }
-    // Descend to the committed tip before deriving anything: a block's
-    // committee anchors on its parent, so an ancestor's anchor is only in
-    // hand once the walk has reached the block below it.
-    let mut chain: Vec<(&Block, WeightedTimestamp)> = Vec::new();
+    // Descend to the committed tip before deriving anything, so the
+    // leaves append oldest first.
+    let mut chain: Vec<(&Block, Epoch)> = Vec::new();
     let mut current = parent_block_hash;
-    // The QC certifying `current` — the caller's `parent_qc` for the first
-    // ancestor, then each block's own `parent_qc` as the walk descends.
-    let mut certifying_wt = parent_qc_wt;
+    // The epoch the QC certifying `current` signed — the caller's
+    // `parent_qc` for the first ancestor, then each block's own
+    // `parent_qc` as the walk descends.
+    let mut certifying = parent_qc.committee_epoch();
     while current != committed_hash {
         let block: &Block = match pending_blocks.get(current).map(PendingBlock::block) {
             Some(Some(block)) => block,
@@ -207,31 +204,23 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
                 None => return Err(current),
             },
         };
-        chain.push((block, certifying_wt));
-        certifying_wt = block.header().parent_qc().weighted_timestamp();
+        chain.push((block, certifying));
+        certifying = block.header().parent_qc().committee_epoch();
         current = block.header().parent_block_hash();
     }
     let mut leaves = committed_leaves.to_vec();
-    for (index, (block, certifying_wt)) in chain.iter().enumerate().rev() {
+    for (block, certifying) in chain.iter().rev() {
         let header = block.header();
         // This ancestor's leaves committed under its own committee — the
-        // certified binding of its committee anchor and its certifying QC.
-        // The committee anchor is the parent's own anchor: `chain[index + 1]`
-        // is this block's parent, and the walk's last entry extends the
-        // committed tip. Resolving it per ancestor (rather than under the
-        // walk's tip committee) keeps a boundary-straddling pending chain
-        // byte-identical to what each block committed; the certified binding
-        // keeps a halt recovery's sync-admitted suffix on the old committee
-        // its headers committed while a bridge block resolves the fresh
-        // committee that proposed it — stable across replicas however late
-        // they walk it.
-        let committee_anchor = chain
-            .get(index + 1)
-            .map_or(committed_block_anchor_wt, |(parent, _)| {
-                parent.header().parent_qc().weighted_timestamp()
-            });
+        // window the QC its child pins signed. Resolving it per ancestor
+        // (rather than under the walk's tip committee) keeps a
+        // boundary-straddling pending chain byte-identical to what each
+        // block committed, and the signed epoch keeps a halt recovery's
+        // sync-admitted suffix on the old committee its headers committed
+        // while a bridge block resolves the fresh committee that proposed
+        // it — stable across replicas however late they walk it.
         let Some(committee) = schedule
-            .certified_committee(local_shard, committee_anchor, *certifying_wt)
+            .signed_committee(local_shard, *certifying)
             .committee()
         else {
             return Err(block.hash());
@@ -366,7 +355,8 @@ mod tests {
     }
 
     /// An empty block at `height` extending `parent_hash`, whose parent QC
-    /// carries `anchor_ms` and sits `skipped` rounds below the block's own.
+    /// carries `anchor_ms`, states epoch 0's committee, and sits `skipped`
+    /// rounds below the block's own.
     fn chained(height: BlockHeight, parent_hash: BlockHash, anchor_ms: u64, skipped: u64) -> Block {
         let parent_round = Round::new(height.inner());
         let parent_qc = QuorumCertificate::new(
@@ -375,6 +365,7 @@ mod tests {
             BlockHeight::new(height.inner() - 1),
             BlockHash::ZERO,
             parent_round,
+            Epoch::new(0),
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(anchor_ms),
@@ -435,12 +426,24 @@ mod tests {
         hold(&mut pending, &a);
         hold(&mut pending, &p);
 
+        // The QC over P: P's committee anchors on A, so it signs under
+        // epoch 0 though it stamps past the cut.
+        let over_p = QuorumCertificate::new(
+            p.hash(),
+            shard,
+            p.height(),
+            a.hash(),
+            p.header().round(),
+            Epoch::new(0),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(ED + 1),
+        );
         let (_, walked) = prospective_parent_witness_leaves(
             &BeaconWitnessAccumulator::new(),
             committed,
-            WeightedTimestamp::from_millis(ED - 2),
             p.hash(),
-            WeightedTimestamp::from_millis(ED + 1),
+            &over_p,
             &pending,
             &HashMap::new(),
             shard,

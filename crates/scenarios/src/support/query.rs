@@ -1386,6 +1386,7 @@ mod tests {
             at,
             BlockHash::ZERO,
             Round::new(height),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1_000 * height),

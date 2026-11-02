@@ -90,7 +90,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::AggregateSignature;
+    use crate::{AggregateSignature, Epoch};
 
     #[test]
     fn test_empty_response() {
@@ -143,6 +143,7 @@ mod tests {
             source_height,
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

@@ -1028,11 +1028,7 @@ impl TopologySnapshot {
         let history = self.recoveries(shard);
         let unstamped = self.pending_recoveries.get(&shard).and_then(|pending| {
             (history.last().map(|binding| binding.rotated_at) != Some(pending.rotated_at))
-                .then_some(RecoveryBinding {
-                    rotated_at: pending.rotated_at,
-                    attested_frontier: pending.attested_frontier,
-                    completed: false,
-                })
+                .then_some(pending.binding())
         });
         history.iter().copied().chain(unstamped)
     }

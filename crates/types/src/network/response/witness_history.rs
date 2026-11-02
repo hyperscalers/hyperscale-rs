@@ -77,8 +77,8 @@ mod tests {
     use crate::test_utils::test_pool;
     use crate::{
         AggregateSignature, BeaconWitnessLeafCount, BlockHash, BlockHeaderParts, BlockHeight,
-        ChainOrigin, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield,
-        Stake, WeightedTimestamp,
+        ChainOrigin, Epoch, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardId,
+        SignerBitfield, Stake, WeightedTimestamp,
     };
 
     fn make_header() -> BlockHeader {
@@ -114,6 +114,7 @@ mod tests {
             header.height(),
             header.parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

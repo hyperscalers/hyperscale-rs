@@ -742,6 +742,7 @@ impl CoordinatorSim {
             BlockHeight::new(b_height),
             b.header().parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(b_wt),
@@ -861,12 +862,12 @@ impl CoordinatorSim {
         let height = header.height();
         let parent_block_hash = header.parent_block_hash();
         let pred_wt = header.parent_qc().weighted_timestamp();
-        let snapshot = self.coordinators[0]
+        let committee = self.coordinators[0]
             .topology_schedule()
-            .at_for_shard(shard, pred_wt)
-            .expect("committee resolvable at the boundary block's parent wt")
-            .0
-            .clone();
+            .live_committee(shard, pred_wt)
+            .committee()
+            .expect("committee resolvable at the boundary block's parent wt");
+        let (snapshot, committee_epoch) = (Arc::clone(committee.snapshot), committee.epoch);
         let votes: Vec<(usize, Verified<BlockVote>)> = snapshot
             .committee_for_shard(shard)
             .iter()
@@ -880,6 +881,7 @@ impl CoordinatorSim {
                     shard,
                     height,
                     Round::INITIAL,
+                    committee_epoch,
                     *validator,
                     sk,
                     ProposerTimestamp::from_millis(b_wt),
@@ -894,6 +896,7 @@ impl CoordinatorSim {
             shard,
             height,
             Round::INITIAL,
+            committee_epoch,
             parent_block_hash,
             pred_wt,
             &votes,
@@ -2122,6 +2125,7 @@ fn make_source_header_in_round(
         BlockHeight::new(height),
         parent_hash,
         Round::INITIAL,
+        Epoch::GENESIS,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
         parent_wt,
@@ -2150,6 +2154,7 @@ fn make_linked_source_header(
         BlockHeight::new(height.saturating_sub(1)),
         BlockHash::ZERO,
         Round::INITIAL,
+        Epoch::GENESIS,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(parent_wt),
@@ -2178,6 +2183,7 @@ fn placeholder_qc(
         block.height(),
         block.header().parent_block_hash(),
         Round::INITIAL,
+        Epoch::GENESIS,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(wt),
@@ -2192,6 +2198,7 @@ fn redated(qc: &QuorumCertificate) -> QuorumCertificate {
         qc.height(),
         qc.parent_block_hash(),
         qc.round(),
+        qc.committee_epoch(),
         qc.signers().clone(),
         qc.aggregated_signature(),
         WeightedTimestamp::from_millis(qc.weighted_timestamp().as_millis() + 1),

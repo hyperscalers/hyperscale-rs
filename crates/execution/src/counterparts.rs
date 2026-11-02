@@ -4490,7 +4490,10 @@ mod tests {
         for (at, boundary) in boundaries.iter().enumerate() {
             schedule.insert(Epoch::new(at as u64 + 1), snapshot(Some(boundary)));
         }
-        schedule.set_head(snapshot(boundaries.last()));
+        schedule.set_head(
+            Epoch::new(boundaries.len() as u64),
+            snapshot(boundaries.last()),
+        );
         schedule
     }
 

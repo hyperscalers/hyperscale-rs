@@ -459,6 +459,7 @@ pub fn walked(
                 committee.sign_qc(
                     block.header(),
                     &committee.quorum_indices(),
+                    Epoch::GENESIS,
                     WeightedTimestamp::from_millis(900),
                 ),
             )

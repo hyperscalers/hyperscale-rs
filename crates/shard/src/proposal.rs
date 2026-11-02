@@ -3987,7 +3987,7 @@ mod tests {
             let snapshot = if epoch < LATER_LIFE { &before } else { &after };
             schedule.insert(Epoch::new(epoch), Arc::clone(snapshot));
         }
-        schedule.set_head(Arc::clone(&after));
+        schedule.set_head(Epoch::new(20), Arc::clone(&after));
         let mut against = Against::schedule((*after).clone(), schedule);
         against.local_shard = ShardId::leaf(1, 1);
         against.anchor = WeightedTimestamp::from_millis(10_000);

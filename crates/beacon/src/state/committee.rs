@@ -640,8 +640,8 @@ mod tests {
     };
     use crate::state::reshape::schedule_ready_splits;
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, empty_state, live_boundary, net, possession_proof,
-        single_pool_state, validator_record,
+        apply_next_epoch, apply_witness_chunk, apply_witness_chunk_signed_under, empty_state,
+        live_boundary, net, possession_proof, single_pool_state, validator_record,
     };
     use crate::state::vrf::jail_validator;
     use crate::state::witness::apply_shard_payload;
@@ -2387,9 +2387,10 @@ mod tests {
         );
         state.record_recovery(ShardId::leaf(1, 0), rotated_at, BlockHeight::GENESIS);
 
-        apply_witness_chunk(
+        apply_witness_chunk_signed_under(
             &mut state,
             0,
+            rotated_at.next(),
             vec![ShardWitnessPayload::StakeDeposit {
                 pool_id: test_pool(200),
                 amount: Stake::from_whole_tokens(1),

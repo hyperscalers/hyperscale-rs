@@ -291,7 +291,7 @@ mod tests {
 
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
-        AggregateSignature, Block, BlockHeaderParts, BlockManifest, Engagement, Hash,
+        AggregateSignature, Block, BlockHeaderParts, BlockManifest, Engagement, Epoch, Hash,
         LocalTimestamp, ProposerTimestamp, Provision, QuorumCertificate, Round, ShardId,
         SignerBitfield, Transaction, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
         test_utils,
@@ -508,6 +508,7 @@ mod tests {
             BlockHeight::new(1),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -594,6 +595,7 @@ mod tests {
             BlockHeight::new(1),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -746,6 +748,7 @@ mod tests {
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1000),

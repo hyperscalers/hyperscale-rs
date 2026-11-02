@@ -374,6 +374,7 @@ mod tests {
             &committee,
             &anchor_block,
             Round::new(2),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(200),
             pair,
         );
@@ -381,6 +382,7 @@ mod tests {
             &committee,
             &terminal,
             Round::new(3),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(300),
         );
 
@@ -527,12 +529,14 @@ mod tests {
             &committee,
             &anchor_block,
             Round::new(2),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(200),
         );
         let successor = signed_child_block(
             &committee,
             &terminal,
             Round::new(3),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(300),
         );
         let verifier = Counting::default();
@@ -570,6 +574,7 @@ mod tests {
             &committee,
             &anchor_block,
             Round::new(2),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(100),
         );
 

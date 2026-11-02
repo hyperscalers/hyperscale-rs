@@ -46,6 +46,20 @@ pub fn committed_cells_for(block: &Block) -> Vec<(SubstateKey, Vec<u8>)> {
     )
 }
 
+/// Whether `qc`, a certificate over a block of `local_shard`, was signed
+/// by a committee one of the shard's recoveries replaced
+/// ([`TopologySchedule::replaced`]): the block is the halted suffix, an
+/// orphan extending it, or history the recovered chain reads nothing
+/// from. Read off the epoch the QC's signers signed, so a proposer and a
+/// voter reading the same hash-pinned `parent_qc` agree.
+pub fn certified_by_a_replaced_committee(
+    schedule: &TopologySchedule,
+    local_shard: ShardId,
+    qc: &QuorumCertificate,
+) -> bool {
+    !qc.is_genesis() && schedule.replaced(local_shard, qc.committee_epoch())
+}
+
 /// Lifecycle position for a verification entry. `InFlight` covers the
 /// window between dispatch and result; `Verified` is the terminal-success
 /// stage. Failure removes the entry (returning to "not tracked"), so the
@@ -924,9 +938,8 @@ impl VerificationPipeline {
         let (parent_leaves_start, parent_witness_leaves) = match prospective_parent_witness_leaves(
             accumulator,
             committed_hash,
-            committed_block_anchor_wt,
             header.parent_block_hash(),
-            header.parent_qc().weighted_timestamp(),
+            header.parent_qc(),
             pending_blocks,
             &self.verified_certified_blocks,
             local_shard,
@@ -945,7 +958,6 @@ impl VerificationPipeline {
         let thresholds = count_source.thresholds;
         let substate_bytes = match self.witness_substate_bytes(
             committed_hash,
-            committed_block_anchor_wt,
             header,
             pending_blocks,
             local_shard,
@@ -1033,14 +1045,14 @@ impl VerificationPipeline {
     /// irrelevant and verification proceeds without it — bit-identical to a
     /// network without the feature. Enabled, a missing parent delta parks
     /// the verification exactly like a missing witness ancestor — except when
-    /// the parent sits in a halt recovery's suffix band, anchored and
-    /// certified below its bridge. There the predicate is out of play
-    /// (`None`), decided by the parent's anchor and the QC over it (the
-    /// block's own `parent_qc`) alone: the suffix is QC-attested history
-    /// this replica may or may not have executed yet, and a total that
-    /// turned on which it had would split the replicas voting on the block.
-    /// The band is read off every binding the shard's history keeps, so it
-    /// holds after the recovery completes and past later ones.
+    /// the parent was certified by a committee a halt recovery replaced.
+    /// There the predicate is out of play (`None`), decided by the epoch
+    /// the QC over the parent (the block's own hash-pinned `parent_qc`)
+    /// signed alone: the suffix is QC-attested history this replica may or
+    /// may not have executed yet, and a total that turned on which it had
+    /// would split the replicas voting on the block. Every binding the
+    /// shard's history keeps is read, so the answer holds after the
+    /// recovery completes and past later ones.
     ///
     /// A block naming a [`substate_base`](BlockHeader::substate_base)
     /// counts from that committed height instead of its parent's claim:
@@ -1049,11 +1061,9 @@ impl VerificationPipeline {
     /// proposer's total from any tip between the base and the parent. A
     /// base above the parent, or a parent this replica has already
     /// committed past, derives no total, so a claimed one is refused.
-    #[allow(clippy::too_many_arguments)] // the walk's inputs beside the parent's anchors
     fn witness_substate_bytes(
         &self,
         committed_hash: BlockHash,
-        committed_block_anchor_wt: WeightedTimestamp,
         header: &BlockHeader,
         pending_blocks: &PendingBlocks,
         local_shard: ShardId,
@@ -1064,21 +1074,7 @@ impl VerificationPipeline {
             return Ok(None);
         }
         let parent_hash = header.parent_block_hash();
-        if self
-            .block_anchor(
-                parent_hash,
-                committed_hash,
-                committed_block_anchor_wt,
-                pending_blocks,
-            )
-            .is_some_and(|parent_anchor| {
-                schedule.recovery_suffix_band(
-                    local_shard,
-                    parent_anchor,
-                    header.parent_qc().weighted_timestamp(),
-                )
-            })
-        {
+        if certified_by_a_replaced_committee(schedule, local_shard, header.parent_qc()) {
             return Ok(None);
         }
         let Some(base) = header.substate_base() else {
@@ -2576,6 +2572,7 @@ mod tests {
             BlockHeight::new(1),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -2741,7 +2738,6 @@ mod tests {
             };
             vp.witness_substate_bytes(
                 hashes[tip],
-                WeightedTimestamp::ZERO,
                 header,
                 &pending,
                 ShardId::ROOT,
@@ -2821,6 +2817,7 @@ mod tests {
             BlockHeight::new(1),
             committed_hash,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -3097,6 +3094,7 @@ mod tests {
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

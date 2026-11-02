@@ -12,9 +12,10 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemo
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
-    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRoot, QuorumCertificate, Round, ShardId, SignerBitfield,
-    TopologySchedule, TopologySnapshot, Verified, WeightedTimestamp, WitnessSources,
+    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Epoch, Hash, LocalTimestamp,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRoot, QuorumCertificate, Round, ShardId,
+    SignerBitfield, TopologySchedule, TopologySnapshot, Verified, WeightedTimestamp,
+    WitnessSources,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -67,6 +68,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
             __qc.height(),
             __qc.parent_block_hash(),
             __qc.round(),
+            __qc.committee_epoch(),
             __qc.signers().clone(),
             __qc.aggregated_signature(),
             WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
@@ -109,6 +111,7 @@ fn make_remote_header_targeting(
         height,
         BlockHash::ZERO,
         Round::INITIAL,
+        Epoch::GENESIS,
         SignerBitfield::empty(),
         AggregateSignature::ZERO,
         WeightedTimestamp::ZERO,
