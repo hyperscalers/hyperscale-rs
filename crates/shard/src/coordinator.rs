@@ -7380,7 +7380,9 @@ impl ShardCoordinator {
     /// of its block's header is adopted, or driven again, when the header
     /// lands; one adopted without it — from a store, an announcement or a
     /// timeout — has nothing behind it that brings the header if no block
-    /// follows.
+    /// follows. A sibling block sync already applied at that height puts
+    /// the height behind the sync frontier, so the height is reopened
+    /// naming the certified block instead.
     fn fetch_committing_child(&mut self, qc: &Verified<QuorumCertificate>) -> Vec<Action> {
         let adopted = self
             .latest_qc
@@ -7388,6 +7390,15 @@ impl ShardCoordinator {
             .is_some_and(|latest| latest.block_hash() == qc.block_hash());
         if !adopted {
             return Vec::new();
+        }
+        if self
+            .block_sync
+            .has_applied_sibling(qc.height(), &qc.block_hash())
+        {
+            return vec![Action::ReopenSyncHeight {
+                height: qc.height(),
+                hash: qc.block_hash(),
+            }];
         }
         self.start_block_sync(qc.height())
     }
@@ -24433,9 +24444,14 @@ mod tests {
     /// dissolved and ingesting no header — no later block brings the child
     /// as a missing parent, so the deferral fetches it through block sync,
     /// and the parent commits once it lands, carrying the pinned copy.
+    ///
+    /// When block sync already applied a sibling at the child's height,
+    /// the sync frontier stands past it and a new sync target asks for
+    /// nothing, so the deferral reopens the height naming the child.
     #[test]
     fn a_commit_deferred_on_an_announced_child_lands_when_the_chain_stops() {
-        for dissolved in [false, true] {
+        for (dissolved, sibling_applied) in [(false, false), (true, false), (false, true)] {
+            let case = format!("dissolved={dissolved} sibling_applied={sibling_applied}");
             let (mut state, topology_schedule) = make_test_state();
             state.set_time(LocalTimestamp::from_millis(100_000));
             state.committed_height = BlockHeight::new(3);
@@ -24452,9 +24468,34 @@ mod tests {
                 QcSubject::SyncedBlock(parent),
                 Ok(make_test_qc(parent, BlockHeight::new(4))),
             );
+            if sibling_applied {
+                // A certified fork of the committed tip, two rounds apart
+                // so it commits nothing, applied at heights 4 and 5 in
+                // rounds below the child's.
+                let uncle = at_round(&block_with_parent_qc_ts(BlockHeight::new(4), 90), 1, 0);
+                let (uncle, _) = deliver_synced(&mut state, &topology_schedule, uncle);
+                let _ = state.on_qc_signature_verified(
+                    &topology_schedule,
+                    QcSubject::SyncedBlock(uncle),
+                    Ok(qc_at_round(uncle, BlockHeight::new(4), 1)),
+                );
+                let cousin = at_round(&block_chained_on(BlockHeight::new(5), uncle, 95), 3, 1);
+                let (cousin, _) = deliver_synced(&mut state, &topology_schedule, cousin);
+                let _ = state.on_qc_signature_verified(
+                    &topology_schedule,
+                    QcSubject::SyncedBlock(cousin),
+                    Ok(qc_at_round(cousin, BlockHeight::new(5), 3)),
+                );
+                assert_eq!(
+                    state.block_sync.sync_applied_height(),
+                    BlockHeight::new(5),
+                    "{case}"
+                );
+            }
             state.set_block_syncing(false);
 
             let child = block_chained_on(BlockHeight::new(5), parent, 110);
+            let child_hash = child.hash();
             let child_qc = qc_on(&child);
             let actions = state.try_adopt_verified_qc(&topology_schedule, &child_qc);
             assert!(
@@ -24462,15 +24503,26 @@ mod tests {
                     a,
                     Action::Continuation(ProtocolEvent::BlockReadyToCommit { .. })
                 )),
-                "dissolved={dissolved}: nothing commits without the child's header; got {actions:?}"
+                "{case}: nothing commits without the child's header; got {actions:?}"
             );
-            assert!(
-                actions.iter().any(|a| matches!(
-                    a,
-                    Action::StartBlockSync { target } if *target == BlockHeight::new(5)
-                )),
-                "dissolved={dissolved}: the child is fetched; got {actions:?}"
-            );
+            if sibling_applied {
+                assert!(
+                    actions.iter().any(|a| matches!(
+                        a,
+                        Action::ReopenSyncHeight { height, hash }
+                            if *height == BlockHeight::new(5) && *hash == child_hash
+                    )),
+                    "{case}: the child's height is reopened naming it; got {actions:?}"
+                );
+            } else {
+                assert!(
+                    actions.iter().any(|a| matches!(
+                        a,
+                        Action::StartBlockSync { target } if *target == BlockHeight::new(5)
+                    )),
+                    "{case}: the child is fetched; got {actions:?}"
+                );
+            }
 
             let pinned = child.header().parent_qc().clone();
             let (child_hash, _) = deliver_synced(&mut state, &topology_schedule, child);
@@ -24487,14 +24539,68 @@ mod tests {
                     _ => None,
                 });
             let committed = committed.unwrap_or_else(|| {
-                panic!("dissolved={dissolved}: the parent commits once its child lands; got {actions:?}")
+                panic!("{case}: the parent commits once its child lands; got {actions:?}")
             });
             assert_eq!(
                 committed.qc(),
                 &pinned,
-                "the commit carries the child-pinned QC"
+                "{case}: the commit carries the child-pinned QC"
             );
         }
+    }
+
+    /// `block` at `round`, its parent QC certifying the parent at
+    /// `parent_round`.
+    fn at_round(block: &Block, round: u64, parent_round: u64) -> Block {
+        let parts = block.header().clone().into_parts();
+        let parent_qc = block.header().parent_qc();
+        let header = BlockHeader::new(BlockHeaderParts {
+            round: Round::new(round),
+            parent_qc: QuorumCertificate::new(
+                parent_qc.block_hash(),
+                parent_qc.shard_id(),
+                parent_qc.height(),
+                parent_qc.parent_block_hash(),
+                Round::new(parent_round),
+                parent_qc.committee_epoch(),
+                parent_qc.signers().clone(),
+                AggregateSignature::ZERO,
+                parent_qc.weighted_timestamp(),
+            )
+            .into(),
+            ..parts
+        });
+        Block::Live {
+            header,
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// [`make_test_qc`] certifying `block_hash` in `round`.
+    fn qc_at_round(
+        block_hash: BlockHash,
+        height: BlockHeight,
+        round: u64,
+    ) -> Verified<QuorumCertificate> {
+        // SAFETY: synthetic test fixture, no real signature.
+        Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+            block_hash,
+            ShardId::ROOT,
+            height,
+            BlockHash::ZERO,
+            Round::new(round),
+            Epoch::GENESIS,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(100_000),
+        ))
     }
 
     /// The header the high QC certifies drives the commit it deferred the
