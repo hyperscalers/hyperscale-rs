@@ -3078,6 +3078,172 @@ mod tests {
         ));
     }
 
+    /// The window every role resolves for a block of `shard` whose
+    /// committee anchor is `anchor`, certified with stamp `stamp`: built
+    /// and voted under `live`, its QC verified and the block folded under
+    /// `verifier`. Panics where two roles part.
+    fn agree(
+        live: &TopologySchedule,
+        verifier: &TopologySchedule,
+        shard: ShardId,
+        anchor: WeightedTimestamp,
+        stamp: WeightedTimestamp,
+    ) -> (Epoch, Vec<ValidatorId>) {
+        let members =
+            |committee: BlockCommittee<'_>| committee.snapshot.committee_for_shard(shard).to_vec();
+        let proposed = live
+            .live_committee(shard, anchor)
+            .committee()
+            .expect("the proposer resolves its committee");
+        let signed = proposed.epoch;
+        let QcAdmission::Admit(checked) = verifier.admits(shard, anchor, stamp, signed) else {
+            panic!("the verifier refuses {signed:?} at {anchor:?} stamped {stamp:?}");
+        };
+        let folded = verifier
+            .signed_committee(shard, signed)
+            .committee()
+            .expect("the fold resolves the signed window");
+        assert_eq!((checked.epoch, folded.epoch), (signed, signed));
+        assert!(Arc::ptr_eq(checked.snapshot, folded.snapshot));
+        assert_eq!(members(checked), members(proposed));
+        (signed, members(folded))
+    }
+
+    /// [`proposer_voter_and_fold_resolve_one_committee`] across a reshape:
+    /// a block whose cut lies between its anchors, and a split child's
+    /// first block. Window 0 runs the root whole, window 1 its children.
+    #[test]
+    fn proposer_voter_and_fold_resolve_one_committee_across_a_reshape() {
+        let (set, old, fresh) = recovery_committees();
+        let at = |ms: u64| WeightedTimestamp::from_millis(ms);
+        let (left, right) = ShardId::ROOT.children();
+        let whole = Arc::new(TopologySnapshot::with_shard_committees(
+            NetworkDefinition::simulator(),
+            1,
+            &set,
+            std::iter::once((ShardId::ROOT, old.clone())).collect(),
+        ));
+        let split = Arc::new(TopologySnapshot::with_shard_committees(
+            NetworkDefinition::simulator(),
+            2,
+            &set,
+            [(left, fresh.clone()), (right, old.clone())]
+                .into_iter()
+                .collect(),
+        ));
+        let mut reshaped = TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(0), whole);
+        reshaped.insert(Epoch::new(1), Arc::clone(&split));
+        reshaped.set_head(Epoch::new(1), split);
+        assert_eq!(
+            agree(&reshaped, &reshaped, ShardId::ROOT, at(900), at(1_100)),
+            (Epoch::new(0), old),
+            "a block whose own anchor lies past the cut",
+        );
+        assert_eq!(
+            agree(&reshaped, &reshaped, left, at(1_100), at(1_200)),
+            (Epoch::new(1), fresh),
+            "the split child's first block",
+        );
+    }
+
+    /// The committee a block's proposer builds under and its voters sign
+    /// (the live committee at its committee anchor, whose epoch the votes
+    /// carry), the one a verifier admits its QC under, and the one the
+    /// commit fold classifies it under (the window that epoch keys) are
+    /// one window, each read under the schedule that role holds when it
+    /// runs: before a recovery folds, after, or lagging behind it.
+    #[test]
+    fn proposer_voter_and_fold_resolve_one_committee() {
+        let (set, old, fresh) = recovery_committees();
+        let shard = BOUNDED;
+        let at = |ms: u64| WeightedTimestamp::from_millis(ms);
+        let binding = |rotated_at: u64| RecoveryBinding {
+            rotated_at: Epoch::new(rotated_at),
+            attested_frontier: BlockHeight::GENESIS,
+            completed: false,
+        };
+        let window = |committee: &[ValidatorId], history: Vec<RecoveryBinding>| {
+            Arc::new(
+                seating(&set, committee, None)
+                    .with_recoveries(std::iter::once((shard, history)).collect()),
+            )
+        };
+
+        // A halt recovery: T anchored in window 2 and certified there
+        // before the recovery folds; X1 and X2, whose committee anchor is
+        // T's own, built by the fresh committee seated at 20 (bridge 21).
+        let mut halted = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(2),
+            window(&old, vec![]),
+        );
+        halted.set_head(Epoch::new(3), window(&old, vec![]));
+        let mut recovered = halted.clone();
+        let seated = Arc::new(
+            window(&fresh, vec![binding(20)])
+                .as_ref()
+                .clone()
+                .with_pending_recoveries(
+                    std::iter::once((shard, halt_recovery(20, &old))).collect(),
+                ),
+        );
+        recovered.insert(Epoch::new(21), Arc::clone(&seated));
+        recovered.set_head(Epoch::new(21), seated);
+        let t = agree(&halted, &recovered, shard, at(2_400), at(2_900));
+        assert_eq!(t, (Epoch::new(2), old.clone()), "T");
+        for (block, stamp) in [("X1", at(20_500)), ("X2", at(21_100))] {
+            assert_eq!(
+                agree(&recovered, &recovered, shard, at(2_900), stamp),
+                (Epoch::new(21), fresh.clone()),
+                "{block}",
+            );
+        }
+
+        // A chained recovery whose second draw seats the original
+        // committee at its own indexes: the stalled chain's next block,
+        // anchored in window 2, takes the second bridge's window, never
+        // window 2, though both seat the same members.
+        let mut first = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(2),
+            window(&old, vec![]),
+        );
+        let first_fresh = window(&fresh, vec![binding(20)]);
+        first.insert(Epoch::new(21), Arc::clone(&first_fresh));
+        first.set_head(Epoch::new(21), first_fresh);
+        let mut chained = first.clone();
+        let redrawn = window(&old, vec![binding(20), binding(40)]);
+        chained.insert(Epoch::new(41), Arc::clone(&redrawn));
+        chained.set_head(Epoch::new(41), redrawn);
+        assert_eq!(
+            agree(&chained, &chained, shard, at(2_900), at(41_100)),
+            (Epoch::new(41), old.clone()),
+            "the redrawn committee",
+        );
+        assert_eq!(
+            agree(&first, &chained, shard, at(21_500), at(21_900)),
+            (Epoch::new(21), fresh.clone()),
+            "the first fresh committee's own block, verified after the redraw",
+        );
+
+        // A verifier whose beacon lags the recovery waits, and once it
+        // folds the recovery agrees with the fresh committee's voters.
+        let mut lagging = halted;
+        lagging.set_head(Epoch::new(5), window(&old, vec![]));
+        assert!(matches!(
+            lagging.admits(shard, at(2_900), at(21_100), Epoch::new(21)),
+            QcAdmission::Wait
+        ));
+        let mut caught_up = lagging;
+        let folded = recovered.head().clone();
+        caught_up.insert(Epoch::new(21), Arc::clone(&folded));
+        caught_up.set_head(Epoch::new(21), folded);
+        assert_eq!(
+            agree(&recovered, &caught_up, shard, at(2_900), at(21_100)),
+            (Epoch::new(21), fresh),
+        );
+    }
+
     /// A fresh committee that certified in the epoch a re-draw was seated,
     /// before folding the re-draw, is still admitted once the verifier has
     /// folded it: the windows overlap at the seating epoch.
