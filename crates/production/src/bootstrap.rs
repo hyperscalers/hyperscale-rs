@@ -526,8 +526,8 @@ mod tests {
     };
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, ShardAnchor, SubstateLeaf,
-        TopologySnapshot, ValidatorId, ValidatorSet, WeightedTimestamp,
+        GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, QuorumCertificate,
+        ShardAnchor, SubstateLeaf, TopologySnapshot, ValidatorId, ValidatorSet, WeightedTimestamp,
     };
 
     use super::*;
@@ -668,11 +668,29 @@ mod tests {
         fn unsubscribe_shard(&self, _shard: ShardId) {}
     }
 
-    fn shared_topology(anchor: ShardAnchor, shard: ShardId) -> SharedTopologySnapshot {
-        Arc::new(ArcSwap::from_pointee(attesting(anchor, shard)))
+    fn shared_topology(
+        store: &SimShardStorage,
+        anchor: ShardAnchor,
+        shard: ShardId,
+    ) -> SharedTopologySnapshot {
+        Arc::new(ArcSwap::from_pointee(attesting(
+            anchor,
+            attested_qc(store, &anchor),
+            shard,
+        )))
     }
 
-    fn attesting(anchor: ShardAnchor, shard: ShardId) -> TopologySnapshot {
+    /// The QC the beacon attests for `anchor`: the one `store` certified
+    /// the anchor block with.
+    fn attested_qc(store: &SimShardStorage, anchor: &ShardAnchor) -> QuorumCertificate {
+        store
+            .get_block(anchor.height)
+            .expect("the replica holds its anchor block")
+            .qc()
+            .clone()
+    }
+
+    fn attesting(anchor: ShardAnchor, qc: QuorumCertificate, shard: ShardId) -> TopologySnapshot {
         TopologySnapshot::from_explicit_committees(
             NetworkDefinition::simulator(),
             &ValidatorSet::new(Vec::new()),
@@ -685,6 +703,7 @@ mod tests {
             BTreeMap::new(),
             BTreeSet::new(),
         )
+        .with_boundary_qcs(BTreeMap::from([(shard, qc)]))
     }
 
     /// The pump end to end over the sequencer: request dispatch with
@@ -695,7 +714,7 @@ mod tests {
         let (serving, anchor) = replica();
         let shard = ShardId::ROOT;
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 3));
-        let topology_snapshot = shared_topology(anchor, shard);
+        let topology_snapshot = shared_topology(&serving, anchor, shard);
         let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
         let importing = Arc::new(Importing::default());
 
@@ -732,7 +751,7 @@ mod tests {
         assert!(local.committed_height() > anchor.height);
         let shard = ShardId::ROOT;
         let network = Arc::new(StubNetwork::new(Arc::clone(&local), usize::MAX));
-        let topology_snapshot = shared_topology(anchor, shard);
+        let topology_snapshot = shared_topology(&local, anchor, shard);
         let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
 
         let recovered = bootstrap_shard_state(
@@ -764,7 +783,12 @@ mod tests {
         // The "previous process": witness, then stage three sub-ranges
         // of the fan-out before dying.
         let pending_chain = PendingChain::new(Arc::clone(&serving), BlockHeight::GENESIS);
-        let mut first = ShardBootstrap::new(shard, anchor, None, WeightedTimestamp::ZERO);
+        let mut first = ShardBootstrap::new(
+            shard,
+            anchor,
+            Some(attested_qc(&serving, &anchor)),
+            WeightedTimestamp::ZERO,
+        );
         let mut staged = 0usize;
         'outer: for _ in 0..1_000 {
             for request in first.next_requests() {
@@ -794,7 +818,7 @@ mod tests {
         assert!(fresh.read_import_progress().is_some());
 
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
-        let topology_snapshot = shared_topology(anchor, shard);
+        let topology_snapshot = shared_topology(&serving, anchor, shard);
         let recovered = bootstrap_shard_state(
             &network,
             &topology_snapshot,
@@ -836,7 +860,7 @@ mod tests {
             .unwrap();
 
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
-        let topology_snapshot = shared_topology(anchor, shard);
+        let topology_snapshot = shared_topology(&serving, anchor, shard);
         let recovered = bootstrap_shard_state(
             &network,
             &topology_snapshot,
@@ -877,11 +901,12 @@ mod tests {
         };
 
         let shard = ShardId::ROOT;
-        let topology_snapshot = shared_topology(stale, shard);
+        let topology_snapshot = shared_topology(&serving, stale, shard);
         let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
         let advance = Arc::clone(&topology_snapshot);
+        let advanced_qc = attested_qc(&serving, &advanced);
         *lock(&network.on_state_range) = Some(Box::new(move || {
-            advance.store(Arc::new(attesting(advanced, shard)));
+            advance.store(Arc::new(attesting(advanced, advanced_qc.clone(), shard)));
         }));
         let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
 

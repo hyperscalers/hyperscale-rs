@@ -776,6 +776,28 @@ impl BlockHeader {
         parent_qc.is_genesis() && self.height == parent_qc.height()
     }
 
+    /// The QC a genesis header is certified by, which no committee
+    /// signed: its own genesis parent QC naming this block. `None` for
+    /// any header that is not [genesis](Self::is_genesis).
+    #[must_use]
+    pub fn genesis_certifying_qc(&self) -> Option<QuorumCertificate> {
+        if !self.is_genesis() {
+            return None;
+        }
+        let base = self.parent_qc();
+        Some(QuorumCertificate::new(
+            self.hash(),
+            base.shard_id(),
+            base.height(),
+            base.parent_block_hash(),
+            base.round(),
+            base.committee_epoch(),
+            base.signers().clone(),
+            base.aggregated_signature(),
+            base.weighted_timestamp(),
+        ))
+    }
+
     /// Get the expected proposer for this height (round-robin).
     #[must_use]
     pub const fn expected_proposer(&self, num_validators: u64) -> ValidatorId {

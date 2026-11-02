@@ -67,7 +67,6 @@ pub fn serve_witness_history_request<S: ShardStorage>(
     GetWitnessHistoryResponse {
         history: Some(WitnessHistoryChunk {
             header: header.clone(),
-            qc: certified.qc().clone(),
             payloads,
             more: end < count,
         }),

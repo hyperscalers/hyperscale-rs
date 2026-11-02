@@ -210,23 +210,10 @@ impl Verified<CertifiedBlock> {
     /// Panics if `block` is not structurally genesis.
     #[must_use]
     pub fn genesis_certified(block: Block) -> Self {
-        assert!(
-            block.is_genesis(),
-            "genesis pairing for a non-genesis block"
-        );
-        let block_hash = block.hash();
-        let base = block.header().parent_qc().clone();
-        let qc_for_block = QuorumCertificate::new(
-            block_hash,
-            base.shard_id(),
-            base.height(),
-            base.parent_block_hash(),
-            base.round(),
-            base.committee_epoch(),
-            base.signers().clone(),
-            base.aggregated_signature(),
-            base.weighted_timestamp(),
-        );
+        let qc_for_block = block
+            .header()
+            .genesis_certifying_qc()
+            .expect("genesis pairing for a non-genesis block");
         // SAFETY: genesis-shape QC paired with a freshly-built local
         // genesis block; both inputs are verified by construction
         // (empty-input root compute + zero-signers QC).
