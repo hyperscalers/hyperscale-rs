@@ -21619,6 +21619,98 @@ mod tests {
         );
     }
 
+    /// The seating-epoch forgery at the fork gate. With a fork recovery
+    /// seated at 2 (bridge 3), the replaced committee of epoch 0 signs a
+    /// block above the frontier under its own window and stamps it in the
+    /// seating epoch, where its window is still a candidate. The gate reads
+    /// the signed epoch, not the stamp, and refuses it. The same block at
+    /// the frontier syncs, as does a halt recovery's harvested tail and
+    /// the fresh committee's block above the frontier.
+    #[test]
+    fn a_retained_quorum_stamped_in_the_seating_epoch_is_refused_at_the_fork_gate() {
+        use hyperscale_types::test_utils::make_live_block;
+        use hyperscale_types::{CertifiedBlock, RecoveryBinding, RecoveryCause, ShardRecovery};
+
+        let admit = |cause: RecoveryCause, frontier: u64, epoch: u64, stamp: u64| {
+            let (mut state, schedule, _, _) = claim_epochs();
+            let mut recovering = schedule.clone();
+            let binding = RecoveryBinding {
+                rotated_at: Epoch::new(2),
+                attested_frontier: BlockHeight::new(frontier),
+                completed: false,
+            };
+            let head = schedule
+                .head()
+                .as_ref()
+                .clone()
+                .with_recoveries(std::iter::once((ShardId::ROOT, vec![binding])).collect())
+                .with_pending_recoveries(
+                    std::iter::once((
+                        ShardId::ROOT,
+                        ShardRecovery {
+                            cause,
+                            rotated_at: Epoch::new(2),
+                            retained: Vec::new(),
+                            attested_frontier: BlockHeight::new(frontier),
+                        },
+                    ))
+                    .collect(),
+                );
+            recovering.set_head(Epoch::new(3), Arc::new(head));
+            let block = make_live_block(
+                ShardId::ROOT,
+                BlockHeight::new(5),
+                1_000,
+                ValidatorId::new(1),
+                vec![],
+                vec![],
+            );
+            let mut signers = SignerBitfield::new(4);
+            for i in 0..3 {
+                signers.set(i);
+            }
+            let qc = QuorumCertificate::new(
+                block.hash(),
+                ShardId::ROOT,
+                block.height(),
+                block.header().parent_block_hash(),
+                Round::new(5),
+                Epoch::new(epoch),
+                signers,
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(stamp),
+            );
+            let certified = CertifiedBlock::new_unchecked(block, qc);
+            state
+                .submit_synced_block_for_verification(&recovering, certified)
+                .iter()
+                .any(|a| {
+                    matches!(
+                        a,
+                        Action::Consensus(ConsensusAction::VerifyQcSignature { .. })
+                    )
+                })
+        };
+        let seating = 2 * CLAIM_ED + 100;
+
+        assert!(
+            !admit(RecoveryCause::Fork, 0, 0, seating),
+            "the replaced committee's block above the frontier is refused"
+        );
+        assert!(
+            admit(RecoveryCause::Fork, 5, 0, seating),
+            "the same block at the frontier syncs"
+        );
+        assert!(
+            admit(RecoveryCause::Halt, 0, 0, seating),
+            "a halt recovery's harvested tail syncs"
+        );
+        assert!(
+            admit(RecoveryCause::Fork, 0, 3, 3 * CLAIM_ED + 100),
+            "the fresh committee's block above the frontier syncs"
+        );
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Vote Locking Safety Tests
     // ═══════════════════════════════════════════════════════════════════════════

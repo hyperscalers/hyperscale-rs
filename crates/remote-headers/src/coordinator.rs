@@ -4892,6 +4892,55 @@ mod tests {
         );
     }
 
+    /// The stamp rides outside the signed message, so a relay can rewrite
+    /// it, but not the epoch the quorum signed. The fresh committee's
+    /// bridge block, its stamp rewritten to before the recovery was
+    /// seated, places no committee of its anchor at the epoch it names:
+    /// the copy is refused and checked under no window, while the copy
+    /// carrying the quorum's own stamp is checked.
+    #[test]
+    fn a_rewritten_stamp_refuses_the_copy_and_moves_no_epoch() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let parent = chain_header_dated(remote, 5, 5, None, 9_500);
+        let honest = chain_header_signed(remote, 6, 6, Some(&parent), Epoch::new(10), 10_200);
+        coord.on_verified_remote_header_received(&cleared, parent, ValidatorId::new(1));
+        let qc = honest.qc();
+        let restamped = CertifiedBlockHeader::new(
+            honest.header().clone(),
+            QuorumCertificate::new(
+                qc.block_hash(),
+                qc.shard_id(),
+                qc.height(),
+                qc.parent_block_hash(),
+                qc.round(),
+                qc.committee_epoch(),
+                qc.signers().clone(),
+                qc.aggregated_signature(),
+                WeightedTimestamp::from_millis(8_500),
+            ),
+        );
+        assert_eq!(restamped.qc().committee_epoch(), Epoch::new(10));
+
+        let actions = coord.on_remote_header_received(&cleared, restamped, gossip(2));
+        assert!(
+            actions.is_empty(),
+            "the restamped copy is refused: {actions:?}"
+        );
+        assert!(coord.get_pending(remote, BlockHeight::new(6)).is_none());
+
+        let actions = coord.on_remote_header_received(&cleared, unverified(&honest), gossip(1));
+        assert_eq!(
+            verify_qc_count(&actions),
+            1,
+            "the quorum's own copy is checked"
+        );
+    }
+
     /// Shared history at or below the frontier, certified by the replaced
     /// committee long before the bridge, is admitted after the clear.
     #[test]

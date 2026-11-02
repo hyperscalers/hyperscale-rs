@@ -897,6 +897,61 @@ mod tests {
         );
     }
 
+    /// The guessed anchor refuses on the signed epoch alone. With one
+    /// committee seated on both sides of the cut, the keys verify the QC
+    /// under either window, but it names the window its parent anchors in.
+    /// Without the parent, the boundary's own anchor admits no committee
+    /// at that epoch, so the member abstains and asks for the parent; once
+    /// the parent is proven the QC is admitted under it and verifies.
+    #[test]
+    fn a_guessed_anchor_across_a_cut_waits_for_the_parent() {
+        let committee = TestCommittee::new(4, 1);
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(2),
+            Arc::new(committee.topology_snapshot(1)),
+        );
+        schedule.insert(Epoch::new(0), Arc::new(committee.topology_snapshot(1)));
+        schedule.insert(Epoch::new(1), Arc::new(committee.topology_snapshot(1)));
+
+        let parent = chained_header(9, 9, BlockHash::ZERO, ED - 1);
+        let boundary = chained_header(10, 10, parent.hash(), ED + 1);
+        let qc = signed_qc(&committee, &boundary, 0, ED + 2);
+        let parent_slot = (SHARD, BlockHeight::new(9));
+        let authentic = |tracker: &ShardSourceTracker| {
+            boundary_qc_authentic(
+                &BlsVerifier,
+                SHARD,
+                &boundary,
+                &qc,
+                tracker,
+                &schedule,
+                &NetworkDefinition::simulator(),
+            )
+        };
+
+        let mut shard_source = ShardSourceTracker::new();
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(boundary.clone(), qc.clone()),
+        ));
+        assert!(
+            !authentic(&shard_source),
+            "the guess admits no committee at the signed epoch"
+        );
+        assert!(
+            awaited_boundaries(&proposing(&qc), &shard_source).contains(&parent_slot),
+            "the missing parent is asked for",
+        );
+
+        shard_source.admit_proven_boundary(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(parent, boundary.parent_qc().clone()),
+        ));
+        assert!(
+            authentic(&shard_source),
+            "the parent's window admits the epoch"
+        );
+    }
+
     /// A boundary QC over a certified-but-uncommitted block is
     /// inadmissible. A 2f+1 QC proves availability, not commitment: a
     /// shard can halt with its epoch-crossing block certified yet never

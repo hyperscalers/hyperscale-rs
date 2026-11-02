@@ -1292,6 +1292,40 @@ mod tests {
         ));
     }
 
+    /// A double vote whose sides sign different committee epochs still
+    /// jails through the fold: the epoch is part of each signed message,
+    /// not a way out of the contradiction. The same pair with one side's
+    /// epoch misstated verifies under neither and convicts nobody.
+    #[test]
+    fn a_double_vote_is_still_jailed() {
+        let fold = |ev: ShardVoteEquivocation| {
+            let mut state = single_pool_state(4);
+            state.committee = (0u64..4).map(ValidatorId::new).collect();
+            state.validators.insert(
+                ValidatorId::new(9),
+                validator_record(9, 0, ValidatorStatus::Pooled),
+            );
+            isolate_in_own_pool(&mut state, ValidatorId::new(9), 9);
+            let target_epoch = state.current_epoch.next();
+            let mut committed = vec![(
+                ValidatorId::new(0),
+                vrf_proposal_with_vote_equivocations(0, target_epoch, vec![ev]),
+            )];
+            committed
+                .extend((1u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target_epoch))));
+            apply_next_epoch(&mut state, &committed).revoked
+        };
+
+        let ev = genuine_equivocation_under(9, Epoch::new(5), Epoch::new(6));
+        assert_eq!(fold(ev.clone()), vec![ValidatorId::new(9)]);
+
+        let misstated = ShardVoteEquivocation {
+            committee_epoch_b: Epoch::new(5),
+            ..ev
+        };
+        assert!(fold(misstated).is_empty());
+    }
+
     /// A forged pair on the proposal lane is dropped at the fold's
     /// fail-closed re-verify — unlike witness leaves, lane evidence
     /// carries no shard QC attestation to trust.
@@ -2579,11 +2613,21 @@ mod tests {
     /// carries. Each signature is real, so the leaf verifies against the
     /// signer's key — the block-validity soundness the shard QC attests.
     fn genuine_equivocation(equivocator: u64) -> ShardVoteEquivocation {
+        genuine_equivocation_under(equivocator, Epoch::GENESIS, Epoch::GENESIS)
+    }
+
+    /// [`genuine_equivocation`] with each side signed under its own
+    /// committee epoch.
+    fn genuine_equivocation_under(
+        equivocator: u64,
+        committee_epoch_a: Epoch,
+        committee_epoch_b: Epoch,
+    ) -> ShardVoteEquivocation {
         let sk = keypair(equivocator);
         let shard = ShardId::leaf(1, 0);
         let (height, round) = (BlockHeight::new(5), Round::new(2));
         let voter = ValidatorId::new(equivocator);
-        let sign = |blk: &[u8], parent: &[u8]| {
+        let sign = |blk: &[u8], parent: &[u8], epoch: Epoch| {
             let block_hash = BlockHash::from_raw(Hash::from_bytes(blk));
             let parent_hash = BlockHash::from_raw(Hash::from_bytes(parent));
             let vote = BlockVote::new(
@@ -2593,7 +2637,7 @@ mod tests {
                 shard,
                 height,
                 round,
-                Epoch::GENESIS,
+                epoch,
                 voter,
                 &sk,
                 ProposerTimestamp::ZERO,
@@ -2601,8 +2645,10 @@ mod tests {
             .expect("sign");
             (block_hash, parent_hash, vote.signature())
         };
-        let (block_hash_a, parent_block_hash_a, sig_a) = sign(b"equiv-block-a", b"equiv-parent-a");
-        let (block_hash_b, parent_block_hash_b, sig_b) = sign(b"equiv-block-b", b"equiv-parent-b");
+        let (block_hash_a, parent_block_hash_a, sig_a) =
+            sign(b"equiv-block-a", b"equiv-parent-a", committee_epoch_a);
+        let (block_hash_b, parent_block_hash_b, sig_b) =
+            sign(b"equiv-block-b", b"equiv-parent-b", committee_epoch_b);
         ShardVoteEquivocation {
             validator: voter,
             shard,
@@ -2610,11 +2656,11 @@ mod tests {
             round,
             block_hash_a,
             parent_block_hash_a,
-            committee_epoch_a: Epoch::GENESIS,
+            committee_epoch_a,
             sig_a,
             block_hash_b,
             parent_block_hash_b,
-            committee_epoch_b: Epoch::GENESIS,
+            committee_epoch_b,
             sig_b,
         }
     }
