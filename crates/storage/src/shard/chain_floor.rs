@@ -42,14 +42,15 @@ use crate::Substates;
 
 /// What a store keeps beneath its chain floor: for every member row
 /// standing in its committed state, the transaction's body and the
-/// metadata rows of the height that committed it and of the height below.
+/// metadata rows of the height that committed it and of the height above.
 ///
 /// An accepted row is the exception: it has settled, and keeps nothing.
 ///
-/// A record naming the transaction restates the block that committed it
-/// and two anchors: that block's own, and the one its classification and
-/// price were frozen at, which is the anchor of the block below. Each is
-/// a parent-QC clock read off the header at its own height.
+/// A record naming the transaction restates the block that committed it,
+/// that block's own anchor, and the committee epoch its classification
+/// and price were frozen under. The anchor is the parent-QC clock on the
+/// committing header; the epoch is the one the QC certifying that block
+/// signed, read off the copy the header above pins as its parent QC.
 ///
 /// Read off committed state alone, so every replica at one tip holds the
 /// same rows whatever it has run since it opened, and a store that holds
@@ -83,7 +84,7 @@ impl ChainHold {
             }
             hold.bodies.insert(row.tx);
             hold.rows.insert(row.height);
-            hold.rows.extend(row.height.prev());
+            hold.rows.insert(row.height.next());
         }
         hold
     }
@@ -233,8 +234,8 @@ mod tests {
     use crate::MemberInputs;
 
     /// A standing row holds its body and the rows at its height and the
-    /// one below; a row at the first height holds no row beneath it; and
-    /// an index with no rows holds nothing.
+    /// one above, whose header pins the QC certifying it; and an index
+    /// with no rows holds nothing.
     #[test]
     fn a_member_row_holds_its_body_and_two_rows() {
         let shard = ShardId::ROOT;
@@ -256,11 +257,11 @@ mod tests {
         let rows: Vec<u64> = (0..=9)
             .filter(|height| hold.keeps_row(BlockHeight::new(*height)))
             .collect();
-        assert_eq!(rows, [0, 6, 7]);
+        assert_eq!(rows, [0, 1, 7, 8]);
     }
 
     /// An accepted row has settled and holds nothing: neither its body
-    /// nor a row at its height or the one below. A stated row beside it
+    /// nor a row at its height or the one above. A stated row beside it
     /// holds all three.
     #[test]
     fn an_accepted_row_holds_nothing_and_a_stated_one_holds_on() {
@@ -294,7 +295,7 @@ mod tests {
         let rows: Vec<u64> = (0..=9)
             .filter(|height| hold.keeps_row(BlockHeight::new(*height)))
             .collect();
-        assert_eq!(rows, [6, 7], "only the stated row's heights are kept");
+        assert_eq!(rows, [7, 8], "only the stated row's heights are kept");
     }
 
     /// The floor is the deeper of the two reaches, and a shard with no

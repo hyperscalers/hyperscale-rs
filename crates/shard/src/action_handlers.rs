@@ -891,7 +891,8 @@ fn commit_windows_for(
 ///
 /// Both headers and the carrying manifest stay in the store for as long
 /// as the transaction's member row stands, however far beneath its
-/// chain floor.
+/// chain floor: the store's `ChainHold` keeps the metadata rows at the
+/// committing height and the one above it.
 fn bears_out_commit<H: AsRef<CertifiedBlockHeader>>(
     entry: &UnsettledTx,
     carries: impl Fn(BlockHeight, TxHash) -> Option<bool>,
@@ -2139,13 +2140,14 @@ mod tests {
     use hyperscale_provisions::Unrouted;
     use hyperscale_storage::test_helpers::{commit_writes, placeholder_local_ec};
     use hyperscale_storage::{
-        ChainEntry, PendingChain, ShardChainReader, TickChain, committed_here,
+        ChainEntry, ChainHold, MemberIndex, MemberInputs, PendingChain, ShardChainReader,
+        TickChain, committed_here,
     };
     use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
     use hyperscale_types::test_utils::{
         StubVmStatics, TestCommittee, install_stub_protocol_statics, stating_half_on,
-        stub_abort_charge, stub_transaction, stub_transaction_with_reads, test_pool, test_prefix,
-        test_principal,
+        stub_abort_charge, stub_stated_terms, stub_transaction, stub_transaction_with_reads,
+        test_pool, test_prefix, test_principal,
     };
     use hyperscale_types::{
         Address, AddressClass, AggregateSignature, BeaconBlockHash, BeaconChainConfig, BeaconState,
@@ -2557,6 +2559,78 @@ mod tests {
 
         assert_eq!(verdict(&bridged), Resolutions::Exact);
         assert_eq!(verdict(&raw), Resolutions::Wrong(tx.hash()));
+    }
+
+    /// A record naming a member committed beneath the chain floor is
+    /// judged from the rows the store's hold keeps there, and nothing
+    /// else: the signed window restates exactly, and another is refused.
+    #[test]
+    fn a_record_naming_a_member_beneath_the_floor_restates_from_the_held_rows() {
+        install_stub_protocol_statics();
+        let tx = Verified::<Transaction>::from_persisted(stub_transaction(
+            test_principal(1),
+            &[test_prefix(1)],
+            1_000_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        ));
+        let mut members = MemberIndex::empty(ShardId::ROOT);
+        members.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(tx.hash(), Deadline::of_transaction(&tx))],
+            terms: vec![stub_stated_terms(tx.hash(), 1)],
+            ..MemberInputs::still(ShardId::ROOT)
+        });
+        let kept = ChainHold::of(&members);
+        let collected: Vec<Option<Verified<CertifiedBlockHeader>>> = committed_chain(2_500, 21)
+            .into_iter()
+            .zip(0u64..)
+            .map(|(header, height)| kept.keeps_row(BlockHeight::new(height)).then_some(header))
+            .collect();
+        assert!(
+            collected[0].is_none(),
+            "the fixture collects a row the hold does not keep"
+        );
+
+        let beacon = Folded::to(&[(2, 1), (21, 1)]);
+        let named = |epoch: u64| {
+            let at = beacon
+                .get_state_by_epoch(Epoch::new(epoch))
+                .expect("the fixture folds the epoch")
+                .commit_window();
+            let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &at.trie);
+            UnsettledTx::for_transaction(
+                &tx,
+                CommittedAt {
+                    height: BlockHeight::new(1),
+                    anchor: WeightedTimestamp::from_millis(2_500),
+                    committee_epoch: Epoch::new(epoch),
+                },
+                classified.local_price(&tx, ShardId::ROOT, &at.prices),
+                &at.prices,
+            )
+        };
+        let held = HashMap::from([(tx.hash(), tx.clone())]);
+        let verdict = |entry: &UnsettledTx| {
+            resolutions_of(
+                vec![entry.clone()],
+                &held,
+                &beacon,
+                ShardId::ROOT,
+                |height, _| (height == BlockHeight::new(1)).then_some(true),
+                |height| {
+                    collected
+                        .get(usize::try_from(height.inner()).ok()?)
+                        .cloned()
+                        .flatten()
+                },
+            )
+        };
+
+        assert_eq!(verdict(&named(21)), Resolutions::Exact);
+        assert_eq!(verdict(&named(2)), Resolutions::Wrong(tx.hash()));
     }
 
     fn shard() -> ShardId {

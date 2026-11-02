@@ -6133,7 +6133,7 @@ fn holds_body(storage: &impl ShardChainReader, tx: &Transaction) -> bool {
 ///
 /// A height no standing row names loses its metadata row and every row
 /// its manifest names; a transaction whose row stands keeps its body and
-/// the metadata rows at its height and the one below, until a
+/// the metadata rows at its height and the one above, until a
 /// finalization settles the row; the floor never moves down; and every
 /// height at or above it still rebuilds.
 ///
@@ -6153,8 +6153,8 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
     };
     // `first` is the one transaction beneath the floor whose row stands.
     // Its sibling in the block and the transaction in the block below
-    // are settled, as is `second`, with a receipt. `late` stands too, in
-    // a block whose own row and the one below sit at or above the floor.
+    // are settled, as is `second` in the block above, with a receipt.
+    // `late` stands too, in a block at or above the floor.
     let settling_second = push_certificate(
         make_test_block(BlockHeight::new(4)),
         make_finalization_settling(
@@ -6196,7 +6196,7 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
     collect(storage);
     assert_eq!(storage.chain_floor(), floor);
     assert!(
-        !rebuilds(3) && !metadata_at(3) && !holds_body(storage, second),
+        !rebuilds(1) && !metadata_at(1) && !holds_body(storage, below),
         "a height no standing row names goes whole",
     );
     assert!(
@@ -6211,17 +6211,17 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
         "a standing row keeps its body and its height's metadata row, and nothing else there",
     );
     assert!(
-        metadata_at(1) && !holds_body(storage, below),
-        "and the metadata row of the height below, without what that height carried",
+        metadata_at(3) && !holds_body(storage, second),
+        "and the metadata row of the height above, without what that height carried",
     );
     assert!(
-        (1..=2).all(|height| storage
+        (2..=3).all(|height| storage
             .get_certified_header(BlockHeight::new(height))
             .is_some()),
         "so the headers a record's check reads off the two heights answer",
     );
     assert!(
-        !rebuilds(1) && !rebuilds(2),
+        !rebuilds(2) && !rebuilds(3),
         "and no partial block rebuilds from what is held",
     );
     assert!(
@@ -6239,7 +6239,7 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
     storage.advance_chain_floor(ShardId::ROOT, floor);
     collect(storage);
     assert!(
-        !metadata_at(2) && !metadata_at(1) && !holds_body(storage, first),
+        !metadata_at(2) && !metadata_at(3) && !holds_body(storage, first),
         "a row a finalization settles releases its rows at the next collection",
     );
     assert!(
@@ -6374,14 +6374,13 @@ pub fn test_a_standing_member_row_keeps_its_rows<S: ShardChainReader + TestStore
     for block in chain {
         commit_with_members(&storage, &make_test_certified(block));
     }
-    let anchors: Vec<WeightedTimestamp> = (2..=3)
+    let headers: Vec<BlockHash> = (3..=4)
         .map(|height| {
             storage
                 .get_certified_header(BlockHeight::new(height))
                 .expect("a committed height")
                 .header()
-                .parent_qc()
-                .weighted_timestamp()
+                .hash()
         })
         .collect();
 
@@ -6394,19 +6393,16 @@ pub fn test_a_standing_member_row_keeps_its_rows<S: ShardChainReader + TestStore
             holds_body(&storage, standing),
             "a standing row keeps its transaction's body",
         );
-        let held: Vec<WeightedTimestamp> = (2..=3)
+        let held: Vec<BlockHash> = (3..=4)
             .filter_map(|height| storage.get_certified_header(BlockHeight::new(height)))
-            .map(|header| header.header().parent_qc().weighted_timestamp())
+            .map(|header| header.header().hash())
             .collect();
         assert_eq!(
-            held, anchors,
-            "and the headers at its height and the one below, each with its anchor",
+            held, headers,
+            "and the headers at its height and the one above, whose parent QC \
+             states the epoch its commit signed",
         );
-        assert!(
-            !holds_body(&storage, below),
-            "the height below keeps its row alone",
-        );
-        for height in [1, 4, 5] {
+        for height in [1, 2, 5] {
             assert!(
                 storage
                     .get_block_metadata(BlockHeight::new(height))
@@ -6446,8 +6442,9 @@ pub fn test_a_member_row_naming_an_unheld_height_keeps_nothing<S: ShardChainRead
     assert!(!metadata_at(1) && !metadata_at(2));
 
     let unheld = test_transaction(1);
+    // Height 1, so neither its row nor the one above is held.
     let naming = MemberInputs {
-        height: BlockHeight::new(2),
+        height: BlockHeight::new(1),
         transactions: vec![(unheld.hash(), Deadline::of_transaction(&unheld))],
         terms: vec![stub_stated_terms(unheld.hash(), 1)],
         ..MemberInputs::still(ShardId::ROOT)
