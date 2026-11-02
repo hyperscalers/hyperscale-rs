@@ -31,9 +31,9 @@ use hyperscale_types::test_utils::{certify, make_live_block, test_pool, test_tra
 use hyperscale_types::{
     Address, AddressClass, AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert,
     BeaconChainConfig, BeaconProposal, BeaconProposalDraft, BeaconWitnessLeafCount,
-    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockVote,
-    CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, ConsensusSignature, Hash,
-    LeafIndex, NetworkMessage, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound,
+    BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockVote,
+    CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, ConsensusSignature,
+    Hash, LeafIndex, NetworkMessage, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound,
     ProposerTimestamp, QuorumCertificate, RatifyCert, RatifyPhase, RatifyRound, RatifyVote, Round,
     SignerBitfield, SpcView, TopologySchedule, Unresolved, ValidatorStatus, VrfProof,
     WeightedTimestamp, shard_prefix_path,
@@ -1452,6 +1452,55 @@ fn restarted_at(
         },
         ..RecoveredState::default()
     }
+}
+
+/// A restart replaying a chain's genesis block floors the committee
+/// anchor at that block's own anchor, which the fold classifies it
+/// under though no quorum signed it: a split child whose first signed
+/// block a recovery bridge carries into a later window still holds the
+/// window its genesis anchors in.
+#[test]
+fn a_replayed_genesis_block_floors_the_committee_anchor_at_its_own() {
+    let fix = Fixture::new();
+    let origin = ChainOrigin {
+        genesis_height: BlockHeight::new(4),
+        anchor_wt: in_epoch(&fix, 2),
+    };
+    let mut genesis = make_live_block(
+        SHARD,
+        origin.genesis_height,
+        origin.anchor_wt.as_millis(),
+        ValidatorId::new(0),
+        vec![],
+        vec![],
+    );
+    if let Block::Live { header, .. } = &mut genesis {
+        *header = BlockHeader::new(BlockHeaderParts {
+            shard_id: SHARD,
+            height: origin.genesis_height,
+            parent_qc: QuorumCertificate::genesis(SHARD, origin).into(),
+            ..Default::default()
+        });
+    }
+    assert!(genesis.is_genesis());
+    let recovered = RecoveredState {
+        committed_height: BlockHeight::new(5),
+        committed_block_anchor_wt: Some(in_epoch(&fix, 5)),
+        committed_committee_anchor_wt: Some(in_epoch(&fix, 5)),
+        replay: ReplayWindow {
+            blocks: vec![
+                Verified::<CertifiedBlock>::genesis_certified(genesis),
+                replayed(SHARD, 5, in_epoch(&fix, 5), 5),
+            ],
+            dispatch_from: BlockHeight::GENESIS,
+            anchor_wt: None,
+        },
+        ..RecoveredState::default()
+    };
+    assert_eq!(
+        chain_anchors(&recovered, fix.genesis_state().chain_config.epoch_windows()).committee,
+        origin.anchor_wt,
+    );
 }
 
 /// A restart whose replay reaches five epochs below its tip holds every

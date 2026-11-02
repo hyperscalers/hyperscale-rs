@@ -30,9 +30,8 @@ use hyperscale_storage::{
     BeaconChainReader, BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain,
 };
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, Derivation, Epoch, EpochWindows, LocalTimestamp,
-    QuorumCertificate, ShardId, Signer, Transaction, TransactionStatus, TxHash, ValidatorId,
-    Verified,
+    Block, BlockHeight, CertifiedBlock, Derivation, Epoch, EpochWindows, LocalTimestamp, ShardId,
+    Signer, Transaction, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 
 use crate::NodeStateMachine;
@@ -664,12 +663,13 @@ fn reseed_code<S: ShardStorage>(
 /// replays was signed in.
 ///
 /// The replay folds each block under the committee its stored QC signed,
-/// and reaches far below the tip, so retention keyed on the tip alone
-/// would evict windows it still reads. Floored here, registration widens
-/// the schedule to those windows before the chain's terminal latch can
-/// drop its term, and the schedule the replay runs on holds them. The
-/// chain's first commit after the restart lifts the floor back to its
-/// tip.
+/// or a chain's genesis block, which no quorum signed, under the one at
+/// its own anchor; and it reaches far below the tip, so retention keyed
+/// on the tip alone would evict windows it still reads. Floored here,
+/// registration widens the schedule to those windows before the chain's
+/// terminal latch can drop its term, and the schedule the replay runs on
+/// holds them. The chain's first commit after the restart lifts the
+/// floor back to its tip.
 #[must_use]
 pub fn chain_anchors(recovered: &RecoveredState, windows: EpochWindows) -> LocalChainAnchors {
     let tip = recovered.committee_anchor_wt();
@@ -677,12 +677,17 @@ pub fn chain_anchors(recovered: &RecoveredState, windows: EpochWindows) -> Local
         .replay
         .blocks
         .iter()
-        .map(|certified| certified.qc())
-        .filter(|qc| qc.signer_count() > 0)
-        .map(QuorumCertificate::committee_epoch)
+        .map(|certified| {
+            let block = certified.block();
+            if block.is_genesis() {
+                block.header().parent_qc().weighted_timestamp()
+            } else {
+                windows.window_of(certified.qc().committee_epoch()).start
+            }
+        })
         .min();
     LocalChainAnchors {
-        committee: replayed.map_or(tip, |epoch| tip.min(windows.window_of(epoch).start)),
+        committee: replayed.map_or(tip, |floor| tip.min(floor)),
         block: recovered.block_anchor_wt(),
     }
 }
