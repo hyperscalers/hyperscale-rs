@@ -44,7 +44,7 @@ use hyperscale_storage::{
     with_fee_holds,
 };
 use hyperscale_types::test_utils::{
-    StubVmStatics, TestCommittee, certify, make_live_block, naming,
+    StubVmStatics, TestCommittee, certify_live, make_live_block, naming,
 };
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
@@ -498,8 +498,13 @@ impl ExecutionSim {
             txs,
             certificates.into_iter().map(Verifiable::from).collect(),
         );
-        let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
         let committee_anchor = self.committee_anchor();
+        let certified = certify_live(
+            &self.topology,
+            block,
+            self.height.inner() * BLOCK_INTERVAL_MS,
+            committee_anchor,
+        );
         let effects = match manifest {
             Some(lines) => self.coord.commit_block(
                 &self.topology,
@@ -586,8 +591,13 @@ impl ExecutionSim {
             },
             sealed @ Block::Sealed { .. } => sealed,
         };
-        let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
         let committee_anchor = self.committee_anchor();
+        let certified = certify_live(
+            &self.topology,
+            block,
+            self.height.inner() * BLOCK_INTERVAL_MS,
+            committee_anchor,
+        );
         let effects =
             self.coord
                 .commit_block_composing(&self.topology, &certified, committee_anchor);

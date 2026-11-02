@@ -484,14 +484,15 @@ pub struct ShardCoordinator {
     /// the tip could not otherwise be resolved when verifying the QC over it.
     committed_committee_anchor_wt: WeightedTimestamp,
 
-    /// The committed tip whose `committed_committee_anchor_wt` is a
-    /// stand-in, not read off its parent. A store seated at a snap-synced
-    /// anchor holds no such parent and stands in the tip's own anchor,
-    /// which names the window after the parent's when the tip opens an
-    /// epoch; a QC over that tip is then admitted at the stand-in anchor
-    /// or in the window below it. The tip is committed history, so no
-    /// recovery's fence applies to it. The next commit clears this.
-    stand_in_anchor_tip: Option<BlockHash>,
+    /// The epoch the QC certifying the committed tip signed, read off the
+    /// copy its child pins (or, after a snap sync, the anchor QC, dropped
+    /// with it if it fails verification): the window a QC over the tip
+    /// verifies under, with no anchor to
+    /// resolve. A store seated at a snap-synced anchor holds no parent to
+    /// read the tip's committee anchor off, and this needs none. The tip
+    /// is committed history, so no recovery's fence applies to it. `None`
+    /// while the tip is a genesis block, which no committee signed.
+    committed_committee_epoch: Option<Epoch>,
 
     /// Set, never cleared, once a schedule this replica held reads it
     /// quiescent. The fold lets a terminated chain's windows leave the
@@ -916,9 +917,7 @@ impl ShardCoordinator {
         // to two blocks ahead.
         let committed_block_anchor_wt = recovered.block_anchor_wt();
         let committed_committee_anchor_wt = recovered.committee_anchor_wt();
-        let stand_in_anchor_tip = recovered
-            .committed_hash
-            .filter(|_| recovered.committed_committee_anchor_wt.is_none());
+        let committed_committee_epoch = recovered.committed_committee_epoch();
         let high_qc = recovered.latest_qc;
         // Seeded from the chain the store kept, not constructed empty: an
         // empty index refuses no duplicate, so a coordinator resuming a
@@ -953,7 +952,7 @@ impl ShardCoordinator {
             quiescent_latched: false,
             dissolved_latched: false,
             committed_committee_anchor_wt,
-            stand_in_anchor_tip,
+            committed_committee_epoch,
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
@@ -1332,8 +1331,10 @@ impl ShardCoordinator {
         topology_schedule: &'t TopologySchedule,
         qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
-        if self.stand_in_anchor_tip == Some(qc.block_hash()) {
-            return self.stand_in_tip_committee(topology_schedule, qc);
+        if qc.block_hash() == self.committed_hash
+            && let Some(epoch) = self.committed_committee_epoch
+        {
+            return self.committed_tip_committee(topology_schedule, epoch, qc);
         }
         self.committee_certified_at(
             topology_schedule,
@@ -1342,30 +1343,22 @@ impl ShardCoordinator {
         )
     }
 
-    /// [`Self::committee_of_qc`] for a QC over the committed tip whose
-    /// committee anchor is a stand-in. The tip's real committee anchor is
-    /// its parent's, which lies in the stand-in's window or the one below,
-    /// so the QC is admitted at either and nowhere else. Unfenced: the tip
-    /// is committed history.
-    fn stand_in_tip_committee<'t>(
+    /// [`Self::committee_of_qc`] for a QC over the committed tip, whose
+    /// certifying quorum signed `epoch`. Every QC over one block states
+    /// one epoch, so the QC is admitted only stating it, and verifies
+    /// under that window. Unfenced: the tip is committed history.
+    fn committed_tip_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
+        epoch: Epoch,
         qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
-        let stand_in = self.committed_committee_anchor_wt;
-        let below = topology_schedule
-            .epoch_for(stand_in)
-            .inner()
-            .checked_sub(1)
-            .map(|epoch| {
-                topology_schedule
-                    .windows()
-                    .window_of(Epoch::new(epoch))
-                    .start
-            });
-        std::iter::once(stand_in)
-            .chain(below)
-            .find_map(|anchor| self.committee_certified_at(topology_schedule, anchor, qc))
+        if qc.committee_epoch() != epoch {
+            return None;
+        }
+        self.signed_committee_of(topology_schedule, qc)
+            .committee()
+            .map(|committee| committee.snapshot.as_ref())
     }
 
     /// [`Self::committee_of_qc`] with the certified block's committee anchor
@@ -1437,10 +1430,9 @@ impl ShardCoordinator {
 
     /// Whether work anchored at `wt` rides an in-flight halt recovery's
     /// bridge: the anchor predates the window the fresh committee governs
-    /// from. Bridge blocks must be empty — the anchored-committee
-    /// resolution downstream (execution votes, tick fencing) never sees a
-    /// stale-anchored block carry content — mirroring the coast blocks
-    /// past a terminal cut.
+    /// from. Bridge blocks must be empty — execution's tick fencing reads
+    /// a tick's own anchor, so no tick anchored below the bridge may carry
+    /// content — mirroring the coast blocks past a terminal cut.
     fn recovery_bridging(
         &self,
         topology_schedule: &TopologySchedule,
@@ -2374,7 +2366,7 @@ impl ShardCoordinator {
         self.clock.advance(genesis_anchor);
         self.committed_block_anchor_wt = genesis_anchor;
         self.committed_committee_anchor_wt = genesis_anchor;
-        self.stand_in_anchor_tip = None;
+        self.committed_committee_epoch = None;
         self.substate_bytes_frontier = (genesis.height(), genesis_bytes);
         // No commit precedes the chain's first blocks to mark them, and a
         // split child or merged parent opens on business its predecessor
@@ -4884,6 +4876,11 @@ impl ShardCoordinator {
                     "Snap-synced anchor QC failed verification — discarding"
                 );
                 self.anchor_qc = None;
+                // The tip's epoch was read off this copy; it states
+                // nothing a quorum is known to have signed.
+                if qc.block_hash() == self.committed_hash {
+                    self.committed_committee_epoch = None;
+                }
             }
             return Vec::new();
         };
@@ -7613,7 +7610,8 @@ impl ShardCoordinator {
         // the committee of the block extending it, and the one its parent
         // carried, which anchors the committee that signed the tip itself.
         self.committed_committee_anchor_wt = self.committed_block_anchor_wt;
-        self.stand_in_anchor_tip = None;
+        self.committed_committee_epoch =
+            (certifying_qc.signer_count() > 0).then(|| certifying_qc.committee_epoch());
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
@@ -10382,9 +10380,8 @@ mod tests {
         TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule,
         TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxOutcome,
         Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, ValidatorInfo, ValidatorSet,
-        Value, VoteCount, VrfProof, WeightedTimestamp, WindowLookup, WitnessSources, decide,
-        encode_amount, read_amount, receipt_hash_of, said_at, test_utils, tick_terms_admit_block,
-        verdict_leaf,
+        Value, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, decide, encode_amount,
+        read_amount, receipt_hash_of, said_at, test_utils, tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{
@@ -19850,22 +19847,25 @@ mod tests {
         assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
     }
 
-    /// A snap-seated tip anchors on a stand-in, and a QC over it is
-    /// admitted under the stand-in's window or the one below, where the
-    /// tip's parent anchors. A quorum of any other window the schedule
-    /// holds is refused, at any stamp.
+    /// A QC over the committed tip is admitted only stating the epoch the
+    /// tip's stored QC signed, and verifies under that window with no
+    /// anchor to resolve — so a snap-seated tip, whose committee anchor
+    /// is a stand-in for a parent it never imported, admits the tip's
+    /// committee when the tip opens an epoch. A quorum of any other window
+    /// the schedule holds is refused, at any stamp.
     #[test]
-    fn a_stand_in_tip_admits_only_the_windows_its_parent_can_anchor() {
+    fn a_committed_tip_admits_only_the_epoch_its_stored_qc_signed() {
         let (mut state, schedule, keys, epochs) = claim_epochs();
-        let tip = qc_signed_by(&keys, &epochs[2], Epoch::new(2), 12, 2 * CLAIM_ED + 100);
+        let tip = qc_signed_by(&keys, &epochs[1], Epoch::new(1), 12, 2 * CLAIM_ED + 100);
         state.committed_height = BlockHeight::new(12);
         state.committed_hash = tip.block_hash();
         state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(2 * CLAIM_ED + 50);
-        state.stand_in_anchor_tip = Some(tip.block_hash());
+        state.committed_committee_epoch = Some(Epoch::new(1));
 
         for (window, stamp, admitted) in [
-            (2usize, 2 * CLAIM_ED + 100, true),
-            (1, 2 * CLAIM_ED + 100, true),
+            (1usize, 2 * CLAIM_ED + 100, true),
+            (1, 2 * CLAIM_ED + 5, true),
+            (2, 2 * CLAIM_ED + 100, false),
             (3, 3 * CLAIM_ED + 100, false),
             (0, 2 * CLAIM_ED + 100, false),
         ] {
@@ -26525,7 +26525,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(1),
                 anchor: WeightedTimestamp::ZERO,
-                committee_anchor: WeightedTimestamp::ZERO,
+                committee_epoch: Epoch::GENESIS,
             },
             reach: Capped::from_array([route(0xAA)]),
         }
@@ -26762,9 +26762,11 @@ mod tests {
                 .is_some(),
             "the block's own anchor must still resolve, or this tests the wrong miss",
         );
-        let stated = figures_of(b"tx").committed.committee_anchor;
+        let stated = figures_of(b"tx").committed.committee_epoch;
         assert!(
-            matches!(sched.lookup(stated), WindowLookup::Evicted),
+            sched
+                .retained_epochs()
+                .is_some_and(|(oldest, _)| stated < oldest),
             "and the name's own window must be gone",
         );
 

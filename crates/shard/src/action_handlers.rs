@@ -846,11 +846,12 @@ fn check_completed<T, E: std::fmt::Display>(
 /// The placement and the table each name's own commit ran under, by the
 /// epoch that froze them.
 ///
-/// Keyed on the committee anchor and not on the block's own, because
-/// that is the one admission judged the ceiling at and the one the
-/// ledger priced under — a block's two anchors straddle an epoch cut
-/// once per window, and a record is written a deadline after the commit
-/// it names, so neither is reliably the window carrying the record.
+/// Keyed on the epoch the committing block's QC signed, because that
+/// window is the one admission judged the ceiling at and the one the
+/// ledger priced under — neither of the block's anchors names it across
+/// a halt recovery's bridge, and a record is written a deadline after
+/// the commit it names, so the window carrying the record is not it
+/// either.
 ///
 /// Read off the committed beacon chain rather than the live schedule. A
 /// name outlives the window that froze it for as long as its counterpart
@@ -863,12 +864,10 @@ fn check_completed<T, E: std::fmt::Display>(
 /// an unheld body already sets.
 fn commit_windows_for(
     chain: &dyn BeaconChainReader,
-    windows: EpochWindows,
     entries: &[UnsettledTx],
 ) -> HashMap<Epoch, CommitWindow> {
     let mut resolved: HashMap<Epoch, CommitWindow> = HashMap::new();
-    for stated in entries.iter().map(|entry| entry.committed.committee_anchor) {
-        let epoch = windows.epoch_for(stated);
+    for epoch in entries.iter().map(|entry| entry.committed.committee_epoch) {
         if let hash_map::Entry::Vacant(slot) = resolved.entry(epoch)
             && let Some(state) = chain.get_state_by_epoch(epoch)
         {
@@ -883,19 +882,18 @@ fn commit_windows_for(
 /// which leaves the name unanswered as an unheld body does.
 ///
 /// The block at the stated height carries the transaction under the
-/// anchor the name states. The block below it fixes the committee
-/// anchor: its parent-QC clock, which its hash pins and the carrying
-/// block's parent link pins in turn, is the anchor the commit froze its
-/// classification and price at. A name stating a committee anchor in
-/// any other window states figures under a table the commit never ran
-/// under, however exactly they restate there.
+/// anchor the name states. The block above it fixes the committee
+/// window: the QC certifying the carrying block, which the child's hash
+/// pins, states the epoch its quorum signed, and that is the window the
+/// commit froze its classification and price at. A name stating any
+/// other epoch states figures under a table the commit never ran under,
+/// however exactly they restate there.
 ///
 /// Both headers and the carrying manifest stay in the store for as long
 /// as the transaction's member row stands, however far beneath its
 /// chain floor.
 fn bears_out_commit<H: AsRef<CertifiedBlockHeader>>(
     entry: &UnsettledTx,
-    windows: EpochWindows,
     carries: impl Fn(BlockHeight, TxHash) -> Option<bool>,
     certified_header: impl Fn(BlockHeight) -> Option<H>,
 ) -> Option<bool> {
@@ -903,19 +901,45 @@ fn bears_out_commit<H: AsRef<CertifiedBlockHeader>>(
     if !carries(committed.height, entry.tx_hash)? {
         return Some(false);
     }
-    let Some(below) = committed.height.prev() else {
-        return Some(false);
-    };
     let carrying = certified_header(committed.height)?;
     let carrying = carrying.as_ref().header();
-    let parent = certified_header(below)?;
-    let parent = parent.as_ref().header();
+    let child = certified_header(committed.height.next())?;
+    let certifying = child.as_ref().header().parent_qc();
     Some(
         carrying.parent_qc().weighted_timestamp() == committed.anchor
-            && carrying.parent_block_hash() == parent.hash()
-            && windows.epoch_for(parent.parent_qc().weighted_timestamp())
-                == windows.epoch_for(committed.committee_anchor),
+            && certifying.block_hash() == carrying.hash()
+            && certifying.committee_epoch() == committed.committee_epoch,
     )
+}
+
+/// How the names `entries` stand against this chain and the windows
+/// their commits ran under, `held` the transactions this node holds and
+/// can derive: each name must be borne out by the chain
+/// ([`bears_out_commit`]) and restate its figures exactly under its
+/// stated window. A window above this node's fold is one to wait for, on
+/// the terms an unheld body already sets.
+fn resolutions_of<H: AsRef<CertifiedBlockHeader>>(
+    entries: Vec<UnsettledTx>,
+    held: &HashMap<TxHash, Verified<Transaction>>,
+    chain: &dyn BeaconChainReader,
+    shard: ShardId,
+    carries: impl Fn(BlockHeight, TxHash) -> Option<bool>,
+    certified_header: impl Fn(BlockHeight) -> Option<H>,
+) -> Resolutions {
+    let committed_windows = commit_windows_for(chain, &entries);
+    Resolutions::of(entries, |entry| {
+        let tx = held.get(&entry.tx_hash)?;
+        let at = committed_windows.get(&entry.committed.committee_epoch)?;
+        let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &at.trie);
+        let restated = bears_out_commit(entry, &carries, &certified_header)?
+            && UnsettledTx::for_transaction(
+                tx,
+                entry.committed,
+                classified.local_price(tx, shard, &at.prices),
+                &at.prices,
+            ) == *entry;
+        Some(restated)
+    })
 }
 
 fn absorb_finalized_cells(ticks: &[Verifiable<Finalization>], derivation: &dyn Derivation) {
@@ -1169,7 +1193,6 @@ where
         ConsensusAction::VerifyResolutions {
             block_hash,
             entries,
-            windows,
         } => {
             // A resolution names a transaction committed before it — a
             // record epochs after the commit, a finalization a tick or
@@ -1186,32 +1209,14 @@ where
                 .filter(|tx| tx.try_derived(derivation.as_ref()).is_ok())
                 .map(|tx| (tx.hash(), tx))
                 .collect();
-            let committed_at = |entry: &UnsettledTx| -> Option<bool> {
-                bears_out_commit(
-                    entry,
-                    windows,
-                    |height, tx| ctx.pending_chain.carries(height, tx),
-                    |height| ctx.pending_chain.certified_header(height),
-                )
-            };
-            let committed_windows = commit_windows_for(ctx.beacon_chain, windows, &entries);
-            let verdict = Resolutions::of(entries, |entry| {
-                let tx = held.get(&entry.tx_hash)?;
-                // A window above this node's fold is one to wait for, on
-                // the terms an unheld body already sets.
-                let at =
-                    committed_windows.get(&windows.epoch_for(entry.committed.committee_anchor))?;
-                let classified =
-                    Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &at.trie);
-                let restated = committed_at(entry)?
-                    && UnsettledTx::for_transaction(
-                        tx,
-                        entry.committed,
-                        classified.local_price(tx, ctx.shard, &at.prices),
-                        &at.prices,
-                    ) == *entry;
-                Some(restated)
-            });
+            let verdict = resolutions_of(
+                entries,
+                &held,
+                ctx.beacon_chain,
+                ctx.shard,
+                |height, tx| ctx.pending_chain.carries(height, tx),
+                |height| ctx.pending_chain.certified_header(height),
+            );
             // An exact answer passes; a wrong figure refuses the block; a
             // name this validator's store never held is neither — the
             // check waits for the body.
@@ -2307,9 +2312,9 @@ mod tests {
         }
     }
 
-    /// One name, committed at `committee_anchor` with its block's own
-    /// anchor at `anchor`.
-    fn named_at(committee_anchor: u64, anchor: u64) -> UnsettledTx {
+    /// One name, committed at height 1 under the window `committee_epoch`
+    /// keys, with its block's own anchor at `anchor`.
+    fn named_at(committee_epoch: u64, anchor: u64) -> UnsettledTx {
         UnsettledTx {
             tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
             deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
@@ -2318,7 +2323,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(1),
                 anchor: WeightedTimestamp::from_millis(anchor),
-                committee_anchor: WeightedTimestamp::from_millis(committee_anchor),
+                committee_epoch: Epoch::new(committee_epoch),
             },
             reach: Capped::empty(),
         }
@@ -2335,10 +2340,9 @@ mod tests {
     /// never released.
     #[test]
     fn a_name_is_weighed_at_the_window_that_committed_it() {
-        let windows = EpochWindows::new(0, 1_000);
         let chain = Folded::to(&[(0, 1), (1, 2)]);
 
-        let resolved = commit_windows_for(&chain, windows, &[named_at(500, 500)]);
+        let resolved = commit_windows_for(&chain, &[named_at(0, 500)]);
 
         assert_eq!(
             resolved[&Epoch::new(0)].prices.compute,
@@ -2351,30 +2355,24 @@ mod tests {
         );
     }
 
-    /// A name whose commit straddles an epoch cut is weighed at the
-    /// anchor that froze its figures, not at the one that dated it.
-    ///
-    /// Every block carries two anchors, and for the first block of a
-    /// window they fall either side of the cut. Admission judged the
-    /// ceiling at the committee's and the ledger priced the entry there,
-    /// so only that one names the table the figures were frozen against.
+    /// A name is weighed at the window its commit's quorum signed, which
+    /// neither of the block's anchors names across a halt recovery's
+    /// bridge: the fresh committee signs the window it was seated in.
     #[test]
-    fn a_name_committed_across_a_cut_is_weighed_where_it_was_frozen() {
-        let windows = EpochWindows::new(0, 1_000);
-        let chain = Folded::to(&[(0, 1), (1, 2)]);
+    fn a_name_is_weighed_at_its_signed_window_whatever_its_anchor_dates() {
+        let chain = Folded::to(&[(2, 1), (21, 2)]);
 
-        // The first block of the later window: its own anchor sits in
-        // that window, the anchor its parent carried in the earlier one.
-        let resolved = commit_windows_for(&chain, windows, &[named_at(900, 1_100)]);
+        // Anchored in epoch 2, certified by a committee seated for 21.
+        let resolved = commit_windows_for(&chain, &[named_at(21, 2_500)]);
 
         assert_eq!(
-            resolved[&Epoch::new(0)].prices.compute,
-            1,
-            "the committee anchor's window is the one that froze the figures"
+            resolved[&Epoch::new(21)].prices.compute,
+            2,
+            "the signed window is the one that froze the figures"
         );
         assert!(
-            !resolved.contains_key(&Epoch::new(1)),
-            "and never the window its own anchor opens"
+            !resolved.contains_key(&Epoch::new(2)),
+            "and never the window its anchor dates"
         );
     }
 
@@ -2384,18 +2382,18 @@ mod tests {
     /// the share at a placement the transaction never ran under.
     #[test]
     fn an_unfolded_epoch_resolves_no_window() {
-        let windows = EpochWindows::new(0, 1_000);
         let chain = Folded::to(&[(0, 1)]);
 
-        let resolved = commit_windows_for(&chain, windows, &[named_at(5_000, 5_000)]);
+        let resolved = commit_windows_for(&chain, &[named_at(5, 5_000)]);
 
         assert!(resolved.is_empty());
     }
 
-    /// The headers at heights 0 and 1 of a chain whose block 0 dates at
-    /// `committee_anchor` and whose block 1, extending it, at `anchor`.
-    fn committed_pair(committee_anchor: u64, anchor: u64) -> [Verified<CertifiedBlockHeader>; 2] {
-        let certify = |height: u64, parent: BlockHash, dated: u64| {
+    /// The headers at heights 0 to 2 of a chain whose block 1 dates at
+    /// `anchor` and whose block 2, extending it, pins a QC over block 1
+    /// that its quorum signed under `signed`.
+    fn committed_chain(anchor: u64, signed: u64) -> [Verified<CertifiedBlockHeader>; 3] {
+        let certify = |height: u64, parent: BlockHash, dated: u64, epoch: u64| {
             let height = BlockHeight::new(height);
             let header = BlockHeader::new(BlockHeaderParts {
                 height,
@@ -2406,7 +2404,7 @@ mod tests {
                     height.prev().unwrap_or(height),
                     BlockHash::ZERO,
                     Round::INITIAL,
-                    Epoch::GENESIS,
+                    Epoch::new(epoch),
                     SignerBitfield::empty(),
                     AggregateSignature::ZERO,
                     WeightedTimestamp::from_millis(dated),
@@ -2426,20 +2424,16 @@ mod tests {
             );
             Verified::<CertifiedBlockHeader>::from_persisted(CertifiedBlockHeader::new(header, qc))
         };
-        let below = certify(0, BlockHash::ZERO, committee_anchor);
-        let carrying = certify(1, below.header().hash(), anchor);
-        [below, carrying]
+        let below = certify(0, BlockHash::ZERO, 0, 0);
+        let carrying = certify(1, below.header().hash(), anchor, 0);
+        let child = certify(2, carrying.header().hash(), anchor, signed);
+        [below, carrying, child]
     }
 
     /// Whether the chain `held` bears out `entry`, block 1 carrying it.
-    fn borne_out(
-        entry: &UnsettledTx,
-        held: &[Verified<CertifiedBlockHeader>],
-        windows: EpochWindows,
-    ) -> Option<bool> {
+    fn borne_out(entry: &UnsettledTx, held: &[Verified<CertifiedBlockHeader>]) -> Option<bool> {
         bears_out_commit(
             entry,
-            windows,
             |height, _| (height == BlockHeight::new(1)).then_some(true),
             |height| held.get(usize::try_from(height.inner()).ok()?).cloned(),
         )
@@ -2450,67 +2444,119 @@ mod tests {
     /// window is the proposer's to choose otherwise, and the burn with it.
     #[test]
     fn a_name_stating_another_window_than_its_commit_ran_under_is_refused() {
-        let windows = EpochWindows::new(0, 1_000);
-        let chain = committed_pair(500, 600);
+        let chain = committed_chain(600, 0);
 
-        assert_eq!(borne_out(&named_at(500, 600), &chain, windows), Some(true));
+        assert_eq!(borne_out(&named_at(0, 600), &chain), Some(true));
         assert_eq!(
-            borne_out(&named_at(1_500, 600), &chain, windows),
+            borne_out(&named_at(1, 600), &chain),
             Some(false),
             "a dearer window"
         );
-        let later = committed_pair(1_500, 1_600);
+        let later = committed_chain(1_600, 1);
         assert_eq!(
-            borne_out(&named_at(500, 1_600), &later, windows),
+            borne_out(&named_at(0, 1_600), &later),
             Some(false),
             "a cheaper window"
         );
-    }
-
-    /// A commit straddling a cut is fixed at the window its parent's
-    /// anchor dates, not the one its own anchor opens, and its name
-    /// passes there however many windows later it is carried.
-    #[test]
-    fn a_name_committed_across_a_cut_is_borne_out_at_its_committee_window() {
-        let windows = EpochWindows::new(0, 1_000);
-        let chain = committed_pair(900, 1_100);
-
         assert_eq!(
-            borne_out(&named_at(900, 1_100), &chain, windows),
-            Some(true)
-        );
-        assert_eq!(
-            borne_out(&named_at(1_100, 1_100), &chain, windows),
+            borne_out(&named_at(0, 1_600), &chain),
             Some(false),
-            "the window the commit's own anchor opens"
+            "another anchor"
         );
     }
 
-    /// A block below the carrying one that is not this chain's parent of
-    /// it fixes nothing, and a missing one leaves the name unanswered.
+    /// A child that does not pin a QC over the carrying block fixes
+    /// nothing, and a missing one leaves the name unanswered.
     #[test]
-    fn a_committee_anchor_is_read_only_off_the_carrying_blocks_parent() {
-        let windows = EpochWindows::new(0, 1_000);
-        let [_, carrying] = committed_pair(500, 600);
-        let [unlinked, _] = committed_pair(1_500, 600);
+    fn a_committee_epoch_is_read_only_off_the_carrying_blocks_child() {
+        let [below, carrying, _] = committed_chain(600, 0);
+        let [_, _, unlinked] = committed_chain(700, 0);
 
         assert_eq!(
-            borne_out(
-                &named_at(1_500, 600),
-                &[unlinked, carrying.clone()],
-                windows
-            ),
+            borne_out(&named_at(0, 600), &[below, carrying.clone(), unlinked]),
             Some(false)
         );
         assert_eq!(
             bears_out_commit(
-                &named_at(500, 600),
-                windows,
+                &named_at(0, 600),
                 |_, _| Some(true),
                 |height| (height == BlockHeight::new(1)).then(|| carrying.clone()),
             ),
             None
         );
+    }
+
+    /// A record naming a transaction a halt recovery's crossing block
+    /// committed restates exactly at the window the block's QC signed,
+    /// the one the fresh committee was seated in, and is refused stating
+    /// the window its committee anchor dates, figures and all.
+    ///
+    /// The carrying block is anchored in epoch 2, below the bridge at 21,
+    /// and its child pins a QC its quorum signed under 21.
+    #[test]
+    fn a_record_named_from_a_bridged_commit_restates_exactly() {
+        install_stub_protocol_statics();
+        let tx = Verified::<Transaction>::from_persisted(stub_transaction(
+            test_principal(1),
+            &[test_prefix(1)],
+            1_000_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        ));
+        let mut beacon = Folded::to(&[(2, 1), (21, 1)]);
+        let dear = Arc::make_mut(
+            beacon
+                .0
+                .get_mut(&Epoch::new(21))
+                .expect("the fixture folds 21"),
+        );
+        dear.prices = PriceTable {
+            compute: 1_000 * PriceTable::GENESIS.compute,
+            read_bytes: 1_000 * PriceTable::GENESIS.read_bytes,
+            write_bytes: 1_000 * PriceTable::GENESIS.write_bytes,
+            footprint: 1_000 * PriceTable::GENESIS.footprint,
+            retention: 1_000 * PriceTable::GENESIS.retention,
+        };
+        let chain = committed_chain(2_500, 21);
+        let named = |epoch: u64| {
+            let at = beacon
+                .get_state_by_epoch(Epoch::new(epoch))
+                .expect("the fixture folds the epoch")
+                .commit_window();
+            let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &at.trie);
+            UnsettledTx::for_transaction(
+                &tx,
+                CommittedAt {
+                    height: BlockHeight::new(1),
+                    anchor: WeightedTimestamp::from_millis(2_500),
+                    committee_epoch: Epoch::new(epoch),
+                },
+                classified.local_price(&tx, ShardId::ROOT, &at.prices),
+                &at.prices,
+            )
+        };
+        let (bridged, raw) = (named(21), named(2));
+        assert_ne!(
+            (bridged.charged, bridged.charge),
+            (raw.charged, raw.charge),
+            "the two windows price the transaction differently"
+        );
+        let held = HashMap::from([(tx.hash(), tx.clone())]);
+        let verdict = |entry: &UnsettledTx| {
+            resolutions_of(
+                vec![entry.clone()],
+                &held,
+                &beacon,
+                ShardId::ROOT,
+                |height, _| (height == BlockHeight::new(1)).then_some(true),
+                |height| chain.get(usize::try_from(height.inner()).ok()?).cloned(),
+            )
+        };
+
+        assert_eq!(verdict(&bridged), Resolutions::Exact);
+        assert_eq!(verdict(&raw), Resolutions::Wrong(tx.hash()));
     }
 
     fn shard() -> ShardId {

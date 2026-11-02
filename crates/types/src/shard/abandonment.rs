@@ -39,31 +39,33 @@ use hyperscale_hbor::{Capped, Hbor};
 use hyperscale_vm_types::Quanta;
 
 use crate::{
-    ABANDONMENT_RECORD_BYTES, BlockHeight, Deadline, MAX_PREFIXES_PER_TX, MAX_UNSETTLED_PER_BLOCK,
-    PriceTable, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
-    TxHash, UNSETTLED_TX_BYTES, WeightedTimestamp,
+    ABANDONMENT_RECORD_BYTES, BlockHeight, Deadline, Epoch, MAX_PREFIXES_PER_TX,
+    MAX_UNSETTLED_PER_BLOCK, PriceTable, ROUTE_PREFIX_BYTES, RoutePrefix, ShardId, ShardTrie,
+    SubstateKey, Transaction, TxHash, UNSETTLED_TX_BYTES, WeightedTimestamp,
 };
 
 /// Where a chain committed a transaction: the block, the anchor it was
-/// admitted against, and the anchor it derived under.
+/// admitted against, and the window it derived under.
 ///
-/// A block carries two instants and they straddle an epoch cut once per
-/// window, so a name that means to restate what its commit owed has to
-/// say which it means. `anchor` is the block's own — its parent QC's
-/// weighted timestamp — which dates the commit and orders it against a
-/// departure's cut. `committee_anchor` is the anchor its *parent*
-/// carried, since a block's committee keys on its parent: the trie that
+/// `anchor` is the block's own — its parent QC's weighted timestamp —
+/// which dates the commit and orders it against a departure's cut.
+/// `committee_epoch` keys the window whose committee certified the
+/// block, the epoch the QC its child pins signed: the trie that
 /// classified the transaction and routed its crossings, and the table
-/// that priced it. The height is where a replica reads both off its own
-/// chain.
+/// that priced it. A block's committee window is neither its own
+/// anchor's nor always its parent's — a halt recovery's crossing block
+/// signs the window its fresh committee was seated in — so a name states
+/// the epoch the quorum signed rather than an instant to re-resolve. The
+/// height is where a replica reads both off its own chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
 pub struct CommittedAt {
     /// The block that carried the transaction.
     pub height: BlockHeight,
     /// The anchor that block was admitted against.
     pub anchor: WeightedTimestamp,
-    /// The anchor its classification and its price were frozen at.
-    pub committee_anchor: WeightedTimestamp,
+    /// The epoch of the window its classification and its price were
+    /// frozen at.
+    pub committee_epoch: Epoch,
 }
 
 /// What an abort of one transaction burns, and out of whose vault.
@@ -465,7 +467,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(u64::from(seed)),
                 anchor: WeightedTimestamp::from_millis(u64::from(seed) * 10),
-                committee_anchor: WeightedTimestamp::from_millis(u64::from(seed) * 10),
+                committee_epoch: Epoch::new(u64::from(seed)),
             },
             reach: Capped::from_array([RoutePrefix::of(Address::new(
                 [seed; 31],
@@ -569,7 +571,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(7),
                 anchor: WeightedTimestamp::from_millis(1_000),
-                committee_anchor: WeightedTimestamp::from_millis(1_000),
+                committee_epoch: Epoch::GENESIS,
             },
             ..tx(1)
         };
@@ -717,7 +719,7 @@ mod tests {
                 CommittedAt {
                     height: BlockHeight::new(1),
                     anchor: wt(),
-                    committee_anchor: wt(),
+                    committee_epoch: Epoch::GENESIS,
                 },
                 price,
                 &PriceTable::GENESIS,

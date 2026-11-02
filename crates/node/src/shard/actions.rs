@@ -803,10 +803,9 @@ mod tests {
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
         Address, AddressClass, BlockHash, BlockHeight, ChainOrigin, CheckOutcome, ConsensusReceipt,
-        EpochWindows, Finalization, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate,
-        SWEEP_BUCKET_MS, SettledWrites, StateWrites, StoredReceipt, SubstateKey, SweepBucket,
-        SweepFrontier, TickId, TxHash, ValidatorId, Verifiable, VerificationKind,
-        WeightedTimestamp, shard_prefix_path,
+        Finalization, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, SWEEP_BUCKET_MS,
+        SettledWrites, StateWrites, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, TickId,
+        TxHash, ValidatorId, Verifiable, VerificationKind, WeightedTimestamp, shard_prefix_path,
     };
 
     use super::{SignerResolution, resolve_signer};
@@ -1126,7 +1125,6 @@ mod tests {
         let check = ConsensusAction::VerifyResolutions {
             block_hash: BlockHash::ZERO,
             entries: Vec::new(),
-            windows: EpochWindows::new(0, 1_000),
         };
         assert_eq!(
             resolve(&check, &[validator(1)], &committee),
@@ -1147,7 +1145,6 @@ mod tests {
             ConsensusAction::VerifyResolutions {
                 block_hash,
                 entries: Vec::new(),
-                windows: EpochWindows::new(0, 1_000),
             },
         )]);
         assert!(

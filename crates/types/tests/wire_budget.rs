@@ -126,7 +126,7 @@ fn name(seed: u8, routes: usize) -> UnsettledTx {
         committed: CommittedAt {
             height: BlockHeight::new(u64::MAX),
             anchor: WeightedTimestamp::from_millis(u64::MAX / 2),
-            committee_anchor: WeightedTimestamp::from_millis(u64::MAX / 2),
+            committee_epoch: Epoch::new(u64::MAX),
         },
         reach: Capped::new(
             (0..routes)

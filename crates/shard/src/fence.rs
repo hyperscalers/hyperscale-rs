@@ -857,7 +857,7 @@ mod tests {
                 committed: CommittedAt {
                     height: BlockHeight::new(3),
                     anchor: WeightedTimestamp::from_millis(3_000),
-                    committee_anchor: WeightedTimestamp::from_millis(2_000),
+                    committee_epoch: Epoch::GENESIS,
                 },
                 reach: Capped::from_array([RoutePrefix::of(Address::new(
                     [0x33; 31],

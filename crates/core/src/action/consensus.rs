@@ -10,11 +10,11 @@ use hyperscale_storage::BlockSweep;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, CertifiedBlockHeader, ConsensusPublicKey,
-    Epoch, EpochWindows, Finalization, FrontierInputs, Hash, HeaderSource, ProposerTimestamp,
-    Provision, QuorumCertificate, ReadFence, ReadySignal, ReshapeKind, ReshapeThresholds,
-    ReshapeTrigger, ResolvedCommittee, RevealChain, Round, Settling, ShardForkProof, ShardId,
-    ShardLoad, SharedWitnessSources, StandingAnswers, StateClaim, StateRoot, SubstateClaim,
-    Timeout, TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId,
+    Epoch, Finalization, FrontierInputs, Hash, HeaderSource, ProposerTimestamp, Provision,
+    QuorumCertificate, ReadFence, ReadySignal, ReshapeKind, ReshapeThresholds, ReshapeTrigger,
+    ResolvedCommittee, RevealChain, Round, Settling, ShardForkProof, ShardId, ShardLoad,
+    SharedWitnessSources, StandingAnswers, StateClaim, StateRoot, SubstateClaim, Timeout,
+    TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId,
     Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
@@ -425,11 +425,6 @@ pub enum ConsensusAction {
         block_hash: BlockHash,
         /// Every name the block's records carry.
         entries: Vec<UnsettledTx>,
-        /// The epoch grid, which places each name's stated commit anchor
-        /// in the window that froze its figures. Carried rather than
-        /// read off the store because it is a property of the chain
-        /// config and not of any one window.
-        windows: EpochWindows,
     },
 
     /// Build a complete block proposal.

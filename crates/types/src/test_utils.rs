@@ -29,10 +29,10 @@ use crate::{
     ProtocolStatics, QuorumCertificate, Role, Round, Routing, SectionRoots, SettledTxsRoot,
     Settlement, ShardForkProof, ShardId, ShardLoad, SignerBitfield, SplitChildRoots, StakePoolId,
     StateClaim, StateRoot, StateWrites, StatedTerms, StoredReceipt, TickHalf, TickId, TickLine,
-    TimestampRange, TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope,
-    TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, VrfProof,
-    WeightedTimestamp, WitnessSources, compute_global_receipt_root, install_protocol_statics,
-    protocol_statics_installed, signed_bytes,
+    TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
+    TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+    Verified, VrfProof, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
+    install_protocol_statics, protocol_statics_installed, signed_bytes,
 };
 
 /// A stake pool for tests, at a component address `n` alone fixes.
@@ -697,6 +697,43 @@ pub fn certify(block: Block, weighted_timestamp_ms: u64) -> CertifiedBlock {
     // commit path stores a verified QC — consumers of committed blocks
     // (e.g. `certified_header()`) rely on that invariant.
     CertifiedBlock::new_unchecked(block, Verified::new_unchecked_for_test(qc))
+}
+
+/// [`certify`] with the certifying QC stating `epoch`, as the copy a
+/// committing block's child pins does.
+#[must_use]
+pub fn certify_signed(block: Block, weighted_timestamp_ms: u64, epoch: Epoch) -> CertifiedBlock {
+    let (block, qc) = certify(block, weighted_timestamp_ms).into_parts();
+    let qc = qc.as_unverified();
+    let signed = QuorumCertificate::new(
+        qc.block_hash(),
+        qc.shard_id(),
+        qc.height(),
+        qc.parent_block_hash(),
+        qc.round(),
+        epoch,
+        qc.signers().clone(),
+        qc.aggregated_signature(),
+        qc.weighted_timestamp(),
+    );
+    CertifiedBlock::new_unchecked(block, Verified::new_unchecked_for_test(signed))
+}
+
+/// [`certify`] with the certifying QC stating the epoch an honest quorum
+/// signs for `block`: its live committee's at `committee_anchor`, the
+/// parent's anchor. [`Epoch::GENESIS`] where `schedule` resolves none.
+#[must_use]
+pub fn certify_live(
+    schedule: &TopologySchedule,
+    block: Block,
+    weighted_timestamp_ms: u64,
+    committee_anchor: WeightedTimestamp,
+) -> CertifiedBlock {
+    let epoch = schedule
+        .live_committee(block.header().shard_id(), committee_anchor)
+        .committee()
+        .map_or(Epoch::GENESIS, |committee| committee.epoch);
+    certify_signed(block, weighted_timestamp_ms, epoch)
 }
 
 /// Build a real-BLS [`ShardForkProof::ConflictingCommits`] for `shard` at

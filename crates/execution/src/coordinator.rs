@@ -71,16 +71,16 @@ use hyperscale_storage::{
 };
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CarriedClaims, CertifiedBlock,
-    CheckedStateProof, CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation,
-    DiscardCause, EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionOutcome, ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError,
-    GlobalReceiptRoot, Hash, Joins, Mode, Movement, ProvenAnchors, Provision, REATTESTATION_STEP,
-    ScheduleLookup, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim, StateWrites,
-    StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
-    VerdictCells, VerdictQuestion, Verifiable, Verified, WeightedTimestamp,
-    derive_block_transactions, tick_leader,
+    Anchor, Attempt, Block, BlockCommittee, BlockHash, BlockHeight, BlockResolution, BloomFilter,
+    CarriedClaims, CertifiedBlock, CheckedStateProof, CommittedAt, ConsensusPublicKey,
+    CounterpartMirror, DeclaredKey, Derivation, DiscardCause, Epoch, EpochWindows,
+    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
+    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Joins, Mode,
+    Movement, ProvenAnchors, Provision, REATTESTATION_STEP, SettledTxSet, Settlement, ShardId,
+    ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxResolution, UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
+    WeightedTimestamp, derive_block_transactions, tick_leader,
 };
 use tracing::instrument;
 
@@ -476,12 +476,12 @@ pub struct ExecutionCoordinator {
     stalled_for: Duration,
     stall_retry_periods: u32,
 
-    /// Anchor selecting the committee that governs the last locally committed
-    /// block — the anchor its *parent* carried, since a block's committee
-    /// keys on its parent. What tick and provision classification resolves
-    /// against, so every replica groups a block's transactions exactly as the
-    /// proposer built them and the verifier validated them.
-    committed_committee_anchor_wt: WeightedTimestamp,
+    /// The epoch of the window the last locally committed block was
+    /// certified under ([`Self::certified_committee`]): what a probe of
+    /// silent counterparts resolves its trie from. `None` while the tip
+    /// is one no committee signed, a chain's genesis block, whose window
+    /// is its own anchor's.
+    committed_committee_epoch: Option<Epoch>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Tick dispatch
@@ -574,10 +574,10 @@ pub struct ExecutionCoordinator {
     /// would go out ahead of the later blocks that settle it, and land
     /// an entry the base already carries with nothing to say so.
     replay_through: BlockHeight,
-    /// Commits whose anchored committee sits in a window this node's
-    /// beacon has not committed yet, each with its committee anchor, in
-    /// commit order. Folded as the windows land, and every later commit
-    /// queues behind the first, so the fold never runs out of order.
+    /// Commits whose certified committee sits in a window this schedule
+    /// does not hold, each with its committee anchor, in commit order.
+    /// Folded as the windows land, and every later commit queues behind
+    /// the first, so the fold never runs out of order.
     awaiting_window: VecDeque<(CertifiedBlock, WeightedTimestamp, Naming)>,
 
     /// The lowest height a tick may be *dispatched* at.
@@ -720,12 +720,10 @@ impl ExecutionCoordinator {
     ///
     /// Either way the seed keeps the next commit on the exact carry path —
     /// height-contiguous, its committee anchor the previous block's — where
-    /// a zero frontier would take the gap fallback and classify that
-    /// block's ticks under the window it opens: a replica restarted just
-    /// below an epoch cut that a reshape moves would group ticks
-    /// differently from its peers and split execution votes. A seeded
-    /// frontier also gives pre-first-commit bookkeeping a real clock
-    /// instead of a zero one.
+    /// a zero frontier would take the gap fallback and place that block
+    /// against a recovery's bridge by its own anchor. A seeded frontier
+    /// also gives pre-first-commit bookkeeping a real clock instead of a
+    /// zero one.
     ///
     /// `persisted_base` is how far the store under the replica's tick
     /// chain is written: the store's tree version. Each tick waits until
@@ -760,13 +758,6 @@ impl ExecutionCoordinator {
             Some((_, None)) => (BlockHeight::GENESIS, WeightedTimestamp::ZERO),
             None => (recovered.committed_height, recovered.block_anchor_wt()),
         };
-        // Whatever seeds the height seeds this too: the block above is
-        // contiguous, so it carries `committed_ts` into the slot before
-        // anything classifies against it.
-        let committed_committee_anchor_wt = match resume {
-            Some(_) => committed_block_anchor_wt,
-            None => recovered.committee_anchor_wt(),
-        };
         Self {
             counterparts: Counterparts::new(
                 local_shard,
@@ -782,7 +773,10 @@ impl ExecutionCoordinator {
             stall_seen_ts: committed_block_anchor_wt,
             stalled_for: Duration::ZERO,
             stall_retry_periods: 0,
-            committed_committee_anchor_wt,
+            // A replay commits from its first block before anything
+            // probes, and each replayed commit reseats this off its own
+            // stored QC.
+            committed_committee_epoch: recovered.committed_committee_epoch(),
             pending_ticks: VecDeque::new(),
             held: BTreeMap::new(),
             code,
@@ -952,64 +946,76 @@ impl ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// The committee a committed block's content is classified under: the
-    /// one at its `committee_anchor`, its parent's anchor, which is the
-    /// snapshot the proposer classified the block against and the verifier
-    /// validated it against. The block's own anchor and its committee
-    /// anchor straddle an epoch cut once per window, and a reshape cut
-    /// there changes the shard set `compute_ticks` routes over.
+    /// window whose committee certified it, keyed by the epoch the QC its
+    /// child pins signed. `certified` carries that copy, which the commit
+    /// stores. Honest voters validated the block's content under exactly
+    /// that window before signing it, so its trie and prices are the ones
+    /// the proposer classified and priced under and admission judged —
+    /// including for a halt recovery's crossing block, whose committee
+    /// anchor lies below the bridge and whose fresh committee signs the
+    /// window it was seated in.
+    ///
+    /// A chain's genesis block carries no signed QC; its committee anchor
+    /// is its own, the chain origin's.
     ///
     /// `None` while that window is newer than this node's beacon has
-    /// committed: the commit waits for it rather than read the head, so
-    /// every replica groups a block's transactions identically across a
-    /// reshape boundary.
+    /// committed: the commit waits for it rather than read the head.
     ///
-    /// An evicted committee anchor is reached by the first block of a
-    /// chain whose predecessor's anchor lies before its cut, and that
-    /// block classifies under its own anchor's window. Where that is
-    /// evicted too, no window names this shard at all — a split child
+    /// A restart's replay can reach a block whose signed window the
+    /// schedule no longer retains. That block folds under its own
+    /// anchor's window, and where that is gone too — a split child
     /// replaying the window it inherited, whose content predates its own
-    /// cut — and the head, its only committee, classifies the content the
-    /// way the child's own keyspace is cut.
-    fn anchored_committee<'t>(
+    /// cut — under the head, still stating the epoch its QC signed.
+    fn certified_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
-        committee_anchor: WeightedTimestamp,
-        own_anchor: WeightedTimestamp,
-    ) -> Option<&'t TopologySnapshot> {
-        let resolve = |wt| match topology_schedule.lookup_for_shard(self.local_shard, wt).0 {
-            ScheduleLookup::Committee(snapshot) => Ok(snapshot.as_ref()),
-            ScheduleLookup::NotYetCommitted => Err(true),
-            ScheduleLookup::Evicted => Err(false),
+        certified: &CertifiedBlock,
+    ) -> Option<BlockCommittee<'t>> {
+        let block = certified.block();
+        let own_anchor = block.header().parent_qc().weighted_timestamp();
+        if block.is_genesis() {
+            return topology_schedule
+                .live_committee(self.local_shard, own_anchor)
+                .committee();
+        }
+        let epoch = certified.qc().committee_epoch();
+        let stand_in = |snapshot| BlockCommittee {
+            snapshot,
+            epoch,
+            past_terminal: false,
         };
-        match resolve(committee_anchor) {
-            Ok(snapshot) => Some(snapshot),
-            Err(true) => None,
-            Err(false) => match resolve(own_anchor) {
-                Ok(snapshot) => Some(snapshot),
-                Err(true) => None,
-                Err(false) => Some(topology_schedule.head().as_ref()),
-            },
+        match topology_schedule.signed_committee(self.local_shard, epoch) {
+            BlockResolution::Committee(committee) => Some(committee),
+            BlockResolution::NotYetCommitted => None,
+            BlockResolution::Evicted => {
+                match topology_schedule.resolve_for_shard(self.local_shard, own_anchor) {
+                    BlockResolution::Committee(committee) => Some(stand_in(committee.snapshot)),
+                    BlockResolution::NotYetCommitted => None,
+                    BlockResolution::Evicted => Some(stand_in(topology_schedule.head())),
+                }
+            }
         }
     }
 
     /// The trie that says who was party to a transaction, off the latest
-    /// committed block's anchored committee; `None` while that window is
-    /// not committed here.
+    /// committed block's certified committee; `None` while that window is
+    /// not held here.
     ///
     /// What a probe of silent counterparts places its questions under. A
     /// window later resolves a departed counterpart's *successor*, a
-    /// shard that was never party, so the anchor is the committed
+    /// shard that was never party, so the window is the committed
     /// block's and never this node's head.
     fn counterpart_trie<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
     ) -> Option<&'t ShardTrie> {
-        self.anchored_committee(
-            topology_schedule,
-            self.committed_committee_anchor_wt,
-            self.committed_ts,
-        )
-        .map(TopologySnapshot::shard_trie)
+        self.committed_committee_epoch
+            .map_or_else(
+                || topology_schedule.live_committee(self.local_shard, self.committed_ts),
+                |epoch| topology_schedule.signed_committee(self.local_shard, epoch),
+            )
+            .committee()
+            .map(|committee| committee.snapshot.shard_trie())
     }
 
     /// Register a new cross-shard tick's transactions: the dependency set
@@ -1079,10 +1085,12 @@ impl ExecutionCoordinator {
     /// at this commit is composition's question, asked again at every one.
     fn register_committed_txs(
         &mut self,
-        classification: &TopologySnapshot,
+        classification: BlockCommittee<'_>,
         block: &CommittingBlock,
         transactions: &[Verifiable<Transaction>],
     ) {
+        let committee_epoch = classification.epoch;
+        let classification = classification.snapshot.as_ref();
         let local_shard = self.local_shard;
         let members = committed_members(classification, local_shard, transactions);
         // The ledger takes the transactions themselves, each with the
@@ -1096,7 +1104,7 @@ impl ExecutionCoordinator {
             CommittedAt {
                 height: block.height,
                 anchor: block.ts,
-                committee_anchor: self.committed_committee_anchor_wt,
+                committee_epoch,
             },
             &classification.prices(),
             members
@@ -1212,7 +1220,7 @@ impl ExecutionCoordinator {
     /// in for.
     fn composed_lines(
         &self,
-        anchored: &TopologySnapshot,
+        committee: &TopologySnapshot,
         tick_id: TickId,
         unanswerable: &[Unanswerable],
         recovered: &[TickId],
@@ -1263,7 +1271,7 @@ impl ExecutionCoordinator {
                 None => None,
             };
             let reach: Vec<ShardId> = ledger
-                .counterparts(entry.tx_hash, anchored.shard_trie())
+                .counterparts(entry.tx_hash, committee.shard_trie())
                 .into_iter()
                 .collect();
             let crossings =
@@ -1469,7 +1477,7 @@ impl ExecutionCoordinator {
     fn seat_tick(
         &mut self,
         topology_schedule: &TopologySchedule,
-        anchored: &TopologySnapshot,
+        committee: &TopologySnapshot,
         block: &CommittingBlock,
         named: Named<'_>,
         seated: &mut Vec<TickLine>,
@@ -1487,7 +1495,7 @@ impl ExecutionCoordinator {
                 unanswerable,
                 recovered,
             } => {
-                composed = self.composed_lines(anchored, tick_id, unanswerable, recovered);
+                composed = self.composed_lines(committee, tick_id, unanswerable, recovered);
                 &composed[..]
             }
         };
@@ -1525,7 +1533,7 @@ impl ExecutionCoordinator {
             self.admit_member(tick_id, member, &mut state, &mut ticked, &mut requests);
         }
 
-        self.admit_abandoned(anchored.shard_trie(), tick_id, &mut state, lines);
+        self.admit_abandoned(committee.shard_trie(), tick_id, &mut state, lines);
 
         if state.is_empty() {
             return (None, Vec::new(), Vec::new());
@@ -1573,12 +1581,12 @@ impl ExecutionCoordinator {
         let pending = (!requests.is_empty()).then(|| PendingTick {
             tick: block.height,
             tick_ts: block.ts,
-            // Off the block's anchored committee, on the same terms the
+            // Off the block's certified committee, on the same terms the
             // classification above reads it: what a seal opens onto is
             // execution output, and a window taken from this node's head
             // would make the answer depend on how far this node has
             // folded the beacon rather than on what the block committed.
-            env: TickEnvironment::governing(anchored, topology_schedule.windows()),
+            env: TickEnvironment::governing(committee, topology_schedule.windows()),
             requests,
             included: block.fees.clone(),
             in_hand,
@@ -3110,10 +3118,12 @@ impl ExecutionCoordinator {
     /// Fold a committed block into execution: the one entry live commits,
     /// block sync and the restart's replay all take.
     ///
-    /// The fold waits behind any commit whose anchored committee sits in
+    /// The fold waits behind any commit whose certified committee sits in
     /// a window this node's beacon has not committed, and folds with it
     /// once it lands, so the effects returned may carry earlier blocks'
-    /// ahead of this one's, or nothing. Each block's fold, in order:
+    /// ahead of this one's, or nothing. `committee_anchor`, the parent's
+    /// own anchor, places the block against a recovery's bridge; it
+    /// classifies nothing. Each block's fold, in order:
     ///
     /// 1. **Resolutions** — what its finalizations settle, read off the
     ///    ledger before anything releases the entries.
@@ -3178,26 +3188,23 @@ impl ExecutionCoordinator {
     }
 
     /// Fold the commits waiting on their windows, oldest first, for as
-    /// long as each one's anchored committee resolves. A commit whose
+    /// long as each one's certified committee resolves. A commit whose
     /// window this node's beacon has not committed stays at the front,
     /// and every later one queues behind it, so the fold still runs in
     /// commit order.
     fn drain_awaiting_window(&mut self, topology_schedule: &TopologySchedule) -> CommitEffects {
         let mut effects = CommitEffects::default();
-        while let Some((certified, committee_anchor, _)) = self.awaiting_window.front() {
-            let own_anchor = certified.block().header().parent_qc().weighted_timestamp();
-            let Some(anchored) =
-                self.anchored_committee(topology_schedule, *committee_anchor, own_anchor)
-            else {
+        while let Some((certified, _, _)) = self.awaiting_window.front() {
+            let Some(committee) = self.certified_committee(topology_schedule, certified) else {
                 break;
             };
             let (certified, committee_anchor, naming) = self
                 .awaiting_window
                 .pop_front()
                 .expect("the front was just read");
-            effects.absorb(self.commit_anchored(
+            effects.absorb(self.commit_certified(
                 topology_schedule,
-                anchored,
+                committee,
                 &certified,
                 committee_anchor,
                 naming,
@@ -3232,19 +3239,20 @@ impl ExecutionCoordinator {
         self.commit_named(topology_schedule, certified, committee_anchor, naming)
     }
 
-    /// One commit's fold, under the committee its anchor resolved.
+    /// One commit's fold, under the committee its QC signed.
     #[allow(clippy::too_many_lines)] // sequential orchestration of one commit's fold
-    fn commit_anchored(
+    fn commit_certified(
         &mut self,
         topology_schedule: &TopologySchedule,
-        anchored: &TopologySnapshot,
+        window: BlockCommittee<'_>,
         certified: &CertifiedBlock,
         committee_anchor: WeightedTimestamp,
         naming: Naming,
     ) -> CommitEffects {
         let block = certified.block();
         let height = block.height();
-        let (floor, crossed) = self.cross_a_bridge(topology_schedule, committee_anchor, block);
+        let (floor, crossed) =
+            self.cross_a_bridge(topology_schedule, window.snapshot, committee_anchor, block);
 
         // What the block's finalizations settle about the transactions
         // they name, read off their outcomes alone.
@@ -3262,7 +3270,7 @@ impl ExecutionCoordinator {
         // for timeout calculations and pruning even when there are no new
         // transactions.
         if height > self.committed_height {
-            self.committed_committee_anchor_wt = committee_anchor;
+            self.committed_committee_epoch = Some(window.epoch);
             self.committed_height = height;
             self.committed_ts = block.header().parent_qc().weighted_timestamp();
         }
@@ -3283,7 +3291,7 @@ impl ExecutionCoordinator {
         // What the block says about counterparts, and what it opens to
         // ask them; the strands no counterpart can answer for any more
         // are let go of below.
-        let trie = anchored.shard_trie();
+        let trie = window.snapshot.shard_trie();
         let wanted = self.wanted_records();
         actions.extend(self.release_early_pushes(topology_schedule, &wanted));
         let committed =
@@ -3401,24 +3409,10 @@ impl ExecutionCoordinator {
         actions.extend(self.drain_ready_tick_resolutions());
 
         let mut named = Vec::new();
-        // The committee the block was certified under, whose window its
-        // proposer computed the provision roots in: the one the QC its
-        // child pins signed. A block a halt recovery's fresh committee
-        // built over the halted tip signs the window that committee was
-        // seated in, while the halted suffix signs its own windows.
-        let signed = Some(certified.qc())
-            .filter(|qc| !qc.is_genesis())
-            .and_then(|qc| {
-                topology_schedule
-                    .signed_committee(self.local_shard, qc.committee_epoch())
-                    .committee()
-            })
-            .map_or(anchored, |committee| committee.snapshot.as_ref());
         actions.extend(self.on_block_committed(
             &mut named,
             topology_schedule,
-            anchored,
-            signed,
+            window,
             block,
             match naming {
                 Naming::Manifest => Named::Lines(block.tick_manifest()),
@@ -3442,14 +3436,12 @@ impl ExecutionCoordinator {
     /// it, and the pushes queued for the next. Nothing on a block this
     /// replica cannot run.
     ///
-    /// The provisions route under `signed`, the committee the block's QC
-    /// signed, under which the header's roots were computed, so each part
-    /// walks to its target's root; the crossing pushes route under
-    /// `anchored`.
+    /// Everything routes under `window`, the one the block's QC signed,
+    /// under which the header's roots were computed, so each part walks
+    /// to its target's root.
     fn pushes(
         &mut self,
-        anchored: &TopologySnapshot,
-        signed: &TopologySnapshot,
+        window: &TopologySnapshot,
         committed: &Block,
         runnable: bool,
     ) -> Vec<Action> {
@@ -3470,7 +3462,7 @@ impl ExecutionCoordinator {
         if runnable && self.signers.contains(&proposer) {
             let local_shard = self.local_shard;
             if let Some((requests, shard_recipients)) =
-                build_provision_requests(signed, transactions, &self.signers, local_shard)
+                build_provision_requests(window, transactions, &self.signers, local_shard)
             {
                 actions.push(Action::Provisions(
                     ProvisionAction::FetchAndBroadcastProvisions {
@@ -3491,7 +3483,7 @@ impl ExecutionCoordinator {
                 // one past its validity end, pushed again at the
                 // parent's view, where each record still stands.
                 for (target, records) in self.counterparts.record_repushes(
-                    anchored.shard_trie(),
+                    window.shard_trie(),
                     self.committed_ts,
                     anchor.height,
                 ) {
@@ -3502,7 +3494,7 @@ impl ExecutionCoordinator {
                 }
                 let shard_recipients = targets
                     .keys()
-                    .map(|&target| (target, anchored.committee_for_shard(target).to_vec()))
+                    .map(|&target| (target, window.committee_for_shard(target).to_vec()))
                     .collect();
                 actions.push(Action::Provisions(ProvisionAction::PushCrossingReadings {
                     block_hash: parent_hash,
@@ -3520,7 +3512,7 @@ impl ExecutionCoordinator {
             let ledger = &self.counterparts.ledger;
             let targets = record_pushes(
                 finalizations,
-                anchored.shard_trie(),
+                window.shard_trie(),
                 self.local_shard,
                 |tx_hash, record| ledger.claimants(tx_hash, record),
             );
@@ -3547,8 +3539,7 @@ impl ExecutionCoordinator {
         &mut self,
         seated: &mut Vec<TickLine>,
         topology_schedule: &TopologySchedule,
-        anchored: &TopologySnapshot,
-        signed: &TopologySnapshot,
+        window: BlockCommittee<'_>,
         committed: &Block,
         named: Named<'_>,
     ) -> Vec<Action> {
@@ -3567,7 +3558,7 @@ impl ExecutionCoordinator {
         // hold.
         let runnable = committed.is_live() && height >= self.dispatch_from;
 
-        actions.extend(self.pushes(anchored, signed, committed, runnable));
+        actions.extend(self.pushes(window.snapshot, committed, runnable));
 
         let block = CommittingBlock {
             hash: block_hash,
@@ -3580,7 +3571,7 @@ impl ExecutionCoordinator {
         // anything is composed from it: the block's own transactions, and
         // the provisions and engagement echoes its batches carry.
         if !transactions.is_empty() {
-            self.register_committed_txs(anchored, &block, transactions);
+            self.register_committed_txs(window, &block, transactions);
         }
         // After the block's transactions are registered, so a record
         // read in a transaction's own block is its arrival.
@@ -3596,7 +3587,7 @@ impl ExecutionCoordinator {
         let (pending, early_votes, members) = if self.terminated {
             (None, Vec::new(), Vec::new())
         } else {
-            self.seat_tick(topology_schedule, anchored, &block, named, seated)
+            self.seat_tick(topology_schedule, window.snapshot, &block, named, seated)
         };
         for vote in early_votes {
             actions.extend(self.on_execution_vote(topology_schedule, vote));
@@ -4041,28 +4032,25 @@ impl ExecutionCoordinator {
     /// the floor, so the chain drops it.
     ///
     /// Asks the shard's own question of the shard's own inputs
-    /// ([`TopologySchedule::crossing_block`] at the block's committee
-    /// anchor, its parent's), so the commit that drops the ticks is the
-    /// one whose lines discard their rows. Answers the floor raise beside
-    /// the ticks dropped.
+    /// ([`TopologySchedule::crossing_block`] over the block's certified
+    /// committee, between its committee anchor, its parent's, and its
+    /// own), so the commit that drops the ticks is the one whose lines
+    /// discard their rows. Answers the floor raise beside the ticks
+    /// dropped.
     fn cross_a_bridge(
         &mut self,
         topology_schedule: &TopologySchedule,
+        committee: &TopologySnapshot,
         committee_anchor: WeightedTimestamp,
         block: &Block,
     ) -> (Vec<Action>, Vec<TickId>) {
         let Some(floor) = block.height().prev().filter(|_| {
-            topology_schedule
-                .live_committee(self.local_shard, committee_anchor)
-                .committee()
-                .is_some_and(|committee| {
-                    topology_schedule.crossing_block(
-                        committee.snapshot,
-                        self.local_shard,
-                        committee_anchor,
-                        block.header().parent_qc().weighted_timestamp(),
-                    )
-                })
+            topology_schedule.crossing_block(
+                committee,
+                self.local_shard,
+                committee_anchor,
+                block.header().parent_qc().weighted_timestamp(),
+            )
         }) else {
             return (Vec::new(), Vec::new());
         };
@@ -5033,7 +5021,7 @@ mod tests {
         CommittedAt {
             height: BlockHeight::new(1),
             anchor: WeightedTimestamp::ZERO,
-            committee_anchor: WeightedTimestamp::ZERO,
+            committee_epoch: Epoch::GENESIS,
         }
     }
 
@@ -5048,7 +5036,8 @@ mod tests {
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
-        StubVmStatics, certify as test_certify, genesis_charge, install_stub_protocol_statics,
+        StubVmStatics, certify as test_certify, certify_live, certify_signed as signed_certify,
+        genesis_charge, install_stub_protocol_statics,
         make_finalization as helpers_make_finalization, make_finalization_leaving,
         make_leg_finalization, make_live_block as helpers_make_live_block, naming, proven_claim,
         state_and_proof, state_and_proof_holding, stating_half_on, stub_abort_charge,
@@ -5301,6 +5290,12 @@ mod tests {
 
     fn certify(block: Block) -> CertifiedBlock {
         test_certify(block, 0)
+    }
+
+    /// [`certify_signed`](hyperscale_types::test_utils::certify_signed)
+    /// stating epoch `epoch`.
+    fn certify_signed(block: Block, anchor_ms: u64, epoch: u64) -> CertifiedBlock {
+        signed_certify(block, anchor_ms, Epoch::new(epoch))
     }
 
     #[test]
@@ -8818,6 +8813,7 @@ mod tests {
             );
             state.cross_a_bridge(
                 &schedule,
+                &head,
                 WeightedTimestamp::from_millis(parent_ms),
                 block.block(),
             )
@@ -8846,6 +8842,194 @@ mod tests {
         let (raised, dropped) = at(&mut state, 6, 21_100, 21_200);
         assert!(raised.is_empty() && dropped.is_empty());
         assert!(state.ticks.get_tick(&fresh).is_some());
+    }
+
+    /// A halt recovery of [`HOME`] across a reshape: [`PEER`] runs beside
+    /// it in epoch 2, where the halted tip anchors, and has split into
+    /// [`UPPER`] and [`LOWER`] by epoch 21, the window the fresh committee
+    /// was seated for (rotated at 20, bridge 21). That window prices at
+    /// `prices`.
+    fn halt_across_a_split(prices: PriceTable) -> TopologySchedule {
+        let recoveries = BTreeMap::from([(
+            HOME,
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
+                rotated_at: Epoch::new(20),
+                retained: Vec::new(),
+                attested_frontier: BlockHeight::new(1),
+            },
+        )]);
+        let bridged = Arc::new(
+            leaves_snap(&[HOME, UPPER, LOWER], &[])
+                .as_ref()
+                .clone()
+                .with_pending_recoveries(recoveries)
+                .with_prices(prices),
+        );
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(2),
+            leaves_snap(&[HOME, PEER], &[]),
+        );
+        schedule.insert(Epoch::new(21), Arc::clone(&bridged));
+        schedule.set_head(Epoch::new(21), bridged);
+        schedule
+    }
+
+    /// Commit X2 of a halt recovery on [`HOME`] under `schedule`: the
+    /// crossing block, its committee anchor (the halted tip's, 2.5 s) in
+    /// epoch 2 below the bridge and its own anchor past it, certified by
+    /// a QC its fresh quorum signed under 21. It carries `tx`, which reads
+    /// a key [`UPPER`] holds, with the bundle [`UPPER`] sent for it, and
+    /// names it in its tick.
+    fn commit_crossing_block(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        tx: &Transaction,
+    ) -> CommitEffects {
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(3),
+            21_100,
+            ValidatorId::new(0),
+            vec![tx.clone()],
+        )
+        else {
+            unreachable!("a live block")
+        };
+        let bundle = Provision::dummy_at(
+            UPPER,
+            HOME,
+            BlockHeight::new(3),
+            WeightedTimestamp::from_millis(21_050),
+            tx.hash(),
+        );
+        let block = Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions: Arc::new(
+                Capped::new(vec![Verifiable::from(bundle)]).expect("one bundle fits"),
+            ),
+            abandonment_records,
+            state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources,
+        };
+        let line = TickLine::Member {
+            staged: 0,
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: genesis_charge(tx),
+            share: 0,
+            reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(tx),
+            crossings: Capped::empty(),
+        };
+        state.commit_block(
+            schedule,
+            &naming(&certify_signed(block, 21_100, 21), vec![line]),
+            WeightedTimestamp::from_millis(2_500),
+        )
+    }
+
+    /// A transaction on [`HOME`] reading a key [`PEER`] held in epoch 2
+    /// and [`UPPER`] holds in epoch 21.
+    fn reading_across_the_split() -> Transaction {
+        test_transaction_with_prefixes(&[0x11], &[test_prefix(0x91)], &[test_prefix(0x11)])
+    }
+
+    /// The first Members block after a halt recovery runs its tick under
+    /// the committee its QC signed. Its committee anchor lies below the
+    /// bridge, where [`PEER`] still owns the key the member reads; the
+    /// fresh committee validated it under the window it was seated in,
+    /// where [`UPPER`] does, and [`UPPER`]'s bundle is in hand. Classified
+    /// under the raw window the member waits on a shard that no longer
+    /// exists, the tick is held, and serial dispatch wedges behind it on
+    /// every replica.
+    #[test]
+    fn a_members_block_after_a_halt_dispatches_under_the_bridge() {
+        let schedule = halt_across_a_split(PriceTable::GENESIS);
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tx = reading_across_the_split();
+
+        let effects = commit_crossing_block(&mut state, &schedule, &tx);
+
+        let tick = TickId::new(HOME, BlockHeight::new(3));
+        assert_eq!(state.ticks.tick_assignment(tx.hash()), Some(tick));
+        assert!(!state.held.contains_key(&tick), "the tick is not held");
+        assert!(
+            matches!(state.pending_ticks.front(), Some(Queued::Run(_)))
+                || effects.actions.iter().any(|action| matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
+            "the tick runs: {:?}",
+            effects.actions,
+        );
+    }
+
+    /// The figures the ledger owes for a transaction the crossing block
+    /// committed are the ones admission judged: priced under the table of
+    /// the window its QC signed, not under the one its committee anchor
+    /// dates, which prices every epoch differently.
+    #[test]
+    fn a_members_block_after_a_halt_prices_under_the_bridge() {
+        let dear = PriceTable {
+            compute: 1_000 * PriceTable::GENESIS.compute,
+            read_bytes: 1_000 * PriceTable::GENESIS.read_bytes,
+            write_bytes: 1_000 * PriceTable::GENESIS.write_bytes,
+            footprint: 1_000 * PriceTable::GENESIS.footprint,
+            retention: 1_000 * PriceTable::GENESIS.retention,
+        };
+        let schedule = halt_across_a_split(dear);
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tx = reading_across_the_split();
+
+        let _ = commit_crossing_block(&mut state, &schedule, &tx);
+
+        let window = schedule
+            .signed_committee(HOME, Epoch::new(21))
+            .committee()
+            .expect("the fixture holds 21");
+        let classified = Classified::freeze(
+            tx.legs(),
+            tx.fee_payer(),
+            tx.accounts(),
+            window.snapshot.shard_trie(),
+        );
+        let admitted = classified.local_price(&tx, HOME, &dear);
+        let raw = Classified::freeze(
+            tx.legs(),
+            tx.fee_payer(),
+            tx.accounts(),
+            leaves_snap(&[HOME, PEER], &[]).shard_trie(),
+        )
+        .local_price(&tx, HOME, &PriceTable::GENESIS);
+        assert_ne!(admitted, raw, "the two windows price it differently");
+        let owed = state
+            .counterparts
+            .ledger
+            .past_deadline(Deadline::of_transaction(&tx).at());
+        let figures = owed
+            .iter()
+            .find(|entry| entry.tx_hash == tx.hash())
+            .expect("the ledger owes the transaction");
+        assert_eq!(figures.charged, admitted);
+        assert_eq!(figures.committed.committee_epoch, Epoch::new(21));
     }
 
     /// A two-committee schedule for one shard under a halt recovery: the
@@ -8907,7 +9091,8 @@ mod tests {
         let tx = test_transaction(u8::try_from(height.inner()).unwrap());
         let tx_hash = tx.hash();
         let block = make_live_block(height, anchor_ms, ValidatorId::new(0), vec![tx]);
-        state.commit_block_carrying(schedule, &test_certify(block, anchor_ms), Naming::Composed);
+        let certified = certify_on(state, schedule, block, anchor_ms);
+        state.commit_block_carrying(schedule, &certified, Naming::Composed);
         let tick_id = state
             .ticks
             .tick_assignment(tx_hash)
@@ -9607,20 +9792,45 @@ mod tests {
 
     /// An empty block at `height` whose parent QC carries `anchor_ms` — the
     /// block's own position on the weighted-time grid.
-    /// Commit-time classification resolves against the window the block's
-    /// *parent* anchored in, because that is where a block's committee comes
-    /// from — so it matches the snapshot the proposer built under and the
-    /// verifier validated against. Reading the block's own anchor instead
-    /// straddles an epoch cut once per window, and a reshape cut there
-    /// changes the shard set `compute_ticks` routes over.
-    #[test]
-    fn classification_anchors_on_the_parents_window_across_commits() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
-        let topo = make_test_topology();
+    /// A one-shard window at epoch 0 and a two-shard one at epoch 1, the
+    /// head, over one validator set.
+    fn one_then_two_shards() -> TopologySchedule {
+        windows_of(2)
+    }
 
-        // `certify` stamps the block's parent-QC weighted timestamp, which is
-        // the block's own anchor.
-        let commit = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
+    /// A one-shard window at epoch 0 and a `later`-shard one at epoch 1,
+    /// the head, over one validator set.
+    fn windows_of(later: u64) -> TopologySchedule {
+        let validators: Vec<ValidatorInfo> = (0..4u64)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let snapshot = |shards| {
+            Arc::new(TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                shards,
+                ValidatorSet::new(validators.clone()),
+            ))
+        };
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(0), snapshot(1));
+        sched.insert(Epoch::new(1), snapshot(later));
+        sched.set_head(Epoch::new(1), snapshot(later));
+        sched
+    }
+
+    /// Commit-time classification resolves the window the block's QC
+    /// signed — the window honest voters validated its content under —
+    /// whatever either of the block's anchors dates. A block anchored in
+    /// one window can be certified by a committee seated for another: a
+    /// halt recovery's crossing block, or the first block past a cut.
+    #[test]
+    fn classification_reads_the_window_its_qc_signed() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let sched = windows_of(1);
+        let commit = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64, epoch| {
             let block = make_live_block_on_shard(
                 ShardId::ROOT,
                 BlockHeight::new(height),
@@ -9629,73 +9839,69 @@ mod tests {
                 vec![],
             );
             let _ = state.commit_block_carrying(
-                &topo,
-                &test_certify(block, anchor_ms),
+                &sched,
+                &certify_signed(block, anchor_ms, epoch),
                 Naming::Composed,
             );
         };
+        let probes_under = |state: &ExecutionCoordinator, epoch: u64| {
+            let window = sched
+                .signed_committee(ShardId::ROOT, Epoch::new(epoch))
+                .committee()
+                .expect("both windows are held");
+            state
+                .counterpart_trie(&sched)
+                .is_some_and(|trie| std::ptr::eq(trie, window.snapshot.shard_trie()))
+        };
 
-        commit(&mut state, 1, 500);
-        commit(&mut state, 2, 1_500);
+        commit(&mut state, 1, 500, 1);
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(1)));
+        assert!(probes_under(&state, 1), "anchored in epoch 0, signed in 1");
 
-        assert_eq!(
-            state.committed_committee_anchor_wt,
-            WeightedTimestamp::from_millis(500),
-            "the second block is classified in the window its parent anchored in",
-        );
+        commit(&mut state, 2, 1_700, 0);
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(0)));
+        assert!(probes_under(&state, 0), "anchored in epoch 1, signed in 0");
         assert_eq!(
             state.committed_ts,
-            WeightedTimestamp::from_millis(1_500),
+            WeightedTimestamp::from_millis(1_700),
             "its own anchor still drives the deterministic clock",
         );
     }
 
-    /// A root chain's first blocks genuinely anchor at zero, and that zero
-    /// is a carriable parent anchor, not an uninitialized clock: the second
-    /// commit classifies in the window its parent anchored (epoch 0) even
-    /// when the chain stalled long enough at genesis for the block to date
-    /// itself past a cut.
+    /// A restarted replica probes under the window its recovered tip's
+    /// stored QC signed, and its first commit reseats that from the
+    /// commit's own QC.
     #[test]
-    fn a_zero_anchor_at_genesis_is_carried_not_treated_as_a_gap() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
-        let topo = make_test_topology();
-
-        let commit = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
-            let block = make_live_block_on_shard(
+    fn a_restart_seeds_the_window_its_tips_qc_signed() {
+        let sched = windows_of(1);
+        let tip = certify_signed(
+            make_live_block_on_shard(
                 ShardId::ROOT,
-                BlockHeight::new(height),
-                anchor_ms,
+                BlockHeight::new(5),
+                900,
                 ValidatorId::new(0),
                 vec![],
-            );
-            let _ = state.commit_block_carrying(
-                &topo,
-                &test_certify(block, anchor_ms),
-                Naming::Composed,
-            );
-        };
-
-        // Block 1 anchors at genesis zero; block 2 dates itself far past it.
-        commit(&mut state, 1, 0);
-        commit(&mut state, 2, 1_500);
-
-        assert_eq!(
-            state.committed_committee_anchor_wt,
-            WeightedTimestamp::ZERO,
-            "block 2's committee anchors on block 1, at genesis zero",
+            ),
+            900,
+            0,
         );
-    }
-
-    /// A restarted replica's first commit classifies exactly like a
-    /// non-restarted peer's: the frontier seeded from the recovered tip is
-    /// the parent anchor the carry needs, so the commit extending the tip
-    /// resolves the window the tip anchored — not the one the new block
-    /// opens, which a zero frontier's gap fallback would pick and which a
-    /// reshape cut between the two turns into a vote-splitting divergence.
-    #[test]
-    fn a_seeded_frontier_carries_the_recovered_anchor_across_a_restart() {
-        let topo = make_test_topology();
-        // The recovered tip: height 5, its own anchor at 900 ms.
+        let (_, unsigned) = tip.into_parts();
+        let unsigned = unsigned.as_unverified();
+        let mut signers = SignerBitfield::new(4);
+        for index in 0..3 {
+            signers.set(index);
+        }
+        let tip_qc = QuorumCertificate::new(
+            unsigned.block_hash(),
+            unsigned.shard_id(),
+            unsigned.height(),
+            unsigned.parent_block_hash(),
+            unsigned.round(),
+            unsigned.committee_epoch(),
+            signers,
+            unsigned.aggregated_signature(),
+            unsigned.weighted_timestamp(),
+        );
         let mut state = ExecutionCoordinator::with_shared_stores(
             ShardId::ROOT,
             Arc::new(TestCode::default()),
@@ -9704,6 +9910,7 @@ mod tests {
                 committed_height: BlockHeight::new(5),
                 committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
                 committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(800)),
+                latest_qc: Some(Verified::new_unchecked_for_test(tip_qc)),
                 ..RecoveredState::default()
             },
             Arc::new(ExecCertStore::new()),
@@ -9713,9 +9920,8 @@ mod tests {
             BlockHeight::GENESIS,
         )
         .signed_by(ValidatorId::new(0));
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(0)));
 
-        // The first post-restart commit extends the tip and dates itself
-        // past it.
         let block = make_live_block_on_shard(
             ShardId::ROOT,
             BlockHeight::new(6),
@@ -9723,22 +9929,50 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        let _ = state.commit_block_carrying(&topo, &test_certify(block, 1_100), Naming::Composed);
+        let _ =
+            state.commit_block_carrying(&sched, &certify_signed(block, 1_100, 1), Naming::Composed);
 
-        assert_eq!(
-            state.committed_committee_anchor_wt,
-            WeightedTimestamp::from_millis(900),
-            "the commit extending the recovered tip is classified in the tip's window",
-        );
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(1)));
         assert_eq!(state.committed_ts, WeightedTimestamp::from_millis(1_100));
     }
 
-    /// Commit-time tick/provision classification anchors on the block's
-    /// committee — not the `ArcSwap` head, so every replica groups a block's
-    /// transactions identically across a reshape boundary (matching the
-    /// proposer and the verifier).
-    /// A commit whose committee anchor lies in a window this node's
-    /// beacon has not committed is parked, not classified under the head:
+    /// A replayed commit whose signed window the schedule no longer
+    /// retains folds under its own anchor's window, still stating the
+    /// epoch its QC signed, rather than wedging the fold.
+    #[test]
+    fn an_evicted_signed_window_folds_under_the_blocks_own_window() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let mut sched = windows_of(1);
+        sched.evict_below(Epoch::new(1));
+        let certified = certify_signed(
+            make_live_block_on_shard(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                1_500,
+                ValidatorId::new(0),
+                vec![],
+            ),
+            1_500,
+            0,
+        );
+        let own = sched
+            .signed_committee(ShardId::ROOT, Epoch::new(1))
+            .committee()
+            .expect("the own anchor's window is held");
+
+        let committee = state
+            .certified_committee(&sched, &certified)
+            .expect("an evicted window stands in its block's own");
+        assert!(std::ptr::eq(committee.snapshot, own.snapshot));
+        assert_eq!(committee.epoch, Epoch::new(0));
+
+        let _ =
+            state.commit_block_composing(&sched, &certified, WeightedTimestamp::from_millis(500));
+        assert_eq!(state.committed_height, BlockHeight::new(1));
+    }
+
+    /// A commit whose signed window this node's beacon has not committed
+    /// is parked, not classified under the head:
     /// the frontier holds, and a later commit queues behind it. Once the
     /// beacon commits the window, both fold in order under it, as on a
     /// replica that held the window all along.
@@ -9769,7 +10003,7 @@ mod tests {
         sched.set_head(Epoch::new(0), two_shards);
 
         let block_at = |height: u64, anchor_ms: u64| {
-            test_certify(
+            certify_signed(
                 make_live_block_on_shard(
                     ShardId::ROOT,
                     BlockHeight::new(height),
@@ -9778,6 +10012,7 @@ mod tests {
                     vec![],
                 ),
                 anchor_ms,
+                1,
             )
         };
         let first = block_at(1, 1_500);
@@ -9802,45 +10037,29 @@ mod tests {
     }
 
     #[test]
-    fn classification_committee_anchors_at_the_block_window_not_the_head() {
+    fn classification_resolves_the_signed_window_not_the_head() {
         let state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
-        // Epoch 0 carries ROOT (one shard) — the block's anchor; epoch 1
-        // splits it (two shards) and is installed as the flipped head.
-        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
-        let validators: Vec<ValidatorInfo> = keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| ValidatorInfo {
-                validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
-            })
-            .collect();
-        let pre_split = Arc::new(TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            1,
-            ValidatorSet::new(validators.clone()),
-        ));
-        let post_split = Arc::new(TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            2,
-            ValidatorSet::new(validators),
-        ));
-        let mut sched = TopologySchedule::new(
-            EpochWindows::new(0, 1000),
-            Epoch::new(0),
-            Arc::clone(&pre_split),
+        // Epoch 0 carries ROOT (one shard); epoch 1 splits it (two shards)
+        // and is installed as the flipped head.
+        let sched = one_then_two_shards();
+        let certified = certify_signed(
+            make_live_block_on_shard(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                500,
+                ValidatorId::new(0),
+                vec![],
+            ),
+            500,
+            0,
         );
-        sched.insert(Epoch::new(1), Arc::clone(&post_split));
-        sched.set_head(Epoch::new(1), post_split);
-
-        let at = WeightedTimestamp::from_millis(500);
-        let anchored = state
-            .anchored_committee(&sched, at, at)
+        let committee = state
+            .certified_committee(&sched, &certified)
             .expect("the fixture holds the window");
         assert_eq!(
-            anchored.num_shards(),
+            committee.snapshot.num_shards(),
             1,
-            "classification anchors at the block's window (ROOT, one shard), not the two-shard head",
+            "classification reads the signed window (ROOT, one shard), not the two-shard head",
         );
     }
 
@@ -10297,6 +10516,7 @@ mod tests {
         );
         let _ = state.cross_a_bridge(
             &schedule,
+            schedule.head(),
             WeightedTimestamp::from_millis(2_000),
             crossing.block(),
         );
@@ -16567,13 +16787,27 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
+        let certified = certify_on(state, schedule, block, ts.as_millis());
         state
-            .commit_block_carrying(
-                schedule,
-                &test_certify(block, ts.as_millis()),
-                Naming::Composed,
-            )
+            .commit_block_carrying(schedule, &certified, Naming::Composed)
             .actions
+    }
+
+    /// `block`, anchored at `anchor_ms`, certified by the quorum honest
+    /// voters form for it on `state`'s chain: stating the epoch its live
+    /// committee resolves at its parent's anchor.
+    fn certify_on(
+        state: &ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        block: Block,
+        anchor_ms: u64,
+    ) -> CertifiedBlock {
+        let committee_anchor = if block.height() == state.committed_height.next() {
+            state.committed_ts
+        } else {
+            WeightedTimestamp::from_millis(anchor_ms)
+        };
+        certify_live(schedule, block, anchor_ms, committee_anchor)
     }
 
     /// The outcomes every tick that can vote now attests.

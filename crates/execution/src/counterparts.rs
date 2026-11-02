@@ -4355,7 +4355,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(1),
                 anchor: WeightedTimestamp::ZERO,
-                committee_anchor: WeightedTimestamp::ZERO,
+                committee_epoch: Epoch::GENESIS,
             },
             reach: Capped::new(
                 (0..routes)

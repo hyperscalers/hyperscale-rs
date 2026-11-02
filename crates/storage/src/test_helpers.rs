@@ -5048,7 +5048,7 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
             committed: CommittedAt {
                 height: BlockHeight::new(1),
                 anchor: WeightedTimestamp::from_millis(100),
-                committee_anchor: WeightedTimestamp::from_millis(100),
+                committee_epoch: Epoch::GENESIS,
             },
             reach: stranded.routing().all_routes(),
         }],

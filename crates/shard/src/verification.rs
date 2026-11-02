@@ -895,7 +895,6 @@ impl VerificationPipeline {
         vec![Action::Consensus(ConsensusAction::VerifyResolutions {
             block_hash,
             entries,
-            windows: schedule.windows(),
         })]
     }
 

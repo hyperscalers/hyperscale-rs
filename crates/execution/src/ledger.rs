@@ -657,11 +657,11 @@ impl Ledger {
     /// own validity window, and re-registering one must not move the
     /// deadline it was admitted under.
     ///
-    /// `prices` is the table the committing block's committee anchor
-    /// names — the one admission judged its ceiling at — so what a
+    /// `prices` is the table of the window the committing block's QC
+    /// signed — the one admission judged its ceiling at — so what a
     /// record restates is what the block that committed the transaction
     /// charged, and a later fold moving the table never moves a figure
-    /// already owed. `committed.committee_anchor` states which that was,
+    /// already owed. `committed.committee_epoch` states which that was,
     /// so a verifier holding no entry resolves the same window.
     pub(crate) fn register_committed<'a>(
         &mut self,
@@ -1460,7 +1460,7 @@ mod tests {
         make_finalization, make_leg_finalization, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, MAX_FINALIZATION_DELAY,
+        AbortCharge, BlockHeight, EPOCH_DURATION, Epoch, EpochWindows, MAX_FINALIZATION_DELAY,
         MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
     };
     use hyperscale_vm_effects::Answered;
@@ -1667,7 +1667,7 @@ mod tests {
         CommittedAt {
             height: BlockHeight::new(1),
             anchor,
-            committee_anchor: anchor,
+            committee_epoch: Epoch::GENESIS,
         }
     }
 
