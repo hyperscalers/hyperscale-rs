@@ -11,9 +11,9 @@ use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::request::GetProvisionsRequest;
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, Derivation, Hash, LeafPath, MAX_FETCH_RESPONSE_BYTES,
-    MAX_TXS_PER_BLOCK, Provision, ProvisionCount, ScheduleLookup, ShardId, ShardTrie,
-    TopologySchedule, Verified, WeightedTimestamp, derive_block_transactions,
+    Block, BlockHeight, BlockResolution, CertifiedBlock, Derivation, Hash, LeafPath,
+    MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, Provision, ProvisionCount, ScheduleLookup,
+    ShardId, ShardTrie, TopologySchedule, Verified, derive_block_transactions,
 };
 use tracing::warn;
 
@@ -140,25 +140,33 @@ pub fn provision_answer(
 
 /// What this node's committed block at `height` owes `target_shard`:
 /// [`Owing::Nothing`] where its header commits the target nothing,
-/// [`Owing::Leaves`] once the leaves some candidate routing makes out of
-/// the block's own state walk to the header's root, and `None` where
-/// this node does not hold the block or its state, or no candidate
-/// matches. Only an answer is kept.
+/// [`Owing::Leaves`] once the leaves the block's routing makes out of
+/// its own state walk to the header's root, and `None` where this node
+/// does not hold the block or its state, its routing is not resolvable
+/// here, or the leaves do not match. Only an answer is kept.
 ///
-/// The candidates, in order, each skipped when it resolves to no
-/// committee here or repeats one already tried:
-/// 1. the committee anchor, the parent's own anchor, resolved as the
-///    proposer resolved it: terminal-clamped and across this shard's
-///    newest recovery bridge; skipped, with the next, when the parent's
-///    header is not held;
-/// 2. the committee anchor's own window, which a recovery folded after
-///    the block was proposed no longer bridges to;
-/// 3. the block's own anchor;
-/// 4. `schedule`'s head.
+/// The routing is the trie of the window whose committee certified the
+/// block, keyed by the epoch its stored QC signed: the copy its child's
+/// header pins, which the commit stores. The proposer made the header's
+/// roots under the live committee of the block's committee anchor, and
+/// every honest voter checked them under the committee it signed for, so
+/// that window is the one the roots were made under for every certified
+/// block whichever QC copy a replica holds (every QC over one block
+/// states one epoch). A recovery folded since, or a reshape of the
+/// target, moves nothing.
 ///
-/// They differ only when a target reshapes while this shard survives,
-/// or across a recovery bridge. Matching compares key-only roots and
-/// builds no proof.
+/// A signed window this node's beacon has evicted falls back to the
+/// block's own anchor's window. The two differ only on a chain that
+/// stalled across the eviction floor between the block's committee
+/// anchor and its own, and the root match keeps the guess honest. An
+/// own anchor evicted too lies past the tx-artifact horizon, so every
+/// part of the block is past its deadline, and the answer is `None`. A
+/// signed window not yet committed here is `None` as well. A `None`
+/// answers the request empty, which the requester takes as "not held"
+/// and asks another holder.
+///
+/// A chain's genesis block, the one block whose QC no committee signed,
+/// carries no transactions, so its header commits no target anything.
 ///
 /// `derivation` is this node's: routing is a derived fact, and a block
 /// read back out of storage carries none.
@@ -183,44 +191,41 @@ pub fn owed_leaves<S: ShardStorage>(
     let view = pending_chain.view_at(block.hash(), height);
     let state = view.served_snapshot()?;
 
-    let resolve = |wt: WeightedTimestamp| match schedule.lookup_for_shard(local_shard, wt).0 {
-        ScheduleLookup::Committee(snapshot) => Some(snapshot.shard_trie().clone()),
-        ScheduleLookup::NotYetCommitted | ScheduleLookup::Evicted => None,
-    };
-    let bridged = |wt: WeightedTimestamp| {
-        schedule
-            .live_committee(local_shard, wt)
-            .committee()
-            .map(|committee| committee.snapshot.shard_trie().clone())
-    };
-    let committee_anchor = height
-        .prev()
-        .and_then(|parent| pending_chain.certified_header(parent))
-        .map(|parent| parent.header().parent_qc().weighted_timestamp());
-    let candidates = [
-        committee_anchor.and_then(bridged),
-        committee_anchor.and_then(resolve),
-        resolve(block.header().parent_qc().weighted_timestamp()),
-        Some(schedule.head().shard_trie().clone()),
-    ];
-    let mut tried: Vec<ShardTrie> = Vec::with_capacity(candidates.len());
-    for trie in candidates.into_iter().flatten() {
-        if tried.contains(&trie) {
-            continue;
+    let epoch = certified.qc().committee_epoch();
+    let trie = match schedule.signed_committee(local_shard, epoch) {
+        BlockResolution::Committee(committee) => committee.snapshot.shard_trie(),
+        BlockResolution::NotYetCommitted => return None,
+        BlockResolution::Evicted => {
+            let own_anchor = block.header().parent_qc().weighted_timestamp();
+            match schedule.lookup_for_shard(local_shard, own_anchor).0 {
+                ScheduleLookup::Committee(snapshot) => snapshot.shard_trie(),
+                ScheduleLookup::NotYetCommitted | ScheduleLookup::Evicted => {
+                    warn!(
+                        local_shard = local_shard.inner(),
+                        target_shard = target_shard.inner(),
+                        block_height = height.inner(),
+                        epoch = epoch.inner(),
+                        "Provision request: the block's windows are evicted; serving none"
+                    );
+                    return None;
+                }
+            }
         }
-        let requests = requests_under(&trie, block, local_shard, target_shard);
-        let owed = Owed::of(&state, &requests, target_shard);
-        if owed.root() == Some(claimed) {
-            return Some(Owing::Leaves(OwedLeaves::new(owed.leaves().to_vec(), trie)));
-        }
-        tried.push(trie);
+    };
+    let requests = requests_under(trie, block, local_shard, target_shard);
+    let owed = Owed::of(&state, &requests, target_shard);
+    if owed.root() == Some(claimed) {
+        return Some(Owing::Leaves(OwedLeaves::new(
+            owed.leaves().to_vec(),
+            trie.clone(),
+        )));
     }
     warn!(
         local_shard = local_shard.inner(),
         target_shard = target_shard.inner(),
         block_height = height.inner(),
-        candidates = tried.len(),
-        "Provision request: no routing walks to the block's own root; serving none"
+        epoch = epoch.inner(),
+        "Provision request: the block's routing does not walk to its own root; serving none"
     );
     None
 }
@@ -375,6 +380,7 @@ mod tests {
     use hyperscale_provisions::provision_tx_roots;
     use hyperscale_storage::test_helpers::{
         commit_settled_at, make_test_block_with_anchor_wt, make_test_certified,
+        make_test_certified_signed,
     };
     use hyperscale_storage::{
         ChainEntry, ChainWrites, JmtSnapshot, MemberInputs, ParentAnchor, PreparedBlockView,
@@ -390,7 +396,7 @@ mod tests {
         Epoch, EpochWindows, FrontierInputs, NetworkDefinition, PrincipalAddr, ProvisionTxRoot,
         ProvisionTxRootsMap, RecoveryCause, ShardRecovery, SubstateEntry, SubstateKey,
         SweepFrontier, TimestampRange, TopologySnapshot, Transaction, TxHash, ValidatorSet,
-        Verifiable, provision_leaf, served_digest,
+        Verifiable, WeightedTimestamp, provision_leaf, served_digest,
     };
 
     use super::*;
@@ -793,11 +799,11 @@ mod tests {
 
     /// What a surviving source owes [`PAYER_SHARD`] for its first block
     /// anchored past the cut, whose transaction reads a cell here for a
-    /// payer there. Its proposer classified it under its parent's anchor,
-    /// before the cut, so its header names the payer shard as it stood.
-    /// The parent, anchored before the cut, is held when `parent_held`;
-    /// otherwise the block is the chain's first past genesis, whose
-    /// header this store does not hold.
+    /// payer there. Its committee signed the window before the cut, where
+    /// its proposer classified it, so its header names the payer shard as
+    /// it stood. The parent, anchored before the cut, is held when
+    /// `parent_held`; otherwise the block is the chain's first past
+    /// genesis, whose header this store does not hold.
     fn owed_at_the_cut(parent_held: bool) -> Option<Owing> {
         let schedule = payer_shard_grown_at_1000();
         assert_eq!(
@@ -812,6 +818,7 @@ mod tests {
             &schedule,
             parent_held.then_some(500),
             1_500,
+            Epoch::new(0),
             &ShardTrie::uniform(1),
             PAYER_SHARD,
         )
@@ -821,15 +828,16 @@ mod tests {
     const PAYER: PrincipalAddr = PrincipalAddr::new([0x80; 31]);
 
     /// What this node owes `target` for a committed block anchored at
-    /// `anchor_ms` whose transaction reads a cell here for [`PAYER`], its
-    /// header's roots routed under `classified`. Its parent, anchored at
-    /// `parent_anchor_ms`, is held when that is given; otherwise the block
-    /// is the chain's first past genesis, whose header this store does
-    /// not hold.
+    /// `anchor_ms` and certified under `signed`, whose transaction reads a
+    /// cell here for [`PAYER`], its header's roots routed under
+    /// `classified`. Its parent, anchored at `parent_anchor_ms`, is held
+    /// when that is given; otherwise the block is the chain's first past
+    /// genesis, whose header this store does not hold.
     fn owed_of_block(
         schedule: &TopologySchedule,
         parent_anchor_ms: Option<u64>,
         anchor_ms: u64,
+        signed: Epoch,
         classified: &ShardTrie,
         target: ShardId,
     ) -> Option<Owing> {
@@ -859,7 +867,7 @@ mod tests {
         assert!(roots.contains_key(&target));
         commit_settled_at(
             &*storage,
-            &make_test_certified(block_committing(height, anchor_ms, &tx, roots)),
+            &make_test_certified_signed(block_committing(height, anchor_ms, &tx, roots), signed),
             &[],
             &[],
             &witness,
@@ -882,33 +890,93 @@ mod tests {
     }
 
     /// A surviving source's block at the cut where its target grows is
-    /// served under the committee anchor, the one routing that names the
-    /// target as the header does: the block's own anchor and the head
-    /// both route its transaction to a child.
+    /// served under the window its committee signed, the one routing
+    /// that names the target as the header does: the block's own anchor
+    /// and the head both route its transaction to a child.
     #[test]
-    fn a_block_at_the_cut_where_its_target_grows_serves_under_its_committee_anchor() {
+    fn a_block_at_the_cut_where_its_target_grows_serves_under_its_signed_window() {
         let Some(Owing::Leaves(owed)) = owed_at_the_cut(true) else {
-            panic!("the committee anchor's routing matches the header")
+            panic!("the signed window's routing matches the header")
         };
+        assert_eq!(owed.trie, ShardTrie::uniform(1));
         assert_eq!(owed.count().count, 1);
     }
 
-    /// With the parent's header not held, the committee anchor is not a
-    /// candidate, and the routings left do not match the header.
+    /// The signed window is read off the block's own QC, so a block whose
+    /// parent's header this store does not hold serves all the same.
     #[test]
-    fn a_block_whose_parent_header_is_absent_skips_the_committee_anchor() {
-        assert!(owed_at_the_cut(false).is_none());
+    fn a_block_whose_parent_header_is_absent_serves_under_its_signed_window() {
+        let Some(Owing::Leaves(owed)) = owed_at_the_cut(false) else {
+            panic!("the signed window needs no parent header")
+        };
+        assert_eq!(owed.trie, ShardTrie::uniform(1));
+    }
+
+    /// Three windows of one trie, [`PAYER_SHARD`] whole in each, with
+    /// every window below `floor` evicted.
+    fn uniform_evicted_below(floor: Epoch) -> TopologySchedule {
+        let uniform = snapshot_of(&ShardTrie::uniform(1));
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1000),
+            Epoch::new(0),
+            Arc::clone(&uniform),
+        );
+        schedule.insert(Epoch::new(1), Arc::clone(&uniform));
+        schedule.insert(Epoch::new(2), Arc::clone(&uniform));
+        schedule.set_head(Epoch::new(2), uniform);
+        schedule.evict_below(floor);
+        schedule
+    }
+
+    /// A block signed under an evicted window, anchored in a window still
+    /// held, is served under its own anchor's routing once that walks to
+    /// the header's root: a chain that stalled across the floor.
+    #[test]
+    fn an_evicted_signed_window_serves_under_the_retained_own_anchor() {
+        let schedule = uniform_evicted_below(Epoch::new(1));
+        let trie = ShardTrie::uniform(1);
+        let Some(Owing::Leaves(owed)) = owed_of_block(
+            &schedule,
+            Some(500),
+            1_500,
+            Epoch::new(0),
+            &trie,
+            PAYER_SHARD,
+        ) else {
+            panic!("the own anchor's routing matches the header")
+        };
+        assert_eq!(owed.trie, trie);
+    }
+
+    /// A block whose signed window and own anchor's window are both
+    /// evicted answers nothing, though the head would route it as the
+    /// header does: its parts are past their deadline, and the requester
+    /// takes the empty answer as "not held".
+    #[test]
+    fn a_block_whose_windows_are_evicted_answers_none() {
+        let schedule = uniform_evicted_below(Epoch::new(2));
+        assert!(
+            owed_of_block(
+                &schedule,
+                Some(500),
+                1_500,
+                Epoch::new(0),
+                &ShardTrie::uniform(1),
+                PAYER_SHARD,
+            )
+            .is_none()
+        );
     }
 
     /// The first block past a halt recovery extends the halted tip, so
-    /// its committee anchor sits below the bridge and its proposer
-    /// classified it under the window the fresh committee was seated in,
-    /// where [`PAYER_SHARD`] has grown. Neither the committee anchor's own
-    /// window, nor the block's own (past the bridge, where the payer shard
-    /// has merged back), nor the head names the target the header does;
-    /// the bridged committee anchor does, and serves.
+    /// its committee anchor sits below the bridge and its committee
+    /// signed the window the fresh committee was seated in, where
+    /// [`PAYER_SHARD`] has grown and the proposer classified it. Neither
+    /// the committee anchor's own window, nor the block's own (past the
+    /// bridge, where the payer shard has merged back), nor the head names
+    /// the target the header does; the signed window does, and serves.
     #[test]
-    fn a_block_past_a_recovery_bridge_serves_under_the_bridged_committee() {
+    fn a_block_past_a_recovery_bridge_serves_under_its_signed_window() {
         let grown = ShardTrie::from_leaves([LOCAL, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
         let recovering = |trie: &ShardTrie| {
             Arc::new(
@@ -938,10 +1006,15 @@ mod tests {
         let target = ShardId::leaf(2, 2);
         assert_eq!(grown.shard_for_prefix(PAYER.address()), target);
 
-        let Some(Owing::Leaves(owed)) =
-            owed_of_block(&schedule, Some(2_500), 22_500, &grown, target)
-        else {
-            panic!("the bridged committee anchor's routing matches the header")
+        let Some(Owing::Leaves(owed)) = owed_of_block(
+            &schedule,
+            Some(2_500),
+            22_500,
+            Epoch::new(21),
+            &grown,
+            target,
+        ) else {
+            panic!("the signed window's routing matches the header")
         };
         assert_eq!(owed.trie, grown);
         assert_eq!(owed.count().count, 1);

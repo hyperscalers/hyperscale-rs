@@ -319,6 +319,11 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
 /// require the verified marker.
 #[must_use]
 pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
+    make_test_qc_signed(block, Epoch::GENESIS)
+}
+
+/// [`make_test_qc`] signed under `committee_epoch`.
+fn make_test_qc_signed(block: &Block, committee_epoch: Epoch) -> Verified<QuorumCertificate> {
     // SAFETY: synthetic test fixture, no real signature.
     Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
         block.hash(),
@@ -326,7 +331,7 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
         block.height(),
         block.header().parent_block_hash(),
         Round::INITIAL,
-        Epoch::GENESIS,
+        committee_epoch,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
@@ -343,7 +348,16 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
 /// the helper precludes by construction.
 #[must_use]
 pub fn make_test_certified(block: Block) -> Arc<Verified<CertifiedBlock>> {
-    let qc = make_test_qc(&block);
+    make_test_certified_signed(block, Epoch::GENESIS)
+}
+
+/// [`make_test_certified`] with its QC signed under `committee_epoch`.
+#[must_use]
+pub fn make_test_certified_signed(
+    block: Block,
+    committee_epoch: Epoch,
+) -> Arc<Verified<CertifiedBlock>> {
+    let qc = make_test_qc_signed(&block, committee_epoch);
     let certified = CertifiedBlock::new_unchecked(block, qc);
     // SAFETY: synthetic test fixture; storage round-trip tests don't
     // exercise the `Verified<CertifiedBlock>` predicate.
