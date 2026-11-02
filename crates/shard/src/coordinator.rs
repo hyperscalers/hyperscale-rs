@@ -4694,6 +4694,9 @@ impl ShardCoordinator {
     /// cannot reach it through a claim; the halt harvest is what carries it
     /// there, from the retained ex-members' timeouts.
     ///
+    /// A window below the one the tip's committee anchor resolves is left
+    /// out: the claim's block extends the tip, so it anchors there or
+    /// later, and recoveries only raise the window its committee signs.
     /// A window the beacon has not committed yet is left out until it has,
     /// an evicted one for good, and one that seats nobody here always: its
     /// quorum is empty.
@@ -4703,6 +4706,13 @@ impl ShardCoordinator {
         qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
         if !topology_schedule.fence_admits(self.local_shard, qc.committee_epoch()) {
+            return None;
+        }
+        let floor = topology_schedule
+            .resolve_for_shard(self.local_shard, self.committed_block_anchor_wt)
+            .committee()
+            .map(|committee| committee.epoch);
+        if floor.is_some_and(|floor| qc.committee_epoch() < floor) {
             return None;
         }
         let committee = self
@@ -19810,6 +19820,33 @@ mod tests {
         assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
         let (_, verifications) = answer_sync_claims_counted(&mut state, &schedule, &actions);
         assert_eq!(verifications, 1);
+    }
+
+    /// A block above the tip anchors at or past the tip's anchor, and no
+    /// committee signs below the window it resolves there, so a claim
+    /// signed under an older window the schedule still holds starts no
+    /// check. One signed under the tip's window does.
+    #[test]
+    fn a_claim_signed_below_the_tips_window_is_not_checked() {
+        let (mut state, schedule, keys, epochs) = claim_epochs();
+        state.committed_height = BlockHeight::new(10);
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(2 * CLAIM_ED + 50);
+
+        let retired = qc_signed_by(&keys, &epochs[1], Epoch::new(1), 20, 2 * CLAIM_ED + 100);
+        let actions = state.sync_to_certified_block(
+            &schedule,
+            &Verifiable::from(retired),
+            Carrier::Proposer(ValidatorId::new(4)),
+        );
+        assert_eq!(sync_claim_count(&actions), 0, "{actions:?}");
+
+        let current = qc_signed_by(&keys, &epochs[2], Epoch::new(2), 20, 2 * CLAIM_ED + 100);
+        let actions = state.sync_to_certified_block(
+            &schedule,
+            &Verifiable::from(current),
+            Carrier::Proposer(ValidatorId::new(8)),
+        );
+        assert_eq!(sync_claim_count(&actions), 1, "{actions:?}");
     }
 
     /// A snap-seated tip anchors on a stand-in, and a QC over it is

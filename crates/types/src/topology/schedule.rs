@@ -766,7 +766,8 @@ impl TopologySchedule {
     /// [`lookup_for_shard`](Self::lookup_for_shard) with the epoch of the
     /// window resolved: the anchor's window, or the shard's terminal
     /// window where the anchor's no longer carries it.
-    fn resolve_for_shard(&self, shard: ShardId, wt: WeightedTimestamp) -> BlockResolution<'_> {
+    #[must_use]
+    pub fn resolve_for_shard(&self, shard: ShardId, wt: WeightedTimestamp) -> BlockResolution<'_> {
         match self.lookup_snapshot(wt) {
             ScheduleLookup::Committee(snapshot) if !snapshot.shard_trie().contains(shard) => self
                 .terminal_window(shard, wt)
