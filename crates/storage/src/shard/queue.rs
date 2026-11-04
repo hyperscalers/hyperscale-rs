@@ -647,4 +647,156 @@ mod tests {
         let (next, _) = class_span(key, PinClass::Movement);
         assert!(hi < next);
     }
+
+    mod pin_index {
+        use hyperscale_types::{Hash, SubstateKey};
+        use proptest::collection::vec;
+        use proptest::option;
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// One collection's entries, read by range.
+        struct Stored(BTreeMap<u128, Vec<u8>>);
+
+        impl Substates for Stored {
+            fn cell(&self, _key: SubstateKey) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn entries_in_range(
+                &self,
+                _owner: Address,
+                _collection: CollectionId,
+                lo: u128,
+                hi: u128,
+                limit: usize,
+            ) -> Vec<(u128, Vec<u8>)> {
+                if lo > hi {
+                    return Vec::new();
+                }
+                self.0
+                    .range(lo..=hi)
+                    .take(limit)
+                    .map(|(order, bytes)| (*order, bytes.clone()))
+                    .collect()
+            }
+        }
+
+        /// Three keys: the first two share a bucket, the third has its
+        /// own.
+        fn key(at: u8) -> PinKey {
+            let mut key = [0x40; 16];
+            if at == 2 {
+                key[0] = 0x41;
+            }
+            key[15] = at;
+            PinKey(key)
+        }
+
+        fn tx(at: u8) -> TxHash {
+            TxHash::from(Hash::from_bytes(&[at; 32]))
+        }
+
+        /// An entry: which key, class and place, and which members it
+        /// names, by a mask over the keys sharing its bucket.
+        type Drawn = (u8, u8, u8, u8, u8);
+
+        fn entry((at, class, height, rank, member): Drawn) -> (u128, QueueValue) {
+            let class = PinClass::ALL[usize::from(class % 4)];
+            let place = Place {
+                height: BlockHeight::new(u64::from(height % 4)),
+                rank: u16::from(rank % 4),
+            };
+            let key = key(at % 3);
+            let mut named = vec![(key, tx(member))];
+            if at % 3 < 2 && member % 2 == 0 {
+                // The bucket's other key, beside it in one value.
+                named.push((self::key(1 - at % 3), tx(member)));
+            }
+            named.sort();
+            (
+                queue_order(key, class, place),
+                Capped::new(named).expect("two at most"),
+            )
+        }
+
+        proptest! {
+            /// Over any stored entries and any writes over them, the
+            /// earliest entry naming a key and every member named below
+            /// a place are what a scan of the merged collection reads,
+            /// whether the collection is read whole or sought, and keys
+            /// sharing a bucket never answer for each other.
+            #[test]
+            fn probes_match_a_scan(
+                stored in vec((0u8..3, 0u8..4, 0u8..4, 0u8..4, 0u8..4), 0..12),
+                writes in vec(((0u8..3, 0u8..4, 0u8..4, 0u8..4, 0u8..4), any::<bool>()), 0..12),
+                asks in vec((0u8..3, 0u8..4, option::of((0u8..4, 0u8..4))), 1..12),
+                sought in any::<bool>(),
+            ) {
+                let mut held: BTreeMap<u128, Vec<u8>> = stored
+                    .into_iter()
+                    .map(entry)
+                    .map(|(order, value)| (order, to_vec(&value).expect("encodes")))
+                    .collect();
+                if sought {
+                    // Past what a fold reads whole, far from every key.
+                    for at in 0..=WHOLE_READ as u128 {
+                        held.insert((0xF0u128 << 120) | at, Vec::new());
+                    }
+                }
+                let state = Stored(held.clone());
+                let mut index = PinIndex::new(
+                    &MemberFamily::of(ShardId::ROOT),
+                    MemberCollection::Queue,
+                );
+                let mut merged: BTreeMap<u128, QueueValue> = held
+                    .iter()
+                    .filter_map(|(order, bytes)| Some((*order, from_slice(bytes).ok()?)))
+                    .collect();
+                let mut asks = asks.into_iter();
+                for (drawn, keep) in writes {
+                    let (order, value) = entry(drawn);
+                    if keep {
+                        index.set(order, Some(value.clone()));
+                        merged.insert(order, value);
+                    } else {
+                        index.set(order, None);
+                        merged.remove(&order);
+                    }
+                    // Ask between writes too, so kept answers are moved on.
+                    if let Some((at, class, _)) = asks.next() {
+                        let key = key(at);
+                        let span = class_span(key, PinClass::ALL[usize::from(class)]);
+                        let scanned = merged
+                            .range(span.0..=span.1)
+                            .find(|(_, value)| value.iter().any(|(at, _)| *at == key))
+                            .map(|(order, _)| *order);
+                        prop_assert_eq!(index.first(&state, key, span), scanned);
+                    }
+                }
+                for (at, class, below) in asks {
+                    let key = key(at);
+                    let class = PinClass::ALL[usize::from(class)];
+                    let span = class_span(key, class);
+                    let below = below.map(|(height, rank)| {
+                        queue_order(
+                            key,
+                            class,
+                            Place {
+                                height: BlockHeight::new(u64::from(height)),
+                                rank: u16::from(rank),
+                            },
+                        )
+                    });
+                    let scanned: BTreeSet<TxHash> = merged
+                        .range(span.0..=span.1)
+                        .filter(|(order, _)| below.is_none_or(|below| **order < below))
+                        .flat_map(|(_, value)| value.iter().filter(|(at, _)| *at == key).map(|(_, tx)| *tx).collect::<Vec<_>>())
+                        .collect();
+                    prop_assert_eq!(index.naming(&state, key, span, below), scanned);
+                }
+            }
+        }
+    }
 }
