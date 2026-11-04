@@ -3001,7 +3001,7 @@ impl ShardCoordinator {
         let views = sibling_views(hearing_rows(&ancestry.rows), topology_schedule, anchor);
         legs_licensed(&ancestry.rows, &pending, block.certificates(), &views)?;
         let mut rows = ancestry.rows.clone();
-        rows.advance(&pending);
+        rows.advance_content(&pending);
         // The end lines closing a block of member lines are the
         // proposer's to carry or leave out, so they are split off and
         // licensed apart, as is each exit of a stated row among the

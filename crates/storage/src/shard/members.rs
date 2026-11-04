@@ -66,8 +66,9 @@ use crate::Substates;
 use crate::shard::crossings::record_arrivals;
 use crate::shard::fee_holds::FeeTerms;
 use crate::shard::queue::{
-    AWAITED_RANK, Head, PinIndex, PinsChunk, Place, RowEntries, pin_chunks, queue_order, row_pins,
-    shared_standing, tick_of_pins, tick_pins_order, tick_pins_span,
+    AWAITED_RANK, Head, PinIndex, PinMemo, PinsChunk, Place, RowEntries, WAITER_RANK, class_span,
+    pin_chunks, queue_order, shared_standing, tick_of_pins, tick_pins_order, tick_pins_span,
+    waiter_span,
 };
 use crate::shard::sweep::committed_tx_cell_key;
 use crate::shard::writes::{entry_leaf_value, fold_state_writes};
@@ -1129,9 +1130,9 @@ struct Working<'s, S: ?Sized> {
     queue: PinIndex,
     /// The `Waiters` collection, likewise.
     waiters: PinIndex,
-    /// Each row's pins here, derived at most once per row the fold
-    /// leaves as it is.
-    row_pins: BTreeMap<u128, Pins>,
+    /// Each row's pins here, derived again only where what they are
+    /// taken off changes.
+    pins: PinMemo,
     /// The `Behind` entries the fold changed, likewise.
     behind: BTreeMap<u128, Option<TxHash>>,
     /// Each tick's pins as the fold leaves them, decoded at most once.
@@ -1159,7 +1160,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             staged: BTreeMap::new(),
             queue: PinIndex::new(family, MemberCollection::Queue),
             waiters: PinIndex::new(family, MemberCollection::Waiters),
-            row_pins: BTreeMap::new(),
+            pins: PinMemo::new(shard),
             behind: BTreeMap::new(),
             tick_pins: BTreeMap::new(),
             every_tick_pins: false,
@@ -1224,7 +1225,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             self.set_tick(height, owes.then_some(tick));
         }
         self.reindex(held.as_ref(), row.as_ref());
-        self.row_pins.remove(&order);
         self.members.insert(order, row);
         self.changed_members.insert(order);
     }
@@ -1236,8 +1236,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         {
             return;
         }
-        let was = RowEntries::of(left, self.shard);
-        let is = RowEntries::of(entered, self.shard);
+        let was = self.pins.entries(left);
+        let is = self.pins.entries(entered);
         for order in was.queue.keys() {
             if !is.queue.contains_key(order) {
                 self.queue.set(*order, None);
@@ -1272,26 +1272,21 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// The pins of the row standing for `tx` here, as the fold leaves
     /// it; none where no row stands.
     fn pins_of_row(&mut self, tx: TxHash) -> Pins {
-        let order = member_order(tx);
-        if let Some(pins) = self.row_pins.get(&order) {
-            return pins.clone();
+        if self.peek(tx).is_none() {
+            return Capped::empty();
         }
-        let pins = self
-            .member(tx)
-            .map_or_else(Capped::empty, |row| row_pins(&row, self.shard));
-        self.row_pins.insert(order, pins.clone());
-        pins
+        let row = self.members[&member_order(tx)]
+            .as_ref()
+            .expect("a row standing");
+        self.pins.pins(row)
     }
 
     /// The modes every standing waiter pins on `key`, unioned: a claim
     /// refuses one of them exactly where it refuses the union, since the
     /// relation reads one candidate mode bit per clause.
     fn waiter_modes(&mut self, key: PinKey) -> Modes {
-        let mut waiters = BTreeSet::new();
-        for class in [PinClass::Read, PinClass::Movement, PinClass::Write] {
-            waiters.extend(self.waiters.naming(self.state, key, class, None));
-        }
-        waiters
+        self.waiters
+            .naming(self.state, key, waiter_span(key), None)
             .into_iter()
             .flat_map(|tx| self.pins_of_row(tx).to_vec())
             .filter(|pin| pin.key == key)
@@ -1331,6 +1326,24 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 
     /// Write the tick at `height`'s pins, or delete them with `None`.
     fn set_tick_pins(&mut self, height: BlockHeight, pins: Option<Arc<Vec<Pin>>>) {
+        if pins.is_none() && !self.tick_pins.contains_key(&height) && !self.every_tick_pins {
+            // Deleting pins never decoded: whether any stand is enough.
+            let (lo, hi) = tick_pins_span(height);
+            let (owner, collection) = (
+                self.family.owner(),
+                self.family.id(MemberCollection::TickPins),
+            );
+            if !self
+                .state
+                .entries_in_range(owner, collection, lo, hi, 1)
+                .is_empty()
+            {
+                self.dirty = true;
+                self.tick_pins.insert(height, None);
+                self.changed_tick_pins.insert(height);
+            }
+            return;
+        }
         if self.tick_pins(height) != pins {
             if pins.is_none() {
                 self.dirty = true;
@@ -1354,7 +1367,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 if pin.modes.refused_by(class)
                     && self
                         .queue
-                        .first(self.state, pin.key, class)
+                        .first(self.state, pin.key, class_span(pin.key, class))
                         .is_some_and(|first| first < queue_order(pin.key, class, place))
                 {
                     return false;
@@ -1448,7 +1461,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 
     /// Place the shared rows the block places, test each for head, and
     /// set the refusals placing them and the block's determined commits
-    /// first show. Answers with how many it placed.
+    /// first show.
     ///
     /// The rows placed are each shared row the block commits that pays
     /// the fee here or waits on no record, and each one whose last record
@@ -1467,7 +1480,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         committed: BTreeSet<TxHash>,
         completed: BTreeSet<TxHash>,
         determined: &[(TxHash, Pins)],
-    ) -> u16 {
+    ) {
         let mut candidates: BTreeSet<TxHash> = committed.into_iter().chain(completed).collect();
         candidates.extend(self.stand_line_runs(inputs, stated));
         let local = self.shard;
@@ -1496,7 +1509,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             self.try_head(tx, inputs);
         }
         self.refusals(inputs, &placed, determined);
-        u16::try_from(placed.len()).expect("a block places within a rank's width")
     }
 
     /// Stand each shared transaction the block commits and runs on no
@@ -1604,10 +1616,14 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         };
         let mut waited: BTreeMap<PinKey, Modes> = BTreeMap::new();
         let mut blocked = BTreeSet::new();
+        let waiting = !self.waiters.is_empty(self.state);
         for &tx in placed {
             let place = self.peek(tx).and_then(|row| row.queued);
             for pin in self.pins_of_row(tx).iter() {
                 ask(pin, place);
+                if !waiting {
+                    continue;
+                }
                 if let Entry::Vacant(slot) = waited.entry(pin.key) {
                     slot.insert(self.waiter_modes(pin.key));
                 }
@@ -1616,13 +1632,19 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 }
             }
         }
-        for (_, pins) in determined {
-            for pin in pins.iter() {
-                ask(pin, None);
+        // A quiet queue refuses no determined commit.
+        if !self.queue.is_empty(self.state) {
+            for (_, pins) in determined {
+                for pin in pins.iter() {
+                    ask(pin, None);
+                }
             }
         }
         for ((key, class), bound) in below {
-            blocked.extend(self.queue.naming(self.state, key, class, bound));
+            blocked.extend(
+                self.queue
+                    .naming(self.state, key, class_span(key, class), bound),
+            );
         }
         for tx in blocked {
             self.block(tx, inputs.committed);
@@ -1630,9 +1652,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     }
 
     /// Give each determined row the block commits and leaves `Pending` a
-    /// place behind the block's shared places, ranked in hash order
-    /// among every determined member the block commits.
-    fn wait(&mut self, inputs: &MemberInputs, determined: &[(TxHash, Pins)], placed: u16) {
+    /// place behind the block's shared places, ranked from
+    /// [`WAITER_RANK`] in hash order among every determined member the
+    /// block commits.
+    fn wait(&mut self, inputs: &MemberInputs, determined: &[(TxHash, Pins)]) {
         for (at, (tx, _)) in determined.iter().enumerate() {
             let Some(mut row) = self.member(*tx) else {
                 continue;
@@ -1646,10 +1669,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             if !waits {
                 continue;
             }
-            let rank = usize::from(placed) + at;
             row.queued = Some(Place {
                 height: inputs.height,
-                rank: u16::try_from(rank).expect("a block's places fit a rank's width"),
+                rank: WAITER_RANK
+                    + u16::try_from(at).expect("a block's commits fit a rank's width"),
             });
             self.set_member(*tx, Some(row));
         }
@@ -2201,7 +2224,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// [`MAX_UNSETTLED_TXS`]: hyperscale_types::MAX_UNSETTLED_TXS
     /// [`MAX_HOLDS_PER_MEMBER`]: hyperscale_types::MAX_HOLDS_PER_MEMBER
     /// [`MAX_DECLARED_RESERVE`]: hyperscale_types::MAX_DECLARED_RESERVE
-    fn into_writes(self, writes: &mut SettledEntries) {
+    fn into_writes(mut self, writes: &mut SettledEntries) {
         self.pins_writes(writes);
         let family = self.family;
         let mut moved: BTreeMap<u128, (u128, u128)> = BTreeMap::new();
@@ -2259,8 +2282,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             {
                 index_writes(
                     family,
-                    &RowEntries::of(held.as_ref(), self.shard),
-                    &RowEntries::of(row, self.shard),
+                    &self.pins.entries(held.as_ref()),
+                    &self.pins.entries(row),
                     writes,
                 );
             }
@@ -2486,7 +2509,25 @@ pub(crate) fn owed_by_entries(terms: &[StatedTerms]) -> BTreeMap<TxHash, Owes> {
 /// reserve of it, which no state this fold wrote does.
 #[must_use]
 pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -> SettledEntries {
-    fold(state, &MemberFamily::of(inputs.shard), inputs, None).0
+    fold(
+        state,
+        &MemberFamily::of(inputs.shard),
+        inputs,
+        None,
+        Pass::Block,
+    )
+    .0
+}
+
+/// What a fold takes a block's inputs as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// The block whole, as committed or carried.
+    Block,
+    /// A block's content ahead of its lines, which a fold of the block
+    /// with them follows: the determined members it commits take their
+    /// waiter places there, so this fold gives them none.
+    Content,
 }
 
 /// [`member_writes`], beside what the block's rows heard of its claims
@@ -2498,6 +2539,7 @@ fn fold(
     family: &MemberFamily,
     inputs: &MemberInputs,
     pins: Option<&DecodedPins>,
+    pass: Pass,
 ) -> (SettledEntries, HeardCells, PinChanges) {
     let mut family = Working::new(state, inputs.shard, family);
     if let Some(pins) = pins {
@@ -2553,9 +2595,11 @@ fn fold(
     }
     let completed = family.arrive(&inputs.arrivals);
     let determined = determined_commits(inputs, &stated);
-    let placed = family.place(inputs, &stated, committed, completed, &determined);
+    family.place(inputs, &stated, committed, completed, &determined);
     family.name(inputs);
-    family.wait(inputs, &determined, placed);
+    if pass == Pass::Block {
+        family.wait(inputs, &determined);
+    }
     let heard = family.hear(&inputs.heard);
 
     let (mut fated, mut ended) = (Vec::new(), Vec::new());
@@ -2948,7 +2992,25 @@ impl MemberIndex {
     /// If a written row fails to decode, which a row this fold encoded
     /// cannot.
     pub fn advance(&mut self, inputs: &MemberInputs) -> HeardCells {
-        let (writes, heard, pinned) = fold(&*self, &self.family, inputs, Some(&self.tick_pins));
+        self.advance_as(inputs, Pass::Block)
+    }
+
+    /// Fold a block's content in ahead of its lines, as a proposer
+    /// names them and a voter judges them: [`Self::advance`], except that
+    /// the determined members the block commits take no waiter place,
+    /// which the fold of the block with its lines that follows gives
+    /// them as one fold of the block does.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::advance`].
+    pub fn advance_content(&mut self, inputs: &MemberInputs) -> HeardCells {
+        self.advance_as(inputs, Pass::Content)
+    }
+
+    fn advance_as(&mut self, inputs: &MemberInputs, pass: Pass) -> HeardCells {
+        let (writes, heard, pinned) =
+            fold(&*self, &self.family, inputs, Some(&self.tick_pins), pass);
         for (height, pins) in pinned {
             match pins {
                 Some(pins) => {
@@ -7882,7 +7944,7 @@ mod tests {
             assert_eq!(row(&store, later).head, None, "a read and a write of A");
             assert_eq!(
                 row(&store, 2).queued,
-                Some(at(1, 2)),
+                Some(at(1, WAITER_RANK)),
                 "a determined waiter follows the block's shared places"
             );
             assert_eq!(count(&store, MemberCollection::Queue), 3);
@@ -8317,7 +8379,7 @@ mod tests {
                 );
                 let left = MemberIndex::load(&store, LOCAL).members.remove(&tx(1));
                 assert_eq!(
-                    RowEntries::of(left.as_ref(), LOCAL),
+                    PinMemo::new(LOCAL).entries(left.as_ref()),
                     RowEntries::default(),
                     "{exit:?} leaves the leg standing nowhere"
                 );
@@ -8763,16 +8825,21 @@ mod tests {
                     let height = at as u64 + 1;
                     let next = history.block(step, height, &rows);
                     let carrying = carried(&next);
-                    let mut twice = Entries(store.0.clone());
-                    twice.fold(&MemberInputs {
+                    let content = MemberInputs {
                         manifest: Arc::new(Capped::empty()),
                         ..next
-                    });
+                    };
+                    let mut twice = Entries(store.0.clone());
+                    twice.fold(&content);
                     twice.fold(&carrying);
+                    let mut voter = rows.clone();
+                    voter.advance_content(&content);
+                    voter.advance(&carrying);
                     store.fold(&carrying);
                     prop_assert_eq!(&twice.0, &store.0, "folded twice at {}", height);
                     let before = rows.clone();
                     rows = MemberIndex::load(&store, LOCAL);
+                    prop_assert_eq!(&voter, &rows, "content then block at {}", height);
                     for row in rows.members.values() {
                         let terms = &history.terms[&row.tx];
                         if row.state == RowState::Pending && terms.settlement == Settlement::Shared {
@@ -8898,6 +8965,348 @@ mod tests {
                     prop_assert_eq!(&MemberIndex::load(&store, LOCAL), &index, "at {}", at + 1);
                 }
             }
+        }
+    }
+
+    /// What the family's writes cost a block in steady state at 4,096
+    /// three-key transfers, by shape.
+    mod write_costs {
+        use std::time::Instant;
+
+        use hyperscale_types::{DeclaredKey, LocalKey, Mode};
+        use hyperscale_vm_types::Moves;
+
+        use super::*;
+
+        const BATCH: u32 = 4_096;
+
+        const COLLECTIONS: [(MemberCollection, &str); 11] = [
+            (MemberCollection::Members, "Members"),
+            (MemberCollection::Ticks, "Ticks"),
+            (MemberCollection::Seats, "Seats"),
+            (MemberCollection::Reserved, "Reserved"),
+            (MemberCollection::Verdicts, "Verdicts"),
+            (MemberCollection::Staged, "Staged"),
+            (MemberCollection::Queue, "Queue"),
+            (MemberCollection::Waiters, "Waiters"),
+            (MemberCollection::TickPins, "TickPins"),
+            (MemberCollection::Behind, "Behind"),
+            (MemberCollection::Serves, "Serves"),
+        ];
+
+        /// A store read by range, as a tree-backed one reads.
+        #[derive(Default)]
+        struct Store(BTreeMap<EntryKey, Vec<u8>>);
+
+        impl Substates for Store {
+            fn cell(&self, _key: SubstateKey) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn entries_in_range(
+                &self,
+                owner: Address,
+                collection: CollectionId,
+                lo: u128,
+                hi: u128,
+                limit: usize,
+            ) -> Vec<(u128, Vec<u8>)> {
+                if lo > hi {
+                    return Vec::new();
+                }
+                let at = |order| EntryKey {
+                    owner,
+                    collection,
+                    order,
+                };
+                self.0
+                    .range(at(lo)..=at(hi))
+                    .take(limit)
+                    .map(|(key, bytes)| (key.order, bytes.clone()))
+                    .collect()
+            }
+        }
+
+        impl Store {
+            fn apply(&mut self, writes: &SettledEntries) {
+                for (key, change) in writes {
+                    match change {
+                        Some(bytes) => {
+                            self.0.insert(*key, bytes.clone());
+                        }
+                        None => {
+                            self.0.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn transfer(batch: u32, at: u32) -> TxHash {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&batch.to_be_bytes());
+            bytes[4..8].copy_from_slice(&at.to_be_bytes());
+            TxHash::from(Hash::from_bytes(&bytes))
+        }
+
+        fn cell(batch: u32, at: u32, slot: u8) -> SubstateKey {
+            let mut local = [slot; 16];
+            local[..4].copy_from_slice(&batch.to_be_bytes());
+            local[4..8].copy_from_slice(&at.to_be_bytes());
+            SubstateKey {
+                owner: Address::new([0x11; 31], AddressClass::Component),
+                local: LocalKey(local),
+            }
+        }
+
+        /// Transfer `at` of `batch`: a debit, a credit and its fee.
+        fn terms(batch: u32, at: u32, settlement: Settlement) -> MemberTerms {
+            let peers = if settlement.alone() {
+                Capped::empty()
+            } else {
+                Capped::from_array([PEER])
+            };
+            MemberTerms {
+                leg: false,
+                settlement,
+                declared: Capped::new(vec![
+                    (
+                        DeclaredKey::Cell(cell(batch, at, 1)),
+                        Mode::Delta { moves: Moves::Out },
+                    ),
+                    (
+                        DeclaredKey::Cell(cell(batch, at, 2)),
+                        Mode::Delta { moves: Moves::In },
+                    ),
+                    (
+                        DeclaredKey::Cell(cell(batch, at, 3)),
+                        Mode::Delta { moves: Moves::Out },
+                    ),
+                ])
+                .expect("three keys"),
+                reach: peers.clone(),
+                awaits: peers,
+                engages: Capped::empty(),
+                crossings: Capped::empty(),
+                waits: false,
+                charge: AbortCharge {
+                    vault: cell(batch, at, 3),
+                    amount: 1,
+                },
+                share: 0,
+                reserves: Capped::empty(),
+                staged: 0,
+            }
+        }
+
+        fn far() -> Deadline {
+            Deadline::of(WeightedTimestamp::from_millis(90_000_000))
+        }
+
+        fn line(batch: u32, at: u32, settlement: Settlement) -> TickLine {
+            let terms = terms(batch, at, settlement);
+            TickLine::Member {
+                tx: transfer(batch, at),
+                joins: Joins::Executes,
+                settlement,
+                holds: if settlement.alone() {
+                    Capped::empty()
+                } else {
+                    terms.declared.clone()
+                },
+                pins: if settlement.alone() {
+                    pins_of(&terms.declared, LOCAL)
+                } else {
+                    Capped::empty()
+                },
+                reach: terms.reach,
+                awaits: terms.awaits,
+                charge: terms.charge,
+                share: 0,
+                reserves: Capped::empty(),
+                staged: 0,
+                deadline: far(),
+                crossings: Capped::empty(),
+            }
+        }
+
+        /// How the shape moves its transfers through a block.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Shape {
+            /// Each block commits a batch of determined transfers and
+            /// runs them, and settles the batch before.
+            RunWhereCommitted,
+            /// Each block commits a batch of determined transfers, names
+            /// the batch before, and settles the one before that.
+            NamedALater,
+            /// Each block commits a batch of shared transfers paying here,
+            /// names the batch before, states the one before that,
+            /// accepts the next older, and ends the oldest.
+            Shared,
+        }
+
+        /// The block at `height` of `shape`: its content, folded first
+        /// by a proposer or voter, and the block as carried.
+        fn block_at(shape: Shape, height: u64) -> (MemberInputs, MemberInputs) {
+            let batch = u32::try_from(height).expect("a short run");
+            let settlement = if shape == Shape::Shared {
+                Settlement::Shared
+            } else {
+                Settlement::Alone
+            };
+            let mut next = MemberInputs {
+                height: BlockHeight::new(height),
+                committed: WeightedTimestamp::from_millis(height * 1_000),
+                ..MemberInputs::still(LOCAL)
+            };
+            for at in 0..BATCH {
+                next.transactions.push((transfer(batch, at), far()));
+                next.terms.push(StatedTerms {
+                    tx: transfer(batch, at),
+                    terms: terms(batch, at, settlement),
+                });
+            }
+            let named = if shape == Shape::RunWhereCommitted {
+                batch
+            } else {
+                batch - 1
+            };
+            let mut lines: Vec<TickLine> = (0..BATCH)
+                .filter(|_| named > 0)
+                .map(|at| line(named, at, settlement))
+                .collect();
+            let older = |back: u32| (batch > back).then(|| batch - back);
+            let batch_of = |of: u32| (0..BATCH).map(move |at| transfer(of, at));
+            let tick = |of: u32, by: u32| TickId::new(LOCAL, BlockHeight::new(u64::from(of + by)));
+            match shape {
+                Shape::RunWhereCommitted | Shape::NamedALater => {
+                    let settled = if shape == Shape::RunWhereCommitted {
+                        older(1)
+                    } else {
+                        older(2)
+                    };
+                    if let Some(of) = settled {
+                        let ran = u32::from(shape != Shape::RunWhereCommitted);
+                        next.settled.push(SettledHalf {
+                            tick: tick(of, ran),
+                            half: TickHalf::Determined,
+                            deleted: batch_of(of).collect(),
+                            accepted: Vec::new(),
+                            stated: Vec::new(),
+                        });
+                    }
+                }
+                Shape::Shared => {
+                    if let Some(of) = older(2) {
+                        next.settled.push(SettledHalf {
+                            tick: tick(of, 1),
+                            half: TickHalf::Stated,
+                            deleted: Vec::new(),
+                            accepted: Vec::new(),
+                            stated: batch_of(of)
+                                .map(|tx| yes_receipt(tx, GlobalReceiptHash::from_raw(Hash::ZERO)))
+                                .collect(),
+                        });
+                    }
+                    if let Some(of) = older(3) {
+                        next.settled.push(SettledHalf {
+                            tick: tick(of, 1),
+                            half: TickHalf::Legs,
+                            deleted: Vec::new(),
+                            accepted: batch_of(of).collect(),
+                            stated: Vec::new(),
+                        });
+                    }
+                    if let Some(of) = older(4) {
+                        lines.extend(batch_of(of).map(|tx| TickLine::End { tx }));
+                    }
+                }
+            }
+            let content = next.clone();
+            next.manifest = Arc::new(Capped::new(lines).expect("within the line cap"));
+            (content, carried(&next))
+        }
+
+        /// What one fold wrote, per collection: entries and bytes.
+        fn tally(writes: &SettledEntries) -> BTreeMap<&'static str, (usize, usize)> {
+            let mut tallied = BTreeMap::new();
+            for (key, change) in writes {
+                let Some((_, name)) = COLLECTIONS
+                    .iter()
+                    .find(|(kind, _)| kind.of(LOCAL).1 == key.collection)
+                else {
+                    continue;
+                };
+                let (entries, bytes) = tallied.entry(*name).or_insert((0, 0));
+                *entries += 1;
+                *bytes += change.as_ref().map_or(0, Vec::len);
+            }
+            tallied
+        }
+
+        /// Runs `shape` to its steady state and reports the block that
+        /// reaches it: what its commit writes, how long that fold takes,
+        /// and what the content fold a proposer or voter runs first
+        /// writes to its index and takes.
+        fn steady(shape: Shape) -> BTreeMap<&'static str, (usize, usize)> {
+            let mut store = Store::default();
+            let mut index = MemberIndex::empty(LOCAL);
+            let last = 6;
+            for height in 1..last {
+                let (_, carried) = block_at(shape, height);
+                store.apply(&member_writes(&store, &carried));
+                index.advance(&carried);
+            }
+            let (content, carried) = block_at(shape, last);
+            let started = Instant::now();
+            let writes = member_writes(&store, &carried);
+            let commit = started.elapsed();
+            let tallied = tally(&writes);
+            let (entries, bytes) = tallied
+                .values()
+                .fold((0, 0), |(e, b), (entries, bytes)| (e + entries, b + bytes));
+            println!("{shape:?}: {entries} entries, {bytes} bytes, commit fold {commit:?}");
+            for (name, (entries, bytes)) in &tallied {
+                println!("  {name}: {entries} entries, {bytes} bytes");
+            }
+            let (first, ..) = fold(
+                &index,
+                &MemberFamily::of(LOCAL),
+                &content,
+                Some(&index.tick_pins),
+                Pass::Content,
+            );
+            let mut voter = index.clone();
+            let started = Instant::now();
+            voter.advance_content(&content);
+            let content_fold = started.elapsed();
+            let started = Instant::now();
+            voter.advance(&carried);
+            let carried_fold = started.elapsed();
+            println!(
+                "  content fold: {:?} {content_fold:?}; carried fold {carried_fold:?}",
+                tally(&first)
+            );
+            tallied
+        }
+
+        #[test]
+        fn steady_state_member_writes_per_block() {
+            let run = steady(Shape::RunWhereCommitted);
+            for name in ["Queue", "Waiters", "Behind", "Serves"] {
+                assert_eq!(
+                    run.get(name),
+                    None,
+                    "a run where committed writes no {name}"
+                );
+            }
+            assert_eq!(
+                run.get("TickPins").map(|(entries, _)| *entries),
+                Some(2),
+                "one tick's pins written and one deleted"
+            );
+            steady(Shape::NamedALater);
+            steady(Shape::Shared);
         }
     }
 }

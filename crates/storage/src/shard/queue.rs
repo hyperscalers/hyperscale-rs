@@ -8,7 +8,7 @@
 //!   counterpart shares the verdict on, from its place until the row is
 //!   accepted, deleted, released or aborted; and of each leg in flight
 //!   on awaited terms, from the line running it until it leaves its tick.
-//! - `Waiters`: the same per pin of each determined row standing
+//! - `Waiters`: one entry per pin of each determined row standing
 //!   `Pending` with a place, until a line names it or it leaves.
 //! - `TickPins`: the pins a tick's determined lines take, unioned per
 //!   key, while its determined half is owed.
@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_hbor::{Capped, Hbor, from_slice};
 use hyperscale_types::{
-    Address, BlockHeight, CollectionId, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK,
+    Address, BlockHeight, CollectionId, Holds, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK,
     MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MemberCollection, MemberFamily, Pin, PinClass,
     PinKey, Pins, Settlement, ShardId, TxHash, WeightedTimestamp, member_order, pins_of,
 };
@@ -103,6 +103,21 @@ fn class_base(key: PinKey, class: PinClass) -> u128 {
     (u128::from(key.bucket()) << 64) | ((class as u128) << 62)
 }
 
+/// The order key of a waiter's `Waiters` entry for `key` at `place`:
+/// `bucket:64 ‖ 0:2 ‖ height:46 ‖ rank:16`, one per pin whatever its
+/// modes, since what a waiter is refused on is read off its row.
+#[must_use]
+pub fn waiter_order(key: PinKey, place: Place) -> u128 {
+    (u128::from(key.bucket()) << 64) | u128::from(place.packed())
+}
+
+/// The order keys of every waiter's place on `key`.
+#[must_use]
+pub fn waiter_span(key: PinKey) -> (u128, u128) {
+    let base = u128::from(key.bucket()) << 64;
+    (base, base | ((1u128 << 62) - 1))
+}
+
 /// The order key of a row's `Serves` entry: `height:64 ‖ rank:64`.
 #[must_use]
 pub fn serves_order(head: Head) -> u128 {
@@ -143,13 +158,53 @@ pub fn pin_chunks(pins: &[Pin]) -> Vec<PinsChunk> {
         .collect()
 }
 
-/// What a row declares on `local`, as its pins: what it waits on while
-/// `Pending`, and what it holds after.
-#[must_use]
-pub fn row_pins(row: &MemberRow, local: ShardId) -> Pins {
+/// What a row's pins are taken off: what it waits on while `Pending`,
+/// and what it holds after.
+const fn pinned_holds(row: &MemberRow) -> &Holds {
     match (&row.state, &row.waiting) {
-        (RowState::Pending, Some(waiting)) => pins_of(&waiting.declared, local),
-        _ => pins_of(&row.holds, local),
+        (RowState::Pending, Some(waiting)) => &waiting.declared,
+        _ => &row.holds,
+    }
+}
+
+/// Each row's pins as a fold derives them, kept per row beside what
+/// they were derived from: a row is rewritten several times a fold, and
+/// its pins move only where what they are taken off does.
+pub struct PinMemo {
+    local: ShardId,
+    held: BTreeMap<u128, (Holds, Pins)>,
+}
+
+impl PinMemo {
+    /// No pins derived yet, on `local`.
+    #[must_use]
+    pub const fn new(local: ShardId) -> Self {
+        Self {
+            local,
+            held: BTreeMap::new(),
+        }
+    }
+
+    /// `row`'s pins.
+    pub fn pins(&mut self, row: &MemberRow) -> Pins {
+        let source = pinned_holds(row);
+        let order = member_order(row.tx);
+        if let Some((held, pins)) = self.held.get(&order)
+            && held == source
+        {
+            return pins.clone();
+        }
+        let pins = pins_of(source, self.local);
+        self.held.insert(order, (source.clone(), pins.clone()));
+        pins
+    }
+
+    /// The entries `row` implies.
+    pub fn entries(&mut self, row: Option<&MemberRow>) -> RowEntries {
+        let pins = row
+            .filter(|row| row.queued.is_some())
+            .map(|row| self.pins(row));
+        RowEntries::of_pinned(row, pins.as_ref())
     }
 }
 
@@ -175,8 +230,15 @@ pub fn shared_standing(row: &MemberRow) -> bool {
 /// leg stands behind them on its block's height.
 pub const AWAITED_RANK: u16 = 1 << 15;
 
+/// The first rank a block gives the determined members it commits and
+/// leaves waiting: past every shared place the block takes, which are at
+/// most the rows standing and the block's own commits, so a waiter's
+/// rank is the same whichever fold of the block places it.
+pub const WAITER_RANK: u16 = 1 << 14;
+
 const _: () = assert!(
-    MAX_UNSETTLED_PER_BLOCK + MAX_TXS_PER_BLOCK <= AWAITED_RANK as usize
+    MAX_UNSETTLED_PER_BLOCK + MAX_TXS_PER_BLOCK <= WAITER_RANK as usize
+        && WAITER_RANK as usize + MAX_TXS_PER_BLOCK <= AWAITED_RANK as usize
         && MAX_TICK_LINES_PER_BLOCK <= (u16::MAX - AWAITED_RANK) as usize
 );
 
@@ -228,15 +290,15 @@ pub struct RowEntries {
 }
 
 impl RowEntries {
-    /// What `row` implies on `local`; nothing where no row stands or the
-    /// row has no place.
+    /// What `row` implies where `pins` are its pins; nothing where no
+    /// row stands or the row has no place.
     ///
     /// # Panics
     ///
     /// Never: a member's entries under one key are at most its pins.
     #[must_use]
-    pub fn of(row: Option<&MemberRow>, local: ShardId) -> Self {
-        let Some(row) = row.filter(|row| row.queued.is_some()) else {
+    pub fn of_pinned(row: Option<&MemberRow>, pins: Option<&Pins>) -> Self {
+        let (Some(row), Some(pins)) = (row.filter(|row| row.queued.is_some()), pins) else {
             return Self::default();
         };
         let (shared, holding, waiting) = (
@@ -248,9 +310,15 @@ impl RowEntries {
             return Self::default();
         }
         let place = row.queued.expect("filtered on a place");
-        let pins = row_pins(row, local);
         let mut keyed_entries: BTreeMap<u128, Vec<(PinKey, TxHash)>> = BTreeMap::new();
         for pin in pins.iter() {
+            if waiting {
+                keyed_entries
+                    .entry(waiter_order(pin.key, place))
+                    .or_default()
+                    .push((pin.key, row.tx));
+                continue;
+            }
             for class in PinClass::ALL {
                 if pin.modes.stands_in(class) {
                     keyed_entries
@@ -286,7 +354,7 @@ impl RowEntries {
             behind: row.head.is_none().then(|| (member_order(row.tx), row.tx)),
             serves: row
                 .head
-                .filter(|_| keyed(&pins))
+                .filter(|_| keyed(pins))
                 .map(|head| (serves_order(head), row.tx)),
             waiters: BTreeMap::new(),
         }
@@ -304,11 +372,12 @@ const PAGE: usize = 8;
 /// One of the queue's pin collections, `Queue` or `Waiters`, as a fold
 /// leaves it so far: the stored entries under the fold's own writes.
 ///
-/// A fold asks of a key and class either for its earliest entry or for
-/// every entry below a place. The earliest stored entry is found once
-/// per key and class and kept; the fold only ever overwrites more, so a
-/// kept answer moves forward and never back, and the stored entries of
-/// one key are walked at most once per fold. A collection holding at
+/// A fold asks of a key's span, one class of it in `Queue` and the whole
+/// of it in `Waiters`, either for its earliest entry or for every entry
+/// below a place. The earliest stored entry is found once per key and
+/// span and kept; the fold only ever overwrites more, so a kept answer
+/// moves forward and never back, and the stored entries of one span are
+/// walked at most once per fold. A collection holding at
 /// most [`WHOLE_READ`] entries is read whole the first time it is asked
 /// about, so a quiet queue costs one read however many keys a block
 /// touches.
@@ -321,10 +390,13 @@ pub struct PinIndex {
     gone: BTreeSet<u128>,
     /// The stored collection, where it was read whole.
     whole: Whole,
-    /// Per key and class, the earliest stored entry naming the key that
-    /// the fold had not overwritten when last asked; `None` where none
-    /// stands.
-    first: BTreeMap<(PinKey, PinClass), Option<u128>>,
+    /// Per key and span, by the span's first order key, the earliest
+    /// stored entry naming the key that the fold had not overwritten
+    /// when last asked; `None` where none stands.
+    first: BTreeMap<(PinKey, u128), Option<u128>>,
+    /// Per bucket asked about, whether the stored collection holds no
+    /// entry in it.
+    bare: BTreeMap<u64, bool>,
 }
 
 /// What a fold holds of a stored pin collection read whole.
@@ -353,6 +425,7 @@ impl PinIndex {
             gone: BTreeSet::new(),
             whole: Whole::Unread,
             first: BTreeMap::new(),
+            bare: BTreeMap::new(),
         }
     }
 
@@ -400,6 +473,28 @@ impl PinIndex {
         }
     }
 
+    /// Whether the stored collection holds no entry in `key`'s bucket:
+    /// one read per bucket a fold asks about, answering every span of
+    /// it, which is how a key nobody else stands on is answered.
+    fn bare(&mut self, state: &(impl Substates + ?Sized), key: PinKey) -> bool {
+        let bucket = key.bucket();
+        if let Some(&bare) = self.bare.get(&bucket) {
+            return bare;
+        }
+        let lo = u128::from(bucket) << 64;
+        let bare = self
+            .stored(state, lo, lo | u128::from(u64::MAX), 1)
+            .is_empty();
+        self.bare.insert(bucket, bare);
+        bare
+    }
+
+    /// Whether the collection holds no entry at all, as the fold leaves
+    /// it so far.
+    pub fn is_empty(&mut self, state: &(impl Substates + ?Sized)) -> bool {
+        self.live.is_empty() && self.stored(state, 0, u128::MAX, 1).is_empty()
+    }
+
     /// The earliest stored entry in `from..=hi` naming `key` that the
     /// fold has not overwritten.
     fn seek(
@@ -425,23 +520,29 @@ impl PinIndex {
         }
     }
 
-    /// The order key of the earliest entry naming `key` in `class`.
+    /// The order key of the earliest entry naming `key` in `span`, one
+    /// of `key`'s spans.
     pub fn first(
         &mut self,
         state: &(impl Substates + ?Sized),
         key: PinKey,
-        class: PinClass,
+        span: (u128, u128),
     ) -> Option<u128> {
-        let (lo, hi) = class_span(key, class);
-        let stored = match self.first.get(&(key, class)) {
-            Some(&Some(order)) if !self.overlaid(order) => Some(order),
-            Some(None) => None,
-            Some(&Some(order)) => order
-                .checked_add(1)
-                .and_then(|from| self.seek(state, key, from, hi)),
-            None => self.seek(state, key, lo, hi),
+        let (lo, hi) = span;
+        let stored = if self.bare(state, key) {
+            None
+        } else {
+            let stored = match self.first.get(&(key, lo)) {
+                Some(&Some(order)) if !self.overlaid(order) => Some(order),
+                Some(None) => None,
+                Some(&Some(order)) => order
+                    .checked_add(1)
+                    .and_then(|from| self.seek(state, key, from, hi)),
+                None => self.seek(state, key, lo, hi),
+            };
+            self.first.insert((key, lo), stored);
+            stored
         };
-        self.first.insert((key, class), stored);
         let live = self
             .live
             .range(lo..=hi)
@@ -453,16 +554,16 @@ impl PinIndex {
         }
     }
 
-    /// Every member with an entry naming `key` in `class`, below the
-    /// order key `below` where one is given.
+    /// Every member with an entry naming `key` in `span`, one of `key`'s
+    /// spans, below the order key `below` where one is given.
     pub fn naming(
         &mut self,
         state: &(impl Substates + ?Sized),
         key: PinKey,
-        class: PinClass,
+        span: (u128, u128),
         below: Option<u128>,
     ) -> BTreeSet<TxHash> {
-        let (lo, mut hi) = class_span(key, class);
+        let (lo, mut hi) = span;
         if let Some(below) = below {
             if below <= lo {
                 return BTreeSet::new();
@@ -470,7 +571,7 @@ impl PinIndex {
             hi = hi.min(below - 1);
         }
         let mut found = BTreeSet::new();
-        let Some(lo) = self.first(state, key, class).filter(|first| *first <= hi) else {
+        let Some(lo) = self.first(state, key, span).filter(|first| *first <= hi) else {
             return found;
         };
         for (order, bytes) in self.stored(state, lo, hi, usize::MAX) {

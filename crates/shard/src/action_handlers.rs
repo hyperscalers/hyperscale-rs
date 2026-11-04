@@ -690,7 +690,7 @@ impl Naming<'_> {
             ),
         );
         let mut rows = self.parent.clone();
-        rows.advance(&pending);
+        rows.advance_content(&pending);
         let (lines, contended, proven) = match self.manifest.kind {
             ManifestKind::Members => {
                 let victims = wounded(&rows, self.anchor, self.claims);
