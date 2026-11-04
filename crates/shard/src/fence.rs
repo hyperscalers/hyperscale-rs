@@ -24,8 +24,8 @@
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Block, BoundaryAttestation, CounterpartMirror, ProvenAnchors,
-    ShardId, StateClaim, TopologySchedule, WeightedTimestamp,
+    AbandonmentRecord, Anchor, Block, BoundaryAttestation, CounterpartMirror, MAX_VALIDITY_RANGE,
+    ProvenAnchors, ShardId, StateClaim, TopologySchedule, WeightedTimestamp,
 };
 
 use crate::precut::{Precut, PrecutStatus};
@@ -290,6 +290,14 @@ impl VoteFence<'_> {
     /// rather than deferring on the first unresolved transaction it
     /// meets.
     ///
+    /// The line is the block's own anchor. One anchored
+    /// `MAX_VALIDITY_RANGE` or more past the cut passes here: no window
+    /// it can carry opens before the cut, and the body root check refuses
+    /// one that claims to. Below it a right child that has stopped asking
+    /// defers, so a leader extending a QC older than this validator's
+    /// high QC cannot carry a pre-cut transaction past a guard this
+    /// validator's own clock retired.
+    ///
     /// Provisions are left out. A batch carries its *source* shard's
     /// weighted timestamp where the cut is in this chain's, so a rule
     /// written on that comparison would refuse honest batches near the
@@ -301,6 +309,9 @@ impl VoteFence<'_> {
     /// A transaction the parent's terminal state marks committed, or one
     /// not yet answered for.
     pub(crate) fn precut(&self, block: &Block) -> Result<(), Withheld> {
+        if block.header().parent_qc().weighted_timestamp() >= self.cut.plus(MAX_VALIDITY_RANGE) {
+            return Ok(());
+        }
         let mut deferred = None;
         for tx in block
             .transactions()

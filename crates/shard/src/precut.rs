@@ -9,9 +9,17 @@
 //! asks for each one by a state proof against the parent's terminal
 //! root.
 //!
-//! Nothing here applies to a chain older than `MAX_VALIDITY_RANGE`. That
-//! is the widest a validity window gets, so no transaction a chain of
-//! that age can be offered opens before its origin.
+//! Nothing here applies to a block anchored `MAX_VALIDITY_RANGE` or more
+//! past its chain's origin. That is the widest a validity window gets, so
+//! no transaction such a block can carry opens before the origin. The
+//! line is the judged block's anchor, never a node's own progress: a
+//! leader may extend a QC older than a voter's high QC, and a block
+//! anchored below the line can still carry a pre-cut transaction.
+//!
+//! One level of asking is enough. The beacon's scheduling rule puts two
+//! cuts on one lineage at least `MAX_VALIDITY_RANGE` apart on the epoch
+//! grid, so a transaction a successor can be offered opens after its
+//! parent's own origin, and only the parent can have committed it.
 
 use std::collections::HashMap;
 
@@ -36,15 +44,15 @@ pub enum PrecutStatus {
 /// Where this chain reads the answer for a transaction older than it.
 #[derive(Debug, Clone, Default)]
 pub enum Precut {
-    /// The chains this one succeeds are not yet known here, so a
-    /// transaction older than the chain is not proposed and a vote on one
-    /// defers. A chain born at network genesis sits here for good, and
-    /// nothing is older than it.
+    /// Nothing answers for a transaction older than the chain: the
+    /// chains this one succeeds are not yet known here, or a right child
+    /// has stopped asking its parent. Such a transaction is not proposed
+    /// and a vote on one defers. A chain born at network genesis sits
+    /// here for good, and nothing is older than it.
     #[default]
-    Awaiting,
+    Unanswered,
     /// Every predecessor's markers are in this chain's own state: a left
-    /// child's, a merged parent's, and every chain's once the rule has
-    /// retired.
+    /// child's and a merged parent's.
     Local,
     /// A split's right child, asking the parent's terminal state.
     Remote {
@@ -66,7 +74,7 @@ impl Precut {
     #[must_use]
     pub(crate) fn adopted(local_shard: ShardId, predecessors: &[Anchor]) -> Self {
         match predecessors {
-            [] => Self::Awaiting,
+            [] => Self::Unanswered,
             [parent] if parent.shard.children().1 == local_shard => Self::Remote {
                 terminal: *parent,
                 answers: HashMap::new(),
@@ -75,10 +83,10 @@ impl Precut {
         }
     }
 
-    /// Whether the chains this one succeeds are still unknown here.
+    /// Whether nothing answers here yet.
     #[must_use]
-    pub(crate) const fn is_awaiting(&self) -> bool {
-        matches!(self, Self::Awaiting)
+    pub(crate) const fn is_unanswered(&self) -> bool {
+        matches!(self, Self::Unanswered)
     }
 
     /// The terminal a right child asks, while it still asks.
@@ -86,14 +94,16 @@ impl Precut {
     pub(crate) const fn terminal(&self) -> Option<Anchor> {
         match self {
             Self::Remote { terminal, .. } => Some(*terminal),
-            Self::Awaiting | Self::Local => None,
+            Self::Unanswered | Self::Local => None,
         }
     }
 
-    /// Stop asking once the rule has retired: nothing on offer opens
-    /// before the cut from there on, so no answer is consulted again.
+    /// Stop asking and drop the answers. A right child's state still
+    /// holds none of the parent's markers, so a pre-cut transaction it
+    /// meets afterwards, which only a block anchored below the line can
+    /// carry, defers rather than passes.
     pub(crate) fn retire(&mut self) {
-        *self = Self::Local;
+        *self = Self::Unanswered;
     }
 
     /// Record what a proof against `terminal` says of `key`. Ignored
@@ -114,7 +124,7 @@ impl Precut {
     #[must_use]
     pub(crate) fn status(&self, tx_hash: TxHash, validity_end: WeightedTimestamp) -> PrecutStatus {
         match self {
-            Self::Awaiting => PrecutStatus::Unresolved,
+            Self::Unanswered => PrecutStatus::Unresolved,
             Self::Local => PrecutStatus::Absent,
             Self::Remote { terminal, answers } => {
                 match answers.get(&committed_tx_cell_key(
@@ -209,15 +219,15 @@ mod tests {
             Precut::adopted(parent, &[terminal(left), terminal(right)]),
             Precut::Local
         ));
-        assert!(Precut::adopted(right, &[]).is_awaiting());
+        assert!(Precut::adopted(right, &[]).is_unanswered());
     }
 
-    /// Awaiting resolves nothing; Local passes everything on to the
+    /// Unanswered resolves nothing; Local passes everything on to the
     /// marker rule.
     #[test]
-    fn awaiting_defers_and_local_passes() {
+    fn unanswered_defers_and_local_passes() {
         assert_eq!(
-            Precut::Awaiting.status(tx(1), END),
+            Precut::Unanswered.status(tx(1), END),
             PrecutStatus::Unresolved
         );
         assert_eq!(Precut::Local.status(tx(1), END), PrecutStatus::Absent);
@@ -272,12 +282,20 @@ mod tests {
         assert!(Precut::Local.outstanding([(tx(2), END)]).is_empty());
     }
 
-    /// Retiring stops the asking and leaves the marker rule.
+    /// Retiring stops the asking and forgets the answers, including one
+    /// that refused: the right child's own state never held the parent's
+    /// markers, so what it meets afterwards defers.
     #[test]
-    fn retiring_leaves_the_local_rule() {
-        let (_, mut precut) = right_child();
+    fn retiring_forgets_the_answers_and_defers() {
+        let (terminal, mut precut) = right_child();
+        precut.record(
+            terminal,
+            committed_tx_cell_key(terminal.shard, tx(1), END),
+            true,
+        );
         precut.retire();
         assert!(precut.terminal().is_none());
-        assert_eq!(precut.status(tx(1), END), PrecutStatus::Absent);
+        assert_eq!(precut.status(tx(1), END), PrecutStatus::Unresolved);
+        assert!(!precut.admissible(tx(1), END));
     }
 }

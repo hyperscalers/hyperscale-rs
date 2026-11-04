@@ -1823,7 +1823,10 @@ impl ShardCoordinator {
     ///
     /// A property of the chain rather than of what this node holds — which
     /// is what makes it the right gate for *acquiring* the predecessors,
-    /// where [`Self::precut_rule_live`] would be circular.
+    /// where [`Self::precut_rule_live`] would be circular. It decides only
+    /// whether to keep asking. What a block may carry is judged against
+    /// that block's own anchor, and a leader extending an older QC
+    /// anchors below this node's high QC.
     #[must_use]
     pub(crate) fn precut_window_open(&self) -> bool {
         !self.chain_origin.born_at_network_genesis()
@@ -1846,14 +1849,14 @@ impl ShardCoordinator {
     /// validator rotated onto the successor committee afterwards, or a
     /// snap-synced joiner — none of which run a reshape duty.
     ///
-    /// Runs only while the window is open and only while nothing is
-    /// adopted, so it neither displaces what the flip delivered nor undoes
-    /// a retirement. Returns whether anything was adopted.
+    /// Runs only while nothing answers here, so it never displaces what
+    /// the flip delivered, and only while the window is open, which a
+    /// retired rule is already past. Returns whether anything was adopted.
     pub(crate) fn adopt_precut_predecessors(
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> bool {
-        if !self.precut.is_awaiting() || !self.precut_window_open() {
+        if !self.precut.is_unanswered() || !self.precut_window_open() {
             return false;
         }
         let predecessors =
@@ -1925,7 +1928,9 @@ impl ShardCoordinator {
     }
 
     /// Stop asking once the rule has retired, so neither the terminal nor
-    /// its answers are held for this coordinator's life.
+    /// its answers are held for this coordinator's life. A pre-cut
+    /// transaction met afterwards defers: only a block anchored below the
+    /// line can carry one, and that block is a stale fork.
     ///
     /// The caller drives it, because forgetting the terminal is also what
     /// stops it releasing the query slots it holds: the release is a
@@ -10772,6 +10777,72 @@ mod tests {
         assert_eq!(state.precut_terminal(), None);
     }
 
+    /// Retiring is this node's clock, but what a block may carry is its
+    /// own anchor's. A leader extending a QC older than the voter's high
+    /// QC can still anchor below `cut + MAX_VALIDITY_RANGE` and carry a
+    /// transaction that opened before the cut and that the parent
+    /// committed. A retired right child holds none of the parent's
+    /// markers, so the vote defers on it rather than passing it to a
+    /// marker rule that never reads the parent's owner.
+    #[test]
+    fn a_retired_right_child_defers_a_pre_cut_tx_anchored_below_the_line() {
+        let cut = WeightedTimestamp::from_millis(10_000);
+        let line = cut.plus(MAX_VALIDITY_RANGE);
+        let mut state = make_successor(cut, line);
+
+        let opens = WeightedTimestamp::from_millis(cut.as_millis() - 1_000);
+        let range = TimestampRange::new(opens, opens.plus(MAX_VALIDITY_RANGE));
+        let tx = test_utils::stub_transaction(
+            test_utils::test_principal(7),
+            &[test_utils::test_prefix(7)],
+            1_000,
+            range,
+        );
+        state.record_precut_proof(
+            parent_terminal(),
+            &[(
+                parent_marker((tx.hash(), range.end_timestamp_exclusive)),
+                true,
+            )],
+        );
+        assert!(state.retire_precut());
+
+        let carrying = |height: u64, parent: &[u8], anchored_ms: u64| {
+            let mut block = block_on_chained_on(
+                PARENT.children().1,
+                BlockHeight::new(height),
+                BlockHash::from_raw(Hash::from_bytes(parent)),
+                anchored_ms,
+            );
+            if let Block::Live { transactions, .. } = &mut block {
+                *transactions = Arc::new(
+                    Capped::new(vec![Verifiable::from(tx.clone())]).expect("one transaction fits"),
+                );
+            }
+            block
+        };
+
+        let older_fork = carrying(11, b"older parent", line.as_millis() - 2_000);
+        let anchor = older_fork.header().parent_qc().weighted_timestamp();
+        assert!(
+            range.is_well_formed(anchor) && range.contains(anchor),
+            "the transaction is still offerable at the older fork's anchor"
+        );
+        assert!(
+            matches!(
+                state.vote_fence().precut(&older_fork),
+                Err(Withheld::Deferred { .. })
+            ),
+            "a pre-cut transaction the parent committed passes the retired guard"
+        );
+
+        // At the line the window has closed: the precut rule has nothing
+        // to judge, and the body root check refuses the expired range.
+        let at_line = carrying(12, b"high parent", line.as_millis());
+        assert!(!range.contains(at_line.header().parent_qc().weighted_timestamp()));
+        assert!(state.vote_fence().precut(&at_line).is_ok());
+    }
+
     /// An answered key drops out; its sibling stays owed.
     #[test]
     fn an_answered_key_is_no_longer_outstanding() {
@@ -10844,7 +10915,7 @@ mod tests {
 
         let mut state = successor_holding(right, cut, now, Vec::new());
         assert!(
-            state.precut.is_awaiting(),
+            state.precut.is_unanswered(),
             "holding nothing, the strict refusal stands"
         );
         assert!(state.precut_window_open(), "but the window is still open");
@@ -10890,7 +10961,7 @@ mod tests {
 
         assert!(!state.precut_window_open());
         assert!(!state.adopt_precut_predecessors(&sched));
-        assert!(state.precut.is_awaiting());
+        assert!(state.precut.is_unanswered());
     }
 
     #[test]
