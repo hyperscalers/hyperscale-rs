@@ -89,8 +89,8 @@ pub use shard::sweep::{
     without_colliding_committed_cells,
 };
 pub use shard::tick_chain::{
-    ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewPoints,
-    TickViewSnapshot, declared_reservations,
+    ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewSnapshot,
+    declared_reservations,
 };
 pub use shard::unresolved::{ReplayWindow, replay_cutoff, replay_window, unresolved_replay_floor};
 pub use shard::vote_registers::{SafeVoteRegisterStore, carry_signed_rounds};

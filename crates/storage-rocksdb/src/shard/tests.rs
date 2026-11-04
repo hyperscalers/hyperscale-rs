@@ -19,7 +19,7 @@ use hyperscale_storage::test_helpers::{
     test_a_standing_member_row_keeps_its_rows,
     test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives,
     test_a_stating_blocks_yes_receipts_prune_with_it, test_a_stored_block_keeps_its_terms,
-    test_a_successor_keeps_its_predecessors_terminal,
+    test_a_successor_keeps_its_predecessors_terminal, test_a_ticks_probe_outlives_a_raised_floor,
     test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does,
     test_chain_floor_prunes_beneath_it, test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_bundle_outlives_sealing,
@@ -165,6 +165,19 @@ fn snapshot_at_below_the_floor_panics() {
 fn historical_reads_respect_retention() {
     let (_dir, storage) = open_fresh();
     test_historical_reads_respect_retention(&storage);
+}
+
+/// The history under the anchor is collected as well as retired, so the
+/// probe answers only through what its view holds.
+#[test]
+fn a_ticks_probe_outlives_a_raised_floor() {
+    let (_dir, storage) = open_fresh();
+    test_a_ticks_probe_outlives_a_raised_floor(&storage, |storage| {
+        assert!(
+            storage.run_state_history_gc() > 0,
+            "history retired under the anchor"
+        );
+    });
 }
 
 #[test]

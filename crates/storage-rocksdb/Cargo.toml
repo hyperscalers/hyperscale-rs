@@ -17,6 +17,7 @@ rocksdb.workspace = true
 hyperscale-hbor.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+yoke.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true

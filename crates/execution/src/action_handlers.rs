@@ -16,7 +16,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     ActionContext, CrossShardExecutionRequest, ExecutionAction, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
+use hyperscale_engine::{ExecutedTx, PointReads, TickBatchContext, TickTxInput};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
@@ -284,7 +284,10 @@ where
             let view = ctx
                 .tick_chain
                 .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));
-            let view_snap = view.snapshot();
+            // One base snapshot for the batch: the pre-read and every
+            // probe past it read through it, so a probe answers at the
+            // anchor even once a floor raise lets retention pass it.
+            let view_snap = Arc::new(view.snapshot());
             // From the same view as the baseline, so a leg's debit and
             // the hold standing for it are never both visible, nor are a
             // burn and the fee hold it came out of.
@@ -297,9 +300,7 @@ where
                 env,
                 holds: &holds,
                 fee_holds: &fee_holds,
-                // Off the same view, so a probe past the pre-read reads
-                // the version the pre-read did.
-                points: Some(Arc::new(view.points())),
+                points: Some(Arc::clone(&view_snap) as Arc<dyn PointReads>),
             };
             let inputs: Vec<TickTxInput<'_>> = requests
                 .iter()
@@ -315,7 +316,7 @@ where
                 .collect();
             let executed = match ctx
                 .executor
-                .execute_tick_batch(&tick_ctx, &view_snap, &inputs)
+                .execute_tick_batch(&tick_ctx, &*view_snap, &inputs)
             {
                 Ok(executed) => executed,
                 // Nothing ran and nothing was attested, so the tick is

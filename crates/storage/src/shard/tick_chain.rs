@@ -54,7 +54,7 @@ use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::shard::fee_holds::{FeeTerms, HeldByTx, StandingFeeHolds, release_of};
 use crate::shard::members::{MemberIndex, RowState, row_state};
 use crate::shard::writes::{entry_overlay_range, fold_state_writes, merge_entry_overlay};
-use crate::{Substates, VersionedStore};
+use crate::{Anchored, Substates, VersionedStore};
 
 /// One cross-shard transaction's provisional contribution to a tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -963,7 +963,7 @@ where
         let mut released = HeldByTx::new();
         // Taken by the first fold that has a deletion to ask about, and
         // shared by the rest.
-        let mut base_at_tick: Option<S::Snapshot<'_>> = None;
+        let mut base_at_tick: Option<S::Versioned> = None;
         let mut release = |key: SubstateKey| {
             let base = base_at_tick.get_or_insert_with(|| self.base.snapshot_at(tick));
             release_of(base, key)
@@ -1054,23 +1054,15 @@ pub struct TickView<S> {
 impl<S: VersionedStore> TickView<S> {
     /// Snapshot for batch execution: the folds over the base as of this
     /// view's anchor height.
+    ///
+    /// The base snapshot is taken here and owned by what this returns,
+    /// so every read through it, a probe the batch makes long after the
+    /// pre-read included, answers at the anchor however far the base's
+    /// retention has moved since. The floor is judged only now.
     #[must_use]
-    pub fn snapshot(&self) -> TickViewSnapshot<S::Snapshot<'_>> {
+    pub fn snapshot(&self) -> TickViewSnapshot<S::Versioned> {
         TickViewSnapshot {
             base_snapshot: self.base.snapshot_at(self.anchor),
-            overlays: Arc::clone(&self.overlays),
-        }
-    }
-
-    /// The view's point reads, owned rather than borrowed, so a baseline
-    /// that outlives this call can still answer an entry no pre-read
-    /// named: the same layers over the base as of the same anchor as
-    /// [`Self::snapshot`].
-    #[must_use]
-    pub fn points(&self) -> TickViewPoints<S> {
-        TickViewPoints {
-            base: Arc::clone(&self.base),
-            anchor: self.anchor,
             overlays: Arc::clone(&self.overlays),
         }
     }
@@ -1097,7 +1089,7 @@ impl<S: VersionedStore> TickView<S> {
         &self,
         included: &[FeeTerms],
         prefix: &NibblePath,
-    ) -> StandingFeeHolds<S::Snapshot<'_>> {
+    ) -> StandingFeeHolds<S::Versioned> {
         StandingFeeHolds::new(
             self.base.snapshot_at(self.anchor),
             Arc::clone(&self.released),
@@ -1107,54 +1099,20 @@ impl<S: VersionedStore> TickView<S> {
     }
 }
 
-/// A [`TickView`]'s point reads of ordered-collection entries: the view's
-/// layers topmost first, then the base as of the view's anchor.
-///
-/// The tick chain holds the base's retention at a floor no queued tick's
-/// anchor is below ([`TickChain::prune_persisted`]), so a probe made while
-/// the tick this view is the baseline of runs still reads at the anchor.
-pub struct TickViewPoints<S> {
-    base: Arc<S>,
-    anchor: BlockHeight,
-    overlays: Arc<Vec<Arc<StateWrites>>>,
-}
-
-impl<S> std::fmt::Debug for TickViewPoints<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TickViewPoints")
-            .field("anchor", &self.anchor)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<S: VersionedStore> TickViewPoints<S> {
-    /// The entry at `order` as the view reads it.
-    #[must_use]
-    pub fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
-        let key = EntryKey {
-            owner,
-            collection,
-            order,
-        };
-        if let Some(change) = self
-            .overlays
-            .iter()
-            .rev()
-            .find_map(|layer| layer.entries.get(&key))
-        {
-            return change.clone();
-        }
-        self.base
-            .snapshot_at(self.anchor)
-            .entry(owner, collection, order)
-    }
-}
-
 /// Snapshot from a [`TickView`] — the same layers on the base storage's
 /// snapshot.
 pub struct TickViewSnapshot<Snap> {
     base_snapshot: Snap,
     overlays: Arc<Vec<Arc<StateWrites>>>,
+}
+
+impl<Snap: Anchored> std::fmt::Debug for TickViewSnapshot<Snap> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TickViewSnapshot")
+            .field("anchor", &self.base_snapshot.anchor())
+            .field("layers", &self.overlays.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
@@ -1250,6 +1208,25 @@ impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
             hi,
             limit,
         )
+    }
+
+    /// The topmost layer that reached the order key, a removal included,
+    /// and the base beneath them all: the width-one interval, read
+    /// without collapsing one.
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        let key = EntryKey {
+            owner,
+            collection,
+            order,
+        };
+        self.overlays
+            .iter()
+            .rev()
+            .find_map(|layer| layer.entries.get(&key))
+            .map_or_else(
+                || self.base_snapshot.entry(owner, collection, order),
+                Clone::clone,
+            )
     }
 }
 
@@ -1376,8 +1353,6 @@ mod tests {
     }
 
     struct StubSnapshot(HashMap<SubstateKey, Vec<u8>>, BTreeMap<EntryKey, Vec<u8>>);
-    use crate::Anchored;
-
     impl Anchored for StubSnapshot {
         fn anchor(&self) -> BlockHeight {
             BlockHeight::GENESIS
@@ -1411,15 +1386,17 @@ mod tests {
     }
 
     impl VersionedStore for StubStore {
+        type Versioned = StubSnapshot;
+
         fn retention_floor(&self) -> u64 {
             0
         }
 
-        fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        fn snapshot_held_at(&self, height: BlockHeight) -> Option<StubSnapshot> {
             (height <= self.tip).then(|| self.snapshot_at(height))
         }
 
-        fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+        fn snapshot_at(&self, height: BlockHeight) -> StubSnapshot {
             lock_or_recover(&self.anchors).push(height);
             self.at(height)
         }

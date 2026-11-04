@@ -27,7 +27,7 @@ use hyperscale_effects_bridge::{
     witness_from_event,
 };
 use hyperscale_metrics::{record_provision_range_entries_consumed, record_transaction_executed};
-use hyperscale_storage::{TickViewPoints, VersionedStore, entry_from_leaf};
+use hyperscale_storage::{Anchored, TickViewSnapshot, entry_from_leaf};
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Epoch, EscrowedValue,
     Event, EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
@@ -199,9 +199,9 @@ pub trait PointReads: Send + Sync + std::fmt::Debug {
     fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>>;
 }
 
-impl<S: VersionedStore> PointReads for TickViewPoints<S> {
+impl<Snap: Anchored + 'static> PointReads for TickViewSnapshot<Snap> {
     fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
-        Self::entry(self, owner, collection, order)
+        Substates::entry(self, owner, collection, order)
     }
 }
 

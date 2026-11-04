@@ -1291,14 +1291,14 @@ impl<S: SubstateStore + VersionedStore> SubstateView<S> {
     /// [`SubstateStore::snapshot`] would read a stale tip or panic below
     /// the retention floor.
     #[must_use]
-    pub fn served_snapshot(&self) -> Option<ViewSnapshot<S::Snapshot<'_>>> {
+    pub fn served_snapshot(&self) -> Option<ViewSnapshot<S::Versioned>> {
         self.held_base()
             .map(|base_snapshot| self.over(base_snapshot))
     }
 
     /// The base as of the anchor, where the view holds it: history at or
     /// below the base's tip, or the tip its own chain ends at.
-    fn held_base(&self) -> Option<S::Snapshot<'_>> {
+    fn held_base(&self) -> Option<S::Versioned> {
         if self.anchor_height <= (*self.base).jmt_height() {
             (*self.base).snapshot_held_at(self.anchor_height)
         } else if self
@@ -1361,7 +1361,7 @@ impl<S: SubstateStore + VersionedStore> SubstateView<S> {
 
 impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
     type Snapshot<'a>
-        = ViewSnapshot<S::Snapshot<'a>>
+        = ViewSnapshot<S::Versioned>
     where
         Self: 'a;
 
@@ -1620,15 +1620,17 @@ mod tests {
     }
 
     impl VersionedStore for StubStore {
+        type Versioned = StubSnapshot;
+
         fn retention_floor(&self) -> u64 {
             0
         }
 
-        fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        fn snapshot_held_at(&self, height: BlockHeight) -> Option<StubSnapshot> {
             (height <= self.jmt_height()).then(|| self.snapshot_at(height))
         }
 
-        fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+        fn snapshot_at(&self, height: BlockHeight) -> StubSnapshot {
             self.recorded_snapshot_at
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

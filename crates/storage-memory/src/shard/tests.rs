@@ -10,7 +10,7 @@ use hyperscale_storage::test_helpers::{
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
     test_a_recovery_anchor_reads_back, test_a_replayed_sweep_reads_what_its_block_removed,
-    test_a_stored_block_keeps_its_terms,
+    test_a_stored_block_keeps_its_terms, test_a_ticks_probe_outlives_a_raised_floor,
     test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does,
     test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_receipts_reach_state,
@@ -167,6 +167,11 @@ fn snapshot_at_below_the_floor_panics() {
 #[test]
 fn historical_reads_respect_retention() {
     test_historical_reads_respect_retention(&SimShardStorage::default());
+}
+
+#[test]
+fn a_ticks_probe_outlives_a_raised_floor() {
+    test_a_ticks_probe_outlives_a_raised_floor(&SimShardStorage::default(), |_| {});
 }
 
 #[test]

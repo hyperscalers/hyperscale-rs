@@ -6,13 +6,17 @@
 //! value is the value at V. If no such entry exists, `StateCf[K]` was
 //! stable since V and is the answer.
 
+use std::sync::Arc;
+
 use hyperscale_storage::{Anchored, Substates};
 use hyperscale_types::{BlockHeight, SubstateKey};
 use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::{DB, ReadOptions, Snapshot};
+use yoke::{Yoke, Yokeable};
 
 use super::column_families::{CfHandles, EntriesCf, EntriesHistoryCf, StateCf, StateHistoryCf};
 use super::entry_key::{EntryKeyCodec, VersionedEntryKeyCodec, entry_range_bounds, scan_entries};
+use super::retention::retention_floor;
 use crate::typed_cf::{DbCodec, HborCodec, TypedCf, get};
 
 /// Length of the version suffix on each state-history key (`u64` big-endian).
@@ -21,6 +25,7 @@ const VERSION_LEN: usize = 8;
 /// Point-in-time `RocksDB` snapshot scoped to a specific version within
 /// the retention window. Retention enforcement happens at construction
 /// in `RocksDbShardStorage::snapshot_at`.
+#[derive(Yokeable)]
 pub struct RocksDbSnapshot<'a> {
     pub(crate) snapshot: Snapshot<'a>,
     pub(crate) db: &'a DB,
@@ -30,6 +35,59 @@ pub struct RocksDbSnapshot<'a> {
     /// `version >= current_version` we take the trivial branch
     /// (direct `StateCf` read) for every operation.
     pub(crate) current_version: u64,
+}
+
+/// A [`RocksDbSnapshot`] carrying its own handle on the database, so it
+/// can outlive the borrow of the store it was taken through.
+///
+/// The `RocksDB` snapshot inside pins the sequence number it was taken
+/// at, so history collected after it was taken stays readable through
+/// it until it drops.
+pub struct OwnedSnapshot(Yoke<RocksDbSnapshot<'static>, Arc<DB>>);
+
+impl OwnedSnapshot {
+    /// The snapshot `take` builds over `db`, owning a handle on it.
+    pub(crate) fn take(db: &Arc<DB>, take: impl FnOnce(&DB) -> RocksDbSnapshot<'_>) -> Self {
+        Self(Yoke::attach_to_cart(Arc::clone(db), take))
+    }
+
+    /// Whether the store held this snapshot's version when it was taken:
+    /// at or below the tip and at or above the retention floor, both read
+    /// through the snapshot itself.
+    pub(crate) fn held(&self) -> bool {
+        let snapshot = self.0.get();
+        snapshot.version <= snapshot.current_version
+            && snapshot.version >= retention_floor(&snapshot.snapshot)
+    }
+}
+
+impl Anchored for OwnedSnapshot {
+    fn anchor(&self) -> BlockHeight {
+        self.0.get().anchor()
+    }
+}
+
+impl Substates for OwnedSnapshot {
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        self.0.get().cell(key)
+    }
+
+    fn entries_in_range(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        lo: u128,
+        hi: u128,
+        limit: usize,
+    ) -> Vec<(u128, Vec<u8>)> {
+        self.0
+            .get()
+            .entries_in_range(owner, collection, lo, hi, limit)
+    }
+
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        self.0.get().entry(owner, collection, order)
+    }
 }
 
 impl RocksDbSnapshot<'_> {

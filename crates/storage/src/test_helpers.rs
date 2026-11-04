@@ -5736,6 +5736,57 @@ pub fn test_snapshot_at_below_the_floor_panics<S: TestStore + VersionedStore>(st
     let _snapshot = storage.snapshot_at(BlockHeight::new(1));
 }
 
+/// A tick's snapshot still reads at its anchor once a crossing's floor
+/// raise lets retention pass it.
+///
+/// The raise lifts the hold above the in-flight tick's anchor, the
+/// halt's jump on the tip clock retires history up to it, and `collect`
+/// runs the backend's history collection over what retired.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_ticks_probe_outlives_a_raised_floor<S: TestStore + VersionedStore>(
+    storage: &S,
+    collect: impl Fn(&S),
+) {
+    let key = entry_key(7, 5);
+    commit_writes_at(
+        storage,
+        &make_settled_entries(7, &[(5, Some(vec![1]))]),
+        paced(1, 2),
+    );
+    commit_writes_at(
+        storage,
+        &make_settled_entries(7, &[(5, Some(vec![2]))]),
+        paced(2, 2),
+    );
+    let chain = TickChain::new(Arc::new(storage.clone()));
+    let anchor = BlockHeight::new(1);
+    let snapshot = chain.view_at(anchor).snapshot();
+
+    chain.raise_floor(BlockHeight::new(2), ShardId::leaf(0, 0));
+    for height in 3..=10u64 {
+        commit_writes_at(storage, &SettledWrites::default(), paced(height, 2));
+    }
+    assert!(
+        storage.retention_floor() > anchor.inner(),
+        "the history under the anchor retired",
+    );
+    collect(storage);
+
+    assert_eq!(
+        snapshot.entry(key.owner, key.collection, key.order),
+        Some(vec![1]),
+        "the probe reads the version the anchor names",
+    );
+    assert_eq!(
+        snapshot.entries_in_range(key.owner, key.collection, 0, u128::MAX, 4),
+        vec![(5, vec![1])],
+        "as does a range over it",
+    );
+}
+
 /// A historical read of a height outside retention answers `None`
 /// rather than panicking: the external-facing spelling.
 ///

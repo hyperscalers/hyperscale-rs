@@ -205,15 +205,17 @@ impl SubstateStore for StubBase {
 }
 
 impl VersionedStore for StubBase {
+    type Versioned = StubSnapshot;
+
     fn retention_floor(&self) -> u64 {
         0
     }
 
-    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<StubSnapshot> {
         (height <= self.jmt_height()).then(|| self.snapshot_at(height))
     }
 
-    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+    fn snapshot_at(&self, height: BlockHeight) -> StubSnapshot {
         StubSnapshot(self.cells_at(height))
     }
     fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
