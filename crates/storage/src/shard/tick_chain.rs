@@ -1910,6 +1910,97 @@ mod tests {
         );
     }
 
+    /// A point read answers what the width-one interval does, for an
+    /// entry a layer wrote, one an upper layer deleted over the base, and
+    /// one only the base holds, with the base persisted past the anchor
+    /// and moving each of them there.
+    #[test]
+    fn a_point_reads_what_its_interval_does() {
+        let owner = Address::new([3; 31], AddressClass::Component);
+        let collection = CollectionId([4; 16]);
+        let mut store = StubStore::with_cell(key(1), b"base");
+        let key = |order: u128| EntryKey {
+            owner,
+            collection,
+            order,
+        };
+        store.entries = BTreeMap::from([
+            (
+                BlockHeight::GENESIS,
+                vec![
+                    (key(1), Some(b"base one".to_vec())),
+                    (key(2), Some(b"base two".to_vec())),
+                    (key(3), Some(b"base three".to_vec())),
+                ],
+            ),
+            // Above the anchor: the settlements a lagging tick queue
+            // has persisted and the anchor must not read.
+            (
+                BlockHeight::new(9),
+                vec![
+                    (key(1), Some(b"later".to_vec())),
+                    (key(2), None),
+                    (key(3), Some(b"later".to_vec())),
+                    (key(4), Some(b"later".to_vec())),
+                ],
+            ),
+        ]);
+        let chain = TickChain::new(Arc::new(store));
+        let entry = |order: u128, value: Option<&[u8]>| {
+            let mut written = StateWrites::default();
+            written
+                .entries
+                .insert(key(order), value.map(<[u8]>::to_vec));
+            written
+        };
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: vec![
+                    (tx(1), entry(2, Some(b"one wrote"))),
+                    (tx(2), entry(3, Some(b"one wrote"))),
+                ],
+                provisional: Vec::new(),
+            },
+            &[],
+        );
+        chain.append(
+            BlockHeight::new(2),
+            TickOutput {
+                determined: vec![
+                    (tx(3), entry(2, Some(b"two wrote"))),
+                    (tx(4), entry(3, None)),
+                ],
+                provisional: Vec::new(),
+            },
+            &[],
+        );
+
+        let snapshot = chain.view_at(BlockHeight::new(2)).snapshot();
+        let interval = |order: u128| {
+            snapshot
+                .entries_in_range(owner, collection, order, order, 1)
+                .into_iter()
+                .next()
+                .map(|(_, value)| value)
+        };
+        let expected: [(u128, Option<&[u8]>); 4] = [
+            (1, Some(b"base one")),
+            (2, Some(b"two wrote")),
+            (3, None),
+            (4, None),
+        ];
+        for (order, value) in expected {
+            let point = snapshot.entry(owner, collection, order);
+            assert_eq!(point.as_deref(), value, "the point at {order}");
+            assert_eq!(
+                point,
+                interval(order),
+                "the point at {order} and its interval"
+            );
+        }
+    }
+
     /// A tick reads the base at its own height, wherever persistence
     /// sits above it. That keeps a lagging replica — which has already
     /// persisted settlements belonging to ticks it has not run — from

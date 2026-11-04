@@ -17,7 +17,9 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::{Capped, from_slice};
 use hyperscale_storage::test_helpers::block_settling;
-use hyperscale_storage::{BoundaryStore, GenesisCommit, NoFeeHolds, SubstateStore, Substates};
+use hyperscale_storage::{
+    BoundaryStore, GenesisCommit, NoFeeHolds, SubstateStore, Substates, TickChain,
+};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
@@ -118,24 +120,13 @@ fn storage_seeding(
     storage
 }
 
-/// The store's point reads at its tip, which is the snapshot a tick here
-/// executes over: each tick commits before the next one runs.
-struct TipPoints(SimShardStorage);
-
-impl std::fmt::Debug for TipPoints {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("TipPoints")
-    }
-}
-
-impl PointReads for TipPoints {
-    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
-        self.0.entry(owner, collection, order)
-    }
-}
-
-/// Execute one transaction as one tick's batch over the store's current
-/// snapshot under `env`, commit its receipts, and return them.
+/// Execute one transaction as one tick's batch under `env`, commit its
+/// receipts, and return them.
+///
+/// The batch reads a tick chain's view at the store's tip, as a node's
+/// tick does: the pre-read and every probe past it through the one
+/// snapshot. Each tick commits before the next one runs, so no layer is
+/// retained over the base.
 fn run_tick(
     executor: &Executor,
     storage: &SimShardStorage,
@@ -144,6 +135,8 @@ fn run_tick(
     tx: Transaction,
 ) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
+    let chain = TickChain::new(Arc::new(storage.clone()));
+    let snapshot = Arc::new(chain.view_at(storage.jmt_height()).snapshot());
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
@@ -151,7 +144,7 @@ fn run_tick(
         env,
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
-        points: Some(Arc::new(TipPoints(storage.clone()))),
+        points: Some(Arc::clone(&snapshot) as Arc<dyn PointReads>),
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
@@ -160,7 +153,7 @@ fn run_tick(
         .execute_batch(
             &ctx,
             PriceTable::GENESIS,
-            &storage.snapshot(),
+            &*snapshot,
             std::slice::from_ref(&verified),
         )
         .expect("the harness engine holds every package it runs");
@@ -221,15 +214,15 @@ fn holding_nf(alice: &[u128], bob: &[u128]) -> SimShardStorage {
     storage
 }
 
-/// Alice's holdings of [`NF`] seeded with instances 1 and 2.
-fn alice_holding_two() -> SimShardStorage {
-    holding_nf(&[1, 2], &[])
-}
-
 /// Alice withdraws `id` of the two she holds and deposits it with Bob.
 fn withdraw_one(id: u64) -> (SimShardStorage, ExecutedTx) {
+    withdraw_one_of(&[1, 2], id)
+}
+
+/// Alice withdraws `id` of the `held` ids and deposits it with Bob.
+fn withdraw_one_of(held: &[u128], id: u64) -> (SimShardStorage, ExecutedTx) {
     let executor = Executor::new(ExecutionMode::Serial);
-    let storage = alice_holding_two();
+    let storage = holding_nf(held, &[]);
     let mut executed = run_tick(
         &executor,
         &storage,
@@ -272,6 +265,24 @@ fn a_withdrawal_of_a_later_id_takes_it() {
     );
     assert_eq!(held_ids(&storage, principal(ALICE), NF), vec![1]);
     assert_eq!(held_ids(&storage, principal(BOB), NF), vec![2]);
+}
+
+/// An id past the lift is taken through the probe alone.
+///
+/// Alice holds 1, 2 and 3 and names 3: the declaration lifts the
+/// interval's two lowest ids, so the take finds 3 only by reading the
+/// tick view's snapshot beneath the map.
+#[test]
+fn a_withdrawal_of_an_id_past_the_lift_takes_it() {
+    let (storage, executed) = withdraw_one_of(&[1, 2, 3], 3);
+    assert!(
+        matches!(&executed.consensus, ConsensusReceipt::Succeeded { .. }),
+        "Alice holds id 3, so withdrawing it settles: {:?} {:?}",
+        executed.consensus,
+        executed.metadata
+    );
+    assert_eq!(held_ids(&storage, principal(ALICE), NF), vec![1, 2]);
+    assert_eq!(held_ids(&storage, principal(BOB), NF), vec![3]);
 }
 
 /// A filing over an id its holder already holds past the cap is refused.
