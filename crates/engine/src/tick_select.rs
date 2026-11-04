@@ -10,7 +10,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_effects_bridge::is_protocol_vault;
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_terminal_fated_hearing_rows;
 use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
@@ -20,8 +19,9 @@ use hyperscale_types::{
     MAX_STAGED_RECEIPT_BYTES, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_STAGED_BYTES, MemberTerms, Mode,
     ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, SiblingView,
     Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
-    Value, WeightedTimestamp, Window, compatible, decide, pins_of, staged_yes_bound,
-    tick_manifest_admits_block, tick_manifest_admits_members, value_of, verdict_leaf,
+    Value, WeightedTimestamp, Window, compatible, decide, is_protocol_vault, pins_of,
+    staged_yes_bound, tick_manifest_admits_block, tick_manifest_admits_members, value_of,
+    verdict_leaf,
 };
 use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};

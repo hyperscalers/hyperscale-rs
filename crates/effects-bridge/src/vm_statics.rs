@@ -608,16 +608,7 @@ pub fn vault_key(owner: impl Into<Address>, resource: ResourceAddr) -> SubstateK
     vault_cell(&ProtocolHasher, owner, resource)
 }
 
-/// Whether `key` is a principal's vault of the protocol resource: the
-/// one kind of cell a fee hold stands on.
-///
-/// A component's cell of the same resource is not one. No transaction
-/// names a component as its fee payer, so nothing is ever held against
-/// its balance.
-#[must_use]
-pub fn is_protocol_vault(key: &SubstateKey) -> bool {
-    key.owner.class() == AddressClass::Principal && *key == vault_key(key.owner, *PROTOCOL_RESOURCE)
-}
+pub use hyperscale_types::is_protocol_vault;
 
 /// The stored-authority cell under `owner` — what `securify` writes,
 /// and what the injected sign-in condition and the payer shard's
