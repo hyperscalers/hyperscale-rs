@@ -18,15 +18,16 @@
 //! Entries are a function of a row's own fields, so every collection but
 //! `TickPins` is written wherever a row's entries change, as a seat is.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_hbor::{Capped, Hbor};
+use hyperscale_hbor::{Capped, Hbor, from_slice};
 use hyperscale_types::{
-    BlockHeight, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, Pin, PinClass, PinKey, Pins, Settlement, ShardId, TxHash,
-    WeightedTimestamp, member_order, pins_of,
+    Address, BlockHeight, CollectionId, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MemberCollection, MemberFamily, Pin, PinClass,
+    PinKey, Pins, Settlement, ShardId, TxHash, WeightedTimestamp, member_order, pins_of,
 };
 
+use crate::Substates;
 use crate::shard::members::{MemberRow, RowState};
 
 /// Where a member stands in its shard's queue: the block that placed it
@@ -289,6 +290,201 @@ impl RowEntries {
                 .map(|head| (serves_order(head), row.tx)),
             waiters: BTreeMap::new(),
         }
+    }
+}
+
+/// The most entries of one pin collection a fold reads whole, in one
+/// range read, rather than seeking each key it asks about.
+const WHOLE_READ: usize = 4_096;
+
+/// The entries one seek reads at a time, walking past entries of keys
+/// sharing a bucket and entries the fold overwrote.
+const PAGE: usize = 8;
+
+/// One of the queue's pin collections, `Queue` or `Waiters`, as a fold
+/// leaves it so far: the stored entries under the fold's own writes.
+///
+/// A fold asks of a key and class either for its earliest entry or for
+/// every entry below a place. The earliest stored entry is found once
+/// per key and class and kept; the fold only ever overwrites more, so a
+/// kept answer moves forward and never back, and the stored entries of
+/// one key are walked at most once per fold. A collection holding at
+/// most [`WHOLE_READ`] entries is read whole the first time it is asked
+/// about, so a quiet queue costs one read however many keys a block
+/// touches.
+pub struct PinIndex {
+    owner: Address,
+    collection: CollectionId,
+    /// Entries the fold wrote.
+    live: BTreeMap<u128, QueueValue>,
+    /// Entries the fold deleted.
+    gone: BTreeSet<u128>,
+    /// The stored collection, where it was read whole.
+    whole: Whole,
+    /// Per key and class, the earliest stored entry naming the key that
+    /// the fold had not overwritten when last asked; `None` where none
+    /// stands.
+    first: BTreeMap<(PinKey, PinClass), Option<u128>>,
+}
+
+/// What a fold holds of a stored pin collection read whole.
+enum Whole {
+    /// Not read yet.
+    Unread,
+    /// Every entry, encoded.
+    Read(BTreeMap<u128, Vec<u8>>),
+    /// More than [`WHOLE_READ`] entries, so each read seeks.
+    TooMany,
+}
+
+/// Whether `value` holds an entry of `key`'s.
+fn names(value: &QueueValue, key: PinKey) -> bool {
+    value.iter().any(|(at, _)| *at == key)
+}
+
+impl PinIndex {
+    /// The family's `kind` collection, as the state holds it.
+    #[must_use]
+    pub const fn new(family: &MemberFamily, kind: MemberCollection) -> Self {
+        Self {
+            owner: family.owner(),
+            collection: family.id(kind),
+            live: BTreeMap::new(),
+            gone: BTreeSet::new(),
+            whole: Whole::Unread,
+            first: BTreeMap::new(),
+        }
+    }
+
+    /// Write the entry at `order`, or delete it with `None`.
+    pub fn set(&mut self, order: u128, value: Option<QueueValue>) {
+        if let Some(value) = value {
+            self.gone.remove(&order);
+            self.live.insert(order, value);
+        } else {
+            self.live.remove(&order);
+            self.gone.insert(order);
+        }
+    }
+
+    fn overlaid(&self, order: u128) -> bool {
+        self.live.contains_key(&order) || self.gone.contains(&order)
+    }
+
+    /// The stored entries in `from..=hi`, at most `limit` of them.
+    fn stored(
+        &mut self,
+        state: &(impl Substates + ?Sized),
+        from: u128,
+        hi: u128,
+        limit: usize,
+    ) -> Vec<(u128, Vec<u8>)> {
+        if matches!(self.whole, Whole::Unread) {
+            let read =
+                state.entries_in_range(self.owner, self.collection, 0, u128::MAX, WHOLE_READ + 1);
+            self.whole = if read.len() <= WHOLE_READ {
+                Whole::Read(read.into_iter().collect())
+            } else {
+                Whole::TooMany
+            };
+        }
+        match &self.whole {
+            Whole::Read(whole) => whole
+                .range(from..=hi)
+                .take(limit)
+                .map(|(order, bytes)| (*order, bytes.clone()))
+                .collect(),
+            Whole::Unread | Whole::TooMany => {
+                state.entries_in_range(self.owner, self.collection, from, hi, limit)
+            }
+        }
+    }
+
+    /// The earliest stored entry in `from..=hi` naming `key` that the
+    /// fold has not overwritten.
+    fn seek(
+        &mut self,
+        state: &(impl Substates + ?Sized),
+        key: PinKey,
+        mut from: u128,
+        hi: u128,
+    ) -> Option<u128> {
+        loop {
+            let page = self.stored(state, from, hi, PAGE);
+            for (order, bytes) in &page {
+                if !self.overlaid(*order)
+                    && from_slice::<QueueValue>(bytes).is_ok_and(|value| names(&value, key))
+                {
+                    return Some(*order);
+                }
+            }
+            if page.len() < PAGE {
+                return None;
+            }
+            from = page.last()?.0.checked_add(1)?;
+        }
+    }
+
+    /// The order key of the earliest entry naming `key` in `class`.
+    pub fn first(
+        &mut self,
+        state: &(impl Substates + ?Sized),
+        key: PinKey,
+        class: PinClass,
+    ) -> Option<u128> {
+        let (lo, hi) = class_span(key, class);
+        let stored = match self.first.get(&(key, class)) {
+            Some(&Some(order)) if !self.overlaid(order) => Some(order),
+            Some(None) => None,
+            Some(&Some(order)) => order
+                .checked_add(1)
+                .and_then(|from| self.seek(state, key, from, hi)),
+            None => self.seek(state, key, lo, hi),
+        };
+        self.first.insert((key, class), stored);
+        let live = self
+            .live
+            .range(lo..=hi)
+            .find(|(_, value)| names(value, key))
+            .map(|(order, _)| *order);
+        match (stored, live) {
+            (Some(stored), Some(live)) => Some(stored.min(live)),
+            (stored, live) => stored.or(live),
+        }
+    }
+
+    /// Every member with an entry naming `key` in `class`, below the
+    /// order key `below` where one is given.
+    pub fn naming(
+        &mut self,
+        state: &(impl Substates + ?Sized),
+        key: PinKey,
+        class: PinClass,
+        below: Option<u128>,
+    ) -> BTreeSet<TxHash> {
+        let (lo, mut hi) = class_span(key, class);
+        if let Some(below) = below {
+            if below <= lo {
+                return BTreeSet::new();
+            }
+            hi = hi.min(below - 1);
+        }
+        let mut found = BTreeSet::new();
+        let Some(lo) = self.first(state, key, class).filter(|first| *first <= hi) else {
+            return found;
+        };
+        for (order, bytes) in self.stored(state, lo, hi, usize::MAX) {
+            if self.overlaid(order) {
+                continue;
+            }
+            if let Ok(value) = from_slice::<QueueValue>(&bytes) {
+                found.extend(value.iter().filter(|(at, _)| *at == key).map(|(_, tx)| *tx));
+            }
+        }
+        for value in self.live.range(lo..=hi).map(|(_, value)| value) {
+            found.extend(value.iter().filter(|(at, _)| *at == key).map(|(_, tx)| *tx));
+        }
+        found
     }
 }
 
