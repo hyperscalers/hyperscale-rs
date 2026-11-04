@@ -127,7 +127,7 @@ pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
 /// and the seed window is a function of that epoch alone, so two shards
 /// running one core in ticks under different windows pass one window.
 ///
-/// Each epoch's window is built once into `windows` and shared by every
+/// Each epoch's window is built once into `drawn` and shared by every
 /// member clocked in it.
 ///
 /// # Panics
@@ -138,11 +138,11 @@ pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
 /// alone answers.
 fn env_at(
     ctx: &TickBatchContext<'_>,
-    windows: &mut BTreeMap<Epoch, SeedWindow>,
+    drawn: &mut BTreeMap<Epoch, SeedWindow>,
     clock: WeightedTimestamp,
 ) -> EnvInputs {
     let epoch = ctx.env.windows.epoch_for(clock);
-    let seeds = windows
+    let seeds = drawn
         .entry(epoch)
         .or_insert_with(|| {
             ctx.env
@@ -1589,10 +1589,10 @@ impl Executor {
                 (i.tx_hash, Arc::new(reads))
             })
             .collect();
-        let mut windows = BTreeMap::new();
+        let mut drawn = BTreeMap::new();
         let env_by_tx: BTreeMap<TxHash, EnvInputs> = inputs
             .iter()
-            .map(|i| (i.tx_hash, env_at(ctx, &mut windows, i.clock)))
+            .map(|i| (i.tx_hash, env_at(ctx, &mut drawn, i.clock)))
             .collect();
         let shapes: BTreeMap<TxHash, &TickTxInput<'_>> =
             inputs.iter().map(|i| (i.tx_hash, i)).collect();

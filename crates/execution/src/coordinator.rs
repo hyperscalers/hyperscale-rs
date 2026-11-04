@@ -315,8 +315,8 @@ enum SeatedSeeds {
     Held,
     /// The beacon has yet to publish these epochs' windows.
     Unpublished(BTreeSet<Epoch>),
-    /// The window of this epoch, which this node's schedule no longer
-    /// holds, so the tick is one this node cannot run.
+    /// The window of this epoch, which no ring this node's schedule holds
+    /// reaches, so the tick is one this node cannot run.
     Evicted(Epoch),
 }
 
@@ -4383,27 +4383,6 @@ impl ExecutionCoordinator {
             .collect()
     }
 
-    /// Dispatch the queued tick at the head, unless one is already in
-    /// flight. Ticks execute serially: each output is the next tick's
-    /// baseline, so the next dispatch waits for the previous
-    /// `ExecutionBatchCompleted` — by which point the handler has
-    /// appended the output to the tick chain.
-    ///
-    /// It waits too for the block below the tick to be written. That
-    /// block's commit is in hand by then, and its write never waits on a
-    /// tick, so the wait ends at the `BlockPersisted` that names it.
-    ///
-    /// The tick goes out with every fate recorded for it so far, which
-    /// the chain applies under the acquisition that appends its output.
-    /// They stay buffered too, and are emitted again once the tick
-    /// completes with whatever was recorded while it ran: the chain
-    /// resolves a member once however often it is told.
-    ///
-    /// No tick anchored below a halt recovery's bridge leaves here once
-    /// `topology_schedule` holds the recovery: each is dropped from the
-    /// queue, since the crossing block discards it. Every dispatch reads
-    /// the schedule, so a tick queued before the fold is dropped by the
-    /// first dispatch after it, a write's or a commit's alike.
     /// Hold the queued tick `tick_id` names if it still awaits a seed
     /// window, as a finalization of it commits.
     ///
@@ -4429,6 +4408,27 @@ impl ExecutionCoordinator {
         }
     }
 
+    /// Dispatch the queued tick at the head, unless one is already in
+    /// flight. Ticks execute serially: each output is the next tick's
+    /// baseline, so the next dispatch waits for the previous
+    /// `ExecutionBatchCompleted` — by which point the handler has
+    /// appended the output to the tick chain.
+    ///
+    /// It waits too for the block below the tick to be written. That
+    /// block's commit is in hand by then, and its write never waits on a
+    /// tick, so the wait ends at the `BlockPersisted` that names it.
+    ///
+    /// The tick goes out with every fate recorded for it so far, which
+    /// the chain applies under the acquisition that appends its output.
+    /// They stay buffered too, and are emitted again once the tick
+    /// completes with whatever was recorded while it ran: the chain
+    /// resolves a member once however often it is told.
+    ///
+    /// No tick anchored below a halt recovery's bridge leaves here once
+    /// `topology_schedule` holds the recovery: each is dropped from the
+    /// queue, since the crossing block discards it. Every dispatch reads
+    /// the schedule, so a tick queued before the fold is dropped by the
+    /// first dispatch after it, a write's or a commit's alike.
     fn dispatch_next_tick(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let local_shard = self.local_shard;
         let ticks = &self.ticks;
