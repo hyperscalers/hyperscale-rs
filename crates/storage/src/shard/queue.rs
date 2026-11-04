@@ -12,7 +12,8 @@
 //!   `Pending` with a place, until a line names it or it leaves.
 //! - `TickPins`: the pins a tick's determined lines take, unioned per
 //!   key, while its determined half is owed.
-//! - `Behind`: each placed shared row not yet head.
+//! - `Behind`: each placed shared row not yet head, by place, so the
+//!   rows behind are tested again in place order.
 //! - `Serves`: each keyed shared row made head, while it stands placed.
 //!
 //! Entries are a function of a row's own fields, so every collection but
@@ -351,7 +352,10 @@ impl RowEntries {
         }
         Self {
             queue: entries,
-            behind: row.head.is_none().then(|| (member_order(row.tx), row.tx)),
+            behind: row
+                .head
+                .is_none()
+                .then(|| (u128::from(place.packed()), row.tx)),
             serves: row
                 .head
                 .filter(|_| keyed(pins))

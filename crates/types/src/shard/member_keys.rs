@@ -36,7 +36,7 @@ pub enum MemberCollection {
     /// The pins each tick whose determined half is owed takes, by height
     /// and chunk.
     TickPins,
-    /// The placed rows not yet head, by member.
+    /// The placed rows not yet head, by place.
     Behind,
     /// The keyed rows made head, by head height and place.
     Serves,

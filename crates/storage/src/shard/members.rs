@@ -1230,7 +1230,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     }
 
     /// Move the queue entries `left` implies to those `entered` does. A
-    /// `Queue` entry deleted marks the fold dirty.
+    /// `Queue` entry deleted or rewritten marks the fold dirty.
     fn reindex(&mut self, left: Option<&MemberRow>, entered: Option<&MemberRow>) {
         if left.and_then(|row| row.queued).is_none() && entered.and_then(|row| row.queued).is_none()
         {
@@ -1245,8 +1245,14 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             }
         }
         for (order, value) in is.queue {
-            if was.queue.get(&order) != Some(&value) {
-                self.queue.set(order, Some(value));
+            match was.queue.get(&order) {
+                Some(held) if *held == value => {}
+                held => {
+                    // A value rewritten in place may have let go of a key
+                    // two of the row's pins shared a bucket on.
+                    self.dirty |= held.is_some();
+                    self.queue.set(order, Some(value));
+                }
             }
         }
         for order in was.waiters.keys() {
@@ -1678,8 +1684,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
     }
 
-    /// Test every row behind again, now that something it waited on may
-    /// have left.
+    /// Test every row behind again, in place order, now that something
+    /// it waited on may have left.
     fn reconsider(&mut self, inputs: &MemberInputs) {
         let id = self.family.id(MemberCollection::Behind);
         let mut behind: BTreeMap<u128, TxHash> = self
