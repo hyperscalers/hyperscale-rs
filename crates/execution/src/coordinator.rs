@@ -162,6 +162,7 @@ fn receipt_writes(fw: &Finalization) -> Vec<(TxHash, StateWrites)> {
 /// What the lines of a held tick's block say of its members: the block's
 /// own content, never what this node's ledger let it seat, so every
 /// replica holding the tick reads the same set.
+#[derive(Clone)]
 struct HeldTick {
     /// The members the lines name `Aborted`: the ones that reach no
     /// engine, whose refusal receipts are built at seating.
@@ -284,8 +285,77 @@ struct PendingTick {
     /// that judges debits under them.
     included: Vec<FeeTerms>,
     /// Whether this node holds everything the tick's lines name: a body
-    /// for each member and the bundles each one named to run needs.
+    /// for each member, the bundles each one named to run needs, and the
+    /// seed window each draws on or one the beacon has yet to publish.
     in_hand: bool,
+    /// The member windows the beacon had not published when the tick was
+    /// seated. `None` once the tick's ring holds every member's.
+    awaiting: Option<AwaitedSeeds>,
+}
+
+/// The seed windows a seated tick waits on, each newer than every window
+/// the schedule held when it was seated.
+///
+/// The fold that publishes such a window is the newest the schedule
+/// holds, so a tick queued while it folds takes the ring in then. One
+/// that is still waiting when a finalization of it commits is answered
+/// by that finalization instead, as a tick this node cannot run is.
+#[derive(Clone)]
+struct AwaitedSeeds {
+    epochs: BTreeSet<Epoch>,
+    /// What the tick is held as should a finalization of it come first.
+    held: HeldTick,
+}
+
+/// Where a tick's members' seed windows stand once seating has taken in
+/// every one the schedule holds.
+enum SeatedSeeds {
+    /// The tick's ring holds every one.
+    Held,
+    /// The beacon has yet to publish these epochs' windows.
+    Unpublished(BTreeSet<Epoch>),
+    /// A window this node no longer holds. Nothing brings an evicted
+    /// window back, so the tick is one this node cannot run.
+    Evicted,
+}
+
+/// Take into `env` the ring of each member window it lacks and
+/// `schedule` holds.
+///
+/// Read at seating rather than at dispatch: the schedule evicts at every
+/// beacon fold, while a tick may wait behind others far longer than one.
+fn seat_seeds(
+    env: &mut TickEnvironment,
+    requests: &[CrossShardExecutionRequest],
+    schedule: &TopologySchedule,
+) -> SeatedSeeds {
+    let epochs: BTreeSet<Epoch> = requests
+        .iter()
+        .map(|request| env.windows.epoch_for(request.clock))
+        .collect();
+    let newest = schedule.retained_epochs().map(|(_, newest)| newest);
+    let mut unpublished = BTreeSet::new();
+    for epoch in epochs {
+        if env.seeds.window_for(epoch).is_some() {
+            continue;
+        }
+        if let Some(ring) = schedule.seeds_at(epoch) {
+            env.seeds.absorb(ring);
+            if env.seeds.window_for(epoch).is_some() {
+                continue;
+            }
+        }
+        if newest.is_none_or(|newest| epoch > newest) {
+            unpublished.insert(epoch);
+        } else {
+            return SeatedSeeds::Evicted;
+        }
+    }
+    if unpublished.is_empty() {
+        SeatedSeeds::Held
+    } else {
+        SeatedSeeds::Unpublished(unpublished)
+    }
 }
 
 /// One seated tick in dispatch order.
@@ -315,28 +385,29 @@ impl PendingTick {
         missing.into_iter().collect()
     }
 
-    /// Whether the tick's ring holds every member's seed window, after
-    /// taking in the ring of each member's own window from `schedule`
-    /// where its own falls short.
+    /// Take in the ring of each awaited window `schedule` now holds, and
+    /// say whether the tick's ring holds every member's window.
     ///
-    /// Short only for a member clocked past the tick's window, which is a
-    /// whole member whose remote payer committed it later than this shard
-    /// did, or for one run further behind its clock than the ring keeps.
-    /// Either way the window is a fact the beacon fixes and this node has
-    /// not folded or no longer holds, so the tick waits for it rather
+    /// A window is awaited only for a member clocked past every window
+    /// held at seating: a whole member whose remote payer committed it
+    /// later than this shard did. Its seeds are a fact the beacon fixes
+    /// and this node has not folded, so the tick waits for them rather
     /// than answer a draw some other way.
-    fn holds_seeds(&mut self, schedule: &TopologySchedule) -> bool {
+    fn take_published_seeds(&mut self, schedule: &TopologySchedule) -> bool {
+        let Some(awaited) = &mut self.awaiting else {
+            return true;
+        };
         let env = &mut self.env;
-        self.requests.iter().all(|request| {
-            if env.seed_window_for(request.clock).is_some() {
-                return true;
-            }
-            let epoch = env.windows.epoch_for(request.clock);
-            if let Some(ring) = schedule.seeds_at(epoch) {
+        awaited.epochs.retain(|epoch| {
+            if let Some(ring) = schedule.seeds_at(*epoch) {
                 env.seeds.absorb(ring);
             }
-            env.seed_window_for(request.clock).is_some()
-        })
+            env.seeds.window_for(*epoch).is_none()
+        });
+        if awaited.epochs.is_empty() {
+            self.awaiting = None;
+        }
+        self.awaiting.is_none()
     }
 }
 
@@ -1616,17 +1687,29 @@ impl ExecutionCoordinator {
             }
         }
 
-        let pending = (!requests.is_empty()).then(|| PendingTick {
-            tick: block.height,
-            tick_ts: block.ts,
-            // Off the block's certified committee, whose ring holds every
-            // seed a member named short of its deadline draws on. Taken
-            // now, while that window is certainly held, so a tick that
-            // waits to dispatch never reads a window evicted meanwhile.
-            env: TickEnvironment::governing(committee, topology_schedule.windows()),
-            requests,
-            included: block.fees.clone(),
-            in_hand,
+        let pending = (!requests.is_empty()).then(|| {
+            // Off the block's certified committee, with the ring of each
+            // member's own window the schedule holds where that one falls
+            // short: a member clocked past the block's window, or one a
+            // halt recovery's crossing block names under a committee
+            // epochs past its clock.
+            let mut env = TickEnvironment::governing(committee, topology_schedule.windows());
+            let seeds = seat_seeds(&mut env, &requests, topology_schedule);
+            PendingTick {
+                tick: block.height,
+                tick_ts: block.ts,
+                env,
+                requests,
+                included: block.fees.clone(),
+                in_hand: in_hand && !matches!(seeds, SeatedSeeds::Evicted),
+                awaiting: match seeds {
+                    SeatedSeeds::Unpublished(epochs) => Some(AwaitedSeeds {
+                        epochs,
+                        held: HeldTick::of(lines),
+                    }),
+                    SeatedSeeds::Held | SeatedSeeds::Evicted => None,
+                },
+            }
         });
         (pending, votes_to_replay, members)
     }
@@ -1759,6 +1842,7 @@ impl ExecutionCoordinator {
             requests,
             included,
             in_hand: true,
+            awaiting: None,
         }));
         Vec::new()
     }
@@ -3455,6 +3539,7 @@ impl ExecutionCoordinator {
                 .filter(|(_, decision)| !matches!(decision, TransactionDecision::Accept))
                 .map(|(tx_hash, _)| tx_hash)
                 .collect();
+            self.hold_awaiting_seeds(*fw.tick_id());
             if let Some(held) = self.held.get(fw.tick_id())
                 && height >= self.dispatch_from
             {
@@ -4260,6 +4345,31 @@ impl ExecutionCoordinator {
     /// queue, since the crossing block discards it. Every dispatch reads
     /// the schedule, so a tick queued before the fold is dropped by the
     /// first dispatch after it, a write's or a commit's alike.
+    /// Hold the queued tick `tick_id` names if it still awaits a seed
+    /// window, as a finalization of it commits.
+    ///
+    /// Its peers ran it, and what this node's draw would answer the
+    /// finalization already says. Held from here, the tick is seated from
+    /// that finalization as a tick this node cannot run is, rather than
+    /// waiting on a window the schedule may evict before it arrives.
+    fn hold_awaiting_seeds(&mut self, tick_id: TickId) {
+        for queued in &mut self.pending_ticks {
+            if let Queued::Run(pending) = queued
+                && TickId::new(self.local_shard, pending.tick) == tick_id
+            {
+                if let Some(awaited) = pending.awaiting.take() {
+                    tracing::debug!(
+                        tick = %tick_id,
+                        "Holding a tick its finalization settled before its seeds arrived"
+                    );
+                    self.held.insert(tick_id, awaited.held);
+                    *queued = Queued::Held(tick_id);
+                }
+                return;
+            }
+        }
+    }
+
     fn dispatch_next_tick(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let local_shard = self.local_shard;
         let ticks = &self.ticks;
@@ -4327,9 +4437,9 @@ impl ExecutionCoordinator {
         }
         // A draw this node cannot answer from the beacon's own seeds is
         // one it would answer unlike its peers, so the tick waits for the
-        // fold that brings them. Every beacon fold dispatches again.
+        // fold that publishes them. Every beacon fold dispatches again.
         if let Some(Queued::Run(head)) = self.pending_ticks.front_mut()
-            && !head.holds_seeds(topology_schedule)
+            && !head.take_published_seeds(topology_schedule)
         {
             tracing::debug!(
                 shard = %self.local_shard,
@@ -4723,7 +4833,14 @@ impl ExecutionCoordinator {
         effects
             .actions
             .extend(self.release(topology_schedule, Wake::Beacon));
-        // A tick held for seeds this fold may have brought.
+        // Every queued tick awaiting a window this fold may have
+        // published takes it now, while it is the newest held, and the
+        // head may dispatch on it.
+        for queued in &mut self.pending_ticks {
+            if let Queued::Run(pending) = queued {
+                pending.take_published_seeds(topology_schedule);
+            }
+        }
         effects
             .actions
             .extend(self.dispatch_next_tick(topology_schedule));
@@ -8974,7 +9091,8 @@ mod tests {
                 .as_ref()
                 .clone()
                 .with_pending_recoveries(recoveries)
-                .with_prices(prices),
+                .with_prices(prices)
+                .with_seeds(seed_ring(EpochWindows::new(0, 1_000), 1..=21)),
         );
         let mut schedule = TopologySchedule::new(
             EpochWindows::new(0, 1_000),
@@ -10415,13 +10533,23 @@ mod tests {
         request.clock = clock;
 
         let mut state = make_test_state();
+        let mut env = TickEnvironment::governing(&seeded_snapshot(windows, 1..=T - 1), windows);
+        let requests = vec![request];
+        let SeatedSeeds::Unpublished(epochs) = seat_seeds(&mut env, &requests, &sched) else {
+            panic!("window {} is past every window the schedule holds", T + 1);
+        };
+        assert_eq!(epochs, BTreeSet::from([Epoch::new(T + 1)]));
         state.pending_ticks.push_back(Queued::Run(PendingTick {
             tick: BlockHeight::new(1),
             tick_ts: WeightedTimestamp::from_millis(T * ED),
-            env: TickEnvironment::governing(&seeded_snapshot(windows, 1..=T - 1), windows),
-            requests: vec![request],
+            env,
+            requests,
             included: Vec::new(),
             in_hand: true,
+            awaiting: Some(AwaitedSeeds {
+                epochs,
+                held: HeldTick::of(&[]),
+            }),
         }));
         assert!(
             state.dispatch_next_tick(&sched).is_empty(),
@@ -10447,23 +10575,203 @@ mod tests {
         );
     }
 
+    /// A schedule holding window `A` with the ring folded through it,
+    /// and window `C` whose ring keeps only its last few epochs: the
+    /// shape a halt recovery's crossing block commits under, its anchor
+    /// in `A` and its QC signed by `C`'s committee.
+    fn bridged_seed_schedule(windows: EpochWindows, a: u64, c: u64) -> TopologySchedule {
+        let mut sched =
+            TopologySchedule::new(windows, Epoch::new(a), seeded_snapshot(windows, 1..=a - 1));
+        sched.insert(Epoch::new(a), seeded_snapshot(windows, 1..=a));
+        sched.insert(Epoch::new(c), seeded_snapshot(windows, c - 4..=c));
+        sched.set_head(Epoch::new(c), seeded_snapshot(windows, c - 4..=c));
+        sched
+    }
+
+    /// A tick whose member is clocked in an older window than the ring
+    /// its committee carries draws on that window, which the schedule
+    /// may evict before the tick reaches the dispatch head. Seating
+    /// takes it while it is held, so the tick runs after the eviction.
+    #[test]
+    fn a_tick_seated_while_its_members_window_is_held_runs_after_the_eviction() {
+        const ED: u64 = 1_000;
+        const A: u64 = 70;
+        const C: u64 = 80;
+
+        let windows = EpochWindows::new(0, ED);
+        let mut sched = bridged_seed_schedule(windows, A, C);
+        let mut state = make_test_state();
+        // A tick ahead of it is in flight, so this one waits in the queue.
+        state.tick_in_flight = true;
+        let block = make_live_block(
+            BlockHeight::new(1),
+            A * ED + 500,
+            ValidatorId::new(0),
+            vec![(test_transaction(1))],
+        );
+        let _ = state.commit_block_carrying(
+            &sched,
+            &certify_signed(block, A * ED, C),
+            Naming::Composed,
+        );
+        assert!(
+            matches!(state.pending_ticks.front(), Some(Queued::Run(_))),
+            "the tick is seated to run and waits behind the one in flight"
+        );
+
+        sched.evict_below(Epoch::new(C));
+        state.tick_in_flight = false;
+        let dispatched = state.dispatch_next_tick(&sched);
+        let (env, requests) = dispatched
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
+                    env, requests, ..
+                }) => Some((env, requests)),
+                _ => None,
+            })
+            .expect("the tick dispatches over the window it took at seating");
+        let clock = requests[0].clock;
+        assert_eq!(windows.epoch_for(clock), Epoch::new(A));
+        assert_eq!(
+            env.seed_window_for(clock),
+            seeded_snapshot(windows, 1..=A)
+                .seeds()
+                .window_for(Epoch::new(A)),
+        );
+    }
+
+    /// The same tick seated on a replica whose schedule has already
+    /// evicted its member's window, as one syncing the recovered chain
+    /// late or rebuilt by a restart: nothing brings the window back, so
+    /// the tick is held for its finalization rather than run.
+    #[test]
+    fn a_tick_seated_past_its_members_evicted_window_is_held() {
+        const ED: u64 = 1_000;
+        const A: u64 = 70;
+        const C: u64 = 80;
+
+        let windows = EpochWindows::new(0, ED);
+        let mut sched = bridged_seed_schedule(windows, A, C);
+        sched.evict_below(Epoch::new(C));
+        let mut state = make_test_state();
+        let block = make_live_block(
+            BlockHeight::new(1),
+            A * ED + 500,
+            ValidatorId::new(0),
+            vec![(test_transaction(1))],
+        );
+        let effects = state.commit_block_carrying(
+            &sched,
+            &certify_signed(block, A * ED, C),
+            Naming::Composed,
+        );
+        assert!(!effects.actions.iter().any(|action| matches!(
+            action,
+            Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+        )));
+        let tick = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        assert!(
+            matches!(state.pending_ticks.front(), Some(Queued::Held(held)) if *held == tick),
+            "the tick holds dispatch for its finalization"
+        );
+        assert!(state.held.contains_key(&tick));
+    }
+
+    /// A tick whose member is clocked past every window held at seating
+    /// waits for the fold that publishes it. A finalization of it that
+    /// commits first answers the draw instead: the tick is held from
+    /// there and seated from what the finalization says it left.
+    #[test]
+    fn a_tick_awaiting_seeds_is_seated_from_a_finalization_that_comes_first() {
+        const ED: u64 = 1_000;
+        const T: u64 = 70;
+
+        let windows = EpochWindows::new(0, ED);
+        let mut sched = TopologySchedule::new(
+            windows,
+            Epoch::new(T - 1),
+            seeded_snapshot(windows, 1..=T - 1),
+        );
+        sched.insert_lookahead(Epoch::new(T), seeded_snapshot(windows, 1..=T - 1));
+        let tx = test_transaction(1);
+        let mut state = make_test_state();
+        // Signed by window `T`'s committee and anchored in `T + 1`,
+        // which the beacon has not published here.
+        let block = make_live_block(
+            BlockHeight::new(1),
+            (T + 1) * ED + 500,
+            ValidatorId::new(0),
+            vec![tx.clone()],
+        );
+        let effects = state.commit_block_carrying(
+            &sched,
+            &certify_signed(block, (T + 1) * ED, T),
+            Naming::Composed,
+        );
+        assert!(!effects.actions.iter().any(|action| matches!(
+            action,
+            Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+        )));
+        assert!(
+            matches!(
+                state.pending_ticks.front(),
+                Some(Queued::Run(pending)) if pending.awaiting.is_some()
+            ),
+            "the tick waits on window {}",
+            T + 1
+        );
+
+        let mut writes = StateWrites::default();
+        writes.cells.insert(
+            SubstateKey {
+                owner: Address::new([7; 31], AddressClass::Component),
+                local: LocalKey([1; 16]),
+            },
+            Some(vec![1]),
+        );
+        let finalization: Verifiable<Finalization> =
+            make_finalization_leaving(BlockHeight::new(1), tx.hash(), writes).into();
+        let settling = helpers_make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(2),
+            (T + 1) * ED + 700,
+            ValidatorId::new(0),
+            vec![],
+            vec![finalization],
+        );
+        let effects = state.commit_block_carrying(
+            &sched,
+            &certify_signed(settling, (T + 1) * ED + 200, T),
+            Naming::Composed,
+        );
+        assert!(
+            effects.actions.iter().any(|action| matches!(
+                action,
+                Action::ResolveTicks { resolutions }
+                    if resolutions.iter().any(|(tick, resolution)| {
+                        tick.block_height() == BlockHeight::new(1)
+                            && matches!(resolution, TickResolution::Restored { .. })
+                    })
+            )),
+            "the finalization's writes are seated for the tick"
+        );
+        assert!(
+            !state.pending_ticks.iter().any(|queued| matches!(
+                queued,
+                Queued::Run(pending) if pending.tick == BlockHeight::new(1)
+            )),
+            "and the tick never runs here"
+        );
+    }
+
     /// A snapshot whose ring the beacon folded over `epochs`, each seed a
     /// byte of its own epoch.
     fn seeded_snapshot(
         windows: EpochWindows,
         epochs: std::ops::RangeInclusive<u64>,
     ) -> Arc<TopologySnapshot> {
-        let mut ring = SeedRing::default();
-        for epoch in epochs {
-            ring.record(
-                Epoch::new(epoch),
-                EpochSeed {
-                    randomness: Randomness::new([u8::try_from(epoch % 251).unwrap(); 32]),
-                    source: SeedSource::Reveals,
-                },
-                windows,
-            );
-        }
+        let ring = seed_ring(windows, epochs);
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
@@ -10478,6 +10786,23 @@ mod tests {
             )
             .with_seeds(ring),
         )
+    }
+
+    /// The ring the beacon folded over `epochs`, each seed a byte of its
+    /// own epoch.
+    fn seed_ring(windows: EpochWindows, epochs: std::ops::RangeInclusive<u64>) -> SeedRing {
+        let mut ring = SeedRing::default();
+        for epoch in epochs {
+            ring.record(
+                Epoch::new(epoch),
+                EpochSeed {
+                    randomness: Randomness::new([u8::try_from(epoch % 251).unwrap(); 32]),
+                    source: SeedSource::Reveals,
+                },
+                windows,
+            );
+        }
+        ring
     }
 
     /// The transactions the ledger names past their deadline, and what
