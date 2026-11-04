@@ -122,15 +122,6 @@ const _: () = assert!(
     "a committed cell lives to the close of the window its absence answers in",
 );
 
-/// The horizon must not outlive the epoch that produced what it retains.
-///
-/// A reshape's cut is scheduled one window ahead, so a successor
-/// inheriting a predecessor's tx-derived state has one epoch of chain to
-/// read it from. A horizon past that reaches back further than the
-/// reshape spans, and the successor has to fetch below what it already
-/// walks. Half an epoch is the working margin, not the hard bound.
-const _: () = assert!(RETENTION_HORIZON.as_secs() < EPOCH_DURATION.as_secs());
-
 /// A skipped epoch and its recovery must not expire the transactions a
 /// shard is holding. `SKIP_TIMEOUT` bounds the wait before the pool
 /// prevotes a skip, and ratification rounds follow it; a validity window

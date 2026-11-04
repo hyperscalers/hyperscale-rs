@@ -34,16 +34,16 @@ use crate::WeightedTimestamp;
 /// [`MAX_FINALIZATION_DELAY`] beyond it to terminate, and the sum is
 /// [`RETENTION_HORIZON`].
 ///
-/// Bounded on both sides. Above by [`EPOCH_DURATION`]: an artifact that
-/// outlives the committee epoch that produced it forces every successor
-/// of a reshape to reach back further than the reshape itself spans.
-/// Below by [`SKIP_TIMEOUT`] — a beacon skip and its recovery must not
-/// expire every transaction a shard is holding — for which a small
-/// multiple is the margin.
+/// Bounded on both sides. Above by what a reshape pays for it: the beacon
+/// holds a cut until the chain it ends has run this far past the cut that
+/// formed it, and a split's right child asks its parent's terminal for
+/// this long, so a wider range is a longer wait on the chain's configured
+/// epochs. Below by [`SKIP_TIMEOUT`] — a beacon skip and its recovery
+/// must not expire every transaction a shard is holding — for which a
+/// small multiple is the margin.
 ///
 /// [`MAX_FINALIZATION_DELAY`]: crate::MAX_FINALIZATION_DELAY
 /// [`RETENTION_HORIZON`]: crate::RETENTION_HORIZON
-/// [`EPOCH_DURATION`]: crate::EPOCH_DURATION
 /// [`SKIP_TIMEOUT`]: crate::SKIP_TIMEOUT
 pub const MAX_VALIDITY_RANGE: Duration = Duration::from_secs(120);
 
