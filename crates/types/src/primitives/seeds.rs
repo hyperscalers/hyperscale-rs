@@ -179,11 +179,13 @@ impl SeedRing {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
     use hyperscale_vm_types::Drawn;
 
     use super::*;
-    use crate::WeightedTimestamp;
+    use crate::{Deadline, MAX_VALIDITY_RANGE, TimestampRange, WeightedTimestamp};
 
     fn seed(byte: u8) -> EpochSeed {
         EpochSeed {
@@ -318,37 +320,53 @@ mod tests {
         );
     }
 
-    /// A tick on thirty-second epochs runs at most the retention horizon
-    /// past its member's clock: five epochs past it at the latest. Its
-    /// window's ring then still holds the oldest seed the member draws
-    /// on, and one epoch later it would not.
+    /// The latest anchor a member clocked at `clock` is named to run at:
+    /// the last instant short of the deadline of the widest validity
+    /// range a block at `clock` admits, which is where naming stops.
+    fn last_named_anchor(clock: WeightedTimestamp) -> WeightedTimestamp {
+        let ms = Duration::from_millis(1);
+        let widest = TimestampRange::new(clock, clock.plus(MAX_VALIDITY_RANGE));
+        assert!(widest.is_well_formed(clock));
+        assert!(
+            !TimestampRange::new(clock, clock.plus(MAX_VALIDITY_RANGE).plus(ms))
+                .is_well_formed(clock)
+        );
+        let deadline = Deadline::of(widest.end_timestamp_exclusive);
+        let last = WeightedTimestamp::from_millis(deadline.at().as_millis() - 1);
+        assert!(!deadline.passed(last) && deadline.passed(last.plus(ms)));
+        last
+    }
+
+    /// A member clocked at the very end of its epoch is named to run at
+    /// most up to its deadline, and its tick's window is the epoch that
+    /// anchor falls in. That window's ring, even the copy its own fold
+    /// left, still holds the oldest seed the member draws on, and the
+    /// ring one fold on would not: the depth is exact. Checked on epoch
+    /// lengths that divide the horizon and ones that do not.
     #[test]
     fn a_tick_at_its_horizon_still_holds_the_oldest_seed() {
-        const E: u64 = 200;
-        let clock = THIRTY_SECONDS.window_of(Epoch::new(E)).end.as_millis() - 1;
-        let latest = THIRTY_SECONDS.epoch_for(WeightedTimestamp::from_millis(
-            clock + RETENTION_HORIZON.as_secs() * 1_000 - 1,
-        ));
-        assert_eq!(latest, Epoch::new(E + 5));
+        const E: u64 = 300;
+        for duration_ms in [300_000, 48_000, 30_000, 7_000] {
+            let windows = EpochWindows::new(0, duration_ms);
+            let clock = WeightedTimestamp::from_millis(
+                windows.window_of(Epoch::new(E)).end.as_millis() - 1,
+            );
+            assert_eq!(windows.epoch_for(clock), Epoch::new(E));
+            let tick = windows.epoch_for(last_named_anchor(clock)).inner();
 
-        let at_the_horizon = folded_through(E + 5, THIRTY_SECONDS);
-        let window = at_the_horizon
-            .window_for(Epoch::new(E))
-            .expect("the ring of a tick five epochs on holds the whole window");
-        assert_eq!(
-            window,
-            folded_through(E - 1, THIRTY_SECONDS)
+            let window = folded_through(tick, windows)
                 .window_for(Epoch::new(E))
-                .unwrap()
-        );
-        assert_eq!(
-            window.at(E - SEED_WINDOW_EPOCHS),
-            Drawn::Ready(*seed_of(E - SEED_WINDOW_EPOCHS).randomness.as_bytes())
-        );
-        assert_eq!(
-            folded_through(E + 6, THIRTY_SECONDS).window_for(Epoch::new(E)),
-            None
-        );
+                .unwrap_or_else(|| panic!("a tick in {tick} holds window {E} at {duration_ms} ms"));
+            assert_eq!(
+                Some(window),
+                folded_through(E - 1, windows).window_for(Epoch::new(E))
+            );
+            assert_eq!(
+                folded_through(tick + 1, windows).window_for(Epoch::new(E)),
+                None,
+                "one fold past the horizon at {duration_ms} ms"
+            );
+        }
     }
 
     /// The window keeps out a ceremony roll, below a frontier that says

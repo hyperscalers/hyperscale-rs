@@ -10427,11 +10427,11 @@ mod tests {
     /// Two replicas of one shard commit one block in window `E`: one
     /// still holds the projection of `E` the fold of `E - 1` published,
     /// the other the frozen copy the fold of `E` replaced it with. Both
-    /// copies carry the ring as their fold left it, one seed apart, and
-    /// the tick must open every seal alike on both.
+    /// copies carry the ring as their fold left it, one seed apart at
+    /// either end, and the tick must open every seal alike on both.
     #[test]
     fn replicas_on_either_copy_of_a_window_open_a_seal_alike() {
-        const ED: u64 = 1_000;
+        const ED: u64 = 300_000;
         const E: u64 = 70;
 
         let windows = EpochWindows::new(0, ED);
@@ -10444,6 +10444,16 @@ mod tests {
         let mut frozen = lookahead.clone();
         frozen.set_head(Epoch::new(E), folded_through(E));
         frozen.insert(Epoch::new(E), folded_through(E));
+        let tx = stub_transaction_with_reads(
+            PrincipalAddr::new([1; 31]),
+            &[test_prefix(1)],
+            &[test_prefix(11)],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::from_millis(E * ED - 60_000),
+                WeightedTimestamp::from_millis(E * ED + 60_000),
+            ),
+        );
 
         let window_on = |sched: &TopologySchedule| {
             let mut state = make_test_state();
@@ -10451,7 +10461,7 @@ mod tests {
                 BlockHeight::new(1),
                 E * ED + 500,
                 ValidatorId::new(0),
-                vec![(test_transaction(1))],
+                vec![tx.clone()],
             );
             let (env, requests) = state
                 .commit_block_carrying(sched, &certify_signed(block, E * ED, E), Naming::Composed)
@@ -10472,14 +10482,24 @@ mod tests {
             assert_eq!(env.windows, windows);
             let clock = requests[0].clock;
             assert_eq!(windows.epoch_for(clock), Epoch::new(E));
-            env.seed_window_for(clock)
-                .expect("the tick dispatched, so it holds the window")
+            let window = env
+                .seed_window_for(clock)
+                .expect("the tick dispatched, so it holds the window");
+            (env.seeds, window)
         };
-        let (behind, ahead) = (window_on(&lookahead), window_on(&frozen));
+        let ((behind_ring, behind), (ahead_ring, ahead)) =
+            (window_on(&lookahead), window_on(&frozen));
+
+        // The ring's old edge: the copy one fold behind still holds the
+        // seed the newer copy dropped.
+        let edge = E - 1 - SeedRing::retained_epochs(windows);
+        assert!(behind_ring.get(Epoch::new(edge)).is_some());
+        assert_eq!(ahead_ring.get(Epoch::new(edge)), None);
 
         // A seal written in `E - 2` matures into `E`; one written in
-        // `E - 67` matured into `E - 65`, the old edge of either ring.
-        for matures in [E - 65, E - SEED_WINDOW_EPOCHS, E - 1, E] {
+        // `E - 67` matured into `E - 65`, below the window either ring
+        // gives, and one matured into the ring's old edge reads alike too.
+        for matures in [edge, E - 65, E - SEED_WINDOW_EPOCHS, E - 1, E] {
             assert_eq!(
                 behind.at(matures),
                 ahead.at(matures),
@@ -10490,6 +10510,7 @@ mod tests {
         assert_eq!(behind.at(E - 1), Drawn::Ready([69; 32]));
         assert_eq!(behind.at(E - SEED_WINDOW_EPOCHS), Drawn::Ready([6; 32]));
         assert_eq!(behind.at(E - 65), Drawn::Expired);
+        assert_eq!(behind.at(edge), Drawn::Expired);
     }
 
     /// A whole member whose remote payer committed it in a later window
