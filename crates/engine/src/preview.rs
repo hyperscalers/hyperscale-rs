@@ -41,7 +41,7 @@ use hyperscale_vm_types::{EffectSet, EffectTarget, Outcome, PriceTable, SeedWind
 use crate::batch::TickEnvironment;
 use crate::executor::{
     PayerFee, PointReads, TickBaseline, abort_reason, batch_entry, materialize_declared,
-    protocol_hash,
+    protocol_hash, routed_to,
 };
 use crate::genesis::vault_key;
 use crate::{Executor, PROTOCOL_RESOURCE};
@@ -117,9 +117,13 @@ impl PreviewPoints {
             .clone()
     }
 
-    /// These reads as a baseline's: its own shard's owners alone.
-    fn reader(self: &Arc<Self>) -> (ShardId, Arc<dyn PointReads>) {
-        (self.shard, Arc::clone(self) as Arc<dyn PointReads>)
+    /// These reads as a baseline's: the owners `trie` routes to its own
+    /// shard alone.
+    fn reader(self: &Arc<Self>, trie: &ShardTrie) -> (OwnerSet, Arc<dyn PointReads>) {
+        (
+            routed_to(trie, self.shard),
+            Arc::clone(self) as Arc<dyn PointReads>,
+        )
     }
 }
 
@@ -830,7 +834,10 @@ impl Executor {
         // the hosted chain; an owner the preview fetched reads what was
         // fetched alone, so a probe past it is advisory.
         let mut base = TickBaseline {
-            points: inputs.points.as_ref().map(PreviewPoints::reader),
+            points: inputs
+                .points
+                .as_ref()
+                .map(|points| points.reader(&inputs.holds.trie)),
             ..TickBaseline::default()
         };
         materialize_declared(

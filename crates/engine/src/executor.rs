@@ -183,10 +183,12 @@ pub struct TickBaseline {
     /// reach, its own members named apart. Empty for a baseline with
     /// nothing committed over it — a preview.
     pub(crate) fee_holds: BTreeMap<SubstateKey, FeeHolds>,
-    /// The shard this baseline executes on and the reader that answers
-    /// an entry point no pre-read named, at the version the pre-read
-    /// read. `None` answers every point from the map alone.
-    pub(crate) points: Option<(ShardId, Arc<dyn PointReads>)>,
+    /// The owners whose entry points fall through, and the reader that
+    /// answers one no pre-read named, at the version the pre-read read.
+    /// The owners are the ones the trie routes to the executing shard,
+    /// the same rule [`materialize_declared`]'s locality and the fee
+    /// paths apply. `None` answers every point from the map alone.
+    pub(crate) points: Option<(OwnerSet, Arc<dyn PointReads>)>,
 }
 
 /// Point reads of ordered-collection entries at a baseline's version.
@@ -197,6 +199,14 @@ pub struct TickBaseline {
 pub trait PointReads: Send + Sync + std::fmt::Debug {
     /// The entry at `order`, if any.
     fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>>;
+}
+
+/// The owners `trie` routes to `shard`: a batch's share of the world
+/// when it reaches beyond its shard, and the owners whose points fall
+/// through to its reader.
+pub fn routed_to(trie: &ShardTrie, shard: ShardId) -> OwnerSet {
+    let trie = trie.clone();
+    OwnerSet::of(move |owner: Address| trie.shard_for_prefix(owner) == shard)
 }
 
 impl<Snap: Anchored + 'static> PointReads for TickViewSnapshot<Snap> {
@@ -238,10 +248,11 @@ impl Substates for TickBaseline {
             .collect()
     }
 
-    /// The map, then the point reader for an owner this shard owns. Any
-    /// other owner's entry answers from the map alone: read out of this
-    /// store it would differ between replicas, which hold nothing of
-    /// another shard's subtree in common.
+    /// The map, then the point reader for an owner the trie routes here.
+    /// Any other owner's entry answers from the map alone: read out of
+    /// this store it would differ between replicas, which hold nothing of
+    /// another shard's subtree in common, and the pre-read named none of
+    /// it either.
     fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
         let key = EntryKey {
             owner,
@@ -251,8 +262,8 @@ impl Substates for TickBaseline {
         if let Some(value) = self.entries.get(&key) {
             return Some(value.clone());
         }
-        let (shard, points) = self.points.as_ref()?;
-        if !ShardTrie::shard_owns_prefix(*shard, owner) {
+        let (routed, points) = self.points.as_ref()?;
+        if !routed.covers(owner) {
             return None;
         }
         points.entry(owner, collection, order)
@@ -1647,9 +1658,7 @@ impl Executor {
         let locality = if inputs.iter().all(|i| !i.member.reaches_beyond()) {
             OwnerSet::whole()
         } else {
-            let trie = ctx.shard_trie.clone();
-            let local_shard = ctx.local_shard;
-            OwnerSet::of(move |owner: Address| trie.shard_for_prefix(owner) == local_shard)
+            routed_to(ctx.shard_trie, ctx.local_shard)
         };
         // Publishes carry no manifest, so they never reach the kernel;
         // they settle in their own pass below.
@@ -1724,10 +1733,12 @@ impl Executor {
         // declared content from the tick snapshot. Provisioned content is
         // each member's own, beneath it.
         let mut base = TickBaseline {
-            points: ctx
-                .points
-                .as_ref()
-                .map(|points| (ctx.local_shard, Arc::clone(points))),
+            points: ctx.points.as_ref().map(|points| {
+                (
+                    routed_to(ctx.shard_trie, ctx.local_shard),
+                    Arc::clone(points),
+                )
+            }),
             ..TickBaseline::default()
         };
         for entry in prepared.values() {
@@ -2583,29 +2594,55 @@ mod tests {
         );
     }
 
+    /// A reader answering every point it is asked.
+    #[derive(Debug)]
+    struct Everywhere;
+
+    impl PointReads for Everywhere {
+        fn entry(&self, _: Address, _: CollectionId, _: u128) -> Option<Vec<u8>> {
+            Some(vec![7])
+        }
+    }
+
+    /// A baseline executing on `shard` under `trie`, its points read by
+    /// [`Everywhere`].
+    fn probing(trie: &ShardTrie, shard: ShardId) -> TickBaseline {
+        TickBaseline {
+            points: Some((routed_to(trie, shard), Arc::new(Everywhere))),
+            ..TickBaseline::default()
+        }
+    }
+
     /// A point the map lacks falls through to the reader for an owner
-    /// this shard owns, and never for one it does not: another shard's
-    /// cell read out of this store would differ between replicas.
+    /// the trie routes to this shard, and never for one it routes away:
+    /// another shard's cell read out of this store would differ between
+    /// replicas.
     #[test]
     fn a_point_of_another_shards_owner_never_falls_through() {
-        /// A reader answering every point it is asked.
-        #[derive(Debug)]
-        struct Everywhere;
-        impl PointReads for Everywhere {
-            fn entry(&self, _: Address, _: CollectionId, _: u128) -> Option<Vec<u8>> {
-                Some(vec![7])
-            }
-        }
-
+        let trie = ShardTrie::uniform_from_count(2);
         let ours = Address::new([0x00; 31], AddressClass::Component);
         let theirs = Address::new([0xFF; 31], AddressClass::Component);
-        let base = TickBaseline {
-            points: Some((ShardId::leaf(1, 0), Arc::new(Everywhere))),
-            ..TickBaseline::default()
-        };
+        let shard = trie.shard_for_prefix(ours);
+        assert_ne!(trie.shard_for_prefix(theirs), shard);
+        let base = probing(&trie, shard);
         assert_eq!(base.entry(ours, LADDER, 5), Some(vec![7]));
         assert_eq!(base.entry(theirs, LADDER, 5), None);
         // And a baseline with no reader answers from its map alone.
         assert_eq!(TickBaseline::default().entry(ours, LADDER, 5), None);
+    }
+
+    /// A shard the trie has split, as a straddling parent executing after
+    /// its split is, routes no owner to itself, so no point falls through:
+    /// the gate is the pre-read's locality, which names none of its old
+    /// subtree either, not the prefix the parent once owned.
+    #[test]
+    fn a_point_on_a_shard_no_longer_a_leaf_never_falls_through() {
+        let trie = ShardTrie::uniform_from_count(2);
+        let base = probing(&trie, ShardId::ROOT);
+        for owner in [[0x00; 31], [0xFF; 31]] {
+            let owner = Address::new(owner, AddressClass::Component);
+            assert!(ShardTrie::shard_owns_prefix(ShardId::ROOT, owner));
+            assert_eq!(base.entry(owner, LADDER, 5), None);
+        }
     }
 }
