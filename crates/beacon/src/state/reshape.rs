@@ -20,8 +20,9 @@ use std::collections::BTreeMap;
 use blake3::Hasher;
 use hyperscale_types::{
     BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, CohortSeat, DeclaredWork, Epoch,
-    KeeperSeat, PendingReshape, Randomness, ScheduledSplit, ShardBoundary, ShardCommittee, ShardId,
-    StateRoot, ValidatorId, ValidatorStatus, WeightedTimestamp, byzantine_threshold,
+    KeeperSeat, MAX_VALIDITY_RANGE, PendingReshape, Randomness, ScheduledSplit, ShardBoundary,
+    ShardCommittee, ShardId, StateRoot, ValidatorId, ValidatorStatus, WeightedTimestamp,
+    byzantine_threshold,
 };
 use rand::RngExt;
 use rand_chacha::ChaCha20Rng;
@@ -389,6 +390,9 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
         return;
     }
     let terminal = state.current_epoch.next();
+    if !outlives_its_predecessors(state, target, terminal) {
+        return;
+    }
     tracing::info!(
         shard = ?target,
         terminal = terminal.inner(),
@@ -461,15 +465,42 @@ fn drained(state: &mut BeaconState, target: ShardId) -> bool {
     quiet
 }
 
+/// Whether a cut at the close of `terminal` ends `shard`'s chain late
+/// enough that no transaction its predecessors committed is still valid
+/// on its successors.
+///
+/// This is what lets a successor judge a transaction as already committed
+/// by its own markers and its immediate predecessors' alone: a transaction
+/// predates at most one cut on its lineage. A predecessor's last content
+/// block is anchored at or before the cut that formed `shard`, the opening
+/// of the window `formed` names, so whatever it committed expires by that
+/// instant plus [`MAX_VALIDITY_RANGE`]. Every block of a successor is
+/// anchored at or after the close of `terminal`, and a range's end is
+/// exclusive.
+///
+/// A chain seated at genesis has no predecessors and is never held.
+fn outlives_its_predecessors(state: &BeaconState, shard: ShardId, terminal: Epoch) -> bool {
+    let formed = state.boundaries[&shard].formed;
+    if formed == Epoch::GENESIS {
+        return true;
+    }
+    let windows = state.chain_config.epoch_windows();
+    windows.window_of(terminal).end >= windows.window_of(formed).start.plus(MAX_VALIDITY_RANGE)
+}
+
 fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
     let Some(PendingReshape::Split {
         cohort,
-        scheduled: Some(ScheduledSplit { halves, .. }),
+        scheduled: Some(ScheduledSplit { terminal, halves }),
         ..
     }) = state.pending_reshapes.remove(&target)
     else {
         unreachable!("scheduled split read above");
     };
+    debug_assert!(
+        outlives_its_predecessors(state, target, terminal),
+        "a split was scheduled to end {target:?} while its predecessors' transactions stand",
+    );
     tracing::info!(shard = ?target, "Shard split cut reached; reshaping the trie");
     state.next_shard_committees.remove(&target);
     // The parent's seats are re-carved between its children, so a pair
@@ -625,6 +656,12 @@ fn try_schedule_merge(state: &mut BeaconState, parent: ShardId) {
         return;
     }
     let terminal = state.current_epoch.next();
+    let (left, right) = parent.children();
+    if !outlives_its_predecessors(state, left, terminal)
+        || !outlives_its_predecessors(state, right, terminal)
+    {
+        return;
+    }
     tracing::info!(
         ?parent,
         terminal = terminal.inner(),
@@ -659,16 +696,28 @@ fn try_schedule_merge(state: &mut BeaconState, parent: ShardId) {
 }
 
 fn apply_scheduled_merge(state: &mut BeaconState, parent: ShardId) {
-    let Some(PendingReshape::Merge { keepers, .. }) = state.pending_reshapes.remove(&parent) else {
+    let Some(PendingReshape::Merge {
+        keepers,
+        scheduled_terminal: Some(terminal),
+        ..
+    }) = state.pending_reshapes.remove(&parent)
+    else {
         unreachable!("scheduled merge read above");
     };
+    let children: [ShardId; 2] = parent.children().into();
+    debug_assert!(
+        children
+            .iter()
+            .all(|child| outlives_its_predecessors(state, *child, terminal)),
+        "a merge was scheduled to end {parent:?}'s children while their predecessors' \
+         transactions stand",
+    );
     tracing::info!(?parent, "Shard merge cut reached; reshaping the trie");
 
     // Drop the children from the lookahead: keepers move to the parent
     // below, the rest return to the pool. The children's chains keep
     // running their in-flight window from the frozen active committee
     // until their terminal block.
-    let children: [ShardId; 2] = parent.children().into();
     for child in children {
         // Keepers move to the parent and everyone else pools, so both
         // parties of any rotation on this child land in a placement of
@@ -4726,5 +4775,168 @@ mod tests {
                 "{child:?}",
             );
         }
+    }
+
+    // ─── a chain outlives its predecessors ──────────────────────────────
+
+    /// `leaf(1, 0)` split on `epoch_ms` windows, its right child's own
+    /// split admitted in the window the child first runs, every seat ready
+    /// and the drain latched in that fold. Returns the state at that fold
+    /// and the child.
+    fn split_born_right_child_latched(epoch_ms: u64) -> (BeaconState, ShardId) {
+        let p = ShardId::leaf(1, 0);
+        let (_, right) = p.children();
+        let mut state = grow_state(8);
+        state.chain_config.epoch_duration_ms = epoch_ms;
+        let admit = |state: &mut BeaconState, shard: ShardId| {
+            let epoch = state.current_epoch;
+            apply_shard_payload(
+                &BlsVerifier,
+                state,
+                &net(),
+                shard,
+                &ShardWitnessPayload::ScheduleSplit {
+                    shard,
+                    epoch,
+                    settling: None,
+                },
+            );
+            ready_every_seat(state);
+        };
+        admit(&mut state, p);
+        fold_split(&mut state);
+        assert!(
+            state.pending_reshapes.is_empty(),
+            "the parent split applied"
+        );
+
+        let formed = state.boundaries[&right].formed;
+        assert_eq!(formed, state.current_epoch.next());
+        state.current_epoch = formed;
+        state.shard_committees = state.next_shard_committees.clone();
+        admit(&mut state, right);
+        schedule_ready_splits(&mut state);
+        assert!(admission_of(&state, right).drain_by.is_some(), "latched");
+        assert_quiet(&mut state);
+        (state, right)
+    }
+
+    /// On 30-second windows a split-born chain is not cut before its
+    /// predecessors' transactions expire: the quiet folds at `formed` and
+    /// `formed + 1` would end it 60 and 90 seconds after the cut that
+    /// formed it, inside one validity range, and schedule nothing, and the
+    /// fold at `formed + 2` schedules the cut that ends it 120 seconds on.
+    #[test]
+    fn a_split_born_right_child_splits_only_past_its_predecessors_range() {
+        let (mut state, right) = split_born_right_child_latched(30_000);
+        let formed = state.boundaries[&right].formed;
+
+        for held in [formed, formed.next()] {
+            state.current_epoch = held;
+            schedule_ready_splits(&mut state);
+            assert_eq!(
+                state.pending_reshapes[&right].scheduled_terminal(),
+                None,
+                "scheduled at {held:?}",
+            );
+            assert_eq!(state.boundaries[&right].terminal_epoch, None);
+        }
+
+        state.current_epoch = formed.saturating_add(2);
+        schedule_ready_splits(&mut state);
+        let terminal = formed.saturating_add(3);
+        assert_eq!(
+            state.pending_reshapes[&right].scheduled_terminal(),
+            Some(terminal),
+        );
+        let windows = state.chain_config.epoch_windows();
+        assert_eq!(
+            windows.window_of(terminal).end,
+            windows.window_of(formed).start.plus(MAX_VALIDITY_RANGE),
+        );
+    }
+
+    /// On five-minute windows one window already spans the validity range,
+    /// so the rule never holds a cut the pipeline would schedule: the
+    /// split-born child's split schedules at the first quiet fold, and the
+    /// predicate holds for any terminal at or past the formation.
+    #[test]
+    fn the_rule_never_binds_on_five_minute_windows() {
+        let (mut state, right) = split_born_right_child_latched(300_000);
+        let formed = state.boundaries[&right].formed;
+        schedule_ready_splits(&mut state);
+        assert_eq!(
+            state.pending_reshapes[&right].scheduled_terminal(),
+            Some(formed.next()),
+        );
+
+        for formed in (1..20).map(Epoch::new) {
+            state.boundaries.get_mut(&right).expect("seated").formed = formed;
+            for terminal in (0..4).map(|ahead| formed.saturating_add(ahead)) {
+                assert!(
+                    outlives_its_predecessors(&state, right, terminal),
+                    "formed {formed:?}, terminal {terminal:?}",
+                );
+            }
+        }
+    }
+
+    /// A merge is held by its younger child: with one child formed long
+    /// ago and the other formed at the latching fold, the quiet fold after
+    /// the latch schedules nothing, and the one after that schedules the
+    /// cut. Either child, as the younger, binds.
+    #[test]
+    fn a_merge_is_held_by_its_younger_child() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        for (older, younger) in [(left, right), (right, left)] {
+            let (mut state, _) = merge_ready();
+            state.chain_config.epoch_duration_ms = 30_000;
+            let formed = state.current_epoch;
+            state.boundaries.get_mut(&older).expect("seated").formed = Epoch::new(1);
+            state.boundaries.get_mut(&younger).expect("seated").formed = formed;
+
+            schedule_ready_merges(&mut state);
+            let at = admission_of(&state, parent).at;
+            settle_half(&mut state, parent, left, at, true);
+            settle_half(&mut state, parent, right, at, true);
+            for held in [formed, formed.next()] {
+                state.current_epoch = held;
+                schedule_ready_merges(&mut state);
+                assert_eq!(
+                    state.pending_reshapes[&parent].scheduled_terminal(),
+                    None,
+                    "{younger:?} younger, scheduled at {held:?}",
+                );
+            }
+
+            state.current_epoch = formed.saturating_add(2);
+            schedule_ready_merges(&mut state);
+            assert_eq!(
+                state.pending_reshapes[&parent].scheduled_terminal(),
+                Some(formed.saturating_add(3)),
+                "{younger:?} younger",
+            );
+        }
+    }
+
+    /// A chain seated at genesis has no predecessors, so its cut is never
+    /// held, however soon after genesis it falls: a split latched and
+    /// quiet in the window after genesis schedules its cut for the next.
+    #[test]
+    fn a_genesis_chain_is_never_held() {
+        let (mut state, p) = split_ready();
+        state.chain_config.epoch_duration_ms = 30_000;
+        state.current_epoch = Epoch::new(1);
+        assert_eq!(state.boundaries[&p].formed, Epoch::GENESIS);
+
+        schedule_ready_splits(&mut state);
+        let at = admission_of(&state, p).at;
+        settle_split(&mut state, p, at, true);
+        schedule_ready_splits(&mut state);
+        assert_eq!(
+            state.pending_reshapes[&p].scheduled_terminal(),
+            Some(Epoch::new(2)),
+        );
     }
 }

@@ -738,6 +738,15 @@ impl CommittedHere {
 
 /// [`committed_tx_cells`], with each row carrying the inherited key a
 /// transaction older than `origin` is also judged by.
+///
+/// The chain's own owner and its right half's are the only keys read, so
+/// the immediate predecessors are the only chains that answer. That holds
+/// because a transaction predates at most one cut on its lineage: the
+/// beacon schedules no cut that ends a chain sooner than
+/// [`MAX_VALIDITY_RANGE`](hyperscale_types::MAX_VALIDITY_RANGE) after the
+/// cut that formed it (`outlives_its_predecessors`), so whatever a
+/// generation before them committed has expired by the first anchor of
+/// this chain.
 #[must_use]
 pub fn committed_here<'a>(
     local_shard: ShardId,

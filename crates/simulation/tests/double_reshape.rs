@@ -9,7 +9,7 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::wait::await_split_admitted;
 use hyperscale_scenarios::{Cluster, ScenarioConfig, epochs};
-use hyperscale_types::{MAX_VALIDITY_RANGE, ShardId};
+use hyperscale_types::{MAX_VALIDITY_RANGE, ShardId, WeightedTimestamp};
 use support::{SimCluster, sim_seed};
 
 /// The split trigger armed, and pool surplus for three splits: the root,
@@ -30,15 +30,15 @@ fn live(c: &impl Cluster, shard: ShardId) -> bool {
     c.serves_shard(shard) && c.committed_height(shard).is_some_and(|h| h.inner() >= 1)
 }
 
-fn origin_ms(c: &impl Cluster, shard: ShardId) -> u64 {
+fn origin(c: &impl Cluster, shard: ShardId) -> WeightedTimestamp {
     c.chain_origin(shard)
         .expect("a live shard reports its origin")
         .anchor_wt
-        .as_millis()
 }
 
-/// Split `parent` and return the later of its children's origins.
-fn split(c: &mut SimCluster, parent: ShardId) -> u64 {
+/// Split `parent` and return the earlier of its children's origins: the
+/// first instant any block of either is anchored at.
+fn split(c: &mut SimCluster, parent: ShardId) -> WeightedTimestamp {
     let (left, right) = parent.children();
     assert!(
         await_split_admitted(c, parent, epochs(12)),
@@ -50,19 +50,29 @@ fn split(c: &mut SimCluster, parent: ShardId) -> u64 {
         c.run_until(epochs(28), |c| live(c, left) && live(c, right)),
         "{parent}'s children were not live within budget",
     );
-    origin_ms(c, left).max(origin_ms(c, right))
+    origin(c, left).min(origin(c, right))
+}
+
+/// The cut that formed `shard`: the opening of the window its record
+/// names as its formation.
+fn formation_cut(c: &impl Cluster, shard: ShardId) -> WeightedTimestamp {
+    let state = c.beacon_state().expect("the beacon has committed");
+    let formed = state.boundaries[&shard].formed;
+    state.chain_config.epoch_windows().window_of(formed).start
 }
 
 /// A transaction predates at most one cut on its lineage.
 ///
 /// A successor reads only its immediate predecessors' committed markers,
-/// so the rule holds only while the next cut on a lineage falls more than
-/// a validity range after the last. A transaction the grandparent
-/// committed was anchored before the first cut, and its range ends at
-/// most [`MAX_VALIDITY_RANGE`] past its start, so no block a grandchild
-/// anchors at or past the second cut can carry it.
+/// so the rule holds only while every block of a grandchild is anchored
+/// at least a validity range after the cut that formed its parent. A
+/// transaction the grandparent committed was anchored at or before that
+/// cut, and its range ends at most [`MAX_VALIDITY_RANGE`] past its anchor,
+/// so no block anchored there or later can carry it. The beacon holds a
+/// young chain's cut until this is so; here it is watched on a live
+/// cluster splitting the root and then its right child.
 #[test]
-fn two_cuts_on_one_lineage_lie_further_apart_than_a_validity_range() {
+fn a_grandchild_anchors_a_validity_range_past_its_parents_formation() {
     let seed = sim_seed(42);
     let root = ShardId::ROOT;
     let (_, right) = root.children();
@@ -76,13 +86,20 @@ fn two_cuts_on_one_lineage_lie_further_apart_than_a_validity_range() {
         c.run_until(epochs(8), |c| c.beacon_state().is_some()),
         "the beacon must commit an epoch",
     );
-    let first_cut = split(&mut c, root);
-    let second_cut = split(&mut c, right);
-    let gap = Duration::from_millis(second_cut - first_cut);
-    eprintln!("seed {seed}: cuts at {first_cut} ms and {second_cut} ms, gap {gap:?}");
+    let first_anchor = split(&mut c, root);
+    let formed_at = formation_cut(&c, right);
+    let grandchild_anchor = split(&mut c, right);
+    let gap = Duration::from_millis(grandchild_anchor.as_millis() - formed_at.as_millis());
+    eprintln!(
+        "seed {seed}: {right} formed at {} ms, first anchored at {} ms; its children first \
+         anchored at {} ms, {gap:?} past its formation",
+        formed_at.as_millis(),
+        first_anchor.as_millis(),
+        grandchild_anchor.as_millis(),
+    );
     assert!(
-        gap > MAX_VALIDITY_RANGE,
-        "the cuts at {first_cut} ms and {second_cut} ms lie {gap:?} apart, within one \
-         validity range ({MAX_VALIDITY_RANGE:?}): a transaction can predate both",
+        grandchild_anchor >= formed_at.plus(MAX_VALIDITY_RANGE),
+        "{right}'s children first anchored {gap:?} past the cut that formed it, within one \
+         validity range ({MAX_VALIDITY_RANGE:?}): a transaction can predate both cuts",
     );
 }
