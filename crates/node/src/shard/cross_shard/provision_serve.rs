@@ -328,18 +328,20 @@ fn held_block<S: ShardStorage>(
 }
 
 /// The requests `block`'s transactions owe `target_shard` routed under
-/// `trie`, in block order, each narrowed to that one target: the same
-/// rule the proposer committed the header's root by.
+/// `trie`, in block order, each narrowed to that one target and at the
+/// clock the block commits them at: the same rule the proposer committed
+/// the header's root by.
 fn requests_under(
     trie: &ShardTrie,
     block: &Block,
     local_shard: ShardId,
     target_shard: ShardId,
 ) -> Vec<ProvisionsRequest> {
+    let clock = block.header().parent_qc().weighted_timestamp();
     block
         .transactions()
         .iter()
-        .filter_map(|tx| provision_request(trie, tx, local_shard))
+        .filter_map(|tx| provision_request(trie, tx, local_shard, clock))
         .filter(|request| request.targets.contains(&target_shard))
         .map(|mut request| {
             request.targets = vec![target_shard];
@@ -423,10 +425,21 @@ mod tests {
     }
 
     /// The provision roots `tx` owes at `state` from [`LOCAL`] routed
-    /// under `trie`.
-    fn roots_of(state: &impl Substates, trie: &ShardTrie, tx: &Transaction) -> ProvisionTxRootsMap {
-        provision_tx_roots(state, trie, LOCAL, &[Verifiable::from(tx.clone())])
-            .expect("the test derives its transaction")
+    /// under `trie`, committed by a block anchored at `anchor_ms`.
+    fn roots_of(
+        state: &impl Substates,
+        trie: &ShardTrie,
+        anchor_ms: u64,
+        tx: &Transaction,
+    ) -> ProvisionTxRootsMap {
+        provision_tx_roots(
+            state,
+            trie,
+            LOCAL,
+            WeightedTimestamp::from_millis(anchor_ms),
+            &[Verifiable::from(tx.clone())],
+        )
+        .expect("the test derives its transaction")
     }
 
     /// A live test block at `height` anchored at `anchor_ms` carrying `tx`
@@ -509,8 +522,13 @@ mod tests {
                 1_000,
                 validity(),
             );
-            let request = provision_request(&trie, &Verifiable::from(tx.clone()), LOCAL)
-                .expect("the transaction reads a cell here");
+            let request = provision_request(
+                &trie,
+                &Verifiable::from(tx.clone()),
+                LOCAL,
+                WeightedTimestamp::ZERO,
+            )
+            .expect("the transaction reads a cell here");
             let [key] = request.local_keys[..] else {
                 panic!("one cell read here: {:?}", request.local_keys)
             };
@@ -540,6 +558,7 @@ mod tests {
                     block: &jmt_snapshot,
                 },
                 &trie,
+                0,
                 &tx,
             );
             Self {
@@ -665,7 +684,11 @@ mod tests {
             .clone();
         let forged = ProvisionTxRootsMap::new(BTreeMap::from([(
             PAYER_SHARD,
-            ProvisionTxRoot::over(&[provision_leaf(tx.hash(), served_digest(std::iter::empty()))]),
+            ProvisionTxRoot::over(&[provision_leaf(
+                tx.hash(),
+                WeightedTimestamp::ZERO,
+                served_digest(std::iter::empty()),
+            )]),
         )]))
         .expect("one target");
         block.certified = make_test_certified(block_committing(HEIGHT, 0, &tx, forged));
@@ -701,7 +724,7 @@ mod tests {
 
         let height = BlockHeight::new(1);
         let storage = Arc::new(SimShardStorage::default());
-        let roots = roots_of(&storage.snapshot(), &trie, &routed);
+        let roots = roots_of(&storage.snapshot(), &trie, 0, &routed);
         let claimed = roots[&payer_shard];
         let block = block_committing(height, 0, &routed, roots);
         commit_settled_at(
@@ -768,7 +791,13 @@ mod tests {
         let tx = |seed: &[u8]| TxHash::from(Hash::from_bytes(seed));
         let leaves: Vec<Hash> = [tx(b"a"), tx(b"b")]
             .into_iter()
-            .map(|tx| provision_leaf(tx, served_digest(std::iter::empty())))
+            .map(|tx| {
+                provision_leaf(
+                    tx,
+                    WeightedTimestamp::ZERO,
+                    served_digest(std::iter::empty()),
+                )
+            })
             .collect();
         let count = ProvisionCount::over(&leaves);
         let unbuildable = ServedPart::new(None, count);
@@ -863,7 +892,7 @@ mod tests {
             );
             HEIGHT.next()
         });
-        let roots = roots_of(&storage.snapshot(), classified, &tx);
+        let roots = roots_of(&storage.snapshot(), classified, anchor_ms, &tx);
         assert!(roots.contains_key(&target));
         commit_settled_at(
             &*storage,

@@ -11,7 +11,7 @@ use hyperscale_core::ProvisionsRequest;
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
     DeclaredKey, DeclaredRange, ShardId, ShardTrie, SubstateKey, TopologySnapshot, Transaction,
-    ValidatorId, Verifiable,
+    ValidatorId, Verifiable, WeightedTimestamp,
 };
 
 /// Per-shard recipient lists for provision broadcasting.
@@ -32,11 +32,15 @@ pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
 /// and their read sets come off a derivation only the nodes holding those
 /// records reach: this node has nothing to say about them, and a
 /// requester asks a peer that does.
+///
+/// `clock` is the parent-QC weighted timestamp of the block committing
+/// `tx`, which the request's leaf binds.
 #[must_use]
 pub fn provision_request(
     trie: &ShardTrie,
     tx: &Verifiable<Transaction>,
     local_shard: ShardId,
+    clock: WeightedTimestamp,
 ) -> Option<ProvisionsRequest> {
     if !tx.as_unverified().is_routed() {
         return None;
@@ -85,6 +89,7 @@ pub fn provision_request(
     }
     Some(ProvisionsRequest {
         tx_hash: tx.hash(),
+        clock,
         targets,
         local_keys,
         local_ranges,
@@ -92,7 +97,8 @@ pub fn provision_request(
 }
 
 /// Build provision requests and shard recipients for the block's
-/// cross-shard transactions: read sets only.
+/// cross-shard transactions, which the block commits at `clock`: read
+/// sets only.
 ///
 /// A transaction this node never routed is skipped: whether it crosses
 /// at all is a derivation only the nodes holding its records reach, and
@@ -105,10 +111,11 @@ pub fn build_provision_requests(
     transactions: &[Verifiable<Transaction>],
     signers: &BTreeSet<ValidatorId>,
     local_shard: ShardId,
+    clock: WeightedTimestamp,
 ) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
     let provision_requests: Vec<ProvisionsRequest> = transactions
         .iter()
-        .filter_map(|tx| provision_request(topology_snapshot.shard_trie(), tx, local_shard))
+        .filter_map(|tx| provision_request(topology_snapshot.shard_trie(), tx, local_shard, clock))
         .collect();
     if provision_requests.is_empty() {
         return None;
@@ -166,7 +173,15 @@ mod tests {
     #[test]
     fn an_unrouted_transaction_names_no_provisions() {
         let topology = TestCommittee::new(4, 1).topology_snapshot(1);
-        assert!(provision_request(topology.shard_trie(), &unrouted(), ShardId::ROOT).is_none());
+        assert!(
+            provision_request(
+                topology.shard_trie(),
+                &unrouted(),
+                ShardId::ROOT,
+                WeightedTimestamp::ZERO
+            )
+            .is_none()
+        );
     }
 
     /// A transaction placed wholly on one shard owes nothing, even to a
@@ -177,7 +192,10 @@ mod tests {
         let payer = test_principal(0x81);
         let tx = routed(payer, &[payer.address(), test_prefix(0x82)]);
         for local in [ShardId::leaf(1, 0), ShardId::leaf(1, 1)] {
-            assert!(provision_request(topology.shard_trie(), &tx, local).is_none());
+            assert!(
+                provision_request(topology.shard_trie(), &tx, local, WeightedTimestamp::ZERO)
+                    .is_none()
+            );
         }
     }
 
@@ -193,7 +211,8 @@ mod tests {
         let payer = test_principal(0x81);
         let tx = routed(payer, &[test_prefix(0x01), test_prefix(0x81)]);
         let targets = |local| {
-            provision_request(topology.shard_trie(), &tx, local).map(|request| request.targets)
+            provision_request(topology.shard_trie(), &tx, local, WeightedTimestamp::ZERO)
+                .map(|request| request.targets)
         };
         assert_eq!(targets(counterpart), Some(vec![payer_shard]));
         assert_eq!(targets(payer_shard), Some(vec![counterpart]));
@@ -211,6 +230,7 @@ mod tests {
                 &[unrouted()],
                 &BTreeSet::from([committee.validator_id(0)]),
                 ShardId::ROOT,
+                WeightedTimestamp::ZERO,
             )
             .is_none()
         );

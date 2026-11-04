@@ -307,6 +307,7 @@ mod tests {
             target_shard: ShardId::leaf(1, 1),
             block_height: BlockHeight::new(3),
             source_block_ts: WeightedTimestamp::ZERO,
+            clock: WeightedTimestamp::ZERO,
             tx_hash: TxHash::from(Hash::from_bytes(&index.to_le_bytes())),
             entries: Capped::empty(),
             proof: MerkleInclusionProof::new(vec![0x5A; 3 * 1024 * 1024]),
@@ -349,6 +350,7 @@ mod tests {
         let view = chain.view_at_persisted_tip();
         let request = ProvisionsRequest {
             tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
+            clock: WeightedTimestamp::ZERO,
             targets: vec![target],
             local_keys: vec![state_key(7, 1)],
             local_ranges: Vec::new(),
@@ -369,6 +371,7 @@ mod tests {
 
         let stripped = roots(ProvisionTxRoot::over(&[provision_leaf(
             request.tx_hash,
+            request.clock,
             served_digest(std::iter::empty()),
         )]));
         assert!(send(&stripped).is_empty(), "a root over a stripped part");

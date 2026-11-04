@@ -411,6 +411,7 @@ mod tests {
             target_shard: ShardId::leaf(2, 0),
             block_height: height,
             source_block_ts: WeightedTimestamp::ZERO,
+            clock: WeightedTimestamp::ZERO,
             tx_hash: TxHash::from(Hash::from_bytes(&height.inner().to_le_bytes())),
             entries: Capped::empty(),
             proof: MerkleInclusionProof::new(vec![0x5A; MAX_MERKLE_PROOF_LEN]),

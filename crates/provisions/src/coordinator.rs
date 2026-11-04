@@ -1173,7 +1173,11 @@ mod tests {
 
     /// The leaf of a part for `tx` that carries no entries.
     fn keyless_leaf(tx: TxHash) -> Hash {
-        provision_leaf(tx, served_digest(std::iter::empty()))
+        provision_leaf(
+            tx,
+            WeightedTimestamp::ZERO,
+            served_digest(std::iter::empty()),
+        )
     }
 
     /// A minimal head-only schedule with no pending recoveries — the
@@ -1717,6 +1721,7 @@ mod tests {
                     target_shard,
                     block_height: height,
                     source_block_ts: WeightedTimestamp::ZERO,
+                    clock: WeightedTimestamp::ZERO,
                     tx_hash,
                     entries: Capped::empty(),
                     proof: MerkleInclusionProof::new(Vec::new()),
@@ -2297,7 +2302,11 @@ mod tests {
         let height = BlockHeight::new(10);
         let tx_hash = TxHash::from(Hash::from_bytes(b"tx"));
         let key = test_key(1);
-        let leaf = provision_leaf(tx_hash, served_digest([key].into_iter()));
+        let leaf = provision_leaf(
+            tx_hash,
+            WeightedTimestamp::ZERO,
+            served_digest([key].into_iter()),
+        );
         let header = make_certified_header_committing_leaves(source_shard, height, local, &[leaf]);
         let mut coordinator = ProvisionCoordinator::new(local);
         deliver_committed_header(&mut coordinator, &header);
@@ -2308,6 +2317,7 @@ mod tests {
                 target_shard: local,
                 block_height: height,
                 source_block_ts: WeightedTimestamp::ZERO,
+                clock: WeightedTimestamp::ZERO,
                 tx_hash,
                 entries: Capped::new(entries).expect("within the cap"),
                 proof: MerkleInclusionProof::new(Vec::new()),
@@ -3536,6 +3546,7 @@ mod tests {
                     target_shard: ShardId::leaf(2, 0),
                     block_height: at,
                     source_block_ts: WeightedTimestamp::ZERO,
+                    clock: WeightedTimestamp::ZERO,
                     tx_hash: TxHash::ZERO,
                     entries: Capped::empty(),
                     proof: MerkleInclusionProof::new(vec![0x5A; proof_len]),

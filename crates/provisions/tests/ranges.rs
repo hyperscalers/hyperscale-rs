@@ -33,6 +33,7 @@ fn request(
 ) -> ProvisionsRequest {
     ProvisionsRequest {
         tx_hash: TxHash::from_raw(Hash::from_bytes(seed)),
+        clock: WeightedTimestamp::ZERO,
         targets: vec![ShardId::leaf(1, 1)],
         local_keys,
         local_ranges: ranges,
@@ -227,6 +228,7 @@ fn none_claimed_for_a_present_cell_is_misstated() {
         target_shard: honest.target_shard(),
         block_height: honest.block_height(),
         source_block_ts: honest.source_block_ts(),
+        clock: honest.clock(),
         tx_hash: honest.tx_hash(),
         entries: Capped::new(entries).expect("within the cap"),
         proof: honest.proof().clone(),

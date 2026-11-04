@@ -3698,16 +3698,21 @@ impl ExecutionCoordinator {
         let proposer = header.proposer();
         if runnable && self.signers.contains(&proposer) {
             let local_shard = self.local_shard;
-            if let Some((requests, shard_recipients)) =
-                build_provision_requests(window, transactions, &self.signers, local_shard)
-            {
+            let source_block_ts = header.parent_qc().weighted_timestamp();
+            if let Some((requests, shard_recipients)) = build_provision_requests(
+                window,
+                transactions,
+                &self.signers,
+                local_shard,
+                source_block_ts,
+            ) {
                 actions.push(Action::Provisions(
                     ProvisionAction::FetchAndBroadcastProvisions {
                         block_hash,
                         requests,
                         source_shard: local_shard,
                         block_height: height,
-                        source_block_ts: header.parent_qc().weighted_timestamp(),
+                        source_block_ts,
                         claimed: header.provision_tx_roots().clone(),
                         shard_recipients,
                         signer: proposer,

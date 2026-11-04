@@ -1903,6 +1903,7 @@ mod tests {
             target_shard: ShardId::leaf(1, 1),
             block_height: BlockHeight::new(height),
             source_block_ts: WeightedTimestamp::ZERO,
+            clock: WeightedTimestamp::ZERO,
             tx_hash,
             entries: Capped::empty(),
             proof: MerkleInclusionProof::new(vec![0x5A; MAX_MERKLE_PROOF_LEN]),
@@ -1921,7 +1922,11 @@ mod tests {
 
     /// The leaf of a keyless part for `tx`.
     fn keyless_leaf(tx: TxHash) -> Hash {
-        provision_leaf(tx, served_digest(std::iter::empty()))
+        provision_leaf(
+            tx,
+            WeightedTimestamp::ZERO,
+            served_digest(std::iter::empty()),
+        )
     }
 
     /// The leaves of the source block at `height`: one.
@@ -1956,6 +1961,7 @@ mod tests {
             target_shard: ShardId::leaf(1, 1),
             block_height: BlockHeight::new(1),
             source_block_ts: WeightedTimestamp::ZERO,
+            clock: WeightedTimestamp::ZERO,
             tx_hash: TxHash::from(Hash::from_bytes(&index.to_le_bytes())),
             entries: Capped::empty(),
             proof: MerkleInclusionProof::new(Vec::new()),

@@ -80,6 +80,7 @@ mod tests {
             target_shard: LOCAL,
             block_height: BlockHeight::new(height),
             source_block_ts: WeightedTimestamp::ZERO,
+            clock: WeightedTimestamp::ZERO,
             tx_hash: TxHash::from(Hash::from_bytes(&[u8::try_from(index).unwrap()])),
             entries: Capped::empty(),
             proof: MerkleInclusionProof::new(vec![0x5A; proof_len]),

@@ -3,9 +3,9 @@
 //!
 //! A source block's root for a target wraps the binary merkle root over
 //! one tagged leaf per transaction it owes that target with the number
-//! of those leaves. Each leaf binds the transaction and the keys its
-//! part serves, so a part missing a key, or carrying one more, walks to
-//! another root. A part carries its leaf's path and that count, and a
+//! of those leaves. Each leaf binds the transaction, its clock and the
+//! keys its part serves, so a part missing a key, carrying one more, or
+//! stating another clock walks to another root. A part carries its leaf's path and that count, and a
 //! receiver recomputes the leaf from the part and walks the path to the
 //! header's root: the count fixes the tree's depth, so a part verifies
 //! only at a real leaf position, never at an internal node, a padding
@@ -17,23 +17,21 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     Hash, MAX_PROVISION_TARGET_SHARDS, ProvisionTxRoot, ShardId, SubstateKey, TxHash,
-    compute_merkle_root, merkle_paths,
+    WeightedTimestamp, compute_merkle_root, merkle_paths,
 };
 
 /// Domain tag of a provision leaf's preimage.
 ///
-/// Its length is not 32, so a leaf's preimage — the tag, a 32-byte
-/// transaction hash and a 32-byte served digest — is never 64 bytes
-/// long, which every internal node's preimage is.
-pub const PROVISION_LEAF_DOMAIN_TAG: &[u8] = b"hyperscale-provision-leaf-v1";
+/// A leaf's preimage — the tag, a 32-byte transaction hash, an 8-byte
+/// clock and a 32-byte served digest — is never 64 bytes long, which
+/// every internal node's preimage is.
+pub const PROVISION_LEAF_DOMAIN_TAG: &[u8] = b"hyperscale-provision-leaf-v2";
 
 /// Domain tag of the digest over a part's served keys.
 pub const PROVISION_SERVED_DOMAIN_TAG: &[u8] = b"hyperscale-provision-served-v1";
 
 /// Domain tag of the wrap committing a provision root's leaf count.
 pub const PROVISION_ROOT_DOMAIN_TAG: &[u8] = b"hyperscale-provision-root-v1";
-
-const _: () = assert!(PROVISION_LEAF_DOMAIN_TAG.len() != 32);
 
 /// The deepest tree a provision path walks: a block owes one target far
 /// fewer than `2^32` transactions.
@@ -60,13 +58,18 @@ pub fn served_digest(keys: impl ExactSizeIterator<Item = SubstateKey>) -> Hash {
     Hash::from_parts(&parts)
 }
 
-/// The leaf a provision root holds for `tx_hash`, whose part serves the
-/// keys `served` digests.
+/// The leaf a provision root holds for `tx_hash`, committed at `clock`,
+/// whose part serves the keys `served` digests.
+///
+/// `clock` is the committing block's parent-QC weighted timestamp: the
+/// transaction clock every receiver prices the transaction at, whichever
+/// block roots the leaf.
 #[must_use]
-pub fn provision_leaf(tx_hash: TxHash, served: Hash) -> Hash {
+pub fn provision_leaf(tx_hash: TxHash, clock: WeightedTimestamp, served: Hash) -> Hash {
     Hash::from_parts(&[
         PROVISION_LEAF_DOMAIN_TAG,
         Hash::from(tx_hash).as_bytes(),
+        &clock.as_millis().to_le_bytes(),
         served.as_bytes(),
     ])
 }
@@ -218,6 +221,7 @@ mod tests {
             .map(|i| {
                 provision_leaf(
                     TxHash::from(Hash::from_bytes(&[i])),
+                    WeightedTimestamp::ZERO,
                     served_digest(std::iter::empty()),
                 )
             })
@@ -334,8 +338,8 @@ mod tests {
     }
 
     /// No leaf equals an internal node over the same leaves: a leaf's
-    /// preimage is the tag, a transaction hash and a digest, never the
-    /// 64 bytes of a node's.
+    /// preimage is the tag, a transaction hash, a clock and a digest,
+    /// never the 64 bytes of a node's.
     #[test]
     fn no_leaf_equals_an_internal_node() {
         let txs: Vec<TxHash> = (0..8u8)
@@ -343,7 +347,13 @@ mod tests {
             .collect();
         let leaves: Vec<Hash> = txs
             .iter()
-            .map(|tx| provision_leaf(*tx, served_digest(std::iter::empty())))
+            .map(|tx| {
+                provision_leaf(
+                    *tx,
+                    WeightedTimestamp::ZERO,
+                    served_digest(std::iter::empty()),
+                )
+            })
             .collect();
         let mut level = leaves.clone();
         let mut nodes = Vec::new();
@@ -359,7 +369,23 @@ mod tests {
         for leaf in &leaves {
             assert!(!nodes.contains(leaf));
         }
-        assert_ne!(PROVISION_LEAF_DOMAIN_TAG.len() + 64, 64);
+        assert_ne!(PROVISION_LEAF_DOMAIN_TAG.len() + 72, 64);
+    }
+
+    /// A transaction's leaf moves with its clock: the same keys under
+    /// another clock walk to another leaf.
+    #[test]
+    fn a_leaf_binds_its_clock() {
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let leaf = |millis| {
+            provision_leaf(
+                tx,
+                WeightedTimestamp::from_millis(millis),
+                served_digest([1, 2].map(test_key).into_iter()),
+            )
+        };
+        assert_eq!(leaf(1_000), leaf(1_000));
+        assert_ne!(leaf(1_000), leaf(1_001));
     }
 
     /// A transaction's leaf moves with every key its part serves: one
@@ -369,7 +395,11 @@ mod tests {
     fn a_leaf_binds_every_served_key() {
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         let leaf = |keys: &[u8]| {
-            provision_leaf(tx, served_digest(keys.iter().map(|seed| test_key(*seed))))
+            provision_leaf(
+                tx,
+                WeightedTimestamp::ZERO,
+                served_digest(keys.iter().map(|seed| test_key(*seed))),
+            )
         };
         let honest = leaf(&[1, 2, 3]);
         for other in [
@@ -384,6 +414,7 @@ mod tests {
         assert_ne!(
             provision_leaf(
                 TxHash::from(Hash::from_bytes(b"other")),
+                WeightedTimestamp::ZERO,
                 served_digest([1, 2, 3].map(test_key).into_iter()),
             ),
             honest,

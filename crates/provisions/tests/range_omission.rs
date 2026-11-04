@@ -70,6 +70,7 @@ impl Source {
         let probe = entry_key(OWNER_SEED, 5);
         let request = ProvisionsRequest {
             tx_hash: TxHash::from(Hash::from_bytes(b"range-tx")),
+            clock: WeightedTimestamp::ZERO,
             targets: vec![TARGET],
             local_keys: vec![state_key(CELL_OWNER_SEED, 1)],
             local_ranges: vec![DeclaredRange {
@@ -138,6 +139,7 @@ impl Source {
             target_shard: honest.target_shard(),
             block_height: honest.block_height(),
             source_block_ts: honest.source_block_ts(),
+            clock: honest.clock(),
             tx_hash: honest.tx_hash(),
             entries: Capped::new(entries).expect("within the cap"),
             proof,

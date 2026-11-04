@@ -812,7 +812,11 @@ mod tests {
             owner: Address::new([0x10; 31], AddressClass::Component),
             local: LocalKey([1; 16]),
         };
-        let leaf = provision_leaf(tx_hash, served_digest([key].into_iter()));
+        let leaf = provision_leaf(
+            tx_hash,
+            WeightedTimestamp::ZERO,
+            served_digest([key].into_iter()),
+        );
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: SOURCE,
             height: SOURCE_HEIGHT,
@@ -843,6 +847,7 @@ mod tests {
                 target_shard: ShardId::ROOT,
                 block_height: SOURCE_HEIGHT,
                 source_block_ts: WeightedTimestamp::ZERO,
+                clock: WeightedTimestamp::ZERO,
                 tx_hash,
                 entries: Capped::new(entries).expect("within the cap"),
                 proof: MerkleInclusionProof::new(Vec::new()),

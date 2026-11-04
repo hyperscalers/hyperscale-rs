@@ -570,6 +570,7 @@ mod tests {
                 target_shard: venue,
                 block_height: BlockHeight::new(height),
                 source_block_ts: ms(height * 1_000),
+                clock: ms(height * 1_000),
                 tx_hash: tx,
                 entries: Capped::from_array([SubstateEntry::new(
                     key,
@@ -695,6 +696,7 @@ mod tests {
                 target_shard: local,
                 block_height: BlockHeight::new(3),
                 source_block_ts: ms(900),
+                clock: ms(900),
                 tx_hash: hash,
                 entries: Capped::empty(),
                 proof: MerkleInclusionProof::dummy(),

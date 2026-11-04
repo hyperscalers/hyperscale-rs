@@ -323,6 +323,9 @@ pub struct ParticipationChange {
 pub struct ProvisionsRequest {
     /// Transaction hash (for correlation).
     pub tx_hash: TxHash,
+    /// The parent-QC weighted timestamp of the block that commits the
+    /// transaction: the clock its leaf binds and its parts carry.
+    pub clock: WeightedTimestamp,
     /// The shards this request serves a bundle to.
     pub targets: Vec<ShardId>,
     /// The locally owned keys of the transaction's read set (fresh

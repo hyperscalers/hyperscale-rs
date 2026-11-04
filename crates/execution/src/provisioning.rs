@@ -53,7 +53,8 @@ pub struct WantedRecord {
 /// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceAnchor {
-    /// The source block's parent-QC weighted timestamp.
+    /// The parent-QC weighted timestamp of the source block that commits
+    /// the transaction, as the part's leaf binds it.
     pub(crate) clock: WeightedTimestamp,
 }
 
@@ -250,8 +251,8 @@ impl ProvisioningTracker {
     /// - A core member runs under the earliest of the core shards'
     ///   committing clocks, its own included. It runs only once every
     ///   other core shard's bundle is in hand, and each bundle carries
-    ///   its source block's clock, so every core shard takes the minimum
-    ///   over one set.
+    ///   its committing block's clock, bound by its leaf, so every core
+    ///   shard takes the minimum over one set.
     /// - A leg runs alone and under its own.
     ///
     /// `None` for a core member while another core shard's bundle is not
@@ -376,7 +377,7 @@ impl ProvisioningTracker {
         let tx_hash = part.tx_hash();
         let height = part.block_height();
         let anchor = SourceAnchor {
-            clock: part.source_block_ts(),
+            clock: part.clock(),
         };
         self.absorbed
             .entry(tx_hash)
@@ -512,6 +513,37 @@ mod tests {
         make_provisions_at(source, block_height, anchor(0), tx_hash)
     }
 
+    /// A keyless part from `source` for `tx`, whose transaction the
+    /// source committed at `clock_ms` and a block anchored [`SERVE_LAG_MS`]
+    /// later roots.
+    fn served_late(
+        source: ShardId,
+        block_height: BlockHeight,
+        clock_ms: u64,
+        tx_hash: TxHash,
+    ) -> Verified<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+            source_shard: source,
+            target_shard: ShardId::leaf(2, 0),
+            block_height,
+            source_block_ts: anchor(clock_ms + SERVE_LAG_MS).clock,
+            clock: anchor(clock_ms).clock,
+            tx_hash,
+            entries: Capped::empty(),
+            proof: MerkleInclusionProof::new(Vec::new()),
+            leaf: LeafPath {
+                count: 1,
+                index: 0,
+                siblings: Capped::empty(),
+            },
+        }))
+    }
+
+    /// How long after its commit a [`served_late`] part's rooting block
+    /// is anchored: past every clock the clock tests compare, so a reader
+    /// of the rooting clock reads none of them.
+    const SERVE_LAG_MS: u64 = 10_000;
+
     fn bundle_for(
         source: ShardId,
         tx_hash: TxHash,
@@ -522,6 +554,7 @@ mod tests {
             target_shard: ShardId::leaf(2, 0),
             block_height: BlockHeight::new(5),
             source_block_ts: anchor(0).clock,
+            clock: anchor(0).clock,
             tx_hash,
             entries,
             proof: MerkleInclusionProof::dummy(),
@@ -577,6 +610,7 @@ mod tests {
             target_shard: ShardId::leaf(2, 0),
             block_height: BlockHeight::new(height),
             source_block_ts: anchor(clock_ms).clock,
+            clock: anchor(clock_ms).clock,
             tx_hash: tx,
             entries: Capped::new(list(entries).to_vec()).expect("a list written out in a test"),
             proof: MerkleInclusionProof::dummy(),
@@ -989,6 +1023,7 @@ mod tests {
                 target_shard: ShardId::leaf(2, 0),
                 block_height: BlockHeight::new(height),
                 source_block_ts: anchor(clock_ms).clock,
+                clock: anchor(clock_ms).clock,
                 tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
                 entries: Capped::new(entries).expect("a list written out in a test"),
                 proof: MerkleInclusionProof::dummy(),
@@ -1065,6 +1100,14 @@ mod tests {
             tx,
         ));
         assert_eq!(whole_clock(&t, tx), anchor(9_500).clock);
+
+        // A payer's part rooted by a later block than the one committing
+        // the transaction carries the committing clock, and that is the
+        // clock the member runs under, not the rooting block's.
+        let mut t = ProvisioningTracker::new();
+        t.record_payer_shard(tx, shard(2));
+        t.absorb_provisions(&served_late(shard(2), BlockHeight::new(12), 9_500, tx));
+        assert_eq!(whole_clock(&t, tx), anchor(9_500).clock);
     }
 
     /// The member `local` runs of a core over leaf(1, 0) and leaf(2, 2),
@@ -1098,7 +1141,9 @@ mod tests {
     /// other's bundle, and neither reads the leg's, though the leg pays
     /// and committed first, nor that of a shard outside the core holding
     /// a component the transaction calls, which also committed before
-    /// either. The leg runs alone, under its own.
+    /// either. The leg runs alone, under its own. Each bundle is rooted
+    /// by a block later than the one committing the transaction, and the
+    /// clock is the committing block's.
     #[test]
     fn every_core_member_runs_under_the_earliest_core_clock() {
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
@@ -1108,12 +1153,7 @@ mod tests {
             let mut t = ProvisioningTracker::new();
             t.record_payer_shard(tx, leg);
             for (source, ms) in [(other, other_ms), (leg, 1_000), (holder, 3_000)] {
-                t.absorb_provisions(&make_provisions_at(
-                    source,
-                    BlockHeight::new(5),
-                    anchor(ms),
-                    tx,
-                ));
+                t.absorb_provisions(&served_late(source, BlockHeight::new(5), ms, tx));
             }
             t
         };

@@ -513,7 +513,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
 
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
     // Each leaf binds the keys its part serves out of the state this
-    // block leaves, which the header's state root commits.
+    // block leaves, which the header's state root commits, and the
+    // block's clock, which commits its transactions.
     let provision_tx_roots = provision_tx_roots(
         &PreparedBlockView {
             parent: &anchored,
@@ -521,6 +522,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         },
         topology_snapshot.shard_trie(),
         local_shard,
+        anchor,
         &transactions,
     )
     .expect("a proposal's transactions are verified, which derives them");
@@ -1451,6 +1453,7 @@ where
                     },
                     &judgement.provisions.trie,
                     ctx.shard,
+                    parent_weighted_timestamp,
                     &transactions,
                 )
             });
@@ -3402,6 +3405,7 @@ mod tests {
                 },
                 &trie,
                 LOCAL,
+                WeightedTimestamp::ZERO,
                 std::slice::from_ref(&tx),
             )
             .expect("the transaction is derived");
@@ -3535,6 +3539,7 @@ mod tests {
             PAYER_SHARD,
             ProvisionTxRoot::over(&[provision_leaf(
                 block.tx.hash(),
+                WeightedTimestamp::ZERO,
                 served_digest(std::iter::empty()),
             )]),
         )]))
@@ -3584,6 +3589,7 @@ mod tests {
                 &state.snapshot(),
                 &block.trie,
                 LOCAL,
+                WeightedTimestamp::ZERO,
                 std::slice::from_ref(&tx)
             ),
             Err(Unrouted { tx_hash: tx.hash() }),
@@ -3854,7 +3860,11 @@ mod tests {
         served.sort_unstable();
         ProvisionTxRootsMap::new(BTreeMap::from([(
             PAYER_SHARD,
-            ProvisionTxRoot::over(&[provision_leaf(tx_hash, served_digest(served.into_iter()))]),
+            ProvisionTxRoot::over(&[provision_leaf(
+                tx_hash,
+                WeightedTimestamp::ZERO,
+                served_digest(served.into_iter()),
+            )]),
         )]))
         .expect("one target")
     }

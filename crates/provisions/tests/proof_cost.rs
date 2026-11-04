@@ -85,6 +85,7 @@ struct PartWire {
     target_shard: ShardId,
     block_height: BlockHeight,
     source_block_ts: WeightedTimestamp,
+    clock: WeightedTimestamp,
     tx_hash: TxHash,
     entries: Vec<SubstateEntry>,
     proof: MerkleInclusionProof,
@@ -136,6 +137,7 @@ fn source() -> (Arc<SubstateView<SimShardStorage>>, Vec<ProvisionsRequest>) {
     let requests = (0..TRANSFERS)
         .map(|t| ProvisionsRequest {
             tx_hash: TxHash::from(Hash::from_bytes(&t.to_be_bytes())),
+            clock: WeightedTimestamp::ZERO,
             targets: vec![TARGET],
             local_keys: vec![cell(t * stride)],
             local_ranges: vec![],
@@ -187,6 +189,7 @@ fn mirrored(part: &Provision) -> PartWire {
         target_shard: part.target_shard(),
         block_height: part.block_height(),
         source_block_ts: part.source_block_ts(),
+        clock: part.clock(),
         tx_hash: part.tx_hash(),
         entries: part.entries().to_vec(),
         proof: part.proof().clone(),

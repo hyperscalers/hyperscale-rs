@@ -88,3 +88,78 @@ pub fn build_verify_actions(
     }
     actions
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use hyperscale_hbor::Capped;
+    use hyperscale_types::{
+        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, Hash, LeafPath,
+        MerkleInclusionProof, ProvisionParts, QuorumCertificate, TxHash, WeightedTimestamp,
+        provision_leaf, served_digest,
+    };
+
+    use super::*;
+
+    const SOURCE: ShardId = ShardId::leaf(1, 0);
+    const LOCAL: ShardId = ShardId::leaf(1, 1);
+
+    /// A keyless part for `tx` stating `clock`, its leaf the one leaf of
+    /// its root.
+    fn part(tx: TxHash, clock: WeightedTimestamp) -> Provision {
+        Provision::new(ProvisionParts {
+            source_shard: SOURCE,
+            target_shard: LOCAL,
+            block_height: BlockHeight::new(3),
+            source_block_ts: WeightedTimestamp::from_millis(9_000),
+            clock,
+            tx_hash: tx,
+            entries: Capped::empty(),
+            proof: MerkleInclusionProof::new(Vec::new()),
+            leaf: LeafPath {
+                count: 1,
+                index: 0,
+                siblings: Capped::empty(),
+            },
+        })
+    }
+
+    /// A part stating another clock than the one its source's root binds
+    /// for its transaction walks to another root and is refused; the
+    /// part stating the bound clock is owed. The rooting block's own
+    /// clock is neither.
+    #[test]
+    fn a_part_whose_clock_is_not_its_leafs_fails() {
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let committed = WeightedTimestamp::from_millis(5_000);
+        let leaf = provision_leaf(tx, committed, served_digest(std::iter::empty()));
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: SOURCE,
+            height: BlockHeight::new(3),
+            provision_tx_roots: Capped::new(BTreeMap::from([(
+                LOCAL,
+                ProvisionTxRoot::over(&[leaf]),
+            )]))
+            .expect("one target"),
+            ..Default::default()
+        });
+        let certified = Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+            header,
+            QuorumCertificate::genesis(SOURCE, ChainOrigin::root(WeightedTimestamp::ZERO)),
+        ));
+
+        assert_eq!(judge_owed(LOCAL, &part(tx, committed), &certified), Ok(()));
+        for other in [5_001, 9_000] {
+            assert_eq!(
+                judge_owed(
+                    LOCAL,
+                    &part(tx, WeightedTimestamp::from_millis(other)),
+                    &certified
+                ),
+                Err(ProvisionRefusal::ContentMismatch),
+                "a part stating {other} ms",
+            );
+        }
+    }
+}

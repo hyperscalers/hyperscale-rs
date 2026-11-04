@@ -41,12 +41,17 @@ struct Carried {
     source_shard: ShardId,
     target_shard: ShardId,
     block_height: BlockHeight,
-    /// The source block's parent-QC weighted timestamp. Verification
-    /// checks it against the commit-proven source header, so a part
-    /// reaching execution through a committed block carries the value
-    /// BFT-attested — the transaction clock, available to receivers that
-    /// no longer hold the header itself.
+    /// The rooting source block's parent-QC weighted timestamp.
+    /// Verification checks it against the commit-proven source header,
+    /// so a part reaching execution through a committed block carries
+    /// the value BFT-attested, available to receivers that no longer
+    /// hold the header itself.
     source_block_ts: WeightedTimestamp,
+    /// The parent-QC weighted timestamp of the block that commits the
+    /// transaction: the transaction clock receivers price it at. The
+    /// leaf binds it, so the header's root attests it whichever block
+    /// roots the part.
+    clock: WeightedTimestamp,
     tx_hash: TxHash,
     /// Strictly ascending by key. Empty for an engagement echo — a
     /// counterpart with nothing to serve still owes the payer its
@@ -71,6 +76,8 @@ pub struct ProvisionParts {
     pub block_height: BlockHeight,
     /// The source block's parent-QC weighted timestamp.
     pub source_block_ts: WeightedTimestamp,
+    /// The transaction's committing block's parent-QC weighted timestamp.
+    pub clock: WeightedTimestamp,
     /// The transaction the part provisions.
     pub tx_hash: TxHash,
     /// Its entries, strictly ascending by key.
@@ -114,6 +121,7 @@ impl Provision {
             target_shard,
             block_height,
             source_block_ts,
+            clock,
             tx_hash,
             entries,
             proof,
@@ -124,6 +132,7 @@ impl Provision {
             target_shard,
             block_height,
             source_block_ts,
+            clock,
             tx_hash,
             entries,
             proof,
@@ -157,6 +166,13 @@ impl Provision {
         self.0.source_block_ts
     }
 
+    /// The parent-QC weighted timestamp of the block that commits the
+    /// transaction, bound by the leaf: the transaction clock.
+    #[must_use]
+    pub fn clock(&self) -> WeightedTimestamp {
+        self.0.clock
+    }
+
     /// The transaction this part provisions.
     #[must_use]
     pub fn tx_hash(&self) -> TxHash {
@@ -183,13 +199,15 @@ impl Provision {
         &self.0.leaf
     }
 
-    /// The leaf this part is under its target's root: its transaction
-    /// and the keys it carries, so a part serving other keys than its
-    /// source committed walks to another root.
+    /// The leaf this part is under its target's root: its transaction,
+    /// its clock and the keys it carries, so a part serving other keys or
+    /// stating another clock than its source committed walks to another
+    /// root.
     #[must_use]
     pub fn leaf_hash(&self) -> Hash {
         provision_leaf(
             self.0.tx_hash,
+            self.0.clock,
             served_digest(self.0.entries.iter().map(|entry| entry.key)),
         )
     }
@@ -256,6 +274,7 @@ impl Provision {
             target_shard,
             block_height,
             source_block_ts,
+            clock: source_block_ts,
             tx_hash,
             entries: Capped::empty(),
             proof: MerkleInclusionProof::new(Vec::new()),
@@ -278,6 +297,7 @@ impl Provision {
             target_shard: carried.target_shard,
             block_height: carried.block_height,
             source_block_ts: carried.source_block_ts,
+            clock: carried.clock,
             tx_hash: carried.tx_hash,
             entries: carried.entries.clone(),
             proof: carried.proof.clone(),
@@ -528,6 +548,7 @@ mod tests {
                 target_shard: ShardId::leaf(1, 1),
                 block_height: BlockHeight::new(10),
                 source_block_ts: WeightedTimestamp::ZERO,
+                clock: WeightedTimestamp::ZERO,
                 tx_hash: tx(b"tx1"),
                 entries: Capped::from_array([entry.clone()]),
                 proof: MerkleInclusionProof::dummy(),
@@ -628,6 +649,7 @@ mod tests {
                 target_shard: ShardId::leaf(1, 1),
                 block_height: BlockHeight::new(1),
                 source_block_ts,
+                clock: source_block_ts,
                 tx_hash: tx(b"tx"),
                 entries: Capped::new(entries).expect("a list written out in a test"),
                 proof,
@@ -741,6 +763,7 @@ mod tests {
                 target_shard: ShardId::leaf(1, 1),
                 block_height: BlockHeight::new(1),
                 source_block_ts: WeightedTimestamp::ZERO,
+                clock: WeightedTimestamp::ZERO,
                 tx_hash: tx(b"tx"),
                 entries: Capped::new(carried(&items)).unwrap(),
                 proof,

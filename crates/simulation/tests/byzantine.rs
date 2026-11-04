@@ -529,6 +529,7 @@ fn reprove_parts(storage: &SimShardStorage, honest: &[u8], forge: EntryForgery) 
                 target_shard: part.target_shard(),
                 block_height: part.block_height(),
                 source_block_ts: part.source_block_ts(),
+                clock: part.clock(),
                 tx_hash: part.tx_hash(),
                 entries,
                 proof,

@@ -10,7 +10,8 @@ use hyperscale_hbor::Capped;
 use hyperscale_storage::Substates;
 use hyperscale_types::{
     EntryKey, Hash, ProtocolHasher, ProvisionTxRoot, ProvisionTxRootsMap, ShardId, ShardTrie,
-    SubstateKey, Transaction, TxHash, Verifiable, entry_leaf_key, provision_leaf, served_digest,
+    SubstateKey, Transaction, TxHash, Verifiable, WeightedTimestamp, entry_leaf_key,
+    provision_leaf, served_digest,
 };
 use thiserror::Error;
 
@@ -60,10 +61,14 @@ pub struct Unrouted {
 }
 
 /// The leaf `request`'s part sits at under each of its targets' roots,
-/// over `keys`, its [`served_keys`].
+/// over `keys`, its [`served_keys`], at the request's clock.
 #[must_use]
 pub fn served_leaf(request: &ProvisionsRequest, keys: &[SubstateKey]) -> Hash {
-    provision_leaf(request.tx_hash, served_digest(keys.iter().copied()))
+    provision_leaf(
+        request.tx_hash,
+        request.clock,
+        served_digest(keys.iter().copied()),
+    )
 }
 
 /// Each request's [`served_keys`] out of `state`, in request order: read
@@ -101,6 +106,8 @@ pub fn leaves_over_requests(
 /// `transactions`, routed under `trie`, over `state`, the state the block
 /// leaves: one entry for each target owed at least one leaf.
 ///
+/// Each leaf binds `clock`, the block's parent-QC weighted timestamp.
+///
 /// # Errors
 ///
 /// [`Unrouted`] for the first transaction this node has not derived:
@@ -115,6 +122,7 @@ pub fn provision_tx_roots(
     state: &impl Substates,
     trie: &ShardTrie,
     local_shard: ShardId,
+    clock: WeightedTimestamp,
     transactions: &[Verifiable<Transaction>],
 ) -> Result<ProvisionTxRootsMap, Unrouted> {
     let mut requests = Vec::new();
@@ -122,7 +130,7 @@ pub fn provision_tx_roots(
         if !tx.as_unverified().is_routed() {
             return Err(Unrouted { tx_hash: tx.hash() });
         }
-        requests.extend(provision_request(trie, tx, local_shard));
+        requests.extend(provision_request(trie, tx, local_shard, clock));
     }
     Ok(Capped::new(
         leaves_over_requests(state, &requests)
@@ -173,12 +181,18 @@ mod tests {
     }
 
     fn roots(transactions: &[Verifiable<Transaction>]) -> Result<ProvisionTxRootsMap, Unrouted> {
-        provision_tx_roots(&Empty, &ShardTrie::uniform(1), LOCAL, transactions)
+        provision_tx_roots(
+            &Empty,
+            &ShardTrie::uniform(1),
+            LOCAL,
+            WeightedTimestamp::ZERO,
+            transactions,
+        )
     }
 
     /// The leaf `tx`'s part to [`REMOTE`] sits at.
     fn leaf_of(tx: &Verifiable<Transaction>) -> Hash {
-        let request = provision_request(&ShardTrie::uniform(1), tx, LOCAL)
+        let request = provision_request(&ShardTrie::uniform(1), tx, LOCAL, WeightedTimestamp::ZERO)
             .expect("the transaction owes the remote shard");
         served_leaf(&request, &served_keys(&Empty, &request))
     }

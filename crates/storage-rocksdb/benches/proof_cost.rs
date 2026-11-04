@@ -81,6 +81,7 @@ fn transfers() -> Vec<ProvisionsRequest> {
     (0..TRANSFERS)
         .map(|t| ProvisionsRequest {
             tx_hash: TxHash::from(Hash::from_bytes(&t.to_be_bytes())),
+            clock: WeightedTimestamp::ZERO,
             targets: vec![TARGET],
             local_keys: vec![cell(t * stride)],
             local_ranges: vec![],

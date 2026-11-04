@@ -25,7 +25,7 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHeight, CertifiedBlock, ConsensusReceipt,
     DeclaredRange, Finalization, FrontierInputs, GlobalReceiptHash, Hash, ProtocolHasher,
     SettledWrites, ShardId, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TxHash,
-    Verified, entry_leaf_key,
+    Verified, WeightedTimestamp, entry_leaf_key,
 };
 use tempfile::tempdir;
 
@@ -70,6 +70,7 @@ fn leaf(seed: u8, order: u128) -> SubstateKey {
 fn request() -> ProvisionsRequest {
     ProvisionsRequest {
         tx_hash: TxHash::from(Hash::from_bytes(b"reader")),
+        clock: WeightedTimestamp::ZERO,
         targets: vec![ShardId::leaf(1, 1)],
         local_keys: vec![state_key(0x55, 1)],
         local_ranges: vec![
