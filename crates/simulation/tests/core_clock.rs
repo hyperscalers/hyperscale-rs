@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::{
-    BOOK_SHARD, BookRoute, FaultableCluster, ScenarioConfig,
+    BOOK_SHARD, BOOK_VENUE_SHARD, BookRoute, FaultableCluster, ScenarioConfig,
     a_divided_core_pays_out_under_one_clock, book_route_genesis_accounts, cutoff_genesis_accounts,
     departing_venue_split_bytes, epochs,
 };
@@ -57,7 +57,7 @@ const LOST_VOTES: usize = 120;
 
 /// The book route's four quarters, grown on dedicated pool hosts, the
 /// reshape trigger armed above every quarter and never voted down.
-fn book_route_cluster() -> SimCluster {
+fn book_route_cluster(seed: u64) -> SimCluster {
     SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &ScenarioConfig {
             shard_size: 4,
@@ -67,7 +67,7 @@ fn book_route_cluster() -> SimCluster {
             split_bytes: departing_venue_split_bytes(),
             latency: std::time::Duration::from_millis(150),
         },
-        42,
+        seed,
         &book_route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     )
@@ -96,7 +96,7 @@ fn book_route_cluster() -> SimCluster {
 #[test]
 #[ignore = "a core member's tick view of its own cells is not what its bundle served"]
 fn a_core_member_reads_its_own_cells_as_its_bundle_served_them() {
-    let mut cluster = book_route_cluster();
+    let mut cluster = book_route_cluster(sim_seed(42));
     cluster.run_faultable(|c| {
         let mut route = BookRoute::stand_up(c);
         let lost = Arc::new(AtomicUsize::new(0));
@@ -119,6 +119,59 @@ fn a_core_member_reads_its_own_cells_as_its_bundle_served_them() {
         assert!(
             lost.load(Ordering::Relaxed) > LOST_VOTES,
             "the book's votes have to have been lost and then flowed, or nothing raced: {fill:?}",
+        );
+        route.assert_conserved(c, epochs(12));
+    });
+}
+
+/// Provision broadcasts the venue's committee sends that are lost before
+/// the rest go through: every one the route's core sends, so the book's
+/// shard holds the route pending until it fetches the venue's part.
+const LOST_PROVISIONS: usize = 64;
+
+/// A local fill the book's shard commits after a route and runs while the
+/// route waits on the venue's part leaves the route's two core members
+/// walking two ladders.
+///
+/// The venue's committee loses its first provision broadcasts, so the
+/// book's shard holds the route pending until it fetches the venue's
+/// part. A local fill submitted once the book's shard has committed the
+/// route commits after it, and a pending row holds nothing, so the fill
+/// is named and runs in the meantime. The book's bundle serves the
+/// ladder its committing block left, which the later fill never touched;
+/// the book's own member reads the ladder through its tick, which layers
+/// the fill's output. So the venue banks the base of one walk and the
+/// book's vault gives up the base of another.
+///
+/// The route must bank one base on both shards, the one the walk over
+/// the ladder the book's committing block left buys, as one run of the
+/// core would.
+#[test]
+#[ignore = "a member committed after a core member runs before it on the cells the core's part served"]
+fn a_fill_committed_after_the_route_waits_for_the_route() {
+    let mut cluster = book_route_cluster(sim_seed(42));
+    cluster.run_faultable(|c| {
+        let mut route = BookRoute::stand_up(c);
+        let lost = Arc::new(AtomicUsize::new(0));
+        for host in c.committee_hosts(BOOK_VENUE_SHARD) {
+            let lost = Arc::clone(&lost);
+            let _ = c.rewrite_notifications(
+                host,
+                "provisions.broadcast",
+                Arc::new(move |_asked: &[u8], honest: &[u8]| {
+                    if lost.fetch_add(1, Ordering::Relaxed) < LOST_PROVISIONS {
+                        Vec::new()
+                    } else {
+                        honest.to_vec()
+                    }
+                }),
+            );
+        }
+
+        let fill = route.run_with_a_later_fill(c, epochs(12), "a fill committed after the route");
+        assert!(
+            lost.load(Ordering::Relaxed) > 0,
+            "the venue's broadcasts have to have been lost, or the route never waited: {fill:?}",
         );
         route.assert_conserved(c, epochs(12));
     });

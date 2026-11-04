@@ -14,8 +14,9 @@ use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::{config_key, crossing_records};
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BlockHeight, DeclaredRange, Ed25519PrivateKey, MIN_STAKE_FLOOR, PrincipalAddr, ProtocolHasher,
-    ResourceAddr, ShardId, SubstateKey, TransactionDecision, TransactionStatus, TxHash,
+    BlockHeight, ConsensusReceipt, DeclaredRange, Ed25519PrivateKey, MIN_STAKE_FLOOR, Movement,
+    PrincipalAddr, ProtocolHasher, ResourceAddr, ShardId, SubstateKey, TransactionDecision,
+    TransactionStatus, TxHash,
 };
 use hyperscale_vm_effects::{InstanceMeta, SlotId, Value, child_key, collection_id};
 use hyperscale_vm_fixtures::book::{self, FILL_CAP};
@@ -23,7 +24,7 @@ use hyperscale_vm_sdk::client::VaultField;
 
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
 use crate::support::conservation::{Charges, World};
-use crate::support::query::{declared_price, held, held_at, stands_at};
+use crate::support::query::{declared_price, held, held_at, owning_shard, stands_at};
 use crate::support::tx::{
     FILL_TICKS, GENESIS_POOL, ballast_to, book_on, build_book_route_tx, build_fill_asks_tx,
     build_instantiate_tx, build_place_asks_tx, build_stake_tx, departing_target, pool_at,
@@ -251,9 +252,38 @@ impl BookRoute {
     ///
     /// Panics if the route or a local fill does not accept within
     /// `budget`, if fewer than [`FILL_CAP`] asks stood in the interval at
-    /// the book's committing height, or if the venue's reserve or the
-    /// trader's balance does not settle at the closed form.
+    /// the book's committing height, if the venue's shard banks other
+    /// base than the book's shard removed from its asks, or if the
+    /// venue's reserve or the trader's balance does not settle at the
+    /// closed form.
     pub fn run<C: Cluster>(&mut self, c: &mut C, budget: Budget, label: &str) -> RouteFill {
+        self.run_scheduled(c, budget, label, Second::Beside)
+    }
+
+    /// [`run`](Self::run), with the second local fill submitted only once
+    /// the book's shard has committed the route, so it commits after the
+    /// route there.
+    ///
+    /// # Panics
+    ///
+    /// As [`run`](Self::run) does, and if the book's shard does not
+    /// commit the route within `budget`.
+    pub fn run_with_a_later_fill<C: Cluster>(
+        &mut self,
+        c: &mut C,
+        budget: Budget,
+        label: &str,
+    ) -> RouteFill {
+        self.run_scheduled(c, budget, label, Second::AfterTheRoute)
+    }
+
+    fn run_scheduled<C: Cluster>(
+        &mut self,
+        c: &mut C,
+        budget: Budget,
+        label: &str,
+        second: Second,
+    ) -> RouteFill {
         let (trader_key, trader) = &self.trader;
         let (local_key, local) = &self.local;
         let unit_reserve = reserve_cell(&self.venue.meta, self.venue.unit);
@@ -294,6 +324,12 @@ impl BookRoute {
 
         let before = self.charges.submit(c, before);
         let hash = self.charges.submit(c, route);
+        if second == Second::AfterTheRoute {
+            assert!(
+                c.run_until(budget, |c| c.chain_fate(BOOK_SHARD, hash).0.is_some()),
+                "{label}: the book's shard must commit the route before the later fill",
+            );
+        }
         let beside = self.charges.submit(c, beside);
         for (what, tx) in [
             ("route", hash),
@@ -323,6 +359,8 @@ impl BookRoute {
              or the cap bites nothing: {}",
             standing.len(),
         );
+        self.assert_one_base(c, hash, budget, label);
+
         let (bought, spent) = capped_walk(&standing, ROUTE_INPUT);
         let out = venue_quote(reserves, bought);
         let banked = funded - ROUTE_INPUT - price + (ROUTE_INPUT - spent) + out;
@@ -348,6 +386,57 @@ impl BookRoute {
         }
     }
 
+    /// Assert the route's two core members banked one base: what the
+    /// venue's shard credits the venue's base reserve is what the book's
+    /// shard takes out of the book's base vault, the asks its own walk
+    /// removed.
+    ///
+    /// Each shard certifies its own projection of the core, and a leaf
+    /// carries no content, so two members that walked two ladders both
+    /// settle, and the difference between their walks is base minted or
+    /// burned. Only the two receipts side by side name it.
+    fn assert_one_base<C: Cluster>(&self, c: &mut C, hash: TxHash, budget: Budget, label: &str) {
+        let unit_reserve = reserve_cell(&self.venue.meta, self.venue.unit);
+        let book_base = book_vault(&self.book, BOOK_BASE, self.venue.unit);
+        let venue_shard = owning_shard(c, unit_reserve.owner);
+        assert!(
+            c.run_until(budget, |c| {
+                c.receipt(BOOK_SHARD, hash).is_some() && c.receipt(venue_shard, hash).is_some()
+            }),
+            "{label}: the book's shard and the venue's {venue_shard:?} must each settle the route \
+             under a receipt",
+        );
+        let moved = |shard, cell| {
+            let receipt = c
+                .receipt(shard, hash)
+                .expect("a receipt once held stays held");
+            match receipt.as_ref() {
+                ConsensusReceipt::Succeeded { writes, .. } => writes
+                    .movements
+                    .get(&cell)
+                    .copied()
+                    .unwrap_or_else(|| Movement::none(self.venue.unit)),
+                ConsensusReceipt::Failed => {
+                    panic!("{label}: {shard:?} settled an accepted route as failed")
+                }
+            }
+        };
+        let removed = moved(BOOK_SHARD, book_base);
+        let banked = moved(venue_shard, unit_reserve);
+        assert!(
+            removed.credit == 0
+                && banked.debit == 0
+                && removed.unjudged_debit == 0
+                && banked.unjudged_debit == 0
+                && removed.debit == banked.credit,
+            "{label}: the venue's shard banks {} base and the book's shard removed {} from its \
+             asks: the two members of one core walked two ladders (book vault {removed:?}, venue \
+             reserve {banked:?})",
+            banked.credit,
+            removed.debit,
+        );
+    }
+
     /// Assert both worlds settle across every route and local fill run.
     ///
     /// # Panics
@@ -363,6 +452,15 @@ impl BookRoute {
         self.units
             .assert_settles_within(c, &Charges::default(), budget, "the book route's base");
     }
+}
+
+/// When a route's second local fill is submitted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Second {
+    /// With the route.
+    Beside,
+    /// Once the book's shard has committed the route.
+    AfterTheRoute,
 }
 
 /// The book's whole ladder as a declared interval, cut at `cap`.

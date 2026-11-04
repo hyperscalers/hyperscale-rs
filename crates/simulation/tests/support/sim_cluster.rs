@@ -1108,6 +1108,18 @@ impl Cluster for SimCluster {
         })
     }
 
+    fn receipt(&self, shard: ShardId, tx: TxHash) -> Option<Arc<ConsensusReceipt>> {
+        let store =
+            (0..self.runner.num_hosts()).find_map(|host| self.runner.hosts_shard(host, shard))?;
+        let mut receipts = store.get_consensus_receipts(&tx);
+        assert!(
+            receipts.len() <= 1,
+            "{shard:?} settled {} receipts for {tx:?}",
+            receipts.len(),
+        );
+        receipts.pop()
+    }
+
     fn tx_statuses(&self, tx: TxHash) -> Vec<(TransactionStatus, ShardId)> {
         // A replica holding a tail its shard's chain replaced reports what
         // it decided off that tail, which the shard discarded.

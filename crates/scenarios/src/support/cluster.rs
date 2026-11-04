@@ -8,10 +8,10 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_storage::RowState;
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, ChainOrigin, DeclaredRange, Derivation, Epoch, Event, Heard,
-    PriceTable, ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    ValidatorId, WeightedTimestamp,
+    Address, BeaconState, BlockHeight, ChainOrigin, ConsensusReceipt, DeclaredRange, Derivation,
+    Epoch, Event, Heard, PriceTable, ShardId, Signer, StandingAnswers, StandingToward, StateRoot,
+    SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    TxsInFlight, ValidatorId, WeightedTimestamp,
 };
 
 use super::Budget;
@@ -231,6 +231,24 @@ pub trait Cluster {
     /// shard for a multi-shard transaction by design. `None` when no
     /// hosted store on `shard` holds the receipt.
     fn events(&self, shard: ShardId, tx: TxHash) -> Option<Vec<Event>> {
+        let _ = (shard, tx);
+        None
+    }
+
+    /// The receipt `shard` settled its member of `tx` under: the writes
+    /// and movements its own projection of the run applies. `None` when
+    /// no hosted store on `shard` holds one.
+    ///
+    /// The same observation seam as [`events`](Self::events): each shard
+    /// a core spans certifies its own projection, so whether two of them
+    /// ran one walk is read off their two receipts and nowhere else.
+    ///
+    /// # Panics
+    ///
+    /// Where a store of `shard` holds more than one receipt for `tx`,
+    /// which a shard running two members of it settles and which no
+    /// scenario asking this one builds.
+    fn receipt(&self, shard: ShardId, tx: TxHash) -> Option<Arc<ConsensusReceipt>> {
         let _ = (shard, tx);
         None
     }

@@ -764,14 +764,11 @@ impl MempoolCoordinator {
     }
 
     /// Drive one transaction to `Completed(Aborted)`: drop it from the
-    /// pool, release its locks if it was in flight, tombstone it, and
-    /// return its terminal status action. `None` for a hash not in the
-    /// pool (already terminal).
+    /// pool, tombstone it, and return its terminal status action. `None`
+    /// for a hash not in the pool (already terminal).
     ///
-    /// Lock release filters declared keys to the local shard, like its
-    /// lock/unlock siblings — only locally-routed keys were ever locked.
-    /// At a reshape boundary the head trie may have re-routed keys this
-    /// chain locked; skipping them is sound because a terminated chain's
+    /// The pool holds no state locks, so dropping the entry releases
+    /// everything it held of the transaction.
     fn abort_one(&mut self, tx_hash: TxHash) -> Option<Action> {
         let entry = self.pool.remove(&tx_hash)?;
         self.tombstones.tombstone(tx_hash, entry.admissible_until);
