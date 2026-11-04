@@ -336,12 +336,12 @@ fn seat_seeds(
     let newest = schedule.retained_epochs().map(|(_, newest)| newest);
     let mut unpublished = BTreeSet::new();
     for epoch in epochs {
-        if env.seeds.window_for(epoch).is_some() {
+        if env.seeds.holds_window(epoch) {
             continue;
         }
         if let Some(ring) = schedule.seeds_at(epoch) {
             env.seeds.absorb(ring);
-            if env.seeds.window_for(epoch).is_some() {
+            if env.seeds.holds_window(epoch) {
                 continue;
             }
         }
@@ -402,7 +402,7 @@ impl PendingTick {
             if let Some(ring) = schedule.seeds_at(*epoch) {
                 env.seeds.absorb(ring);
             }
-            env.seeds.window_for(*epoch).is_none()
+            !env.seeds.holds_window(*epoch)
         });
         if awaited.epochs.is_empty() {
             self.awaiting = None;

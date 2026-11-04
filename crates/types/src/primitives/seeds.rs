@@ -1,6 +1,7 @@
 //! The window of past epoch seeds a draw can still reach.
 
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 
 use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::SeedWindow;
@@ -124,19 +125,35 @@ impl SeedRing {
     /// the round closes again.
     #[must_use]
     pub fn window_for(&self, epoch: Epoch) -> Option<SeedWindow> {
-        let Some(frontier) = epoch.inner().checked_sub(1) else {
+        let Some(drawn) = Self::drawn_on(epoch) else {
             return Some(SeedWindow::unfolded());
         };
-        // The genesis epoch rolls no seed, so epoch 1's is the first.
-        let oldest = epoch.inner().saturating_sub(SEED_WINDOW_EPOCHS).max(1);
+        let frontier = *drawn.end();
         let mut usable = BTreeMap::new();
-        for at in oldest..=frontier {
+        for at in drawn {
             let seed = self.get(Epoch::new(at))?;
             if matches!(seed.source, SeedSource::Reveals) {
                 usable.insert(at, *seed.randomness.as_bytes());
             }
         }
         Some(SeedWindow::new(usable, Some(frontier)))
+    }
+
+    /// Whether [`Self::window_for`] `epoch` answers, without building the
+    /// window.
+    #[must_use]
+    pub fn holds_window(&self, epoch: Epoch) -> bool {
+        Self::drawn_on(epoch)
+            .is_none_or(|mut drawn| drawn.all(|at| self.0.contains_key(&Epoch::new(at))))
+    }
+
+    /// The epochs whose seeds a draw clocked in `epoch` reads, oldest
+    /// first; `None` for the genesis epoch, before which nothing rolled.
+    fn drawn_on(epoch: Epoch) -> Option<RangeInclusive<u64>> {
+        let frontier = epoch.inner().checked_sub(1)?;
+        // The genesis epoch rolls no seed, so epoch 1's is the first.
+        let oldest = epoch.inner().saturating_sub(SEED_WINDOW_EPOCHS).max(1);
+        Some(oldest..=frontier)
     }
 
     /// Take in every seed `other` holds that this ring does not.
@@ -278,6 +295,27 @@ mod tests {
         let ring = folded_through(98, PRODUCTION);
         assert_eq!(ring.window_for(Epoch::new(100)), None);
         assert!(ring.window_for(Epoch::new(99)).is_some());
+    }
+
+    /// Whether a ring holds a window is whether it builds one, at either
+    /// end of the ring and at genesis.
+    #[test]
+    fn holding_a_window_is_building_one() {
+        let ring = folded_through(150, PRODUCTION);
+        for epoch in 0..=160 {
+            let epoch = Epoch::new(epoch);
+            assert_eq!(
+                ring.holds_window(epoch),
+                ring.window_for(epoch).is_some(),
+                "epoch {epoch}"
+            );
+        }
+        assert!(ring.holds_window(Epoch::new(151)));
+        assert!(!ring.holds_window(Epoch::new(152)));
+        assert!(
+            !ring.holds_window(Epoch::new(84)),
+            "its oldest seeds are gone"
+        );
     }
 
     /// A tick on thirty-second epochs runs at most the retention horizon

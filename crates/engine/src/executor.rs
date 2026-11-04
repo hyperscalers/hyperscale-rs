@@ -29,8 +29,8 @@ use hyperscale_effects_bridge::{
 use hyperscale_metrics::{record_provision_range_entries_consumed, record_transaction_executed};
 use hyperscale_storage::entry_from_leaf;
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
-    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Epoch, EscrowedValue,
+    Event, EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
     MAX_STAGED_RECEIPT_BYTES, MAX_TICK_STAGED_BYTES, Movement, PriceTable, PrincipalAddr,
     ProvisionalHolds, Role, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
     Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
@@ -47,7 +47,7 @@ use hyperscale_vm_kernel::{
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
-    EntryKey, Mode, Moves, Outcome, ResourceAddr, SubstateKey, UnmetCondition,
+    EntryKey, Mode, Moves, Outcome, ResourceAddr, SeedWindow, SubstateKey, UnmetCondition,
 };
 
 use crate::backend::{Availability, EngineBackend};
@@ -127,20 +127,34 @@ pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
 /// and the seed window is a function of that epoch alone, so two shards
 /// running one core in ticks under different windows pass one window.
 ///
+/// Each epoch's window is built once into `windows` and shared by every
+/// member clocked in it.
+///
 /// # Panics
 ///
 /// Where the tick's ring lacks a seed of the member's window. A tick
 /// dispatches only once it holds every member's, so this is a dispatch
 /// that skipped the wait; answering it anyway would be a draw this node
 /// alone answers.
-fn env_at(ctx: &TickBatchContext<'_>, clock: WeightedTimestamp) -> EnvInputs {
+fn env_at(
+    ctx: &TickBatchContext<'_>,
+    windows: &mut BTreeMap<Epoch, SeedWindow>,
+    clock: WeightedTimestamp,
+) -> EnvInputs {
+    let epoch = ctx.env.windows.epoch_for(clock);
+    let seeds = windows
+        .entry(epoch)
+        .or_insert_with(|| {
+            ctx.env
+                .seeds
+                .window_for(epoch)
+                .expect("a tick dispatches once its ring holds every member's seed window")
+        })
+        .clone();
     EnvInputs {
         clock_ms: clock.as_millis(),
-        epoch: ctx.env.windows.epoch_for(clock).inner(),
-        seeds: ctx
-            .env
-            .seed_window_for(clock)
-            .expect("a tick dispatches once its ring holds every member's seed window"),
+        epoch: epoch.inner(),
+        seeds,
     }
 }
 
@@ -1575,9 +1589,10 @@ impl Executor {
                 (i.tx_hash, Arc::new(reads))
             })
             .collect();
+        let mut windows = BTreeMap::new();
         let env_by_tx: BTreeMap<TxHash, EnvInputs> = inputs
             .iter()
-            .map(|i| (i.tx_hash, env_at(ctx, i.clock)))
+            .map(|i| (i.tx_hash, env_at(ctx, &mut windows, i.clock)))
             .collect();
         let shapes: BTreeMap<TxHash, &TickTxInput<'_>> =
             inputs.iter().map(|i| (i.tx_hash, i)).collect();
