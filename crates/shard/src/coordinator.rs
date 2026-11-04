@@ -10887,8 +10887,11 @@ mod tests {
     }
 
     /// The line changes nothing where every predecessor's markers are in
-    /// this chain's own state, nor on a chain born at network genesis,
-    /// whose cut is zero and before which nothing opens.
+    /// this chain's own state, nor on a chain born at network genesis.
+    /// Such a chain anchors at the network's genesis instant but succeeds
+    /// nothing, so its cut is zero: a transaction opening before that
+    /// instant, on a block anchored well inside `MAX_VALIDITY_RANGE` of
+    /// it, is no predecessor's and passes.
     #[test]
     fn the_line_leaves_a_left_child_and_a_genesis_chain_alone() {
         let cut = WeightedTimestamp::from_millis(10_000);
@@ -10919,29 +10922,31 @@ mod tests {
             );
         }
 
-        let (genesis, _) = make_test_state();
+        let instant = WeightedTimestamp::from_millis(1_700_000_000_000);
+        let genesis = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+            instant,
+        )
+        .signed_by(ValidatorId::new(0));
         assert!(genesis.chain_origin.born_at_network_genesis());
+        assert_eq!(genesis.chain_origin.anchor_wt, instant);
         assert!(genesis.precut.is_unanswered());
-        let tx = tx_over(
-            9,
-            TimestampRange::new(
-                WeightedTimestamp::ZERO,
-                WeightedTimestamp::from_millis(60_000),
-            ),
-        );
-        for anchored_ms in [
-            1_000,
-            WeightedTimestamp::ZERO.plus(MAX_VALIDITY_RANGE).as_millis(),
-        ] {
+        assert!(!genesis.precut_window_open());
+        let opens = WeightedTimestamp::from_millis(instant.as_millis() - 1_000);
+        let range = TimestampRange::new(opens, opens.plus(MAX_VALIDITY_RANGE));
+        let tx = tx_over(9, range);
+        for anchored_ms in [instant.as_millis(), instant.as_millis() + 1_000] {
+            let block = block_carrying(ShardId::ROOT, &tx, 11, anchored_ms);
+            assert!(range.contains(block.header().parent_qc().weighted_timestamp()));
             assert!(
                 genesis
                     .vote_fence()
-                    .judge(
-                        &fence_schedule(),
-                        &block_carrying(ShardId::ROOT, &tx, 11, anchored_ms)
-                    )
+                    .judge(&fence_schedule(), &block)
                     .is_ok(),
-                "nothing opens before a genesis chain's cut, at {anchored_ms}"
+                "a genesis chain defers nothing opening before its instant, at {anchored_ms}"
             );
         }
     }

@@ -2421,23 +2421,35 @@ mod tests {
         /// The builder and the voter read one rule: whatever the builder
         /// keeps, the voter admits, and whatever it drops, the voter
         /// refuses — alone, or beside a kept twin.
+        ///
+        /// Every transaction opens at one instant, and the origin lands
+        /// just before it, on it, or just after it. Before it, an inherited
+        /// marker the state holds is not read, so a transaction marked
+        /// only there is kept; on it or after, that marker refuses.
         #[test]
         fn the_builder_keeps_exactly_what_the_voter_admits(
             picks in prop::collection::vec(0u8..6, 0..10),
             marked in prop::collection::vec((0u8..6, any::<bool>()), 0..6),
+            origin_offset in prop::sample::select(vec![-1i64, 0, 1]),
         ) {
-            use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+            use hyperscale_types::TimestampRange;
+            use hyperscale_types::test_utils::{
+                install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
+            };
 
             install_stub_protocol_statics();
             let shard = ShardId::leaf(1, 0);
-            let origin = WeightedTimestamp::from_millis(1);
+            let opens = WeightedTimestamp::from_millis(60_000);
+            let range = TimestampRange::new(opens, opens.plus(std::time::Duration::from_mins(1)));
+            let tx_of = |seed: u8| stub_transaction(test_principal(seed), &[test_prefix(seed)], 1_000, range);
+            let origin = WeightedTimestamp::from_millis(opens.as_millis().saturating_add_signed(origin_offset));
             let state = holding_keys(marked.iter().filter_map(|(seed, inherited)| {
-                let row = committed_here(shard, origin, [&test_transaction(*seed)]).remove(0);
+                let row = committed_here(shard, opens, [&tx_of(*seed)]).remove(0);
                 if *inherited { row.inherited } else { Some(row.key) }
             }));
             let listed: Vec<_> = picks
                 .iter()
-                .map(|seed| Verified::new_unchecked_for_test(test_transaction(*seed)))
+                .map(|seed| Verified::new_unchecked_for_test(tx_of(*seed)))
                 .collect();
             let mut kept: Capped<Vec<_>, 16> = Capped::new(listed.clone()).expect("under the cap");
             without_colliding_committed_cells(shard, origin, &mut kept, &state);
@@ -2449,6 +2461,15 @@ mod tests {
                 let twin_kept = kept.iter().any(|k| k.hash() == tx.hash());
                 let alone = colliding_committed_cell(&[rows_of_tx(shard, origin, tx)], &state);
                 prop_assert!(twin_kept || alone.is_some(), "a dropped transaction the voter admits alone");
+                let marked_by = |by_inherited: bool| marked.iter().any(|(seed, inherited)| {
+                    *inherited == by_inherited && tx_of(*seed).hash() == tx.hash()
+                });
+                if origin < opens && !marked_by(false) {
+                    prop_assert!(twin_kept, "an inherited marker refused a transaction opening after the origin");
+                }
+                if origin >= opens && marked_by(true) {
+                    prop_assert!(alone.is_some(), "an inherited marker went unread on or after the origin");
+                }
             }
         }
 

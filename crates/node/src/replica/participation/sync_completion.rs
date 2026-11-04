@@ -191,17 +191,21 @@ impl ShardParticipation {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine};
+    use hyperscale_core::{
+        Action, CommitSource, FetchIds, FetchRequest, ProtocolEvent, StateMachine,
+    };
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{RecoveredState, ReplayWindow};
     use hyperscale_types::test_utils::{
-        certify, make_live_block, naming_its_own, test_transaction,
+        certify, certify_signed, make_live_block, naming_its_own, test_transaction,
     };
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock,
-        CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, ProvisionTxRoot,
-        QuorumCertificate, ShardId, ValidatorId, Verified, WeightedTimestamp,
+        Anchor, BeaconChainConfig, BeaconState, Block, BlockHash, BlockHeader, BlockHeaderParts,
+        BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Epoch, Hash,
+        LocalTimestamp, MAX_VALIDITY_RANGE, ProvisionTxRoot, QuorumCertificate, ShardId, StateRoot,
+        ValidatorId, Verified, WeightedTimestamp,
     };
 
     use crate::assert_emits;
@@ -399,5 +403,164 @@ mod tests {
                 "a replay ran a live hook: {action:?}",
             );
         }
+    }
+
+    /// Window 1 runs the root's two children on the genesis committee.
+    fn split(genesis: BeaconState) -> Vec<BeaconState> {
+        let mut state = genesis;
+        state.current_epoch = Epoch::new(1);
+        let committee = state.shard_committees[&ShardId::ROOT].clone();
+        let (left, right) = ShardId::ROOT.children();
+        state.shard_committees = [(left, committee.clone()), (right, committee)].into();
+        state.next_shard_committees = state.shard_committees.clone();
+        state.shard_consensus_members = state.ready_consensus_members(&state.shard_committees);
+        vec![state]
+    }
+
+    /// The precut scans a right child runs around a commit that carries
+    /// its committed anchor across the line.
+    struct Crossing {
+        terminal: Anchor,
+        before: Vec<Action>,
+        at: Vec<Action>,
+        after: Vec<Action>,
+        node: NodeStateMachine,
+    }
+
+    /// The root's right child, cut inside window 1 and holding the root's
+    /// terminal, commits height 11 anchored `past_cut` after its cut,
+    /// through the consensus commit path, with a cleanup tick before the
+    /// commit and two after it.
+    fn cross(past_cut: Duration) -> Crossing {
+        let (_, right) = ShardId::ROOT.children();
+        let epoch_ms = BeaconChainConfig::at_unix_epoch().epoch_duration_ms;
+        let cut = WeightedTimestamp::from_millis(epoch_ms + 1);
+        let anchored = cut.plus(past_cut);
+        assert!(
+            anchored.as_millis() < 2 * epoch_ms,
+            "the commit stays in window 1"
+        );
+        let terminal = Anchor {
+            shard: ShardId::ROOT,
+            height: BlockHeight::new(9),
+            state_root: StateRoot::ZERO,
+            ts: cut,
+        };
+        let recovered = RecoveredState {
+            chain_origin: Some(ChainOrigin {
+                genesis_height: BlockHeight::new(10),
+                anchor_wt: cut,
+            }),
+            predecessors: vec![terminal],
+            committed_height: BlockHeight::new(10),
+            committed_hash: Some(BlockHash::ZERO),
+            committed_block_anchor_wt: Some(cut),
+            committed_committee_anchor_wt: Some(cut),
+            ..RecoveredState::default()
+        };
+        let TestNode { mut node, .. } = TestNode::builder()
+            .local_shard(right)
+            .recovered(recovered)
+            .beacon_history(split)
+            .build();
+        assert_eq!(node.shard_coordinator().precut_terminal(), Some(terminal));
+        assert!(node.shard_coordinator().precut_rule_live());
+
+        let now = LocalTimestamp::from_millis(anchored.as_millis());
+        let before = node.handle(now, ProtocolEvent::CleanupTimer);
+
+        let block = make_live_block(
+            right,
+            BlockHeight::new(11),
+            anchored.as_millis(),
+            ValidatorId::new(0),
+            vec![],
+            vec![],
+        );
+        let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+            certify_signed(block, anchored.as_millis(), Epoch::new(1)),
+        ));
+        let _ = node.handle(
+            now,
+            ProtocolEvent::BlockReadyToCommit {
+                certified,
+                source: CommitSource::Aggregator,
+            },
+        );
+        assert_eq!(
+            node.shard_coordinator().committed_height(),
+            BlockHeight::new(11),
+            "the commit went through",
+        );
+
+        let at = node.handle(now, ProtocolEvent::CleanupTimer);
+        let after = node.handle(now, ProtocolEvent::CleanupTimer);
+        Crossing {
+            terminal,
+            before,
+            at,
+            after,
+            node,
+        }
+    }
+
+    fn precut_fetches(actions: &[Action]) -> Vec<(Anchor, usize)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::PrecutProofs { terminal, keys, .. }) => {
+                    Some((*terminal, keys.len()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A commit that carries the committed anchor across the line retires
+    /// the rule on the next scan. That scan still names the terminal, with
+    /// an empty set, which is what releases the fetch slots it holds; the
+    /// terminal is dropped after it, so nothing asks again.
+    #[test]
+    fn a_commit_across_the_line_releases_the_queries_and_drops_the_terminal() {
+        let Crossing {
+            terminal,
+            before,
+            at,
+            after,
+            node,
+        } = cross(MAX_VALIDITY_RANGE);
+        assert_eq!(precut_fetches(&before), vec![(terminal, 0)]);
+        assert_eq!(
+            precut_fetches(&at),
+            vec![(terminal, 0)],
+            "the scan that retires the rule still sends the release",
+        );
+        assert_eq!(node.shard_coordinator().precut_terminal(), None);
+        assert!(!node.shard_coordinator().precut_rule_live());
+        assert!(
+            precut_fetches(&after).is_empty(),
+            "a retired rule asks nothing"
+        );
+    }
+
+    /// A commit short of the line keeps the rule live and the terminal
+    /// held: every scan still asks.
+    #[test]
+    fn a_commit_short_of_the_line_keeps_asking() {
+        let Crossing {
+            terminal,
+            at,
+            after,
+            node,
+            ..
+        } = cross(
+            MAX_VALIDITY_RANGE
+                .checked_sub(Duration::from_millis(1))
+                .expect("the range is wider than a millisecond"),
+        );
+        assert_eq!(precut_fetches(&at), vec![(terminal, 0)]);
+        assert_eq!(precut_fetches(&after), vec![(terminal, 0)]);
+        assert_eq!(node.shard_coordinator().precut_terminal(), Some(terminal));
+        assert!(node.shard_coordinator().precut_rule_live());
     }
 }
