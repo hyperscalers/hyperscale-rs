@@ -61,12 +61,11 @@ impl SeedRing {
     /// How many epochs below its newest the ring keeps on `windows`.
     ///
     /// A tick reads the ring its block's window carried, which can be
-    /// that window's own fold. A member named to execute is named short
-    /// of its deadline, which lies at most [`RETENTION_HORIZON`] past its
-    /// clock, so its tick's window sits at most that many epochs, rounded
-    /// up, past the member's own. Keeping that many beyond the draw window
-    /// keeps the whole of it, and one more covers a payer's leg attested
-    /// aborted, which is named at its deadline rather than short of it.
+    /// that window's own fold, ending at the window itself. A member is
+    /// named to run only short of its deadline, which lies at most
+    /// [`RETENTION_HORIZON`] past its clock, so its tick's window sits at
+    /// most that many epochs, rounded up, past the member's own. Keeping
+    /// that many beyond the draw window keeps the whole of it.
     #[must_use]
     pub const fn retained_epochs(windows: EpochWindows) -> u64 {
         let epoch_ms = windows.epoch_duration_ms();
@@ -74,7 +73,7 @@ impl SeedRing {
             return SEED_WINDOW_EPOCHS;
         }
         let horizon_ms = RETENTION_HORIZON.as_secs() * 1_000;
-        SEED_WINDOW_EPOCHS + horizon_ms.div_ceil(epoch_ms) + 1
+        SEED_WINDOW_EPOCHS + horizon_ms.div_ceil(epoch_ms)
     }
 
     /// Record `epoch`'s seed and drop whatever fell below the ring's
@@ -191,16 +190,16 @@ mod tests {
     }
 
     /// The depth is the draw window plus the epochs a tick can run past
-    /// its member's clock, plus one for a leg named at its deadline.
+    /// its member's clock.
     #[test]
     fn the_depth_covers_the_draw_window_and_the_tick_horizon() {
         assert_eq!(
             SeedRing::retained_epochs(PRODUCTION),
-            SEED_WINDOW_EPOCHS + 2
+            SEED_WINDOW_EPOCHS + 1
         );
         assert_eq!(
             SeedRing::retained_epochs(THIRTY_SECONDS),
-            SEED_WINDOW_EPOCHS + 6
+            SEED_WINDOW_EPOCHS + 5
         );
         assert_eq!(
             SeedRing::retained_epochs(EpochWindows::new(0, 0)),
@@ -271,10 +270,9 @@ mod tests {
     }
 
     /// A tick on thirty-second epochs runs at most the retention horizon
-    /// past its member's clock: five epochs past it at the latest, a
-    /// sixth for a leg named at its deadline. Its window's ring then still
-    /// holds the oldest seed the member draws on, and one epoch later it
-    /// would not.
+    /// past its member's clock: five epochs past it at the latest. Its
+    /// window's ring then still holds the oldest seed the member draws
+    /// on, and one epoch later it would not.
     #[test]
     fn a_tick_at_its_horizon_still_holds_the_oldest_seed() {
         const E: u64 = 200;
@@ -284,10 +282,10 @@ mod tests {
         ));
         assert_eq!(latest, Epoch::new(E + 5));
 
-        let named_at_deadline = folded_through(E + 6, THIRTY_SECONDS);
-        let window = named_at_deadline
+        let at_the_horizon = folded_through(E + 5, THIRTY_SECONDS);
+        let window = at_the_horizon
             .window_for(Epoch::new(E))
-            .expect("the ring of a tick six epochs on holds the whole window");
+            .expect("the ring of a tick five epochs on holds the whole window");
         assert_eq!(
             window,
             folded_through(E - 1, THIRTY_SECONDS)
@@ -299,7 +297,7 @@ mod tests {
             Drawn::Ready(*seed_of(E - SEED_WINDOW_EPOCHS).randomness.as_bytes())
         );
         assert_eq!(
-            folded_through(E + 7, THIRTY_SECONDS).window_for(Epoch::new(E)),
+            folded_through(E + 6, THIRTY_SECONDS).window_for(Epoch::new(E)),
             None
         );
     }
