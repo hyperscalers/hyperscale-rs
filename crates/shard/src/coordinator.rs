@@ -1825,8 +1825,12 @@ impl ShardCoordinator {
     ///
     /// Keyed on the committed block, not the high QC: a leader may extend
     /// a QC below this node's high QC, and under the lock that block can
-    /// still become canonical and still need the answers. The committed
-    /// anchor only rises, so once closed the window stays closed.
+    /// still become canonical and still need the answers. Within one
+    /// coordinator the committed anchor only rises, so once closed the
+    /// window stays closed. A fork recovery is the one way it falls: the
+    /// loop is rebuilt at the attested anchor with a fresh coordinator
+    /// below the discarded tail, which starts unanswered and adopts the
+    /// predecessors again only if its own window is open.
     ///
     /// A property of the chain rather than of what this node holds — which
     /// is what makes it the right gate for *acquiring* the predecessors,
@@ -1854,8 +1858,9 @@ impl ShardCoordinator {
     ///
     /// Runs only while nothing answers here, so it never displaces what
     /// the flip delivered, and only while the window is open. A rule
-    /// retires only once the window has closed, and it never reopens, so
-    /// a retired rule is never adopted again. Returns whether anything was
+    /// retires only once the window has closed, and it never reopens
+    /// within one coordinator, so a retired rule is never adopted again.
+    /// Returns whether anything was
     /// adopted.
     pub(crate) fn adopt_precut_predecessors(
         &mut self,
@@ -1932,11 +1937,23 @@ impl ShardCoordinator {
         self.precut.terminal()
     }
 
-    /// Stop asking once the rule has retired, so neither the terminal nor
-    /// its answers are held for this coordinator's life. A pre-cut
-    /// transaction met afterwards defers. Only a block anchored below the
-    /// line can carry one, and once the committed block is past the line
-    /// no such block extends it, so none can become canonical.
+    /// Stop asking once the rule has retired, dropping the terminal and
+    /// its answers. A pre-cut transaction met afterwards defers. Only a
+    /// block anchored below the line can carry one, and once the committed
+    /// block is past the line no such block extends it, so none can become
+    /// canonical.
+    ///
+    /// A right child may end before the rule retires. On epochs no longer
+    /// than `MAX_VALIDITY_RANGE`, the beacon may cut it again at a
+    /// terminal whose window closes exactly that far past the grid cut
+    /// that formed it (`outlives_its_predecessors`), while its line sits
+    /// past its origin, the parent terminal's QC, which trails that cut.
+    /// Its committed anchor can then stop short of the line, and the
+    /// chain asks until its coordinator is torn down. That costs the
+    /// terminal, its answers and one request per scan, nothing more: the
+    /// answers stay true and the fence stays correct. Every pre-cut
+    /// range ends before the line, so the set asked shrinks as the pool
+    /// drops what has expired.
     ///
     /// The caller drives it, because forgetting the terminal is also what
     /// stops it releasing the query slots it holds: the release is a

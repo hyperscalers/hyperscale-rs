@@ -727,9 +727,11 @@ pub struct CommittedHere {
     /// A shard's owner is its path padded with zeros, so a left
     /// predecessor wrote under this chain's own owner and `key` already
     /// answers for it. A merged parent's right predecessor wrote here, in
-    /// the parent's own state. On a chain not born by a merge nothing
-    /// sits at it, so reading it needs no knowledge of how the chain was
-    /// born.
+    /// the parent's own state. On any other chain nothing sits at it that
+    /// this lineage did not commit: an earlier merge's right half may
+    /// have left markers there not yet swept, and a hit on one is still a
+    /// transaction committed here. So reading it needs no knowledge of
+    /// how the chain was born.
     pub inherited: Option<SubstateKey>,
 }
 
