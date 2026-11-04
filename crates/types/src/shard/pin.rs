@@ -24,6 +24,12 @@ use crate::{
 /// The domain a pin key is hashed under.
 const PIN_DOMAIN: &[u8] = b"hyperscale-pin-v1";
 
+/// The byte a cell's pin key is hashed behind.
+const CELL_TAG: u8 = 0;
+
+/// The byte a range's pin key is hashed behind.
+const RANGE_TAG: u8 = 1;
+
 /// The protocol resource, derived once.
 static PROTOCOL_RESOURCE: LazyLock<ResourceAddr> =
     LazyLock::new(|| protocol_resource(&ProtocolHasher));
@@ -41,8 +47,11 @@ pub fn is_protocol_vault(key: &SubstateKey) -> bool {
 }
 
 /// What a pin stands on: the first 16 bytes of the key's hash under the
-/// pin domain, where the key is a cell, or a range's owner and
-/// collection. A collision only adds a wait.
+/// pin domain. A collision only adds a wait.
+///
+/// The key is a cell, or a range's owner and collection, behind a byte
+/// telling the two apart, since a cell's local key and a collection
+/// encode alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 #[hbor(transparent)]
 pub struct PinKey(pub [u8; 16]);
@@ -55,14 +64,14 @@ impl PinKey {
     /// Never: a declared key encodes.
     #[must_use]
     pub fn of(declared: &DeclaredKey) -> Self {
-        let encoded = match declared {
-            DeclaredKey::Cell(cell) => to_vec(cell),
-            DeclaredKey::Range(range) => to_vec(&(range.owner, range.collection)),
-        }
-        .expect("a declared key encodes");
+        let (tag, encoded) = match declared {
+            DeclaredKey::Cell(cell) => (CELL_TAG, to_vec(cell)),
+            DeclaredKey::Range(range) => (RANGE_TAG, to_vec(&(range.owner, range.collection))),
+        };
         let mut hasher = Hasher::new();
         hasher.update(PIN_DOMAIN);
-        hasher.update(&encoded);
+        hasher.update(&[tag]);
+        hasher.update(&encoded.expect("a declared key encodes"));
         let mut key = [0u8; 16];
         key.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
         Self(key)
@@ -353,6 +362,34 @@ mod tests {
             "two intervals of one collection pin one key"
         );
         assert!(pins.windows(2).all(|pair| pair[0].key < pair[1].key));
+    }
+
+    /// A cell and a range whose local key and collection share their
+    /// bytes, under one owner, pin two keys.
+    #[test]
+    fn a_cell_and_a_range_of_like_bytes_pin_apart() {
+        let owner = Address::new([3; 31], AddressClass::Principal);
+        let cell = DeclaredKey::Cell(SubstateKey {
+            owner,
+            local: LocalKey([7; 16]),
+        });
+        let range = DeclaredKey::Range(DeclaredRange {
+            owner,
+            collection: CollectionId([7; 16]),
+            lo: 0,
+            hi: 10,
+            cap: 4,
+        });
+        assert_eq!(
+            to_vec(&SubstateKey {
+                owner,
+                local: LocalKey([7; 16])
+            })
+            .expect("encodes"),
+            to_vec(&(owner, CollectionId([7; 16]))).expect("encodes"),
+            "the two encode alike"
+        );
+        assert_ne!(PinKey::of(&cell), PinKey::of(&range));
     }
 
     #[test]
