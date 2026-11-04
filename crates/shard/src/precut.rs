@@ -21,8 +21,8 @@
 //!
 //! One level of asking is enough. The beacon's scheduling rule puts two
 //! cuts on one lineage at least `MAX_VALIDITY_RANGE` apart on the epoch
-//! grid, so a transaction a successor can be offered opens after its
-//! parent's own origin, and only the parent can have committed it.
+//! grid, so a transaction a successor can be offered opens after the cut
+//! that formed its parent, and only the parent can have committed it.
 
 use std::collections::HashMap;
 
