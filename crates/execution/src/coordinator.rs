@@ -10887,13 +10887,8 @@ mod tests {
     /// while `T + 1`'s own ring is held.
     fn jumped_past_an_awaited_window(newest: u64) -> (TopologySchedule, PendingTick) {
         const T: u64 = 70;
-        let windows = EpochWindows::new(0, 1_000);
-        let mut sched = TopologySchedule::new(
-            windows,
-            Epoch::new(T - 1),
-            seeded_snapshot(windows, 1..=T - 1),
-        );
-        sched.insert_lookahead(Epoch::new(T), seeded_snapshot(windows, 1..=T - 1));
+        let mut sched = folded_before(T);
+        let windows = sched.windows();
         let clock = windows.window_of(Epoch::new(T + 1)).start;
         let tick = queued_tick(&sched, T, 1, &test_transaction(1), clock);
         assert!(tick.awaiting.is_some(), "the tick awaits window {}", T + 1);
@@ -10954,6 +10949,162 @@ mod tests {
                 .any(|queued| matches!(queued, Queued::Run(_))),
             "and never runs here"
         );
+    }
+
+    /// A schedule that holds window `T` and has folded through `T - 1`.
+    fn folded_before(t: u64) -> TopologySchedule {
+        let windows = EpochWindows::new(0, 1_000);
+        let mut sched = TopologySchedule::new(
+            windows,
+            Epoch::new(t - 1),
+            seeded_snapshot(windows, 1..=t - 1),
+        );
+        sched.insert_lookahead(Epoch::new(t), seeded_snapshot(windows, 1..=t - 1));
+        sched
+    }
+
+    /// The block height each dispatch in `actions` runs a tick at.
+    fn dispatched_ticks(actions: &[Action]) -> Vec<BlockHeight> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) => Some(*tick),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tick behind the head, queued while another runs, takes in the
+    /// window it awaits on the fold that publishes it, and runs on it once
+    /// the ticks ahead have, though the schedule has evicted it by then.
+    #[test]
+    fn a_tick_behind_the_head_takes_in_its_window_on_the_fold() {
+        const T: u64 = 70;
+        let mut sched = folded_before(T);
+        let windows = sched.windows();
+        let ahead = queued_tick(
+            &sched,
+            T,
+            1,
+            &test_transaction(1),
+            windows.window_of(Epoch::new(T)).start,
+        );
+        assert!(ahead.awaiting.is_none());
+        let clock = windows.window_of(Epoch::new(T + 1)).start;
+        let behind = queued_tick(&sched, T, 2, &test_transaction(2), clock);
+        assert!(behind.awaiting.is_some());
+        let mut state = make_test_state();
+        state.persisted = BlockHeight::new(1);
+        state.tick_in_flight = true;
+        state
+            .pending_ticks
+            .extend([Queued::Run(ahead), Queued::Run(behind)]);
+
+        sched.insert(Epoch::new(T), seeded_snapshot(windows, 1..=T));
+        sched.insert_lookahead(Epoch::new(T + 1), seeded_snapshot(windows, 1..=T));
+        assert!(
+            dispatched_ticks(&state.on_beacon_block_persisted(&sched).actions).is_empty(),
+            "a tick is in flight"
+        );
+        sched.insert(Epoch::new(300), seeded_snapshot(windows, 1..=300));
+        sched.evict_below(Epoch::new(300));
+
+        state.tick_in_flight = false;
+        assert_eq!(
+            dispatched_ticks(&state.dispatch_next_tick(&sched)),
+            vec![BlockHeight::new(1)]
+        );
+        state.tick_in_flight = false;
+        let dispatched = state.dispatch_next_tick(&sched);
+        let env =
+            dispatched
+                .iter()
+                .find_map(|action| match action {
+                    Action::Execution(ExecutionAction::ExecuteTransactions {
+                        tick, env, ..
+                    }) if *tick == BlockHeight::new(2) => Some(env),
+                    _ => None,
+                })
+                .expect("the tick behind runs on the window it took in");
+        assert_eq!(
+            env.seed_window_for(clock),
+            seeded_snapshot(windows, 1..=T + 1)
+                .seeds()
+                .window_for(Epoch::new(T + 1)),
+        );
+    }
+
+    /// A tick held in place of one awaiting its seeds holds every tick
+    /// behind it until its determined half settles, and never runs here,
+    /// even once a fold publishes the window it awaited. Checked for both
+    /// ways an awaiting tick comes to be held: a finalization of it
+    /// committing first, and its window evicted unseen.
+    #[test]
+    fn a_tick_held_for_its_seeds_holds_the_ticks_behind_it() {
+        const T: u64 = 70;
+        for evicted in [false, true] {
+            let mut sched = folded_before(T);
+            let windows = sched.windows();
+            let held_tx = test_transaction(1);
+            let awaiting = queued_tick(
+                &sched,
+                T,
+                1,
+                &held_tx,
+                windows.window_of(Epoch::new(T + 1)).start,
+            );
+            let later = queued_tick(
+                &sched,
+                T,
+                2,
+                &test_transaction(2),
+                windows.window_of(Epoch::new(T)).start,
+            );
+            let mut state = make_test_state();
+            state.persisted = BlockHeight::new(1);
+            let tick = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+            state.ticks.insert_tick(
+                tick,
+                tick_holding(
+                    tick,
+                    WeightedTimestamp::from_millis(T * 1_000),
+                    vec![(verified_tx(&held_tx), BTreeSet::from([ShardId::ROOT]))],
+                ),
+            );
+            state
+                .pending_ticks
+                .extend([Queued::Run(awaiting), Queued::Run(later)]);
+            if evicted {
+                sched.insert(Epoch::new(300), seeded_snapshot(windows, 1..=300));
+                sched.evict_below(Epoch::new(300));
+            } else {
+                state.hold_awaiting_seeds(tick);
+            }
+
+            assert!(
+                dispatched_ticks(&state.dispatch_next_tick(&sched)).is_empty(),
+                "the held tick holds tick 2 back (evicted: {evicted})"
+            );
+            assert!(
+                matches!(state.pending_ticks.front(), Some(Queued::Held(held)) if *held == tick)
+            );
+            sched.insert(Epoch::new(T + 1), seeded_snapshot(windows, 1..=T + 1));
+            assert!(
+                dispatched_ticks(&state.on_beacon_block_persisted(&sched).actions).is_empty(),
+                "and still does once its window is published (evicted: {evicted})"
+            );
+
+            state
+                .ticks
+                .get_tick_mut(&tick)
+                .expect("seated")
+                .record_settled([held_tx.hash()]);
+            assert_eq!(
+                dispatched_ticks(&state.dispatch_next_tick(&sched)),
+                vec![BlockHeight::new(2)],
+                "once it settles, the tick behind runs and it never does (evicted: {evicted})"
+            );
+        }
     }
 
     /// A snapshot whose ring the beacon folded over `epochs`, each seed a
