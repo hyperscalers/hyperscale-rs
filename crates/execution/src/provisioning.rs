@@ -1090,16 +1090,19 @@ mod tests {
 
     /// Both core shards run every core node, so both run it under the
     /// earliest of their committing clocks: each takes its own and the
-    /// other's bundle, and neither reads the leg's. The leg runs alone,
-    /// under its own.
+    /// other's bundle, and neither reads the leg's, though the leg pays
+    /// and committed first, nor that of a shard outside the core holding
+    /// a component the transaction calls, which also committed before
+    /// either. The leg runs alone, under its own.
     #[test]
     fn every_core_member_runs_under_the_earliest_core_clock() {
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         let (early, late) = (ShardId::leaf(2, 2), ShardId::leaf(1, 0));
-        let leg = ShardId::leaf(2, 3);
+        let (leg, holder) = (ShardId::leaf(2, 3), ShardId::leaf(2, 1));
         let tracker_beside = |other: ShardId, other_ms: u64| {
             let mut t = ProvisioningTracker::new();
-            for (source, ms) in [(other, other_ms), (leg, 1_000)] {
+            t.record_payer_shard(tx, leg);
+            for (source, ms) in [(other, other_ms), (leg, 1_000), (holder, 3_000)] {
                 t.absorb_provisions(&make_provisions_at(
                     source,
                     BlockHeight::new(5),
