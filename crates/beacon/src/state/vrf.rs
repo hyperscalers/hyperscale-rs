@@ -141,12 +141,14 @@ pub(super) fn filter_and_roll_randomness<'a>(
     // resolving against a past epoch reads what stood then. Which roll
     // produced it travels with it: the two are not interchangeable to
     // anything that draws on one.
+    let windows = state.chain_config.epoch_windows();
     state.seeds.record(
         epoch,
         EpochSeed {
             randomness: state.randomness,
             source,
         },
+        windows,
     );
 
     // Cascade jail for rejected proposers currently `OnShard`.

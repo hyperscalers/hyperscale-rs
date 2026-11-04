@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::{
     Anchor, BlockHeader, BlockHeight, CertifiedBlockHeader, Epoch, EpochWindows, PriceTable,
-    RecoveryBinding, ReshapeThresholds, ShardAnchor, ShardForkProof, ShardId, ShardTrie,
+    RecoveryBinding, ReshapeThresholds, SeedRing, ShardAnchor, ShardForkProof, ShardId, ShardTrie,
     TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
@@ -580,6 +580,16 @@ impl TopologySchedule {
             Some((newest, _)) if epoch > *newest => ScheduleLookup::NotYetCommitted,
             _ => ScheduleLookup::Evicted,
         }
+    }
+
+    /// The seed ring the window keyed `epoch` carries, if it is held.
+    ///
+    /// Either copy of the window serves: the one the fold before it
+    /// published and the one its own fold replaced it with both hold every
+    /// seed a draw clocked in `epoch` reads.
+    #[must_use]
+    pub fn seeds_at(&self, epoch: Epoch) -> Option<&SeedRing> {
+        self.by_epoch.get(&epoch).map(|snapshot| snapshot.seeds())
     }
 
     /// Active head committee — for the chain's constant

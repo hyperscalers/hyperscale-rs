@@ -7,7 +7,6 @@
 //! entries in the interval than the declaration's cap, and asserts what
 //! the full store says is true.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::account_address;
@@ -21,11 +20,11 @@ use hyperscale_storage::{BoundaryStore, GenesisCommit, NoFeeHolds, SubstateStore
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    BlockHeight, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, EpochWindows,
-    FrontierInputs, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
-    ProtocolHasher, ProvisionalHolds, ResourceAddr, SettledWrites, ShardId, ShardTrie,
-    StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
-    absorb_committed_cells,
+    BlockHeight, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, Epoch, EpochSeed,
+    EpochWindows, FrontierInputs, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
+    ProtocolHasher, ProvisionalHolds, Randomness, ResourceAddr, SeedRing, SeedSource,
+    SettledWrites, ShardId, ShardTrie, StoredReceipt, TimestampRange, Transaction, Verified,
+    WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
     Composed, Hash32, InstanceMeta, IntentHeader, IntentTree, Value, collection_id,
@@ -34,7 +33,7 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::IntentBuilder;
 use hyperscale_vm_stdlib::{account, instantiate};
-use hyperscale_vm_types::{CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow};
+use hyperscale_vm_types::CollectionId;
 
 /// The widest window an intent may stand for.
 const OFFER_MS: u64 = MAX_INTENT_VALIDITY_RANGE.as_secs() * 1_000;
@@ -297,15 +296,23 @@ fn signed_lottery(build: impl FnOnce(IntentBuilder<'_>) -> IntentTree) -> Transa
     Transaction::new(lottery_client().sign_tree(&tree, &[&key], terms(1_000_000)))
 }
 
-/// The environment a round sealed at epoch zero opens under.
+/// The environment a round sealed at epoch zero opens under: the tick's
+/// clock falls in epoch 4 of a 250 ms grid, whose window holds the
+/// reveal-folded seeds of epochs 1 to 3, the seal's maturity among them.
 fn sealed_env() -> TickEnvironment {
-    TickEnvironment {
-        seeds: SeedWindow::new(
-            BTreeMap::from([(SEAL_MATURITY_EPOCHS, [0x5E; 32])]),
-            Some(SEAL_MATURITY_EPOCHS),
-        ),
-        windows: EpochWindows::new(0, 0),
+    let windows = EpochWindows::new(0, 250);
+    let mut seeds = SeedRing::default();
+    for epoch in 1..=3 {
+        seeds.record(
+            Epoch::new(epoch),
+            EpochSeed {
+                randomness: Randomness::new([0x5E; 32]),
+                source: SeedSource::Reveals,
+            },
+            windows,
+        );
     }
+    TickEnvironment { seeds, windows }
 }
 
 /// A closed round holding one ticket per seed in `entrants`, every

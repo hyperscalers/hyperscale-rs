@@ -120,19 +120,27 @@ pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
 }
 
 /// The environment a member executes under: its transaction clock, the
-/// epoch that clock falls in, and the seeds a seal written in that epoch
-/// can later be opened against.
+/// epoch that clock falls in, and the seeds a draw clocked there reads.
 ///
-/// The clock and the epoch are facts about the transaction: every shard
-/// running the same body passes one clock, and the epoch is the grid's
-/// answer for it. The seed window is the tick's, off the window governing
-/// the block that seated it, so two shards running one core in ticks
-/// under different windows can pass two windows.
+/// All three are facts about the transaction: every shard running the
+/// same body passes one clock, the epoch is the grid's answer for it,
+/// and the seed window is a function of that epoch alone, so two shards
+/// running one core in ticks under different windows pass one window.
+///
+/// # Panics
+///
+/// Where the tick's ring lacks a seed of the member's window. A tick
+/// dispatches only once it holds every member's, so this is a dispatch
+/// that skipped the wait; answering it anyway would be a draw this node
+/// alone answers.
 fn env_at(ctx: &TickBatchContext<'_>, clock: WeightedTimestamp) -> EnvInputs {
     EnvInputs {
         clock_ms: clock.as_millis(),
         epoch: ctx.env.windows.epoch_for(clock).inner(),
-        seeds: ctx.env.seeds.clone(),
+        seeds: ctx
+            .env
+            .seed_window_for(clock)
+            .expect("a tick dispatches once its ring holds every member's seed window"),
     }
 }
 

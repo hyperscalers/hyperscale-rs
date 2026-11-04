@@ -942,8 +942,9 @@ pub struct BeaconState {
     /// the shard reveal chains folded this epoch; an epoch where no
     /// reveal folds mixes the accepted ceremony VRF outputs instead.
     pub randomness: Randomness,
-    /// The seeds of the epochs still inside [`SEED_WINDOW_EPOCHS`](crate::SEED_WINDOW_EPOCHS), each
-    /// beside the roll that produced it.
+    /// The seeds of the epochs still inside
+    /// [`SeedRing::retained_epochs`] of the chain's grid, each beside the
+    /// roll that produced it.
     ///
     /// `randomness` is the head of this: what a draw resolving against a
     /// past epoch needs is the value as it stood then, and reading the
@@ -2618,7 +2619,9 @@ mod tests {
             randomness: Randomness::new([0x5A; 32]),
             source: SeedSource::Reveals,
         };
-        state.seeds.record(Epoch::new(4), seed);
+        state
+            .seeds
+            .record(Epoch::new(4), seed, state.chain_config.epoch_windows());
         state.current_epoch = Epoch::new(4);
 
         for snapshot in [

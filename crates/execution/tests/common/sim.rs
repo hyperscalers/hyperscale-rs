@@ -48,13 +48,14 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
-    ConsensusReceipt, CounterpartMirror, DeclaredRange, Epoch, EpochWindows, EventRoot,
+    ConsensusReceipt, CounterpartMirror, DeclaredRange, Epoch, EpochSeed, EpochWindows, EventRoot,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt,
-    LocalKey, Movement, ProvenAnchors, Provision, RecoveryCause, ResourceAddr, SettledWrites,
-    ShardId, ShardRecovery, ShardTrie, SignerBitfield, StateRoot, StateWrites, StatedTerms,
-    StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    compute_global_receipt_root, encode_amount, read_amount, shard_prefix_path, writes_root,
+    LocalKey, Movement, ProvenAnchors, Provision, Randomness, RecoveryCause, ResourceAddr,
+    SeedRing, SeedSource, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield,
+    StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, compute_global_receipt_root, encode_amount, read_amount,
+    shard_prefix_path, writes_root,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -412,13 +413,26 @@ impl ExecutionSim {
     }
 
     /// Hold the window of `epoch`, stamped or not as [`Self::recover`]
-    /// says.
+    /// says, carrying the seeds the beacon's fold of `epoch` leaves.
     fn open_window(&mut self, epoch: Epoch) {
         let snapshot = match &self.unstamped {
-            Some((from, before)) if epoch < *from => Arc::clone(before),
-            _ => Arc::clone(&self.snapshot),
+            Some((from, before)) if epoch < *from => before,
+            _ => &self.snapshot,
         };
-        self.topology.insert(epoch, snapshot);
+        let windows = self.topology.windows();
+        let mut seeds = SeedRing::default();
+        for rolled in 1..=epoch.inner() {
+            seeds.record(
+                Epoch::new(rolled),
+                EpochSeed {
+                    randomness: Randomness::new([0; 32]),
+                    source: SeedSource::Reveals,
+                },
+                windows,
+            );
+        }
+        let folded = (**snapshot).clone().with_seeds(seeds);
+        self.topology.insert(epoch, Arc::new(folded));
     }
 
     /// The epoch the next block is anchored in, once a recovery has given

@@ -30,12 +30,13 @@ use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
-    Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
-    GlobalReceipt, Hash, Inclusion, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
+    Ed25519PrivateKey, EnvelopeExt, Epoch, EpochSeed, EpochWindows, EscrowedValue, EventExt,
+    EventRoot, GlobalReceipt, Hash, Inclusion, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
     MIN_STAKE_FLOOR, MerkleInclusionProof, Movement, NetworkId, PriceTable, PrincipalAddr,
-    ProvisionalHolds, RETENTION_HORIZON, SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot,
-    StateWrites, Stated, SubstateEntry, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
-    WeightedTimestamp, absorb_committed_cells, compute_merkle_root, shard_prefix_path, writes_root,
+    ProvisionalHolds, RETENTION_HORIZON, Randomness, SeedRing, SeedSource, SettledWrites, ShardId,
+    ShardTrie, StateClaim, StateRoot, StateWrites, Stated, SubstateEntry, SubstateKey,
+    TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
+    compute_merkle_root, shard_prefix_path, writes_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Answered, Composed, CrossingCell, CrossingId, CrossingLeaf, Hash32, InstanceMeta,
@@ -46,7 +47,7 @@ use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{GraphBuilder, IntentBuilder, signing};
 use hyperscale_vm_stdlib::{STAKING_MODULE, account, instantiate, staking};
 use hyperscale_vm_types::{
-    Address, CollectionId, LocalKey, ResourceAddr, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell,
+    Address, CollectionId, LocalKey, ResourceAddr, SEAL_MATURITY_EPOCHS, amount_cell,
     attestation_work, encode_amount,
 };
 use proptest::prelude::*;
@@ -422,10 +423,11 @@ fn with_rounds(accounts: &[(PrincipalAddr, u128)], executor: &Executor, salts: &
             &[&key],
             terms(1_000_000),
         ));
-        let executed = execute_batch_on(
+        let executed = execute_batch_at(
             &store,
             executor,
             &[(Verified::<Transaction>::from_persisted(close))],
+            0,
         );
         let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
             panic!("the close must settle: {:?}", executed[0].consensus);
@@ -446,16 +448,39 @@ fn closing_tree(salt: u8, signer: PrincipalAddr) -> IntentTree {
     root.build().expect("the intent declares no hole")
 }
 
-/// The environment a round sealed in this file's epoch grid opens
-/// under. The grid folds every timestamp to genesis, so a seal records
-/// epoch zero and matures two past it.
+/// The epoch grid this file's rounds run on: a round closes at the
+/// origin, recording genesis, and its seal matures into epoch two, which
+/// a settlement at the batch clock reads from the window of epoch four.
+const SEALED_GRID: EpochWindows = EpochWindows::new(0, BATCH_CLOCK_MS / 4);
+
+/// The clock every batch in this file runs at but a round's close.
+const BATCH_CLOCK_MS: u64 = 1_000;
+
+/// The environment a round sealed on [`SEALED_GRID`] opens under, with
+/// `byte` as the seed its seal matures into.
 fn sealed_env(byte: u8) -> TickEnvironment {
+    let mut seeds = SeedRing::default();
+    for epoch in 1..SEALED_GRID
+        .epoch_for(WeightedTimestamp::from_millis(BATCH_CLOCK_MS))
+        .inner()
+    {
+        let seed = if epoch == SEAL_MATURITY_EPOCHS {
+            byte
+        } else {
+            0
+        };
+        seeds.record(
+            Epoch::new(epoch),
+            EpochSeed {
+                randomness: Randomness::new([seed; 32]),
+                source: SeedSource::Reveals,
+            },
+            SEALED_GRID,
+        );
+    }
     TickEnvironment {
-        seeds: SeedWindow::new(
-            BTreeMap::from([(SEAL_MATURITY_EPOCHS, [byte; 32])]),
-            Some(SEAL_MATURITY_EPOCHS),
-        ),
-        windows: EpochWindows::new(0, 0),
+        seeds,
+        windows: SEALED_GRID,
     }
 }
 
@@ -661,14 +686,24 @@ fn execute_batch_on(
     executor: &Executor,
     transactions: &[Verified<Transaction>],
 ) -> Vec<ExecutedTx> {
+    execute_batch_at(snapshot_store, executor, transactions, BATCH_CLOCK_MS)
+}
+
+/// [`execute_batch_on`] at a clock of `clock_ms`.
+fn execute_batch_at(
+    snapshot_store: &(dyn Substates + Sync),
+    executor: &Executor,
+    transactions: &[Verified<Transaction>],
+    clock_ms: u64,
+) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
     let ctx = TickBatchContext {
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
-        tick_ts: WeightedTimestamp::from_millis(1_000),
-        // A round sealed under this grid records genesis, so the window
-        // holds the epoch such a seal matures into — every settlement
-        // here opens rather than waiting.
+        tick_ts: WeightedTimestamp::from_millis(clock_ms),
+        // A round closed at the origin records genesis, so the window at
+        // the batch clock holds the epoch such a seal matures into, and
+        // every settlement here opens rather than waiting.
         env: sealed_env(0x5E),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,

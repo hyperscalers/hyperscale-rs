@@ -36,7 +36,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_kernel::{EnvInputs, OwnerSet, Substates as KernelReads, decode_amount};
 use hyperscale_vm_preview::{Report as PreviewRun, Slack, preview as preview_run};
-use hyperscale_vm_types::{EffectSet, EffectTarget, Outcome, PriceTable, SubstateKey};
+use hyperscale_vm_types::{EffectSet, EffectTarget, Outcome, PriceTable, SeedWindow, SubstateKey};
 
 use crate::batch::TickEnvironment;
 use crate::executor::{
@@ -758,7 +758,13 @@ impl Executor {
             EnvInputs {
                 clock_ms: inputs.clock.as_millis(),
                 epoch: inputs.env.windows.epoch_for(inputs.clock).inner(),
-                seeds: inputs.env.seeds.clone(),
+                // A node short of the frontier previews every draw as
+                // not yet rolled: a preview waits on nothing, and the
+                // chain would wait for the seed rather than guess it.
+                seeds: inputs
+                    .env
+                    .seed_window_for(inputs.clock)
+                    .unwrap_or_else(SeedWindow::unfolded),
             },
             OwnerSet::whole(),
             None,
