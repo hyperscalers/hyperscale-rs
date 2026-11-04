@@ -1325,26 +1325,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 
     /// The pins the state holds in `lo..=hi`, by tick, each tick's
     /// entries joined in order.
-    fn stored_pins(&self, lo: u128, hi: u128) -> BTreeMap<BlockHeight, Arc<Vec<Pin>>> {
-        let mut joined: BTreeMap<BlockHeight, Vec<Pin>> = BTreeMap::new();
-        for (order, bytes) in self.state.entries_in_range(
-            self.family.owner(),
-            self.family.id(MemberCollection::TickPins),
-            lo,
-            hi,
-            usize::MAX,
-        ) {
-            if let Ok(chunk) = from_slice::<PinsChunk>(&bytes) {
-                joined
-                    .entry(tick_of_pins(order))
-                    .or_default()
-                    .extend(chunk.iter().copied());
-            }
-        }
-        joined
-            .into_iter()
-            .map(|(height, pins)| (height, Arc::new(pins)))
-            .collect()
+    fn stored_pins(&self, lo: u128, hi: u128) -> DecodedPins {
+        joined_pins(self.state, self.family, lo, hi)
     }
 
     /// Write the tick at `height`'s pins, or delete them with `None`.
@@ -2504,17 +2486,27 @@ pub(crate) fn owed_by_entries(terms: &[StatedTerms]) -> BTreeMap<TxHash, Owes> {
 /// reserve of it, which no state this fold wrote does.
 #[must_use]
 pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -> SettledEntries {
-    fold(state, &MemberFamily::of(inputs.shard), inputs).0
+    fold(state, &MemberFamily::of(inputs.shard), inputs, None).0
 }
 
-/// [`member_writes`], beside what the block's rows heard of its claims.
-/// `family` is `inputs.shard`'s.
+/// [`member_writes`], beside what the block's rows heard of its claims
+/// and the pins of each tick whose pins it changed, `None` for those it
+/// deleted. `family` is `inputs.shard`'s; `pins`, where given, is every
+/// tick's pins `state` holds, decoded, which the fold then never reads.
 fn fold(
     state: &(impl Substates + ?Sized),
     family: &MemberFamily,
     inputs: &MemberInputs,
-) -> (SettledEntries, HeardCells) {
+    pins: Option<&DecodedPins>,
+) -> (SettledEntries, HeardCells, PinChanges) {
     let mut family = Working::new(state, inputs.shard, family);
+    if let Some(pins) = pins {
+        family.tick_pins = pins
+            .iter()
+            .map(|(height, pins)| (*height, Some(Arc::clone(pins))))
+            .collect();
+        family.every_tick_pins = true;
+    }
     for settled in &inputs.settled {
         family.settle(settled);
     }
@@ -2580,9 +2572,51 @@ fn fold(
         family.reconsider(inputs);
     }
 
+    let pinned = family
+        .changed_tick_pins
+        .iter()
+        .map(|height| (*height, family.tick_pins.get(height).cloned().flatten()))
+        .collect();
     let mut writes = SettledEntries::new();
     family.into_writes(&mut writes);
-    (writes, heard)
+    (writes, heard, pinned)
+}
+
+/// Every owed tick's pins, decoded once and shared by every fold that
+/// reads them.
+type DecodedPins = BTreeMap<BlockHeight, Arc<Vec<Pin>>>;
+
+/// The pins of each tick a fold changed, `None` for a tick it deleted
+/// them from.
+type PinChanges = BTreeMap<BlockHeight, Option<Arc<Vec<Pin>>>>;
+
+/// The pins `state` holds in `TickPins` entries `lo..=hi`, by tick, each
+/// tick's entries joined in order.
+fn joined_pins(
+    state: &(impl Substates + ?Sized),
+    family: &MemberFamily,
+    lo: u128,
+    hi: u128,
+) -> DecodedPins {
+    let mut joined: BTreeMap<BlockHeight, Vec<Pin>> = BTreeMap::new();
+    for (order, bytes) in state.entries_in_range(
+        family.owner(),
+        family.id(MemberCollection::TickPins),
+        lo,
+        hi,
+        usize::MAX,
+    ) {
+        if let Ok(chunk) = from_slice::<PinsChunk>(&bytes) {
+            joined
+                .entry(tick_of_pins(order))
+                .or_default()
+                .extend(chunk.iter().copied());
+        }
+    }
+    joined
+        .into_iter()
+        .map(|(height, pins)| (height, Arc::new(pins)))
+        .collect()
 }
 
 /// One verdict leaf a block wrote or deleted, for one sibling that reads
@@ -2787,17 +2821,21 @@ pub struct MemberIndex {
     /// Every reserved total, by its vault's order key: what the fold
     /// differences the rows it changes against.
     reserved: BTreeMap<u128, u128>,
-    /// The queue index's collections as the state holds them, each entry
-    /// encoded, in the order of [`INDEXED`]: what the fold reads beside
-    /// the rows. Shared, so cloning the index copies no pins.
+    /// The queue index's row-derived collections as the state holds
+    /// them, each entry encoded, in the order of [`INDEXED`]: what the
+    /// fold reads beside the rows.
     index: [BTreeMap<u128, Arc<[u8]>>; INDEXED.len()],
+    /// Every owed tick's pins, decoded once, as the state's `TickPins`
+    /// entries join them: shared, so a clone of the index and every fold
+    /// over it read them without copying or decoding them again. As
+    /// bounded as the ticks owing their determined half.
+    tick_pins: DecodedPins,
 }
 
 /// The queue index's collections, which [`MemberIndex`] keeps encoded.
-const INDEXED: [MemberCollection; 5] = [
+const INDEXED: [MemberCollection; 4] = [
     MemberCollection::Queue,
     MemberCollection::Waiters,
-    MemberCollection::TickPins,
     MemberCollection::Behind,
     MemberCollection::Serves,
 ];
@@ -2813,6 +2851,7 @@ impl MemberIndex {
             ticks: BTreeMap::new(),
             reserved: BTreeMap::new(),
             index: Default::default(),
+            tick_pins: BTreeMap::new(),
         }
     }
 
@@ -2881,13 +2920,16 @@ impl MemberIndex {
                 .map(|(order, bytes)| (order, Arc::from(bytes)))
                 .collect()
         });
+        let family = MemberFamily::of(shard);
+        let tick_pins = joined_pins(state, &family, 0, u128::MAX);
         Self {
             shard,
-            family: MemberFamily::of(shard),
+            family,
             members,
             ticks,
             reserved,
             index,
+            tick_pins,
         }
     }
 
@@ -2906,7 +2948,17 @@ impl MemberIndex {
     /// If a written row fails to decode, which a row this fold encoded
     /// cannot.
     pub fn advance(&mut self, inputs: &MemberInputs) -> HeardCells {
-        let (writes, heard) = fold(&*self, &self.family, inputs);
+        let (writes, heard, pinned) = fold(&*self, &self.family, inputs, Some(&self.tick_pins));
+        for (height, pins) in pinned {
+            match pins {
+                Some(pins) => {
+                    self.tick_pins.insert(height, pins);
+                }
+                None => {
+                    self.tick_pins.remove(&height);
+                }
+            }
+        }
         let members = self.family.id(MemberCollection::Members);
         let ticks = self.family.id(MemberCollection::Ticks);
         let reserved = self.family.id(MemberCollection::Reserved);
@@ -3074,6 +3126,20 @@ impl Substates for MemberIndex {
                 .range(lo..=hi)
                 .take(limit)
                 .map(|(order, bytes)| (*order, bytes.to_vec()))
+                .collect()
+        } else if collection == self.family.id(MemberCollection::TickPins) {
+            self.tick_pins
+                .range(tick_of_pins(lo)..=tick_of_pins(hi))
+                .flat_map(|(height, pins)| {
+                    (0u64..).zip(pin_chunks(pins)).map(|(at, chunk)| {
+                        (
+                            tick_pins_order(*height, at),
+                            to_vec(&chunk).expect("a pins entry encodes"),
+                        )
+                    })
+                })
+                .filter(|(order, _)| (lo..=hi).contains(order))
+                .take(limit)
                 .collect()
         } else {
             Vec::new()
@@ -8276,6 +8342,39 @@ mod tests {
             store.fold(&first);
             assert_eq!(headed(&store, 2), Some((BlockHeight::new(1), clock(1))));
             assert_eq!(row(&store, 1).queued, Some(at(1, AWAITED_RANK)));
+        }
+
+        /// A tick's pins are decoded once: an index cloned and advanced
+        /// past blocks that leave them shares the one decode.
+        #[test]
+        fn a_ticks_pins_are_decoded_once_and_shared() {
+            let determined = terms(&Kind::Determined, &[write(A)]);
+            let mut index = MemberIndex::empty(LOCAL);
+            let mut first = block(1);
+            commit(&mut first, 1, determined.clone());
+            index.advance(&first);
+            let mut second = block(2);
+            lines(&mut second, vec![run(1, &determined)]);
+            index.advance(&second);
+            let decoded = Arc::clone(&index.tick_pins[&BlockHeight::new(2)]);
+
+            let mut ancestry = index.clone();
+            let mut third = block(3);
+            commit(&mut third, 2, terms(&Kind::Payer(vec![]), &[read(A)]));
+            ancestry.advance(&third);
+            assert_eq!(row_in(&ancestry, 2).head, None, "the tick's write is owed");
+            assert!(Arc::ptr_eq(
+                &ancestry.tick_pins[&BlockHeight::new(2)],
+                &decoded
+            ));
+            assert!(Arc::ptr_eq(
+                &index.tick_pins[&BlockHeight::new(2)],
+                &decoded
+            ));
+        }
+
+        fn row_in(index: &MemberIndex, seed: u8) -> MemberRow {
+            index.members[&tx(seed)].clone()
         }
 
         #[test]
