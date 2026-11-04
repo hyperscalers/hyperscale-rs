@@ -6,7 +6,8 @@
 //!
 //! - `Queue`: one entry per pin and class of each placed row a
 //!   counterpart shares the verdict on, from its place until the row is
-//!   accepted, deleted, released or aborted.
+//!   accepted, deleted, released or aborted; and of each leg in flight
+//!   on awaited terms, from the line running it until it leaves its tick.
 //! - `Waiters`: the same per pin of each determined row standing
 //!   `Pending` with a place, until a line names it or it leaves.
 //! - `TickPins`: the pins a tick's determined lines take, unioned per
@@ -21,7 +22,8 @@ use std::collections::BTreeMap;
 
 use hyperscale_hbor::{Capped, Hbor};
 use hyperscale_types::{
-    BlockHeight, MAX_HOLDS_PER_MEMBER, Pin, PinClass, PinKey, Pins, Settlement, ShardId, TxHash,
+    BlockHeight, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, Pin, PinClass, PinKey, Pins, Settlement, ShardId, TxHash,
     WeightedTimestamp, member_order, pins_of,
 };
 
@@ -167,6 +169,31 @@ pub fn shared_standing(row: &MemberRow) -> bool {
         }
 }
 
+/// The first rank a block gives the legs its lines run on awaited terms:
+/// past every shared place and determined waiter the block takes, so a
+/// leg stands behind them on its block's height.
+pub const AWAITED_RANK: u16 = 1 << 15;
+
+const _: () = assert!(
+    MAX_UNSETTLED_PER_BLOCK + MAX_TXS_PER_BLOCK <= AWAITED_RANK as usize
+        && MAX_TICK_LINES_PER_BLOCK <= (u16::MAX - AWAITED_RANK) as usize
+);
+
+/// Whether `row` stands in the queue as a leg in flight on awaited
+/// terms: placed by the line running it, and holding what it declared
+/// until it leaves its tick.
+#[must_use]
+pub const fn awaited_holding(row: &MemberRow) -> bool {
+    row.queued.is_some()
+        && matches!(
+            row.state,
+            RowState::InFlight {
+                settlement: Settlement::Awaited,
+                ..
+            }
+        )
+}
+
 /// Whether `row` stands as a determined waiter: placed and `Pending` on
 /// terms its own certificate settles.
 #[must_use]
@@ -211,8 +238,12 @@ impl RowEntries {
         let Some(row) = row.filter(|row| row.queued.is_some()) else {
             return Self::default();
         };
-        let (shared, waiting) = (shared_standing(row), determined_waiting(row));
-        if !shared && !waiting {
+        let (shared, holding, waiting) = (
+            shared_standing(row),
+            awaited_holding(row),
+            determined_waiting(row),
+        );
+        if !shared && !holding && !waiting {
             return Self::default();
         }
         let place = row.queued.expect("filtered on a place");
@@ -240,6 +271,12 @@ impl RowEntries {
         if waiting {
             return Self {
                 waiters: entries,
+                ..Self::default()
+            };
+        }
+        if holding {
+            return Self {
+                queue: entries,
                 ..Self::default()
             };
         }
