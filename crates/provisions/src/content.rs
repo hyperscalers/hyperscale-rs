@@ -11,7 +11,7 @@ use hyperscale_storage::Substates;
 use hyperscale_types::{
     EntryKey, Hash, ProtocolHasher, ProvisionTxRoot, ProvisionTxRootsMap, ShardId, ShardTrie,
     SubstateKey, Transaction, TxHash, Verifiable, WeightedTimestamp, entry_leaf_key,
-    provision_leaf, served_digest,
+    provision_leaf, range_lift, served_digest,
 };
 use thiserror::Error;
 
@@ -20,11 +20,12 @@ use crate::requests::provision_request;
 /// The keys `request`'s part serves out of `state`, the state the
 /// source block left.
 ///
-/// Every declared local cell, and the leaf of each entry a declared
-/// local range holds in `state`, up to its cap; ascending, one copy
-/// each. The one function that decides a part's keys. Cells cost no
-/// read: a part's proof binds their presence and values. Only ranges
-/// read state.
+/// Every declared local cell, and the leaf of each of the lowest
+/// [`range_lift`] entries a declared local range holds in `state` — one
+/// past its cap, which is the successor a reader's coverage answer
+/// turns on; ascending, one copy each. The one function that decides a
+/// part's keys. Cells cost no read: a part's proof binds their presence
+/// and values. Only ranges read state.
 #[must_use]
 pub fn served_keys(state: &impl Substates, request: &ProvisionsRequest) -> Vec<SubstateKey> {
     let mut keys = request.local_keys.clone();
@@ -34,7 +35,7 @@ pub fn served_keys(state: &impl Substates, request: &ProvisionsRequest) -> Vec<S
             range.collection,
             range.lo,
             range.hi,
-            range.cap as usize,
+            range_lift(range.lo, range.hi, range.cap),
         );
         keys.extend(held.into_iter().map(|(order, _)| {
             entry_leaf_key(
@@ -146,7 +147,7 @@ mod tests {
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, test_prefix, test_transaction_with_prefixes,
     };
-    use hyperscale_types::{Address, CollectionId};
+    use hyperscale_types::{Address, AddressClass, CollectionId, DeclaredRange};
 
     use super::*;
 
@@ -236,5 +237,101 @@ mod tests {
                 tx_hash: unrouted.hash()
             }),
         );
+    }
+
+    const OWNER: Address = Address::new([0x11; 31], AddressClass::Component);
+    const COLLECTION: CollectionId = CollectionId([4; 16]);
+
+    /// One collection holding an entry at each of `orders`.
+    struct Holding(Vec<u128>);
+
+    impl Substates for Holding {
+        fn cell(&self, _: SubstateKey) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn entries_in_range(
+            &self,
+            owner: Address,
+            collection: CollectionId,
+            lo: u128,
+            hi: u128,
+            limit: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            if owner != OWNER || collection != COLLECTION {
+                return Vec::new();
+            }
+            self.0
+                .iter()
+                .copied()
+                .filter(|order| (lo..=hi).contains(order))
+                .take(limit)
+                .map(|order| (order, vec![1]))
+                .collect()
+        }
+    }
+
+    /// The orders whose leaves a part declaring `[lo, hi]` at `cap` over
+    /// `held` serves, ascending.
+    fn served_orders(held: &[u128], lo: u128, hi: u128, cap: u32) -> Vec<SubstateKey> {
+        let request = ProvisionsRequest {
+            tx_hash: TxHash::from(Hash::from_bytes(b"ranged")),
+            targets: vec![REMOTE],
+            local_keys: Vec::new(),
+            local_ranges: vec![DeclaredRange {
+                owner: OWNER,
+                collection: COLLECTION,
+                lo,
+                hi,
+                cap,
+            }],
+            clock: WeightedTimestamp::ZERO,
+        };
+        served_keys(&Holding(held.to_vec()), &request)
+    }
+
+    /// The leaves of `orders`, ascending as a part serves them.
+    fn leaves(orders: &[u128]) -> Vec<SubstateKey> {
+        let mut keys: Vec<SubstateKey> = orders
+            .iter()
+            .map(|order| {
+                entry_leaf_key(
+                    &ProtocolHasher,
+                    EntryKey {
+                        owner: OWNER,
+                        collection: COLLECTION,
+                        order: *order,
+                    },
+                )
+            })
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// A range holding more than its cap serves the entry past it, so a
+    /// counterpart reads the same successor the source's page does.
+    #[test]
+    fn a_full_range_serves_the_entry_past_its_cap() {
+        let held = [10, 20, 30, 40, 50];
+        assert_eq!(
+            served_orders(&held, 0, u128::MAX, 3),
+            leaves(&[10, 20, 30, 40])
+        );
+    }
+
+    /// A range holding no more than its cap serves what it holds.
+    #[test]
+    fn a_short_range_serves_what_it_holds() {
+        let held = [10, 20];
+        assert_eq!(served_orders(&held, 0, u128::MAX, 3), leaves(&[10, 20]));
+    }
+
+    /// An entry is its width-one interval: it serves itself and no
+    /// neighbour past it.
+    #[test]
+    fn an_entry_serves_no_successor() {
+        let held = [10, 11, 12];
+        assert_eq!(served_orders(&held, 11, 11, 1), leaves(&[11]));
     }
 }

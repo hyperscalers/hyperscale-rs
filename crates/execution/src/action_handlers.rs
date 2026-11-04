@@ -297,6 +297,9 @@ where
                 env,
                 holds: &holds,
                 fee_holds: &fee_holds,
+                // Off the same view, so a probe past the pre-read reads
+                // the version the pre-read did.
+                points: Some(Arc::new(view.points())),
             };
             let inputs: Vec<TickTxInput<'_>> = requests
                 .iter()

@@ -887,8 +887,8 @@ mod tests {
                     8
                 )
                 .len(),
-            4,
-            "with the entries its own store holds, up to the cap the declaration named"
+            5,
+            "with the entries its own store holds, one past the cap the declaration named"
         );
         assert!(
             fetched.unproven.is_empty(),
@@ -975,7 +975,7 @@ mod tests {
                 .iter()
                 .map(|(order, _)| *order)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4, 5],
             "and the run would read order 0 as absent"
         );
         assert_eq!(

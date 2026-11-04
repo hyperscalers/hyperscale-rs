@@ -22,6 +22,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_types::{PriceTable, SeedWindow};
 
+use crate::executor::PointReads;
 use crate::legs::Member;
 
 /// What a block fixes about the environment its tick executes under.
@@ -118,6 +119,11 @@ pub struct TickBatchContext<'a> {
     /// burned was promised, and a member's own burn comes out of its
     /// own hold.
     pub fee_holds: &'a dyn FeeHoldReading,
+    /// What answers an entry point of this shard's own owners that no
+    /// declaration's pre-read named, read at the snapshot's version: the
+    /// tick view's own reads. `None` answers every point from the
+    /// pre-read alone.
+    pub points: Option<Arc<dyn PointReads>>,
 }
 
 /// One member of a tick's batch.

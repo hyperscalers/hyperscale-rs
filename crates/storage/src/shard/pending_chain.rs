@@ -1144,6 +1144,15 @@ impl<P: Substates> Substates for PreparedBlockView<'_, P> {
     }
 }
 
+/// A view whose state at its anchor is held neither by its own chain nor
+/// by the base: retention has passed the anchor, or the anchor is above
+/// the base's tip where the view's chain does not end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchorUnheld {
+    /// The view's anchor.
+    pub anchor: BlockHeight,
+}
+
 /// A sweep walk over a store that had persisted past the view's anchor
 /// by the time the walk finished.
 ///
@@ -1283,18 +1292,56 @@ impl<S: SubstateStore + VersionedStore> SubstateView<S> {
     /// the retention floor.
     #[must_use]
     pub fn served_snapshot(&self) -> Option<ViewSnapshot<S::Snapshot<'_>>> {
-        let base_snapshot = if self.anchor_height <= (*self.base).jmt_height() {
-            (*self.base).snapshot_held_at(self.anchor_height)?
+        self.held_base()
+            .map(|base_snapshot| self.over(base_snapshot))
+    }
+
+    /// The base as of the anchor, where the view holds it: history at or
+    /// below the base's tip, or the tip its own chain ends at.
+    fn held_base(&self) -> Option<S::Snapshot<'_>> {
+        if self.anchor_height <= (*self.base).jmt_height() {
+            (*self.base).snapshot_held_at(self.anchor_height)
         } else if self
             .versioned_settled
             .last()
             .is_some_and(|(at, _)| *at == self.anchor_height)
         {
-            (*self.base).snapshot_at(self.anchor_height)
+            Some((*self.base).snapshot_at(self.anchor_height))
         } else {
-            return None;
+            None
+        }
+    }
+
+    /// The entry at `order` as this view reads it at its anchor.
+    ///
+    /// The pending entries answer first; beneath them the base is read
+    /// on [`Self::served_snapshot`]'s terms, so a pending tip answers and
+    /// a base whose retention passed the anchor says it cannot rather
+    /// than reading a later version or panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`AnchorUnheld`] where neither the pending entries nor the base
+    /// can answer at the anchor.
+    pub fn entry_held(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        order: u128,
+    ) -> Result<Option<Vec<u8>>, AnchorUnheld> {
+        let key = EntryKey {
+            owner,
+            collection,
+            order,
         };
-        Some(self.over(base_snapshot))
+        if let Some(change) = self.overlay_entries.get(&key) {
+            return Ok(change.clone());
+        }
+        self.held_base()
+            .map(|base| base.entry(owner, collection, order))
+            .ok_or(AnchorUnheld {
+                anchor: self.anchor_height,
+            })
     }
 
     /// The view's overlay laid over `base_snapshot`, a base reading at

@@ -2188,6 +2188,7 @@ dependencies = [
  "hyperscale-vm-preview",
  "hyperscale-vm-ref",
  "hyperscale-vm-runtime",
+ "hyperscale-vm-sdk",
  "hyperscale-vm-stdlib",
  "hyperscale-vm-types",
  "indexmap",

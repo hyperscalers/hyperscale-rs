@@ -45,8 +45,8 @@ use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    BlockHeight, DeclaredKey, Mode, Movement, ProvisionalHolds, ShardId, StateWrites, SubstateKey,
-    TickId, TxHash, amount_cell, read_amount,
+    BlockHeight, DeclaredKey, EntryKey, Mode, Movement, ProvisionalHolds, ShardId, StateWrites,
+    SubstateKey, TickId, TxHash, amount_cell, read_amount,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -1062,6 +1062,19 @@ impl<S: VersionedStore> TickView<S> {
         }
     }
 
+    /// The view's point reads, owned rather than borrowed, so a baseline
+    /// that outlives this call can still answer an entry no pre-read
+    /// named: the same layers over the base as of the same anchor as
+    /// [`Self::snapshot`].
+    #[must_use]
+    pub fn points(&self) -> TickViewPoints<S> {
+        TickViewPoints {
+            base: Arc::clone(&self.base),
+            anchor: self.anchor,
+            overlays: Arc::clone(&self.overlays),
+        }
+    }
+
     /// What unresolved legs hold against the cells this view reads.
     ///
     /// The companion to the overlay: the overlay is what a reader may
@@ -1091,6 +1104,49 @@ impl<S: VersionedStore> TickView<S> {
             included,
             prefix,
         )
+    }
+}
+
+/// A [`TickView`]'s point reads of ordered-collection entries: the view's
+/// layers topmost first, then the base as of the view's anchor.
+///
+/// The tick chain holds the base's retention at a floor no queued tick's
+/// anchor is below ([`TickChain::prune_persisted`]), so a probe made while
+/// the tick this view is the baseline of runs still reads at the anchor.
+pub struct TickViewPoints<S> {
+    base: Arc<S>,
+    anchor: BlockHeight,
+    overlays: Arc<Vec<Arc<StateWrites>>>,
+}
+
+impl<S> std::fmt::Debug for TickViewPoints<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TickViewPoints")
+            .field("anchor", &self.anchor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: VersionedStore> TickViewPoints<S> {
+    /// The entry at `order` as the view reads it.
+    #[must_use]
+    pub fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        let key = EntryKey {
+            owner,
+            collection,
+            order,
+        };
+        if let Some(change) = self
+            .overlays
+            .iter()
+            .rev()
+            .find_map(|layer| layer.entries.get(&key))
+        {
+            return change.clone();
+        }
+        self.base
+            .snapshot_at(self.anchor)
+            .entry(owner, collection, order)
     }
 }
 

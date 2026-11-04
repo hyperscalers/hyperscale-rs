@@ -109,7 +109,7 @@ pub use hyperscale_vm_types::{
     ModeKind, Movement, NativeAddr, NotCallable, OverDebit, PackageAddr, Presence, PriceBounds,
     PriceTable, PrincipalAddr, ResourceAddr, SWEEP_BUCKET_BYTES, SWEEP_BUCKET_SHIFT, SchemeId,
     SettledCells, SettledEntries, SettledWrites, StateWrites, SubstateKey, SweepBucket,
-    Utilization, amount_cell, compatible, encode_amount, entry_leaf_key, read_amount,
+    Utilization, amount_cell, compatible, encode_amount, entry_leaf_key, range_lift, read_amount,
 };
 pub use network::{
     GossipMessage, GossipScope, MessageClass, NetworkMessage, Request, Signed, SignedContext,

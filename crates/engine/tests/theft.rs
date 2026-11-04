@@ -127,6 +127,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");

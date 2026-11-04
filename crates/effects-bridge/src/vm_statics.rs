@@ -36,7 +36,7 @@ use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectSet, EffectTarget,
     LegShape, LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey, Terms,
-    TermsRefusal, admit_event_bounds, attestation_work, read_bytes, written_leaf,
+    TermsRefusal, admit_event_bounds, attestation_work, range_lift, read_bytes, written_leaf,
 };
 
 use crate::ProtocolHasher;
@@ -861,13 +861,14 @@ fn classify_declared_access(declared: &EffectSet, fee_payer: PrincipalAddr) -> D
 /// [`MAX_PROVISION_WEIGHT`] is refused here — at admission, before an
 /// honest server does enumeration work a part it cannot build would
 /// throw away. A cell serves one entry; a range serves at most its
-/// declared cap.
+/// [`range_lift`], one past its declared cap, and an entry, its own
+/// width-one interval, serves one.
 fn check_provision_weight(provision_keys: &BTreeSet<DeclaredKey>) -> Result<(), DerivationError> {
     let weight: usize = provision_keys
         .iter()
         .map(|key| match key {
             DeclaredKey::Cell(_) => 1,
-            DeclaredKey::Range(range) => usize::try_from(range.cap).unwrap_or(usize::MAX),
+            DeclaredKey::Range(range) => range_lift(range.lo, range.hi, range.cap),
         })
         .fold(0, usize::saturating_add);
     if weight > MAX_PROVISION_WEIGHT {
@@ -2818,36 +2819,116 @@ mod tests {
         );
     }
 
+    /// A wide interval from `lo` at `cap`, which weighs its lift.
+    fn wide_range(cap: u32, lo: u128) -> DeclaredKey {
+        DeclaredKey::Range(DeclaredRange {
+            owner: Address::new([9; 31], AddressClass::Component),
+            collection: CollectionId([3; 16]),
+            lo,
+            hi: u128::MAX,
+            cap,
+        })
+    }
+
     /// The provision-weight cap: cells count one, ranges count their
-    /// declared cap, and a set no one part could carry is refused at
-    /// admission.
+    /// lift, and a set no one part could carry is refused at admission.
     #[test]
     fn a_declaration_past_one_parts_weight_is_refused() {
         let owner = Address::new([9; 31], AddressClass::Component);
-        let range = |cap: u32, salt: u128| {
-            DeclaredKey::Range(DeclaredRange {
-                owner,
-                collection: CollectionId([3; 16]),
-                lo: salt,
-                hi: salt,
-                cap,
-            })
-        };
-        let cap_u32 = u32::try_from(MAX_PROVISION_WEIGHT).unwrap();
+        let lifts_whole = u32::try_from(MAX_PROVISION_WEIGHT).unwrap() - 1;
 
-        let at_cap: BTreeSet<DeclaredKey> = [range(cap_u32, 0)].into();
+        let at_cap: BTreeSet<DeclaredKey> = [wide_range(lifts_whole, 0)].into();
         assert!(check_provision_weight(&at_cap).is_ok());
 
-        let over: BTreeSet<DeclaredKey> = [range(cap_u32, 0), range(1, 1)].into();
+        let over: BTreeSet<DeclaredKey> = [wide_range(lifts_whole, 0), wide_range(1, 1)].into();
         assert!(check_provision_weight(&over).is_err());
+
+        let cells_fill: BTreeSet<DeclaredKey> = [
+            DeclaredKey::substate(owner, [1; 16]),
+            wide_range(lifts_whole - 1, 0),
+        ]
+        .into();
+        assert!(check_provision_weight(&cells_fill).is_ok());
 
         let cells_count: BTreeSet<DeclaredKey> = [
             DeclaredKey::substate(owner, [1; 16]),
-            range(cap_u32 - 1, 0),
-            range(1, 1),
+            wide_range(lifts_whole, 0),
         ]
         .into();
         assert!(check_provision_weight(&cells_count).is_err());
+    }
+
+    /// A range weighs what its part serves: the cap and the successor
+    /// past it, or the whole interval where it is narrower. The injected
+    /// any-instance interval, a cap of one over every id, weighs two.
+    #[test]
+    fn a_range_weighs_its_cap_and_its_successor() {
+        let weight = MAX_PROVISION_WEIGHT;
+        let cap = u32::try_from(weight).unwrap();
+        assert!(check_provision_weight(&[wide_range(cap - 1, 0)].into()).is_ok());
+        assert!(
+            check_provision_weight(&[wide_range(cap, 0)].into()).is_err(),
+            "a cap at the weight lifts one past it"
+        );
+        let narrow = DeclaredKey::Range(DeclaredRange {
+            owner: Address::new([9; 31], AddressClass::Component),
+            collection: CollectionId([3; 16]),
+            lo: 0,
+            hi: u128::from(cap) - 1,
+            cap,
+        });
+        assert!(
+            check_provision_weight(&[narrow].into()).is_ok(),
+            "an interval narrower than its lift weighs its width"
+        );
+        let any_instance = DeclaredKey::Range(DeclaredRange {
+            owner: Address::new([9; 31], AddressClass::Component),
+            collection: CollectionId([3; 16]),
+            lo: 0,
+            hi: u128::from(u64::MAX),
+            cap: 1,
+        });
+        let mut fits: BTreeSet<DeclaredKey> = (0..weight - 2)
+            .map(|index| {
+                DeclaredKey::substate(
+                    Address::new([9; 31], AddressClass::Component),
+                    u128::try_from(index).unwrap().to_be_bytes(),
+                )
+            })
+            .collect();
+        fits.insert(any_instance);
+        assert!(check_provision_weight(&fits).is_ok());
+        fits.insert(DeclaredKey::substate(
+            Address::new([8; 31], AddressClass::Component),
+            [0; 16],
+        ));
+        assert!(check_provision_weight(&fits).is_err());
+    }
+
+    /// An entry target is its width-one interval and weighs one, as a
+    /// cell does: it has no successor to serve.
+    #[test]
+    fn an_entry_weighs_one() {
+        let entry = admission_key(&EffectTarget::Entry {
+            owner: Address::new([9; 31], AddressClass::Component),
+            collection: CollectionId([3; 16]),
+            order: 7,
+        });
+        let mut fits: BTreeSet<DeclaredKey> = (0..MAX_PROVISION_WEIGHT - 1)
+            .map(|index| {
+                DeclaredKey::substate(
+                    Address::new([9; 31], AddressClass::Component),
+                    u128::try_from(index).unwrap().to_be_bytes(),
+                )
+            })
+            .collect();
+        fits.insert(entry);
+        assert!(check_provision_weight(&fits).is_ok());
+        fits.insert(DeclaredKey::substate(
+            Address::new([8; 31], AddressClass::Component),
+            [0; 16],
+        ));
+        assert!(check_provision_weight(&fits).is_err());
     }
 
     /// A record is seated under the address its own contents derive, and

@@ -1087,6 +1087,7 @@ impl Cluster for SimCluster {
                     fetched: FetchedCells::default(),
                 },
                 grants,
+                points: None,
             },
         ))
     }

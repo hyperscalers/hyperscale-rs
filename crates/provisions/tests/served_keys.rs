@@ -83,20 +83,24 @@ fn request() -> ProvisionsRequest {
 }
 
 /// The keys [`request`] is served after the block, as the reading at
-/// every stage must find them.
+/// every stage must find them: each interval's lowest entries, one past
+/// its cap.
 fn expected() -> Vec<SubstateKey> {
     let mut expected = vec![
         state_key(0x55, 1),
         leaf(INSERTED, 10),
         leaf(INSERTED, 15),
         leaf(INSERTED, 20),
+        leaf(INSERTED, 30),
         leaf(THINNED, 30),
         leaf(THINNED, 40),
+        leaf(THINNED, 50),
         leaf(REWRITTEN, 10),
         leaf(REWRITTEN, 25),
         leaf(REWRITTEN, 30),
         leaf(UNTOUCHED, 1),
         leaf(UNTOUCHED, 2),
+        leaf(UNTOUCHED, 3),
     ];
     expected.sort_unstable();
     expected

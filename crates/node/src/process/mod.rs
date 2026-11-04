@@ -23,8 +23,8 @@ pub use canonical_txs::CanonicalTxs;
 use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{
-    CodeAvailability, FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport,
-    TickEnvironment,
+    CodeAvailability, FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewPoints,
+    PreviewReport, TickEnvironment,
 };
 use hyperscale_hbor::Capped;
 use hyperscale_network::Network;
@@ -606,6 +606,7 @@ where
                     fetched,
                 },
                 grants,
+                points: Some(Arc::new(PreviewPoints::new(payer_shard, Arc::clone(&view)))),
             },
         )))
     }

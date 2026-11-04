@@ -500,6 +500,7 @@ fn execute_seeded(
         env,
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     derived_through(executor, transactions);
     executor
@@ -707,6 +708,7 @@ fn execute_batch_at(
         env: sealed_env(0x5E),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     derived_through(executor, transactions);
     executor
@@ -1248,6 +1250,7 @@ fn execute_on_shard(
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     derived_through(executor, transactions);
     executor
@@ -1589,6 +1592,7 @@ fn a_transfer_executes_divided_on_the_payers_shard() {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            points: None,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1686,6 +1690,7 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            points: None,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1818,6 +1823,7 @@ fn a_consumers_taken_read_present_retires_the_record_in_the_fold() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     let input = TickTxInput {
         prices: PriceTable::GENESIS,
@@ -1900,6 +1906,7 @@ fn inherited_record() -> Inherited {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     let input = TickTxInput {
         prices: PriceTable::GENESIS,
@@ -1976,6 +1983,7 @@ fn tick_context<'a>(
         env: TickEnvironment::unfolded(),
         holds,
         fee_holds: &NoFeeHolds,
+        points: None,
     }
 }
 
@@ -2272,6 +2280,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            points: None,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -2347,6 +2356,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         env: TickEnvironment::unfolded(),
         holds: &holds,
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     derived_through(&executor, std::slice::from_ref(&tx));
     let executed = executor
@@ -2366,6 +2376,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
     let unheld = TickBatchContext {
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
         ..ctx
     };
     let executed = executor
@@ -2853,6 +2864,7 @@ fn a_completed_publish_a_counterpart_can_refuse_carries_its_charge_apart() {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            points: None,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -3326,6 +3338,7 @@ fn preview_on(
                 fetched: FetchedCells::default(),
             },
             grants,
+            points: None,
         },
     )
 }
@@ -3496,6 +3509,7 @@ fn a_preview_speaks_for_a_shard_a_fan_out_answered() {
                 fetched,
             },
             grants: PreviewGrants::default(),
+            points: None,
         },
     );
     assert!(
@@ -3540,6 +3554,7 @@ fn a_refused_preview_names_no_anchor() {
                 fetched: FetchedCells::default(),
             },
             grants: PreviewGrants::default(),
+            points: None,
         },
     );
     assert!(matches!(report.outcome, PreviewOutcome::Refused { .. }));
@@ -3598,6 +3613,7 @@ fn a_preview_refuses_what_this_node_cannot_see() {
                 fetched: FetchedCells::default(),
             },
             grants: PreviewGrants::default(),
+            points: None,
         },
     );
     match report.outcome {
@@ -3787,6 +3803,7 @@ fn a_members_fee_follows_the_table_it_carries() {
             env: sealed_env(0x5E),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            points: None,
         };
         let executed = executor
             .execute_batch(
@@ -4440,6 +4457,7 @@ fn execute_under_holds(
         env: sealed_env(0x5E),
         holds: &holds,
         fee_holds: &fee_holds,
+        points: None,
     };
     executor
         .execute_batch(&ctx, PriceTable::GENESIS, &view.snapshot(), members)

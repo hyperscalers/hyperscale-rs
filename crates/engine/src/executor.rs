@@ -27,7 +27,7 @@ use hyperscale_effects_bridge::{
     witness_from_event,
 };
 use hyperscale_metrics::{record_provision_range_entries_consumed, record_transaction_executed};
-use hyperscale_storage::entry_from_leaf;
+use hyperscale_storage::{TickViewPoints, VersionedStore, entry_from_leaf};
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Epoch, EscrowedValue,
     Event, EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
@@ -48,6 +48,7 @@ use hyperscale_vm_kernel::{
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
     EntryKey, Mode, Moves, Outcome, ResourceAddr, SeedWindow, SubstateKey, UnmetCondition,
+    range_lift,
 };
 
 use crate::backend::{Availability, EngineBackend};
@@ -182,6 +183,26 @@ pub struct TickBaseline {
     /// reach, its own members named apart. Empty for a baseline with
     /// nothing committed over it — a preview.
     pub(crate) fee_holds: BTreeMap<SubstateKey, FeeHolds>,
+    /// The shard this baseline executes on and the reader that answers
+    /// an entry point no pre-read named, at the version the pre-read
+    /// read. `None` answers every point from the map alone.
+    pub(crate) points: Option<(ShardId, Arc<dyn PointReads>)>,
+}
+
+/// Point reads of ordered-collection entries at a baseline's version.
+///
+/// What a take or a filing probes at an order no declaration's pre-read
+/// could know, since a filing can follow a mint whose ids the issuer
+/// chose. Ranges never reach this: they are the pre-read's.
+pub trait PointReads: Send + Sync + std::fmt::Debug {
+    /// The entry at `order`, if any.
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>>;
+}
+
+impl<S: VersionedStore> PointReads for TickViewPoints<S> {
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        Self::entry(self, owner, collection, order)
+    }
 }
 
 impl Substates for TickBaseline {
@@ -216,6 +237,26 @@ impl Substates for TickBaseline {
             .map(|(key, value)| (key.order, value.clone()))
             .collect()
     }
+
+    /// The map, then the point reader for an owner this shard owns. Any
+    /// other owner's entry answers from the map alone: read out of this
+    /// store it would differ between replicas, which hold nothing of
+    /// another shard's subtree in common.
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        let key = EntryKey {
+            owner,
+            collection,
+            order,
+        };
+        if let Some(value) = self.entries.get(&key) {
+            return Some(value.clone());
+        }
+        let (shard, points) = self.points.as_ref()?;
+        if !ShardTrie::shard_owns_prefix(*shard, owner) {
+            return None;
+        }
+        points.entry(owner, collection, order)
+    }
 }
 
 impl Baseline for TickBaseline {
@@ -234,7 +275,9 @@ impl Baseline for TickBaseline {
 
 /// Materialize one declaration's baseline from the tick snapshot: for
 /// every declared effect this shard owns, the committed content it
-/// reads — the point cell, or the entries of the collection interval.
+/// reads — the point cell, or the interval's [`range_lift`] lowest
+/// entries, which is what the kernel's page lifts and what a provision
+/// part serves of the same interval.
 ///
 /// The one pre-read: `run_batch` and `preview` both fill their baselines
 /// here, so ordered-collection support exists in exactly one place and
@@ -274,7 +317,8 @@ pub fn materialize_declared(
             } => (owner, collection, lo, hi, cap),
         };
         if locality.covers(owner) {
-            for (order, value) in snapshot.entries_in_range(owner, collection, lo, hi, cap as usize)
+            for (order, value) in
+                snapshot.entries_in_range(owner, collection, lo, hi, range_lift(lo, hi, cap))
             {
                 base.entries.insert(
                     EntryKey {
@@ -1679,7 +1723,13 @@ impl Executor {
         // The committed baseline every member shares: the locally owned
         // declared content from the tick snapshot. Provisioned content is
         // each member's own, beneath it.
-        let mut base = TickBaseline::default();
+        let mut base = TickBaseline {
+            points: ctx
+                .points
+                .as_ref()
+                .map(|points| (ctx.local_shard, Arc::clone(points))),
+            ..TickBaseline::default()
+        };
         for entry in prepared.values() {
             materialize_declared(snapshot, &entry.declaration.set, &locality, &mut base);
         }
@@ -2107,6 +2157,7 @@ impl Executor {
 mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{AddressClass, ExecutionOutcome, GlobalReceiptHash, LocalKey, Presence};
+    use hyperscale_vm_kernel::{KernelHost, KernelSession};
     use hyperscale_vm_types::{AbortReason, encode_amount};
 
     use super::*;
@@ -2419,5 +2470,142 @@ mod tests {
     #[should_panic(expected = "BFT CRITICAL")]
     fn a_charge_on_a_vault_that_is_no_amount_stops_the_batch() {
         let _ = charge_over(b"not an amount".to_vec(), 0);
+    }
+
+    const LADDER_OWNER: Address = Address::new([0x11; 31], AddressClass::Component);
+    const LADDER: CollectionId = CollectionId([4; 16]);
+
+    /// A store holding an entry at each order in `0..count` of the
+    /// ladder.
+    fn ladder_of(count: u8) -> MemoryStore {
+        let mut store = MemoryStore::new();
+        for order in 0..count {
+            store.entry_write(LADDER_OWNER, LADDER, u128::from(order), vec![order]);
+        }
+        store
+    }
+
+    /// The whole ladder at `cap`, in `mode`.
+    fn ladder_at(cap: u32, mode: Mode) -> Effect {
+        Effect {
+            target: EffectTarget::Range {
+                owner: LADDER_OWNER,
+                collection: LADDER,
+                lo: 0,
+                hi: u128::MAX,
+                cap,
+            },
+            mode,
+        }
+    }
+
+    fn declared_of(effects: &[Effect]) -> EffectSet {
+        let mut set = EffectSet::new();
+        for effect in effects {
+            set.insert_at_cap(*effect)
+                .expect("the fixture's accesses fold");
+        }
+        set
+    }
+
+    /// The orders of the ladder a baseline holds.
+    fn orders_in(base: &TickBaseline) -> Vec<u128> {
+        base.entries.keys().map(|key| key.order).collect()
+    }
+
+    /// A declared range lifts one past its cap: the successor a page's
+    /// coverage turns on.
+    #[test]
+    fn a_declared_range_materializes_its_successor() {
+        let mut base = TickBaseline::default();
+        materialize_declared(
+            &ladder_of(6),
+            &declared_of(&[ladder_at(3, Mode::Read)]),
+            &OwnerSet::whole(),
+            &mut base,
+        );
+        assert_eq!(orders_in(&base), vec![0, 1, 2, 3]);
+    }
+
+    /// The source's baseline holds whatever a batch-mate's wider read
+    /// materializes beside a member's own interval, and a counterpart's
+    /// holds the member's part alone. A page that removes what it shows
+    /// counts and covers alike over both, because both answer its lift.
+    #[test]
+    fn a_full_page_answers_coverage_alike_on_both_shards() {
+        let store = ladder_of(10);
+        let member = ladder_at(4, Mode::Write { moves: Moves::Both });
+        let mut source = TickBaseline::default();
+        materialize_declared(
+            &store,
+            &declared_of(&[member, ladder_at(8, Mode::Read)]),
+            &OwnerSet::whole(),
+            &mut source,
+        );
+        let mut counterpart = TickBaseline::default();
+        materialize_declared(
+            &store,
+            &declared_of(&[member]),
+            &OwnerSet::whole(),
+            &mut counterpart,
+        );
+        assert_eq!(orders_in(&source).len(), 9, "the batch-mate's read");
+        assert_eq!(orders_in(&counterpart), vec![0, 1, 2, 3, 4], "the part");
+
+        let walk = |base: TickBaseline| {
+            let mut session = KernelSession::materialize(
+                OverlayStore::new(Arc::new(base)),
+                &Declaration::from_set(declared_of(&[member])),
+                TxHash::from(Hash::from_bytes(b"walker")),
+                EnvInputs::unsealed(0),
+                protocol_hash,
+            )
+            .expect("one write interval materializes");
+            let mut answers = Vec::new();
+            for _ in 0..4 {
+                answers.push((
+                    session.range_count(0, 0).unwrap(),
+                    KernelHost::site_covered(&mut session, 0, 0).unwrap(),
+                ));
+                session.range_remove(0, 0, 0).unwrap();
+            }
+            answers.push((
+                session.range_count(0, 0).unwrap(),
+                KernelHost::site_covered(&mut session, 0, 0).unwrap(),
+            ));
+            answers
+        };
+        let on_source = walk(source);
+        assert_eq!(on_source, walk(counterpart));
+        assert_eq!(
+            on_source,
+            vec![(4, false), (3, false), (2, false), (1, false), (0, false)]
+        );
+    }
+
+    /// A point the map lacks falls through to the reader for an owner
+    /// this shard owns, and never for one it does not: another shard's
+    /// cell read out of this store would differ between replicas.
+    #[test]
+    fn a_point_of_another_shards_owner_never_falls_through() {
+        /// A reader answering every point it is asked.
+        #[derive(Debug)]
+        struct Everywhere;
+        impl PointReads for Everywhere {
+            fn entry(&self, _: Address, _: CollectionId, _: u128) -> Option<Vec<u8>> {
+                Some(vec![7])
+            }
+        }
+
+        let ours = Address::new([0x00; 31], AddressClass::Component);
+        let theirs = Address::new([0xFF; 31], AddressClass::Component);
+        let base = TickBaseline {
+            points: Some((ShardId::leaf(1, 0), Arc::new(Everywhere))),
+            ..TickBaseline::default()
+        };
+        assert_eq!(base.entry(ours, LADDER, 5), Some(vec![7]));
+        assert_eq!(base.entry(theirs, LADDER, 5), None);
+        // And a baseline with no reader answers from its map alone.
+        assert_eq!(TickBaseline::default().entry(ours, LADDER, 5), None);
     }
 }

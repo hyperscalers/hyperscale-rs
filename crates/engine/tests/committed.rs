@@ -1112,6 +1112,7 @@ impl Window {
                     env: TickEnvironment::unfolded(),
                     holds: &ProvisionalHolds::new(),
                     fee_holds: &NoFeeHolds,
+                    points: None,
                 },
                 PriceTable::GENESIS,
                 &store,
@@ -1221,6 +1222,7 @@ impl Window {
             env: TickEnvironment::unfolded(),
             holds: &holds,
             fee_holds: &NoFeeHolds,
+            points: None,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,

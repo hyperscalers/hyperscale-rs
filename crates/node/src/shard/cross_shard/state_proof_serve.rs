@@ -17,7 +17,7 @@ use hyperscale_types::network::request::{GetCellsRequest, GetStateProofRequest};
 use hyperscale_types::network::response::{GetCellsResponse, GetStateProofResponse, RangeAnswer};
 use hyperscale_types::{
     EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, SubstateKey,
-    entry_leaf_key,
+    entry_leaf_key, range_lift,
 };
 use hyperscale_vm_effects::CrossingLeaf;
 use tracing::warn;
@@ -144,9 +144,11 @@ pub fn serve_cells_request<S: ShardStorage>(
     // here is signed — a preview asks before there is a transaction to
     // sign — so the caps are the asker's word, and a query wider than
     // any declaration could be is refused rather than walked. An
-    // interval costs at least the one leaf it always stands on.
+    // interval costs what it lifts, one past its cap, and at least the
+    // one leaf it always stands on.
     let asked = req.ranges.iter().fold(req.keys.len() as u64, |sum, range| {
-        sum.saturating_add(u64::from(range.cap.max(1)))
+        let lift = range_lift(range.lo, range.hi, range.cap).max(1);
+        sum.saturating_add(u64::try_from(lift).unwrap_or(u64::MAX))
     });
     if asked > MAX_CELLS_PER_QUERY {
         return GetCellsResponse::not_found();
@@ -189,12 +191,14 @@ pub fn serve_cells_request<S: ShardStorage>(
     let mut leaves = req.keys.to_vec();
     let mut ranges = Vec::with_capacity(req.ranges.len());
     for range in &req.ranges {
+        // The lift a member's own page reads, so a preview answers
+        // coverage over a fetched interval as the chain would.
         let found = at.entries_in_range(
             range.owner,
             range.collection,
             range.lo,
             range.hi,
-            range.cap as usize,
+            range_lift(range.lo, range.hi, range.cap),
         );
         let mut entries = Vec::with_capacity(found.len());
         for (order, value) in found {
@@ -223,7 +227,7 @@ pub fn serve_cells_request<S: ShardStorage>(
         }
         ranges.push(RangeAnswer {
             entries: Capped::new(entries)
-                .expect("no more entries than the interval's own cap admits"),
+                .expect("no more entries than the interval's own lift admits"),
         });
     }
 
@@ -490,8 +494,9 @@ mod tests {
 
         // The budget is spent across the whole request, not per
         // interval: two halves of it asked separately would otherwise
-        // buy twice what one asks for.
-        let cap = u32::try_from(MAX_CELLS_PER_QUERY).expect("the budget fits a cap");
+        // buy twice what one asks for. An interval spends its lift, one
+        // past its cap.
+        let cap = u32::try_from(MAX_CELLS_PER_QUERY).expect("the budget fits a cap") - 1;
         let split = serve_cells_request(
             &chain,
             &GetCellsRequest::new(
@@ -512,6 +517,14 @@ mod tests {
         assert!(
             served.proof.is_some(),
             "a query inside the budget is answered as before"
+        );
+        let past = serve_cells_request(
+            &chain,
+            &GetCellsRequest::new(Capped::empty(), Capped::from_array([whole_space(cap + 1)])),
+        );
+        assert!(
+            past.proof.is_none(),
+            "a cap at the budget lifts one past it"
         );
     }
 
@@ -559,13 +572,14 @@ mod tests {
             "an answer whose values outweigh the frame is refused, not built"
         );
 
-        // And one leaf fewer is inside the budget and served, so what
-        // refuses above is the budget and not the shape of the query.
+        // And a lift one leaf fewer is inside the budget and served, so
+        // what refuses above is the budget and not the shape of the
+        // query. A cap lifts one past itself, so that cap is two fewer.
         let served = serve_cells_request(
             &chain,
             &GetCellsRequest::new(
                 Capped::empty(),
-                Capped::from_array([whole(u32::try_from(count - 1).expect("a small count"))]),
+                Capped::from_array([whole(u32::try_from(count - 2).expect("a small count"))]),
             ),
         );
         assert!(
@@ -593,7 +607,8 @@ mod tests {
         let collection = entry_key(OWNER_SEED, 0).collection;
 
         // A cap under what the interval holds: the declaration bought
-        // three leaves and is answered with three, not with everything.
+        // three leaves and is answered with its lift of four, not with
+        // everything.
         let response = serve_cells_request(
             &chain,
             &GetCellsRequest::new(
@@ -620,8 +635,8 @@ mod tests {
         let answered = &response.ranges[0].entries;
         assert_eq!(
             answered.iter().map(|(order, _)| *order).collect::<Vec<_>>(),
-            vec![2, 3, 4],
-            "the interval is answered from its low end, up to the cap the declaration signed"
+            vec![2, 3, 4, 5],
+            "the interval is answered from its low end, one past the cap the declaration signed"
         );
 
         // Every entry it named proves present, at the leaf the requester
@@ -644,6 +659,45 @@ mod tests {
             attested.iter().all(|(_, inclusion)| inclusion.is_present()),
             "every entry the answer carries stands under the height's root"
         );
+    }
+
+    /// A preview's fetched interval carries the successor past its cap,
+    /// so the run over it answers coverage as a member's own page would;
+    /// an interval narrower than its lift serves what it holds.
+    #[test]
+    fn a_preview_range_serves_its_successor() {
+        const OWNER_SEED: u8 = 0x12;
+        let storage = Arc::new(SimShardStorage::default());
+        let written: Vec<(u128, Option<Vec<u8>>)> =
+            (0u128..6).map(|order| (order, Some(vec![1; 4]))).collect();
+        commit_writes(&*storage, &make_settled_entries(OWNER_SEED, &written));
+        let chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
+        let key = entry_key(OWNER_SEED, 0);
+        let orders = |lo: u128, hi: u128, cap: u32| {
+            let response = serve_cells_request(
+                &chain,
+                &GetCellsRequest::new(
+                    Capped::empty(),
+                    Capped::from_array([CellRange {
+                        owner: key.owner,
+                        collection: key.collection,
+                        lo,
+                        hi,
+                        cap,
+                    }]),
+                ),
+            );
+            assert!(response.proof.is_some(), "the tip is answerable");
+            response.ranges[0]
+                .entries
+                .iter()
+                .map(|(order, _)| *order)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(orders(0, u128::MAX, 2), vec![0, 1, 2], "the successor");
+        assert_eq!(orders(0, u128::MAX, 6), (0..6).collect::<Vec<_>>());
+        assert_eq!(orders(1, 2, 4), vec![1, 2], "the interval ends first");
+        assert_eq!(orders(4, 4, 1), vec![4], "an entry serves itself");
     }
 
     /// A record cell the proof shows present is served with its value,

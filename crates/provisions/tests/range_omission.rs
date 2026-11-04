@@ -204,9 +204,10 @@ fn a_part_omitting_an_interval_entry_is_refused() {
 
 #[test]
 fn a_capped_interval_shifted_past_an_omitted_entry_is_refused() {
-    // Cap 2: the honest part serves the two lowest orders. A forger drops
-    // 10 and serves 20 in its place, still within the cap.
-    let source = Source::new(2);
+    // Cap 1: the honest part serves the two lowest orders, the cap and
+    // the successor past it. A forger drops 10 and serves 20 in its
+    // place, still within the lift.
+    let source = Source::new(1);
     let mut honest = source.honest_keys();
     assert!(honest.contains(&entry_leaf(10)));
     assert!(!honest.contains(&entry_leaf(20)));

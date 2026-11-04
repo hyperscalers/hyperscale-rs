@@ -24,11 +24,11 @@
 //! server left as the collection's own.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hyperscale_effects_bridge::admit_package;
 use hyperscale_hbor::Capped;
-use hyperscale_storage::Substates;
+use hyperscale_storage::{AnchorUnheld, SubstateStore, SubstateView, Substates, VersionedStore};
 use hyperscale_types::network::request::{CellRange, MAX_RANGES_PER_QUERY};
 use hyperscale_types::{
     Address, BlockHeight, CollectionId, Event, MAX_PROOFS_PER_QUERY, ShardId, ShardTrie,
@@ -40,7 +40,8 @@ use hyperscale_vm_types::{EffectSet, EffectTarget, Outcome, PriceTable, SeedWind
 
 use crate::batch::TickEnvironment;
 use crate::executor::{
-    PayerFee, TickBaseline, abort_reason, batch_entry, materialize_declared, protocol_hash,
+    PayerFee, PointReads, TickBaseline, abort_reason, batch_entry, materialize_declared,
+    protocol_hash,
 };
 use crate::genesis::vault_key;
 use crate::{Executor, PROTOCOL_RESOURCE};
@@ -55,6 +56,96 @@ pub struct PreviewGrants {
     /// payer's vault. This is what lets a wallet price an envelope whose
     /// payer could not cover the ceiling it names.
     pub free_credit: bool,
+}
+
+/// A preview's point reads of the shard it reads itself, over the hosted
+/// chain's view: what answers a take's or a filing's probe at an order
+/// no declared interval reached.
+///
+/// A preview runs beside the commit pipeline, so retention can pass the
+/// view's anchor mid-run. A probe the view can then no longer answer
+/// reads absent and is kept as an interval nobody proved, for the report
+/// to name: the run completes and says which points it could not read.
+pub struct PreviewPoints {
+    /// The shard the view is of: only its owners' points are read here.
+    shard: ShardId,
+    view: Arc<dyn HeldEntries>,
+    unread: Mutex<BTreeSet<UnprovenInterval>>,
+}
+
+/// A view that says whether it still holds the entry it is asked for.
+trait HeldEntries: Send + Sync {
+    fn entry_held(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        order: u128,
+    ) -> Result<Option<Vec<u8>>, AnchorUnheld>;
+}
+
+impl<S: SubstateStore + VersionedStore> HeldEntries for SubstateView<S> {
+    fn entry_held(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        order: u128,
+    ) -> Result<Option<Vec<u8>>, AnchorUnheld> {
+        Self::entry_held(self, owner, collection, order)
+    }
+}
+
+impl PreviewPoints {
+    /// Point reads over `view`, `shard`'s chain, which the preview's
+    /// snapshot is of.
+    #[must_use]
+    pub fn new<S: SubstateStore + VersionedStore>(
+        shard: ShardId,
+        view: Arc<SubstateView<S>>,
+    ) -> Self {
+        Self {
+            shard,
+            view: view as Arc<dyn HeldEntries>,
+            unread: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// The points a probe asked for and the view could not answer.
+    fn unread(&self) -> BTreeSet<UnprovenInterval> {
+        self.unread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// These reads as a baseline's: its own shard's owners alone.
+    fn reader(self: &Arc<Self>) -> (ShardId, Arc<dyn PointReads>) {
+        (self.shard, Arc::clone(self) as Arc<dyn PointReads>)
+    }
+}
+
+impl std::fmt::Debug for PreviewPoints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreviewPoints").finish_non_exhaustive()
+    }
+}
+
+impl PointReads for PreviewPoints {
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        self.view
+            .entry_held(owner, collection, order)
+            .unwrap_or_else(|_| {
+                self.unread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(UnprovenInterval {
+                        owner,
+                        collection,
+                        lo: order,
+                        hi: order,
+                    });
+                None
+            })
+    }
 }
 
 /// The transaction environment a preview reads, supplied by the caller
@@ -92,6 +183,9 @@ pub struct PreviewInputs {
     /// table, and a fold moving it between the quote and the commit is
     /// what the signed ceiling absorbs.
     pub prices: PriceTable,
+    /// The point reads of the shard the snapshot is of, or `None` to
+    /// answer every probe from the declared pre-read alone.
+    pub points: Option<Arc<PreviewPoints>>,
 }
 
 /// What one shard is to be asked for on a preview's behalf.
@@ -732,7 +826,13 @@ impl Executor {
         // a tick, so no tick's reservation is in flight over the
         // baseline it reads, and total locality covers every cell the
         // envelope touches.
-        let mut base = TickBaseline::default();
+        // A probe past the pre-read reads this node's own shard through
+        // the hosted chain; an owner the preview fetched reads what was
+        // fetched alone, so a probe past it is advisory.
+        let mut base = TickBaseline {
+            points: inputs.points.as_ref().map(PreviewPoints::reader),
+            ..TickBaseline::default()
+        };
         materialize_declared(
             &cells,
             &prepared.declaration.set,
@@ -794,8 +894,19 @@ impl Executor {
             ceilings: report.ceilings,
             events: report.events,
             anchors: inputs.holds.fetched.anchors.clone(),
-            unproven_intervals: inputs.holds.fetched.unproven.clone(),
+            unproven_intervals: inputs.unproven(),
         }
+    }
+}
+
+impl PreviewInputs {
+    /// Every read the run rests on that nobody proved: the intervals a
+    /// server answered, and the points this node's own view could no
+    /// longer read.
+    fn unproven(&self) -> BTreeSet<UnprovenInterval> {
+        let mut unproven = self.holds.fetched.unproven.clone();
+        unproven.extend(self.points.iter().flat_map(|points| points.unread()));
+        unproven
     }
 }
 
@@ -1013,5 +1124,295 @@ mod tests {
             fanned_out.missing(&declared, on(held)).is_empty(),
             "a shard that answered is one the preview can speak for"
         );
+    }
+}
+
+/// A preview's probes past its pre-read, read through the hosted chain.
+#[cfg(test)]
+mod point_tests {
+    use std::sync::LazyLock;
+
+    use hyperscale_effects_bridge::account_address;
+    use hyperscale_storage::test_helpers::{
+        commit_settled_at, make_test_block, make_test_certified, placeholder_local_ec,
+        push_certificate,
+    };
+    use hyperscale_storage::{
+        ChainEntry, ChainWrites, GenesisCommit, MemberInputs, ParentAnchor, PendingChain,
+        ShardChainWriter,
+    };
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_transactions::{Ceilings, Client, Terms};
+    use hyperscale_types::{
+        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
+        BlockHeader, BlockHeaderParts, ConsensusReceipt, Ed25519PrivateKey, EntryKey, Epoch,
+        Finalization, FrontierInputs, GlobalReceiptHash, MAX_INTENT_VALIDITY_RANGE, NetworkId,
+        PrincipalAddr, ProposerTimestamp, ProtocolHasher, QuorumCertificate, RETENTION_HORIZON,
+        ResourceAddr, Round, SettledWrites, SignerBitfield, StoredReceipt, TickHalf, TickId,
+        TimestampRange, TxHash, WitnessSources,
+    };
+    use hyperscale_vm_effects::holdings_collection;
+    use hyperscale_vm_kernel::ExecutionMode;
+    use hyperscale_vm_stdlib::account;
+
+    use super::*;
+    use crate::genesis::{GenesisPackages, genesis_writes};
+
+    const ALICE: u8 = 1;
+    const BOB: u8 = 2;
+    /// The non-fungible resource Alice holds.
+    const NF: ResourceAddr = ResourceAddr::new([0xE7; 31]);
+
+    fn key_of(seed: u8) -> Ed25519PrivateKey {
+        Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap()
+    }
+
+    fn principal(seed: u8) -> PrincipalAddr {
+        account_address(&key_of(seed).public_key().0)
+    }
+
+    fn client() -> &'static Client {
+        static CLIENT: LazyLock<Client> = LazyLock::new(|| Client::genesis(NetworkId(244)));
+        &CLIENT
+    }
+
+    /// Alice's holdings entry at `id`.
+    fn held(id: u128) -> EntryKey {
+        let alice = principal(ALICE);
+        EntryKey {
+            owner: alice.address(),
+            collection: holdings_collection(&ProtocolHasher, alice, NF),
+            order: id,
+        }
+    }
+
+    /// Genesis funding Alice and Bob, Alice holding the [`NF`] ids named.
+    fn holding(ids: &[u128]) -> Arc<SimShardStorage> {
+        let genesis = genesis_writes(
+            &[(principal(ALICE), 10_000), (principal(BOB), 10_000)],
+            &[],
+            &GenesisPackages::protocol(),
+        );
+        let (cells, _) = genesis.into_parts();
+        let entries = ids.iter().map(|id| (held(*id), Some(vec![1]))).collect();
+        let seeded = SettledWrites::from_parts(cells, entries);
+        let storage = SimShardStorage::default();
+        storage.install_genesis(&seeded, &seeded);
+        Arc::new(storage)
+    }
+
+    /// Alice withdraws `id` and deposits it with Bob. `withdraw-nf`
+    /// declares her holdings at a cap of one, so the pre-read lifts her
+    /// two lowest ids and a later one is the take's own probe.
+    fn withdrawal_of(id: u64) -> Transaction {
+        let chain = client().records();
+        let mut b = client().builder(&chain, principal(ALICE));
+        let funds =
+            account::withdraw_nf(&mut b, principal(ALICE), NF, &[id]).expect("withdraw-nf types");
+        account::deposit_nf(&mut b, principal(BOB), funds).expect("deposit-nf types");
+        let graph = b.build().expect("every output is consumed");
+        let validity = TimestampRange::new(
+            WeightedTimestamp::from_millis(0),
+            WeightedTimestamp::from_millis(MAX_INTENT_VALIDITY_RANGE.as_secs() * 1_000),
+        );
+        Transaction::new(client().sign(
+            graph,
+            &key_of(ALICE),
+            validity,
+            Terms {
+                max_fee: 1_000,
+                ceilings: Ceilings::Guessed,
+                priority_bp: 0,
+                message: Vec::new(),
+            },
+        ))
+    }
+
+    /// Preview `tx` over `snapshot`, its probes read through `points`.
+    fn preview_over(
+        snapshot: &(dyn Substates + Sync),
+        tx: &Transaction,
+        points: Arc<PreviewPoints>,
+    ) -> PreviewReport {
+        Executor::new(ExecutionMode::Serial).preview(
+            snapshot,
+            tx,
+            &PreviewInputs {
+                clock: WeightedTimestamp::from_millis(1_000),
+                env: TickEnvironment::unfolded(),
+                grants: PreviewGrants::default(),
+                holds: Holds {
+                    trie: ShardTrie::single(),
+                    shards: BTreeSet::from([ShardId::ROOT]),
+                    fetched: FetchedCells::default(),
+                },
+                prices: PriceTable::GENESIS,
+                points: Some(points),
+            },
+        )
+    }
+
+    /// A probe at a point the view no longer holds, because retention
+    /// passed its anchor while the preview ran, reads absent and is named
+    /// as a point nobody proved: the report completes and says so.
+    #[test]
+    fn a_preview_probe_past_retention_reports_it_unproven() {
+        let horizon = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
+        let storage = holding(&[1, 2, 3]);
+        let chain = Arc::new(PendingChain::new(
+            Arc::clone(&storage),
+            BlockHeight::GENESIS,
+        ));
+        let witness = BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO);
+        // A block whose parent QC stamps `ms`, the clock retention is
+        // measured against.
+        let block = |height: u64, ms: u64| {
+            let parent_qc = QuorumCertificate::new(
+                BlockHash::ZERO,
+                ShardId::ROOT,
+                BlockHeight::new(height - 1),
+                BlockHash::ZERO,
+                Round::INITIAL,
+                Epoch::GENESIS,
+                SignerBitfield::new(4),
+                AggregateSignature::new([0u8; 96]),
+                WeightedTimestamp::from_millis(ms),
+            );
+            make_test_certified(Block::Live {
+                header: BlockHeader::new(BlockHeaderParts {
+                    shard_id: ShardId::ROOT,
+                    height: BlockHeight::new(height),
+                    parent_block_hash: BlockHash::ZERO,
+                    parent_qc: parent_qc.into(),
+                    timestamp: ProposerTimestamp::from_millis(ms),
+                    ..Default::default()
+                }),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            })
+        };
+        commit_settled_at(&*storage, &block(1, 1_000), &[], &[], &witness);
+        let started = chain.view_at_persisted_tip();
+        commit_settled_at(&*storage, &block(2, 1_001 + horizon), &[], &[], &witness);
+        assert!(
+            started
+                .entry_held(held(3).owner, held(3).collection, 3)
+                .is_err(),
+            "the started view's anchor has aged out"
+        );
+
+        let now = chain.view_at_persisted_tip();
+        let report = preview_over(
+            &now.snapshot(),
+            &withdrawal_of(3),
+            Arc::new(PreviewPoints::new(ShardId::ROOT, started)),
+        );
+        assert!(
+            matches!(report.outcome, PreviewOutcome::Aborted { .. }),
+            "the probe read the id as absent: {:?}",
+            report.outcome
+        );
+        assert_eq!(
+            report.unproven_intervals,
+            BTreeSet::from([UnprovenInterval {
+                owner: held(3).owner,
+                collection: held(3).collection,
+                lo: 3,
+                hi: 3,
+            }]),
+            "and the report names the point it could not read"
+        );
+    }
+
+    /// A view anchored at a block still pending answers a probe out of
+    /// that block's own writes.
+    #[test]
+    fn a_preview_on_a_pending_tip_reads_its_points() {
+        let storage = holding(&[1, 2]);
+        let chain = Arc::new(PendingChain::new(
+            Arc::clone(&storage),
+            BlockHeight::GENESIS,
+        ));
+        let parent_height = storage.jmt_height();
+        let height = parent_height.next();
+
+        // The pending block files id 3 with Alice.
+        let writes =
+            SettledWrites::from_parts(BTreeMap::new(), BTreeMap::from([(held(3), Some(vec![1]))]));
+        let receipt = StoredReceipt {
+            tx_hash: TxHash::ZERO,
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: writes.into(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        };
+        let finalization = Finalization::new(
+            TickId::new(ShardId::ROOT, height),
+            TickHalf::Determined,
+            Some(placeholder_local_ec(ShardId::ROOT, height)),
+            Capped::from_array([receipt]),
+        );
+        let certified = make_test_certified(push_certificate(
+            make_test_block(height),
+            finalization.into(),
+        ));
+        let block = certified.block();
+        let parent_view = chain.view_at(block.header().parent_block_hash(), parent_height);
+        let anchored = parent_view.snapshot();
+        let (_, jmt_snapshot, _) = storage.prepare_block_commit(
+            ParentAnchor {
+                state_root: storage.state_root(),
+                height: parent_height,
+                state: &anchored,
+                pending: parent_view.pending_snapshots(),
+                base_reads: None,
+            },
+            &block.certificates()[..],
+            ChainWrites {
+                creations: &[],
+                removals: &[],
+                sweep_frontier: block.header().sweep_frontier(),
+                frontier: &FrontierInputs::still(ShardId::ROOT),
+                state_claims: block.state_claims(),
+                members: &MemberInputs::still(ShardId::ROOT),
+            },
+            height,
+        );
+        chain.insert(
+            block.hash(),
+            ChainEntry {
+                parent_block_hash: block.header().parent_block_hash(),
+                height,
+                settled_txs: Vec::new(),
+                jmt_snapshot,
+                certified_block: Some(Arc::clone(&certified)),
+            },
+        );
+
+        let tip = chain.view_at(block.hash(), height);
+        assert_eq!(
+            tip.entry_held(held(3).owner, held(3).collection, 3),
+            Ok(Some(vec![1])),
+            "the pending block's own write answers"
+        );
+        let report = preview_over(
+            &tip.snapshot(),
+            &withdrawal_of(3),
+            Arc::new(PreviewPoints::new(ShardId::ROOT, Arc::clone(&tip))),
+        );
+        assert_eq!(
+            report.outcome,
+            PreviewOutcome::Completed,
+            "the take found the id the pending tip filed"
+        );
+        assert!(report.unproven_intervals.is_empty());
     }
 }

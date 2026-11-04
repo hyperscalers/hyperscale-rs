@@ -1,18 +1,19 @@
 //! What a declared interval's cap does to the baseline a batch executes
 //! over, on one shard with nothing in flight.
 //!
-//! `materialize_declared` lifts at most `cap` entries of each declared
-//! interval out of the tick snapshot, and the kernel reads that map and
-//! nothing beneath it. Every case here runs over a store holding more
-//! entries in the interval than the declaration's cap, and asserts what
-//! the full store says is true.
+//! `materialize_declared` lifts one entry past each declared interval's
+//! cap out of the tick snapshot, and a probe at an instance's own order
+//! reads this shard's store beneath that map. Every case here runs over
+//! a store holding more entries in the interval than the declaration's
+//! cap, and asserts what the full store says is true.
 
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::account_address;
 use hyperscale_engine::genesis::{GenesisPackages, draw_key, genesis_world_with_pools};
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, TickBatchContext, TickEnvironment, genesis_writes,
+    ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, PointReads, TickBatchContext,
+    TickEnvironment, genesis_writes,
 };
 use hyperscale_hbor::{Capped, from_slice};
 use hyperscale_storage::test_helpers::block_settling;
@@ -23,17 +24,19 @@ use hyperscale_types::{
     BlockHeight, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, Epoch, EpochSeed,
     EpochWindows, FrontierInputs, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
     ProtocolHasher, ProvisionalHolds, Randomness, ResourceAddr, SeedRing, SeedSource,
-    SettledWrites, ShardId, ShardTrie, StoredReceipt, TimestampRange, Transaction, Verified,
-    WeightedTimestamp, absorb_committed_cells,
+    SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateKey, TimestampRange, Transaction,
+    Verified, WeightedTimestamp, absorb_committed_cells, encode_amount,
 };
 use hyperscale_vm_effects::{
-    Composed, Hash32, InstanceMeta, IntentHeader, IntentTree, Value, collection_id,
-    holdings_collection, order_key,
+    Composed, Hash32, InstanceMeta, IntentHeader, IntentTree, SlotId, Value, child_key,
+    collection_id, holdings_collection, order_key,
 };
-use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
+use hyperscale_vm_fixtures::book::{self, FILL_CAP};
+use hyperscale_vm_fixtures::{book_package_hash, lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::IntentBuilder;
+use hyperscale_vm_sdk::client::VaultField;
 use hyperscale_vm_stdlib::{account, instantiate};
-use hyperscale_vm_types::CollectionId;
+use hyperscale_vm_types::{Address, CollectionId};
 
 /// The widest window an intent may stand for.
 const OFFER_MS: u64 = MAX_INTENT_VALIDITY_RANGE.as_secs() * 1_000;
@@ -92,12 +95,43 @@ fn storage_with(
     accounts: &[(PrincipalAddr, u128)],
     entries: Vec<(EntryKey, Option<Vec<u8>>)>,
 ) -> SimShardStorage {
+    storage_seeding(packages, accounts, Vec::new(), entries)
+}
+
+/// [`storage_with`], with `cells` seeded beside genesis's own.
+fn storage_seeding(
+    packages: &GenesisPackages,
+    accounts: &[(PrincipalAddr, u128)],
+    seeded_cells: Vec<(SubstateKey, Vec<u8>)>,
+    entries: Vec<(EntryKey, Option<Vec<u8>>)>,
+) -> SimShardStorage {
     let genesis = genesis_writes(accounts, &[], packages);
-    let (cells, _) = genesis.into_parts();
+    let (mut cells, _) = genesis.into_parts();
+    cells.extend(
+        seeded_cells
+            .into_iter()
+            .map(|(key, value)| (key, Some(value))),
+    );
     let seeded = SettledWrites::from_parts(cells, entries.into_iter().collect());
     let storage = SimShardStorage::default();
     storage.install_genesis(&seeded, &seeded);
     storage
+}
+
+/// The store's point reads at its tip, which is the snapshot a tick here
+/// executes over: each tick commits before the next one runs.
+struct TipPoints(SimShardStorage);
+
+impl std::fmt::Debug for TipPoints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TipPoints")
+    }
+}
+
+impl PointReads for TipPoints {
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        self.0.entry(owner, collection, order)
+    }
 }
 
 /// Execute one transaction as one tick's batch over the store's current
@@ -117,6 +151,7 @@ fn run_tick(
         env,
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: Some(Arc::new(TipPoints(storage.clone()))),
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
@@ -158,29 +193,37 @@ fn signed_nf_transfer(from: u8, to: u8, ids: &[u64]) -> Transaction {
     Transaction::new(nf_client().sign(graph, &key_of(from), validity(), terms(1_000)))
 }
 
-/// Alice's holdings of [`NF`] seeded with instances 1 and 2.
-fn alice_holding_two() -> SimShardStorage {
-    let alice = principal(ALICE).address();
-    let entries = [1u128, 2]
-        .into_iter()
-        .map(|id| {
-            (
-                EntryKey {
-                    owner: alice,
-                    collection: holdings(principal(ALICE), NF),
-                    order: id,
-                },
-                Some(vec![1]),
-            )
-        })
-        .collect();
+/// Genesis funding Alice and Bob, each holding the [`NF`] ids named.
+fn holding_nf(alice: &[u128], bob: &[u128]) -> SimShardStorage {
+    let held = |who: PrincipalAddr, ids: &[u128]| {
+        ids.iter()
+            .map(|id| {
+                (
+                    EntryKey {
+                        owner: who.address(),
+                        collection: holdings(who, NF),
+                        order: *id,
+                    },
+                    Some(vec![1]),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut entries = held(principal(ALICE), alice);
+    entries.extend(held(principal(BOB), bob));
     let storage = storage_with(
         &GenesisPackages::protocol(),
         &[(principal(ALICE), FUNDED), (principal(BOB), FUNDED)],
         entries,
     );
-    assert_eq!(held_ids(&storage, principal(ALICE), NF), vec![1, 2]);
+    assert_eq!(held_ids(&storage, principal(ALICE), NF), alice);
+    assert_eq!(held_ids(&storage, principal(BOB), NF), bob);
     storage
+}
+
+/// Alice's holdings of [`NF`] seeded with instances 1 and 2.
+fn alice_holding_two() -> SimShardStorage {
+    holding_nf(&[1, 2], &[])
 }
 
 /// Alice withdraws `id` of the two she holds and deposits it with Bob.
@@ -219,7 +262,6 @@ fn a_withdrawal_of_the_lowest_id_takes_it() {
 /// 2 and names 2: the declaration is `[0, MAX]` at cap 1, and id 2 is
 /// held.
 #[test]
-#[ignore = "baseline lifts only the lowest cap entries; withdraw of id 2 traps InstanceNotHeld"]
 fn a_withdrawal_of_a_later_id_takes_it() {
     let (storage, executed) = withdraw_one(2);
     assert!(
@@ -230,6 +272,39 @@ fn a_withdrawal_of_a_later_id_takes_it() {
     );
     assert_eq!(held_ids(&storage, principal(ALICE), NF), vec![1]);
     assert_eq!(held_ids(&storage, principal(BOB), NF), vec![2]);
+}
+
+/// A filing over an id its holder already holds past the cap is refused.
+///
+/// `deposit-nf` declares Bob's holdings at a cap of one, so the baseline
+/// lifts his two lowest ids and not the third. The filing probes the id
+/// at its own key, which reads this shard's store beneath the lift and
+/// finds it held: the instance would otherwise exist twice.
+#[test]
+fn filing_an_id_held_past_the_cap_is_refused() {
+    let executor = Executor::new(ExecutionMode::Serial);
+    let storage = holding_nf(&[3], &[1, 2, 3]);
+    let executed = run_tick(
+        &executor,
+        &storage,
+        1,
+        TickEnvironment::unfolded(),
+        signed_nf_transfer(ALICE, BOB, &[3]),
+    )
+    .remove(0);
+    assert!(
+        matches!(&executed.consensus, ConsensusReceipt::Failed),
+        "Bob already holds id 3, so filing it again is refused: {:?} {:?}",
+        executed.consensus,
+        executed.metadata
+    );
+    assert!(
+        format!("{:?}", executed.metadata).contains("HeldTwice"),
+        "refused as a second copy of the instance: {:?}",
+        executed.metadata
+    );
+    assert_eq!(held_ids(&storage, principal(ALICE), NF), vec![3]);
+    assert_eq!(held_ids(&storage, principal(BOB), NF), vec![1, 2, 3]);
 }
 
 /// The network the lottery envelopes are signed for.
@@ -416,10 +491,9 @@ fn a_page_the_rounds_size_settles_it() {
 /// tickets.
 ///
 /// Three tickets are in the store and the settlement buys two. The
-/// kernel's coverage probe asks for the successor of the page's last
-/// entry; the store holds one.
+/// baseline lifts three, so the kernel's page reads the third as the
+/// successor past its cap.
 #[test]
-#[ignore = "baseline lifts only cap entries, so a full page reads covered and the round settles"]
 fn a_page_shorter_than_the_round_declines_it() {
     let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
     let storage = closed_round(&executor, &ENTRANTS);
@@ -447,5 +521,143 @@ fn a_page_shorter_than_the_round_declines_it() {
         "the settlement declines RoundTruncated: {:?} {:?}",
         executed.consensus,
         executed.metadata
+    );
+}
+
+/// What the book sells; it is paid in the protocol resource.
+const BOOK_BASE_RESOURCE: ResourceAddr = ResourceAddr::new([0xB5; 31]);
+
+/// Asks resting on the book: two past what one fill's page declares.
+const RESTING: u64 = FILL_CAP as u64 + 2;
+
+/// One quote subunit per tick, at the scale a book's stored tick holds.
+const ONE_QUOTE_PER_TICK: u128 = 1_000_000_000_000_000_000_000_000_000_000_000_000;
+
+fn book_meta() -> InstanceMeta {
+    let mut tick = [0u8; 32];
+    tick[..16].copy_from_slice(&ONE_QUOTE_PER_TICK.to_le_bytes());
+    InstanceMeta {
+        package: book_package_hash(&ProtocolHasher),
+        config: Capped::new(vec![
+            Value::Address(BOOK_BASE_RESOURCE.address()),
+            Value::Address(PROTOCOL_RESOURCE.address()),
+            Value::U256(tick),
+        ])
+        .unwrap(),
+        salt: Hash32([0xB0; 32]),
+    }
+}
+
+fn book_addr() -> ComponentAddr {
+    book_meta().address(&ProtocolHasher)
+}
+
+/// The book's ladder, read from the full store, as tick counts.
+fn standing_ticks(storage: &SimShardStorage) -> Vec<u128> {
+    storage
+        .entries_in_range(
+            book_addr().into(),
+            collection_id(&ProtocolHasher, book_addr(), book::ASKS, &[]),
+            0,
+            u128::MAX,
+            usize::try_from(RESTING).unwrap() + 1,
+        )
+        .into_iter()
+        .map(|(order, _)| order >> 64)
+        .collect()
+}
+
+/// `build` over the book, signed by the settler, with a compute ceiling
+/// a whole capped walk fits under.
+fn signed_book(build: impl FnOnce(IntentBuilder<'_>) -> IntentTree) -> Transaction {
+    let key = key_of(SETTLER);
+    let chain = lottery_client().records();
+    let composed = Composed::new(&chain, &[book_meta()], &ProtocolHasher);
+    let root = IntentBuilder::new(&composed, &ProtocolHasher, principal(SETTLER), HEADER);
+    let tree = build(root);
+    let ceilings = Ceilings::Measured(vec![2_000_000; tree.node_count()]);
+    Transaction::new(lottery_client().sign_tree(
+        &tree,
+        &[&key],
+        Terms {
+            max_fee: 100_000_000,
+            ceilings,
+            priority_bp: 0,
+            message: Vec::new(),
+        },
+    ))
+}
+
+/// A walk that removes every ask its page shows stops at the page: the
+/// ask past the cap was the successor its lift read, never an entry the
+/// page holds, so the walk never reaches for a sixty-fifth write.
+///
+/// The ladder rests one ask of one base unit at each tick from one, two
+/// more of them than the walk's cap of sixty-four, and the budget would
+/// buy every one.
+#[test]
+fn a_removal_from_a_full_page_counts_within_its_first_lift() {
+    let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
+    let owner = Address::from(book_addr());
+    let asks = (1..=RESTING)
+        .map(|ticks| {
+            (
+                EntryKey {
+                    owner,
+                    collection: collection_id(&ProtocolHasher, book_addr(), book::ASKS, &[]),
+                    order: u128::from(ticks) << 64,
+                },
+                Some(1u128.to_le_bytes().to_vec()),
+            )
+        })
+        .collect();
+    let escrow = child_key(
+        &ProtocolHasher,
+        owner,
+        SlotId(<book::Base as VaultField>::SLOT),
+        &[Value::Address(BOOK_BASE_RESOURCE.address()).canonical_bytes()],
+    );
+    let storage = storage_seeding(
+        &lottery_packages(),
+        &[(principal(SETTLER), 1_000_000_000_000)],
+        vec![(escrow, encode_amount(u128::from(RESTING)).to_vec())],
+        asks,
+    );
+
+    let seal = signed_book(|mut root| {
+        instantiate(&mut root, book_addr(), ()).expect("a derivable book answers its seal");
+        root.build_presenting(vec![book_meta()], Vec::new())
+            .expect("the intent declares no hole")
+    });
+    let executed = run_tick(&executor, &storage, 1, TickEnvironment::unfolded(), seal);
+    assert!(
+        matches!(&executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
+        "the instantiation settles: {:?} {:?}",
+        executed[0].consensus,
+        executed[0].metadata
+    );
+    absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
+
+    let fill = signed_book(|mut root| {
+        let payment = account::withdraw(&mut root, principal(SETTLER), *PROTOCOL_RESOURCE, 10_000)
+            .expect("withdraw types");
+        let [bought, change] = book::Book::at(book_addr())
+            .fill_asks(&mut root, 1, u64::MAX, payment)
+            .expect("a book answers a fill");
+        account::deposit(&mut root, principal(SETTLER), bought).expect("deposit types");
+        account::deposit(&mut root, principal(SETTLER), change).expect("deposit types");
+        root.build().expect("every output is consumed")
+    });
+    let executed = run_tick(&executor, &storage, 2, TickEnvironment::unfolded(), fill).remove(0);
+    assert!(
+        matches!(&executed.consensus, ConsensusReceipt::Succeeded { .. }),
+        "a walk inside its first lift writes no entry past its cap: {:?} {:?}",
+        executed.consensus,
+        executed.metadata
+    );
+    assert_eq!(
+        standing_ticks(&storage),
+        vec![u128::from(FILL_CAP) + 1, u128::from(FILL_CAP) + 2],
+        "the two asks past the page still stand"
     );
 }
