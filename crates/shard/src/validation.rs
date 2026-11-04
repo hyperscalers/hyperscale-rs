@@ -762,6 +762,9 @@ pub mod tests {
             covered: false,
             executed: !matches!(state, RowState::Pending),
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
         }
     }
 
@@ -2444,6 +2447,7 @@ pub mod tests {
                     declared: Capped::empty(),
                     engages: Capped::empty(),
                     waits: false,
+                    unarrived: Capped::empty(),
                 }),
                 ..member_row(tx, RowState::Pending)
             };
@@ -2533,6 +2537,7 @@ pub mod tests {
                     declared: Capped::empty(),
                     engages: Capped::empty(),
                     waits: false,
+                    unarrived: Capped::empty(),
                 }),
                 ..member_row(tx, RowState::Pending)
             },
@@ -2669,6 +2674,7 @@ pub mod tests {
                     declared: Capped::empty(),
                     engages: Capped::empty(),
                     waits: false,
+                    unarrived: Capped::empty(),
                 }),
                 ..member_row(tx, RowState::Pending)
             };
@@ -2859,6 +2865,7 @@ pub mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([near]),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
@@ -5819,6 +5826,7 @@ pub mod tests {
                     declared: Capped::empty(),
                     engages: Capped::from_array([source]),
                     waits: false,
+                    unarrived: Capped::empty(),
                 }),
                 ..member_row(tx_hash, RowState::Pending)
             },
@@ -6378,6 +6386,7 @@ pub mod tests {
             joins,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(0),

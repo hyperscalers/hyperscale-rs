@@ -2598,6 +2598,7 @@ fn reserving_chain(first: u64) -> Reserving {
         joins: Joins::Executes,
         settlement: Settlement::Shared,
         holds: Capped::empty(),
+        pins: Capped::empty(),
         reach: stated.terms.reach.clone(),
         awaits: stated.terms.awaits.clone(),
         charge: stated.terms.charge,
@@ -6498,6 +6499,7 @@ fn core_run_at_one(
             joins: Joins::Executes,
             settlement: Settlement::Shared,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::from_array([counterpart]),
             awaits: Capped::from_array([counterpart]),
             charge: AbortCharge {
@@ -6773,6 +6775,7 @@ fn abort_of_a_released_row(tx: TxHash, counterpart: ShardId, deadline: Deadline)
         joins: Joins::Aborted,
         settlement: Settlement::Awaited,
         holds: Capped::empty(),
+        pins: Capped::empty(),
         reach: Capped::from_array([counterpart]),
         awaits: Capped::empty(),
         charge: AbortCharge {

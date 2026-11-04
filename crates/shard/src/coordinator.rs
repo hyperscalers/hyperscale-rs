@@ -10481,17 +10481,18 @@ mod tests {
         GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LEAF_KEY_BYTES,
         LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD,
         MAX_TICK_MANIFEST_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK,
-        MAX_UNSETTLED_TXS, MemberTerms, MerkleInclusionProof, Mode, NetworkDefinition, NetworkId,
-        NetworkParams, Owes, PROGRESS_WAIT_MULTIPLIER, PrincipalAddr, ProvisionTxRoot,
-        RETENTION_HORIZON, ReadFence, ReadMark, Reading, RevealChain, Role, RoutePrefix, Routing,
-        Said, SectionRoots, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor,
-        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, StateWrites, StatedTerms,
-        SubstateClaim, SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES,
-        TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule,
-        TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxOutcome,
-        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, ValidatorInfo, ValidatorSet,
-        Value, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, decide, encode_amount,
-        read_amount, receipt_hash_of, said_at, test_utils, tick_terms_admit_block, verdict_leaf,
+        MAX_UNSETTLED_TXS, MemberTerms, MerkleInclusionProof, Mode, Modes, NetworkDefinition,
+        NetworkId, NetworkParams, Owes, PROGRESS_WAIT_MULTIPLIER, Pin, PrincipalAddr,
+        ProvisionTxRoot, RETENTION_HORIZON, ReadFence, ReadMark, Reading, RevealChain, Role,
+        RoutePrefix, Routing, Said, SectionRoots, SettledTxSet, SettledTxsRoot, SettledWrites,
+        Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
+        StateWrites, StatedTerms, SubstateClaim, SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS,
+        TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine,
+        TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
+        TransactionEnvelope, TxOutcome, Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_MAX,
+        ValidatorId, ValidatorInfo, ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp,
+        WitnessSources, decide, encode_amount, pins_of, read_amount, receipt_hash_of, said_at,
+        test_utils, tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{
@@ -11335,6 +11336,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: pins_of(&terms.declared, ShardId::ROOT),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: test_utils::genesis_charge(tx),
@@ -11405,6 +11407,64 @@ mod tests {
         }
     }
 
+    /// A determined line carries the pins its declaration takes here, and
+    /// a voter recomputes them: a line naming the right member on the
+    /// right terms with any other pins is refused.
+    #[test]
+    fn a_voter_refuses_a_determined_line_with_other_pins() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"pinned tip"));
+        let tx = test_transaction(1);
+        let committing = carrying(
+            block_chained_on(BlockHeight::new(1), from, 1_000),
+            std::slice::from_ref(&tx),
+            Vec::new(),
+        );
+        let parent = committing.hash();
+        let (state, schedule) = committed_through(from, [committing]);
+        let committee = Arc::clone(schedule.head());
+        let child = |line: TickLine| {
+            carrying(
+                block_chained_on(BlockHeight::new(2), parent, 2_000),
+                &[],
+                vec![line],
+            )
+        };
+        let honest = member(&tx);
+        let TickLine::Member { pins, .. } = &honest else {
+            unreachable!("a member line")
+        };
+        assert!(!pins.is_empty(), "the member declares keys here");
+        assert!(
+            state
+                .check_tick_manifest(&schedule, &committee, &child(honest.clone()))
+                .is_ok(),
+            "the chain's own pins",
+        );
+        let with = |pins: Vec<Pin>| {
+            let mut line = honest.clone();
+            if let TickLine::Member { pins: at, .. } = &mut line {
+                *at = Capped::new(pins).expect("no more pins than the line's");
+            }
+            line
+        };
+        let fewer = pins[..pins.len() - 1].to_vec();
+        let mut other = pins.to_vec();
+        other[0].modes = Modes(other[0].modes.0 ^ Modes::READ.0);
+        for (pins, why) in [
+            (Vec::new(), "no pins"),
+            (fewer, "a pin left out"),
+            (other, "a pin under modes it does not declare"),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(&schedule, &committee, &child(with(pins))),
+                    Err(Withheld::Refused(_))
+                ),
+                "{why}",
+            );
+        }
+    }
+
     /// A chain whose block 1 committed three transactions, in hash order,
     /// and whose block 2 named the first: the coordinator at its tip, the
     /// schedule, the tip's hash and the three.
@@ -11457,6 +11517,7 @@ mod tests {
             joins,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: test_utils::genesis_charge(tx),
@@ -11930,6 +11991,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::from_array([HEARD_SIBLING]),
                 charge,
@@ -12901,12 +12963,14 @@ mod tests {
             "with the manifest to themselves both rows end",
         );
 
-        // Members that reserve on a line's worth of vaults each, and a
-        // last one sized to leave less than two lines of the budget.
-        let weighing = |reserved: usize| TICK_LINE_BYTES + reserved * TICK_RESERVE_BYTES;
+        // Members that reserve on a line's worth of vaults each, pinning
+        // each vault they reserve on, and a last one sized to leave less
+        // than two lines of the budget.
+        let per_vault = TICK_RESERVE_BYTES + TICK_PIN_BYTES;
+        let weighing = |reserved: usize| TICK_LINE_BYTES + reserved * per_vault;
         let full = MAX_TICK_MANIFEST_BYTES / weighing(MAX_HOLDS_PER_MEMBER);
         let rest = MAX_TICK_MANIFEST_BYTES - full * weighing(MAX_HOLDS_PER_MEMBER);
-        let last = (rest - 2 * TICK_LINE_BYTES) / TICK_RESERVE_BYTES;
+        let last = (rest - 2 * TICK_LINE_BYTES) / per_vault;
         let mut heavy: Vec<Transaction> = (0..=full)
             .map(|nth| {
                 let reserved = if nth < full {
@@ -13645,6 +13709,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([reach]),
                 awaits: Capped::empty(),
                 charge: test_utils::genesis_charge(held),
@@ -14191,6 +14256,11 @@ mod tests {
             tx: tx.hash(),
             joins: Joins::Executes,
             settlement: terms.settlement,
+            pins: if terms.settlement == Settlement::Alone {
+                pins_of(&terms.declared, local)
+            } else {
+                Capped::empty()
+            },
             holds: if terms.settlement == Settlement::Alone {
                 Capped::empty()
             } else {
@@ -14282,6 +14352,7 @@ mod tests {
                     joins: Joins::Executes,
                     settlement: terms.settlement,
                     holds: terms.declared.clone(),
+                    pins: Capped::empty(),
                     reach: terms.reach.clone(),
                     awaits: terms.awaits.clone(),
                     charge: terms.charge,
@@ -14348,6 +14419,7 @@ mod tests {
             joins: Joins::Aborted,
             settlement: Settlement::Awaited,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: terms.reach,
             awaits: Capped::empty(),
             charge: terms.charge,
@@ -14460,6 +14532,7 @@ mod tests {
             joins: Joins::Aborted,
             settlement: Settlement::Awaited,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: terms.reach,
             awaits: Capped::empty(),
             charge: terms.charge,
@@ -14741,6 +14814,7 @@ mod tests {
                 settlement: Settlement::Alone,
                 holds: Capped::new(holder.routing().declared_modes.clone())
                     .expect("one declared access"),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: test_utils::genesis_charge(&holder),
@@ -14927,10 +15001,11 @@ mod tests {
             .map(test_utils::test_principal)
             .find(|payer| committee.shard_for_prefix(payer.address()) == local)
             .expect("a payer routes to each shard");
-        // Ten transactions each reserving on a line's worth of local
-        // vaults: nine such lines fit a manifest, and the tenth does not.
+        // Eight transactions each reserving on a line's worth of local
+        // vaults, each line pinning every vault it reserves on: seven such
+        // lines fit a manifest, and the eighth does not.
         let reserved = u32::try_from(MAX_HOLDS_PER_MEMBER).expect("a small cap");
-        let mut heavy: Vec<Transaction> = (0..10)
+        let mut heavy: Vec<Transaction> = (0..8)
             .map(|nth| {
                 reserving(
                     payer,
@@ -14940,7 +15015,7 @@ mod tests {
             })
             .collect();
         heavy.sort_by_key(Transaction::hash);
-        let refused = heavy[9].clone();
+        let refused = heavy[7].clone();
         // Nine members waiting on a remote payer's bundle, whose entries
         // selection charged: with the refused transaction's they pass
         // the terms budget, and without it they fit.
@@ -15004,11 +15079,11 @@ mod tests {
         let offered = in_block_order(heavy.iter().chain(&waiting).cloned().collect());
         let mut first_list = offered.clone();
         let first = named_over(&rows, &committee, local, &mut first_list, false);
-        let first_named: Vec<TxHash> = heavy[..9].iter().map(Transaction::hash).collect();
+        let first_named: Vec<TxHash> = heavy[..7].iter().map(Transaction::hash).collect();
         assert_eq!(
             named_by(&first.lines),
             first_named,
-            "the walk stops at the tenth, short of the standing member",
+            "the walk stops at the eighth, short of the standing member",
         );
         assert!(!tick_terms_admit_block(stated_weight(&first)));
 
@@ -15090,6 +15165,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),

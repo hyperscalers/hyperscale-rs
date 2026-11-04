@@ -35,15 +35,15 @@ use hyperscale_types::{
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES,
     MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TX_READ_BYTES, MAX_TXS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms,
-    MerkleInclusionProof, Movement, Provision, ProvisionContext, ProvisionHash, ProvisionParts,
-    ProvisionTxRoot, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach, Reserves, Role, RoutePrefix,
-    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, Settlement, ShardId,
-    SignerBitfield, StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt,
-    SubstateEntry, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
-    TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickHalf, TickId, TickLine,
-    TickManifest, Transaction, TransactionEnvelope, TxHash, TxOutcome, UNSETTLED_TX_BYTES,
-    UnsettledTx, Verifiable, Verify, WeightedTimestamp, WitnessSources,
+    MerkleInclusionProof, Modes, Movement, Pin, PinKey, Pins, Provision, ProvisionContext,
+    ProvisionHash, ProvisionParts, ProvisionTxRoot, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach,
+    Reserves, Role, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES,
+    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, Settlement,
+    ShardId, SignerBitfield, StateClaim, StateRoot, StateWrites, Stated, StatedTerms,
+    StoredReceipt, SubstateEntry, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES,
+    TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
+    TickHalf, TickId, TickLine, TickManifest, Transaction, TransactionEnvelope, TxHash, TxOutcome,
+    UNSETTLED_TX_BYTES, UnsettledTx, Verifiable, Verify, WeightedTimestamp, WitnessSources,
     compute_global_receipt_root, evidence_admits_block, receipt_hash_of, shard_prefix_path,
     staged_yes_bytes, state_claims_admit_block, tick_manifest_admits_block, tick_terms_admit_block,
 };
@@ -712,6 +712,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                     settlement: Settlement::Awaited,
                     holds: Capped::new((0..holds).map(|at| widest_hold(at, mode)).collect())
                         .expect("a list under the cap"),
+                    pins: Capped::empty(),
                     reach: deepest(holds),
                     awaits: deepest(holds),
                     charge: widest_charge,
@@ -764,6 +765,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         joins: Joins::Executes,
         settlement: Settlement::Alone,
         holds: Capped::from_array([hold(0)]),
+        pins: Capped::empty(),
         reach: Capped::empty(),
         awaits: Capped::empty(),
         charge: widest_charge,
@@ -777,6 +779,61 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         TICK_LINE_BYTES + TICK_HOLD_BYTES + TICK_RESERVE_BYTES + TICK_CROSSING_BYTES,
         "one hold costs one hold, one reserved vault one, and one stated crossing one"
     );
+}
+
+/// `count` pins at their widest: distinct keys under every mode bit.
+fn widest_pins(count: usize) -> Pins {
+    Capped::new(
+        (0..count)
+            .map(|at| {
+                let mut key = [0xFF; 16];
+                key[..8].copy_from_slice(&(at as u64).to_be_bytes());
+                Pin {
+                    key: PinKey(key),
+                    modes: Modes(0xFF),
+                }
+            })
+            .collect(),
+    )
+    .expect("a list under the cap")
+}
+
+/// A determined line's weight bounds its encoding at every count of pins
+/// up to a transaction's worth, and a line of one pin costs one pin
+/// more than the bare line.
+#[test]
+fn a_determined_lines_weight_bounds_its_encoding_at_every_pin_count() {
+    for pins in [0usize, 1, 2, 64, MAX_HOLDS_PER_MEMBER] {
+        let line = TickLine::Member {
+            staged: u64::MAX,
+            tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
+            joins: Joins::ExecutesAborted,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            pins: widest_pins(pins),
+            reach: deepest(pins),
+            awaits: Capped::empty(),
+            charge: widest_charge(),
+            share: u128::MAX,
+            reserves: widest_reserves(pins),
+            deadline: widest_deadline(),
+            crossings: Capped::empty(),
+        };
+        let encoded = hbor_to_vec(&line).expect("a member line encodes");
+        assert!(
+            encoded.len() <= line.wire_weight(),
+            "a determined line of {pins} pins encodes to {} bytes, over the {} its weight claims",
+            encoded.len(),
+            line.wire_weight(),
+        );
+        assert!(tick_manifest_admits_block(line.wire_weight()));
+        if pins == 1 {
+            assert_eq!(
+                line.wire_weight(),
+                TICK_LINE_BYTES + TICK_PIN_BYTES + TICK_REACH_BYTES + TICK_RESERVE_BYTES,
+            );
+        }
+    }
 }
 
 /// An end line decodes to the line encoded, weighs the bare line it is
@@ -838,6 +895,7 @@ fn a_line_at_the_crossings_cap_fits_an_empty_manifest() {
                 .collect(),
         )
         .expect("a list at the cap"),
+        pins: Capped::empty(),
         reach: deepest(MAX_PREFIXES_PER_TX),
         awaits: deepest(MAX_PREFIXES_PER_TX),
         charge: widest_charge(),
@@ -1086,6 +1144,7 @@ fn full_manifest() -> Vec<TickLine> {
                 .collect(),
         )
         .expect("a list under the cap"),
+        pins: Capped::empty(),
         reach: deepest(64),
         awaits: deepest(64),
         charge: widest_charge(),

@@ -2401,6 +2401,9 @@ mod tests {
             covered: false,
             executed: true,
             hearing: Capped::new(heard.into_iter().collect()).expect("one entry"),
+            queued: None,
+            head: None,
+            blocked_at: None,
         }
     }
 

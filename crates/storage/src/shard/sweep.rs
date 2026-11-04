@@ -1193,6 +1193,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([peer]),
                 awaits: Capped::from_array([peer]),
                 charge: stub_abort_charge(1),

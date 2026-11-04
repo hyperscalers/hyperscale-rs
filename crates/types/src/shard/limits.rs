@@ -390,13 +390,16 @@ pub const fn tick_manifest_admits_block(weight: usize) -> bool {
 }
 
 /// Bytes one [`TickLine`](crate::TickLine) costs before its holds,
-/// reach, reserves and crossings: a member's transaction,
+/// pins, reach, reserves and crossings: a member's transaction,
 /// terms, abort charge, share and deadline.
 pub const TICK_LINE_BYTES: usize = 152;
 
 /// Bytes one hold of a member line costs: a declared access and its
 /// mode.
 pub const TICK_HOLD_BYTES: usize = 160;
+
+/// Bytes one pin of a member line costs: a pin key and its modes.
+pub const TICK_PIN_BYTES: usize = 17;
 
 /// Bytes one shard of a member line's reach costs.
 pub const TICK_REACH_BYTES: usize = 16;
@@ -406,7 +409,9 @@ pub const TICK_REACH_BYTES: usize = 16;
 const _: () = assert!(MAX_TICK_LINES_PER_BLOCK * TICK_LINE_BYTES <= MAX_TICK_MANIFEST_BYTES);
 
 /// Any single line fits an empty manifest, so no line is ever left
-/// waiting on a budget it can never meet.
+/// waiting on a budget it can never meet. A line carries holds or pins
+/// and never both, and a pin weighs less than a hold.
+const _: () = assert!(TICK_PIN_BYTES <= TICK_HOLD_BYTES);
 const _: () = assert!(
     TICK_LINE_BYTES
         + MAX_HOLDS_PER_MEMBER * TICK_HOLD_BYTES

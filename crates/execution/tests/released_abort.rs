@@ -57,6 +57,7 @@ fn aborting(tx: &Transaction) -> TickLine {
         joins: Joins::Aborted,
         settlement: Settlement::Awaited,
         holds: Capped::empty(),
+        pins: Capped::empty(),
         reach: Capped::from_array([SIBLING]),
         awaits: Capped::empty(),
         charge: genesis_charge(tx),

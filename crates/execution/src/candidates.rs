@@ -234,6 +234,7 @@ impl TickCandidates {
         covered: &dyn Fn(TxHash) -> bool,
     ) -> Vec<TickLine> {
         select_members(
+            self.local_shard,
             now,
             self.candidates.iter().map(|(tx_hash, candidate)| {
                 let terms = &candidate.terms;
@@ -435,6 +436,7 @@ mod tests {
                 joins: Joins::ExecutesAborted,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
@@ -471,6 +473,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
@@ -518,6 +521,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
@@ -609,6 +613,7 @@ mod tests {
             joins: Joins::ExecutesAborted,
             settlement: Settlement::Awaited,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(0),
@@ -663,6 +668,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Shared,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(0),
@@ -764,6 +770,7 @@ mod tests {
                     joins: Joins::ExecutesAborted,
                     settlement: Settlement::Awaited,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: Capped::empty(),
                     awaits: Capped::empty(),
                     charge: stub_abort_charge(0),

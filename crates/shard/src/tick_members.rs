@@ -395,6 +395,7 @@ mod tests {
             joins,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(seed),

@@ -12,9 +12,9 @@ use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Mode};
 
 use crate::{
     AbortCharge, Deadline, DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX,
-    MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK, RoutePrefix, ShardId, SubstateKey,
-    TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES,
-    TICK_TERMS_BYTES, TickId, TxHash,
+    MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK, Pins, RoutePrefix, ShardId, SubstateKey,
+    TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_REACH_BYTES,
+    TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickId, TxHash,
 };
 
 /// How a member joins its tick: the terms a
@@ -190,6 +190,11 @@ pub enum TickLine {
         settlement: Settlement,
         /// What it holds while the tick is in flight.
         holds: Holds,
+        /// On a line running a member its own certificate settles, the
+        /// keys its declaration takes on this shard, which stand in the
+        /// queue while the tick's determined half is owed. Empty on every
+        /// other line, so a line carries holds or pins and never both.
+        pins: Pins,
         /// The remote shards it reaches.
         reach: Reach,
         /// The remote shards whose certificates its settlement awaits:
@@ -251,14 +256,15 @@ impl TickLine {
     /// An upper bound on what this line costs the block that carries
     /// it, so a composer spends the section's budget as it fills it and
     /// a voter checks the same figure without re-encoding what it
-    /// decoded. Everything but the holds, the reach, the reserves and
-    /// the crossings answered is fixed width.
+    /// decoded. Everything but the holds, the pins, the reach, the
+    /// reserves and the crossings answered is fixed width.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
         TICK_LINE_BYTES
             + match self {
                 Self::Member {
                     holds,
+                    pins,
                     reach,
                     awaits,
                     reserves,
@@ -266,6 +272,7 @@ impl TickLine {
                     ..
                 } => {
                     holds.len() * TICK_HOLD_BYTES
+                        + pins.len() * TICK_PIN_BYTES
                         + (reach.len() + awaits.len()) * TICK_REACH_BYTES
                         + reserves.len() * TICK_RESERVE_BYTES
                         + crossings.len() * TICK_CROSSING_BYTES

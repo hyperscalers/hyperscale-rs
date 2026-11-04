@@ -22,6 +22,9 @@ pub mod genesis;
 pub mod members;
 pub mod packages;
 pub mod pending_chain;
+mod queue;
+
+pub use queue::{Head, Place};
 pub mod read_frontier;
 pub mod recovered_state;
 pub mod retention;

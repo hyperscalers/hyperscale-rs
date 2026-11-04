@@ -1784,6 +1784,9 @@ pub(crate) mod fixtures {
                     covered: false,
                     executed: true,
                     hearing: Capped::empty(),
+                    queued: None,
+                    head: None,
+                    blocked_at: None,
                 };
                 members.members.insert(tx, row);
                 let held = members.ticks.entry(tick).or_insert(TickRow {
@@ -2701,6 +2704,9 @@ mod state_claim_tests {
             covered: false,
             executed: true,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
         }
     }
 

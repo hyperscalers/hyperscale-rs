@@ -3262,6 +3262,9 @@ mod tests {
             covered: false,
             executed: true,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
         }
     }
 

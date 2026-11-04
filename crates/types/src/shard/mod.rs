@@ -21,6 +21,8 @@
 //!   stored-byte totals a header attests, which the beacon reweights
 //!   emission by.
 //! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
+//! - [`pin`]: [`Pin`](pin::Pin), one key a member stands on in its
+//!   shard's queue, under the modes it declares there.
 //! - [`member_keys`]: [`MemberCollection`](member_keys::MemberCollection), where
 //!   a shard's tick membership family sits in its state.
 //! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
@@ -64,6 +66,7 @@ pub mod limits;
 pub mod load;
 pub mod manifest;
 pub mod member_keys;
+pub mod pin;
 pub mod proven_anchors;
 pub mod quorum_certificate;
 pub mod read_frontier;

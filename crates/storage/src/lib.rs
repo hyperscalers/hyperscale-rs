@@ -101,6 +101,7 @@ pub use shard::writes::{
     merge_state_writes, merge_writes_from_receipts, pending_write, prefix_low_key, settle_writes,
     settled_block_at, settled_writes_at, settling_writes,
 };
+pub use shard::{Head, Place};
 pub use tree::{CollectedWrites, JmtSnapshot};
 
 /// Umbrella bound for storage backends threaded as a generic `S` through

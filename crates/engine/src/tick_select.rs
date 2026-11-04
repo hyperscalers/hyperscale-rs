@@ -20,7 +20,7 @@ use hyperscale_types::{
     MAX_STAGED_RECEIPT_BYTES, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_STAGED_BYTES, MemberTerms, Mode,
     ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, SiblingView,
     Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
-    Value, WeightedTimestamp, Window, compatible, decide, staged_yes_bound,
+    Value, WeightedTimestamp, Window, compatible, decide, pins_of, staged_yes_bound,
     tick_manifest_admits_block, tick_manifest_admits_members, value_of, verdict_leaf,
 };
 use hyperscale_vm_effects::{CrossingId, Kind};
@@ -1170,6 +1170,7 @@ pub fn member_lines(
         lines.push(line);
     }
     lines.extend(select_members(
+        rows.shard(),
         anchor,
         candidates,
         inputs,
@@ -1468,6 +1469,7 @@ impl Nameable<'_> {
                 Settlement::Awaited
             },
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: reach.clone(),
             awaits: Capped::empty(),
             charge: self.charge,
@@ -1516,7 +1518,9 @@ impl Nameable<'_> {
 /// a line running a member whose settlement is shared with a sibling
 /// carries the crossings it consumes, which its row keeps. An
 /// abort of a member a tick holds is charged together with that tick's
-/// `Abandoned` discard, so the pair fits or neither does.
+/// `Abandoned` discard, so the pair fits or neither does. A line running
+/// a member its own certificate settles carries the pins its declaration
+/// takes on `local`, and holds nothing.
 ///
 /// Canonical order puts the transactions reaching beyond this shard
 /// first, then hash order: theirs are the provisional writes everything
@@ -1527,6 +1531,7 @@ impl Nameable<'_> {
 /// first line the budget refuses, and the rest wait a block.
 #[must_use]
 pub fn select_members<'a>(
+    local: ShardId,
     anchor: WeightedTimestamp,
     candidates: impl IntoIterator<Item = Nameable<'a>>,
     inputs: &dyn CommittedInputs,
@@ -1584,6 +1589,11 @@ pub fn select_members<'a>(
             settlement: judged.settlement,
             holds: if abortable {
                 judged.declared.clone()
+            } else {
+                Capped::empty()
+            },
+            pins: if judged.settlement.alone() {
+                pins_of(judged.declared, local)
             } else {
                 Capped::empty()
             },
@@ -1981,6 +1991,32 @@ mod tests {
     const DEBIT: Mode = Mode::Delta { moves: Moves::Out };
     const CREDIT: Mode = Mode::Delta { moves: Moves::In };
 
+    /// The queue's pin relation is the hold rule: on one key, a claim's
+    /// pin refuses a candidate's exactly where the claim set holding the
+    /// claim blocks the candidate, debit rule and fee vault included.
+    #[test]
+    fn a_pin_refuses_what_the_hold_rule_blocks() {
+        let fee_vault = DeclaredKey::Cell(vault_key(
+            PrincipalAddr::new([0x52; 31]),
+            *PROTOCOL_RESOURCE,
+        ));
+        let modes = [Mode::Read, WRITE, RESERVE, DEBIT, CREDIT];
+        for key in [cell(1, 1), fee_vault, interval(1, 0, 9)] {
+            for held in modes {
+                for candidate in modes {
+                    let mut claims = ProvisionalCells::default();
+                    claims.claim(&[(key, held)]);
+                    let pin = |mode| pins_of(&[(key, mode)], ShardId::ROOT)[0].modes;
+                    assert_eq!(
+                        pin(held).refuses(pin(candidate)),
+                        claims.blocks(&[(key, candidate)]),
+                        "{held:?} against {candidate:?} on {key:?}",
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn nothing_is_blocked_by_an_empty_claim_set() {
         let claims = ProvisionalCells::default();
@@ -2170,10 +2206,14 @@ mod tests {
                 declared: terms.declared.clone(),
                 engages: terms.engages.clone(),
                 waits: terms.waits,
+                unarrived: terms.crossings.clone(),
             }),
             covered: false,
             executed: false,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
         }
     }
 
@@ -2369,6 +2409,7 @@ mod tests {
             joins: Joins::Aborted,
             settlement: Settlement::Awaited,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: entry.terms.charge,
@@ -2402,6 +2443,7 @@ mod tests {
             joins,
             settlement: terms.settlement,
             holds: terms.declared.clone(),
+            pins: Capped::empty(),
             reach: terms.reach.clone(),
             awaits: terms.awaits.clone(),
             charge: terms.charge,
@@ -2478,6 +2520,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Shared,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::from_array([PEER]),
             awaits: Capped::empty(),
             charge: stub_abort_charge(seed),
@@ -2616,6 +2659,7 @@ mod tests {
         let held = Held::default();
         let mut holds = ProvisionalCells::default();
         let lines = select_members(
+            ShardId::ROOT,
             ms(0),
             [
                 pending(tx(1), &local, far()),
@@ -2645,6 +2689,7 @@ mod tests {
 
         let mut holds = ProvisionalCells::default();
         let lines = select_members(
+            ShardId::ROOT,
             ms(0),
             [
                 pending(tx(1), &local, far()),
@@ -2681,6 +2726,7 @@ mod tests {
         let members: Vec<TxHash> = (0..40u8).map(tx).collect();
         let named = |members: &[TxHash]| -> Vec<TxHash> {
             select_members(
+                ShardId::ROOT,
                 ms(0),
                 members.iter().map(|&member| pending(member, &small, far())),
                 &Held::default(),
@@ -2730,6 +2776,7 @@ mod tests {
             .map(|seed| pending(tx(seed), &wide, far()))
             .collect();
         let lines = select_members(
+            ShardId::ROOT,
             ms(0),
             candidates,
             &Held::default(),
@@ -2753,6 +2800,7 @@ mod tests {
             .collect();
         for (anchor, joins) in [(ms(0), Joins::Executes), (far().at(), Joins::Aborted)] {
             let lines = select_members(
+                ShardId::ROOT,
                 anchor,
                 waiting.iter().map(|&tx| pending(tx, &determined, far())),
                 &Held::default(),
@@ -2782,6 +2830,7 @@ mod tests {
             .map(|at| TxHash::from(Hash::from_bytes(&at.to_be_bytes())))
             .collect();
         let lines = select_members(
+            ShardId::ROOT,
             ms(0),
             carried.iter().map(|&tx| pending(tx, &determined, far())),
             &Held::default(),
@@ -2809,6 +2858,7 @@ mod tests {
         let anchor = ms(60_000);
         assert!(passed.passed(anchor));
         let lines = select_members(
+            ShardId::ROOT,
             anchor,
             [
                 pending(tx(1), &waiting, passed),
@@ -2826,6 +2876,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: CHARGE,
@@ -2846,6 +2897,7 @@ mod tests {
         let deadline = Deadline::of(ms(10_000));
         let named = |at: WeightedTimestamp| {
             select_members(
+                ShardId::ROOT,
                 at,
                 [pending(tx(1), &core, deadline)],
                 &Held::default(),
@@ -2865,6 +2917,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: CHARGE,
@@ -2905,6 +2958,9 @@ mod tests {
             waiting: None,
             executed: joins.dispatched(),
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
         };
         let mut rows = MemberIndex::empty(ShardId::ROOT);
         for held in [
@@ -2935,6 +2991,7 @@ mod tests {
                     joins: Joins::Aborted,
                     settlement: Settlement::Awaited,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: Capped::from_array([PEER]),
                     awaits: Capped::empty(),
                     charge: CHARGE,
@@ -2972,6 +3029,9 @@ mod tests {
             waiting: None,
             executed: true,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
         }
     }
 
@@ -3124,6 +3184,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(seed),
@@ -3355,6 +3416,7 @@ mod tests {
                 Settlement::Awaited
             },
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: row.reach.clone(),
             awaits: Capped::empty(),
             charge: row.charge,
@@ -4326,6 +4388,7 @@ mod tests {
                     joins: Joins::Executes,
                     settlement: Settlement::Shared,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: core.reach.clone(),
                     awaits: core.awaits.clone(),
                     charge: core.charge,
@@ -4796,6 +4859,9 @@ mod tests {
                 waiting: None,
                 executed: true,
                 hearing: Capped::empty(),
+                queued: None,
+                head: None,
+                blocked_at: None,
             },
         );
         rows.ticks.insert(
@@ -4930,6 +4996,9 @@ mod tests {
             waiting: None,
             executed: true,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
         };
         let in_flight = RowState::InFlight {
             tick: BlockHeight::new(2),
@@ -4961,6 +5030,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Shared,
             holds: Capped::from_array([(shared, WRITE)]),
+            pins: Capped::empty(),
             reach: Capped::from_array([PEER]),
             awaits: Capped::from_array([PEER]),
             charge: CHARGE,
@@ -5012,6 +5082,9 @@ mod tests {
             covered: false,
             executed: true,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
         };
         let pending = stating(waiting, far(), &leg(declared.to_vec(), &[PEER]));
         for member in [in_flight, pending] {
@@ -5088,6 +5161,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: CHARGE,
@@ -6536,6 +6610,7 @@ mod tests {
                     joins: Joins::Executes,
                     settlement: Settlement::Shared,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: Capped::from_array([ShardId::ROOT]),
                     awaits: Capped::from_array([ShardId::ROOT]),
                     charge: CHARGE,

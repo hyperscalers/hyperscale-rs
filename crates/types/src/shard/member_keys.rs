@@ -27,17 +27,35 @@ pub enum MemberCollection {
     Verdicts,
     /// The yes receipts of the stated rows, by member.
     Staged,
+    /// The pins of the placed rows a counterpart shares the verdict on,
+    /// by key, class and place.
+    Queue,
+    /// The pins of the determined rows standing `Pending`, by key, class
+    /// and place.
+    Waiters,
+    /// The pins each tick whose determined half is owed takes, by height
+    /// and chunk.
+    TickPins,
+    /// The placed rows not yet head, by member.
+    Behind,
+    /// The keyed rows made head, by head height and place.
+    Serves,
 }
 
 impl MemberCollection {
     /// Every collection of the family, in the order of their materials.
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 11] = [
         Self::Members,
         Self::Ticks,
         Self::Seats,
         Self::Reserved,
         Self::Verdicts,
         Self::Staged,
+        Self::Queue,
+        Self::Waiters,
+        Self::TickPins,
+        Self::Behind,
+        Self::Serves,
     ];
 
     const fn material(self) -> u8 {
@@ -48,6 +66,11 @@ impl MemberCollection {
             Self::Reserved => 3,
             Self::Verdicts => 4,
             Self::Staged => 5,
+            Self::Queue => 6,
+            Self::Waiters => 7,
+            Self::TickPins => 8,
+            Self::Behind => 9,
+            Self::Serves => 10,
         }
     }
 
@@ -81,7 +104,7 @@ impl MemberCollection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberFamily {
     owner: Address,
-    ids: [CollectionId; 6],
+    ids: [CollectionId; MemberCollection::ALL.len()],
 }
 
 impl MemberFamily {

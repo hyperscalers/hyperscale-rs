@@ -1465,6 +1465,7 @@ impl ExecutionCoordinator {
                     Settlement::Awaited
                 },
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::new(reach).expect("no more counterparts than prefixes"),
                 awaits: Capped::empty(),
                 charge: entry.charge,
@@ -9245,6 +9246,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -11431,6 +11433,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(&named_tx),
@@ -11500,6 +11503,7 @@ mod tests {
                     joins: Joins::Executes,
                     settlement: Settlement::Alone,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: Capped::empty(),
                     awaits: Capped::empty(),
                     charge: genesis_charge(&tx),
@@ -11537,19 +11541,16 @@ mod tests {
         assert!(state.held.is_empty(), "the crossing lets go of it");
     }
 
-    /// A tick this node cannot run holds every later tick until its
-    /// determined half settles; the settling commit seats what its
-    /// receipts say it left on the chain, then the later tick runs.
-    #[test]
-    fn a_held_tick_holds_dispatch_until_it_settles() {
-        let schedule = make_test_topology();
-        let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
-        let member = |tx: &Transaction| TickLine::Member {
+    /// The line running `tx` on terms its own certificate settles,
+    /// holding and pinning nothing.
+    fn running_alone(tx: &Transaction) -> TickLine {
+        TickLine::Member {
             staged: 0,
             tx: tx.hash(),
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -11557,7 +11558,17 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
-        };
+        }
+    }
+
+    /// A tick this node cannot run holds every later tick until its
+    /// determined half settles; the settling commit seats what its
+    /// receipts say it left on the chain, then the later tick runs.
+    #[test]
+    fn a_held_tick_holds_dispatch_until_it_settles() {
+        let schedule = make_test_topology();
+        let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
+        let member = running_alone;
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
         state.commit_block_carrying(&schedule, &test_certify(seed, 1_000), Naming::Manifest);
@@ -11736,6 +11747,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -11758,6 +11770,7 @@ mod tests {
                 Settlement::Awaited
             },
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::new(reach.to_vec()).expect("a list written out in a test"),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -12493,6 +12506,7 @@ mod tests {
             joins,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -12599,6 +12613,7 @@ mod tests {
             joins: Joins::Aborted,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -12765,6 +12780,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(1),
@@ -17506,6 +17522,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(2),
@@ -17553,6 +17570,7 @@ mod tests {
                 Settlement::Awaited
             },
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::new(reach.to_vec()).expect("a short reach"),
             awaits: Capped::empty(),
             charge: genesis_charge(transaction),

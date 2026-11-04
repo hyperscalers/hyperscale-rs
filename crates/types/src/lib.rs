@@ -197,17 +197,18 @@ pub use shard::limits::{
     MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES,
     ROUTE_PREFIX_BYTES, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
     STATE_CLAIM_CROSSING_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM,
-    TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES,
-    TICK_TERMS_BYTES, TX_CAPS, UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction,
-    claims_admit_block, drain_admits_block, evidence_admits_block, staged_yes_bound,
-    staged_yes_bytes, state_claims_admit_block, sweep_admits_block, tick_manifest_admits_block,
-    tick_manifest_admits_members, tick_terms_admit_block,
+    TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_REACH_BYTES,
+    TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TX_CAPS, UNSETTLED_TX_BYTES, budget_admits_block,
+    caps_admit_transaction, claims_admit_block, drain_admits_block, evidence_admits_block,
+    staged_yes_bound, staged_yes_bytes, state_claims_admit_block, sweep_admits_block,
+    tick_manifest_admits_block, tick_manifest_admits_members, tick_terms_admit_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad, SubstateClaim};
 pub use shard::manifest::{BlockManifest, BlockManifestParts, BlockMetadata};
 pub use shard::member_keys::{
     MemberCollection, MemberFamily, member_order, staged_leaf, verdict_leaf,
 };
+pub use shard::pin::{Modes, Pin, PinClass, PinKey, Pins, is_protocol_vault, pins_of};
 pub use shard::proven_anchors::ProvenAnchors;
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::read_frontier::{
