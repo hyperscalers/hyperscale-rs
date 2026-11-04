@@ -20,6 +20,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
+hyperscale-core.workspace = true
+hyperscale-provisions = { workspace = true, features = ["test-utils"] }
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
@@ -27,6 +29,10 @@ tempfile.workspace = true
 
 [[bench]]
 name = "import_throughput"
+harness = false
+
+[[bench]]
+name = "proof_cost"
 harness = false
 
 [[bench]]
