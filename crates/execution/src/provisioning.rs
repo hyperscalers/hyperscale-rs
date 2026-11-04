@@ -254,31 +254,35 @@ impl ProvisioningTracker {
     ///   over one set.
     /// - A leg runs alone and under its own.
     ///
-    /// A bundle not yet absorbed leaves its clock out, which only a
-    /// member attested aborted whatever it says runs without.
+    /// `None` for a core member while another core shard's bundle is not
+    /// absorbed: without it there is no minimum every core shard agrees
+    /// on, and a node short of it is short of what the member's line
+    /// names it to run on. A whole member whose remote payer's bundle is
+    /// not absorbed takes its own, which only a member attested aborted
+    /// whatever it says runs under.
     #[must_use]
     pub(crate) fn transaction_clock(
         &self,
         tx_hash: TxHash,
         member: &Member,
         own: WeightedTimestamp,
-    ) -> WeightedTimestamp {
+    ) -> Option<WeightedTimestamp> {
         let absorbed = self.absorbed.get(&tx_hash);
         let clock_of = |shard: &ShardId| absorbed?.get(shard).map(|part| part.anchor.clock);
         match member.role() {
-            Role::Whole => self
-                .payer_shards
-                .get(&tx_hash)
-                .and_then(clock_of)
-                .unwrap_or(own),
+            Role::Whole => Some(
+                self.payer_shards
+                    .get(&tx_hash)
+                    .and_then(clock_of)
+                    .unwrap_or(own),
+            ),
             Role::Core => member
                 .classified()
                 .core()
                 .iter()
                 .filter(|&&shard| shard != member.local())
-                .filter_map(clock_of)
-                .fold(own, WeightedTimestamp::min),
-            Role::Leg | Role::Settling => own,
+                .try_fold(own, |earliest, shard| Some(earliest.min(clock_of(shard)?))),
+            Role::Leg | Role::Settling => Some(own),
         }
     }
 
@@ -1023,6 +1027,7 @@ mod tests {
     /// [`OWN_CLOCK_MS`].
     fn whole_clock(t: &ProvisioningTracker, tx: TxHash) -> WeightedTimestamp {
         t.transaction_clock(tx, &Member::whole(shard(0)), anchor(OWN_CLOCK_MS).clock)
+            .expect("a whole member always has a clock")
     }
 
     /// Where the member under test committed its transaction.
@@ -1118,16 +1123,19 @@ mod tests {
         let clock = |t: &ProvisioningTracker, local, own_ms| {
             t.transaction_clock(tx, &divided_member(local), anchor(own_ms).clock)
         };
-        assert_eq!(clock(&on_late, late, 9_000), anchor(7_000).clock);
-        assert_eq!(clock(&on_early, early, 7_000), anchor(7_000).clock);
+        assert_eq!(clock(&on_late, late, 9_000), Some(anchor(7_000).clock));
+        assert_eq!(clock(&on_early, early, 7_000), Some(anchor(7_000).clock));
         assert_eq!(
             tracker_beside(early, 7_000).transaction_clock(
                 tx,
                 &divided_member(leg),
                 anchor(1_000).clock
             ),
-            anchor(1_000).clock,
+            Some(anchor(1_000).clock),
         );
+        // Short of the other core shard's bundle, a core member has no
+        // clock, whatever else is in hand.
+        assert_eq!(clock(&on_late, early, 7_000), None);
     }
 
     /// A requirement is its candidate's: the sweep drops it the moment

@@ -1758,15 +1758,18 @@ impl ExecutionCoordinator {
             // halt recovery's crossing block names under a committee
             // epochs past its clock.
             let mut env = TickEnvironment::governing(committee, topology_schedule.windows());
-            let (runs, awaiting) =
-                seat_seeds(&mut env, &requests, topology_schedule).awaiting(tick_id, lines);
+            let (in_hand, awaiting) = if in_hand {
+                seat_seeds(&mut env, &requests, topology_schedule).awaiting(tick_id, lines)
+            } else {
+                (false, None)
+            };
             PendingTick {
                 tick: block.height,
                 tick_ts: block.ts,
                 env,
                 requests,
                 included: block.fees.clone(),
-                in_hand: in_hand && runs,
+                in_hand,
                 awaiting,
             }
         });

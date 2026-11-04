@@ -302,8 +302,13 @@ impl TickCandidates {
             // off the record cells the committed claims proved.
             let arrivals =
                 arrivals_for(*tx_hash, candidate.member.classified(), provisioning, local);
+            // A member with no clock yet is one this node is short of a
+            // bundle for, so the tick is never run here and the clock it
+            // stands in with is never read.
             let clock =
                 provisioning.transaction_clock(*tx_hash, &candidate.member, candidate.committed_ts);
+            in_hand &= clock.is_some();
+            let clock = clock.unwrap_or(candidate.committed_ts);
             admitted.push(Admitted {
                 request: CrossShardExecutionRequest {
                     tx_hash: *tx_hash,
