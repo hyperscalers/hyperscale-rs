@@ -294,9 +294,9 @@ impl VoteFence<'_> {
     /// `MAX_VALIDITY_RANGE` or more past the cut passes here: no window
     /// it can carry opens before the cut, and the body root check refuses
     /// one that claims to. Below it a right child that has stopped asking
-    /// defers, so a leader extending a QC older than this validator's
-    /// high QC cannot carry a pre-cut transaction past a guard this
-    /// validator's own clock retired.
+    /// defers, so a block that does not extend this validator's committed
+    /// block cannot carry a pre-cut transaction past a guard its commit
+    /// retired.
     ///
     /// Provisions are left out. A batch carries its *source* shard's
     /// weighted timestamp where the cut is in this chain's, so a rule

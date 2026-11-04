@@ -1812,26 +1812,29 @@ impl ShardCoordinator {
             && self.committed_tip.is_some_and(|tip| tip.commits_parent)
     }
 
-    /// Whether content from before this chain began can still be offered
-    /// to it.
+    /// Whether a block that can still become canonical can carry content
+    /// from before this chain began.
     ///
     /// False on a chain born at network genesis, which has nothing before
-    /// it. False again once the chain's certified clock has run
-    /// `MAX_VALIDITY_RANGE` past its origin: that is the widest a validity
-    /// window gets, so nothing signed since can open before the cut and
-    /// nothing signed before it is still valid.
+    /// it. False again once the committed block's anchor has run
+    /// `MAX_VALIDITY_RANGE` past the origin. Every block that can still
+    /// become canonical extends the committed one, and a voter refuses a
+    /// parent QC keyed below its block's committee anchor, so anchors
+    /// never fall along a chain: each such block anchors at or past the
+    /// line, where no window it can carry opens before the cut.
+    ///
+    /// Keyed on the committed block, not the high QC: a leader may extend
+    /// a QC below this node's high QC, and under the lock that block can
+    /// still become canonical and still need the answers. The committed
+    /// anchor only rises, so once closed the window stays closed.
     ///
     /// A property of the chain rather than of what this node holds — which
     /// is what makes it the right gate for *acquiring* the predecessors,
-    /// where [`Self::precut_rule_live`] would be circular. It decides only
-    /// whether to keep asking. What a block may carry is judged against
-    /// that block's own anchor, and a leader extending an older QC
-    /// anchors below this node's high QC.
+    /// where [`Self::precut_rule_live`] would be circular.
     #[must_use]
     pub(crate) fn precut_window_open(&self) -> bool {
         !self.chain_origin.born_at_network_genesis()
-            && self.high_qc().weighted_timestamp()
-                < self.chain_origin.anchor_wt.plus(MAX_VALIDITY_RANGE)
+            && self.committed_block_anchor_wt < self.chain_origin.anchor_wt.plus(MAX_VALIDITY_RANGE)
     }
 
     /// Whether this chain still asks its parent's terminal: it is a
@@ -1850,8 +1853,10 @@ impl ShardCoordinator {
     /// snap-synced joiner — none of which run a reshape duty.
     ///
     /// Runs only while nothing answers here, so it never displaces what
-    /// the flip delivered, and only while the window is open, which a
-    /// retired rule is already past. Returns whether anything was adopted.
+    /// the flip delivered, and only while the window is open. A rule
+    /// retires only once the window has closed, and it never reopens, so
+    /// a retired rule is never adopted again. Returns whether anything was
+    /// adopted.
     pub(crate) fn adopt_precut_predecessors(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1929,8 +1934,9 @@ impl ShardCoordinator {
 
     /// Stop asking once the rule has retired, so neither the terminal nor
     /// its answers are held for this coordinator's life. A pre-cut
-    /// transaction met afterwards defers: only a block anchored below the
-    /// line can carry one, and that block is a stale fork.
+    /// transaction met afterwards defers. Only a block anchored below the
+    /// line can carry one, and once the committed block is past the line
+    /// no such block extends it, so none can become canonical.
     ///
     /// The caller drives it, because forgetting the terminal is also what
     /// stops it releasing the query slots it holds: the release is a
@@ -10653,17 +10659,7 @@ mod tests {
             predecessors,
             ..RecoveredState::default()
         };
-        recovered.latest_qc = Some(Verified::new_unchecked_for_test(QuorumCertificate::new(
-            BlockHash::ZERO,
-            local_shard,
-            BlockHeight::new(10),
-            BlockHash::ZERO,
-            Round::new(1),
-            Epoch::GENESIS,
-            SignerBitfield::new(4),
-            AggregateSignature::ZERO,
-            now,
-        )));
+        recovered.latest_qc = Some(qc_keyed_at(local_shard, now));
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
             local_shard,
@@ -10672,6 +10668,50 @@ mod tests {
             WeightedTimestamp::ZERO,
         )
         .signed_by(ValidatorId::new(0))
+    }
+
+    /// A QC on `shard`'s chain keyed at `wt`. Recovered with nothing
+    /// committed, it is both the high QC and the committed tip's anchor.
+    fn qc_keyed_at(shard: ShardId, wt: WeightedTimestamp) -> Verified<QuorumCertificate> {
+        Verified::new_unchecked_for_test(QuorumCertificate::new(
+            BlockHash::ZERO,
+            shard,
+            BlockHeight::new(10),
+            BlockHash::ZERO,
+            Round::new(1),
+            Epoch::GENESIS,
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            wt,
+        ))
+    }
+
+    /// A block on `shard`'s chain anchored at `anchored_ms` and carrying
+    /// `tx`.
+    fn block_carrying(shard: ShardId, tx: &Transaction, height: u64, anchored_ms: u64) -> Block {
+        let mut block = block_on_chained_on(
+            shard,
+            BlockHeight::new(height),
+            BlockHash::from_raw(Hash::from_bytes(&height.to_le_bytes())),
+            anchored_ms,
+        );
+        if let Block::Live { transactions, .. } = &mut block {
+            *transactions = Arc::new(
+                Capped::new(vec![Verifiable::from(tx.clone())]).expect("one transaction fits"),
+            );
+        }
+        block
+    }
+
+    /// A transaction over `range`.
+    fn tx_over(seed: u8, range: TimestampRange) -> Transaction {
+        test_utils::install_stub_protocol_statics();
+        test_utils::stub_transaction(
+            test_utils::test_principal(seed),
+            &[test_utils::test_prefix(seed)],
+            1_000,
+            range,
+        )
     }
 
     fn precut_tx(seed: u8, opens_ms: u64) -> Transaction {
@@ -10760,9 +10800,10 @@ mod tests {
         );
     }
 
-    /// Once the chain's clock has run `MAX_VALIDITY_RANGE` past its
-    /// origin the rule retires: nothing still valid can have opened
-    /// before the cut, so the queries stop even with candidates on hand.
+    /// Once the committed block's anchor has run `MAX_VALIDITY_RANGE`
+    /// past the origin the rule retires: nothing a canonical block can
+    /// still carry opened before the cut, so the queries stop even with
+    /// candidates on hand.
     #[test]
     fn the_queries_retire_with_the_rule() {
         let cut = WeightedTimestamp::from_millis(10_000);
@@ -10777,27 +10818,26 @@ mod tests {
         assert_eq!(state.precut_terminal(), None);
     }
 
-    /// Retiring is this node's clock, but what a block may carry is its
-    /// own anchor's. A leader extending a QC older than the voter's high
-    /// QC can still anchor below `cut + MAX_VALIDITY_RANGE` and carry a
-    /// transaction that opened before the cut and that the parent
-    /// committed. A retired right child holds none of the parent's
-    /// markers, so the vote defers on it rather than passing it to a
-    /// marker rule that never reads the parent's owner.
+    /// A retired right child holds none of the parent's markers, so a
+    /// pre-cut transaction on a block anchored below
+    /// `cut + MAX_VALIDITY_RANGE` defers rather than passing to a marker
+    /// rule that never reads the parent's owner. No block extending the
+    /// committed one anchors there once the rule has retired; this is the
+    /// guard for one that does not extend it.
+    ///
+    /// The probes pin the line from both sides. The latest a pre-cut
+    /// window can open is `cut - 1`, so its range ends at `line - 1`: a
+    /// block at `line - 2` can still carry it, one at `line - 1` is the
+    /// fence's to defer, and one at the line passes untouched.
     #[test]
     fn a_retired_right_child_defers_a_pre_cut_tx_anchored_below_the_line() {
         let cut = WeightedTimestamp::from_millis(10_000);
         let line = cut.plus(MAX_VALIDITY_RANGE);
         let mut state = make_successor(cut, line);
 
-        let opens = WeightedTimestamp::from_millis(cut.as_millis() - 1_000);
+        let opens = WeightedTimestamp::from_millis(cut.as_millis() - 1);
         let range = TimestampRange::new(opens, opens.plus(MAX_VALIDITY_RANGE));
-        let tx = test_utils::stub_transaction(
-            test_utils::test_principal(7),
-            &[test_utils::test_prefix(7)],
-            1_000,
-            range,
-        );
+        let tx = tx_over(7, range);
         state.record_precut_proof(
             parent_terminal(),
             &[(
@@ -10807,40 +10847,135 @@ mod tests {
         );
         assert!(state.retire_precut());
 
-        let carrying = |height: u64, parent: &[u8], anchored_ms: u64| {
-            let mut block = block_on_chained_on(
-                PARENT.children().1,
-                BlockHeight::new(height),
-                BlockHash::from_raw(Hash::from_bytes(parent)),
-                anchored_ms,
-            );
-            if let Block::Live { transactions, .. } = &mut block {
-                *transactions = Arc::new(
-                    Capped::new(vec![Verifiable::from(tx.clone())]).expect("one transaction fits"),
-                );
-            }
-            block
-        };
+        let right = PARENT.children().1;
+        let judged = |block: &Block| state.vote_fence().judge(&fence_schedule(), block);
 
-        let older_fork = carrying(11, b"older parent", line.as_millis() - 2_000);
-        let anchor = older_fork.header().parent_qc().weighted_timestamp();
+        let in_range = block_carrying(right, &tx, 11, line.as_millis() - 2);
+        let anchor = in_range.header().parent_qc().weighted_timestamp();
+        assert!(range.is_well_formed(anchor) && range.contains(anchor));
         assert!(
-            range.is_well_formed(anchor) && range.contains(anchor),
-            "the transaction is still offerable at the older fork's anchor"
-        );
-        assert!(
-            matches!(
-                state.vote_fence().precut(&older_fork),
-                Err(Withheld::Deferred { .. })
-            ),
+            matches!(judged(&in_range), Err(Withheld::Deferred { .. })),
             "a pre-cut transaction the parent committed passes the retired guard"
         );
 
-        // At the line the window has closed: the precut rule has nothing
-        // to judge, and the body root check refuses the expired range.
-        let at_line = carrying(12, b"high parent", line.as_millis());
-        assert!(!range.contains(at_line.header().parent_qc().weighted_timestamp()));
-        assert!(state.vote_fence().precut(&at_line).is_ok());
+        let below_line = block_carrying(right, &tx, 12, line.as_millis() - 1);
+        assert!(!range.contains(below_line.header().parent_qc().weighted_timestamp()));
+        assert!(
+            matches!(judged(&below_line), Err(Withheld::Deferred { .. })),
+            "the fence's line sits above `line - 1`"
+        );
+
+        let at_line = block_carrying(right, &tx, 13, line.as_millis());
+        assert!(judged(&at_line).is_ok(), "the fence's line sits at `line`");
+    }
+
+    /// The line changes nothing where every predecessor's markers are in
+    /// this chain's own state, nor on a chain born at network genesis,
+    /// whose cut is zero and before which nothing opens.
+    #[test]
+    fn the_line_leaves_a_left_child_and_a_genesis_chain_alone() {
+        let cut = WeightedTimestamp::from_millis(10_000);
+        let line = cut.plus(MAX_VALIDITY_RANGE);
+        let left = PARENT.children().0;
+        let state = successor_holding(
+            left,
+            cut,
+            WeightedTimestamp::from_millis(10_500),
+            vec![parent_terminal()],
+        );
+        assert!(matches!(state.precut, Precut::Local));
+        let opens = WeightedTimestamp::from_millis(cut.as_millis() - 1);
+        let tx = tx_over(
+            8,
+            TimestampRange::new(opens, opens.plus(MAX_VALIDITY_RANGE)),
+        );
+        for anchored_ms in [line.as_millis() - 2, line.as_millis()] {
+            assert!(
+                state
+                    .vote_fence()
+                    .judge(
+                        &fence_schedule(),
+                        &block_carrying(left, &tx, 11, anchored_ms)
+                    )
+                    .is_ok(),
+                "a left child passes its pre-cut content to the marker rule at {anchored_ms}"
+            );
+        }
+
+        let (genesis, _) = make_test_state();
+        assert!(genesis.chain_origin.born_at_network_genesis());
+        assert!(genesis.precut.is_unanswered());
+        let tx = tx_over(
+            9,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        for anchored_ms in [
+            1_000,
+            WeightedTimestamp::ZERO.plus(MAX_VALIDITY_RANGE).as_millis(),
+        ] {
+            assert!(
+                genesis
+                    .vote_fence()
+                    .judge(
+                        &fence_schedule(),
+                        &block_carrying(ShardId::ROOT, &tx, 11, anchored_ms)
+                    )
+                    .is_ok(),
+                "nothing opens before a genesis chain's cut, at {anchored_ms}"
+            );
+        }
+    }
+
+    /// The window closes on the committed block's anchor. A voter whose
+    /// high QC has crossed the line while its committed block has not can
+    /// still be offered a block extending a QC below its high QC, and
+    /// under the lock that block may become canonical. It keeps asking
+    /// and keeps its answers, so an `Absent`-proven transaction on such a
+    /// block passes; once the commit crosses, the rule retires for good.
+    #[test]
+    fn a_high_qc_past_the_line_keeps_the_answers_until_a_commit_crosses() {
+        let cut = WeightedTimestamp::from_millis(10_000);
+        let line = cut.plus(MAX_VALIDITY_RANGE);
+        let committed = WeightedTimestamp::from_millis(line.as_millis() - 2_000);
+        let right = PARENT.children().1;
+        let mut state = make_successor(cut, committed);
+        state.latest_qc = Some(qc_keyed_at(right, line));
+        assert_eq!(state.committed_block_anchor_wt, committed);
+
+        let opens = WeightedTimestamp::from_millis(cut.as_millis() - 1_000);
+        let range = TimestampRange::new(opens, opens.plus(MAX_VALIDITY_RANGE));
+        let tx = tx_over(10, range);
+        let marker = parent_marker((tx.hash(), range.end_timestamp_exclusive));
+        state.record_precut_proof(parent_terminal(), &[(marker, false)]);
+
+        assert!(
+            state.precut_rule_live(),
+            "the committed block is below the line"
+        );
+        assert!(!state.retire_precut());
+        assert_eq!(state.precut_terminal(), Some(parent_terminal()));
+
+        let lock_safe = block_carrying(right, &tx, 11, committed.as_millis());
+        assert!(range.contains(lock_safe.header().parent_qc().weighted_timestamp()));
+        assert!(
+            state
+                .vote_fence()
+                .judge(&fence_schedule(), &lock_safe)
+                .is_ok(),
+            "the parent's terminal proved the transaction absent"
+        );
+
+        state.committed_block_anchor_wt = line;
+        assert!(!state.precut_rule_live());
+        assert!(state.retire_precut());
+        assert!(
+            !state.adopt_precut_predecessors(&post_split_schedule()),
+            "a retired rule never re-adopts"
+        );
+        assert!(state.precut.is_unanswered());
     }
 
     /// An answered key drops out; its sibling stays owed.

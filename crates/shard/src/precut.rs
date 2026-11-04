@@ -11,10 +11,13 @@
 //!
 //! Nothing here applies to a block anchored `MAX_VALIDITY_RANGE` or more
 //! past its chain's origin. That is the widest a validity window gets, so
-//! no transaction such a block can carry opens before the origin. The
-//! line is the judged block's anchor, never a node's own progress: a
-//! leader may extend a QC older than a voter's high QC, and a block
-//! anchored below the line can still carry a pre-cut transaction.
+//! no transaction such a block can carry opens before the origin. Which
+//! side of the line a block sits on is its own anchor's to say. How a
+//! block below the line is judged is this node's: a right child keeps
+//! asking until its committed block anchors past the line, and defers on
+//! a pre-cut transaction after that. No block extending the committed
+//! one anchors below the line by then, so the deferral never holds up a
+//! block that can become canonical.
 //!
 //! One level of asking is enough. The beacon's scheduling rule puts two
 //! cuts on one lineage at least `MAX_VALIDITY_RANGE` apart on the epoch
