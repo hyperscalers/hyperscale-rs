@@ -215,8 +215,9 @@ fn advance_fullness(state: &mut BeaconState, readings: &BTreeMap<ShardId, FiveWa
 /// ready timeout) and replay witnesses against a watermark that
 /// already accounts for them. Genesis sits at `current_epoch =
 /// GENESIS` and the first apply is `epoch > GENESIS`, so strict `>` is
-/// the right bound. Tests sometimes skip slots, so we don't require
-/// strict-linear `epoch == current_epoch + 1`.
+/// the right bound. Strict-linear `epoch == current_epoch + 1` is not
+/// required here, but the seed ring requires it of every epoch it
+/// records, so a test that skips slots resets `state.seeds` first.
 #[allow(clippy::too_many_lines)] // sequential epoch-fold pipeline; each step is already a helper
 pub fn apply_epoch(
     verifier: &dyn Verifier,

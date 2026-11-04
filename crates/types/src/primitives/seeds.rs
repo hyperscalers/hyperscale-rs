@@ -83,8 +83,14 @@ impl SeedRing {
     /// The beacon folds every epoch past genesis once and in order, Skip
     /// epochs included, so `epoch` is the one after the ring's newest:
     /// [`Self::window_for`] reads a missing epoch as one not yet folded.
+    ///
+    /// # Panics
+    ///
+    /// If the ring holds an epoch and `epoch` is not the one after its
+    /// newest. A gap would read as epochs never folded on every replica
+    /// alike, holding every tick that draws on them.
     pub fn record(&mut self, epoch: Epoch, seed: EpochSeed, windows: EpochWindows) {
-        debug_assert!(
+        assert!(
             self.0
                 .last_key_value()
                 .is_none_or(|(newest, _)| epoch == newest.next()),
