@@ -676,7 +676,7 @@ mod tests {
     /// longer (`withholding_jail_holds_for_the_recency_period`).
     #[test]
     fn async_absence_jail_is_recoverable_after_cooldown() {
-        use hyperscale_types::{JAIL_COOLDOWN_EPOCHS, ShardWitnessPayload};
+        use hyperscale_types::{JAIL_COOLDOWN_EPOCHS, SeedRing, ShardWitnessPayload};
 
         use crate::state::test_fixtures::apply_witness_chunk;
 
@@ -714,6 +714,9 @@ mod tests {
 
         // Once the cooldown elapses, an Unjail lifts it back to the pool.
         state.current_epoch = Epoch::new(jailed_at.inner() + JAIL_COOLDOWN_EPOCHS);
+        // The jump skips the folds that would have rolled those epochs'
+        // seeds, so the ring starts over past it.
+        state.seeds = SeedRing::default();
         let effects = apply_witness_chunk(
             &mut state,
             0,

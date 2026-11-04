@@ -78,7 +78,18 @@ impl SeedRing {
 
     /// Record `epoch`'s seed and drop whatever fell below the ring's
     /// depth on `windows`.
+    ///
+    /// The beacon folds every epoch past genesis once and in order, Skip
+    /// epochs included, so `epoch` is the one after the ring's newest:
+    /// [`Self::window_for`] reads a missing epoch as one not yet folded.
     pub fn record(&mut self, epoch: Epoch, seed: EpochSeed, windows: EpochWindows) {
+        debug_assert!(
+            self.0
+                .last_key_value()
+                .is_none_or(|(newest, _)| epoch == newest.next()),
+            "seed of epoch {epoch} recorded out of order after {:?}",
+            self.0.last_key_value().map(|(newest, _)| *newest),
+        );
         self.0.insert(epoch, seed);
         let floor = epoch.saturating_sub(Self::retained_epochs(windows));
         self.0.retain(|held, _| *held >= floor);
