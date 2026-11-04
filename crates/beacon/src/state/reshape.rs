@@ -4782,7 +4782,8 @@ mod tests {
     /// `leaf(1, 0)` split on `epoch_ms` windows, its right child's own
     /// split admitted in the window the child first runs, every seat ready
     /// and the drain latched in that fold. Returns the state at that fold
-    /// and the child.
+    /// and the child. Nothing is quiet yet: an assertion made under the
+    /// latch folds at `formed + 1` at the earliest.
     fn split_born_right_child_latched(epoch_ms: u64) -> (BeaconState, ShardId) {
         let p = ShardId::leaf(1, 0);
         let (_, right) = p.children();
@@ -4817,33 +4818,37 @@ mod tests {
         admit(&mut state, right);
         schedule_ready_splits(&mut state);
         assert!(admission_of(&state, right).drain_by.is_some(), "latched");
-        assert_quiet(&mut state);
         (state, right)
     }
 
+    /// The next whole fold, with every pending reshape's quiet assertion
+    /// applied as that fold's witnesses.
+    fn fold_quiet(state: &mut BeaconState) {
+        assert_quiet(state);
+        apply_next_epoch(state, &[]);
+    }
+
     /// On 30-second windows a split-born chain is not cut before its
-    /// predecessors' transactions expire: the quiet folds at `formed` and
-    /// `formed + 1` would end it 60 and 90 seconds after the cut that
-    /// formed it, inside one validity range, and schedule nothing, and the
-    /// fold at `formed + 2` schedules the cut that ends it 120 seconds on.
+    /// predecessors' transactions expire. The first quiet fold, at
+    /// `formed + 1`, would end it 90 seconds after the cut that formed
+    /// it, inside one validity range, and schedules nothing; the fold at
+    /// `formed + 2` schedules the cut that ends it 120 seconds on.
     #[test]
     fn a_split_born_right_child_splits_only_past_its_predecessors_range() {
         let (mut state, right) = split_born_right_child_latched(30_000);
         let formed = state.boundaries[&right].formed;
 
-        for held in [formed, formed.next()] {
-            state.current_epoch = held;
-            schedule_ready_splits(&mut state);
-            assert_eq!(
-                state.pending_reshapes[&right].scheduled_terminal(),
-                None,
-                "scheduled at {held:?}",
-            );
-            assert_eq!(state.boundaries[&right].terminal_epoch, None);
-        }
+        fold_quiet(&mut state);
+        assert_eq!(state.current_epoch, formed.next());
+        assert!(
+            !outlives_its_predecessors(&state, right, formed.saturating_add(2)),
+            "the cut this fold would schedule ends the chain too soon",
+        );
+        assert_eq!(state.pending_reshapes[&right].scheduled_terminal(), None);
+        assert_eq!(state.boundaries[&right].terminal_epoch, None);
 
-        state.current_epoch = formed.saturating_add(2);
-        schedule_ready_splits(&mut state);
+        fold_quiet(&mut state);
+        assert_eq!(state.current_epoch, formed.saturating_add(2));
         let terminal = formed.saturating_add(3);
         assert_eq!(
             state.pending_reshapes[&right].scheduled_terminal(),
@@ -4864,10 +4869,10 @@ mod tests {
     fn the_rule_never_binds_on_five_minute_windows() {
         let (mut state, right) = split_born_right_child_latched(300_000);
         let formed = state.boundaries[&right].formed;
-        schedule_ready_splits(&mut state);
+        fold_quiet(&mut state);
         assert_eq!(
             state.pending_reshapes[&right].scheduled_terminal(),
-            Some(formed.next()),
+            Some(formed.saturating_add(2)),
         );
 
         for formed in (1..20).map(Epoch::new) {
@@ -4898,20 +4903,26 @@ mod tests {
 
             schedule_ready_merges(&mut state);
             let at = admission_of(&state, parent).at;
-            settle_half(&mut state, parent, left, at, true);
-            settle_half(&mut state, parent, right, at, true);
-            for held in [formed, formed.next()] {
-                state.current_epoch = held;
-                schedule_ready_merges(&mut state);
-                assert_eq!(
-                    state.pending_reshapes[&parent].scheduled_terminal(),
-                    None,
-                    "{younger:?} younger, scheduled at {held:?}",
-                );
-            }
+            let settle_both = |state: &mut BeaconState| {
+                settle_half(state, parent, left, at, true);
+                settle_half(state, parent, right, at, true);
+            };
+            settle_both(&mut state);
+            apply_next_epoch(&mut state, &[]);
+            assert_eq!(state.current_epoch, formed.next());
+            assert!(
+                outlives_its_predecessors(&state, older, formed.saturating_add(2)),
+                "{older:?}, the older, would not hold the cut",
+            );
+            assert_eq!(
+                state.pending_reshapes[&parent].scheduled_terminal(),
+                None,
+                "{younger:?} younger, scheduled at {formed:?} + 1",
+            );
 
-            state.current_epoch = formed.saturating_add(2);
-            schedule_ready_merges(&mut state);
+            settle_both(&mut state);
+            apply_next_epoch(&mut state, &[]);
+            assert_eq!(state.current_epoch, formed.saturating_add(2));
             assert_eq!(
                 state.pending_reshapes[&parent].scheduled_terminal(),
                 Some(formed.saturating_add(3)),
