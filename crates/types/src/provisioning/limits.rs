@@ -29,7 +29,8 @@ pub const MAX_MERKLE_PROOF_LEN: usize = 4 * 1024 * 1024;
 pub const MAX_STATE_ENTRIES_PER_TX: usize = 16_384;
 
 /// The most entries one transaction's declared reads may serve a target:
-/// a cell serves one and a range at most its cap.
+/// a cell serves one and a range at most its
+/// [`range_lift`](crate::range_lift), one past its cap.
 ///
 /// Held to both the entry cap a reader decodes and the claims one proof
 /// may carry, so a declaration admitted under it never asks a source for

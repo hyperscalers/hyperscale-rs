@@ -744,6 +744,11 @@ where
     /// held at the floor, so the first tick past the crossing reads a
     /// baseline still there.
     ///
+    /// A run at or below the floor may still be under way, and the hold
+    /// passes its anchor. Its output is dropped when it appends, and it
+    /// reads until then through the snapshot its view took
+    /// ([`TickView::snapshot`]), which the hold no longer has to cover.
+    ///
     /// The holds of the pending legs it drops stay, as stated holds: the
     /// crossing keeps each stated row, and a legs half above the floor
     /// still settles it. A leg whose row the crossing releases holds
