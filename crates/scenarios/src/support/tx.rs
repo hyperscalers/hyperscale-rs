@@ -31,7 +31,8 @@ use hyperscale_vm_effects::{
     ResourceKind, SignedIntent, SlotId, Value, child_key, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{
-    amm, amm_package_hash, book, book_package_hash, lottery, lottery_package_hash,
+    amm, amm_package_hash, book, book_package_hash, cutoff, cutoff_package_hash, lottery,
+    lottery_package_hash,
 };
 use hyperscale_vm_manifest_builder::{
     GraphBuilder, IntentBuilder, TypedBuilder, TypedError, signing,
@@ -2568,6 +2569,51 @@ pub(crate) fn book_on(shard: ShardId, pair: (ResourceAddr, ResourceAddr)) -> Ins
         })
         .find(|meta| trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard)
         .unwrap_or_else(|| panic!("no book salt lands on {shard:?}"))
+}
+
+/// A cutoff keeping the protocol resource whose address routes to
+/// `shard`.
+///
+/// # Panics
+///
+/// Panics if no salt in the `u8` space lands on `shard`.
+#[must_use]
+pub(crate) fn cutoff_on(shard: ShardId) -> InstanceMeta {
+    let trie = ShardTrie::uniform_from_count(1u64 << shard.depth());
+    (0..=u8::MAX)
+        .map(|salt| InstanceMeta {
+            package: cutoff_package_hash(&ProtocolHasher),
+            config: Capped::new(vec![Value::Address(PROTOCOL_RESOURCE.address())]).unwrap(),
+            salt: Hash32([salt; 32]),
+        })
+        .find(|meta| trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard)
+        .unwrap_or_else(|| panic!("no cutoff salt lands on {shard:?}"))
+}
+
+/// Pay `amount` of the protocol resource from `payer`'s account through
+/// two cutoffs: `first` keeps it if the clock is short of `cutoff_ms`,
+/// and `second` keeps whatever `first` passed on.
+///
+/// # Panics
+///
+/// If the scenario world does not answer the calls.
+#[must_use]
+pub(crate) fn build_cutoff_tx(
+    payer: &Ed25519PrivateKey,
+    (first, second): (&InstanceMeta, &InstanceMeta),
+    amount: u128,
+    cutoff_ms: u64,
+    validity: TimestampRange,
+) -> Transaction {
+    let from = account_address(&payer.public_key().0);
+    let before = cutoff::Cutoff::at(first.address(&ProtocolHasher));
+    let after = cutoff::Cutoff::at(second.address(&ProtocolHasher));
+    let instances = [first.clone(), second.clone()];
+    build_instances_tx(payer, None, &instances, validity, None, &|b| {
+        let payment = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
+        let passed = before.keep_before(b, payment, cutoff_ms)?;
+        after.keep(b, passed)
+    })
 }
 
 /// Rest one ask per `(ticks, size)` on `book`, each escrowing `size` of

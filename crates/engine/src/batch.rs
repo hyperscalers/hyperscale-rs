@@ -36,9 +36,11 @@ use crate::legs::Member;
 pub struct TickEnvironment {
     /// The epochs a sealed draw in this batch may settle on.
     ///
-    /// Global rather than per transaction: the seeds are the beacon's,
-    /// so every shard resolves the same value for the same epoch and
-    /// nothing about which block executes a leg reaches the answer.
+    /// One window for the batch, the tick block's. A seed is the
+    /// beacon's, so every window holding an epoch's seed holds the same
+    /// one, but which epochs a window holds and where its frontier sits
+    /// are the window's own: two ticks under two windows can answer one
+    /// draw two ways.
     pub seeds: SeedWindow,
     /// The grid that turns a member's clock into the epoch a seal it
     /// writes records — so the epoch rides the clock the transaction
@@ -132,10 +134,12 @@ pub struct TickTxInput<'a> {
     /// Verified provision entry lists, one per source shard contribution.
     /// Empty for a single-shard member.
     pub provisions: &'a [Arc<Vec<SubstateEntry>>],
-    /// The transaction clock, identical on every participant: the
-    /// tick anchor for a single-shard member, the payer-shard
-    /// committing block's parent-QC weighted timestamp for a cross-shard
-    /// leg.
+    /// The transaction clock, identical on every shard running the same
+    /// body: the tick anchor for a single-shard member, the payer-shard
+    /// committing block's parent-QC weighted timestamp for a whole
+    /// cross-shard member, the earliest of the core shards' committing
+    /// clocks for a core member, and its own committing block's for a
+    /// leg, which runs alone.
     pub clock: WeightedTimestamp,
     /// The price table the block that committed this member named.
     ///

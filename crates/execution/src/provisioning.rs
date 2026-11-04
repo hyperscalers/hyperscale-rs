@@ -17,10 +17,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use hyperscale_engine::legs::Member;
 use hyperscale_engine::tick_select::Requirement;
 use hyperscale_storage::live_record;
 use hyperscale_types::{
-    BlockHeight, MAX_FINALIZATION_DELAY, Provision, RETENTION_HORIZON, ShardId, StateClaim,
+    BlockHeight, MAX_FINALIZATION_DELAY, Provision, RETENTION_HORIZON, Role, ShardId, StateClaim,
     SubstateEntry, SubstateKey, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingCell;
@@ -236,14 +237,49 @@ impl ProvisioningTracker {
             .is_some_and(|by_shard| by_shard.contains_key(&shard))
     }
 
-    /// The environment carried by the remote payer's bundle: the
-    /// payer-shard committing block's parent-QC weighted timestamp.
-    /// `None` when the payer is local (the tick block is the anchor) or
-    /// the bundle has not been absorbed.
+    /// The clock `member` of `tx_hash` executes under, where `own` is
+    /// the parent-QC weighted timestamp of the block that committed it
+    /// here.
+    ///
+    /// One value for every shard that runs the same nodes, read off
+    /// anchors each of them holds before it runs:
+    ///
+    /// - A whole member runs under its payer's committing clock: its
+    ///   own where the payer is local, the remote payer's bundle's
+    ///   otherwise.
+    /// - A core member runs under the earliest of the core shards'
+    ///   committing clocks, its own included. It runs only once every
+    ///   other core shard's bundle is in hand, and each bundle carries
+    ///   its source block's clock, so every core shard takes the minimum
+    ///   over one set.
+    /// - A leg runs alone and under its own.
+    ///
+    /// A bundle not yet absorbed leaves its clock out, which only a
+    /// member attested aborted whatever it says runs without.
     #[must_use]
-    pub(crate) fn payer_anchor(&self, tx_hash: TxHash) -> Option<SourceAnchor> {
-        let payer = self.payer_shards.get(&tx_hash)?;
-        Some(self.absorbed.get(&tx_hash)?.get(payer)?.anchor)
+    pub(crate) fn transaction_clock(
+        &self,
+        tx_hash: TxHash,
+        member: &Member,
+        own: WeightedTimestamp,
+    ) -> WeightedTimestamp {
+        let absorbed = self.absorbed.get(&tx_hash);
+        let clock_of = |shard: &ShardId| absorbed?.get(shard).map(|part| part.anchor.clock);
+        match member.role() {
+            Role::Whole => self
+                .payer_shards
+                .get(&tx_hash)
+                .and_then(clock_of)
+                .unwrap_or(own),
+            Role::Core => member
+                .classified()
+                .core()
+                .iter()
+                .filter(|&&shard| shard != member.local())
+                .filter_map(clock_of)
+                .fold(own, WeightedTimestamp::min),
+            Role::Leg | Role::Settling => own,
+        }
     }
 
     /// Whether every requirement for `tx_hash` is met. Returns `false`
@@ -597,7 +633,7 @@ mod tests {
             t.provisions_for(tx),
             vec![list(&[(a, Some(1))]), list(&[(b, Some(2))])],
         );
-        assert_eq!(t.payer_anchor(tx), Some(anchor(9_500)));
+        assert_eq!(whole_clock(&t, tx), anchor(9_500).clock);
     }
 
     #[test]
@@ -979,12 +1015,21 @@ mod tests {
                 vec![Arc::new(vec![SubstateEntry::new(a, None)])],
                 "at height {height}",
             );
-            assert_eq!(t.payer_anchor(tx), Some(anchor(clock_ms)));
+            assert_eq!(whole_clock(&t, tx), anchor(clock_ms).clock);
         }
     }
 
+    /// The clock a whole member on leaf 0 runs under, committed here at
+    /// [`OWN_CLOCK_MS`].
+    fn whole_clock(t: &ProvisioningTracker, tx: TxHash) -> WeightedTimestamp {
+        t.transaction_clock(tx, &Member::whole(shard(0)), anchor(OWN_CLOCK_MS).clock)
+    }
+
+    /// Where the member under test committed its transaction.
+    const OWN_CLOCK_MS: u64 = 8_000;
+
     #[test]
-    fn payer_anchor_reads_the_payer_bundles_clock_and_draw() {
+    fn a_whole_member_runs_under_its_payers_clock() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         t.record_required(
@@ -996,25 +1041,90 @@ mod tests {
         );
         t.record_payer_shard(tx, shard(2));
 
-        // A read-set owner's bundle lands first: no payer anchor yet.
+        // A read-set owner's bundle lands first: its clock is not the
+        // payer's, so the member's own stands until the payer's lands.
         t.absorb_provisions(&make_provisions_at(
             shard(1),
             BlockHeight::new(5),
             anchor(7_000),
             tx,
         ));
-        assert_eq!(t.payer_anchor(tx), None);
+        assert_eq!(whole_clock(&t, tx), anchor(OWN_CLOCK_MS).clock);
 
-        // The payer's bundle carries the committing block's clock and
-        // reveal chain — the environment every participant executes the
-        // transaction under.
+        // The payer's bundle carries its committing block's clock, which
+        // every participant executes the transaction under.
         t.absorb_provisions(&make_provisions_at(
             shard(2),
             BlockHeight::new(9),
             anchor(9_500),
             tx,
         ));
-        assert_eq!(t.payer_anchor(tx), Some(anchor(9_500)));
+        assert_eq!(whole_clock(&t, tx), anchor(9_500).clock);
+    }
+
+    /// The member `local` runs of a core over leaf(1, 0) and leaf(2, 2),
+    /// fed by an inbound leg on leaf(2, 3).
+    fn divided_member(local: ShardId) -> Member {
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+
+        let legs = [
+            leg(3, LegRole::Inbound, &[]),
+            leg(0, LegRole::Core, &[(0, 0)]),
+            leg(2, LegRole::Core, &[(1, 0)]),
+        ];
+        let shards = [
+            ShardId::leaf(1, 0),
+            ShardId::leaf(2, 2),
+            ShardId::leaf(2, 3),
+        ];
+        let classified =
+            Classified::freeze(&legs, legs[0].target, &[], &ShardTrie::from_leaves(shards));
+        assert_eq!(
+            classified.core(),
+            &BTreeSet::from([ShardId::leaf(1, 0), ShardId::leaf(2, 2)])
+        );
+        Member::of(classified, local, shards.into_iter().collect())
+    }
+
+    /// Both core shards run every core node, so both run it under the
+    /// earliest of their committing clocks: each takes its own and the
+    /// other's bundle, and neither reads the leg's. The leg runs alone,
+    /// under its own.
+    #[test]
+    fn every_core_member_runs_under_the_earliest_core_clock() {
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let (early, late) = (ShardId::leaf(2, 2), ShardId::leaf(1, 0));
+        let leg = ShardId::leaf(2, 3);
+        let tracker_beside = |other: ShardId, other_ms: u64| {
+            let mut t = ProvisioningTracker::new();
+            for (source, ms) in [(other, other_ms), (leg, 1_000)] {
+                t.absorb_provisions(&make_provisions_at(
+                    source,
+                    BlockHeight::new(5),
+                    anchor(ms),
+                    tx,
+                ));
+            }
+            t
+        };
+
+        let on_late = tracker_beside(early, 7_000);
+        let on_early = tracker_beside(late, 9_000);
+        let clock = |t: &ProvisioningTracker, local, own_ms| {
+            t.transaction_clock(tx, &divided_member(local), anchor(own_ms).clock)
+        };
+        assert_eq!(clock(&on_late, late, 9_000), anchor(7_000).clock);
+        assert_eq!(clock(&on_early, early, 7_000), anchor(7_000).clock);
+        assert_eq!(
+            tracker_beside(early, 7_000).transaction_clock(
+                tx,
+                &divided_member(leg),
+                anchor(1_000).clock
+            ),
+            anchor(1_000).clock,
+        );
     }
 
     /// A requirement is its candidate's: the sweep drops it the moment
@@ -1046,7 +1156,7 @@ mod tests {
         assert!(!t.is_fully_provisioned(tx));
         assert_eq!(t.absorbed_len(), 0);
         assert_eq!(t.required_len(), 0);
-        assert_eq!(t.payer_anchor(tx), None);
+        assert_eq!(whole_clock(&t, tx), anchor(OWN_CLOCK_MS).clock);
     }
 
     #[test]

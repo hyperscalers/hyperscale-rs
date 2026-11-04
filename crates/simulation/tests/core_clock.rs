@@ -17,10 +17,38 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::{
-    BOOK_SHARD, BookRoute, FaultableCluster, ScenarioConfig, book_route_genesis_accounts,
+    BOOK_SHARD, BookRoute, FaultableCluster, ScenarioConfig,
+    a_divided_core_pays_out_under_one_clock, book_route_genesis_accounts, cutoff_genesis_accounts,
     departing_venue_split_bytes, epochs,
 };
-use support::SimCluster;
+use support::{SimCluster, sim_seed};
+
+/// Four quarters on hosts of their own: the cutoffs on two, the payer on
+/// a third.
+fn cutoff_cluster(seed: u64) -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            shard_size: 4,
+            vnodes_per_host: 1,
+            pool_surplus: 14,
+            num_shards: 4,
+            split_bytes: 0,
+            latency: std::time::Duration::from_millis(150),
+        },
+        seed,
+        &cutoff_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+/// Two core shards that commit a payment on either side of its deadline
+/// run its core under one clock, the earliest of theirs, so the payment
+/// lands in one cutoff.
+#[test]
+fn a_divided_core_runs_under_its_earliest_clock() {
+    let mut cluster = cutoff_cluster(sim_seed(42));
+    cluster.run_faultable(a_divided_core_pays_out_under_one_clock);
+}
 
 /// Execution votes the book's committee sends that are lost before the
 /// rest go through: enough that the local fills beside a route certify

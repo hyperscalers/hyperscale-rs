@@ -1047,8 +1047,9 @@ impl ExecutionCoordinator {
             // and on the crossings its legs consume, and on nothing else.
             // Its inbound escrow is its engagement, and the crossing bundle it consumes is
             // its counterpart's commitment, so neither half of the
-            // engagement exchange is filed, and it runs under its own
-            // committing block's clock.
+            // engagement exchange is filed. Its clock is read off its own
+            // commit and the bundles it waits on, as
+            // `ProvisioningTracker::transaction_clock` reads it.
             if classified.decomposed() {
                 self.provisioning
                     .record_required(tx_hash, requirements_of(member, tx.legs()));

@@ -302,10 +302,8 @@ impl TickCandidates {
             // off the record cells the committed claims proved.
             let arrivals =
                 arrivals_for(*tx_hash, candidate.member.classified(), provisioning, local);
-            // A remote-payer leg executes under the anchor its payer
-            // bundle carried; every other member under its own committing
-            // block's.
-            let anchor = provisioning.payer_anchor(*tx_hash);
+            let clock =
+                provisioning.transaction_clock(*tx_hash, &candidate.member, candidate.committed_ts);
             admitted.push(Admitted {
                 request: CrossShardExecutionRequest {
                     tx_hash: *tx_hash,
@@ -315,7 +313,7 @@ impl TickCandidates {
                     } else {
                         Vec::new()
                     },
-                    clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
+                    clock,
                     // Resolved against that clock once the schedule is
                     // in hand, where the member is seated.
                     prices: PriceTable::GENESIS,

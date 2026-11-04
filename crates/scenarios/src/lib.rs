@@ -19,6 +19,7 @@ mod support;
 
 mod book;
 mod contention;
+mod cutoff;
 mod execution;
 mod faults;
 mod fees;
@@ -38,6 +39,7 @@ mod witnesses;
 
 pub use book::{BOOK_SHARD, BOOK_VENUE_SHARD, BookRoute, RouteFill, book_route_genesis_accounts};
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
+pub use cutoff::{a_divided_core_pays_out_under_one_clock, cutoff_genesis_accounts};
 pub use execution::{
     STANDING_PAYMENTS, a_consumer_never_committing_declines_a_pushed_record,
     a_delivery_cut_off_past_its_window_is_owed,

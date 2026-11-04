@@ -119,14 +119,15 @@ pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
     *blake3_hash(data).as_bytes()
 }
 
-/// The environment a member executes under: its own clock, the epoch
-/// that clock falls in, and the seeds a seal written in that epoch can
-/// later be opened against.
+/// The environment a member executes under: its transaction clock, the
+/// epoch that clock falls in, and the seeds a seal written in that epoch
+/// can later be opened against.
 ///
-/// Every input is a fact about the transaction or about the beacon, and
-/// none is a fact about the block executing it — which is what lets the
-/// shards of a cross-shard transaction derive one receipt, and what
-/// leaves nothing for an attempt to grind.
+/// The clock and the epoch are facts about the transaction: every shard
+/// running the same body passes one clock, and the epoch is the grid's
+/// answer for it. The seed window is the tick's, off the window governing
+/// the block that seated it, so two shards running one core in ticks
+/// under different windows can pass two windows.
 fn env_at(ctx: &TickBatchContext<'_>, clock: WeightedTimestamp) -> EnvInputs {
     EnvInputs {
         clock_ms: clock.as_millis(),
