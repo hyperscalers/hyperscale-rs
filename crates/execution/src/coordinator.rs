@@ -314,9 +314,34 @@ enum SeatedSeeds {
     Held,
     /// The beacon has yet to publish these epochs' windows.
     Unpublished(BTreeSet<Epoch>),
-    /// A window this node no longer holds. Nothing brings an evicted
-    /// window back, so the tick is one this node cannot run.
-    Evicted,
+    /// The window of this epoch, which this node's schedule no longer
+    /// holds, so the tick is one this node cannot run.
+    Evicted(Epoch),
+}
+
+impl SeatedSeeds {
+    /// Whether the seeds let tick `tick_id`, seated from `lines`, run,
+    /// and the windows it waits on if so.
+    fn awaiting(self, tick_id: TickId, lines: &[TickLine]) -> (bool, Option<AwaitedSeeds>) {
+        match self {
+            Self::Held => (true, None),
+            Self::Unpublished(epochs) => (
+                true,
+                Some(AwaitedSeeds {
+                    epochs,
+                    held: HeldTick::of(lines),
+                }),
+            ),
+            Self::Evicted(epoch) => {
+                tracing::warn!(
+                    tick = %tick_id,
+                    epoch = epoch.inner(),
+                    "Holding a tick whose member's seed window this node has evicted"
+                );
+                (false, None)
+            }
+        }
+    }
 }
 
 /// Take into `env` the ring of each member window it lacks and
@@ -348,7 +373,7 @@ fn seat_seeds(
         if newest.is_none_or(|newest| epoch > newest) {
             unpublished.insert(epoch);
         } else {
-            return SeatedSeeds::Evicted;
+            return SeatedSeeds::Evicted(epoch);
         }
     }
     if unpublished.is_empty() {
@@ -1694,21 +1719,16 @@ impl ExecutionCoordinator {
             // halt recovery's crossing block names under a committee
             // epochs past its clock.
             let mut env = TickEnvironment::governing(committee, topology_schedule.windows());
-            let seeds = seat_seeds(&mut env, &requests, topology_schedule);
+            let (runs, awaiting) =
+                seat_seeds(&mut env, &requests, topology_schedule).awaiting(tick_id, lines);
             PendingTick {
                 tick: block.height,
                 tick_ts: block.ts,
                 env,
                 requests,
                 included: block.fees.clone(),
-                in_hand: in_hand && !matches!(seeds, SeatedSeeds::Evicted),
-                awaiting: match seeds {
-                    SeatedSeeds::Unpublished(epochs) => Some(AwaitedSeeds {
-                        epochs,
-                        held: HeldTick::of(lines),
-                    }),
-                    SeatedSeeds::Held | SeatedSeeds::Evicted => None,
-                },
+                in_hand: in_hand && runs,
+                awaiting,
             }
         });
         (pending, votes_to_replay, members)
