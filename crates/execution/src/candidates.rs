@@ -17,12 +17,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member};
 use hyperscale_engine::tick_select::{
-    CommittedInputs, Judged, ManifestBudget, Nameable, ProvisionalCells, Standing, readiness,
+    CommittedInputs, Judged, ManifestBudget, Nameable, ProvisionalCells, Standing, ready,
     select_members, terms_of_member,
 };
 use hyperscale_types::{
-    Deadline, EscrowedValue, Joins, MemberTerms, PriceTable, ShardId, ShardTrie, SubstateKey,
-    TickLine, Transaction, TxHash, Verified, WeightedTimestamp,
+    Deadline, EscrowedValue, MemberTerms, PriceTable, ShardId, ShardTrie, SubstateKey, TickLine,
+    Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
@@ -146,10 +146,6 @@ pub struct Admitted {
     /// Whose certificate its settlement waits on, and who its own is
     /// owed to.
     pub membership: Membership,
-    /// The terms it joins on. Everything composition admits runs; the
-    /// payer's leg whose counterparts never engaged runs and is attested
-    /// `Aborted` regardless.
-    pub joins: Joins,
     /// The table the block that committed this member named.
     ///
     /// What its own share is priced at: the abandonment of a member that
@@ -270,7 +266,6 @@ impl TickCandidates {
         &mut self,
         lines: &[TickLine],
         provisioning: &ProvisioningTracker,
-        anchor: WeightedTimestamp,
     ) -> (Vec<Admitted>, bool) {
         let local = self.local_shard;
         let mut admitted = Vec::new();
@@ -289,15 +284,11 @@ impl TickCandidates {
                 in_hand = false;
                 continue;
             };
-            if *joins == Joins::Executes {
-                in_hand &= readiness(
-                    *tx_hash,
-                    &Judged::of(&candidate.terms),
-                    Deadline::of_transaction(&candidate.tx),
-                    anchor,
-                    &Absorbed(provisioning),
-                ) == Some(Joins::Executes);
-            }
+            in_hand &= ready(
+                *tx_hash,
+                &Judged::of(&candidate.terms),
+                &Absorbed(provisioning),
+            );
             let reaches_beyond = candidate.member.reaches_beyond();
             // What arrived for the edges this member's legs consume, read
             // off the record cells the committed claims proved.
@@ -327,7 +318,6 @@ impl TickCandidates {
                     arrivals,
                 },
                 membership: Membership::of(&candidate.member),
-                joins: *joins,
                 committed_prices: candidate.committed_prices,
             });
         }
@@ -377,7 +367,7 @@ mod tests {
     use hyperscale_types::test_utils::{
         stub_abort_charge, test_prefix, test_transaction_with_prefixes,
     };
-    use hyperscale_types::{Settlement, WeightedTimestamp};
+    use hyperscale_types::{Joins, Settlement, WeightedTimestamp};
 
     use super::*;
 
@@ -433,7 +423,7 @@ mod tests {
             &[TickLine::Member {
                 staged: 0,
                 tx: hash,
-                joins: Joins::ExecutesAborted,
+                joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
                 pins: Capped::empty(),
@@ -446,12 +436,10 @@ mod tests {
                 crossings: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
-            ms(1_000),
         );
-        assert!(in_hand, "a member run attested aborted needs no bundle");
+        assert!(in_hand, "a member on this shard alone needs no bundle");
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].request.tx_hash, hash);
-        assert_eq!(admitted[0].joins, Joins::ExecutesAborted);
         assert_eq!(
             admitted[0].committed_prices, moved,
             "the committing block's table, not the composing tick's"
@@ -483,7 +471,6 @@ mod tests {
                 crossings: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
-            ms(1_000),
         );
         assert!(admitted.is_empty());
         assert!(!in_hand, "a named member with no body is a gap");
@@ -531,7 +518,6 @@ mod tests {
                 crossings: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
-            ms(1_000),
         );
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].membership.awaited(), &BTreeSet::from([local]));
@@ -610,7 +596,7 @@ mod tests {
         let line = |tx: TxHash| TickLine::Member {
             staged: 0,
             tx,
-            joins: Joins::ExecutesAborted,
+            joins: Joins::Executes,
             settlement: Settlement::Awaited,
             holds: Capped::empty(),
             pins: Capped::empty(),
@@ -622,7 +608,7 @@ mod tests {
             deadline: Deadline::of(ms(60_000)),
             crossings: Capped::empty(),
         };
-        let (admitted, _) = candidates.take_named(&members.map(line), &provisioning, ms(10_000));
+        let (admitted, _) = candidates.take_named(&members.map(line), &provisioning);
         assert_eq!(admitted.len(), 2);
         for seated in &admitted {
             assert_eq!(
@@ -687,7 +673,7 @@ mod tests {
                 PriceTable::GENESIS,
                 Classified::whole(),
             );
-            candidates.take_named(std::slice::from_ref(&line), provisioning, ms(2_000))
+            candidates.take_named(std::slice::from_ref(&line), provisioning)
         };
 
         let mut provisioning = ProvisioningTracker::new();
@@ -767,7 +753,7 @@ mod tests {
                 &[TickLine::Member {
                     staged: 0,
                     tx: hash,
-                    joins: Joins::ExecutesAborted,
+                    joins: Joins::Executes,
                     settlement: Settlement::Awaited,
                     holds: Capped::empty(),
                     pins: Capped::empty(),
@@ -780,7 +766,6 @@ mod tests {
                     crossings: Capped::empty(),
                 }],
                 &provisioning,
-                ms(1_000),
             );
             assert_eq!(admitted.len(), 1);
             admitted[0].request.arrivals.clone()

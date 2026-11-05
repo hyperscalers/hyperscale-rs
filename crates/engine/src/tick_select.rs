@@ -531,39 +531,19 @@ pub trait CommittedInputs {
     fn reshaping(&self, tx: TxHash) -> bool;
 }
 
-/// Whether a member can join a tick at `anchor`, and on what terms.
+/// Whether a member short of its deadline can run: it holds every bundle
+/// and crossing it requires, and a payer's counterparts have engaged.
 ///
-/// `None` while it waits: on a bundle or a crossing it requires, or on
-/// its payer's engagement short of `deadline`, the transaction's own.
-/// Past that deadline with a counterpart silent it joins, attested
-/// aborted.
+/// A member past its deadline never asks: [`select_members`] names it
+/// `Aborted`, running nothing, before its inputs are read.
 #[must_use]
-pub fn readiness(
-    tx: TxHash,
-    judged: &Judged<'_>,
-    deadline: Deadline,
-    anchor: WeightedTimestamp,
-    inputs: &dyn CommittedInputs,
-) -> Option<Joins> {
-    let provisioned = judged
+pub fn ready(tx: TxHash, judged: &Judged<'_>, inputs: &dyn CommittedInputs) -> bool {
+    judged
         .engages
         .iter()
         .all(|&shard| inputs.engaged(shard, tx))
-        && judged.records().all(|key| inputs.arrived(key, tx));
-    if !provisioned {
-        return None;
-    }
-    if !judged.waits {
-        return Some(Joins::Executes);
-    }
-    let silent = judged.reach.iter().any(|&shard| !inputs.engaged(shard, tx));
-    if !silent {
-        Some(Joins::Executes)
-    } else if deadline.passed(anchor) {
-        Some(Joins::ExecutesAborted)
-    } else {
-        None
-    }
+        && judged.records().all(|key| inputs.arrived(key, tx))
+        && (!judged.waits || judged.reach.iter().all(|&shard| inputs.engaged(shard, tx)))
 }
 
 /// Committed inputs as the sets a coordinator gathers for the members
@@ -1576,16 +1556,16 @@ pub fn select_members<'a>(
         if judged.settlement == Settlement::Shared && inputs.reshaping(tx) {
             continue;
         }
-        let Some(joins) = readiness(tx, &judged, deadline, anchor, inputs) else {
+        if !ready(tx, &judged, inputs) {
             continue;
-        };
+        }
         let abortable = judged.abortable();
         if !holds.is_empty() && holds.blocks(judged.declared) {
             continue;
         }
         let line = TickLine::Member {
             tx,
-            joins,
+            joins: Joins::Executes,
             settlement: judged.settlement,
             holds: if abortable {
                 judged.declared.clone()
@@ -1742,9 +1722,7 @@ pub fn contentions(
             .iter()
             .filter(|holder| holder.refuses(&waiting))
             .collect();
-        if refusing.is_empty()
-            || readiness(row.tx, &waiting, row.deadline, anchor, inputs).is_none()
-        {
+        if refusing.is_empty() || !ready(row.tx, &waiting, inputs) {
             continue;
         }
         contended.extend(refusing.into_iter().map(|holder| Contention {
@@ -2589,8 +2567,7 @@ mod tests {
     }
 
     /// A member waits on every bundle and crossing it requires, and a
-    /// payer on its counterparts' engagement until the wait's deadline,
-    /// past which it runs attested aborted.
+    /// payer on its counterparts' engagement.
     #[test]
     fn a_member_is_ready_once_its_committed_inputs_are() {
         let crossing = CrossingId {
@@ -2605,46 +2582,59 @@ mod tests {
             crossings: Capped::from_array([crossing]),
             ..leg(vec![], &[PEER])
         };
-        let deadline = Deadline::of(ms(5_000));
-        let ready = |terms: &MemberTerms, at: WeightedTimestamp, held: &Held| {
-            readiness(tx(1), &Judged::of(terms), deadline, at, held)
-        };
+        let is_ready = |terms: &MemberTerms, held: &Held| ready(tx(1), &Judged::of(terms), held);
         let mut held = Held::default();
-        assert_eq!(ready(&terms, ms(0), &held), None);
+        assert!(!is_ready(&terms, &held));
         held.engaged.insert((PEER, tx(1)));
-        assert_eq!(ready(&terms, ms(0), &held), None, "the crossing");
+        assert!(!is_ready(&terms, &held), "the crossing");
         held.arrived.insert((record, tx(2)));
-        assert_eq!(
-            ready(&terms, ms(0), &held),
-            None,
+        assert!(
+            !is_ready(&terms, &held),
             "an arrival naming another transaction answers nothing"
         );
         held.arrived.insert((record, tx(1)));
-        assert_eq!(ready(&terms, ms(0), &held), Some(Joins::Executes));
+        assert!(is_ready(&terms, &held));
 
         let payer = MemberTerms {
             waits: true,
             ..leg(vec![], &[])
         };
         let silent = Held::default();
-        assert_eq!(
-            ready(
-                &payer,
-                deadline.at().minus(Duration::from_millis(1)),
-                &silent
-            ),
-            None
-        );
-        assert_eq!(
-            ready(&payer, deadline.at(), &silent),
-            Some(Joins::ExecutesAborted)
-        );
-        assert_eq!(
-            ready(&payer, ms(0), &held),
-            Some(Joins::Executes),
+        assert!(!is_ready(&payer, &silent));
+        assert!(
+            is_ready(&payer, &held),
             "an engaged counterpart ends the wait"
         );
-        assert_eq!(ready(&alone(vec![]), ms(0), &silent), Some(Joins::Executes));
+        assert!(is_ready(&alone(vec![]), &silent));
+    }
+
+    /// A waiting payer whose counterparts stay silent past its deadline
+    /// is named `Aborted` and never runs.
+    #[test]
+    fn a_silent_payer_past_its_deadline_is_aborted() {
+        let deadline = Deadline::of(ms(5_000));
+        let payer = MemberTerms {
+            waits: true,
+            ..leg(vec![], &[])
+        };
+        for (anchor, expected) in [
+            (deadline.at().minus(Duration::from_millis(1)), None),
+            (deadline.at(), Some(Joins::Aborted)),
+        ] {
+            let lines = select_members(
+                ShardId::ROOT,
+                anchor,
+                [pending(tx(1), &payer, deadline)],
+                &Held::default(),
+                &mut ProvisionalCells::default(),
+                &mut ManifestBudget::default(),
+            );
+            let joins = lines.iter().find_map(|line| match line {
+                TickLine::Member { joins, .. } => Some(*joins),
+                _ => None,
+            });
+            assert_eq!(joins, expected, "at {anchor:?}");
+        }
     }
 
     /// Members reaching beyond the shard are named first, a member an
@@ -3093,49 +3083,47 @@ mod tests {
             )
         };
         let pair = (vec![unanswerable(2, 1), fate_of(1)], vec![]);
-        for joins in [Joins::Executes, Joins::ExecutesAborted] {
-            for covered in [false, true] {
-                let row = in_flight(joins, covered);
-                for anchor in [before, deadline.at()] {
-                    assert_eq!(
-                        lines_over(&row, anchor, Evidence::Unreadable),
-                        pair,
-                        "{joins:?}, covered {covered}, at {anchor:?}",
-                    );
-                    assert_eq!(
-                        lines_over(&row, anchor, Evidence::Unknown),
-                        (vec![], vec![tx(1)]),
-                    );
-                }
-                for answered in [Evidence::Readable, Evidence::Live { terminating: true }] {
-                    assert_eq!(
-                        lines_over(&row, before, answered),
-                        (vec![], vec![]),
-                        "a shard that can answer keeps it short of its deadline",
-                    );
-                    let (lines, missing) = lines_over(&row, deadline.at(), answered);
-                    assert!(missing.is_empty());
-                    if covered {
-                        assert!(
-                            matches!(
-                                lines[..],
-                                [
-                                    TickLine::Member {
-                                        joins: Joins::Aborted,
-                                        ..
-                                    },
-                                    TickLine::Discard {
-                                        cause: DiscardCause::Abandoned(_),
-                                        ..
-                                    },
-                                ]
-                            ),
-                            "a covered member a shard can still answer for is aborted at its \
+        for covered in [false, true] {
+            let row = in_flight(Joins::Executes, covered);
+            for anchor in [before, deadline.at()] {
+                assert_eq!(
+                    lines_over(&row, anchor, Evidence::Unreadable),
+                    pair,
+                    "covered {covered}, at {anchor:?}",
+                );
+                assert_eq!(
+                    lines_over(&row, anchor, Evidence::Unknown),
+                    (vec![], vec![tx(1)]),
+                );
+            }
+            for answered in [Evidence::Readable, Evidence::Live { terminating: true }] {
+                assert_eq!(
+                    lines_over(&row, before, answered),
+                    (vec![], vec![]),
+                    "a shard that can answer keeps it short of its deadline",
+                );
+                let (lines, missing) = lines_over(&row, deadline.at(), answered);
+                assert!(missing.is_empty());
+                if covered {
+                    assert!(
+                        matches!(
+                            lines[..],
+                            [
+                                TickLine::Member {
+                                    joins: Joins::Aborted,
+                                    ..
+                                },
+                                TickLine::Discard {
+                                    cause: DiscardCause::Abandoned(_),
+                                    ..
+                                },
+                            ]
+                        ),
+                        "a covered member a shard can still answer for is aborted at its \
                              deadline: {lines:?}",
-                        );
-                    } else {
-                        assert!(lines.is_empty(), "{lines:?}");
-                    }
+                    );
+                } else {
+                    assert!(lines.is_empty(), "{lines:?}");
                 }
             }
         }
@@ -3202,38 +3190,36 @@ mod tests {
 
     /// A shared member in flight that no record covers is aborted once
     /// its stating window closes, beside the `Abandoned` discard of its
-    /// tick, whether or not it ran: it never stated, so no sibling read a
-    /// yes of it. A shard it reaches that can no longer answer still has
-    /// it fated, and one not yet folded still holds the voter back.
+    /// tick, though it ran: it never stated, so no sibling read a yes of
+    /// it. A shard it reaches that can no longer answer still has it
+    /// fated, and one not yet folded still holds the voter back.
     #[test]
     fn a_shared_member_in_flight_is_aborted_at_its_stating_window_end_without_a_record() {
         let deadline = Deadline::of(ms(10_000));
         let end = Window::Stating.of(deadline).end;
-        for joins in [Joins::Executes, Joins::ExecutesAborted] {
-            let row = held_in(1, deadline, 2, joins, Settlement::Shared);
-            for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
+        let row = held_in(1, deadline, 2, Joins::Executes, Settlement::Shared);
+        for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
+            assert_eq!(
+                lines_over(&row, end.minus(Duration::from_millis(1)), answered),
+                (vec![], vec![]),
+                "under {answered:?} it stands inside its stating window",
+            );
+            for anchor in [end, end.plus(Duration::from_hours(1))] {
                 assert_eq!(
-                    lines_over(&row, end.minus(Duration::from_millis(1)), answered),
-                    (vec![], vec![]),
-                    "{joins:?} under {answered:?} stands inside its stating window",
+                    lines_over(&row, anchor, answered),
+                    (aborted_in(1, deadline, 2), vec![]),
+                    "under {answered:?} at {anchor:?}",
                 );
-                for anchor in [end, end.plus(Duration::from_hours(1))] {
-                    assert_eq!(
-                        lines_over(&row, anchor, answered),
-                        (aborted_in(1, deadline, 2), vec![]),
-                        "{joins:?} under {answered:?} at {anchor:?}",
-                    );
-                }
             }
-            assert_eq!(
-                lines_over(&row, end, Evidence::Unreadable),
-                (vec![unanswerable(2, 1), fate_of(1)], vec![]),
-            );
-            assert_eq!(
-                lines_over(&row, end, Evidence::Unknown),
-                (vec![], vec![tx(1)])
-            );
         }
+        assert_eq!(
+            lines_over(&row, end, Evidence::Unreadable),
+            (vec![unanswerable(2, 1), fate_of(1)], vec![]),
+        );
+        assert_eq!(
+            lines_over(&row, end, Evidence::Unknown),
+            (vec![], vec![tx(1)])
+        );
     }
 
     /// Past its deadline and short of its stating window's end, a shared

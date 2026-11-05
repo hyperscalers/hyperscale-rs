@@ -5040,15 +5040,15 @@ mod tests {
         let mut parent = Entries::default();
         parent.fold(&committing(1, &[1, 2]));
         parent.fold(&naming(2, vec![joining(1, Joins::Executes)]));
-        // Runs two of its own on either dispatched terms, one of them
-        // under a record naming it and the other consuming no crossing;
+        // Runs two of its own, one of them under a record naming it and
+        // the other consuming no crossing;
         // aborts a third; leaves a fourth waiting; and names a standing
         // row beside them.
         let mut block = MemberInputs {
             covered: vec![tx(3), tx(6)],
             manifest: Arc::new(Capped::from_array([
                 joining(3, Joins::Executes),
-                joining(4, Joins::ExecutesAborted),
+                joining(4, Joins::Executes),
                 joining(5, Joins::Aborted),
                 joining(2, Joins::Executes),
             ])),
@@ -5430,7 +5430,7 @@ mod tests {
 
         let mut own = MemberInputs {
             manifest: Arc::new(Capped::from_array([
-                joining(3, Joins::ExecutesAborted),
+                joining(3, Joins::Executes),
                 joining(4, Joins::Aborted),
             ])),
             ..committing(5, &[3, 4])
@@ -9218,9 +9218,6 @@ mod tests {
                         }
                         let stated = &self.terms[&named];
                         let line = match how {
-                            1 if !stated.settlement.alone() => {
-                                line_for(stated, named, Joins::ExecutesAborted)
-                            }
                             0 | 1 => line_for(stated, named, Joins::Executes),
                             _ => abort_of(stated, named),
                         };

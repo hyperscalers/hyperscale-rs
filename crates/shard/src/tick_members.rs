@@ -430,7 +430,7 @@ mod tests {
             line(3, Joins::Executes),
             line(4, Joins::Executes),
             line(5, Joins::Aborted),
-            line(6, Joins::ExecutesAborted),
+            line(6, Joins::Executes),
         ];
         let kept: Vec<TxHash> = stated_terms(derived, &lines)
             .into_iter()

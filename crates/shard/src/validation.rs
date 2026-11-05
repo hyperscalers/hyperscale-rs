@@ -6507,7 +6507,7 @@ pub mod tests {
         assert!(
             validate_terms_section(&carrying(
                 vec![first, third],
-                vec![joining(second, Joins::ExecutesAborted)],
+                vec![joining(second, Joins::Executes)],
             ))
             .is_ok()
         );
@@ -6535,22 +6535,13 @@ pub mod tests {
     fn a_block_stating_crossing_terms_for_a_member_it_runs_is_admitted() {
         let txs = transactions_in_order(3);
         let [first, second, third] = [txs[0].hash(), txs[1].hash(), txs[2].hash()];
-        for runs in [Joins::Executes, Joins::ExecutesAborted] {
+        for entries in [vec![first, second, third], vec![first, third]] {
             assert_eq!(
                 validate_terms_section(&carrying_terms(
                     &txs,
-                    vec![first, second, third],
+                    entries,
                     true,
-                    vec![joining(second, runs)],
-                )),
-                Ok(())
-            );
-            assert_eq!(
-                validate_terms_section(&carrying_terms(
-                    &txs,
-                    vec![first, third],
-                    true,
-                    vec![joining(second, runs)],
+                    vec![joining(second, Joins::Executes)],
                 )),
                 Ok(())
             );

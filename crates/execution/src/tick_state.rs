@@ -228,15 +228,10 @@ struct Seat {
     /// Dispatched to the engine and still owing a result. A tick is
     /// votable once no seat is.
     awaiting_result: bool,
-    /// Attested `Aborted` whatever its execution said: a payer's leg
-    /// whose counterparts never engaged, or a member past its own
-    /// deadline that never ran.
-    aborted: bool,
     /// This tick *is* the member's abandonment — it was seated past the
-    /// window that bounds it, running nothing. Kept apart from
-    /// [`Self::aborted`], which a member that ran can also carry, because
-    /// what it answers is whether abandoning the member again would
-    /// discard the abort already waiting to be certified.
+    /// window that bounds it, running nothing, and attests it `Aborted`.
+    /// It also answers whether abandoning the member again would discard
+    /// the abort already waiting to be certified.
     abandons: bool,
     /// The engine's outcome.
     result: Option<ExecutionOutcome>,
@@ -267,7 +262,6 @@ impl Seat {
             membership,
             charged,
             awaiting_result: joins.dispatched(),
-            aborted: joins.aborts(),
             abandons: matches!(joins, Joins::Aborted),
             result: None,
             receipt: None,
@@ -748,7 +742,7 @@ impl TickState {
                     .seats
                     .get(tx_hash)
                     .expect("a tick seats every member it names");
-                let outcome = if seat.aborted {
+                let outcome = if seat.abandons {
                     ExecutionOutcome::Aborted
                 } else {
                     seat.result
@@ -1141,7 +1135,7 @@ impl TickState {
             local_ec_emitted = self.local_ec_emitted,
             local_receipts_ready,
             execution_results = self.seats.values().filter(|seat| seat.result.is_some()).count(),
-            aborted = self.seats.values().filter(|seat| seat.aborted).count(),
+            aborted = self.seats.values().filter(|seat| seat.abandons).count(),
             ecs_collected = self.execution_certificates.len(),
             determined_ready = self.determined_ready(),
             stating_ready = self.stating_ready(),

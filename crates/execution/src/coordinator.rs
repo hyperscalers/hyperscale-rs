@@ -1625,7 +1625,7 @@ impl ExecutionCoordinator {
                 .member
                 .classified()
                 .local_price(&request.transaction, local_shard, &prices),
-            member.joins,
+            Joins::Executes,
         );
         self.ticks.assign_tx(member.request.tx_hash, tick_id);
         self.counterparts
@@ -1693,9 +1693,7 @@ impl ExecutionCoordinator {
                 | TickLine::End { .. } => {}
             }
         }
-        let (admitted, in_hand) = self
-            .candidates
-            .take_named(lines, &self.provisioning, block.ts);
+        let (admitted, in_hand) = self.candidates.take_named(lines, &self.provisioning);
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());

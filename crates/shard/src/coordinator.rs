@@ -11556,10 +11556,6 @@ mod tests {
                 "an abort of a member in flight no departure covers",
             ),
             (
-                vec![joining(&first, Joins::ExecutesAborted), member(&second)],
-                "a member run aborted before its engagement deadline",
-            ),
-            (
                 vec![member(&held), member(&first), member(&second)],
                 "a member already in flight named again",
             ),

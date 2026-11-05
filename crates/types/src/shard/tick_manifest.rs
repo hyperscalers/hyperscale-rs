@@ -23,10 +23,6 @@ use crate::{
 pub enum Joins {
     /// In the batch, attested on what execution says.
     Executes,
-    /// In the batch, attested `Aborted` whatever it says: the payer's
-    /// leg whose counterparts never engaged. It still executes, because
-    /// the charge that abort settles is what the execution builds.
-    ExecutesAborted,
     /// Not in the batch. Past the deadline that bounds it, or the
     /// victim of a hold cycle the block proves, so no execution here
     /// reaches an outcome, and the tick attests `Aborted` on nothing but
@@ -39,13 +35,7 @@ impl Joins {
     /// waits for a result before it can vote.
     #[must_use]
     pub const fn dispatched(self) -> bool {
-        matches!(self, Self::Executes | Self::ExecutesAborted)
-    }
-
-    /// Whether the tick attests `Aborted` whatever execution says.
-    #[must_use]
-    pub const fn aborts(self) -> bool {
-        matches!(self, Self::ExecutesAborted | Self::Aborted)
+        matches!(self, Self::Executes)
     }
 }
 

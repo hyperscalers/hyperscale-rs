@@ -708,7 +708,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                 let line = TickLine::Member {
                     staged: 0,
                     tx: widest_tx,
-                    joins: Joins::ExecutesAborted,
+                    joins: Joins::Executes,
                     settlement: Settlement::Awaited,
                     holds: Capped::new((0..holds).map(|at| widest_hold(at, mode)).collect())
                         .expect("a list under the cap"),
@@ -807,7 +807,7 @@ fn a_determined_lines_weight_bounds_its_encoding_at_every_pin_count() {
         let line = TickLine::Member {
             staged: u64::MAX,
             tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
-            joins: Joins::ExecutesAborted,
+            joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             pins: widest_pins(pins),
@@ -1136,7 +1136,7 @@ fn full_manifest() -> Vec<TickLine> {
     let line = TickLine::Member {
         staged: 0,
         tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
-        joins: Joins::ExecutesAborted,
+        joins: Joins::Executes,
         settlement: Settlement::Awaited,
         holds: Capped::new(
             (0..64)
