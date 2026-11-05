@@ -30,8 +30,8 @@ pub enum MemberCollection {
     /// The pins of the placed rows a counterpart shares the verdict on,
     /// by key, class and place.
     Queue,
-    /// The pins of the determined rows standing `Pending`, by key, class
-    /// and place.
+    /// The pins of the determined rows and legs standing `Pending`, by
+    /// key and place.
     Waiters,
     /// The pins each tick whose determined half is owed takes, by height
     /// and chunk.

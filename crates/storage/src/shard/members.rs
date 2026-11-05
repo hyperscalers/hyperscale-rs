@@ -1478,7 +1478,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     }
 
     /// Place the shared rows the block places, test each for head, and
-    /// set the refusals placing them and the block's determined commits
+    /// set the refusals placing them and the block's unshared commits
     /// first show.
     ///
     /// The rows placed are each shared row the block commits that pays
@@ -1488,16 +1488,16 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// on the line's terms as a `Pending` row until the line names it.
     ///
     /// Refusals are read before any line is named, over every determined
-    /// member the block commits, named or not, so a fold of the block's
-    /// content and then of the block as carried sets what one fold of
-    /// the block does.
+    /// member and leg the block commits a row for, named or not, so a
+    /// fold of the block's content and then of the block as carried sets
+    /// what one fold of the block does.
     fn place(
         &mut self,
         inputs: &MemberInputs,
         stated: &BTreeMap<TxHash, &MemberTerms>,
         committed: BTreeSet<TxHash>,
         completed: BTreeSet<TxHash>,
-        determined: &[(TxHash, Pins)],
+        unshared: &[(TxHash, Pins)],
     ) {
         let mut candidates: BTreeSet<TxHash> = committed.into_iter().chain(completed).collect();
         candidates.extend(self.stand_line_runs(inputs, stated));
@@ -1526,7 +1526,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         for &tx in &placed {
             self.try_head(tx, inputs);
         }
-        self.refusals(inputs, &placed, determined);
+        self.refusals(inputs, &placed, unshared);
     }
 
     /// Stand each shared transaction the block commits and runs on no
@@ -1605,17 +1605,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         standing
     }
 
-    /// The refusals `placed`, the rows the block places, and
-    /// `determined`, the determined members it commits, first show: each
-    /// unnamed shared row earlier on a key that refuses a placed row or
-    /// a determined commit, and each placed row that refuses a standing
+    /// The refusals `placed`, the rows the block places, and `unshared`,
+    /// the determined members and legs it commits a row for, first show:
+    /// each unnamed shared row earlier on a key that refuses a placed row
+    /// or an unshared commit, and each placed row that refuses a standing
     /// waiter, takes the block's clock as its `blocked_at`.
-    fn refusals(
-        &mut self,
-        inputs: &MemberInputs,
-        placed: &[TxHash],
-        determined: &[(TxHash, Pins)],
-    ) {
+    fn refusals(&mut self, inputs: &MemberInputs, placed: &[TxHash], unshared: &[(TxHash, Pins)]) {
         // Per key and class, the order key below which every standing
         // entry refuses some claim; `None` for all of them. Each span is
         // then read once, however many claims ask of it.
@@ -1650,9 +1645,9 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 }
             }
         }
-        // A quiet queue refuses no determined commit.
+        // A quiet queue refuses no unshared commit.
         if !self.queue.is_empty(self.state) {
-            for (_, pins) in determined {
+            for (_, pins) in unshared {
                 for pin in pins.iter() {
                     ask(pin, None);
                 }
@@ -1669,12 +1664,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
     }
 
-    /// Give each determined row the block commits and leaves `Pending` a
-    /// place behind the block's shared places, ranked from
-    /// [`WAITER_RANK`] in hash order among every determined member the
-    /// block commits.
-    fn wait(&mut self, inputs: &MemberInputs, determined: &[(TxHash, Pins)]) {
-        for (at, (tx, _)) in determined.iter().enumerate() {
+    /// Give each determined row or leg the block commits and leaves
+    /// `Pending` a place behind the block's shared places, ranked from
+    /// [`WAITER_RANK`] in hash order among every unshared commit the
+    /// block makes a row for, those its own lines run included.
+    fn wait(&mut self, inputs: &MemberInputs, unshared: &[(TxHash, Pins)]) {
+        for (at, (tx, _)) in unshared.iter().enumerate() {
             let Some(mut row) = self.member(*tx) else {
                 continue;
             };
@@ -1683,7 +1678,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 && row
                     .waiting
                     .as_ref()
-                    .is_some_and(|waiting| waiting.settlement == Settlement::Alone);
+                    .is_some_and(|waiting| waiting.settlement != Settlement::Shared);
             if !waits {
                 continue;
             }
@@ -2427,15 +2422,20 @@ fn kept_by_a_run(settlement: Settlement, stated: &Crossings) -> Crossings {
     }
 }
 
-/// Every member the block commits that its own certificate settles, in
-/// hash order, with its pins here: off its terms entry, or off the line
-/// running it where the block states none. The same list whether the
-/// block's lines are folded with its content or after it.
-fn determined_commits(
+/// Every member the block commits a row for on terms no counterpart
+/// shares the verdict on, a determined member or a leg, in hash order,
+/// with its pins here: off its terms entry, or, where the block states
+/// none, off the line running it, a determined line's pins or a leg's
+/// holds. The same list whether the block's lines are folded with its
+/// content or after it, since a leg its committing block runs has no
+/// terms entry there. `rowless` are the commits that get no row, those
+/// under an accepted row's key: they wait on nothing and refuse nothing.
+fn unshared_commits(
     inputs: &MemberInputs,
     stated: &BTreeMap<TxHash, &MemberTerms>,
+    rowless: &BTreeSet<TxHash>,
 ) -> Vec<(TxHash, Pins)> {
-    let run: BTreeMap<TxHash, &Pins> = inputs
+    let mut run: BTreeMap<TxHash, Pins> = inputs
         .manifest
         .iter()
         .filter_map(|line| match line {
@@ -2445,7 +2445,14 @@ fn determined_commits(
                 settlement: Settlement::Alone,
                 pins,
                 ..
-            } if joins.dispatched() => Some((*tx, pins)),
+            } if joins.dispatched() => Some((*tx, pins.clone())),
+            TickLine::Member {
+                tx,
+                joins,
+                settlement: Settlement::Awaited,
+                holds,
+                ..
+            } if joins.dispatched() => Some((*tx, pins_of(holds, inputs.shard))),
             TickLine::Member { .. }
             | TickLine::Fate { .. }
             | TickLine::Discard { .. }
@@ -2455,11 +2462,12 @@ fn determined_commits(
     let committed: BTreeSet<TxHash> = inputs.transactions.iter().map(|(tx, _)| *tx).collect();
     committed
         .into_iter()
+        .filter(|tx| !rowless.contains(tx))
         .filter_map(|tx| {
             stated.get(&tx).map_or_else(
-                || run.get(&tx).map(|pins| (tx, (*pins).clone())),
+                || run.remove(&tx).map(|pins| (tx, pins)),
                 |terms| {
-                    (terms.settlement == Settlement::Alone)
+                    (terms.settlement != Settlement::Shared)
                         .then(|| (tx, pins_of(&terms.declared, inputs.shard)))
                 },
             )
@@ -2510,13 +2518,13 @@ pub(crate) fn owed_by_entries(terms: &[StatedTerms]) -> BTreeMap<TxHash, Owes> {
 /// wait on; the shared rows it commits that pay the fee here or wait on
 /// no record, and those whose last record it read, take places in hash
 /// order and are tested for head; the refusals placing them and the
-/// block's determined commits show set `blocked_at`; the lines name,
-/// placing each leg they run on awaited terms behind every other place
-/// of the block, so what it holds stands in the queue until it leaves;
-/// the determined rows it commits and leaves waiting take places behind
-/// its shared ones; and, where the fold deleted a queue entry or a
-/// tick's pins, every row behind is tested again. A tick's pins go with
-/// its determined half.
+/// block's determined and leg commits show set `blocked_at`; the lines
+/// name, placing each leg they run on awaited terms behind every other
+/// place of the block, so what it holds stands in the queue until it
+/// leaves; the determined rows and legs it commits and leaves waiting
+/// take places behind its shared ones; and, where the fold deleted a
+/// queue entry or a tick's pins, every row behind is tested again. A
+/// tick's pins go with its determined half.
 ///
 /// Total over any terms section. A transaction's terms are the first
 /// entry naming it; an entry naming no transaction of the block, or a
@@ -2549,8 +2557,8 @@ enum Pass {
     /// The block whole, as committed or carried.
     Block,
     /// A block's content ahead of its lines, which a fold of the block
-    /// with them follows: the determined members it commits take their
-    /// waiter places there, so this fold gives them none.
+    /// with them follows: the determined members and legs it commits
+    /// take their waiter places there, so this fold gives them none.
     Content,
 }
 
@@ -2591,7 +2599,7 @@ fn fold(
     for entry in &inputs.terms {
         stated.entry(entry.tx).or_insert(&entry.terms);
     }
-    let mut committed = BTreeSet::new();
+    let (mut committed, mut rowless) = (BTreeSet::new(), BTreeSet::new());
     for &(tx, deadline) in &inputs.transactions {
         // An accepted row keeps its key against a transaction committed
         // under it: only an end deletes it.
@@ -2599,6 +2607,7 @@ fn fold(
             .keyed(tx)
             .is_some_and(|row| row.state.ended_by_a_line())
         {
+            rowless.insert(tx);
             continue;
         }
         if let Some(terms) = stated.get(&tx) {
@@ -2618,11 +2627,11 @@ fn fold(
         }
     }
     let completed = family.arrive(&inputs.arrivals);
-    let determined = determined_commits(inputs, &stated);
-    family.place(inputs, &stated, committed, completed, &determined);
+    let unshared = unshared_commits(inputs, &stated, &rowless);
+    family.place(inputs, &stated, committed, completed, &unshared);
     family.name(inputs);
     if pass == Pass::Block {
-        family.wait(inputs, &determined);
+        family.wait(inputs, &unshared);
     }
     let heard = family.hear(&inputs.heard);
 
@@ -3021,9 +3030,9 @@ impl MemberIndex {
 
     /// Fold a block's content in ahead of its lines, as a proposer
     /// names them and a voter judges them: [`Self::advance`], except that
-    /// the determined members the block commits take no waiter place,
-    /// which the fold of the block with its lines that follows gives
-    /// them as one fold of the block does.
+    /// the determined members and legs the block commits take no waiter
+    /// place, which the fold of the block with its lines that follows
+    /// gives them as one fold of the block does.
     ///
     /// # Panics
     ///
@@ -3276,6 +3285,14 @@ mod tests {
 
         fn fold(&mut self, inputs: &MemberInputs) {
             let writes = member_writes(&*self, inputs);
+            self.apply(&writes);
+        }
+
+        /// Fold `inputs` as a block's content, as a proposer or a voter
+        /// folds it ahead of its lines.
+        fn fold_content(&mut self, inputs: &MemberInputs) {
+            let family = MemberFamily::of(inputs.shard);
+            let (writes, ..) = fold(&*self, &family, inputs, None, Pass::Content);
             self.apply(&writes);
         }
     }
@@ -5020,7 +5037,7 @@ mod tests {
         let mut once = MemberIndex::empty(LOCAL);
         for step in &steps {
             let mut twice = once.clone();
-            twice.advance(&MemberInputs {
+            twice.advance_content(&MemberInputs {
                 manifest: Arc::new(Capped::empty()),
                 ..step.clone()
             });
@@ -5349,7 +5366,7 @@ mod tests {
         assert_eq!(stated.terms.len(), 1, "its terms carry crossings");
 
         let mut derived = Entries::default();
-        derived.fold(&MemberInputs {
+        derived.fold_content(&MemberInputs {
             manifest: Arc::new(Capped::empty()),
             ..block
         });
@@ -8355,20 +8372,28 @@ mod tests {
             Fate,
         }
 
-        /// A leg on awaited terms runs a write of A; a shared read of A
-        /// placed after it stands behind it.
+        /// A leg on awaited terms waits in the waiter run, then runs a
+        /// write of A; a shared read of A placed after it stands behind
+        /// it.
         fn leg_then_read() -> (Entries, MemberTerms) {
             let mut store = Entries::default();
             let leg = terms(&Kind::Leg, &[write(A)]);
             let mut first = block(1);
             commit(&mut first, 1, leg.clone());
             store.fold(&first);
-            assert_eq!(row(&store, 1).queued, None, "a leg waiting holds nothing");
+            assert_eq!(
+                row(&store, 1).queued,
+                Some(at(1, WAITER_RANK)),
+                "a leg waiting is placed in the waiter run"
+            );
+            assert_eq!(count(&store, MemberCollection::Waiters), 1);
+            assert_eq!(count(&store, MemberCollection::Queue), 0);
             let mut second = block(2);
             lines(&mut second, vec![run(1, &leg)]);
             store.fold(&second);
             assert_eq!(row(&store, 1).queued, Some(at(2, AWAITED_RANK)));
             assert_eq!(count(&store, MemberCollection::Queue), 1);
+            assert_eq!(count(&store, MemberCollection::Waiters), 0);
             let mut third = block(3);
             commit(&mut third, 2, terms(&Kind::Payer(vec![]), &[read(A)]));
             store.fold(&third);
@@ -8416,7 +8441,9 @@ mod tests {
         }
 
         /// A shared row placed before the leg runs is not held behind it:
-        /// the leg's place follows every place its block takes.
+        /// the leg's place follows every place its block takes. The leg
+        /// is a commit the shared row refuses, named or not, so the row
+        /// takes the block's clock as its `blocked_at`.
         #[test]
         fn an_awaited_leg_stands_behind_the_shared_places_of_its_block() {
             let mut store = Entries::default();
@@ -8425,9 +8452,180 @@ mod tests {
             commit(&mut first, 1, leg.clone());
             commit(&mut first, 2, terms(&Kind::Payer(vec![]), &[read(A)]));
             lines(&mut first, vec![run(1, &leg)]);
-            store.fold(&first);
+            store.fold(&carried(&first));
             assert_eq!(headed(&store, 2), Some((BlockHeight::new(1), clock(1))));
             assert_eq!(row(&store, 1).queued, Some(at(1, AWAITED_RANK)));
+            assert_eq!(row(&store, 2).blocked_at, Some(clock(1)));
+        }
+
+        #[test]
+        fn a_pending_awaited_leg_waits_in_waiters() {
+            let mut store = Entries::default();
+            let mut first = block(1);
+            commit(&mut first, 1, terms(&Kind::Leg, &[write(A), read(B)]));
+            store.fold(&first);
+            let leg = row(&store, 1);
+            assert_eq!(leg.queued, Some(at(1, WAITER_RANK)));
+            assert_eq!(leg.state, RowState::Pending);
+            let entries = PinMemo::new(LOCAL).entries(Some(&leg));
+            assert_eq!(entries.waiters.len(), 2, "one per pin, whatever its modes");
+            assert!(entries.queue.is_empty() && entries.behind.is_none());
+            assert_eq!(count(&store, MemberCollection::Waiters), 2);
+            assert_eq!(count(&store, MemberCollection::Queue), 0);
+        }
+
+        /// The line running a leg rewrites its row once: the fold that
+        /// takes its waiter entries out puts its queue entries in.
+        #[test]
+        fn a_run_awaited_leg_leaves_waiters_for_its_queue_place() {
+            let mut store = Entries::default();
+            let leg = terms(&Kind::Leg, &[write(A), debit(B)]);
+            let mut first = block(1);
+            commit(&mut first, 1, leg.clone());
+            store.fold(&first);
+            assert_eq!(count(&store, MemberCollection::Waiters), 2);
+
+            let mut second = block(2);
+            lines(&mut second, vec![run(1, &leg)]);
+            let writes = member_writes(&store, &second);
+            let written = |kind: MemberCollection| {
+                let collection = kind.of(LOCAL).1;
+                writes
+                    .iter()
+                    .filter(|(key, _)| key.collection == collection)
+                    .map(|(_, change)| change.is_some())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(written(MemberCollection::Members), vec![true]);
+            assert_eq!(written(MemberCollection::Waiters), vec![false, false]);
+            assert_eq!(
+                written(MemberCollection::Queue),
+                vec![true; 3],
+                "a write and a debit's delta and debit classes"
+            );
+            store.apply(&writes);
+            let ran = row(&store, 1);
+            assert!(awaited_holding(&ran));
+            assert_eq!(ran.queued, Some(at(2, AWAITED_RANK)));
+            assert_eq!(count(&store, MemberCollection::Waiters), 0);
+        }
+
+        /// A leg its committing block runs, carried with no terms entry,
+        /// takes no waiter place, and still counts in the waiter run's
+        /// index: a determined commit sorting after it ranks one past it.
+        #[test]
+        fn an_awaited_leg_run_in_its_committing_block_takes_no_waiter_place() {
+            let mut seeds = [4u8, 5];
+            seeds.sort_by_key(|&seed| tx(seed));
+            let [ran, left] = seeds;
+            let leg = terms(&Kind::Leg, &[write(A)]);
+            let mut first = block(1);
+            commit(&mut first, ran, leg.clone());
+            commit(&mut first, left, terms(&Kind::Determined, &[read(B)]));
+            lines(&mut first, vec![run(ran, &leg)]);
+            let carrying = carried(&first);
+            assert!(
+                carrying.terms.iter().all(|entry| entry.tx != tx(ran)),
+                "the leg stands on its line alone"
+            );
+            let mut store = Entries::default();
+            store.fold(&carrying);
+            assert_eq!(row(&store, ran).queued, Some(at(1, AWAITED_RANK)));
+            assert_eq!(row(&store, left).queued, Some(at(1, WAITER_RANK + 1)));
+            assert_eq!(
+                count(&store, MemberCollection::Waiters),
+                1,
+                "the determined one's"
+            );
+        }
+
+        /// A leg committed after a shared row on its key, left waiting,
+        /// is a commit the row refuses.
+        #[test]
+        fn refusing_a_pending_awaited_leg_sets_blocked_at() {
+            let mut store = Entries::default();
+            let mut first = block(1);
+            commit(&mut first, 1, terms(&Kind::Payer(vec![]), &[read(A)]));
+            store.fold(&first);
+            assert_eq!(row(&store, 1).blocked_at, None, "it refuses nobody");
+
+            let mut second = block(2);
+            commit(&mut second, 2, terms(&Kind::Leg, &[write(A)]));
+            store.fold(&second);
+            assert_eq!(row(&store, 2).queued, Some(at(2, WAITER_RANK)));
+            assert_eq!(row(&store, 1).blocked_at, Some(clock(2)));
+        }
+
+        /// A shared row placed on the key a leg waits on, ahead of the
+        /// leg in naming since a waiter keeps no row from head, refuses
+        /// the waiting leg.
+        #[test]
+        fn a_shared_row_placed_ahead_of_a_waiting_leg_sets_blocked_at() {
+            let mut store = Entries::default();
+            let mut first = block(1);
+            commit(&mut first, 1, terms(&Kind::Leg, &[write(A)]));
+            store.fold(&first);
+            assert_eq!(count(&store, MemberCollection::Waiters), 1);
+
+            let mut second = block(2);
+            commit(&mut second, 2, terms(&Kind::Payer(vec![]), &[read(A)]));
+            store.fold(&second);
+            assert_eq!(
+                headed(&store, 2),
+                Some((BlockHeight::new(2), clock(2))),
+                "a waiting leg keeps no shared row from head"
+            );
+            assert_eq!(row(&store, 2).blocked_at, Some(clock(2)));
+        }
+
+        /// A block's waiters, determined members and legs alike, rank
+        /// from the waiter run in hash order over every one of them, so
+        /// no two share a place.
+        #[test]
+        fn waiter_ranks_stay_unique_with_awaited_commits() {
+            let mut seeds: Vec<u8> = (10..20).collect();
+            seeds.sort_by_key(|&seed| tx(seed));
+            let mut first = block(1);
+            for &seed in &seeds {
+                let kind = if seed % 2 == 0 {
+                    Kind::Leg
+                } else {
+                    Kind::Determined
+                };
+                commit(&mut first, seed, terms(&kind, &[write(seed)]));
+            }
+            let mut store = Entries::default();
+            store.fold(&first);
+            for (at_rank, &seed) in seeds.iter().enumerate() {
+                assert_eq!(
+                    row(&store, seed).queued,
+                    Some(at(1, WAITER_RANK + u16::try_from(at_rank).expect("ten"))),
+                );
+            }
+            assert_eq!(count(&store, MemberCollection::Waiters), seeds.len());
+        }
+
+        /// A transaction committed under an accepted row's key gets no
+        /// row, so it waits on nothing and arms no shared row's window.
+        #[test]
+        fn a_commit_under_an_accepted_rows_key_arms_no_window() {
+            let mut store = Entries::default();
+            let accepted = terms(&Kind::Payer(vec![]), &[write(B)]);
+            let mut first = block(1);
+            commit(&mut first, 1, accepted.clone());
+            commit(&mut first, 2, terms(&Kind::Payer(vec![]), &[write(A)]));
+            lines(&mut first, vec![run(1, &accepted)]);
+            store.fold(&carried(&first));
+            store.fold(&stating(2, 1, &[], &[1]));
+            store.fold(&accepting(3, 1, &[1]));
+            assert_eq!(row(&store, 1).state, RowState::Accepted);
+
+            let mut recommit = block(4);
+            commit(&mut recommit, 1, terms(&Kind::Determined, &[write(A)]));
+            store.fold(&recommit);
+            assert_eq!(row(&store, 1).state, RowState::Accepted);
+            assert_eq!(count(&store, MemberCollection::Waiters), 0);
+            assert_eq!(row(&store, 2).blocked_at, None);
         }
 
         /// A row its block's discard releases is no head, though a fold
@@ -8580,6 +8778,118 @@ mod tests {
             }
             assert_eq!(row(&once, ran).queued, None, "named in its own block");
             assert_eq!(count(&once, MemberCollection::TickPins), 1);
+        }
+
+        /// A block running a leg it commits, carried with no terms entry
+        /// for it, beside a determined commit sorting after the leg and
+        /// a shared row standing that the leg's write refuses: folded as
+        /// a proposer and a voter fold it, and as the commit folds it,
+        /// it ranks, refuses and writes alike.
+        #[test]
+        fn a_block_folded_twice_writes_what_one_fold_does_with_a_leg_run_at_commit() {
+            let mut parent = Entries::default();
+            let mut first = block(1);
+            commit(&mut first, 1, terms(&Kind::Payer(vec![7]), &[read(A)]));
+            parent.fold(&first);
+
+            let mut seeds = [4u8, 5];
+            seeds.sort_by_key(|&seed| tx(seed));
+            let [ran, left] = seeds;
+            let leg = terms(&Kind::Leg, &[write(A)]);
+            let mut next = block(2);
+            commit(&mut next, ran, leg.clone());
+            commit(&mut next, left, terms(&Kind::Determined, &[write(B)]));
+            lines(&mut next, vec![run(ran, &leg)]);
+            let carrying = carried(&next);
+            assert!(
+                carrying.terms.iter().all(|entry| entry.tx != tx(ran)),
+                "the leg stands on its line alone"
+            );
+            let content = MemberInputs {
+                manifest: Arc::new(Capped::empty()),
+                ..next
+            };
+
+            let mut voter = MemberIndex::load(&parent, LOCAL);
+            voter.advance_content(&content);
+            voter.advance(&carrying);
+            let mut twice = Entries(parent.0.clone());
+            twice.fold(&content);
+            twice.fold(&carrying);
+            let mut once = Entries(parent.0.clone());
+            once.fold(&carrying);
+            assert_eq!(twice.0, once.0);
+            assert_eq!(voter, MemberIndex::load(&once, LOCAL));
+
+            assert_eq!(row(&once, 1).blocked_at, Some(clock(2)), "the leg refused");
+            assert_eq!(row(&once, ran).queued, Some(at(2, AWAITED_RANK)));
+            assert_eq!(
+                row(&once, left).queued,
+                Some(at(2, WAITER_RANK + 1)),
+                "the leg counts in the waiter run's index"
+            );
+        }
+
+        /// A cell in [`PEER`]'s key space.
+        fn peer_cell(seed: u8) -> SubstateKey {
+            SubstateKey {
+                owner: Address::new([0x91; 31], AddressClass::Component),
+                local: LocalKey([seed; 16]),
+            }
+        }
+
+        /// Two sponsored transactions, each with its payer core on one
+        /// shard and its leg on the other. T1 pays here and its leg runs
+        /// on [`PEER`]; T2 pays on [`PEER`] and its leg runs here. Each
+        /// core waits on the record its own leg writes on the other
+        /// shard, and stands ahead of the other transaction's leg on its
+        /// own: here a leg committed after the core, there a core placed
+        /// after the leg. Both cores take `blocked_at`.
+        #[test]
+        fn a_two_shard_payer_core_and_leg_cycle_arms_both_windows() {
+            const T1: u8 = 1;
+            const T2: u8 = 2;
+            let on = |shard: ShardId, height: u64| MemberInputs {
+                shard,
+                ..block(height)
+            };
+            let peer_write = (
+                DeclaredKey::Cell(peer_cell(1)),
+                Mode::Write { moves: Moves::Both },
+            );
+            let mut t2_core = terms(&Kind::Payer(vec![8]), &[peer_write]);
+            t2_core.charge.vault = vault(false);
+
+            let mut local = MemberIndex::empty(LOCAL);
+            let mut peer = MemberIndex::empty(PEER);
+            let mut next = on(LOCAL, 1);
+            commit(&mut next, T1, terms(&Kind::Payer(vec![7]), &[write(A)]));
+            local.advance(&next);
+            let mut next = on(PEER, 1);
+            commit(&mut next, T1, terms(&Kind::Leg, &[peer_write]));
+            peer.advance(&next);
+
+            let mut next = on(LOCAL, 2);
+            commit(&mut next, T2, terms(&Kind::Leg, &[write(A)]));
+            local.advance(&next);
+            let mut next = on(PEER, 2);
+            commit(&mut next, T2, t2_core);
+            peer.advance(&next);
+
+            for (index, core, leg, leg_place) in [
+                (&local, T1, T2, at(2, WAITER_RANK)),
+                (&peer, T2, T1, at(1, WAITER_RANK)),
+            ] {
+                let core_row = row_in(index, core);
+                assert!(core_row.head.is_some(), "a payer core heads at once");
+                assert_eq!(
+                    core_row.waiting.expect("pending").unarrived.len(),
+                    1,
+                    "its leg's record is owed"
+                );
+                assert_eq!(core_row.blocked_at, Some(clock(2)));
+                assert_eq!(row_in(index, leg).queued, Some(leg_place));
+            }
         }
 
         /// One block of a random history: members committed, records
@@ -8875,7 +9185,7 @@ mod tests {
         proptest! {
             /// Through any history, every standing shared row is placed
             /// exactly when it pays here or its records have all arrived,
-            /// every waiting determined row holds a place, and a row is
+            /// every waiting determined row or leg holds a place, and a row is
             /// head exactly when it was, or when every place it holds is
             /// clear over the rows the block leaves, judged pair by pair;
             /// a fold of a block's content and then the block leaves what
@@ -8911,7 +9221,7 @@ mod tests {
                                 || history.unarrived[&row.tx] == 0;
                             prop_assert_eq!(row.queued.is_some(), placed, "{:?} at {}", row.tx, height);
                         }
-                        if row.state == RowState::Pending && terms.settlement == Settlement::Alone {
+                        if row.state == RowState::Pending && terms.settlement != Settlement::Shared {
                             prop_assert!(row.queued.is_some(), "a waiter at {}", height);
                         }
                         if !shared_standing(row) {
@@ -9420,7 +9730,7 @@ mod tests {
                         .places
                         .keys()
                         .filter(|tx| {
-                            self.terms[*tx].settlement.alone()
+                            self.terms[*tx].settlement != Settlement::Shared
                                 && before
                                     .members
                                     .get(*tx)
@@ -9437,11 +9747,14 @@ mod tests {
                             },
                         );
                     }
-                    // Refusals, read before any line is named.
+                    // Refusals, read before any line is named. A shared
+                    // row stands in `Queue` from its place, and a leg from
+                    // the line running it: a leg waiting stands only in
+                    // `Waiters`.
                     let queued_before = |tx: &TxHash, this: &Self| {
                         this.places.contains_key(tx)
-                            && !this.terms[tx].settlement.alone()
-                            && (pending_before(tx)
+                            && ((this.terms[tx].settlement == Settlement::Shared
+                                && pending_before(tx))
                                 || before.members.get(tx).is_some_and(|row| {
                                     matches!(
                                         row.state,
@@ -9452,9 +9765,11 @@ mod tests {
                                     )
                                 }))
                     };
-                    let determined: Vec<TxHash> = committed
+                    // Every determined member and leg the block commits:
+                    // each gets a row, its hash being fresh.
+                    let unshared: Vec<TxHash> = committed
                         .iter()
-                        .filter(|tx| self.terms[*tx].settlement.alone())
+                        .filter(|tx| self.terms[*tx].settlement != Settlement::Shared)
                         .copied()
                         .collect();
                     let queued: Vec<TxHash> = self
@@ -9472,14 +9787,14 @@ mod tests {
                         let refuses_placed = placed.iter().any(|later| {
                             at < self.places[later] && contends(&pins, &self.pins(*later))
                         });
-                        let refuses_determined = determined
+                        let refuses_commit = unshared
                             .iter()
                             .any(|tx| contends(&pins, &pinned(&self.terms[tx].declared)));
                         let refuses_waiter = placed.contains(refuser)
                             && waiters_before
                                 .iter()
                                 .any(|waiter| contends(&pins, &self.pins(*waiter)));
-                        if refuses_placed || refuses_determined || refuses_waiter {
+                        if refuses_placed || refuses_commit || refuses_waiter {
                             refused.insert(*refuser);
                         }
                     }
@@ -9533,8 +9848,9 @@ mod tests {
                     if !tick.is_empty() {
                         self.tick_pins.insert(height, tick);
                     }
-                    // Waiters: the determined commits left waiting.
-                    for (at, tx) in determined.iter().enumerate() {
+                    // Waiters: the determined and leg commits left
+                    // waiting, ranked among all of them.
+                    for (at, tx) in unshared.iter().enumerate() {
                         if after
                             .members
                             .get(tx)
@@ -9655,7 +9971,7 @@ mod tests {
                             }
                         }
                         let waits = row.state == RowState::Pending
-                            && self.terms[&row.tx].settlement.alone();
+                            && self.terms[&row.tx].settlement != Settlement::Shared;
                         if let Some(place) = self.places.get(&row.tx).filter(|_| waits) {
                             for key in pins.keys() {
                                 waiters
@@ -9762,7 +10078,7 @@ mod tests {
                         for row in rows.members.values() {
                             let expected = reference.queued(row).or_else(|| {
                                 (row.state == RowState::Pending
-                                    && reference.terms[&row.tx].settlement.alone())
+                                    && reference.terms[&row.tx].settlement != Settlement::Shared)
                                     .then(|| reference.places.get(&row.tx).copied())
                                     .flatten()
                             });
@@ -9998,7 +10314,7 @@ mod tests {
                 Capped::from_array([PEER])
             };
             MemberTerms {
-                leg: false,
+                leg: settlement == Settlement::Awaited,
                 settlement,
                 declared: Capped::new(vec![
                     (
@@ -10074,16 +10390,20 @@ mod tests {
             /// names the batch before, states the one before that,
             /// accepts the next older, and ends the oldest.
             Shared,
+            /// Each block commits a batch of legs on awaited terms, names
+            /// the batch before, and settles the one before that by its
+            /// tick's stating half.
+            Legs,
         }
 
         /// The block at `height` of `shape`: its content, folded first
         /// by a proposer or voter, and the block as carried.
         fn block_at(shape: Shape, height: u64) -> (MemberInputs, MemberInputs) {
             let batch = u32::try_from(height).expect("a short run");
-            let settlement = if shape == Shape::Shared {
-                Settlement::Shared
-            } else {
-                Settlement::Alone
+            let settlement = match shape {
+                Shape::RunWhereCommitted | Shape::NamedALater => Settlement::Alone,
+                Shape::Shared => Settlement::Shared,
+                Shape::Legs => Settlement::Awaited,
             };
             let mut next = MemberInputs {
                 height: BlockHeight::new(height),
@@ -10150,6 +10470,17 @@ mod tests {
                     }
                     if let Some(of) = older(4) {
                         lines.extend(batch_of(of).map(|tx| TickLine::End { tx }));
+                    }
+                }
+                Shape::Legs => {
+                    if let Some(of) = older(2) {
+                        next.settled.push(SettledHalf {
+                            tick: tick(of, 1),
+                            half: TickHalf::Stated,
+                            deleted: batch_of(of).collect(),
+                            accepted: Vec::new(),
+                            stated: Vec::new(),
+                        });
                     }
                 }
             }
@@ -10276,6 +10607,17 @@ mod tests {
                     ("Staged", 2 * B, 38 * B),
                     ticks[1],
                     ("Verdicts", 3 * B, 116 * B),
+                ],
+            );
+            // A leg waits a block in `Waiters`, then holds in `Queue`
+            // from the line running it until its stating half settles it.
+            writes_within(
+                Shape::Legs,
+                &[
+                    ("Members", 3 * B, 698 * B),
+                    ("Queue", 10 * B, 245 * B),
+                    ticks[1],
+                    ("Waiters", 6 * B, 147 * B),
                 ],
             );
         }

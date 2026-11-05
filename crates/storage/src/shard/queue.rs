@@ -8,8 +8,9 @@
 //!   counterpart shares the verdict on, from its place until the row is
 //!   accepted, deleted, released or aborted; and of each leg in flight
 //!   on awaited terms, from the line running it until it leaves its tick.
-//! - `Waiters`: one entry per pin of each determined row standing
-//!   `Pending` with a place, until a line names it or it leaves.
+//! - `Waiters`: one entry per pin of each determined row or leg standing
+//!   `Pending` with a place, until a line names it or it leaves. A line
+//!   running a leg moves it from here to its `Queue` place.
 //! - `TickPins`: the pins a tick's determined lines take, unioned per
 //!   key, while its determined half is owed.
 //! - `Behind`: each placed shared row not yet head, by place, so the
@@ -32,8 +33,10 @@ use crate::Substates;
 use crate::shard::members::{MemberRow, RowState};
 
 /// Where a member stands in its shard's queue: the block that placed it
-/// and its rank there. Shared members a block places take ranks first,
-/// in hash order; the block's determined waiters follow.
+/// and its rank there.
+///
+/// Shared members a block places take ranks first, in hash order; the
+/// block's waiters follow, then the legs its lines run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub struct Place {
     /// The block that placed it.
@@ -227,14 +230,16 @@ pub fn shared_standing(row: &MemberRow) -> bool {
 }
 
 /// The first rank a block gives the legs its lines run on awaited terms:
-/// past every shared place and determined waiter the block takes, so a
-/// leg stands behind them on its block's height.
+/// past every shared place and waiter the block takes, so a leg stands
+/// behind them on its block's height.
 pub const AWAITED_RANK: u16 = 1 << 15;
 
-/// The first rank a block gives the determined members it commits and
-/// leaves waiting: past every shared place the block takes, which are at
-/// most the rows standing and the block's own commits, so a waiter's
-/// rank is the same whichever fold of the block places it.
+/// The first rank a block gives the determined members and legs it
+/// commits and leaves waiting: past every shared place the block takes,
+/// which are at most the rows standing and the block's own commits, so a
+/// waiter's rank is the same whichever fold of the block places it. A
+/// block commits a transaction once, so its waiters fit below
+/// [`AWAITED_RANK`].
 pub const WAITER_RANK: u16 = 1 << 14;
 
 const _: () = assert!(
@@ -258,16 +263,16 @@ pub const fn awaited_holding(row: &MemberRow) -> bool {
         )
 }
 
-/// Whether `row` stands as a determined waiter: placed and `Pending` on
-/// terms its own certificate settles.
+/// Whether `row` stands as a waiter: placed and `Pending` on terms no
+/// counterpart shares the verdict on, a determined member's or a leg's.
 #[must_use]
-pub fn determined_waiting(row: &MemberRow) -> bool {
+pub fn standing_waiter(row: &MemberRow) -> bool {
     row.queued.is_some()
         && row.state == RowState::Pending
         && row
             .waiting
             .as_ref()
-            .is_some_and(|waiting| waiting.settlement == Settlement::Alone)
+            .is_some_and(|waiting| waiting.settlement != Settlement::Shared)
 }
 
 /// Whether a row pinning `pins` is keyed: it reads or writes a key this
@@ -305,7 +310,7 @@ impl RowEntries {
         let (shared, holding, waiting) = (
             shared_standing(row),
             awaited_holding(row),
-            determined_waiting(row),
+            standing_waiter(row),
         );
         if !shared && !holding && !waiting {
             return Self::default();
