@@ -7548,6 +7548,24 @@ mod tests {
             }
         }
 
+        /// Fold `inputs` into `rows` as their store writes it, keeping in
+        /// `written` the leaves standing, so a shard's seats can be read.
+        fn fold_written(
+            rows: &mut MemberIndex,
+            written: &mut BTreeSet<SubstateKey>,
+            inputs: &MemberInputs,
+        ) {
+            for (key, change) in member_writes(&*rows, inputs) {
+                let leaf = entry_leaf_key(&ProtocolHasher, key);
+                if change.is_some() {
+                    written.insert(leaf);
+                } else {
+                    written.remove(&leaf);
+                }
+            }
+            rows.advance(inputs);
+        }
+
         /// The crossed pair: H1 and W span A and C, H1 the earlier hash.
         /// On A, H1 writes a key W reads, H1 placed first; on C, W
         /// reserves a vault H1 debits, W placed first. Each is named where
@@ -7555,7 +7573,9 @@ mod tests {
         /// and of C's window:
         ///
         /// - W named on C leaves its reservation in flight there, read one
-        ///   way, so H1 heads and runs on C beside it;
+        ///   way, so H1 heads and runs on C beside it; A's question reads
+        ///   H1 seated on C, which wounds nobody, and W runs on A once H1
+        ///   settles there;
         /// - W left unnamed at its head on C keeps H1 behind it both ways,
         ///   and A's question about holder H1 and waiting W, read off C's
         ///   committed seats, wounds W on A.
@@ -7581,20 +7601,6 @@ mod tests {
                 shard,
                 ..block(height)
             };
-            // C folded as its store writes it, so its seats can be read.
-            let fold = |rows: &mut MemberIndex,
-                        written: &mut BTreeSet<SubstateKey>,
-                        inputs: &MemberInputs| {
-                for (key, change) in member_writes(&*rows, inputs) {
-                    let leaf = entry_leaf_key(&ProtocolHasher, key);
-                    if change.is_some() {
-                        written.insert(leaf);
-                    } else {
-                        written.remove(&leaf);
-                    }
-                }
-                rows.advance(inputs);
-            };
 
             for w_named_on_c in [true, false] {
                 let w_on_c = w(A, if w_named_on_c { &[] } else { &[A] });
@@ -7609,7 +7615,7 @@ mod tests {
                         let mut next = on(on_shard, height);
                         commit(&mut next, seed, &terms, deadline);
                         if on_shard == C {
-                            fold(rows, &mut written, &next);
+                            fold_written(rows, &mut written, &next);
                         } else {
                             rows.advance(&next);
                         }
@@ -7622,18 +7628,16 @@ mod tests {
 
                 if w_named_on_c {
                     assert_eq!(named(&c, clock(3)).get(&tx(W)), RUNS);
-                    fold(
-                        &mut c,
-                        &mut written,
-                        &with_lines(on(C, 3), vec![run(W, &w_on_c)]),
-                    );
+                    let naming_w = with_lines(on(C, 3), vec![run(W, &w_on_c)]);
+                    fold_written(&mut c, &mut written, &naming_w);
                     assert!(c.members[&tx(H1)].head.is_some(), "beside W in flight");
                     assert_eq!(named(&c, clock(4)).get(&tx(H1)), RUNS);
-                    continue;
+                } else {
+                    assert_eq!(named(&c, clock(3)).get(&tx(W)), None, "unready on C");
+                    fold_written(&mut c, &mut written, &on(C, 3));
                 }
 
-                assert_eq!(named(&c, clock(3)).get(&tx(W)), None, "unready on C");
-                fold(&mut c, &mut written, &on(C, 3));
+                // A asks either way, and reads the answer off C's seats.
                 let question = SeatQuestion {
                     shard: C,
                     waiting: tx(W),
@@ -7647,6 +7651,26 @@ mod tests {
                     .collect();
                 let reading = proven_claim(C, 3, &leaves, &question.keys());
                 let victims = wounded(&a, clock(4), from_ref(&reading));
+
+                if w_named_on_c {
+                    // H1 holds a seat on C too: no cycle, nobody wounded.
+                    assert!(leaves.contains(&seat_leaf(C, tx(H1))), "H1 heads on C");
+                    assert!(victims.is_empty());
+                    assert_eq!(named(&a, clock(4)).get(&tx(W)), None, "H1 in flight");
+                    a.advance(&MemberInputs {
+                        settled: vec![SettledHalf {
+                            tick: TickId::new(A, BlockHeight::new(3)),
+                            half: TickHalf::Stated,
+                            deleted: vec![tx(H1)],
+                            accepted: Vec::new(),
+                            stated: Vec::new(),
+                        }],
+                        ..on(A, 4)
+                    });
+                    assert_eq!(named(&a, clock(5)).get(&tx(W)), RUNS, "H1 settled on A");
+                    continue;
+                }
+
                 assert_eq!(victims, BTreeSet::from([tx(W)]));
                 let live = |_, _| Evidence::Live { terminating: false };
                 let (lines, _) =
