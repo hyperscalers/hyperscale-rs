@@ -1719,6 +1719,17 @@ fn pins_conflict(one: &[Pin], other: &[Pin]) -> bool {
     })
 }
 
+/// Whether a member pinning `held` on one shard refuses one pinning
+/// `candidate` there: on some key both pin, the held modes refuse the
+/// candidate's. Both are ascending by key, as [`pins_of`] gives them.
+fn pins_refuse(held: &[Pin], candidate: &[Pin]) -> bool {
+    held.iter().any(|pin| {
+        candidate
+            .binary_search_by_key(&pin.key, |theirs| theirs.key)
+            .is_ok_and(|at| pin.modes.refuses(candidate[at].modes))
+    })
+}
+
 /// A core member's holds, as a refusal reads them.
 struct CoreHolder<'r> {
     tx: TxHash,
@@ -1743,12 +1754,12 @@ impl<'r> CoreHolder<'r> {
         })
     }
 
-    /// Whether these holds conflict here with `waiting`, which pins
-    /// `pinned` here and awaits a shard this holder awaits too: the
-    /// relation the queue reads between two abortable members, over the
-    /// keys this shard owns.
+    /// Whether these holds refuse `waiting` here, which pins `pinned` here
+    /// and awaits a shard this holder awaits too: the relation the queue
+    /// reads against a row in flight, one way, over the keys this shard
+    /// owns.
     fn refuses(&self, waiting: &Judged<'_>, pinned: &[Pin]) -> bool {
-        self.shared(waiting).next().is_some() && pins_conflict(&self.pins, pinned)
+        self.shared(waiting).next().is_some() && pins_refuse(&self.pins, pinned)
     }
 
     /// The shards both this holder and `waiting` await: where each has a
@@ -1774,8 +1785,8 @@ fn in_flight_holders<'r>(
 /// The contentions a block naming `lines` over `rows` leaves standing.
 ///
 /// Every core member short of its deadline that is ready at `anchor` and
-/// that no line names, paired with each core member whose holds conflict
-/// with it on this shard's keys and which awaits a shard it awaits too:
+/// that no line names, paired with each core member whose holds refuse it
+/// on this shard's keys and which awaits a shard it awaits too:
 /// one in flight on its row, or named by `lines` themselves. `rows` is
 /// the family before the lines, so a member they name is still `Pending`
 /// there and counts once, as a holder.
@@ -1846,14 +1857,15 @@ pub fn contentions(
 /// claims, prove the victims of a hold cycle at `anchor`.
 ///
 /// A cycle is two core members each shard holds in the other's order:
-/// here, `holder` is in flight and its holds conflict with `waiting`,
-/// which is pending, on this shard's keys; on a counterpart both await,
-/// the two conflict on that shard's keys, and the claims at one anchor
-/// there read `waiting` seated and `holder` committed, unseated and with
-/// no verdict leaf. The queue reads the same relation, both ways between
-/// two members the earlier of which still waits, so `holder` stands
-/// behind `waiting` there just as `waiting` stands behind `holder` here,
-/// and neither certificate the other awaits can come. Nor can the
+/// here, `holder` is in flight and its holds refuse `waiting`, which is
+/// pending, on this shard's keys; on a counterpart both await, the two
+/// conflict on that shard's keys, and the claims at one anchor there read
+/// `waiting` seated and `holder` committed, unseated and with no verdict
+/// leaf. The queue reads the same relation: one way, the earlier refusing
+/// the later, where the earlier is in flight, and both ways where it
+/// still waits. So `waiting` stands behind `holder` here, `holder` stands
+/// behind `waiting` there, and neither certificate the other awaits can
+/// come. Nor can the
 /// reading go stale: the counterpart releases `waiting` only on this
 /// shard's verdict, which a pending member has not given, so `holder`
 /// stays refused there for as long as this shard's own rows stand. Where
@@ -1959,12 +1971,14 @@ impl SeatQuestion {
 /// The seat questions the pending core members of `rows` put.
 ///
 /// One for each pending core member short of its deadline at `anchor`
-/// and each core member in flight that conflicts with it on this shard's
-/// keys, is earlier in hash order, and awaits a counterpart it awaits,
-/// per such counterpart on whose keys the two conflict too: otherwise an
-/// unseated holder would read as a cycle when it was only not yet ready.
-/// Both legs read the relation the queue reads between two abortable
-/// members, over the pins each shard owns. A holder past its own
+/// and each core member in flight that refuses it on this shard's keys,
+/// is earlier in hash order, and awaits a counterpart it awaits, per such
+/// counterpart on whose keys the two conflict too: otherwise an unseated
+/// holder would read as a cycle when it was only not yet ready. Each leg
+/// reads the relation the queue reads there, over the pins each shard
+/// owns: one way here, where the holder is in flight, and both ways
+/// there, where the reading cannot tell a waiting member from one in
+/// flight. A holder past its own
 /// deadline asks nothing: the counterpart where it waits aborts it,
 /// which breaks the cycle with no victim here.
 #[must_use]
@@ -5503,6 +5517,49 @@ mod tests {
             (2, &[(key, Mode::Read), (vault, Mode::Read)]),
         );
         assert!(seat_questions(&reading, ms(0)).is_empty());
+    }
+
+    /// The holder leg reads the queue's relation for an in-flight row: the
+    /// holder refusing the waiting member, one way. H1 in flight reserves
+    /// a vault here that W debits, which the queue here admits, so W is
+    /// not kept out here and conflicting with H1 on `PEER` makes no cycle.
+    /// The contention count skips the pair too. The reverse, H1 debiting
+    /// beside W's reservation, does keep W out and is asked.
+    #[test]
+    fn an_inflight_reservation_beside_a_waiting_debit_asks_nothing() {
+        let here = ShardId::leaf(1, 0);
+        let (vault, there) = (cell(1, 1), cell(0x91, 1));
+        let rows = held_beside_pending_on(
+            here,
+            (1, &[(vault, RESERVE), (there, WRITE)]),
+            (2, &[(vault, DEBIT), (there, WRITE)]),
+        );
+        assert!(seat_questions(&rows, ms(0)).is_empty());
+        assert!(wounded(&rows, ms(0), &[crossed_reading(1, 2)]).is_empty());
+        let mut held = Held::default();
+        held.engaged.insert((PEER, tx(2)));
+        assert!(contentions(&rows, &[], ms(0), &held).is_empty());
+
+        let debiting = held_beside_pending_on(
+            here,
+            (1, &[(vault, DEBIT), (there, WRITE)]),
+            (2, &[(vault, RESERVE), (there, WRITE)]),
+        );
+        assert_eq!(
+            seat_questions(&debiting, ms(0)),
+            vec![SeatQuestion {
+                shard: PEER,
+                waiting: tx(2),
+                holder: tx(1),
+            }],
+        );
+        assert_eq!(
+            contentions(&debiting, &[], ms(0), &held),
+            vec![Contention {
+                waiting: tx(2),
+                holder: tx(1),
+            }],
+        );
     }
 
     /// A pair that conflicts only on a counterpart's keys asks nothing
