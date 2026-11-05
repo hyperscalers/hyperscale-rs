@@ -409,8 +409,10 @@ impl Verify<&ProvisionContext> for Provision {
         }
 
         // The carried source-block timestamp must be the anchor's own
-        // parent-QC reading: receivers consume it as the transaction
-        // clock, so it clears verification or the part does not.
+        // parent-QC reading: receivers read the recovery band and the
+        // deadline off it, so it clears verification or the part does
+        // not. The transaction clock is the leaf's to bind, not this
+        // check's.
         if self.0.source_block_ts != ctx.anchor.ts {
             return Err(ProvisionVerifyError::SourceBlockTsMismatch);
         }

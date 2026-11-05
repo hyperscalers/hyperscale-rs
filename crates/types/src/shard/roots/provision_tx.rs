@@ -5,11 +5,11 @@
 //! one tagged leaf per transaction it owes that target with the number
 //! of those leaves. Each leaf binds the transaction, its clock and the
 //! keys its part serves, so a part missing a key, carrying one more, or
-//! stating another clock walks to another root. A part carries its leaf's path and that count, and a
-//! receiver recomputes the leaf from the part and walks the path to the
-//! header's root: the count fixes the tree's depth, so a part verifies
-//! only at a real leaf position, never at an internal node, a padding
-//! slot or an index aliased past the end.
+//! stating another clock walks to another root. A part carries its
+//! leaf's path and that count, and a receiver recomputes the leaf from
+//! the part and walks the path to the header's root: the count fixes the
+//! tree's depth, so a part verifies only at a real leaf position, never
+//! at an internal node, a padding slot or an index aliased past the end.
 
 use std::collections::BTreeMap;
 
@@ -26,6 +26,14 @@ use crate::{
 /// clock and a 32-byte served digest — is never 64 bytes long, which
 /// every internal node's preimage is.
 pub const PROVISION_LEAF_DOMAIN_TAG: &[u8] = b"hyperscale-provision-leaf-v2";
+
+const _: () = {
+    let tx = size_of::<Hash>();
+    let clock = size_of::<u64>();
+    let served = size_of::<Hash>();
+    let internal_node = 2 * size_of::<Hash>();
+    assert!(PROVISION_LEAF_DOMAIN_TAG.len() + tx + clock + served != internal_node);
+};
 
 /// Domain tag of the digest over a part's served keys.
 pub const PROVISION_SERVED_DOMAIN_TAG: &[u8] = b"hyperscale-provision-served-v1";
@@ -369,7 +377,6 @@ mod tests {
         for leaf in &leaves {
             assert!(!nodes.contains(leaf));
         }
-        assert_ne!(PROVISION_LEAF_DOMAIN_TAG.len() + 72, 64);
     }
 
     /// A transaction's leaf moves with its clock: the same keys under

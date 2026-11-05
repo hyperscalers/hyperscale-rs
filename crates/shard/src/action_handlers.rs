@@ -3663,11 +3663,13 @@ mod tests {
     }
 
     /// The block `LOCAL`'s proposer builds on `parent` over `chain`,
-    /// carrying `transactions` and `finalization`.
+    /// carrying `transactions` and `finalization`, under a parent QC
+    /// that reads `anchor`.
     fn proposed(
         chain: &Arc<PendingChain<SimShardStorage>>,
         committee: &TopologySnapshot,
         parent: &Parent,
+        anchor: WeightedTimestamp,
         transactions: &[Verified<Transaction>],
         finalization: Verifiable<Finalization>,
     ) -> ProposalResult {
@@ -3681,7 +3683,7 @@ mod tests {
             Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
-            WeightedTimestamp::ZERO,
+            anchor,
         );
         build_proposal(
             &chain.view_at(parent.hash, parent.height),
@@ -3786,6 +3788,7 @@ mod tests {
             &chain,
             &committee,
             &base,
+            WeightedTimestamp::ZERO,
             &[],
             settling(
                 base_height.next(),
@@ -3814,6 +3817,7 @@ mod tests {
             &chain,
             &committee,
             &parent,
+            WeightedTimestamp::ZERO,
             &[Verified::new_unchecked_for_test(tx.clone())],
             settling(
                 parent.height.next(),
@@ -3823,7 +3827,7 @@ mod tests {
         assert_eq!(built.block.transactions().len(), 1, "the reader is carried");
         assert_eq!(
             built.block.header().provision_tx_roots(),
-            &owed_over(tx.hash(), held, &[0, 1, 2]),
+            &owed_over(tx.hash(), WeightedTimestamp::ZERO, held, &[0, 1, 2]),
             "the proposer commits what the interval holds after the block",
         );
 
@@ -3837,9 +3841,14 @@ mod tests {
     }
 
     /// The map a block owes [`PAYER_SHARD`] for one transaction `tx_hash`
-    /// serving `held`'s stub cell and the [`COLLECTION`] entries at
-    /// `orders`.
-    fn owed_over(tx_hash: TxHash, held: Address, orders: &[u128]) -> ProvisionTxRootsMap {
+    /// committed at `clock`, serving `held`'s stub cell and the
+    /// [`COLLECTION`] entries at `orders`.
+    fn owed_over(
+        tx_hash: TxHash,
+        clock: WeightedTimestamp,
+        held: Address,
+        orders: &[u128],
+    ) -> ProvisionTxRootsMap {
         let mut served: Vec<SubstateKey> = orders
             .iter()
             .map(|&order| {
@@ -3862,11 +3871,74 @@ mod tests {
             PAYER_SHARD,
             ProvisionTxRoot::over(&[provision_leaf(
                 tx_hash,
-                WeightedTimestamp::ZERO,
+                clock,
                 served_digest(served.into_iter()),
             )]),
         )]))
         .expect("one target")
+    }
+
+    /// A proposer under a parent QC past genesis binds that QC's reading
+    /// into the leaf it commits, and a voter reading the same QC off the
+    /// header recomputes the same map and seats the block.
+    #[test]
+    fn a_nonzero_parent_qc_clock_is_the_voters_own() {
+        install_stub_protocol_statics();
+        let committee = TestCommittee::new(4, 7).topology_snapshot(2);
+        let trie = committee.shard_trie().clone();
+        let payer = PrincipalAddr::new([0x80; 31]);
+        let held = PrincipalAddr::new([0x10; 31]).address();
+        assert_eq!(trie.shard_for_prefix(held), LOCAL);
+        assert_eq!(trie.shard_for_prefix(payer.address()), PAYER_SHARD);
+        let tx = stub_transaction_with_reads(
+            payer,
+            &[held],
+            &[payer.address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+
+        let storage = Arc::new(SimShardStorage::default());
+        commit_writes(&*storage, &entry_changes(held, &[(0, Some(1))]));
+        let (base_height, Some(base_hash)) = storage.committed_head() else {
+            panic!("the store holds a committed block")
+        };
+        let chain = Arc::new(PendingChain::new(
+            Arc::clone(&storage),
+            BlockHeight::GENESIS,
+        ));
+        let parent = Parent {
+            hash: base_hash,
+            height: base_height,
+            state_root: storage.state_root(),
+            sweep_frontier: SweepFrontier::ZERO,
+        };
+        let clock = WeightedTimestamp::from_millis(1_500);
+        let built = proposed(
+            &chain,
+            &committee,
+            &parent,
+            clock,
+            &[Verified::new_unchecked_for_test(tx.clone())],
+            settling(base_height.next(), entry_changes(held, &[(1, Some(2))])),
+        );
+        assert_eq!(built.block.transactions().len(), 1, "the reader is carried");
+        assert_eq!(
+            built.block.header().provision_tx_roots(),
+            &owed_over(tx.hash(), clock, held, &[]),
+            "the proposer binds its parent QC's clock",
+        );
+
+        let (outcome, seated) =
+            state_root_verdict(&storage, &chain, judged_check(&built, &parent, trie));
+        assert!(
+            matches!(outcome, CheckOutcome::Checked { .. }),
+            "the voter's map is the proposer's: {outcome:?}",
+        );
+        assert!(seated);
     }
 
     /// The state-root check a voter runs on `built` over `parent`, judged
@@ -3893,7 +3965,7 @@ mod tests {
             split_child_roots_required: false,
             terminal_settled_txs_required: false,
             claimed_terminal_settled_txs: None,
-            parent_weighted_timestamp: WeightedTimestamp::ZERO,
+            parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
             settled_txs_window_floor: None,
             parent_sweep_frontier: parent.sweep_frontier,
             claimed_sweep_frontier: block.header().sweep_frontier(),

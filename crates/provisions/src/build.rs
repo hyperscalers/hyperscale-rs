@@ -202,8 +202,9 @@ pub fn build_owed_until<S>(
 
 /// `request`'s part at `path`, or `None` where it cannot be built.
 ///
-/// It carries the request's clock, which its leaf binds, and serves `keys`, its [`served_keys`] out of `state`, the view's
-/// reading at its anchor, and is proven through the view's tree. A proof
+/// It carries the request's clock, which its leaf binds, and serves
+/// `keys`, its [`served_keys`] out of `state`, the view's reading at its
+/// anchor, and is proven through the view's tree. A proof
 /// past a decode cap, an encoding past [`MAX_PROVISION_PART_BYTES`], or a
 /// range naming an entry with no leaf leaves it unbuilt, which costs only
 /// its own transaction.
