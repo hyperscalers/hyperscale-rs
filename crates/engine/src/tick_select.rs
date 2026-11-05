@@ -7370,7 +7370,8 @@ mod tests {
         }
 
         /// A shared head whose own pins conflict with each other is named:
-        /// its own entries in the queue never hold it out.
+        /// its own entries in the queue never hold it out, and it is never
+        /// a party its own window is armed for.
         #[test]
         fn a_self_conflicting_shared_head_is_named() {
             let head = shared(vec![
@@ -7382,6 +7383,7 @@ mod tests {
             ]);
             let rows = committed(&[(1, &head)]);
             assert!(rows.members[&tx(1)].head.is_some());
+            assert_eq!(rows.members[&tx(1)].blocked_at, None);
             assert_eq!(named(&rows, clock(2)).get(&tx(1)), RUNS);
         }
 
