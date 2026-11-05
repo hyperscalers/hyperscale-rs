@@ -86,24 +86,61 @@ impl PinKey {
     }
 }
 
-/// One class a pin stands in, as the queue orders its entries: reads,
-/// the movements, writes, and debiting deltas.
+/// One class a pin stands in, as the queue orders its entries.
+///
+/// A held class refuses a candidate class where the scheduling relation
+/// keeps the two apart:
+///
+/// | Candidate | Refused by a held |
+/// |---|---|
+/// | `Read` | `Credit`, `Reserve`, `Write`, `Debit` |
+/// | `Credit` | `Read`, `Write` |
+/// | `Reserve` | `Read`, `Write`, `Debit` |
+/// | `Write` | every class |
+/// | `Debit` | `Read`, `Write`, `Debit` |
+///
+/// The one pair refused one way only is a held `Reserve` beside a
+/// candidate `Debit`: a reservation's amount is held against the cell
+/// once it runs, and a debiting delta states none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PinClass {
     /// A `Read`.
     Read = 0,
-    /// A `Delta` or a `Reserve`.
-    Movement = 1,
+    /// A `Delta` without the debit bit: a credit, or a debiting delta on
+    /// a principal's protocol vault, which its fee hold bounds.
+    Credit = 1,
+    /// A `Reserve`.
+    Reserve = 2,
     /// A `Write`.
-    Write = 2,
-    /// A debiting `Delta` on a cell that is not a principal's protocol
-    /// vault, which also stands as a movement.
-    Debit = 3,
+    Write = 3,
+    /// A `Delta` with the debit bit: a debiting delta on a cell that is
+    /// not a principal's protocol vault. A pin holding it stands in
+    /// `Debit` alone, whose refusals include `Credit`'s both ways.
+    Debit = 4,
 }
 
 impl PinClass {
     /// Every class, in order.
-    pub const ALL: [Self; 4] = [Self::Read, Self::Movement, Self::Write, Self::Debit];
+    pub const ALL: [Self; 5] = [
+        Self::Read,
+        Self::Credit,
+        Self::Reserve,
+        Self::Write,
+        Self::Debit,
+    ];
+
+    /// The class `bits` encode, or `None` past the last.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            0 => Some(Self::Read),
+            1 => Some(Self::Credit),
+            2 => Some(Self::Reserve),
+            3 => Some(Self::Write),
+            4 => Some(Self::Debit),
+            _ => None,
+        }
+    }
 }
 
 /// The modes one member declares on one pinned key: a bit per mode kind,
@@ -208,7 +245,8 @@ impl Modes {
     pub const fn stands_in(self, class: PinClass) -> bool {
         match class {
             PinClass::Read => self.has(Self::READ),
-            PinClass::Movement => self.has(Self::DELTA) || self.has(Self::RESERVE),
+            PinClass::Credit => self.has(Self::DELTA) && !self.has(Self::DEBIT),
+            PinClass::Reserve => self.has(Self::RESERVE),
             PinClass::Write => self.has(Self::WRITE),
             PinClass::Debit => self.has(Self::DEBIT),
         }
@@ -222,10 +260,33 @@ impl Modes {
             PinClass::Read => {
                 self.has(Self::DELTA) || self.has(Self::RESERVE) || self.has(Self::WRITE)
             }
-            PinClass::Movement => self.has(Self::READ) || self.has(Self::WRITE),
+            PinClass::Credit | PinClass::Reserve => self.has(Self::READ) || self.has(Self::WRITE),
             PinClass::Write => !self.is_empty(),
-            PinClass::Debit => self.debits(),
+            PinClass::Debit => self.has(Self::READ) || self.has(Self::WRITE) || self.debits(),
         }
+    }
+
+    /// Whether a claim holding these modes refuses a candidate standing
+    /// in `class`, whatever else that candidate holds: [`Self::refused_by`]
+    /// with the two sides exchanged.
+    #[must_use]
+    pub const fn refuses_class(self, class: PinClass) -> bool {
+        match class {
+            PinClass::Read => {
+                self.has(Self::DELTA) || self.has(Self::RESERVE) || self.has(Self::WRITE)
+            }
+            PinClass::Credit => self.has(Self::READ) || self.has(Self::WRITE),
+            PinClass::Reserve | PinClass::Debit => {
+                self.has(Self::READ) || self.has(Self::WRITE) || self.has(Self::DEBIT)
+            }
+            PinClass::Write => !self.is_empty(),
+        }
+    }
+
+    /// Whether the two conflict both ways: either refuses the other.
+    #[must_use]
+    pub const fn conflicts(self, other: Self) -> bool {
+        self.refuses(other) || other.refuses(self)
     }
 }
 
@@ -288,7 +349,7 @@ mod tests {
 
     /// The queue answers a refusal by class alone: a claim refuses a
     /// candidate exactly where it stands in a class the candidate is
-    /// refused by.
+    /// refused by, over all five classes.
     #[test]
     fn a_refusal_is_read_off_the_classes_a_claim_stands_in() {
         for held in every_modes() {
@@ -302,6 +363,85 @@ mod tests {
                     "{held:?} against {candidate:?}"
                 );
             }
+        }
+    }
+
+    /// The reverse reading by class is the relation transposed: a
+    /// candidate refuses a claim exactly where the claim stands in a
+    /// class the candidate refuses, so the two readings together are the
+    /// relation's union with its transpose.
+    #[test]
+    fn a_conflict_is_read_off_the_classes_a_claim_stands_in_both_ways() {
+        for held in every_modes() {
+            for candidate in every_modes() {
+                let reverse = PinClass::ALL
+                    .into_iter()
+                    .any(|class| held.stands_in(class) && candidate.refuses_class(class));
+                assert_eq!(
+                    candidate.refuses(held),
+                    reverse,
+                    "{candidate:?} against {held:?}"
+                );
+                let both = PinClass::ALL.into_iter().any(|class| {
+                    held.stands_in(class)
+                        && (candidate.refused_by(class) || candidate.refuses_class(class))
+                });
+                assert_eq!(
+                    held.conflicts(candidate),
+                    both,
+                    "{held:?} and {candidate:?}"
+                );
+                assert_eq!(held.conflicts(candidate), candidate.conflicts(held));
+            }
+        }
+    }
+
+    #[test]
+    fn a_reserve_and_a_credit_stand_in_different_classes() {
+        let classes = |modes: Modes| -> Vec<PinClass> {
+            PinClass::ALL
+                .into_iter()
+                .filter(|class| modes.stands_in(*class))
+                .collect()
+        };
+        assert_eq!(classes(Modes::RESERVE), [PinClass::Reserve]);
+        assert_eq!(classes(Modes::DELTA), [PinClass::Credit]);
+        assert!(!Modes::DELTA.refuses(Modes::RESERVE) && !Modes::RESERVE.refuses(Modes::DELTA));
+    }
+
+    #[test]
+    fn a_delta_with_the_debit_bit_stands_in_debit_alone() {
+        let debit = Modes::DELTA.union(Modes::DEBIT);
+        let classes: Vec<PinClass> = PinClass::ALL
+            .into_iter()
+            .filter(|class| debit.stands_in(*class))
+            .collect();
+        assert_eq!(classes, [PinClass::Debit]);
+        // Everything a credit conflicts with, a debit conflicts with too.
+        for other in every_modes() {
+            if Modes::DELTA.conflicts(other) {
+                assert!(debit.conflicts(other), "{other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_debit_and_a_reserve_conflict_both_ways() {
+        let debit = Modes::DELTA.union(Modes::DEBIT);
+        assert!(!Modes::RESERVE.refuses(debit), "admitted one way");
+        assert!(debit.refuses(Modes::RESERVE));
+        assert!(Modes::RESERVE.conflicts(debit) && debit.conflicts(Modes::RESERVE));
+        assert!(debit.refuses_class(PinClass::Reserve));
+        assert!(!debit.refused_by(PinClass::Reserve));
+    }
+
+    #[test]
+    fn a_class_past_the_last_decodes_to_none() {
+        for class in PinClass::ALL {
+            assert_eq!(PinClass::from_bits(class as u8), Some(class));
+        }
+        for bits in 5..=7 {
+            assert_eq!(PinClass::from_bits(bits), None);
         }
     }
 

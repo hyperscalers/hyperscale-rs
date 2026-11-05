@@ -8575,8 +8575,8 @@ mod tests {
             assert_eq!(written(MemberCollection::Waiters), vec![false, false]);
             assert_eq!(
                 written(MemberCollection::Queue),
-                vec![true; 3],
-                "a write and a debit's delta and debit classes"
+                vec![true; 2],
+                "a write's class and a debit's, which stands in no other"
             );
             store.apply(&writes);
             let ran = row(&store, 1);
@@ -10859,7 +10859,7 @@ mod tests {
                 Shape::Shared,
                 &[
                     ("Members", 5 * B, 1_355 * B),
-                    ("Queue", 10 * B, 245 * B),
+                    ("Queue", 6 * B, 147 * B),
                     ("Seats", 2 * B, 32 * B),
                     ("Staged", 2 * B, 38 * B),
                     ticks[1],
@@ -10872,7 +10872,7 @@ mod tests {
                 Shape::Legs,
                 &[
                     ("Members", 3 * B, 698 * B),
-                    ("Queue", 10 * B, 245 * B),
+                    ("Queue", 6 * B, 147 * B),
                     ticks[1],
                     ("Waiters", 6 * B, 147 * B),
                 ],

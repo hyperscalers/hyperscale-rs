@@ -45,21 +45,31 @@ pub struct Place {
     pub rank: u16,
 }
 
-/// The most height bits a queue order key carries.
-const PLACE_HEIGHT_BITS: u32 = 46;
+/// The bits a queue order key gives its class.
+const CLASS_BITS: u32 = 3;
+
+/// The most height bits a queue order key carries: about 11,000 years
+/// at 100 blocks a second.
+const PLACE_HEIGHT_BITS: u32 = 45;
+
+/// The bits a packed place takes, height over rank.
+const PLACE_BITS: u32 = PLACE_HEIGHT_BITS + 16;
+
+const _: () =
+    assert!(PinClass::ALL.len() <= 1 << CLASS_BITS && CLASS_BITS + PLACE_HEIGHT_BITS + 16 == 64);
 
 impl Place {
-    /// The place in 62 bits, height over rank, in place order.
+    /// The place in 61 bits, height over rank, in place order.
     ///
     /// # Panics
     ///
-    /// Past 2^46 blocks, which no chain reaches.
+    /// Past 2^45 blocks, which no chain reaches.
     #[must_use]
     pub fn packed(self) -> u64 {
         let height = self.height.inner();
         assert!(
             height < 1 << PLACE_HEIGHT_BITS,
-            "a place's height fits 46 bits"
+            "a place's height fits 45 bits"
         );
         (height << 16) | u64::from(self.rank)
     }
@@ -90,7 +100,7 @@ pub type PinsChunk = Capped<Vec<Pin>, MAX_PINS_PER_ENTRY>;
 pub type QueueValue = Capped<Vec<(PinKey, TxHash)>, MAX_HOLDS_PER_MEMBER>;
 
 /// The order key of `key`'s entry in `class` at `place`:
-/// `bucket:64 ‖ class:2 ‖ height:46 ‖ rank:16`.
+/// `bucket:64 ‖ class:3 ‖ height:45 ‖ rank:16`.
 #[must_use]
 pub fn queue_order(key: PinKey, class: PinClass, place: Place) -> u128 {
     class_base(key, class) | u128::from(place.packed())
@@ -100,15 +110,22 @@ pub fn queue_order(key: PinKey, class: PinClass, place: Place) -> u128 {
 #[must_use]
 pub fn class_span(key: PinKey, class: PinClass) -> (u128, u128) {
     let base = class_base(key, class);
-    (base, base | ((1u128 << 62) - 1))
+    (base, base | ((1u128 << PLACE_BITS) - 1))
 }
 
 fn class_base(key: PinKey, class: PinClass) -> u128 {
-    (u128::from(key.bucket()) << 64) | ((class as u128) << 62)
+    (u128::from(key.bucket()) << 64) | ((class as u128) << PLACE_BITS)
+}
+
+/// The class a `Queue` order key stands in, or `None` where its class
+/// bits name none.
+fn class_of(order: u128) -> Option<PinClass> {
+    let bits = (order >> PLACE_BITS) & ((1 << CLASS_BITS) - 1);
+    PinClass::from_bits(u8::try_from(bits).expect("three bits fit a byte"))
 }
 
 /// The order key of a waiter's `Waiters` entry for `key` at `place`:
-/// `bucket:64 ‖ 0:2 ‖ height:46 ‖ rank:16`, one per pin whatever its
+/// `bucket:64 ‖ 0:3 ‖ height:45 ‖ rank:16`, one per pin whatever its
 /// modes, since what a waiter is refused on is read off its row.
 #[must_use]
 pub fn waiter_order(key: PinKey, place: Place) -> u128 {
@@ -119,7 +136,7 @@ pub fn waiter_order(key: PinKey, place: Place) -> u128 {
 #[must_use]
 pub fn waiter_span(key: PinKey) -> (u128, u128) {
     let base = u128::from(key.bucket()) << 64;
-    (base, base | ((1u128 << 62) - 1))
+    (base, base | ((1u128 << PLACE_BITS) - 1))
 }
 
 /// The order key of a row's `Serves` entry: `height:64 ‖ rank:64`.
@@ -407,7 +424,9 @@ impl QueueHolds {
             u128::MAX,
             usize::MAX,
         ) {
-            let class = PinClass::ALL[usize::try_from((order >> 62) & 3).unwrap_or_default()];
+            let Some(class) = class_of(order) else {
+                continue;
+            };
             let Ok(value) = from_slice::<QueueValue>(&bytes) else {
                 continue;
             };
@@ -697,7 +716,9 @@ impl PinIndex {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::to_vec;
-    use hyperscale_types::{EntryKey, MAX_CELL_VALUE_LEN, MemberCollection, Modes};
+    use hyperscale_types::{
+        EntryKey, Hash, MAX_CELL_VALUE_LEN, MemberCollection, Modes, SubstateKey,
+    };
 
     use super::*;
     use crate::shard::writes::entry_leaf_value;
@@ -740,13 +761,83 @@ mod tests {
             height: BlockHeight::new(height),
             rank,
         };
-        let early = queue_order(key, PinClass::Read, at(5, 9));
-        let late = queue_order(key, PinClass::Read, at(6, 0));
-        assert!(early < late);
-        let (lo, hi) = class_span(key, PinClass::Read);
-        assert!((lo..=hi).contains(&early) && (lo..=hi).contains(&late));
-        let (next, _) = class_span(key, PinClass::Movement);
-        assert!(hi < next);
+        let last = at((1 << PLACE_HEIGHT_BITS) - 1, u16::MAX);
+        for pair in PinClass::ALL.windows(2) {
+            let (class, next) = (pair[0], pair[1]);
+            let early = queue_order(key, class, at(5, 9));
+            let late = queue_order(key, class, last);
+            assert!(early < late);
+            let (lo, hi) = class_span(key, class);
+            assert!((lo..=hi).contains(&early) && (lo..=hi).contains(&late));
+            assert_eq!(class_of(late), Some(class));
+            let (after, _) = class_span(key, next);
+            assert_eq!(hi + 1, after, "the class bits sit right above the place");
+        }
+        let (_, hi) = class_span(key, PinClass::Debit);
+        assert!(hi < u128::from(key.bucket() + 1) << 64);
+        assert_eq!(
+            waiter_order(key, last),
+            queue_order(key, PinClass::Read, last),
+            "a waiter's key carries zero class bits"
+        );
+    }
+
+    /// An entry whose class bits name no class is skipped, never indexed.
+    #[test]
+    fn a_class_past_the_last_decodes_as_malformed() {
+        /// One `Queue` collection's entries, and nothing else.
+        struct Queued(BTreeMap<u128, Vec<u8>>);
+
+        impl Substates for Queued {
+            fn cell(&self, _key: SubstateKey) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn entries_in_range(
+                &self,
+                _owner: Address,
+                collection: CollectionId,
+                lo: u128,
+                hi: u128,
+                limit: usize,
+            ) -> Vec<(u128, Vec<u8>)> {
+                if collection != MemberFamily::of(ShardId::ROOT).id(MemberCollection::Queue)
+                    || lo > hi
+                {
+                    return Vec::new();
+                }
+                self.0
+                    .range(lo..=hi)
+                    .take(limit)
+                    .map(|(order, bytes)| (*order, bytes.clone()))
+                    .collect()
+            }
+        }
+
+        let key = PinKey([7; 16]);
+        let tx = TxHash::from(Hash::from_bytes(&[1; 32]));
+        let value = to_vec(&QueueValue::new(vec![(key, tx)]).expect("one entry")).expect("encodes");
+        let place = Place {
+            height: BlockHeight::new(3),
+            rank: 0,
+        };
+        for bits in 5u128..=7 {
+            let order = (u128::from(key.bucket()) << 64)
+                | (bits << PLACE_BITS)
+                | u128::from(place.packed());
+            assert_eq!(class_of(order), None);
+            let rows = MemberIndex::load(
+                &Queued(BTreeMap::from([(order, value.clone())])),
+                ShardId::ROOT,
+            );
+            assert!(QueueHolds::of(&rows).is_empty(), "class bits {bits}");
+        }
+        let order = queue_order(key, PinClass::Write, place);
+        let rows = MemberIndex::load(&Queued(BTreeMap::from([(order, value)])), ShardId::ROOT);
+        assert!(
+            !QueueHolds::of(&rows).is_empty(),
+            "a class within the table is read"
+        );
     }
 
     mod pin_index {
@@ -804,7 +895,7 @@ mod tests {
         type Drawn = (u8, u8, u8, u8, u8);
 
         fn entry((at, class, height, rank, member): Drawn) -> (u128, QueueValue) {
-            let class = PinClass::ALL[usize::from(class % 4)];
+            let class = PinClass::ALL[usize::from(class) % PinClass::ALL.len()];
             let place = Place {
                 height: BlockHeight::new(u64::from(height % 4)),
                 rank: u16::from(rank % 4),
@@ -849,9 +940,9 @@ mod tests {
             /// sharing a bucket never answer for each other.
             #[test]
             fn probes_match_a_scan(
-                stored in vec((0u8..3, 0u8..4, 0u8..4, 0u8..4, 0u8..4), 0..12),
-                writes in vec(((0u8..3, 0u8..4, 0u8..4, 0u8..4, 0u8..4), any::<bool>()), 0..12),
-                asks in vec((0u8..3, 0u8..4, option::of((0u8..4, 0u8..4))), 1..12),
+                stored in vec((0u8..3, 0u8..5, 0u8..4, 0u8..4, 0u8..4), 0..12),
+                writes in vec(((0u8..3, 0u8..5, 0u8..4, 0u8..4, 0u8..4), any::<bool>()), 0..12),
+                asks in vec((0u8..3, 0u8..5, option::of((0u8..4, 0u8..4))), 1..12),
                 sought in any::<bool>(),
             ) {
                 let mut held: BTreeMap<u128, Vec<u8>> = stored
