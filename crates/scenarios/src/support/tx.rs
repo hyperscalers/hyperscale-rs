@@ -2324,7 +2324,7 @@ pub fn build_sponsored_swap_tx(
 ) -> Transaction {
     build_venues_tx(
         payer,
-        Some(sponsor),
+        Some(Sponsor::paying(sponsor)),
         slice::from_ref(venue),
         validity,
         &|pools, b| {
@@ -2387,8 +2387,54 @@ pub(crate) fn build_sponsored_route_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let metas = [venues.0.clone(), venues.1.clone()];
+    build_venues_tx(
+        payer,
+        Some(Sponsor::paying(sponsor)),
+        &metas,
+        validity,
+        &|pools, b| {
+            let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
+            let mid = pools[0].swap(b, funds, 0)?;
+            let out = pools[1].swap(b, mid, 0)?;
+            account::deposit(b, from, out)
+        },
+    )
+}
+
+/// A two-hop route of `paying`'s amount of its resource taking whatever
+/// the second venue quotes, with its fee paid by `sponsor`, which attests
+/// the root first.
+///
+/// Where `presenting` names a resource, the intent also acts as the
+/// sponsor's account and presents the sponsor's vault of it as a badge,
+/// a proof nothing consumes: the route declares a read of that vault on
+/// the sponsor's shard, which refuses a reservation or a credit there
+/// while the route stands.
+///
+/// # Panics
+///
+/// As [`build_route_tx`].
+#[must_use]
+pub(crate) fn build_sponsored_route_presenting_tx(
+    sponsor: &Ed25519PrivateKey,
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venues: (&InstanceMeta, &InstanceMeta),
+    paying: (ResourceAddr, u128),
+    presenting: Option<ResourceAddr>,
+    validity: TimestampRange,
+) -> Transaction {
+    let metas = [venues.0.clone(), venues.1.clone()];
+    let presenter = principal_of(sponsor);
+    let sponsor = Sponsor {
+        key: sponsor,
+        acted_as: presenting.is_some(),
+    };
     build_venues_tx(payer, Some(sponsor), &metas, validity, &|pools, b| {
-        let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
+        if let Some(badge) = presenting {
+            let _ = account::present_badge(b, presenter, badge)?;
+        }
+        let funds = account::withdraw(b, from, paying.0, paying.1)?;
         let mid = pools[0].swap(b, funds, 0)?;
         let out = pools[1].swap(b, mid, 0)?;
         account::deposit(b, from, out)
@@ -2454,7 +2500,7 @@ type VenueRoute<'a> = dyn Fn(&[amm::Amm], &mut TypedBuilder<'_>) -> Result<(), T
 /// If the scenario world does not answer the call.
 fn build_venues_tx(
     payer: &Ed25519PrivateKey,
-    sponsor: Option<&Ed25519PrivateKey>,
+    sponsor: Option<Sponsor<'_>>,
     venues: &[InstanceMeta],
     validity: TimestampRange,
     route: &VenueRoute<'_>,
@@ -2468,6 +2514,25 @@ fn build_venues_tx(
     })
 }
 
+/// Who pays a call envelope's fee in its signer's place.
+#[derive(Clone, Copy)]
+struct Sponsor<'a> {
+    key: &'a Ed25519PrivateKey,
+    /// Whether the intent also acts as the sponsor's account, so a gate
+    /// claiming it is covered.
+    acted_as: bool,
+}
+
+impl<'a> Sponsor<'a> {
+    /// A sponsor that pays and is claimed by no gate.
+    const fn paying(key: &'a Ed25519PrivateKey) -> Self {
+        Self {
+            key,
+            acted_as: false,
+        }
+    }
+}
+
 /// Calls against sealed instances of any package, each typed against the
 /// record its own seal wrote, composed into one intent the payer signs
 /// (behind `sponsor`, when one pays). Each node's compute ceiling is
@@ -2479,7 +2544,7 @@ fn build_venues_tx(
 /// If the scenario world does not answer a call.
 fn build_instances_tx(
     payer: &Ed25519PrivateKey,
-    sponsor: Option<&Ed25519PrivateKey>,
+    sponsor: Option<Sponsor<'_>>,
     instances: &[InstanceMeta],
     validity: TimestampRange,
     gas_per_node: Option<u64>,
@@ -2488,16 +2553,30 @@ fn build_instances_tx(
     let client = client();
     let chain = client.records();
     let composed = Composed::new(&chain, instances, &ProtocolHasher);
-    let mut root = IntentBuilder::new(
-        &composed,
-        &ProtocolHasher,
-        account_address(&payer.public_key().0),
-        scenario_header(validity),
-    );
+    let payer_account = account_address(&payer.public_key().0);
+    let mut root = match sponsor {
+        Some(sponsor) if sponsor.acted_as => IntentBuilder::acting_as(
+            &composed,
+            &ProtocolHasher,
+            &[payer_account, principal_of(sponsor.key)],
+            scenario_header(validity),
+        )
+        .expect("an intent acting as two accounts acts as somebody"),
+        _ => IntentBuilder::new(
+            &composed,
+            &ProtocolHasher,
+            payer_account,
+            scenario_header(validity),
+        ),
+    };
     calls(&mut root).expect("every instance call types against its signature");
     let mut tree = root.build().expect("the intent declares no hole");
     // A sponsor attests the root first, which makes it the fee payer.
-    let signers: Vec<&Ed25519PrivateKey> = sponsor.into_iter().chain([payer]).collect();
+    let signers: Vec<&Ed25519PrivateKey> = sponsor
+        .map(|sponsor| sponsor.key)
+        .into_iter()
+        .chain([payer])
+        .collect();
     tree.root.attested_by =
         Capped::new(signers.iter().map(|signer| principal_of(*signer)).collect())
             .expect("two attesters at most");

@@ -13,10 +13,12 @@ mod support;
 
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::{
-    ScenarioConfig, a_hot_venue_runs_every_swap_where_it_commits,
+    ScenarioConfig, a_cycle_through_a_payer_core_aborts_at_the_window,
+    a_hot_venue_runs_every_swap_where_it_commits,
     a_route_whose_venue_never_commits_frees_the_ladder,
     a_stalled_venue_aborts_its_route_at_the_window, book_route_genesis_accounts,
-    departing_venue_split_bytes, epochs, venue_genesis_accounts,
+    departing_venue_split_bytes, epochs, payer_cycle_genesis_accounts,
+    sponsored_routes_crossed_through_their_legs_abort_at_the_window, venue_genesis_accounts,
 };
 use support::{SimCluster, sim_seed};
 
@@ -35,6 +37,41 @@ fn book_route_cluster(seed: u64) -> SimCluster {
         &book_route_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     )
+}
+
+/// A venue on each of four quarters and the routes' cast, every
+/// committee on hosts of its own, for the cuts that order the commits.
+fn payer_cycle_cluster(seed: u64) -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            shard_size: 4,
+            vnodes_per_host: 1,
+            pool_surplus: 14,
+            num_shards: 4,
+            split_bytes: u64::MAX,
+            latency: std::time::Duration::from_millis(150),
+        },
+        seed,
+        &payer_cycle_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+/// A payer core heads ahead of a member that heads ahead of the core's
+/// own leg: the cycle ends at a naming window, with no more than two
+/// aborts and nothing moved for them but their charges.
+#[test]
+fn a_cycle_through_a_payer_core_ends_at_the_window() {
+    let mut cluster = payer_cycle_cluster(sim_seed(42));
+    cluster.run_faultable(a_cycle_through_a_payer_core_aborts_at_the_window);
+}
+
+/// Two sponsored routes whose payer cores each hold the other's leg off
+/// end at a naming window, as the three-member cycle does.
+#[test]
+fn two_sponsored_routes_crossed_through_their_legs_end_at_the_window() {
+    let mut cluster = payer_cycle_cluster(sim_seed(42));
+    cluster.run_faultable(sponsored_routes_crossed_through_their_legs_abort_at_the_window);
 }
 
 /// Routes back to back through a venue that never commits them: each

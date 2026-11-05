@@ -25,6 +25,7 @@ mod faults;
 mod fees;
 mod liveness;
 mod multi_vnode;
+mod payer_cycle;
 mod payer_floor;
 mod pushes;
 mod reshape;
@@ -94,6 +95,10 @@ pub use fees::{
 };
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
+pub use payer_cycle::{
+    a_cycle_through_a_payer_core_aborts_at_the_window, payer_cycle_genesis_accounts,
+    sponsored_routes_crossed_through_their_legs_abort_at_the_window,
+};
 pub use payer_floor::{
     Ceiling, PAYER_SHARD, Pair, RoutePayer, Spend, a_payer_publishes_beside_its_unsettled_spend,
     a_payer_spends_beside_its_pending_leg, a_payer_spends_beside_its_routes_pending_core,
