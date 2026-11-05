@@ -255,12 +255,11 @@ impl ProvisioningTracker {
     ///   shard takes the minimum over one set.
     /// - A leg runs alone and under its own.
     ///
-    /// `None` for a core member while another core shard's bundle is not
-    /// absorbed: without it there is no minimum every core shard agrees
-    /// on, and a node short of it is short of what the member's line
-    /// names it to run on. A whole member whose remote payer's bundle is
-    /// not absorbed takes its own, which only a member attested aborted
-    /// whatever it says runs under.
+    /// `None` while a bundle the clock is read off is not absorbed: a
+    /// core member's from another core shard, or a whole member's from
+    /// its remote payer. A node short of one is short of what the
+    /// member's line names it to run on, and its peers run under a clock
+    /// it cannot read.
     #[must_use]
     pub(crate) fn transaction_clock(
         &self,
@@ -271,12 +270,7 @@ impl ProvisioningTracker {
         let absorbed = self.absorbed.get(&tx_hash);
         let clock_of = |shard: &ShardId| absorbed?.get(shard).map(|part| part.anchor.clock);
         match member.role() {
-            Role::Whole => Some(
-                self.payer_shards
-                    .get(&tx_hash)
-                    .and_then(clock_of)
-                    .unwrap_or(own),
-            ),
+            Role::Whole => self.payer_shards.get(&tx_hash).map_or(Some(own), clock_of),
             Role::Core => member
                 .classified()
                 .core()
@@ -671,7 +665,7 @@ mod tests {
             t.provisions_for(tx),
             vec![list(&[(a, Some(1))]), list(&[(b, Some(2))])],
         );
-        assert_eq!(whole_clock(&t, tx), anchor(9_500).clock);
+        assert_eq!(whole_clock(&t, tx), Some(anchor(9_500).clock));
     }
 
     #[test]
@@ -1054,15 +1048,14 @@ mod tests {
                 vec![Arc::new(vec![SubstateEntry::new(a, None)])],
                 "at height {height}",
             );
-            assert_eq!(whole_clock(&t, tx), anchor(clock_ms).clock);
+            assert_eq!(whole_clock(&t, tx), Some(anchor(clock_ms).clock));
         }
     }
 
     /// The clock a whole member on leaf 0 runs under, committed here at
     /// [`OWN_CLOCK_MS`].
-    fn whole_clock(t: &ProvisioningTracker, tx: TxHash) -> WeightedTimestamp {
+    fn whole_clock(t: &ProvisioningTracker, tx: TxHash) -> Option<WeightedTimestamp> {
         t.transaction_clock(tx, &Member::whole(shard(0)), anchor(OWN_CLOCK_MS).clock)
-            .expect("a whole member always has a clock")
     }
 
     /// Where the member under test committed its transaction.
@@ -1082,14 +1075,14 @@ mod tests {
         t.record_payer_shard(tx, shard(2));
 
         // A read-set owner's bundle lands first: its clock is not the
-        // payer's, so the member's own stands until the payer's lands.
+        // payer's, so the member has none until the payer's lands.
         t.absorb_provisions(&make_provisions_at(
             shard(1),
             BlockHeight::new(5),
             anchor(7_000),
             tx,
         ));
-        assert_eq!(whole_clock(&t, tx), anchor(OWN_CLOCK_MS).clock);
+        assert_eq!(whole_clock(&t, tx), None);
 
         // The payer's bundle carries its committing block's clock, which
         // every participant executes the transaction under.
@@ -1099,7 +1092,7 @@ mod tests {
             anchor(9_500),
             tx,
         ));
-        assert_eq!(whole_clock(&t, tx), anchor(9_500).clock);
+        assert_eq!(whole_clock(&t, tx), Some(anchor(9_500).clock));
 
         // A payer's part rooted by a later block than the one committing
         // the transaction carries the committing clock, and that is the
@@ -1107,7 +1100,7 @@ mod tests {
         let mut t = ProvisioningTracker::new();
         t.record_payer_shard(tx, shard(2));
         t.absorb_provisions(&served_late(shard(2), BlockHeight::new(12), 9_500, tx));
-        assert_eq!(whole_clock(&t, tx), anchor(9_500).clock);
+        assert_eq!(whole_clock(&t, tx), Some(anchor(9_500).clock));
     }
 
     /// The member `local` runs of a core over leaf(1, 0) and leaf(2, 2),
@@ -1207,7 +1200,7 @@ mod tests {
         assert!(!t.is_fully_provisioned(tx));
         assert_eq!(t.absorbed_len(), 0);
         assert_eq!(t.required_len(), 0);
-        assert_eq!(whole_clock(&t, tx), anchor(OWN_CLOCK_MS).clock);
+        assert_eq!(whole_clock(&t, tx), Some(anchor(OWN_CLOCK_MS).clock));
     }
 
     #[test]

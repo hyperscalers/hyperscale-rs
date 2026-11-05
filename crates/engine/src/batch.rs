@@ -33,10 +33,8 @@ use crate::legs::Member;
 pub struct TickEnvironment {
     /// The seeds this tick's members draw on: the ring the window
     /// governing the block carried, and the ring of each member's own
-    /// window where that one falls short. That window is fresher for a
-    /// member clocked past the block's, and older for one a halt
-    /// recovery's crossing block names under a committee epochs past its
-    /// clock.
+    /// window where that one falls short, which it does only for a member
+    /// clocked past the governing window.
     ///
     /// Only a store. What a member draws on is
     /// [`Self::seed_window_for`] its own clock, which the ring answers

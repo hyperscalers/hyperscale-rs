@@ -1647,7 +1647,8 @@ impl ExecutionCoordinator {
 
     /// Seat the tick the committing block names: its members, its aborts,
     /// its discards and its fates, as the lines say. Seating reads no
-    /// baseline, so it runs whether or not the tick can be dispatched.
+    /// baseline, so it runs whether or not the tick can be dispatched;
+    /// only a `runnable` one takes in the seeds its members draw on.
     fn seat_tick(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1655,6 +1656,7 @@ impl ExecutionCoordinator {
         block: &CommittingBlock,
         named: Named<'_>,
         seated: &mut Vec<TickLine>,
+        runnable: bool,
     ) -> (
         Option<PendingTick>,
         Vec<Verifiable<ExecutionVote>>,
@@ -1752,12 +1754,13 @@ impl ExecutionCoordinator {
 
         let pending = (!requests.is_empty()).then(|| {
             // Off the block's certified committee, with the ring of each
-            // member's own window the schedule holds where that one falls
-            // short: a member clocked past the block's window, or one a
-            // halt recovery's crossing block names under a committee
-            // epochs past its clock.
+            // member's own window the schedule holds where the committee's
+            // ring falls short: a member clocked past the committee's
+            // window.
             let mut env = TickEnvironment::governing(committee, topology_schedule.windows());
-            let (in_hand, awaiting) = if in_hand {
+            // A tick that never runs here draws on nothing, so a window
+            // this node has evicted is no cause to warn of.
+            let (in_hand, awaiting) = if runnable && in_hand {
                 seat_seeds(&mut env, &requests, topology_schedule).awaiting(tick_id, lines)
             } else {
                 (false, None)
@@ -3828,7 +3831,14 @@ impl ExecutionCoordinator {
         let (pending, early_votes, members) = if self.terminated {
             (None, Vec::new(), Vec::new())
         } else {
-            self.seat_tick(topology_schedule, window.snapshot, &block, named, seated)
+            self.seat_tick(
+                topology_schedule,
+                window.snapshot,
+                &block,
+                named,
+                seated,
+                runnable,
+            )
         };
         for vote in early_votes {
             actions.extend(self.on_execution_vote(topology_schedule, vote));
@@ -10651,9 +10661,12 @@ mod tests {
     }
 
     /// A schedule holding window `A` with the ring folded through it,
-    /// and window `C` whose ring keeps only its last few epochs: the
-    /// shape a halt recovery's crossing block commits under, its anchor
-    /// in `A` and its QC signed by `C`'s committee.
+    /// and window `C` whose ring keeps only its last few epochs, for a
+    /// block anchored in `A` whose QC `C`'s committee signs. A unit shape
+    /// production does not reach: a block's committee is never past its
+    /// anchor but on a halt recovery's coast, whose ticks never dispatch.
+    /// It stands in for any member whose window the committee's ring
+    /// cannot reach.
     fn bridged_seed_schedule(windows: EpochWindows, a: u64, c: u64) -> TopologySchedule {
         let mut sched =
             TopologySchedule::new(windows, Epoch::new(a), seeded_snapshot(windows, 1..=a - 1));
@@ -10663,10 +10676,12 @@ mod tests {
         sched
     }
 
-    /// A tick whose member is clocked in an older window than the ring
-    /// its committee carries draws on that window, which the schedule
-    /// may evict before the tick reaches the dispatch head. Seating
-    /// takes it while it is held, so the tick runs after the eviction.
+    /// A tick whose member's window the ring its committee carries cannot
+    /// reach draws on that window, which the schedule may evict before
+    /// the tick reaches the dispatch head. Seating takes it while it is
+    /// held, so the tick runs after the eviction. The window here is
+    /// older than the committee's, in the unit shape of
+    /// [`bridged_seed_schedule`].
     #[test]
     fn a_tick_seated_while_its_members_window_is_held_runs_after_the_eviction() {
         const ED: u64 = 1_000;
@@ -10716,9 +10731,8 @@ mod tests {
         );
     }
 
-    /// The same tick seated on a replica whose schedule has already
-    /// evicted its member's window, as one syncing the recovered chain
-    /// late or rebuilt by a restart: nothing brings the window back, so
+    /// The same unit shape seated on a replica whose schedule has already
+    /// evicted its member's window: nothing brings the window back, so
     /// the tick is held for its finalization rather than run.
     #[test]
     fn a_tick_seated_past_its_members_evicted_window_is_held() {
@@ -14762,6 +14776,7 @@ mod tests {
                 cause: DiscardCause::Recovery,
             }]),
             &mut Vec::new(),
+            true,
         );
         let after = commit_carrying(&mut state, &schedule, 4, past_the_horizon() + 2_000, vec![]);
         assert!(!resolved_aborted(&after, leg.hash()), "resolved once");
@@ -18183,6 +18198,7 @@ mod tests {
             &block,
             Named::Lines(lines),
             &mut Vec::new(),
+            true,
         );
     }
 
@@ -18230,8 +18246,14 @@ mod tests {
             ts: state.committed_ts,
             fees: Vec::new(),
         };
-        let (pending, votes, _) =
-            state.seat_tick(&sched, &anchored, &block, Named::Lines(&lines), &mut seated);
+        let (pending, votes, _) = state.seat_tick(
+            &sched,
+            &anchored,
+            &block,
+            Named::Lines(&lines),
+            &mut seated,
+            true,
+        );
         assert!(pending.is_none());
         assert!(votes.is_empty());
         assert_eq!(seated, lines, "the lines seated are the block's");
