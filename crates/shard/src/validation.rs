@@ -622,7 +622,7 @@ pub mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::{
-        CommittedSets, awaited_core, member_lines, member_of, staged_past_cap,
+        CommittedSets, Naming, awaited_core, member_lines, member_of, staged_past_cap,
     };
     use hyperscale_hbor::{Capped, from_slice, to_vec};
     use hyperscale_storage::test_helpers::{
@@ -2900,7 +2900,7 @@ pub mod tests {
     /// hold it to no clock: the first block names their aborts.
     #[test]
     fn released_rows_leave_the_count_and_the_drain_from_their_deadline() {
-        use hyperscale_engine::tick_select::{CommittedSets, member_lines};
+        use hyperscale_engine::tick_select::{CommittedSets, Naming, member_lines};
         use hyperscale_storage::SettledHalf;
         use hyperscale_types::{Evidence, TickHalf};
 
@@ -2921,12 +2921,14 @@ pub mod tests {
         }
         let named = |rows: &MemberIndex, anchor: WeightedTimestamp| {
             let (lines, missing, _) = member_lines(
-                rows,
-                anchor,
-                &CommittedSets::default(),
-                &|_, _| Evidence::Live { terminating: false },
-                false,
-                &BTreeSet::new(),
+                Naming {
+                    rows,
+                    anchor,
+                    inputs: &CommittedSets::default(),
+                    evidence: &|_, _| Evidence::Live { terminating: false },
+                    recovery: false,
+                    wounded: &BTreeSet::new(),
+                },
                 &BTreeMap::new(),
             );
             assert!(missing.is_empty());
@@ -4858,12 +4860,14 @@ pub mod tests {
         };
         let anchor = WeightedTimestamp::from_millis(2_000);
         let (lines, missing, _) = member_lines(
-            &rows,
-            anchor,
-            &arrived,
-            &|_, _| Evidence::Live { terminating: false },
-            false,
-            &BTreeSet::new(),
+            Naming {
+                rows: &rows,
+                anchor,
+                inputs: &arrived,
+                evidence: &|_, _| Evidence::Live { terminating: false },
+                recovery: false,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert!(missing.is_empty());
@@ -4897,12 +4901,14 @@ pub mod tests {
         anchor: WeightedTimestamp,
     ) -> MemberIndex {
         let (lines, missing, _) = member_lines(
-            &rows,
-            anchor,
-            arrived,
-            &|_, _| Evidence::Live { terminating: false },
-            true,
-            &BTreeSet::new(),
+            Naming {
+                rows: &rows,
+                anchor,
+                inputs: arrived,
+                evidence: &|_, _| Evidence::Live { terminating: false },
+                recovery: true,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert!(missing.is_empty());
@@ -4972,12 +4978,14 @@ pub mod tests {
                         Evidence::Unknown,
                     ] {
                         let (lines, _, _) = member_lines(
-                            rows,
-                            anchor,
-                            arrived,
-                            &|_, _| said,
-                            false,
-                            &BTreeSet::new(),
+                            Naming {
+                                rows,
+                                anchor,
+                                inputs: arrived,
+                                evidence: &|_, _| said,
+                                recovery: false,
+                                wounded: &BTreeSet::new(),
+                            },
                             &BTreeMap::new(),
                         );
                         let unstated = rows.members[&tx].state == in_flight(2, Settlement::Shared)
@@ -5179,12 +5187,14 @@ pub mod tests {
             ] {
                 for recovery in [false, true] {
                     let (lines, missing, _) = member_lines(
-                        rows,
-                        anchor,
-                        arrived,
-                        &|_, _| said,
-                        recovery,
-                        &BTreeSet::new(),
+                        Naming {
+                            rows,
+                            anchor,
+                            inputs: arrived,
+                            evidence: &|_, _| said,
+                            recovery,
+                            wounded: &BTreeSet::new(),
+                        },
                         &BTreeMap::new(),
                     );
                     let fated = match settlement {

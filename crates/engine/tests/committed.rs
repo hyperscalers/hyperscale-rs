@@ -15,7 +15,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, genesis_world_with_pools, pool_address, stake_unit,
 };
 use hyperscale_engine::legs::{Classified, Member};
-use hyperscale_engine::tick_select::{CommittedSets, member_lines, terms_of_member};
+use hyperscale_engine::tick_select::{self, CommittedSets, member_lines, terms_of_member};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
     TickTxInput, genesis_writes,
@@ -928,12 +928,14 @@ impl<'w> Naming<'w> {
         let mut carrying = self.rows.clone();
         carrying.advance(&pending);
         let (lines, missing, _) = member_lines(
-            &carrying,
-            ANCHOR,
-            &self.inputs,
-            &|_, _| Evidence::Readable,
-            false,
-            &BTreeSet::new(),
+            tick_select::Naming {
+                rows: &carrying,
+                anchor: ANCHOR,
+                inputs: &self.inputs,
+                evidence: &|_, _| Evidence::Readable,
+                recovery: false,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert!(missing.is_empty(), "no member is held past its evidence");

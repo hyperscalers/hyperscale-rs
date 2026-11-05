@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_engine::tick_select::{CommittedSets, member_lines};
+use hyperscale_engine::tick_select::{CommittedSets, Naming, member_lines};
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::MemberIndex;
 use hyperscale_storage::test_helpers::test_a_sibling_reads_a_released_rows_abort_as_an_exit;
@@ -20,12 +20,14 @@ use tempfile::TempDir;
 /// The lines a block names for `rows`, with every sibling live.
 fn named(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<TickLine> {
     let (lines, missing, _) = member_lines(
-        rows,
-        anchor,
-        &CommittedSets::default(),
-        &|_, _| Evidence::Live { terminating: false },
-        false,
-        &BTreeSet::new(),
+        Naming {
+            rows,
+            anchor,
+            inputs: &CommittedSets::default(),
+            evidence: &|_, _| Evidence::Live { terminating: false },
+            recovery: false,
+            wounded: &BTreeSet::new(),
+        },
         &BTreeMap::new(),
     );
     assert!(missing.is_empty());

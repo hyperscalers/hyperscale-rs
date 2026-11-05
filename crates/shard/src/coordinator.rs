@@ -146,7 +146,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::tick_select::{
-    ManifestBudget, ManifestInputs, ManifestKind, SeatQuestion, Unlicensed, accepting,
+    ManifestBudget, ManifestInputs, ManifestKind, Naming, SeatQuestion, Unlicensed, accepting,
     carried_verdicts, member_lines, seat_questions, terminal_fates, wounded,
 };
 use hyperscale_metrics::{
@@ -3128,12 +3128,14 @@ impl ShardCoordinator {
             topology_schedule.crossing_block(committee, self.local_shard, parent_anchor, anchor);
         let victims = wounded(rows, anchor, block.state_claims());
         let (lines, missing, budget) = member_lines(
-            rows,
-            anchor,
-            &sets,
-            &|shard, committed| sets.evidence(shard, committed),
-            recovery,
-            &victims,
+            Naming {
+                rows,
+                anchor,
+                inputs: &sets,
+                evidence: &|shard, committed| sets.evidence(shard, committed),
+                recovery,
+                wounded: &victims,
+            },
             verdicts,
         );
         if let Some(tx) = missing.first() {

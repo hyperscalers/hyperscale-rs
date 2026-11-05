@@ -892,27 +892,17 @@ pub fn legs_stand(
 /// derives the lines from: an exit the budget left out frees room for
 /// lines after it, and the second naming keeps every exit the first did,
 /// since each came before the point the first stopped at.
-#[allow(clippy::too_many_arguments)] // member_lines' inputs and the views its verdicts are read under
 #[must_use]
 pub fn licensed_lines(
-    rows: &MemberIndex,
-    anchor: WeightedTimestamp,
-    inputs: &dyn CommittedInputs,
-    evidence: &dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
-    recovery: bool,
-    wounded: &BTreeSet<TxHash>,
+    naming: Naming<'_>,
     views: &SiblingViews,
 ) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
-    let licensed: BTreeMap<TxHash, Decision> = stated_decisions(rows, views)
+    let licensed: BTreeMap<TxHash, Decision> = stated_decisions(naming.rows, views)
         .into_iter()
         .filter(|(_, decision)| *decision == Decision::Refuse)
         .collect();
-    let holds = QueueHolds::of(rows);
-    let named = |verdicts: &BTreeMap<TxHash, Decision>| {
-        lines_over(
-            rows, &holds, anchor, inputs, evidence, recovery, wounded, verdicts,
-        )
-    };
+    let holds = QueueHolds::of(naming.rows);
+    let named = |verdicts: &BTreeMap<TxHash, Decision>| lines_over(naming, holds.clone(), verdicts);
     if licensed.is_empty() {
         return named(&licensed);
     }
@@ -1129,35 +1119,50 @@ impl<'a> Standing<'a> {
 /// names after them.
 #[must_use]
 pub fn member_lines(
-    rows: &MemberIndex,
-    anchor: WeightedTimestamp,
-    inputs: &dyn CommittedInputs,
-    evidence: &dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
-    recovery: bool,
-    wounded: &BTreeSet<TxHash>,
+    naming: Naming<'_>,
     verdicts: &BTreeMap<TxHash, Decision>,
 ) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
-    let holds = QueueHolds::of(rows);
-    lines_over(
-        rows, &holds, anchor, inputs, evidence, recovery, wounded, verdicts,
-    )
+    lines_over(naming, QueueHolds::of(naming.rows), verdicts)
 }
 
-/// [`member_lines`] over `holds`, the `Queue` collection `rows` hold,
-/// read once per block however many times its lines are named.
-#[allow(clippy::too_many_arguments)] // member_lines' inputs and the holds read once per block
+/// What naming a block's member lines reads, however many times the
+/// block names them. See [`member_lines`].
+#[derive(Clone, Copy)]
+pub struct Naming<'a> {
+    /// The family after the block's own content.
+    pub rows: &'a MemberIndex,
+    /// The block's anchor, whose clock every deadline and window is
+    /// judged at.
+    pub anchor: WeightedTimestamp,
+    /// What committed content says each member has in hand, which
+    /// decides whether it is ready.
+    pub inputs: &'a dyn CommittedInputs,
+    /// Asked of each shard a member reaches, at the clock its row was
+    /// committed at.
+    pub evidence: &'a dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
+    /// Whether the block is a recovery's crossing block, which discards
+    /// every tick the rows hold.
+    pub recovery: bool,
+    /// The pending members the block's claims prove the victims of a
+    /// hold cycle. See [`wounded`].
+    pub wounded: &'a BTreeSet<TxHash>,
+}
+
+/// [`member_lines`] over `holds`, the `Queue` collection the rows hold,
+/// which naming the lines takes the walk's lines into.
 fn lines_over(
-    rows: &MemberIndex,
-    holds: &QueueHolds,
-    anchor: WeightedTimestamp,
-    inputs: &dyn CommittedInputs,
-    evidence: &dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
-    recovery: bool,
-    wounded: &BTreeSet<TxHash>,
+    naming: Naming<'_>,
+    mut holds: QueueHolds,
     verdicts: &BTreeMap<TxHash, Decision>,
 ) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
-    // Naming holds the walk's lines in it, so each naming walks a copy.
-    let mut holds = holds.clone();
+    let Naming {
+        rows,
+        anchor,
+        inputs,
+        evidence,
+        recovery,
+        wounded,
+    } = naming;
     let mut candidates = Vec::new();
     let mut missing = Vec::new();
     let mut fated: Vec<(Option<TickLine>, TickLine)> = Vec::new();
@@ -2067,12 +2072,14 @@ mod tests {
         wounded: &BTreeSet<TxHash>,
     ) -> (Vec<TickLine>, Vec<TxHash>) {
         let (lines, missing, _) = member_lines(
-            rows,
-            anchor,
-            inputs,
-            evidence,
-            recovery,
-            wounded,
+            Naming {
+                rows,
+                anchor,
+                inputs,
+                evidence,
+                recovery,
+                wounded,
+            },
             &BTreeMap::new(),
         );
         (lines, missing)
@@ -3173,7 +3180,7 @@ mod tests {
 
     /// The lines named over `row` alone at `anchor`, every shard reading
     /// `evidence`.
-    fn lines_over(
+    fn lines_of_row(
         row: &MemberRow,
         anchor: WeightedTimestamp,
         evidence: Evidence,
@@ -3233,22 +3240,22 @@ mod tests {
             let row = in_flight(Joins::Executes, covered);
             for anchor in [before, deadline.at()] {
                 assert_eq!(
-                    lines_over(&row, anchor, Evidence::Unreadable),
+                    lines_of_row(&row, anchor, Evidence::Unreadable),
                     pair,
                     "covered {covered}, at {anchor:?}",
                 );
                 assert_eq!(
-                    lines_over(&row, anchor, Evidence::Unknown),
+                    lines_of_row(&row, anchor, Evidence::Unknown),
                     (vec![], vec![tx(1)]),
                 );
             }
             for answered in [Evidence::Readable, Evidence::Live { terminating: true }] {
                 assert_eq!(
-                    lines_over(&row, before, answered),
+                    lines_of_row(&row, before, answered),
                     (vec![], vec![]),
                     "a shard that can answer keeps it short of its deadline",
                 );
-                let (lines, missing) = lines_over(&row, deadline.at(), answered);
+                let (lines, missing) = lines_of_row(&row, deadline.at(), answered);
                 assert!(missing.is_empty());
                 if covered {
                     assert!(
@@ -3299,7 +3306,7 @@ mod tests {
             );
             for evidence in [Evidence::Unreadable, Evidence::Unknown] {
                 assert_eq!(
-                    lines_over(&row, deadline.at(), evidence),
+                    lines_of_row(&row, deadline.at(), evidence),
                     (vec![], vec![]),
                     "{joins:?}, {settlement:?}, {evidence:?}",
                 );
@@ -3346,24 +3353,24 @@ mod tests {
         let row = held_in(1, deadline, 2, Joins::Executes, Settlement::Shared);
         for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
             assert_eq!(
-                lines_over(&row, end.minus(Duration::from_millis(1)), answered),
+                lines_of_row(&row, end.minus(Duration::from_millis(1)), answered),
                 (vec![], vec![]),
                 "under {answered:?} it stands inside its stating window",
             );
             for anchor in [end, end.plus(Duration::from_hours(1))] {
                 assert_eq!(
-                    lines_over(&row, anchor, answered),
+                    lines_of_row(&row, anchor, answered),
                     (aborted_in(1, deadline, 2), vec![]),
                     "under {answered:?} at {anchor:?}",
                 );
             }
         }
         assert_eq!(
-            lines_over(&row, end, Evidence::Unreadable),
+            lines_of_row(&row, end, Evidence::Unreadable),
             (vec![unanswerable(2, 1), fate_of(1)], vec![]),
         );
         assert_eq!(
-            lines_over(&row, end, Evidence::Unknown),
+            lines_of_row(&row, end, Evidence::Unknown),
             (vec![], vec![tx(1)])
         );
     }
@@ -3389,12 +3396,12 @@ mod tests {
             last,
         ] {
             assert_eq!(
-                lines_over(&uncovered, anchor, Evidence::Readable),
+                lines_of_row(&uncovered, anchor, Evidence::Readable),
                 (vec![], vec![]),
                 "at {anchor:?}",
             );
             assert_eq!(
-                lines_over(&covered, anchor, Evidence::Readable),
+                lines_of_row(&covered, anchor, Evidence::Readable),
                 (aborted_in(1, deadline, 2), vec![]),
                 "at {anchor:?}",
             );
@@ -3415,12 +3422,12 @@ mod tests {
         let awaiting = held_in(1, deadline, 2, Joins::Executes, Settlement::Awaited);
         for anchor in [deadline.at(), late] {
             assert_eq!(
-                lines_over(&awaiting, anchor, Evidence::Readable),
+                lines_of_row(&awaiting, anchor, Evidence::Readable),
                 (vec![], vec![]),
                 "at {anchor:?}",
             );
             assert_eq!(
-                lines_over(
+                lines_of_row(
                     &MemberRow {
                         covered: true,
                         ..awaiting.clone()
@@ -3437,7 +3444,7 @@ mod tests {
                     ..held_in(1, deadline, 2, Joins::Aborted, Settlement::Awaited)
                 };
                 assert_eq!(
-                    lines_over(&abort, anchor, Evidence::Readable),
+                    lines_of_row(&abort, anchor, Evidence::Readable),
                     (vec![], vec![]),
                     "covered {covered} at {anchor:?}",
                 );
@@ -3470,12 +3477,12 @@ mod tests {
             let row = released(covered);
             for anchor in [before, deadline.at()] {
                 assert_eq!(
-                    lines_over(&row, anchor, Evidence::Unreadable),
+                    lines_of_row(&row, anchor, Evidence::Unreadable),
                     (vec![fate_of(1)], vec![]),
                     "covered {covered}, at {anchor:?}",
                 );
                 assert_eq!(
-                    lines_over(&row, anchor, Evidence::Unknown),
+                    lines_of_row(&row, anchor, Evidence::Unknown),
                     (vec![], vec![tx(1)]),
                 );
             }
@@ -3485,13 +3492,13 @@ mod tests {
             };
             for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
                 assert_eq!(
-                    lines_over(&row, before, answered),
+                    lines_of_row(&row, before, answered),
                     (vec![aborting(&row, Capped::empty())], vec![]),
                     "covered {covered}, {answered:?}",
                 );
-                assert_eq!(lines_over(&unran, before, answered), (vec![], vec![]));
+                assert_eq!(lines_of_row(&unran, before, answered), (vec![], vec![]));
                 assert_eq!(
-                    lines_over(&unran, deadline.at(), answered),
+                    lines_of_row(&unran, deadline.at(), answered),
                     (vec![aborting(&unran, Capped::empty())], vec![]),
                     "covered {covered}, {answered:?}",
                 );
@@ -3507,7 +3514,7 @@ mod tests {
         for settlement in [Settlement::Alone, Settlement::Awaited] {
             let row = standing(1, deadline, RowState::Released { settlement }, false);
             for evidence in [Evidence::Unreadable, Evidence::Unknown] {
-                let (lines, missing) = lines_over(&row, deadline.at(), evidence);
+                let (lines, missing) = lines_of_row(&row, deadline.at(), evidence);
                 assert!(missing.is_empty(), "{settlement:?}, {evidence:?}");
                 assert!(
                     !lines
@@ -3658,7 +3665,7 @@ mod tests {
         let row = stating(1, deadline, &core);
         for said in READINGS {
             assert_eq!(
-                lines_over(&row, deadline.at().minus(MS), said),
+                lines_of_row(&row, deadline.at().minus(MS), said),
                 (vec![], vec![]),
                 "short of its deadline it waits on its bundle",
             );
@@ -3669,7 +3676,7 @@ mod tests {
                 lapse(deadline).plus(TRANSACTION_EVIDENCE_HORIZON),
             ] {
                 assert_eq!(
-                    lines_over(&row, anchor, said),
+                    lines_of_row(&row, anchor, said),
                     (vec![aborting(&row, Capped::empty())], vec![]),
                     "{anchor:?}, {said:?}",
                 );
@@ -3691,13 +3698,13 @@ mod tests {
                 };
                 for said in READINGS {
                     assert_eq!(
-                        lines_over(&row, deadline.at().minus(MS), said),
+                        lines_of_row(&row, deadline.at().minus(MS), said),
                         (vec![], vec![]),
                         "{settlement:?}, covered {covered}, {said:?}",
                     );
                     for anchor in [deadline.at(), lapse(deadline)] {
                         assert_eq!(
-                            lines_over(&row, anchor, said),
+                            lines_of_row(&row, anchor, said),
                             (vec![aborting(&row, Capped::empty())], vec![]),
                             "{settlement:?}, covered {covered}, {said:?} at {anchor:?}",
                         );
@@ -3736,7 +3743,7 @@ mod tests {
                         lapse(deadline).minus(MS),
                     ] {
                         assert_eq!(
-                            lines_over(&row, standing, said),
+                            lines_of_row(&row, standing, said),
                             (vec![], vec![]),
                             "covered {covered}, executed {executed}, {said:?} at {standing:?}",
                         );
@@ -3746,7 +3753,7 @@ mod tests {
                         lapse(deadline).plus(TRANSACTION_EVIDENCE_HORIZON),
                     ] {
                         assert_eq!(
-                            lines_over(&row, closed, said),
+                            lines_of_row(&row, closed, said),
                             (vec![fate_of(1)], vec![]),
                             "covered {covered}, executed {executed}, {said:?} at {closed:?}",
                         );
@@ -3785,13 +3792,13 @@ mod tests {
             ] {
                 let row = released(executed, covered);
                 assert_eq!(
-                    lines_over(&row, deadline.at().minus(MS), said),
+                    lines_of_row(&row, deadline.at().minus(MS), said),
                     (vec![], vec![]),
                     "an abort a wound named and a recovery released waits for its deadline",
                 );
                 for anchor in [deadline.at(), lapse(deadline)] {
                     assert_eq!(
-                        lines_over(&row, anchor, said),
+                        lines_of_row(&row, anchor, said),
                         (vec![aborting(&row, crossings.clone())], vec![]),
                         "executed {executed}, covered {covered}, {said:?} at {anchor:?}",
                     );
@@ -6062,12 +6069,14 @@ mod tests {
     /// every shard's evidence live, acting on what `views` licenses.
     fn licensed_over(rows: &MemberIndex, views: &SiblingViews) -> Vec<TickLine> {
         let (lines, missing, _) = licensed_lines(
-            rows,
-            ms(5_500),
-            &Held::default(),
-            &|_, _| Evidence::Live { terminating: false },
-            false,
-            &BTreeSet::new(),
+            Naming {
+                rows,
+                anchor: ms(5_500),
+                inputs: &Held::default(),
+                evidence: &|_, _| Evidence::Live { terminating: false },
+                recovery: false,
+                wounded: &BTreeSet::new(),
+            },
             views,
         );
         assert!(missing.is_empty());
@@ -6192,15 +6201,15 @@ mod tests {
             BTreeMap::from([(tx(1), Decision::Refuse)]),
         );
 
-        let (lines, missing, budget) = licensed_lines(
-            &rows,
+        let naming = Naming {
+            rows: &rows,
             anchor,
-            &Held::default(),
-            &evidence,
-            false,
-            &BTreeSet::new(),
-            &views,
-        );
+            inputs: &Held::default(),
+            evidence: &evidence,
+            recovery: false,
+            wounded: &BTreeSet::new(),
+        };
+        let (lines, missing, budget) = licensed_lines(naming, &views);
         assert!(missing.is_empty());
         assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK);
         assert!(
@@ -6214,18 +6223,7 @@ mod tests {
         );
 
         let carried = carried_verdicts(&lines, &rows, &views).expect("every exit is licensed");
-        assert_eq!(
-            member_lines(
-                &rows,
-                anchor,
-                &Held::default(),
-                &evidence,
-                false,
-                &BTreeSet::new(),
-                &carried,
-            ),
-            (lines, missing, budget),
-        );
+        assert_eq!(member_lines(naming, &carried), (lines, missing, budget),);
     }
 
     /// A stated row's tick owing its determined half ends the row by no
@@ -6464,12 +6462,14 @@ mod tests {
                 ..CommittedSets::default()
             };
             member_lines(
-                &rows,
-                ms(0),
-                &sets,
-                &|shard, committed| sets.evidence(shard, committed),
-                false,
-                &BTreeSet::new(),
+                Naming {
+                    rows: &rows,
+                    anchor: ms(0),
+                    inputs: &sets,
+                    evidence: &|shard, committed| sets.evidence(shard, committed),
+                    recovery: false,
+                    wounded: &BTreeSet::new(),
+                },
                 &BTreeMap::new(),
             )
             .0
@@ -6525,12 +6525,14 @@ mod tests {
             )]),
         };
         let (lines, missing, _) = licensed_lines(
-            rows,
-            IN_A_LATER_LIFE,
-            sets,
-            &|shard, committed| sets.evidence(shard, committed),
-            false,
-            &BTreeSet::new(),
+            Naming {
+                rows,
+                anchor: IN_A_LATER_LIFE,
+                inputs: sets,
+                evidence: &|shard, committed| sets.evidence(shard, committed),
+                recovery: false,
+                wounded: &BTreeSet::new(),
+            },
             &views,
         );
         (lines, missing)
@@ -6965,12 +6967,14 @@ mod tests {
         let live = |_, _| Evidence::Live { terminating: false };
         let at_cap = fill(MAX_TICK_LINES_PER_BLOCK);
         let (lines, missing, _) = member_lines(
-            &at_cap,
-            ms(5_000),
-            &Held::default(),
-            &live,
-            true,
-            &BTreeSet::new(),
+            Naming {
+                rows: &at_cap,
+                anchor: ms(5_000),
+                inputs: &Held::default(),
+                evidence: &live,
+                recovery: true,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert!(missing.is_empty());
@@ -6984,12 +6988,14 @@ mod tests {
         )));
         let over = fill(MAX_TICK_LINES_PER_BLOCK + 1);
         let (lines, _, _) = member_lines(
-            &over,
-            ms(5_000),
-            &Held::default(),
-            &live,
-            true,
-            &BTreeSet::new(),
+            Naming {
+                rows: &over,
+                anchor: ms(5_000),
+                inputs: &Held::default(),
+                evidence: &live,
+                recovery: true,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert_eq!(

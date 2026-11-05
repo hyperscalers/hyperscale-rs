@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use common::sim::{ExecutionSim, LEFT, Schedule, amount, cell_of, counter};
-use hyperscale_engine::tick_select::{CommittedSets, member_lines};
+use hyperscale_engine::tick_select::{CommittedSets, Naming, member_lines};
 use hyperscale_hbor::Capped;
 use hyperscale_storage::RowState;
 use hyperscale_types::test_utils::{
@@ -92,12 +92,14 @@ fn released_after_running(tx: &Transaction) -> ExecutionSim {
 /// chain leaves, its sibling still answering.
 fn lines_at(sim: &ExecutionSim, anchor: WeightedTimestamp) -> Vec<TickLine> {
     let (lines, missing, _) = member_lines(
-        &sim.member_rows(),
-        anchor,
-        &CommittedSets::default(),
-        &|_, _| Evidence::Live { terminating: false },
-        false,
-        &BTreeSet::new(),
+        Naming {
+            rows: &sim.member_rows(),
+            anchor,
+            inputs: &CommittedSets::default(),
+            evidence: &|_, _| Evidence::Live { terminating: false },
+            recovery: false,
+            wounded: &BTreeSet::new(),
+        },
         &BTreeMap::new(),
     );
     assert!(missing.is_empty());

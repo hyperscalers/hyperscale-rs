@@ -12,7 +12,7 @@ use hyperscale_core::{
 };
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{
-    CommittedSets, ManifestInputs, ManifestKind, contentions, end_lines, licensed_lines,
+    self, CommittedSets, ManifestInputs, ManifestKind, contentions, end_lines, licensed_lines,
     terminal_fates, wounded,
 };
 use hyperscale_hbor::Capped;
@@ -751,12 +751,14 @@ impl Naming<'_> {
             ManifestKind::Members => {
                 let victims = wounded(&rows, self.anchor, self.claims);
                 let (mut lines, _, budget) = licensed_lines(
-                    &rows,
-                    self.anchor,
-                    self.committed,
-                    &|shard, committed| self.committed.evidence(shard, committed),
-                    self.manifest.recovery,
-                    &victims,
+                    tick_select::Naming {
+                        rows: &rows,
+                        anchor: self.anchor,
+                        inputs: self.committed,
+                        evidence: &|shard, committed| self.committed.evidence(shard, committed),
+                        recovery: self.manifest.recovery,
+                        wounded: &victims,
+                    },
                     &self.committed.siblings,
                 );
                 // Every accepted row no sibling can still ask about is
