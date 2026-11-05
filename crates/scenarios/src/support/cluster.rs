@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
-use hyperscale_storage::RowState;
+use hyperscale_storage::{MemberRow, RowState};
 use hyperscale_types::{
     Address, BeaconState, BlockHeight, ChainOrigin, ConsensusReceipt, DeclaredRange, Derivation,
     Epoch, Event, Heard, PriceTable, ShardId, Signer, StandingAnswers, StandingToward, StateRoot,
@@ -284,6 +284,14 @@ pub trait Cluster {
     /// as its own is a fact about committed state no status reports, and
     /// so is which member a tick holds while another waits on it.
     fn member_rows(&self, _shard: ShardId) -> Option<BTreeMap<TxHash, RowState>> {
+        None
+    }
+
+    /// `shard`'s member rows whole, as its tallest store holds them:
+    /// each row's place in the queue, its head and its `blocked_at`
+    /// beside its state; `None` where this cluster cannot read state
+    /// entries. An observation seam, like [`Self::member_rows`].
+    fn queued_rows(&self, _shard: ShardId) -> Option<BTreeMap<TxHash, MemberRow>> {
         None
     }
 

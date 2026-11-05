@@ -55,12 +55,12 @@ use crate::tree::Jmt;
 use crate::tree::proofs::generate_proof;
 use crate::{
     AdoptSource, Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore,
-    ChainEntry, ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit,
+    ChainEntry, ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit, Head,
     ImportCursor, ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, MemberRow,
-    PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState, RecoveryAnchor, RowState,
-    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, SubstateView,
-    Substates, SweepIndex, TickChain, TickOutput, TickResolution, VerdictChange, VersionedStore,
-    WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
+    PackageArtifactStore, ParentAnchor, PendingChain, Place, RecoveredState, RecoveryAnchor,
+    RowState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
+    SubstateView, Substates, SweepIndex, TickChain, TickOutput, TickResolution, VerdictChange,
+    VersionedStore, WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
     committed_tx_cells, entry_leaf_value, filter_state_writes_to_prefix, held_total, holds_state,
     key_under_prefix, member_row_leaf, reserved_total, verdict_changes,
 };
@@ -6563,6 +6563,30 @@ fn core_run_at_one(
             crossings: Capped::empty(),
         }])),
         ..MemberInputs::still(shard)
+    }
+}
+
+/// `row`, built by hand, placed and head of the queue at the block that
+/// committed it.
+///
+/// The row a fold leaves for a member a counterpart shares the verdict
+/// on that nothing stood ahead of. Its rank is read off its hash, so rows
+/// built from distinct hashes take distinct places.
+#[must_use]
+pub fn placed_head(row: MemberRow) -> MemberRow {
+    let bytes = row.tx.as_bytes();
+    let place = Place {
+        height: row.height,
+        rank: u16::from_be_bytes([bytes[0], bytes[1]]) % (1 << 14),
+    };
+    MemberRow {
+        queued: Some(place),
+        head: Some(Head {
+            height: row.height,
+            rank: place.packed(),
+            clock: row.committed,
+        }),
+        ..row
     }
 }
 

@@ -7,9 +7,18 @@
 //! five of the queue index, which `queue` describes. Member rows are keyed by
 //! the first 128 bits of the transaction hash and tick rows by height.
 //! Seats are keyed as member rows are, and stand exactly while a tick
-//! holds a member a counterpart settles against, in flight or stated:
-//! what a counterpart reads, by presence alone, to tell a seated member
-//! from one still waiting.
+//! holds a member a counterpart settles against, in flight or stated,
+//! or while such a member waits unnamed at the head of the queue: what a
+//! counterpart reads, by presence alone, to tell a seated member from
+//! one still waiting behind another.
+//!
+//! The queue orders the members on the keys they pin. A member whose
+//! verdict a counterpart shares takes one place, at the block that
+//! commits it or that reads its last record, and is named only once it
+//! stands head: nothing placed before it on a key it pins refuses it. A
+//! determined member or a leg waits behind every place standing on its
+//! keys, and a head that refuses someone is aborted unnamed once its
+//! naming window closes.
 //! Verdict leaves are keyed as member rows are too, and stand exactly
 //! while a row says yes or accepted: from this shard's own certificate
 //! succeeding for a member its counterparts share the verdict on, until
@@ -641,8 +650,10 @@ pub struct MemberRow {
     /// Its place in the shard's queue: a member a counterpart shares the
     /// verdict on from the block that places it, kept through a line
     /// running it; a determined member from its committing block while
-    /// it waits; a leg on awaited terms from the line running it, past
-    /// every other place its block takes, while it stands in its tick.
+    /// it waits. A leg on awaited terms takes two in turn: a waiter's
+    /// place from its committing block while it waits, and then, from
+    /// the line running it, a `Queue` place past every other place that
+    /// line's block takes, while it stands in its tick.
     pub queued: Option<Place>,
     /// Where a placed member a counterpart shares the verdict on first
     /// found every place it holds clear. Set once.
@@ -692,6 +703,22 @@ impl MemberRow {
             head: None,
             blocked_at: None,
         }
+    }
+
+    /// Whether the row holds a seat: held by a tick and settled against
+    /// by a counterpart, as [`RowState::seated`] says, or `Pending` on
+    /// terms a counterpart shares the verdict on and head of the queue.
+    /// A head row stands first on every key it pins, so a counterpart
+    /// reading its seat reads a member nothing here stands ahead of.
+    #[must_use]
+    pub fn seated(&self) -> bool {
+        self.state.seated()
+            || (self.state == RowState::Pending
+                && self.head.is_some()
+                && self
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|waiting| waiting.settlement == Settlement::Shared))
     }
 
     /// Whether the row's abort charge falls on a vault `local` owns: the
@@ -2292,8 +2319,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 });
                 writes.insert(family.entry(MemberCollection::Staged, order), receipt);
             }
-            let was = held.as_ref().is_some_and(|row| row.state.seated());
-            let seat = row.filter(|row| row.state.seated());
+            let was = held.as_ref().is_some_and(MemberRow::seated);
+            let seat = row.filter(|row| row.seated());
             if was != seat.is_some() {
                 writes.insert(
                     family.entry(MemberCollection::Seats, order),
@@ -3034,6 +3061,29 @@ impl MemberIndex {
     #[must_use]
     pub const fn shard(&self) -> ShardId {
         self.shard
+    }
+
+    /// Stand `row` here with the queue entries its fields imply, as a
+    /// fold writing it would: what a test building rows by hand reads
+    /// the queue through.
+    ///
+    /// # Panics
+    ///
+    /// Never: entries within their caps encode.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn insert_row(&mut self, row: MemberRow) {
+        let entries = PinMemo::new(self.shard).entries(Some(&row));
+        for (at, collection) in [(0, &entries.queue), (1, &entries.waiters)] {
+            for (order, value) in collection {
+                self.index[at].insert(*order, Arc::from(to_vec(value).expect("an entry encodes")));
+            }
+        }
+        for (at, entry) in [(2, entries.behind), (3, entries.serves)] {
+            if let Some((order, tx)) = entry {
+                self.index[at].insert(order, Arc::from(to_vec(&tx).expect("a hash encodes")));
+            }
+        }
+        self.members.insert(row.tx, row);
     }
 
     /// Fold one of the shard's own blocks in, as [`member_writes`] folds
@@ -8601,6 +8651,39 @@ mod tests {
                 "a waiting leg keeps no shared row from head"
             );
             assert_eq!(row(&store, 2).blocked_at, Some(clock(2)));
+        }
+
+        /// A shared row holds a seat from the block that makes it head,
+        /// named or not, and a row behind another holds none until it is
+        /// head itself; its seat goes with its row.
+        #[test]
+        fn a_head_row_holds_a_seat() {
+            let mut store = Entries::default();
+            let mut first = block(1);
+            commit(&mut first, 1, terms(&Kind::Payer(vec![]), &[write(A)]));
+            commit(&mut first, 2, terms(&Kind::Payer(vec![]), &[read(A)]));
+            store.fold(&first);
+            let (head, behind) = if tx(1) < tx(2) { (1, 2) } else { (2, 1) };
+            assert!(row(&store, head).head.is_some());
+            assert_eq!(row(&store, behind).head, None);
+            assert!(row(&store, head).seated() && seated_in(&store, head));
+            assert!(!row(&store, behind).seated() && !seated_in(&store, behind));
+
+            let mut second = block(2);
+            lines(&mut second, vec![fate(head)]);
+            store.fold(&second);
+            assert!(!seated_in(&store, head), "the seat goes with its row");
+            assert!(row(&store, behind).head.is_some());
+            assert!(
+                seated_in(&store, behind),
+                "head once the row before it leaves"
+            );
+
+            let determined = terms(&Kind::Determined, &[write(C)]);
+            let mut third = block(3);
+            commit(&mut third, 3, determined);
+            store.fold(&third);
+            assert!(!seated_in(&store, 3), "a waiter holds no seat");
         }
 
         /// A shared row standing on A, refusing any write of A.

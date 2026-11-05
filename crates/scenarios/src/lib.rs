@@ -37,7 +37,11 @@ mod transactions;
 mod venue;
 mod witnesses;
 
-pub use book::{BOOK_SHARD, BOOK_VENUE_SHARD, BookRoute, RouteFill, book_route_genesis_accounts};
+pub use book::{
+    BOOK_SHARD, BOOK_VENUE_SHARD, BookRoute, RouteFill,
+    a_route_whose_venue_never_commits_frees_the_ladder,
+    a_stalled_venue_aborts_its_route_at_the_window, book_route_genesis_accounts,
+};
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
 pub use cutoff::{a_divided_core_pays_out_under_one_clock, cutoff_genesis_accounts};
 pub use execution::{
@@ -134,8 +138,7 @@ pub use route::{
     an_unseen_never_goes_once_its_producers_leg_is_fated,
     both_venues_read_a_routes_record_inside_the_finalization_delay, core_load_genesis_accounts,
     core_routes_under_load, crossed_route_genesis_accounts, late_certificate_genesis_accounts,
-    ring_route_genesis_accounts, route_genesis_accounts,
-    routes_held_in_a_ring_wait_for_their_deadline,
+    ring_route_genesis_accounts, route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
     routes_seated_the_other_way_lose_the_later_to_the_cycle,
     standing_answers_level_off_under_sustained_load, stated_venues_hear_each_others_yes_by_asking,
@@ -196,6 +199,7 @@ pub use transactions::livelock_resolves_promptly;
 pub use venue::{
     SWAP_INPUT, SWAPPER_SHARD, SWAPPERS, SpendBesideAbort, StockedVenue, VENUE_SHARD, VenueReport,
     WIDE_VENUE_SHARD, a_held_core_keeps_its_sponsors_hold_until_it_aborts,
+    a_hot_venue_runs_every_swap_where_it_commits,
     a_sponsor_spends_its_balance_beside_its_held_cores_abort,
     a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,

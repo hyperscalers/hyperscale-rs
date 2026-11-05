@@ -14852,8 +14852,9 @@ mod tests {
                 })
                 .collect()
         };
-        // A member in flight holds the contended cell, so every
-        // transaction writing it waits out of the tick.
+        // A leg in flight holds the contended cell, standing in the queue
+        // from the line running it, so every transaction writing it
+        // waits out of the tick.
         let holder = test_utils::stub_transaction(payer, &[contended], 1_000, range);
         let mut rows = MemberIndex::empty(ShardId::ROOT);
         rows.advance(&MemberInputs {
@@ -14863,7 +14864,7 @@ mod tests {
                 staged: 0,
                 tx: holder.hash(),
                 joins: Joins::Executes,
-                settlement: Settlement::Alone,
+                settlement: Settlement::Awaited,
                 holds: Capped::new(holder.routing().declared_modes.clone())
                     .expect("one declared access"),
                 pins: Capped::empty(),

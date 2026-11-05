@@ -141,7 +141,7 @@ use hyperscale_scenarios::{
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
     registered_validator_activates_onto_a_shard, ring_route_genesis_accounts,
-    route_genesis_accounts, routes_held_in_a_ring_wait_for_their_deadline,
+    route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
     routes_seated_the_other_way_lose_the_later_to_the_cycle,
     sealed_rounds_settle_on_the_seed_they_committed_to, second_splitter_genesis_accounts,
@@ -1671,9 +1671,9 @@ fn stated_venues_hear_each_others_yes_by_push_sim() {
 
 /// A ring of three venues, each route's trader on its first venue's shard.
 #[test]
-fn routes_held_in_a_ring_wait_for_their_deadline_sim() {
+fn routes_held_in_a_ring_abort_at_the_window_sim() {
     let mut cluster = dedicated_route_cluster(&ring_route_genesis_accounts());
-    cluster.run_faultable(routes_held_in_a_ring_wait_for_their_deadline);
+    cluster.run_faultable(routes_held_in_a_ring_abort_at_the_window);
 }
 
 /// The refusal's own shape: a venue refuses its member, and the `Never`

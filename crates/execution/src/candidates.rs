@@ -17,9 +17,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member};
 use hyperscale_engine::tick_select::{
-    CommittedInputs, Judged, ManifestBudget, Nameable, ProvisionalCells, Standing, ready,
-    select_members, terms_of_member,
+    CommittedInputs, Judged, ManifestBudget, Nameable, Standing, ready, select_members,
+    terms_of_member,
 };
+use hyperscale_storage::QueueHolds;
 use hyperscale_types::{
     Deadline, EscrowedValue, MemberTerms, PriceTable, ShardId, ShardTrie, SubstateKey, TickLine,
     Transaction, TxHash, Verified, WeightedTimestamp,
@@ -218,14 +219,15 @@ impl TickCandidates {
     /// every candidate [`select_members`] admits under `held`, in
     /// canonical order. What a block's manifest names where this node's
     /// inputs are the chain's, which is what a fixture building a block
-    /// stands in for. An abort of a candidate, which never ran, answers
-    /// every crossing it consumes unless `covered` says an abandonment
-    /// record names it.
+    /// stands in for. A fixture keeps no queue of its candidates, so
+    /// each stands head. An abort of a candidate, which never ran,
+    /// answers every crossing it consumes unless `covered` says an
+    /// abandonment record names it.
     #[must_use]
     pub fn named(
         &self,
         provisioning: &ProvisioningTracker,
-        held: &mut ProvisionalCells,
+        held: &mut QueueHolds,
         now: WeightedTimestamp,
         covered: &dyn Fn(TxHash) -> bool,
     ) -> Vec<TickLine> {
@@ -237,7 +239,7 @@ impl TickCandidates {
                 Nameable {
                     tx: *tx_hash,
                     deadline: Deadline::of_transaction(&candidate.tx),
-                    standing: Standing::Pending(Judged::of(terms)),
+                    standing: Standing::Pending(Judged::of(terms).headed()),
                     charge: terms.charge,
                     share: terms.share,
                     reserves: &terms.reserves,
@@ -367,7 +369,7 @@ mod tests {
     use hyperscale_types::test_utils::{
         stub_abort_charge, test_prefix, test_transaction_with_prefixes,
     };
-    use hyperscale_types::{Joins, Settlement, WeightedTimestamp};
+    use hyperscale_types::{Joins, Settlement, WeightedTimestamp, pins_of};
 
     use super::*;
 
@@ -799,7 +801,7 @@ mod tests {
 
         let named = candidates.named(
             &ProvisioningTracker::new(),
-            &mut ProvisionalCells::default(),
+            &mut QueueHolds::default(),
             ms(1_000),
             &|_| false,
         );
@@ -808,8 +810,8 @@ mod tests {
             [TickLine::Member { tx, joins: Joins::Executes, .. }] if *tx == hash
         ));
 
-        let mut held = ProvisionalCells::default();
-        held.claim(&contender.routing().declared_modes);
+        let mut held = QueueHolds::default();
+        held.hold(&pins_of(&contender.routing().declared_modes, LOCAL));
         assert!(
             candidates
                 .named(&ProvisioningTracker::new(), &mut held, ms(1_000), &|_| {

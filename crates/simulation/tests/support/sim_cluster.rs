@@ -35,7 +35,7 @@ use hyperscale_simulation::{
     ArchivedChain, CrashKind, EPOCH_MS, ExecutionMode, ProcessingTimes, SimConfig, SimulationRunner,
 };
 use hyperscale_storage::{
-    BoundaryStore, MemberIndex, RowState, ShardChainReader, SubstateStore, Substates,
+    BoundaryStore, MemberIndex, MemberRow, RowState, ShardChainReader, SubstateStore, Substates,
     VersionedStore, answer_route,
 };
 use hyperscale_storage_memory::SimShardStorage;
@@ -1164,14 +1164,17 @@ impl Cluster for SimCluster {
     }
 
     fn member_rows(&self, shard: ShardId) -> Option<BTreeMap<TxHash, RowState>> {
-        let store = self.tallest_store(shard)?;
         Some(
-            MemberIndex::load(&store.snapshot(), shard)
-                .members
+            self.queued_rows(shard)?
                 .into_iter()
                 .map(|(tx, row)| (tx, row.state))
                 .collect(),
         )
+    }
+
+    fn queued_rows(&self, shard: ShardId) -> Option<BTreeMap<TxHash, MemberRow>> {
+        let store = self.tallest_store(shard)?;
+        Some(MemberIndex::load(&store.snapshot(), shard).members)
     }
 
     fn standing_answers(&self, shard: ShardId) -> Option<StandingAnswers> {

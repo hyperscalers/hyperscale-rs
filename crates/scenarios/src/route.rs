@@ -8,6 +8,7 @@
 //! shape whose settlement waits on a certificate from across a shard
 //! boundary — a transfer never does, its recipient claims a bundle.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{self, Display, Formatter, Write};
 use std::time::{Duration, Instant};
@@ -20,8 +21,8 @@ use hyperscale_types::{
     Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_CLAIMS_BYTES,
     MAX_CLAIMS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_STANDING_ANSWERS,
     MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, PrincipalAddr, REATTESTATION_STEP,
-    ResourceAddr, ShardId, ShardTrie, SubstateKey, TimestampRange, Transaction,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, NAMING_WINDOW, PrincipalAddr,
+    REATTESTATION_STEP, ResourceAddr, ShardId, ShardTrie, SubstateKey, TimestampRange, Transaction,
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
     staged_leaf, verdict_leaf,
 };
@@ -72,10 +73,6 @@ pub const SECOND_TRADER_SHARD: ShardId = ShardId::leaf(2, 3);
 
 /// Where a third venue prices, for a ring of routes through three.
 pub const THIRD_VENUE_SHARD: ShardId = ShardId::leaf(2, 3);
-
-/// Blocks each ring venue commits once the cut lifts, time enough for the
-/// bundles it missed to be fetched and its waiting route made ready.
-const RING_SETTLE_BLOCKS: u64 = 16;
 
 /// The venues of a ring, in its order: each route runs from one venue to
 /// the next, and the last back to the first.
@@ -585,32 +582,36 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
     units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
 }
 
-/// Three routes held in a ring of three venues wait for their deadline.
+/// Three routes held in a ring of three venues abort at their naming
+/// windows.
 ///
 /// Each route runs from one venue to the next round the ring, its trader
-/// on its first venue's shard, so it reaches its two venues and nothing
-/// else. It commits on its first venue and reaches its second by that
-/// venue's bundle, and is ready on a venue once the other venue's bundle
-/// for it arrives. The bundles a venue's successor in the ring sends back
-/// speak for one route alone, the one the venue runs first, so cutting
-/// each venue off from them leaves every venue ready for the route
-/// arriving from its predecessor and nothing else. Each seats that route
-/// and holds its reserve while it waits on the venue before it, which
-/// refuses it behind the route that venue holds. No two of
-/// the routes await a shard in common, so no venue can read the cycle off
-/// one counterpart's seats: the ring stands until the deadline aborts all
-/// three. This pins the bound a longer cycle is left to.
+/// on its first venue's shard, so it pays there and is placed there at
+/// its commit, and reaches its second venue by that venue's bundle. The
+/// bundles a venue's successor in the ring sends back speak for one route
+/// alone, the one the venue runs first, so cutting each venue off from
+/// them leaves every route unready on its first venue, standing head
+/// there. Each venue commits the route arriving from its predecessor only
+/// once the predecessor's bundle lands, which places it behind the
+/// venue's own route on the venue's reserve: each venue's own route
+/// refuses its predecessor's route there, and takes the clock of the
+/// block that first shows it. No two of the routes await a shard in
+/// common and none is named, so no venue can read the cycle off one
+/// counterpart's seats: each route is aborted unnamed on its first venue
+/// once its naming window closes, short of its deadline, and its payer
+/// pays its charge.
 ///
 /// Requires disjoint committees, as the cut is keyed on the hosts.
 ///
 /// # Panics
 ///
 /// Panics if a venue misses its budget standing up, if the cut never
-/// fires, if the venues do not seat the routes round the ring, if a venue
-/// stops committing once the cut lifts, if any route resolves before the
-/// deadline or does not abort after it, if a block aborts any as a proven
-/// victim or counts a contention, or if either side is not conserved.
-pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mut C) {
+/// fires, if the venues do not place the routes round the ring, if any
+/// route runs on its first venue, is not aborted there within its naming
+/// window of its first refusal, or resolves otherwise than aborted before
+/// its deadline, if a block aborts any as a proven victim or counts a
+/// contention, or if either side is not conserved.
+pub fn routes_held_in_a_ring_abort_at_the_window<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let venues = RING.map(|venue| stand_up_venue(c, venue, &mut taken));
     let traders = ring_traders(&mut taken);
@@ -651,54 +652,33 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
         })
         .collect();
     let proven = c.metric("hold_inversions_proven", None);
+    let contended = c.metric("hold_contentions", None);
 
-    // Each venue holds the route arriving from the venue before it, and
-    // the route it runs first stands committed and unseated beside it.
-    let ring_holds = |c: &C| {
+    // Each venue holds its own route head, unnamed and refusing, and the
+    // route arriving from the venue before it placed behind it.
+    let ring_stands = |c: &C| {
         (0..RING.len()).all(|at| {
-            c.member_rows(RING[at]).is_some_and(|rows| {
-                matches!(
-                    rows.get(&routes[prev(at)]),
-                    Some(RowState::InFlight { .. } | RowState::Stated { .. })
-                ) && rows.get(&routes[at]) == Some(&RowState::Pending)
+            c.queued_rows(RING[at]).is_some_and(|rows| {
+                let own = rows.get(&routes[at]);
+                let arriving = rows.get(&routes[prev(at)]);
+                own.is_some_and(|row| {
+                    row.state == RowState::Pending && row.head.is_some() && row.blocked_at.is_some()
+                }) && arriving.is_some_and(|row| {
+                    row.state == RowState::Pending && row.queued.is_some() && row.head.is_none()
+                })
             })
         })
     };
     assert!(
-        c.run_until(epochs(8), ring_holds),
-        "each venue must seat the route arriving from the venue before it, and hold it",
-    );
-    // The bundle a venue's successor sends back goes out once the
-    // successor holds the route, which may be after the ring first reads
-    // held.
-    assert!(
-        c.run_until(epochs(2), |c| ring_holds(c)
+        c.run_until(epochs(8), |c| ring_stands(c)
             && cut.iter().all(|handle| handle.fired() > 0)),
-        "each venue must actually have been cut off from its successor's bundles",
+        "each venue must place its own route head, refusing the route arriving from the venue \
+         before it, while cut off from its successor's bundles",
     );
-
-    // Lifted: each venue's bundles come back and its waiting route is
-    // ready, and refused. No two routes await a shard in common, so the
-    // contention count, which pairs members that do, sees none of it.
-    let contended = c.metric("hold_contentions", None);
-    c.clear_drops();
-    for venue in RING {
-        assert!(
-            await_blocks(c, venue, RING_SETTLE_BLOCKS, epochs(2)),
-            "venue {venue} must keep committing once the cut lifts",
-        );
-    }
-
-    // Read short of the deadline: past it each venue aborts its waiting
-    // route, and the first poll there can already see one gone. Nothing
-    // else moves a ring, so standing just short of it is standing to it.
-    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
-    let short_of = deadline.minus(Duration::from_secs(2));
-    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
-    c.run_until(epochs(8), |c| clock(c) >= short_of || !ring_holds(c));
-    assert!(
-        clock(c) >= short_of && clock(c) < deadline && ring_holds(c),
-        "the ring must stand to the deadline: no venue reads it off one counterpart",
+    each_leaves_its_first_venue_at_its_window(
+        c,
+        &routes,
+        Deadline::of(validity.end_timestamp_exclusive).at(),
     );
 
     let resolved = c.run_until(epochs(8), |c| {
@@ -706,14 +686,15 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
             .iter()
             .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
     });
-    assert!(resolved, "the deadline must resolve every route");
+    assert!(resolved, "the windows must resolve every route");
     for hash in &routes {
         assert_eq!(
             c.tx_status(*hash),
             Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
-            "a route held in the ring to its deadline aborts",
+            "a route held in the ring aborts at its window",
         );
     }
+    c.clear_drops();
     assert_eq!(
         c.metric("hold_inversions_proven", None),
         proven,
@@ -726,6 +707,58 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
     );
     protocol_resource.assert_settles_within(c, &charges, epochs(8), "a ring of holds");
     units.assert_settles_within(c, &Charges::default(), epochs(8), "a ring of holds");
+}
+
+/// Assert each of `routes`, the `at`th standing head of [`RING`]'s `at`th
+/// venue with a refusal clock, leaves that venue by an abort named at
+/// its naming window, unnamed and short of `deadline`.
+fn each_leaves_its_first_venue_at_its_window<C: Cluster>(
+    c: &mut C,
+    routes: &[TxHash],
+    deadline: WeightedTimestamp,
+) {
+    let refused: Vec<WeightedTimestamp> = (0..RING.len())
+        .map(|at| {
+            c.queued_rows(RING[at])
+                .and_then(|rows| rows.get(&routes[at]).and_then(|row| row.blocked_at))
+                .expect("the ring stands")
+        })
+        .collect();
+    // Each route leaves its first venue by the window's abort, its row
+    // there gone or let go of; the time each is first seen gone is when
+    // it left.
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let left: RefCell<BTreeMap<usize, WeightedTimestamp>> = RefCell::new(BTreeMap::new());
+    let all_left = c.run_until(epochs(8), |c| {
+        for at in 0..RING.len() {
+            let waits = c.queued_rows(RING[at]).is_some_and(|rows| {
+                rows.get(&routes[at])
+                    .is_some_and(|row| row.state == RowState::Pending)
+            });
+            if !waits {
+                left.borrow_mut().entry(at).or_insert_with(|| clock(c));
+            }
+        }
+        left.borrow().len() == RING.len()
+    });
+    assert!(all_left, "every route must leave its first venue");
+    // A window closes at an anchor; the abort is named in the block
+    // anchored there and folds a block or two later.
+    let slack = Duration::from_secs(4);
+    for (at, gone) in left.into_inner() {
+        let closes = refused[at].plus(NAMING_WINDOW);
+        assert!(
+            gone >= closes && gone <= closes.plus(slack) && gone < deadline,
+            "route {at} must leave its first venue at its naming window: refused at {:?}, the \
+             window closing at {closes:?}, gone at {gone:?}, its deadline {deadline:?}",
+            refused[at],
+        );
+        assert!(
+            c.ran(RING[at], routes[at]).iter().all(|ran| !ran.succeeded),
+            "route {at} is aborted unnamed on its first venue: {:?}",
+            c.ran(RING[at], routes[at]),
+        );
+    }
 }
 
 /// One route with the venues cut off from each other across the

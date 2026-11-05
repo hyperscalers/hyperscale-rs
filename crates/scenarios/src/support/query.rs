@@ -14,7 +14,7 @@ use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::crossing_ids;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
-use hyperscale_storage::{ShardChainReader, member_row_leaf};
+use hyperscale_storage::{ShardChainReader, member_row_leaf, record_arrivals};
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline,
     DeclaredRange, Epoch, EpochWindows, ExecutionOutcome, Inclusion, MAX_FINALIZATION_DELAY,
@@ -539,6 +539,11 @@ pub struct ChainMentions {
     pub(crate) finalized: Vec<(TxHash, BlockHeight)>,
     /// Every fate a manifest names for one.
     pub(crate) fated: Vec<(TxHash, BlockHeight)>,
+    /// Every member line naming one to run: the tick that runs it.
+    pub(crate) run: Vec<(TxHash, BlockHeight)>,
+    /// Every claim reading a record one issued live: where a crossing it
+    /// consumes arrived.
+    pub(crate) arrived: Vec<(TxHash, BlockHeight)>,
     /// What each of those finalizations decided, in the same order.
     pub(crate) decisions: Vec<(TxHash, TransactionDecision)>,
     /// Every stating half stating one: where its row came to stand
@@ -595,6 +600,11 @@ pub fn chain_mentions(
                     .heard
                     .extend(claim.verdicts.iter().filter_map(|tx| at(*tx)));
             }
+            mentions.arrived.extend(
+                record_arrivals(block.state_claims())
+                    .into_iter()
+                    .filter_map(|(_, tx)| at(tx)),
+            );
             mentions
                 .fated
                 .extend(block.tick_manifest().iter().filter_map(|line| match line {
@@ -602,6 +612,15 @@ pub fn chain_mentions(
                     TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => {
                         None
                     }
+                }));
+            mentions
+                .run
+                .extend(block.tick_manifest().iter().filter_map(|line| match line {
+                    TickLine::Member { tx, joins, .. } if joins.dispatched() => at(*tx),
+                    TickLine::Member { .. }
+                    | TickLine::Fate { .. }
+                    | TickLine::Discard { .. }
+                    | TickLine::End { .. } => None,
                 }));
             for record in block.abandonment_records().iter() {
                 mentions

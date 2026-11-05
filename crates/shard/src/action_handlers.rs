@@ -356,13 +356,17 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // tail goes back to the pool.
     let anchor = parent_qc.weighted_timestamp();
     let parent_rows = MemberIndex::load(&anchored, local_shard);
-    let mut committed = manifest.committed.clone();
-    committed.engaged.extend(
-        Engagement::of_provisions(&provisions)
-            .into_iter()
-            .map(|engagement| (engagement.source, engagement.tx_hash)),
-    );
-    committed.arrived.extend(record_arrivals(&state_claims));
+    let committed_over = |claims: &[StateClaim]| {
+        let mut committed = manifest.committed.clone();
+        committed.engaged.extend(
+            Engagement::of_provisions(&provisions)
+                .into_iter()
+                .map(|engagement| (engagement.source, engagement.tx_hash)),
+        );
+        committed.arrived.extend(record_arrivals(claims));
+        committed
+    };
+    let committed = committed_over(&state_claims);
     let Named {
         mut rows,
         mut pending,
@@ -421,6 +425,33 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
             .map_err(Unproposed::Unrestricted)?,
     )
     .expect("cutting a reading adds no claim");
+    // The lines were named over the claims before the cut, and a voter
+    // names over the claims the block carries. The cut reads the
+    // manifest, so naming stays first and the cut keeps clear of every
+    // input naming reads; a debug build names once more over what the
+    // cut left and holds the two namings equal.
+    if cfg!(debug_assertions) {
+        let recut = committed_over(&state_claims);
+        let renamed = Naming {
+            parent: &parent_rows,
+            shard: local_shard,
+            height,
+            anchor,
+            committee: topology_snapshot,
+            certificates: &certificates,
+            records: &abandonment_records,
+            claims: &state_claims,
+            windows: frontier.windows,
+            manifest,
+            committed: &recut,
+        }
+        .over(transactions);
+        debug_assert_eq!(
+            renamed.lines[..],
+            tick_manifest[..],
+            "a naming over the claims the cut left names what the proposal named"
+        );
+    }
     // What the claims say off the claims carried, as every voter reads
     // them: a record read only for a return the cut took back arrives
     // nowhere.

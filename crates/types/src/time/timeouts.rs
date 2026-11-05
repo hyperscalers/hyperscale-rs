@@ -40,6 +40,15 @@ use crate::{MAX_VALIDITY_RANGE, SPC_VIEW_TIMEOUT};
 /// derives the same deadline.
 pub const MAX_FINALIZATION_DELAY: Duration = Duration::from_secs(24);
 
+/// How long a member a counterpart shares the verdict on may stand head
+/// and unnamed once it refuses someone on a key it pins: past
+/// `max(head, blocked_at)` plus this, its row is aborted unnamed.
+///
+/// One finalization delay: a counterpart slower than that to serve the
+/// part the head waits on is one the transaction would be abandoned
+/// against anyway, and a head blocking nobody keeps its deadline.
+pub const NAMING_WINDOW: Duration = MAX_FINALIZATION_DELAY;
+
 /// How long to retain remote block headers below each shard's tip.
 ///
 /// Shared by `hyperscale-shard` (deferral-proof verification) and

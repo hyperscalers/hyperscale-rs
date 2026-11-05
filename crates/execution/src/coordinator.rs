@@ -54,9 +54,7 @@ use hyperscale_core::{
     ProvisionAction, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Member, abandoned_never};
-use hyperscale_engine::tick_select::{
-    ProvisionalCells, Requirement, SeatQuestion, requirements_of,
-};
+use hyperscale_engine::tick_select::{Requirement, SeatQuestion, requirements_of};
 use hyperscale_engine::{
     CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
 };
@@ -67,7 +65,7 @@ use hyperscale_metrics::{
 };
 use hyperscale_provisions::build_provision_requests;
 use hyperscale_storage::{
-    FeeTerms, ProvisionalTx, RECENT_HEADER_REPLAY, RecoveredState, TickResolution,
+    FeeTerms, ProvisionalTx, QueueHolds, RECENT_HEADER_REPLAY, RecoveredState, TickResolution,
     declared_reservations,
 };
 use hyperscale_types::network::response::ServedValue;
@@ -81,7 +79,7 @@ use hyperscale_types::{
     ShardId, ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId,
     TickLine, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
     TxOutcome, TxResolution, UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable,
-    Verified, WeightedTimestamp, derive_block_transactions, tick_leader,
+    Verified, WeightedTimestamp, derive_block_transactions, pins_of, tick_leader,
 };
 use tracing::instrument;
 
@@ -3924,19 +3922,20 @@ impl ExecutionCoordinator {
         );
     }
 
-    /// The cells unresolved cross-shard legs hold provisionally.
+    /// The keys of this shard unresolved cross-shard legs hold
+    /// provisionally, as the queue holds them.
     ///
     /// Rebuilt per commit from `ticked`, which is small: one entry per
     /// tick whose fate has not committed, and the drain budget bounds how
     /// many that can be.
-    fn provisional_cells(&self) -> ProvisionalCells {
-        let mut cells = ProvisionalCells::default();
+    fn provisional_cells(&self) -> QueueHolds {
+        let mut cells = QueueHolds::default();
         for claims in self
             .ticked
             .values()
             .flat_map(|ticked| ticked.provisional_claims.values())
         {
-            cells.claim(claims);
+            cells.hold(&pins_of(claims, self.local_shard));
         }
         cells
     }

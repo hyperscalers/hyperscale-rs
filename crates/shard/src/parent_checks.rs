@@ -2110,6 +2110,108 @@ mod tests {
         assert!(reads(&cut, record));
     }
 
+    /// A proposal names its lines over the claims it gathered, and a
+    /// voter over the claims the reclaim cut leaves. The cut takes only
+    /// the consumer's `Never` and the record read for its return alone,
+    /// and no row waits on a crossing its consumer answered `Never`, so
+    /// the two namings agree: a shared row waiting on another record the
+    /// same parent claim reads arrives, heads and runs over either.
+    #[test]
+    fn a_proposal_with_a_refused_reclaim_names_what_its_voter_checks() {
+        use hyperscale_engine::tick_select::ManifestInputs;
+        use hyperscale_storage::{MemberIndex, record_arrivals};
+        use hyperscale_types::test_utils::{TestCommittee, stub_abort_charge};
+        use hyperscale_types::{Joins, MemberTerms, Settlement, StatedTerms, TickLine};
+
+        use crate::action_handlers::Naming;
+
+        let (refused, waited) = (returnable(0), returnable(1));
+        let lands = producing(
+            &[refused, waited],
+            credit_cell(),
+            encode_amount(40).to_vec(),
+        );
+        let mut state_claims = parent_claims(&[refused, waited], &[], anchor(PRODUCER, 4), &lands);
+        state_claims.push(declined_at_a_boundary(&[refused]));
+        let members = MemberInputs {
+            committed: past(&declined_at_a_boundary(&[refused])),
+            ..MemberInputs::still(PRODUCER)
+        };
+        let mut outright = StateWrites::default();
+        outright
+            .cells
+            .insert(credit_cell(), Some(encode_amount(7).to_vec()));
+        let cut = without_refused_reclaims(state_claims.clone(), &members, &outright, &lands)
+            .expect("the fixture's claims restrict");
+        assert!(
+            !reads(&cut, refused.record_key(&ProtocolHasher)),
+            "the cut takes the refused record's reading",
+        );
+        assert!(reads(&cut, waited.record_key(&ProtocolHasher)));
+
+        // A shared row of the issuing transaction, paying elsewhere and
+        // waiting on the record the cut leaves.
+        let mut charge = stub_abort_charge(1);
+        charge.vault.owner = Address::new([0xC1; 31], AddressClass::Principal);
+        let terms = MemberTerms {
+            leg: false,
+            settlement: Settlement::Shared,
+            declared: Capped::empty(),
+            reach: Capped::from_array([CONSUMER]),
+            awaits: Capped::from_array([CONSUMER]),
+            engages: Capped::empty(),
+            crossings: Capped::from_array([waited]),
+            waits: false,
+            charge,
+            share: 0,
+            reserves: Capped::empty(),
+            staged: 0,
+        };
+        let deadline = Deadline::of(members.committed.plus(Duration::from_secs(60)));
+        let mut rows = MemberIndex::empty(PRODUCER);
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(issuing(), deadline)],
+            terms: vec![StatedTerms {
+                tx: issuing(),
+                terms,
+            }],
+            ..MemberInputs::still(PRODUCER)
+        });
+        assert_eq!(rows.members[&issuing()].queued, None, "its record is owed");
+
+        let snapshot = TestCommittee::new(4, 7).topology_snapshot(2);
+        let manifest = ManifestInputs::default();
+        let named = |claims: &[StateClaim]| -> Vec<TickLine> {
+            let mut committed = manifest.committed.clone();
+            committed.arrived.extend(record_arrivals(claims));
+            Naming {
+                parent: &rows,
+                shard: PRODUCER,
+                height: BlockHeight::new(2),
+                anchor: members.committed,
+                committee: &snapshot,
+                certificates: &[],
+                records: &[],
+                claims,
+                windows: windows(),
+                manifest: &manifest,
+                committed: &committed,
+            }
+            .over(&[])
+            .lines
+        };
+        let proposed = named(&state_claims);
+        assert!(
+            proposed.iter().any(|line| matches!(
+                line,
+                TickLine::Member { tx, joins: Joins::Executes, .. } if *tx == issuing()
+            )),
+            "the waiting row arrives, heads and runs: {proposed:?}",
+        );
+        assert_eq!(named(&cut), proposed);
+    }
+
     /// A proposer cuts from its claims every owed record whose `Taken`
     /// the count at its parent cannot take beside the ones kept ahead of
     /// it, and every one where it holds no count; the rest of the claim

@@ -30,7 +30,7 @@ use hyperscale_types::{
 };
 
 use crate::Substates;
-use crate::shard::members::{MemberRow, RowState};
+use crate::shard::members::{MemberIndex, MemberRow, RowState};
 
 /// Where a member stands in its shard's queue: the block that placed it
 /// and its rank there.
@@ -367,6 +367,97 @@ impl RowEntries {
                 .map(|head| (serves_order(head), row.tx)),
             waiters: BTreeMap::new(),
         }
+    }
+}
+
+/// What the queue holds on each key, as naming reads it: per key, the
+/// classes the standing `Queue` entries stand in, those of rows holding
+/// what they declared apart from those of shared rows still waiting.
+///
+/// Every row that holds what it declared stands in `Queue`, a shared row
+/// in flight or stated at its place and a leg in flight from the line
+/// running it, so the holding half refuses exactly what their holds
+/// refuse, on the keys this shard owns. A shared row waiting stands
+/// there from its place, ahead of its line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueHolds {
+    holding: BTreeMap<PinKey, u8>,
+    waiting: BTreeMap<PinKey, u8>,
+}
+
+/// Whether the classes `held` stands in on `pin`'s key refuse it.
+fn classes_refuse(held: &BTreeMap<PinKey, u8>, pin: &Pin) -> bool {
+    held.get(&pin.key).is_some_and(|classes| {
+        PinClass::ALL
+            .into_iter()
+            .any(|class| classes & (1 << class as u8) != 0 && pin.modes.refused_by(class))
+    })
+}
+
+impl QueueHolds {
+    /// The `Queue` collection `rows` hold.
+    #[must_use]
+    pub fn of(rows: &MemberIndex) -> Self {
+        let family = MemberFamily::of(rows.shard());
+        let mut held = Self::default();
+        for (order, bytes) in rows.entries_in_range(
+            family.owner(),
+            family.id(MemberCollection::Queue),
+            0,
+            u128::MAX,
+            usize::MAX,
+        ) {
+            let class = PinClass::ALL[usize::try_from((order >> 62) & 3).unwrap_or_default()];
+            let Ok(value) = from_slice::<QueueValue>(&bytes) else {
+                continue;
+            };
+            for (key, tx) in value.iter() {
+                let waits = rows
+                    .members
+                    .get(tx)
+                    .is_some_and(|row| row.state == RowState::Pending);
+                let side = if waits {
+                    &mut held.waiting
+                } else {
+                    &mut held.holding
+                };
+                *side.entry(*key).or_default() |= 1 << class as u8;
+            }
+        }
+        held
+    }
+
+    /// Whether nothing stands.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.holding.is_empty() && self.waiting.is_empty()
+    }
+
+    /// Take `pins` as held too, as a line named to run holds them.
+    pub fn hold(&mut self, pins: &[Pin]) {
+        for pin in pins {
+            for class in PinClass::ALL {
+                if pin.modes.stands_in(class) {
+                    *self.holding.entry(pin.key).or_default() |= 1 << class as u8;
+                }
+            }
+        }
+    }
+
+    /// Whether a row holding what it declared refuses a candidate
+    /// pinning `pins`: some pin's key stands held in a class that pin is
+    /// refused by.
+    #[must_use]
+    pub fn held_refuses(&self, pins: &[Pin]) -> bool {
+        pins.iter().any(|pin| classes_refuse(&self.holding, pin))
+    }
+
+    /// Whether anything standing refuses a candidate pinning `pins`, a
+    /// shared row still waiting included.
+    #[must_use]
+    pub fn refuses(&self, pins: &[Pin]) -> bool {
+        pins.iter()
+            .any(|pin| classes_refuse(&self.holding, pin) || classes_refuse(&self.waiting, pin))
     }
 }
 

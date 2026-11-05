@@ -136,18 +136,20 @@ const LOST_PROVISIONS: usize = 64;
 /// The venue's committee loses its first provision broadcasts, so the
 /// book's shard holds the route pending until it fetches the venue's
 /// part. A local fill submitted once the book's shard has committed the
-/// route commits after it, and a pending row holds nothing, so the fill
-/// is named and runs in the meantime. The book's bundle serves the
-/// ladder its committing block left, which the later fill never touched;
-/// the book's own member reads the ladder through its tick, which layers
-/// the fill's output. So the venue banks the base of one walk and the
-/// book's vault gives up the base of another.
+/// route commits after it. The book's member of the route pays nowhere
+/// and consumes the trader's escrow, so the book places it only at the
+/// block whose claims read the trader's record, which lands after the
+/// fill commits: the fill is named in its own block and runs, and the
+/// route heads once the fill's tick settles. The book's bundle serves
+/// the ladder its committing block left, which the later fill never
+/// touched; the book's own member reads the ladder through its tick,
+/// which layers the fill's output. So the venue banks the base of one
+/// walk and the book's vault gives up the base of another.
 ///
-/// The route must bank one base on both shards, the one the walk over
-/// the ladder the book's committing block left buys, as one run of the
-/// core would.
+/// The route must bank one base on both shards, as one run of the core
+/// would.
 #[test]
-#[ignore = "a member committed after a core member runs before it on the cells the core's part served"]
+#[ignore = "a fill committed before a non-payer route's record lands runs ahead of it while the route's part is served at commit"]
 fn a_fill_committed_after_the_route_waits_for_the_route() {
     let mut cluster = book_route_cluster(sim_seed(42));
     cluster.run_faultable(|c| {

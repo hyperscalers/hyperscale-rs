@@ -10,19 +10,23 @@
 //! provision that served other entries than the source committed shows
 //! as a payout that is not that figure, or as a route that never settles.
 
+use std::time::Duration;
+
 use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::{config_key, crossing_records};
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_storage::RowState;
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, DeclaredRange, Ed25519PrivateKey, MIN_STAKE_FLOOR, Movement,
-    PrincipalAddr, ProtocolHasher, ResourceAddr, ShardId, SubstateKey, TransactionDecision,
-    TransactionStatus, TxHash,
+    NAMING_WINDOW, PrincipalAddr, ProtocolHasher, ResourceAddr, ShardId, SubstateKey,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{InstanceMeta, SlotId, Value, child_key, collection_id};
 use hyperscale_vm_fixtures::book::{self, FILL_CAP};
 use hyperscale_vm_sdk::client::VaultField;
 
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
+use crate::straddler::isolate_provision_intake;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{declared_price, held, held_at, owning_shard, stands_at};
 use crate::support::tx::{
@@ -31,7 +35,7 @@ use crate::support::tx::{
     validity_around, venue_quote,
 };
 use crate::support::wait::await_tx_terminal;
-use crate::support::{Budget, Cluster, epochs};
+use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
     PROVIDER_FUNDING, SWAPPER_FUNDING, StockedVenue, accepted, grind_onto, reserve_cell,
     stand_up_venue,
@@ -452,6 +456,243 @@ impl BookRoute {
         self.units
             .assert_settles_within(c, &Charges::default(), budget, "the book route's base");
     }
+}
+
+/// A route the book's own taker paid for, standing head of the book's
+/// queue, and a local fill it refused there.
+#[derive(Debug)]
+struct HeldLadder {
+    route: TxHash,
+    fill: TxHash,
+    /// When the book's shard first showed the route refusing the fill.
+    blocked_at: WeightedTimestamp,
+    /// When the fill committed on the book's shard.
+    fill_committed: WeightedTimestamp,
+}
+
+impl BookRoute {
+    /// Submit a route the book's local taker pays for, so the book's
+    /// member is the payer's core and is placed at its commit, and once
+    /// the book's shard holds it head of its queue, a local fill on the
+    /// ladder behind it. Answers with the two once the fill has
+    /// committed and the route stands refusing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the route never stands head on the book's shard, or if
+    /// the fill does not commit there behind it within `budget`.
+    fn hold_the_ladder<C: Cluster>(
+        &mut self,
+        c: &mut C,
+        budget: Budget,
+        label: &str,
+    ) -> HeldLadder {
+        let (key, taker) = &self.local;
+        let route = build_book_route_tx(
+            key,
+            *taker,
+            (&self.book, &self.venue.meta),
+            *PROTOCOL_RESOURCE,
+            ROUTE_INPUT,
+            validity_around(c.now()),
+        );
+        let records = crossing_records(
+            &c.with_derivation(|derivation| route.try_derived(derivation))
+                .expect("a scenario route derives")
+                .legs,
+        );
+        self.protocol_resource.owing(records.iter().copied());
+        self.units.owing(records);
+        let route = self.charges.submit(c, route);
+        let head = |c: &C| {
+            c.queued_rows(BOOK_SHARD).is_some_and(|rows| {
+                rows.get(&route)
+                    .is_some_and(|row| row.state == RowState::Pending && row.head.is_some())
+            })
+        };
+        assert!(
+            c.run_until(budget, head),
+            "{label}: the book's shard must hold the route head of its queue",
+        );
+        let fill = build_fill_asks_tx(
+            key,
+            *taker,
+            &self.book,
+            *PROTOCOL_RESOURCE,
+            LOCAL_FILL,
+            validity_around(c.now()),
+        );
+        let fill = self.charges.submit(c, fill);
+        let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+        let refused = |c: &C| {
+            c.queued_rows(BOOK_SHARD).and_then(|rows| {
+                let waiting = rows
+                    .get(&fill)
+                    .is_some_and(|row| row.state == RowState::Pending);
+                rows.get(&route)
+                    .filter(|row| waiting && row.state == RowState::Pending)
+                    .and_then(|row| row.blocked_at)
+            })
+        };
+        assert!(
+            c.run_until(budget, |c| refused(c).is_some()),
+            "{label}: the fill must commit and wait behind the route",
+        );
+        HeldLadder {
+            route,
+            fill,
+            blocked_at: refused(c).expect("the route refuses the fill"),
+            fill_committed: clock(c),
+        }
+    }
+
+    /// Assert `held`'s route leaves the book's shard by an abort at its
+    /// naming window, unnamed, and the fill behind it is named and
+    /// accepted within the window and a finalization's slack of being
+    /// refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the route is named on the book's shard, leaves it
+    /// outside its window, or does not abort, or if the fill does not
+    /// accept in time.
+    fn assert_freed_at_the_window<C: Cluster>(
+        c: &mut C,
+        held: &HeldLadder,
+        budget: Budget,
+        label: &str,
+    ) {
+        let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+        let gone = |c: &C| {
+            !c.queued_rows(BOOK_SHARD).is_some_and(|rows| {
+                rows.get(&held.route)
+                    .is_some_and(|row| row.state == RowState::Pending)
+            })
+        };
+        assert!(
+            c.run_until(budget, gone),
+            "{label}: the route must leave the book's queue"
+        );
+        let left = clock(c);
+        let closes = held.blocked_at.plus(NAMING_WINDOW);
+        assert!(
+            left >= closes && left <= closes.plus(WINDOW_SLACK),
+            "{label}: the route must leave at its window, closing at {closes:?}: left at {left:?}",
+        );
+        assert!(
+            c.ran(BOOK_SHARD, held.route)
+                .iter()
+                .all(|ran| !ran.succeeded),
+            "{label}: the route is aborted unnamed on the book's shard",
+        );
+        let status = await_tx_terminal(c, held.fill, budget);
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "{label}: the fill must accept once the route leaves; status = {status:?}",
+        );
+        let named = clock(c);
+        assert!(
+            named <= held.fill_committed.plus(NAMING_WINDOW).plus(WINDOW_SLACK),
+            "{label}: the fill must run within the window of being refused: committed at {:?}, \
+             accepted at {named:?}",
+            held.fill_committed,
+        );
+        let status = await_tx_terminal(c, held.route, budget);
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Aborted))
+            ),
+            "{label}: the route must abort; status = {status:?}",
+        );
+    }
+}
+
+/// What a window's close and the abort it names take past the anchor
+/// that closes it: a block's naming and a certificate's settling.
+const WINDOW_SLACK: Duration = Duration::from_secs(8);
+
+/// Routes a venue never commits run back to back, each pausing the
+/// ladder it reads for no more than a naming window.
+const GRIEF_ROUTES: usize = 3;
+
+/// Routes back to back through a venue whose committee drops every
+/// bundle the book's shard sends it, so it never commits one.
+///
+/// Each route's payer is the book's own taker, so the book's member of
+/// it is the payer's core: placed at its commit, head of the book's
+/// queue, and waiting on the venue's committed bundle, which never
+/// comes. A local fill on the ladder behind it waits, and the route
+/// takes the clock of that refusal: its window aborts it unnamed, its
+/// payer paying its abort charge, and the fill runs. A freeze costs its
+/// griefer a charge per window and pauses the ladder no longer.
+///
+/// # Panics
+///
+/// Panics if the cut never fires, if a route is named or does not abort
+/// at its window, if a fill does not run within its window, or if the
+/// quote or the base is not conserved.
+pub fn a_route_whose_venue_never_commits_frees_the_ladder<C: FaultableCluster>(c: &mut C) {
+    let mut route = BookRoute::stand_up(c);
+    let cut = isolate_provision_intake(c, BOOK_VENUE_SHARD, BOOK_SHARD);
+    for at in 0..GRIEF_ROUTES {
+        let label = format!("griefing route {at}");
+        let held = route.hold_the_ladder(c, epochs(4), &label);
+        BookRoute::assert_freed_at_the_window(c, &held, epochs(4), &label);
+    }
+    assert!(cut.fired() > 0, "the venue must have been cut off");
+    c.clear_drops();
+    route.assert_conserved(c, epochs(12));
+}
+
+/// How long the venue's part to the book stays undelivered: past one
+/// naming window.
+const STALL: Duration = Duration::from_secs(30);
+
+/// A venue that commits a route and then leaves its part to the book
+/// undelivered past the naming window.
+///
+/// The route's payer is the book's own taker, so the book's member is
+/// the payer's core, placed at its commit and head. The venue commits
+/// the route on the book's bundle, then every part it sends the book is
+/// dropped for [`STALL`]. A fill behind the route on the ladder waits,
+/// the route takes the clock of that refusal and is aborted unnamed at
+/// its window, and the fill runs. Once the venue's parts flow again it
+/// reads the abort, and nothing moves but the payer's charge: no base
+/// is banked off a walk the book never took.
+///
+/// # Panics
+///
+/// Panics if the venue never commits the route, if the route is named
+/// or does not abort at its window, if the fill does not run, or if the
+/// quote or the base is not conserved.
+pub fn a_stalled_venue_aborts_its_route_at_the_window<C: FaultableCluster>(c: &mut C) {
+    let mut route = BookRoute::stand_up(c);
+    let cut = isolate_provision_intake(c, BOOK_SHARD, BOOK_VENUE_SHARD);
+    let stalled = c.now();
+    let held = route.hold_the_ladder(c, epochs(4), "a stalled venue");
+    assert!(
+        c.run_until(epochs(4), |c| c
+            .chain_fate(BOOK_VENUE_SHARD, held.route)
+            .0
+            .is_some()),
+        "the venue must commit the route on the book's bundle",
+    );
+    BookRoute::assert_freed_at_the_window(c, &held, epochs(4), "a stalled venue");
+    let _ = c.run_until(epochs(4), |c| c.now() >= stalled + STALL);
+    assert!(cut.fired() > 0, "the venue's parts must have been dropped");
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(8), |c| c
+            .tx_statuses(held.route)
+            .iter()
+            .all(|(status, _)| status.is_final())),
+        "the venue must read the abort once its parts flow",
+    );
+    route.assert_conserved(c, epochs(12));
 }
 
 /// When a route's second local fill is submitted.
