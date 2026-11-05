@@ -3,9 +3,11 @@
 //!
 //! A member pins the declared entries whose keys its shard owns. A range
 //! pins its collection, since two intervals of one collection contend by
-//! mode alone. Two pins contend exactly where the scheduling relation
-//! says an in-flight claim refuses a candidate: [`Modes::refuses`], the
-//! relation `ProvisionalCells::blocks` holds, debit rule included.
+//! mode alone. A held pin refuses a candidate exactly where the
+//! scheduling relation says an in-flight claim does: [`Modes::refuses`],
+//! the relation `ProvisionalCells::blocks` holds, debit rule included.
+//! Between two abortable members, the earlier one still waiting, the
+//! queue reads it both ways ([`Modes::conflicts`]).
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;

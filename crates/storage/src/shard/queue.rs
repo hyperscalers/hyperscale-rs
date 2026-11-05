@@ -388,26 +388,42 @@ impl RowEntries {
 }
 
 /// What the queue holds on each key, as naming reads it: per key, the
-/// classes the standing `Queue` entries stand in, those of rows holding
-/// what they declared apart from those of shared rows still waiting.
+/// classes the standing `Queue` entries and the walk's lines stand in.
+///
+/// Those of rows holding what they declared stand apart from those of
+/// shared rows still waiting, and the pins the lines a walk has named on
+/// abortable terms hold stand apart from both.
 ///
 /// Every row that holds what it declared stands in `Queue`, a shared row
 /// in flight or stated at its place and a leg in flight from the line
 /// running it, so the holding half refuses exactly what their holds
 /// refuse, on the keys this shard owns. A shared row waiting stands
 /// there from its place, ahead of its line.
+///
+/// Which halves refuse a candidate depends on how it settles
+/// ([`Self::refuses`]). A determined member is read one way against all
+/// of it: its output enters the view at its naming, so a member placed
+/// ahead of it is judged over the view it leaves. A leg is read one way
+/// against what holds and both ways against the shared rows waiting: of
+/// two abortable members on one key, neither may run ahead of an earlier
+/// one it would refuse, since neither one's writes are in a view until
+/// it resolves. A shared member is judged by its head against the
+/// queue, and here only against what the walk holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueueHolds {
     holding: BTreeMap<PinKey, u8>,
     waiting: BTreeMap<PinKey, u8>,
+    walked: BTreeMap<PinKey, u8>,
 }
 
-/// Whether the classes `held` stands in on `pin`'s key refuse it.
-fn classes_refuse(held: &BTreeMap<PinKey, u8>, pin: &Pin) -> bool {
+/// Whether the classes `held` stands in on `pin`'s key refuse it, or,
+/// read `both` ways, are refused by it.
+fn classes_refuse(held: &BTreeMap<PinKey, u8>, pin: &Pin, both: bool) -> bool {
     held.get(&pin.key).is_some_and(|classes| {
-        PinClass::ALL
-            .into_iter()
-            .any(|class| classes & (1 << class as u8) != 0 && pin.modes.refused_by(class))
+        PinClass::ALL.into_iter().any(|class| {
+            classes & (1 << class as u8) != 0
+                && (pin.modes.refused_by(class) || (both && pin.modes.refuses_class(class)))
+        })
     })
 }
 
@@ -449,34 +465,48 @@ impl QueueHolds {
     /// Whether nothing stands.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.holding.is_empty() && self.waiting.is_empty()
+        self.holding.is_empty() && self.waiting.is_empty() && self.walked.is_empty()
     }
 
-    /// Take `pins` as held too, as a line named to run holds them.
+    /// Take `pins` as held for the rest of the walk, as a line named to
+    /// run on abortable terms holds them.
     pub fn hold(&mut self, pins: &[Pin]) {
         for pin in pins {
             for class in PinClass::ALL {
                 if pin.modes.stands_in(class) {
-                    *self.holding.entry(pin.key).or_default() |= 1 << class as u8;
+                    *self.walked.entry(pin.key).or_default() |= 1 << class as u8;
                 }
             }
         }
     }
 
-    /// Whether a row holding what it declared refuses a candidate
-    /// pinning `pins`: some pin's key stands held in a class that pin is
-    /// refused by.
+    /// Whether a candidate settling on `settlement` and pinning `pins` is
+    /// refused: one way by what holds and by what the walk holds, and by
+    /// the shared rows waiting one way for a determined member, both ways
+    /// for a leg, and not at all for a shared member, whose head answers
+    /// for them.
+    ///
+    /// A shared member is in practice never refused here: a line the
+    /// walk runs on abortable terms is a head, compatible both ways with
+    /// every other head, or a leg, which any conflicting shared row
+    /// waiting refuses before it holds. What the walk holds keeps out
+    /// the determined members named after an abortable line.
     #[must_use]
-    pub fn held_refuses(&self, pins: &[Pin]) -> bool {
-        pins.iter().any(|pin| classes_refuse(&self.holding, pin))
-    }
-
-    /// Whether anything standing refuses a candidate pinning `pins`, a
-    /// shared row still waiting included.
-    #[must_use]
-    pub fn refuses(&self, pins: &[Pin]) -> bool {
-        pins.iter()
-            .any(|pin| classes_refuse(&self.holding, pin) || classes_refuse(&self.waiting, pin))
+    pub fn refuses(&self, pins: &[Pin], settlement: Settlement) -> bool {
+        pins.iter().any(|pin| {
+            classes_refuse(&self.walked, pin, false)
+                || match settlement {
+                    Settlement::Shared => false,
+                    Settlement::Awaited => {
+                        classes_refuse(&self.holding, pin, false)
+                            || classes_refuse(&self.waiting, pin, true)
+                    }
+                    Settlement::Alone => {
+                        classes_refuse(&self.holding, pin, false)
+                            || classes_refuse(&self.waiting, pin, false)
+                    }
+                }
+        })
     }
 }
 

@@ -15,10 +15,11 @@
 //! The queue orders the members on the keys they pin. A member whose
 //! verdict a counterpart shares takes one place, at the block that
 //! commits it or that reads its last record, and is named only once it
-//! stands head: nothing placed before it on a key it pins refuses it. A
-//! determined member or a leg waits behind every place standing on its
-//! keys, and a head that refuses someone is aborted unnamed once its
-//! naming window closes.
+//! stands head: nothing placed before it on a key it pins conflicts with
+//! it, read both ways against a member still waiting and one way against
+//! one in flight or stated. A determined member or a leg waits behind
+//! every place standing on its keys, and a head that refuses someone is
+//! aborted unnamed once its naming window closes.
 //! Verdict leaves are keyed as member rows are too, and stand exactly
 //! while a row says yes or accepted: from this shard's own certificate
 //! succeeding for a member its counterparts share the verdict on, until
@@ -708,8 +709,14 @@ impl MemberRow {
     /// Whether the row holds a seat: held by a tick and settled against
     /// by a counterpart, as [`RowState::seated`] says, or `Pending` on
     /// terms a counterpart shares the verdict on and head of the queue.
-    /// A head row stands first on every key it pins, so a counterpart
-    /// reading its seat reads a member nothing here stands ahead of.
+    /// A head row stands first on every key it pins: nothing placed
+    /// before it and still waiting conflicts with it either way, nothing
+    /// before it in flight refuses it, and no abortable member placed
+    /// after it that conflicts with it either way heads or runs while it
+    /// waits. A determined member runs beside it only where the head does
+    /// not refuse it, and its output is then in the view the head runs
+    /// over. A counterpart reading its seat reads a member nothing here
+    /// stands ahead of.
     #[must_use]
     pub fn seated(&self) -> bool {
         self.state.seated()
@@ -1149,6 +1156,15 @@ fn read_all(
     state.entries_in_range(owner, collection, 0, u128::MAX, usize::MAX)
 }
 
+/// The modes the standing waiters pin on one key, unioned per
+/// settlement, since a leg is refused both ways and a determined member
+/// one way.
+#[derive(Debug, Clone, Copy, Default)]
+struct WaiterModes {
+    determined: Modes,
+    legs: Modes,
+}
+
 /// The family as the fold changes it: each row read at most once, and
 /// written back only where it changed.
 struct Working<'s, S: ?Sized> {
@@ -1269,7 +1285,9 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     }
 
     /// Move the queue entries `left` implies to those `entered` does. A
-    /// `Queue` entry deleted or rewritten marks the fold dirty.
+    /// `Queue` entry deleted or rewritten marks the fold dirty, and so
+    /// does one whose row leaves `Pending`, since a later row is read
+    /// against it both ways only while it waits.
     fn reindex(&mut self, left: Option<&MemberRow>, entered: Option<&MemberRow>) {
         if left.and_then(|row| row.queued).is_none() && entered.and_then(|row| row.queued).is_none()
         {
@@ -1277,6 +1295,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
         let was = self.pins.entries(left);
         let is = self.pins.entries(entered);
+        let waited =
+            |row: Option<&MemberRow>| row.is_some_and(|row| row.state == RowState::Pending);
+        if !was.queue.is_empty() && waited(left) && !waited(entered) {
+            self.dirty = true;
+        }
         for order in was.queue.keys() {
             if !is.queue.contains_key(order) {
                 self.queue.set(*order, None);
@@ -1326,16 +1349,29 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         self.pins.pins(row)
     }
 
-    /// The modes every standing waiter pins on `key`, unioned: a claim
-    /// refuses one of them exactly where it refuses the union, since the
-    /// relation reads one candidate mode bit per clause.
-    fn waiter_modes(&mut self, key: PinKey) -> Modes {
-        self.waiters
-            .naming(self.state, key, waiter_span(key), None)
-            .into_iter()
-            .flat_map(|tx| self.pins_of_row(tx).to_vec())
-            .filter(|pin| pin.key == key)
-            .fold(Modes::default(), |modes, pin| modes.union(pin.modes))
+    /// The modes every standing waiter pins on `key`, unioned apart by
+    /// settlement: the determined members' and the legs'. A claim refuses
+    /// one of a set exactly where it refuses the set's union, and one of
+    /// a set refuses it exactly where the union does, since the relation
+    /// reads each side as a union of mode bits per clause.
+    fn waiter_modes(&mut self, key: PinKey) -> WaiterModes {
+        let mut modes = WaiterModes::default();
+        for tx in self.waiters.naming(self.state, key, waiter_span(key), None) {
+            let leg = self.peek(tx).is_some_and(|row| {
+                row.waiting
+                    .as_ref()
+                    .is_some_and(|waiting| waiting.settlement == Settlement::Awaited)
+            });
+            let side = if leg {
+                &mut modes.legs
+            } else {
+                &mut modes.determined
+            };
+            for pin in self.pins_of_row(tx).iter().filter(|pin| pin.key == key) {
+                *side = side.union(pin.modes);
+            }
+        }
+        modes
     }
 
     /// The pins of the tick at `height`, as the fold leaves them.
@@ -1398,10 +1434,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
     }
 
-    /// Whether every place `row` holds is clear: no earlier standing
-    /// shared pin refuses one of its pins, and no earlier tick whose
-    /// determined half is owed pins a key its served modes are refused
-    /// on.
+    /// Whether every place `row` holds is clear: no earlier `Queue`
+    /// entry conflicts with one of its pins, both ways where the entry's
+    /// row is `Pending` and one way, the entry refusing it, where that
+    /// row runs or stated; and no earlier tick whose determined half is
+    /// owed pins a key its served modes are refused on.
     fn clear(&mut self, row: &MemberRow) -> bool {
         let Some(place) = row.queued else {
             return false;
@@ -1409,13 +1446,26 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         let pins = self.pins_of_row(row.tx);
         for pin in pins.iter() {
             for class in PinClass::ALL {
-                if pin.modes.refused_by(class)
-                    && self
+                let span = class_span(pin.key, class);
+                let bound = queue_order(pin.key, class, place);
+                if pin.modes.refused_by(class) {
+                    if self
                         .queue
-                        .first(self.state, pin.key, class_span(pin.key, class))
-                        .is_some_and(|first| first < queue_order(pin.key, class, place))
-                {
-                    return false;
+                        .first(self.state, pin.key, span)
+                        .is_some_and(|first| first < bound)
+                    {
+                        return false;
+                    }
+                } else if pin.modes.refuses_class(class) {
+                    let earlier = self.queue.naming(self.state, pin.key, span, Some(bound));
+                    for tx in earlier {
+                        if self
+                            .peek(tx)
+                            .is_some_and(|row| row.state == RowState::Pending)
+                        {
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -1630,20 +1680,23 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// the rows its claims read records for, that the block placed and
     /// that still stand: a shared row placed at the block's height, and a
     /// waiter it placed. Each unnamed `Pending` shared row earlier on a
-    /// key that refuses a placed party, and each standing on a key that
-    /// refuses a waiter party, takes the block's clock as its
-    /// `blocked_at`; so does a placed party that refuses a standing
-    /// waiter. Whether the block placed a row is read off the row, so a
-    /// fold of the block's content and then of the block computes what
-    /// one fold does.
+    /// key that conflicts with a placed party both ways, and each
+    /// standing on a key that refuses a waiter party, takes the block's
+    /// clock as its `blocked_at`; so does a placed party that refuses a
+    /// standing waiter. A leg waiter is read both ways, as naming reads
+    /// it, and a determined one one way: a shared row beside a determined
+    /// waiter it does not refuse blocks nobody. Whether the block placed
+    /// a row is read off the row, so a fold of the block's content and
+    /// then of the block computes what one fold does.
     fn refusals(&mut self, inputs: &MemberInputs, parties: &BTreeSet<TxHash>) {
         // Per key and class, the order key below which every standing
         // entry refuses some party; `None` for all of them. Each span is
         // then read once, however many parties ask of it.
         let mut below: BTreeMap<(PinKey, PinClass), Option<u128>> = BTreeMap::new();
-        let mut ask = |pin: &Pin, place: Option<Place>| {
+        let mut ask = |pin: &Pin, place: Option<Place>, both: bool| {
             for class in PinClass::ALL {
-                if !pin.modes.refused_by(class) {
+                let asked = pin.modes.refused_by(class) || (both && pin.modes.refuses_class(class));
+                if !asked {
                     continue;
                 }
                 let bound = place.map(|place| queue_order(pin.key, class, place));
@@ -1653,7 +1706,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     .or_insert(bound);
             }
         };
-        let mut waited: BTreeMap<PinKey, Modes> = BTreeMap::new();
+        let mut waited: BTreeMap<PinKey, WaiterModes> = BTreeMap::new();
         let mut blocked = BTreeSet::new();
         let waiting = !self.waiters.is_empty(self.state);
         for &tx in parties {
@@ -1667,15 +1720,22 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             if !placed && !standing_waiter(row) {
                 continue;
             }
+            // A shared party and a leg are abortable, read both ways.
+            let both = placed
+                || row
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|waiting| waiting.settlement == Settlement::Awaited);
             for pin in self.pins_of_row(tx).iter() {
-                ask(pin, placed.then_some(place));
+                ask(pin, placed.then_some(place), both);
                 if !placed || !waiting {
                     continue;
                 }
                 if let Entry::Vacant(slot) = waited.entry(pin.key) {
                     slot.insert(self.waiter_modes(pin.key));
                 }
-                if pin.modes.refuses(waited[&pin.key]) {
+                let modes = waited[&pin.key];
+                if pin.modes.refuses(modes.determined) || pin.modes.conflicts(modes.legs) {
                     blocked.insert(tx);
                 }
             }
@@ -9148,6 +9208,119 @@ mod tests {
             }
         }
 
+        /// A debit placed after an unnamed reservation of its cell does not
+        /// head: the two conflict both ways while the reserver waits, and
+        /// neither's writes are in a view until it resolves. The reserver
+        /// takes the block's clock.
+        #[test]
+        fn a_debit_placed_after_a_pending_reservation_does_not_head() {
+            let mut store = Entries::default();
+            let mut first = block(1);
+            commit(&mut first, 1, terms(&Kind::Payer(vec![]), &[reserve(A)]));
+            store.fold(&first);
+            let mut second = block(2);
+            commit(&mut second, 2, terms(&Kind::Payer(vec![]), &[debit(A)]));
+            store.fold(&second);
+            assert_eq!(headed(&store, 1), Some((BlockHeight::new(1), clock(1))));
+            assert_eq!(row(&store, 2).queued, Some(at(2, 0)));
+            assert_eq!(row(&store, 2).head, None, "behind a waiting reservation");
+            assert_eq!(row(&store, 1).blocked_at, Some(clock(2)));
+        }
+
+        /// A debit placed after a reservation already in flight heads at
+        /// once: the reservation's hold is counted, so the debit is safe
+        /// beside it, and the in-flight row is read one way.
+        #[test]
+        fn a_debit_placed_after_an_inflight_reservation_heads() {
+            let mut store = Entries::default();
+            let reserving = terms(&Kind::Payer(vec![]), &[reserve(A)]);
+            let mut first = block(1);
+            commit(&mut first, 1, reserving.clone());
+            store.fold(&first);
+            let mut second = block(2);
+            lines(&mut second, vec![run(1, &reserving)]);
+            store.fold(&second);
+            let mut third = block(3);
+            commit(&mut third, 2, terms(&Kind::Payer(vec![]), &[debit(A)]));
+            store.fold(&third);
+            assert_eq!(headed(&store, 2), Some((BlockHeight::new(3), clock(3))));
+            assert_eq!(row(&store, 1).blocked_at, None);
+        }
+
+        /// A debit held out by an earlier reservation that waits heads in
+        /// the block whose line names the reserver: the naming leaves the
+        /// reserver's entries where they stand, and still dirties the
+        /// fold, so the rows behind are tested again. Folded as a proposer
+        /// and a voter fold it, the block writes what one fold does.
+        #[test]
+        fn naming_an_earlier_reserver_lets_a_held_out_debit_head() {
+            let mut store = Entries::default();
+            let reserving = terms(&Kind::Payer(vec![]), &[reserve(A)]);
+            let mut first = block(1);
+            commit(&mut first, 1, reserving.clone());
+            store.fold(&first);
+            let mut second = block(2);
+            commit(&mut second, 2, terms(&Kind::Payer(vec![]), &[debit(A)]));
+            store.fold(&second);
+            assert_eq!(row(&store, 2).head, None);
+
+            let mut third = block(3);
+            lines(&mut third, vec![run(1, &reserving)]);
+            let mut twice = Entries(store.0.clone());
+            twice.fold_content(&MemberInputs {
+                manifest: Arc::new(Capped::empty()),
+                ..third.clone()
+            });
+            twice.fold(&third);
+            store.fold(&third);
+            assert_eq!(twice.0, store.0);
+            assert!(matches!(row(&store, 1).state, RowState::InFlight { .. }));
+            assert_eq!(
+                headed(&store, 2),
+                Some((BlockHeight::new(3), clock(3))),
+                "heads beside the reservation now in flight"
+            );
+        }
+
+        /// A shared reservation beside a determined debit waiter blocks
+        /// nobody: the determined member runs beside it, its output in the
+        /// view the reservation is judged over, so neither order arms the
+        /// reservation. Beside a leg debiting the cell, which it holds out
+        /// both ways, it is armed in either order.
+        #[test]
+        fn a_reservation_beside_a_determined_debit_waiter_is_not_armed() {
+            for (waiter, armed) in [(Kind::Determined, None), (Kind::Leg, Some(()))] {
+                // The reservation placed first, then the waiter.
+                let mut store = Entries::default();
+                let mut first = block(1);
+                commit(&mut first, 1, terms(&Kind::Payer(vec![]), &[reserve(A)]));
+                store.fold(&first);
+                let mut second = block(2);
+                commit(&mut second, 2, terms(&waiter, &[debit(A)]));
+                store.fold(&second);
+                assert!(row(&store, 2).queued.is_some(), "{waiter:?} waits");
+                assert_eq!(
+                    row(&store, 1).blocked_at,
+                    armed.map(|()| clock(2)),
+                    "{waiter:?} after"
+                );
+
+                // The waiter first, then the reservation.
+                let mut store = Entries::default();
+                let mut first = block(1);
+                commit(&mut first, 2, terms(&waiter, &[debit(A)]));
+                store.fold(&first);
+                let mut second = block(2);
+                commit(&mut second, 1, terms(&Kind::Payer(vec![]), &[reserve(A)]));
+                store.fold(&second);
+                assert_eq!(
+                    row(&store, 1).blocked_at,
+                    armed.map(|()| clock(2)),
+                    "{waiter:?} before"
+                );
+            }
+        }
+
         /// One block of a random history: members committed, records
         /// arriving, rows fated, rows named and ticks' determined halves
         /// settled, each picked by index among what stands.
@@ -9396,9 +9569,10 @@ mod tests {
             }
 
             /// Whether `row`'s places are all clear over `rows`, judged
-            /// pair by pair: no earlier standing shared row refuses one
-            /// of its pins, and no earlier owed tick pins a key its
-            /// served modes are refused on.
+            /// pair by pair: no earlier standing row conflicts with one
+            /// of its pins, both ways where that row waits and one way
+            /// where it runs or stated, and no earlier owed tick pins a
+            /// key its served modes are refused on.
             fn clear(&self, row: &MemberRow, rows: &MemberIndex) -> bool {
                 let place = row.queued.expect("a placed row");
                 let pins = pins_of(&self.terms[&row.tx].declared, LOCAL);
@@ -9407,11 +9581,13 @@ mod tests {
                         && other.queued.is_some_and(|at| at < place)
                 });
                 for other in earlier {
+                    let waits = other.state == RowState::Pending;
                     for held in pins_of(&self.terms[&other.tx].declared, LOCAL).iter() {
-                        if pins
-                            .iter()
-                            .any(|pin| pin.key == held.key && held.modes.refuses(pin.modes))
-                        {
+                        if pins.iter().any(|pin| {
+                            pin.key == held.key
+                                && (held.modes.refuses(pin.modes)
+                                    || (waits && pin.modes.refuses(held.modes)))
+                        }) {
                             return false;
                         }
                     }
@@ -10091,20 +10267,25 @@ mod tests {
                                     .is_some_and(|at| at.height == height && at.rank < WAITER_RANK)
                         })
                         .collect();
+                    // A leg is read both ways, a determined member one way.
+                    let leg = |tx: TxHash| self.terms[&tx].settlement == Settlement::Awaited;
                     let mut refused = BTreeSet::new();
                     for party in &placed_here {
                         let (at, pins) = (self.places[&party.tx], self.pins(party.tx));
                         for refuser in &unnamed {
+                            let theirs = self.pins(refuser.tx);
                             if self.places[&refuser.tx] < at
-                                && contends(&self.pins(refuser.tx), &pins)
+                                && (contends(&theirs, &pins) || contends(&pins, &theirs))
                             {
                                 refused.insert(refuser.tx);
                             }
                         }
                         if party.state == RowState::Pending
-                            && waiters
-                                .iter()
-                                .any(|waiter| contends(&pins, &self.pins(waiter.tx)))
+                            && waiters.iter().any(|waiter| {
+                                let theirs = self.pins(waiter.tx);
+                                contends(&pins, &theirs)
+                                    || (leg(waiter.tx) && contends(&theirs, &pins))
+                            })
                         {
                             refused.insert(party.tx);
                         }
@@ -10115,7 +10296,10 @@ mod tests {
                     {
                         let pins = self.pins(party.tx);
                         for refuser in &unnamed {
-                            if contends(&self.pins(refuser.tx), &pins) {
+                            let theirs = self.pins(refuser.tx);
+                            if contends(&theirs, &pins)
+                                || (leg(party.tx) && contends(&pins, &theirs))
+                            {
                                 refused.insert(refuser.tx);
                             }
                         }
@@ -10157,14 +10341,18 @@ mod tests {
                         )
                 }
 
-                /// Whether `row`'s places are all clear over `rows`.
+                /// Whether `row`'s places are all clear over `rows`: an
+                /// earlier row standing in `Queue` refuses none of its
+                /// pins, nor, while that row waits, is refused by one.
                 fn clear(&self, row: &MemberRow, rows: &MemberIndex) -> bool {
                     let place = self.places[&row.tx];
                     let pins = self.pins(row.tx);
                     let refused = rows.members.values().any(|other| {
+                        let theirs = self.pins(other.tx);
                         other.tx != row.tx
                             && self.queued(other).is_some_and(|at| at < place)
-                            && contends(&self.pins(other.tx), &pins)
+                            && (contends(&theirs, &pins)
+                                || (other.state == RowState::Pending && contends(&pins, &theirs)))
                     });
                     if refused {
                         return false;

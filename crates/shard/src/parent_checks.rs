@@ -2212,6 +2212,97 @@ mod tests {
         assert_eq!(named(&cut), proposed);
     }
 
+    /// On a merged shard holding both ends of two crossings, whose
+    /// consumer's `Never` of one was read at a predecessor's boundary, the
+    /// cut takes that `Never` and the record read for its return alone,
+    /// which is an arrival; but no row waits on that crossing, so the cut
+    /// and the uncut claims leave every row's unarrived crossings alike,
+    /// and the row waiting on the other record arrives over either.
+    #[test]
+    fn a_merged_shards_cut_leaves_every_rows_arrivals_unchanged() {
+        use hyperscale_storage::{MemberIndex, record_arrivals};
+        use hyperscale_types::test_utils::stub_abort_charge;
+        use hyperscale_types::{MemberTerms, Settlement, StatedTerms};
+
+        const MERGED: ShardId = ShardId::ROOT;
+        let (refused, waited) = (returnable(0), returnable(1));
+        let lands = producing(
+            &[refused, waited],
+            credit_cell(),
+            encode_amount(40).to_vec(),
+        );
+        let mut state_claims = parent_claims(&[refused, waited], &[], anchor(MERGED, 4), &lands);
+        let declined = declined_at_a_boundary(&[refused]);
+        assert_ne!(declined.anchor.shard, MERGED, "read at a predecessor");
+        state_claims.push(declined.clone());
+        let members = MemberInputs {
+            committed: past(&declined),
+            ..MemberInputs::still(MERGED)
+        };
+        let mut outright = StateWrites::default();
+        outright
+            .cells
+            .insert(credit_cell(), Some(encode_amount(7).to_vec()));
+        let cut = without_refused_reclaims(state_claims.clone(), &members, &outright, &lands)
+            .expect("the fixture's claims restrict");
+        let (uncut_arrivals, cut_arrivals) =
+            (record_arrivals(&state_claims), record_arrivals(&cut));
+        assert!(
+            uncut_arrivals.contains(&(refused.record_key(&ProtocolHasher), issuing()))
+                && !cut_arrivals.contains(&(refused.record_key(&ProtocolHasher), issuing())),
+            "the cut takes the refused record's arrival",
+        );
+        assert!(cut_arrivals.contains(&(waited.record_key(&ProtocolHasher), issuing())));
+
+        // The issuing transaction's row, waiting on the record the cut
+        // leaves, on the merged shard; none waits on the refused one.
+        let terms = MemberTerms {
+            leg: false,
+            settlement: Settlement::Shared,
+            declared: Capped::empty(),
+            reach: Capped::from_array([CONSUMER]),
+            awaits: Capped::from_array([CONSUMER]),
+            engages: Capped::empty(),
+            crossings: Capped::from_array([waited]),
+            waits: false,
+            charge: stub_abort_charge(1),
+            share: 0,
+            reserves: Capped::empty(),
+            staged: 0,
+        };
+        let deadline = Deadline::of(members.committed.plus(Duration::from_secs(60)));
+        let mut rows = MemberIndex::empty(MERGED);
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(issuing(), deadline)],
+            terms: vec![StatedTerms {
+                tx: issuing(),
+                terms,
+            }],
+            ..MemberInputs::still(MERGED)
+        });
+        let unarrived = |arrivals| {
+            let mut after = rows.clone();
+            after.advance(&MemberInputs {
+                height: BlockHeight::new(2),
+                arrivals,
+                ..MemberInputs::still(MERGED)
+            });
+            after
+                .members
+                .into_values()
+                .map(|row| (row.tx, row.waiting.map(|waiting| waiting.unarrived)))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let (uncut, cut) = (unarrived(uncut_arrivals), unarrived(cut_arrivals));
+        assert_eq!(uncut, cut);
+        assert_eq!(
+            uncut[&issuing()].as_ref().map(|left| left.len()),
+            Some(0),
+            "the waiting row arrives over either"
+        );
+    }
+
     /// A proposer cuts from its claims every owed record whose `Taken`
     /// the count at its parent cannot take beside the ones kept ahead of
     /// it, and every one where it holds no count; the rest of the claim
