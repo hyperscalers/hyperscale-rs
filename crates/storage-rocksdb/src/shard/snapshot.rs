@@ -48,7 +48,10 @@ pub struct OwnedSnapshot(Yoke<RocksDbSnapshot<'static>, Arc<DB>>);
 impl OwnedSnapshot {
     /// The snapshot `take` builds over `db`, owning a handle on it.
     pub(crate) fn take(db: &Arc<DB>, take: impl FnOnce(&DB) -> RocksDbSnapshot<'_>) -> Self {
-        Self(Yoke::attach_to_cart(Arc::clone(db), take))
+        Self(Yoke::<RocksDbSnapshot<'static>, Arc<DB>>::attach_to_cart(
+            Arc::clone(db),
+            take,
+        ))
     }
 
     /// Whether the store held this snapshot's version when it was taken:
