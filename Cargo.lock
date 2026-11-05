@@ -2205,6 +2205,7 @@ version = "0.1.0"
 dependencies = [
  "hyperscale-core",
  "hyperscale-crypto-bls",
+ "hyperscale-effects-bridge",
  "hyperscale-engine",
  "hyperscale-hbor",
  "hyperscale-metrics",
@@ -2213,8 +2214,10 @@ dependencies = [
  "hyperscale-provisions",
  "hyperscale-shard",
  "hyperscale-storage",
+ "hyperscale-transactions",
  "hyperscale-types",
  "hyperscale-vm-effects",
+ "hyperscale-vm-manifest-builder",
  "hyperscale-vm-types",
  "papaya",
  "proptest",

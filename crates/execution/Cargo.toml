@@ -25,9 +25,12 @@ test-utils = []
 [dev-dependencies]
 hyperscale-engine = { workspace = true, features = ["test-utils"] }
 hyperscale-crypto-bls.workspace = true
+hyperscale-effects-bridge.workspace = true
 hyperscale-metrics-memory.workspace = true
 hyperscale-shard = { workspace = true, features = ["test-utils"] }
+hyperscale-transactions.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
+hyperscale-vm-manifest-builder.workspace = true
 proptest.workspace = true
 
 [lints]
