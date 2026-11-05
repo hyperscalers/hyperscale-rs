@@ -2441,6 +2441,32 @@ pub(crate) fn build_sponsored_route_presenting_tx(
     })
 }
 
+/// A two-hop route of `paying`'s amount of its resource out of `from`'s
+/// vault, taking whatever the second venue quotes, whose intent first
+/// presents that vault as a badge, a proof nothing consumes: the route
+/// declares a read of the vault it withdraws from.
+///
+/// # Panics
+///
+/// As [`build_route_tx`].
+#[must_use]
+pub(crate) fn build_route_presenting_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venues: (&InstanceMeta, &InstanceMeta),
+    paying: (ResourceAddr, u128),
+    validity: TimestampRange,
+) -> Transaction {
+    let metas = [venues.0.clone(), venues.1.clone()];
+    build_venues_tx(payer, None, &metas, validity, &|pools, b| {
+        let _ = account::present_badge(b, from, paying.0)?;
+        let funds = account::withdraw(b, from, paying.0, paying.1)?;
+        let mid = pools[0].swap(b, funds, 0)?;
+        let out = pools[1].swap(b, mid, 0)?;
+        account::deposit(b, from, out)
+    })
+}
+
 /// One call against a sealed venue, typed against the record the seal
 /// wrote.
 fn build_venue_tx(

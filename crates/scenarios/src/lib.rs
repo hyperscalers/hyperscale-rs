@@ -32,6 +32,7 @@ mod reshape;
 mod restart;
 mod route;
 mod route_reshape;
+mod served_reads;
 mod straddler;
 mod swarm;
 mod transactions;
@@ -102,7 +103,8 @@ pub use payer_cycle::{
 pub use payer_floor::{
     Ceiling, PAYER_SHARD, Pair, RoutePayer, Spend, a_payer_publishes_beside_its_unsettled_spend,
     a_payer_spends_beside_its_pending_leg, a_payer_spends_beside_its_routes_pending_core,
-    a_publish_its_packages_shard_refuses_pays_and_ends_its_hold, assert_pair_rule,
+    a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
+    a_whole_members_part_is_served_by_the_block_settling_an_earlier_writer, assert_pair_rule,
     contested_publish_genesis_accounts, pending_leg_genesis_accounts,
     publish_beside_spend_genesis_accounts,
 };
@@ -183,6 +185,10 @@ pub use route_reshape::{
     merged_pair_genesis_accounts, merging_caller_genesis_accounts, merging_route_genesis_accounts,
     saturated_reshape_genesis_accounts, second_splitter_genesis_accounts,
     split_train_genesis_accounts,
+};
+pub use served_reads::{
+    a_leg_reserving_a_read_vault_settles_before_the_read, served_reads_genesis_accounts,
+    two_members_reading_what_the_other_reserves_both_settle,
 };
 pub use straddler::{
     a_delivery_is_owed_when_its_deliverer_splits,

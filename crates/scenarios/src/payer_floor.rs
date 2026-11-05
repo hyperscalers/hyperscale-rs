@@ -13,6 +13,7 @@ use std::time::Duration;
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::package_key;
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_storage::RowState;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TimestampRange,
     TransactionDecision, TxHash, WeightedTimestamp,
@@ -742,6 +743,100 @@ pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableC
         0,
         "{context}: the transfer moved everything the publish left",
     );
+}
+
+/// A whole member placed behind an earlier writer of a key it reads is
+/// served from the block that settles the writer.
+///
+/// Two payers on one shard publish the same artifact, whose package cell
+/// the other shard keeps, so each publish runs whole on both shards. The
+/// package's shard is cut off from the payers' shard's state and
+/// certificates while the rival's publish stands there stated, holding
+/// the package cell, and the payer's publish commits there behind it.
+/// Once the cut lifts the package's shard reads the rival's accept and
+/// lets its row go, and the block whose fold does that makes the payer's
+/// publish head: that block serves the payers' shard its part, over the
+/// package cell as the rival left it.
+///
+/// # Panics
+///
+/// Panics if either publish misses its budget, if the payer's publish
+/// does not wait behind the rival's on the package's shard, if its part
+/// is served by any block but the one settling the rival's there, or if
+/// the payers' world is not conserved.
+pub fn a_whole_members_part_is_served_by_the_block_settling_an_earlier_writer<
+    C: FaultableCluster,
+>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let Contest {
+        rival_key,
+        rival,
+        payer_key,
+        payer,
+        neighbour,
+    } = contest();
+    committees_on_separate_hosts(c, PAYER_SHARD, REMOTE_SHARD);
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [rival.address(), payer.address(), neighbour.address()],
+        [],
+    );
+    let mut charges = Charges::default();
+    let artifact = artifact_kept_on(c, REMOTE_SHARD);
+    let cut = [
+        isolate_ec_intake(c, REMOTE_SHARD, PAYER_SHARD),
+        isolate_crossing_intake(c, REMOTE_SHARD, PAYER_SHARD),
+    ];
+    let first = build_publish_tx(&rival_key, artifact.clone(), validity_around(c.now()));
+    let first_hash = charges.submit(c, first);
+    assert!(
+        c.run_until(budget, |c| c
+            .chain_fate(PAYER_SHARD, first_hash)
+            .1
+            .is_some()
+            && c.chain_fate(REMOTE_SHARD, first_hash).0.is_some()),
+        "the rival's publish must commit on the package's shard and end on its own",
+    );
+    let publish = build_publish_tx(&payer_key, artifact, validity_around(c.now()));
+    let publish_hash = charges.submit(c, publish);
+    let waits = |c: &C| {
+        c.queued_rows(REMOTE_SHARD).is_some_and(|rows| {
+            rows.get(&publish_hash).is_some_and(|row| {
+                row.state == RowState::Pending && row.queued.is_some() && row.head.is_none()
+            })
+        })
+    };
+    assert!(
+        c.run_until(budget, waits),
+        "the payer's publish must wait behind the rival's on the package's shard",
+    );
+    assert!(
+        cut.iter().all(|handle| handle.fired() > 0),
+        "the certificates and readings must have been cut",
+    );
+    c.clear_drops();
+
+    let context = "a whole member behind an earlier writer";
+    assert!(
+        c.run_until(budget, |c| c
+            .tx_status(publish_hash)
+            .is_some_and(|status| status.is_final())),
+        "{context}: the payer's publish must end once the rival's has settled",
+    );
+    let settled = c
+        .chain_fate(REMOTE_SHARD, first_hash)
+        .1
+        .map(|(height, _)| height)
+        .expect("the rival's publish settled on the package's shard");
+    assert_eq!(
+        c.served_at(REMOTE_SHARD, PAYER_SHARD, publish_hash),
+        Some(settled),
+        "{context}: the payer's publish is served by the block settling the rival's",
+    );
+    world.assert_settles_within(c, &charges, budget, context);
 }
 
 /// Some storm artifact whose package cell `shard` keeps.

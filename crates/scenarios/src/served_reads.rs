@@ -1,0 +1,343 @@
+//! What a shared member reads of the vaults the members around it
+//! reserve, and from which block its part is served.
+//!
+//! A route through a venue on its payer's shard runs a core member there
+//! that reads the vault it presents as a badge and reserves the vault it
+//! withdraws from. Its part to the other venue, which shares its verdict,
+//! is served from the block that makes it head: by then every member
+//! placed ahead of it on those vaults has left the queue, and every tick
+//! below its place has settled what it took, so both venues read the
+//! vaults as one.
+
+use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_storage::RowState;
+use hyperscale_types::{
+    Ed25519PrivateKey, PrincipalAddr, ResourceAddr, ShardId, Transaction, TransactionDecision,
+    TransactionStatus, TxHash,
+};
+
+use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD};
+use crate::support::conservation::{Charges, World};
+use crate::support::query::held;
+use crate::support::tx::{
+    build_route_presenting_tx, build_sponsored_route_presenting_tx, build_swap_tx, validity_around,
+};
+use crate::support::wait::await_tx_terminal;
+use crate::support::{Cluster, FaultableCluster, epochs};
+use crate::venue::{
+    PROVIDER_FUNDING, SWAPPER_FUNDING, StockedVenue, accepted, grind_onto, reserve_cell,
+    stand_up_venue,
+};
+
+/// Where the vaults the members read and reserve sit, beside a venue.
+const HOME: ShardId = FIRST_VENUE_SHARD;
+
+/// The venue every core here shares with [`HOME`]'s.
+const AWAY: ShardId = SECOND_VENUE_SHARD;
+
+/// A venue on each, in the order they are stood up.
+const VENUES: [ShardId; 2] = [HOME, AWAY];
+
+/// What each of the cast swaps into stake units before any route.
+const UNITS_BOUGHT: u128 = 4 * ROUTE_INPUT;
+
+/// A provider on every venue's quarter, then the two holders on
+/// [`HOME`], each funded for what it does.
+#[must_use]
+pub fn served_reads_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut taken = Vec::new();
+    let mut accounts: Vec<(PrincipalAddr, u128)> = VENUES
+        .iter()
+        .map(|&venue| (grind_onto(venue, &mut taken).1, PROVIDER_FUNDING))
+        .collect();
+    accounts.extend(
+        cast(&mut taken)
+            .into_iter()
+            .map(|(_, account)| (account, SWAPPER_FUNDING)),
+    );
+    accounts
+}
+
+/// Two holders of stake units on [`HOME`], ground after the providers.
+fn cast(taken: &mut Vec<u8>) -> [(Ed25519PrivateKey, PrincipalAddr); 2] {
+    [grind_onto(HOME, taken), grind_onto(HOME, taken)]
+}
+
+/// Two stocked venues, the cast holding stake units, and the worlds
+/// every route reaches.
+struct Stage {
+    venues: Vec<StockedVenue>,
+    cast: [(Ed25519PrivateKey, PrincipalAddr); 2],
+    unit: ResourceAddr,
+    protocol_resource: World,
+    units: World,
+    charges: Charges,
+}
+
+impl Stage {
+    /// Stand every venue up, swap the cast into stake units on
+    /// [`HOME`]'s venue, and open the worlds.
+    fn stand_up<C: Cluster>(c: &mut C) -> Self {
+        assert!(
+            VENUES.iter().all(|&shard| c.serves_shard(shard)),
+            "the grown four-shard topology must seat every venue's quarter",
+        );
+        let mut taken = Vec::new();
+        let venues: Vec<StockedVenue> = VENUES
+            .iter()
+            .map(|&shard| stand_up_venue(c, shard, &mut taken))
+            .collect();
+        let cast = cast(&mut taken);
+        let unit = venues[0].unit;
+        for (key, account) in &cast {
+            accepted(
+                c,
+                build_swap_tx(
+                    key,
+                    *account,
+                    &venues[0].meta,
+                    *PROTOCOL_RESOURCE,
+                    UNITS_BOUGHT,
+                    0,
+                    validity_around(c.now()),
+                ),
+                "a local swap must hand its caller stake units",
+            );
+            assert!(
+                c.run_until(epochs(4), |c| held(c, account.address(), unit)
+                    >= ROUTE_INPUT),
+                "the swap's units must land before a route spends them",
+            );
+        }
+        let world = |c: &C, resource| {
+            World::open(
+                c,
+                resource,
+                cast.iter().map(|(_, account)| account.address()),
+                venues
+                    .iter()
+                    .map(|venue| reserve_cell(&venue.meta, resource)),
+            )
+        };
+        let protocol_resource = world(c, *PROTOCOL_RESOURCE);
+        let units = world(c, unit);
+        Self {
+            venues,
+            cast,
+            unit,
+            protocol_resource,
+            units,
+            charges: Charges::default(),
+        }
+    }
+
+    /// Submit `tx`, owing its price.
+    fn submit<C: Cluster>(&mut self, c: &mut C, tx: Transaction) -> TxHash {
+        self.charges.submit(c, tx)
+    }
+
+    /// Hold both worlds to settling, `context` naming what ran.
+    fn assert_conserved<C: Cluster>(self, c: &mut C, context: &str) {
+        self.protocol_resource
+            .assert_settles_within(c, &self.charges, epochs(8), context);
+        self.units
+            .assert_settles_within(c, &Charges::default(), epochs(8), context);
+    }
+}
+
+/// Whether `tx` stands placed and head on `shard`, unnamed.
+fn heads<C: Cluster>(c: &C, shard: ShardId, tx: TxHash) -> bool {
+    c.queued_rows(shard).is_some_and(|rows| {
+        rows.get(&tx).is_some_and(|row| {
+            row.state == RowState::Pending && row.queued.is_some() && row.head.is_some()
+        })
+    })
+}
+
+/// Whether `tx` stands placed on `shard` and waits there, not head.
+fn waits<C: Cluster>(c: &C, shard: ShardId, tx: TxHash) -> bool {
+    c.queued_rows(shard).is_some_and(|rows| {
+        rows.get(&tx).is_some_and(|row| {
+            row.state == RowState::Pending && row.queued.is_some() && row.head.is_none()
+        })
+    })
+}
+
+/// Assert `tx` ends as `decision` within the budget.
+fn ends_as<C: Cluster>(c: &mut C, tx: TxHash, decision: TransactionDecision, context: &str) {
+    let status = await_tx_terminal(c, tx, epochs(8));
+    assert_eq!(
+        status,
+        Some(TransactionStatus::Completed(decision)),
+        "{context}",
+    );
+}
+
+/// Two members reading what the other reserves both settle, in the
+/// order they were placed.
+///
+/// Each of two holders on [`HOME`] trades its own units through
+/// [`HOME`]'s venue and [`AWAY`]'s, sponsored by the other, who presents
+/// its vault of units as a badge: the first route reads the second
+/// holder's vault and reserves the first's, the second reads the first's
+/// and reserves the second's. Both are payer cores on [`HOME`], placed at
+/// their commits. The first heads; the second's read meets the first's
+/// reservation, so it waits behind it, and heads only once the first has
+/// left. Each is served to [`AWAY`] from the block making it head there,
+/// over the vaults as everything ahead of it left them, so both venues
+/// run each over one reading and both accept.
+///
+/// # Panics
+///
+/// Panics if a venue or a swap misses its budget, if the first route
+/// does not stand head before the second is submitted, if either route
+/// does not accept, if the second is not served after the first, or if
+/// either side is not conserved.
+pub fn two_members_reading_what_the_other_reserves_both_settle<C: Cluster>(c: &mut C) {
+    let mut stage = Stage::stand_up(c);
+    let validity = validity_around(c.now());
+    let route = |stage: &Stage, sponsor: usize, trader: usize| {
+        let (sponsor_key, _) = &stage.cast[sponsor];
+        let (trader_key, trader) = &stage.cast[trader];
+        build_sponsored_route_presenting_tx(
+            sponsor_key,
+            trader_key,
+            *trader,
+            (&stage.venues[0].meta, &stage.venues[1].meta),
+            (stage.unit, ROUTE_INPUT),
+            Some(stage.unit),
+            validity,
+        )
+    };
+    let first = route(&stage, 1, 0);
+    let first = stage.submit(c, first);
+    assert!(
+        c.run_until(epochs(4), |c| heads(c, HOME, first)),
+        "the first route's payer core must stand head on its sponsor's shard",
+    );
+    let second = route(&stage, 0, 1);
+    let second = stage.submit(c, second);
+    ends_as(
+        c,
+        first,
+        TransactionDecision::Accept,
+        "the first route must accept",
+    );
+    ends_as(
+        c,
+        second,
+        TransactionDecision::Accept,
+        "the second route must accept once the first has left",
+    );
+    let served = |c: &C, tx| c.served_at(HOME, AWAY, tx);
+    assert!(
+        c.run_until(epochs(4), |c| served(c, first).is_some()
+            && served(c, second).is_some()),
+        "the away venue must hold both routes' parts",
+    );
+    assert!(
+        served(c, first) < served(c, second),
+        "the second is served from a later head than the first: {:?} against {:?}",
+        served(c, first),
+        served(c, second),
+    );
+    stage.assert_conserved(c, "two members reading what the other reserves");
+}
+
+/// A leg reserving a vault settles before a member that reads the vault
+/// heads, and the member reads what the leg left.
+///
+/// A holder on [`HOME`] swaps four fifths of its units into the protocol
+/// resource at [`AWAY`]'s venue: on [`HOME`] that swap is only a leg, its
+/// withdraw, which a line names to run, and whose tick the holder's
+/// committee certifies only once its execution votes, held back, flow
+/// again. A second route of the same holder, through [`HOME`]'s venue
+/// and [`AWAY`]'s, submitted while the leg stands in its tick, presents
+/// the holder's vault of units and withdraws half of what it held. Its core
+/// on [`HOME`] is placed behind the leg's hold and heads only once the
+/// leg has left its tick; its part to [`AWAY`] then serves the vault the
+/// leg left, short of the half: the withdraw is infeasible, the route
+/// is rejected, and both venues end it.
+///
+/// # Panics
+///
+/// Panics if a venue or a swap misses its budget, if the leg is not
+/// named before the read is submitted, if the leg does not accept, if
+/// the read completes anywhere or is served before the leg settles, or
+/// if either side is not conserved.
+pub fn a_leg_reserving_a_read_vault_settles_before_the_read<C: FaultableCluster>(c: &mut C) {
+    let mut stage = Stage::stand_up(c);
+    let holder = stage.cast[0].1;
+    let before = held(c, holder.address(), stage.unit);
+    let (taken, asked) = (before * 4 / 5, before / 2);
+    assert!(
+        before - taken < asked,
+        "the leg leaves less than the read asks"
+    );
+    let validity = validity_around(c.now());
+    let leg = build_swap_tx(
+        &stage.cast[0].0,
+        holder,
+        &stage.venues[1].meta,
+        stage.unit,
+        taken,
+        0,
+        validity,
+    );
+    // The holder's committee keeps its execution votes to itself until
+    // the read stands behind the leg, so the leg's tick certifies only
+    // once the read is placed.
+    let votes = c.drop_type_between_members(HOME, HOME, "execution.vote");
+    let leg = stage.submit(c, leg);
+    assert!(
+        c.run_until(epochs(4), |c| c.member_rows(HOME).is_some_and(|rows| {
+            matches!(rows.get(&leg), Some(RowState::InFlight { .. }))
+        })),
+        "the leg's withdraw must be named on the holder's shard",
+    );
+    let read = build_route_presenting_tx(
+        &stage.cast[0].0,
+        holder,
+        (&stage.venues[0].meta, &stage.venues[1].meta),
+        (stage.unit, asked),
+        validity,
+    );
+    let read = stage.submit(c, read);
+    assert!(
+        c.run_until(epochs(4), |c| waits(c, HOME, read)),
+        "the read must stand placed behind the leg on the holder's shard",
+    );
+    assert!(votes.fired() > 0, "the holder's votes must have been held");
+    c.clear_drops();
+    ends_as(c, leg, TransactionDecision::Accept, "the leg must accept");
+    ends_as(
+        c,
+        read,
+        TransactionDecision::Reject,
+        "the read must fail on what the leg left",
+    );
+    for venue in [HOME, AWAY] {
+        assert!(
+            c.run_until(epochs(4), |c| c.chain_fate(venue, read).1.is_some()),
+            "{venue:?} must end the read: {:?}",
+            c.chain_fate(venue, read),
+        );
+    }
+    assert!(
+        c.ran(HOME, read).iter().all(|ran| !ran.succeeded),
+        "the read must not complete where the holder's vault sits: {:?}",
+        c.ran(HOME, read),
+    );
+    let settled = c
+        .chain_fate(HOME, leg)
+        .1
+        .map(|(height, _)| height)
+        .expect("the leg settled on the holder's shard");
+    assert!(
+        c.served_at(HOME, AWAY, read)
+            .is_some_and(|at| at >= settled),
+        "the read is served once the leg has settled: served at {:?}, settled at {settled:?}",
+        c.served_at(HOME, AWAY, read),
+    );
+    stage.assert_conserved(c, "a leg reserving a read vault");
+}

@@ -283,6 +283,54 @@ impl BookRoute {
         self.run_scheduled(c, budget, label, Second::AfterTheRoute)
     }
 
+    /// [`run`](Self::run), with `fills` more local fills submitted one a
+    /// block of the book's shard after the route, so the ladder the route
+    /// reads moves under it every block until it heads.
+    ///
+    /// # Panics
+    ///
+    /// As [`run`](Self::run) does, and if a streamed fill does not
+    /// accept, or the book's shard commits no block within `budget`.
+    pub fn run_with_fills_every_block<C: Cluster>(
+        &mut self,
+        c: &mut C,
+        budget: Budget,
+        label: &str,
+        fills: usize,
+    ) -> RouteFill {
+        self.run_scheduled(c, budget, label, Second::EveryBlock(fills))
+    }
+
+    /// Submit `more` local fills, one each time the book's shard commits
+    /// a block, owing each to `charges`.
+    fn stream_fills<C: Cluster>(
+        (local_key, local): &(Ed25519PrivateKey, PrincipalAddr),
+        book: &InstanceMeta,
+        charges: &mut Charges,
+        c: &mut C,
+        budget: Budget,
+        more: usize,
+    ) -> Vec<TxHash> {
+        let mut streamed = Vec::with_capacity(more);
+        for at in 0..more {
+            let tip = c.committed_height(BOOK_SHARD);
+            assert!(
+                c.run_until(budget, |c| c.committed_height(BOOK_SHARD) > tip),
+                "the book's shard must commit a block for each streamed fill",
+            );
+            let fill = build_fill_asks_tx(
+                local_key,
+                *local,
+                book,
+                *PROTOCOL_RESOURCE,
+                LOCAL_FILL + 2 + u128::try_from(at).expect("a few fills"),
+                validity_around(c.now()),
+            );
+            streamed.push(charges.submit(c, fill));
+        }
+        streamed
+    }
+
     fn run_scheduled<C: Cluster>(
         &mut self,
         c: &mut C,
@@ -337,20 +385,19 @@ impl BookRoute {
             );
         }
         let beside = self.charges.submit(c, beside);
-        for (what, tx) in [
+        let mut submitted = vec![
             ("route", hash),
             ("fill before", before),
             ("fill beside", beside),
-        ] {
-            let status = await_tx_terminal(c, tx, budget);
-            assert!(
-                matches!(
-                    status,
-                    Some(TransactionStatus::Completed(TransactionDecision::Accept))
-                ),
-                "{label}: the {what} must accept; status = {status:?}",
+        ];
+        if let Second::EveryBlock(more) = second {
+            submitted.extend(
+                Self::stream_fills(&self.local, &self.book, &mut self.charges, c, budget, more)
+                    .into_iter()
+                    .map(|tx| ("streamed fill", tx)),
             );
         }
+        accept_all(c, &submitted, budget, label);
 
         // The venue's member shares the core's verdict, so the book's
         // shard serves it from the block that makes the book's member
@@ -706,6 +753,21 @@ pub fn a_stalled_venue_aborts_its_route_at_the_window<C: FaultableCluster>(c: &m
     route.assert_conserved(c, epochs(12));
 }
 
+/// Assert each of `submitted`, named by what it is, accepts within
+/// `budget`.
+fn accept_all<C: Cluster>(c: &mut C, submitted: &[(&str, TxHash)], budget: Budget, label: &str) {
+    for &(what, tx) in submitted {
+        let status = await_tx_terminal(c, tx, budget);
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "{label}: the {what} must accept; status = {status:?}",
+        );
+    }
+}
+
 /// When a route's second local fill is submitted.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Second {
@@ -713,6 +775,9 @@ enum Second {
     Beside,
     /// Once the book's shard has committed the route.
     AfterTheRoute,
+    /// With the route, and then this many more, one a block of the
+    /// book's shard.
+    EveryBlock(usize),
 }
 
 /// The book's whole ladder as a declared interval, cut at `cap`.

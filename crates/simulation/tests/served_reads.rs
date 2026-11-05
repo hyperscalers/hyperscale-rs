@@ -13,12 +13,16 @@ mod support;
 
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::{
-    ScenarioConfig, a_cycle_through_a_payer_core_aborts_at_the_window,
+    BookRoute, ScenarioConfig, a_cycle_through_a_payer_core_aborts_at_the_window,
     a_hot_venue_runs_every_swap_where_it_commits,
+    a_leg_reserving_a_read_vault_settles_before_the_read,
     a_route_whose_venue_never_commits_frees_the_ladder,
-    a_stalled_venue_aborts_its_route_at_the_window, book_route_genesis_accounts,
-    departing_venue_split_bytes, epochs, payer_cycle_genesis_accounts,
-    sponsored_routes_crossed_through_their_legs_abort_at_the_window, venue_genesis_accounts,
+    a_stalled_venue_aborts_its_route_at_the_window,
+    a_whole_members_part_is_served_by_the_block_settling_an_earlier_writer,
+    book_route_genesis_accounts, contested_publish_genesis_accounts, departing_venue_split_bytes,
+    epochs, payer_cycle_genesis_accounts, served_reads_genesis_accounts,
+    sponsored_routes_crossed_through_their_legs_abort_at_the_window,
+    two_members_reading_what_the_other_reserves_both_settle, venue_genesis_accounts,
 };
 use support::{SimCluster, sim_seed};
 
@@ -111,4 +115,72 @@ fn a_hot_venue_names_every_swap_once_it_is_ready() {
         GenesisPackages::with_fixtures(),
     );
     a_hot_venue_runs_every_swap_where_it_commits(&mut cluster, epochs(40));
+}
+
+/// A venue on three quarters and two holders of stake units beside the
+/// first, every committee on hosts of its own.
+fn served_reads_cluster(seed: u64) -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            shard_size: 4,
+            vnodes_per_host: 1,
+            pool_surplus: 14,
+            num_shards: 4,
+            split_bytes: u64::MAX,
+            latency: std::time::Duration::from_millis(150),
+        },
+        seed,
+        &served_reads_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
+/// Two members each reading the vault the other reserves settle in the
+/// order they were placed, each served from its own head.
+#[test]
+fn two_members_reading_what_the_other_reserves_both_settle_sim() {
+    let mut cluster = served_reads_cluster(sim_seed(42));
+    two_members_reading_what_the_other_reserves_both_settle(&mut cluster);
+}
+
+/// A member reading a vault a leg reserves heads once the leg settles,
+/// and reads what the leg left.
+#[test]
+fn a_leg_reserving_a_read_vault_settles_before_the_read_sim() {
+    let mut cluster = served_reads_cluster(sim_seed(42));
+    cluster.run_faultable(a_leg_reserving_a_read_vault_settles_before_the_read);
+}
+
+/// A whole member behind an earlier writer is served from the block that
+/// settles the writer. Dedicated hosts, so the cut has a road to sit on.
+#[test]
+fn a_whole_members_part_is_served_by_the_block_settling_an_earlier_writer_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            shard_size: 4,
+            vnodes_per_host: 1,
+            pool_surplus: 4,
+            num_shards: 2,
+            split_bytes: u64::MAX,
+            latency: std::time::Duration::from_millis(150),
+        },
+        sim_seed(42),
+        &contested_publish_genesis_accounts(),
+    );
+    cluster.run_faultable(|c| {
+        a_whole_members_part_is_served_by_the_block_settling_an_earlier_writer(c, epochs(16));
+    });
+}
+
+/// Local fills streaming onto the book one a block while a route waits
+/// on it: the route accepts within its budget, at the closed form over
+/// the ladder the block making it head left.
+#[test]
+fn a_route_is_served_on_a_book_filled_every_block() {
+    let mut cluster = book_route_cluster(sim_seed(42));
+    cluster.run_faultable(|c| {
+        let mut route = BookRoute::stand_up(c);
+        let _ = route.run_with_fills_every_block(c, epochs(12), "a book filled every block", 6);
+        route.assert_conserved(c, epochs(12));
+    });
 }
