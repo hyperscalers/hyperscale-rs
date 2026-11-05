@@ -24,15 +24,16 @@ use hyperscale_storage::{
     MemberIndex, MemberRow, QueueHolds, RowState, member_row_leaf, seat_leaf,
 };
 use hyperscale_types::{
-    AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, Decision,
-    DeclaredKey, DiscardCause, Evidence, Formed, Hears, Holds, Inclusion, Joins,
-    MAX_STAGED_RECEIPT_BYTES, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_STAGED_BYTES, MemberTerms, Mode,
-    ModeKind, NAMING_WINDOW, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie,
-    SiblingView, Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction,
-    TxHash, Value, WeightedTimestamp, Window, compatible, decide, is_protocol_vault, pins_of,
-    staged_yes_bound, tick_manifest_admits_block, tick_manifest_admits_members, value_of,
-    verdict_leaf,
+    AbortCharge, Anchor, BlockHeight, Crossings, Deadline, Decision, DeclaredKey, DiscardCause,
+    Evidence, Formed, Hears, Holds, Inclusion, Joins, MAX_STAGED_RECEIPT_BYTES,
+    MAX_TICK_LINES_PER_BLOCK, MAX_TICK_STAGED_BYTES, MemberTerms, Mode, NAMING_WINDOW, Pin, Pins,
+    PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, SiblingView, Source,
+    StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash, Value,
+    WeightedTimestamp, Window, decide, is_protocol_vault, pins_of, staged_yes_bound,
+    tick_manifest_admits_block, tick_manifest_admits_members, value_of, verdict_leaf,
 };
+#[cfg(test)]
+use hyperscale_types::{Address, CollectionId, ModeKind, compatible};
 use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
 
@@ -134,7 +135,9 @@ pub fn divided_requirements(
     requirements
 }
 
-/// How unresolved legs are reaching the cells they claimed.
+/// How unresolved legs are reaching the cells they claimed: the
+/// scheduling relation over declared keys, which `Modes::refuses`
+/// holds over pins and is checked against.
 ///
 /// A cross-shard leg's local writes are provisional until its tick
 /// resolves. Whether that stops a later transaction depends entirely on
@@ -168,6 +171,7 @@ pub fn divided_requirements(
 /// over entries, and no point cell is an entry. Overlap alone decides
 /// nothing; what decides is whether the modes on the two sides can be in
 /// flight together.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct ProvisionalCells {
     cells: BTreeMap<SubstateKey, BTreeSet<ModeKind>>,
@@ -180,6 +184,7 @@ pub(crate) struct ProvisionalCells {
     debited: BTreeSet<SubstateKey>,
 }
 
+#[cfg(test)]
 impl ProvisionalCells {
     /// Record how one unresolved leg declared it would reach each cell.
     pub fn claim(&mut self, declared: &[(DeclaredKey, Mode)]) {
@@ -1703,34 +1708,47 @@ pub struct Contention {
     pub holder: TxHash,
 }
 
+/// Whether two members pinning `one` and `other` on one shard conflict
+/// there both ways: on some key both pin, either one's modes refuse the
+/// other's. Both are ascending by key, as [`pins_of`] gives them.
+fn pins_conflict(one: &[Pin], other: &[Pin]) -> bool {
+    one.iter().any(|pin| {
+        other
+            .binary_search_by_key(&pin.key, |theirs| theirs.key)
+            .is_ok_and(|at| pin.modes.conflicts(other[at].modes))
+    })
+}
+
 /// A core member's holds, as a refusal reads them.
 struct CoreHolder<'r> {
     tx: TxHash,
     holds: &'r Holds,
-    cells: ProvisionalCells,
+    /// Its pins on the shard asking.
+    pins: Pins,
     awaits: &'r Reach,
 }
 
 impl<'r> CoreHolder<'r> {
-    /// A holder over `holds`, or `None` where it holds nothing.
-    fn of(tx: TxHash, holds: &'r Holds, awaits: &'r Reach) -> Option<Self> {
+    /// A holder over `holds` on `local`, or `None` where it holds
+    /// nothing.
+    fn of(tx: TxHash, holds: &'r Holds, awaits: &'r Reach, local: ShardId) -> Option<Self> {
         if holds.is_empty() {
             return None;
         }
-        let mut cells = ProvisionalCells::default();
-        cells.claim(holds);
         Some(Self {
             tx,
             holds,
-            cells,
+            pins: pins_of(holds, local),
             awaits,
         })
     }
 
-    /// Whether these holds refuse `waiting`, which awaits a shard this
-    /// holder awaits too.
-    fn refuses(&self, waiting: &Judged<'_>) -> bool {
-        self.shared(waiting).next().is_some() && self.cells.blocks(waiting.declared)
+    /// Whether these holds conflict here with `waiting`, which pins
+    /// `pinned` here and awaits a shard this holder awaits too: the
+    /// relation the queue reads between two abortable members, over the
+    /// keys this shard owns.
+    fn refuses(&self, waiting: &Judged<'_>, pinned: &[Pin]) -> bool {
+        self.shared(waiting).next().is_some() && pins_conflict(&self.pins, pinned)
     }
 
     /// The shards both this holder and `waiting` await: where each has a
@@ -1743,22 +1761,24 @@ impl<'r> CoreHolder<'r> {
     }
 }
 
-/// Every core member of `rows` in flight, with what it holds.
+/// Every core member of `rows` in flight, with what it holds, its pins
+/// read on `local`.
 fn in_flight_holders<'r>(
     rows: impl Iterator<Item = &'r MemberRow>,
+    local: ShardId,
 ) -> impl Iterator<Item = CoreHolder<'r>> {
     rows.filter(|row| row.state.seated())
-        .filter_map(|row| CoreHolder::of(row.tx, &row.holds, &row.awaits))
+        .filter_map(move |row| CoreHolder::of(row.tx, &row.holds, &row.awaits, local))
 }
 
 /// The contentions a block naming `lines` over `rows` leaves standing.
 ///
 /// Every core member short of its deadline that is ready at `anchor` and
-/// that no line names, paired with each core member whose holds refuse
-/// it and which awaits a shard it awaits too: one in flight on its
-/// row, or named by `lines` themselves. `rows` is the family before the
-/// lines, so a member they name is still `Pending` there and counts
-/// once, as a holder.
+/// that no line names, paired with each core member whose holds conflict
+/// with it on this shard's keys and which awaits a shard it awaits too:
+/// one in flight on its row, or named by `lines` themselves. `rows` is
+/// the family before the lines, so a member they name is still `Pending`
+/// there and counts once, as a holder.
 #[must_use]
 pub fn contentions(
     rows: &MemberIndex,
@@ -1766,6 +1786,7 @@ pub fn contentions(
     anchor: WeightedTimestamp,
     inputs: &dyn CommittedInputs,
 ) -> Vec<Contention> {
+    let local = rows.shard();
     let named: BTreeSet<TxHash> = lines
         .iter()
         .filter_map(|line| match line {
@@ -1780,7 +1801,7 @@ pub fn contentions(
             holds,
             awaits,
             ..
-        } => CoreHolder::of(*tx, holds, awaits),
+        } => CoreHolder::of(*tx, holds, awaits, local),
         TickLine::Member {
             settlement: Settlement::Alone | Settlement::Awaited,
             ..
@@ -1789,7 +1810,7 @@ pub fn contentions(
         | TickLine::Discard { .. }
         | TickLine::End { .. } => None,
     });
-    let holders: Vec<CoreHolder<'_>> = in_flight_holders(rows.members.values())
+    let holders: Vec<CoreHolder<'_>> = in_flight_holders(rows.members.values(), local)
         .chain(in_lines)
         .collect();
     if holders.is_empty() {
@@ -1805,9 +1826,10 @@ pub fn contentions(
         if waiting.settlement != Settlement::Shared {
             continue;
         }
+        let pinned = pins_of(waiting.declared, local);
         let refusing: Vec<&CoreHolder<'_>> = holders
             .iter()
-            .filter(|holder| holder.refuses(&waiting))
+            .filter(|holder| holder.refuses(&waiting, &pinned))
             .collect();
         if refusing.is_empty() || !ready(row.tx, &waiting, inputs) {
             continue;
@@ -1824,16 +1846,19 @@ pub fn contentions(
 /// claims, prove the victims of a hold cycle at `anchor`.
 ///
 /// A cycle is two core members each shard holds in the other's order:
-/// here, `holder` is in flight and its holds refuse `waiting`, which is
-/// pending; on a counterpart both await, the claims at one anchor there
-/// read `waiting` seated and `holder` committed, unseated and with no
-/// verdict leaf. Holds are the whole transaction's declared set, and
-/// `waiting`'s refuses `holder`'s in turn, so the counterpart's seat of
-/// `waiting` refuses `holder` there just as `holder` refuses `waiting`
-/// here, and neither certificate the other awaits can come. Nor can the
+/// here, `holder` is in flight and its holds conflict with `waiting`,
+/// which is pending, on this shard's keys; on a counterpart both await,
+/// the two conflict on that shard's keys, and the claims at one anchor
+/// there read `waiting` seated and `holder` committed, unseated and with
+/// no verdict leaf. The queue reads the same relation, both ways between
+/// two members the earlier of which still waits, so `holder` stands
+/// behind `waiting` there just as `waiting` stands behind `holder` here,
+/// and neither certificate the other awaits can come. Nor can the
 /// reading go stale: the counterpart releases `waiting` only on this
 /// shard's verdict, which a pending member has not given, so `holder`
-/// stays refused there for as long as this shard's own rows stand.
+/// stays refused there for as long as this shard's own rows stand. Where
+/// `waiting` is in flight on the counterpart, which reads it one way,
+/// the counterpart's leg over-reads: a rare spurious unnamed abort.
 ///
 /// A reading anchored at or past `holder`'s deadline proves nothing: by
 /// then the counterpart may have aborted `holder` where it waits, which
@@ -1872,7 +1897,8 @@ pub fn wounded(
 /// as the victim of a hold cycle.
 ///
 /// Whether, at one anchor there, `waiting` is seated and `holder`, which
-/// refuses it here, is committed and unseated with no verdict leaf. See
+/// conflicts with it here, is committed and unseated with no verdict
+/// leaf. See
 /// [`wounded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeatQuestion {
@@ -1933,19 +1959,22 @@ impl SeatQuestion {
 /// The seat questions the pending core members of `rows` put.
 ///
 /// One for each pending core member short of its deadline at `anchor`
-/// and each core member in flight that refuses it, is earlier in hash
-/// order, and awaits a counterpart it awaits, per counterpart. The
-/// refusal is asked both ways: the waiting member's seat on the
-/// counterpart must refuse the holder there too, or an unseated holder
-/// would read as a cycle when it was only not yet ready. A holder past
-/// its own deadline asks nothing: the counterpart where it waits aborts
-/// it, which breaks the cycle with no victim here.
+/// and each core member in flight that conflicts with it on this shard's
+/// keys, is earlier in hash order, and awaits a counterpart it awaits,
+/// per such counterpart on whose keys the two conflict too: otherwise an
+/// unseated holder would read as a cycle when it was only not yet ready.
+/// Both legs read the relation the queue reads between two abortable
+/// members, over the pins each shard owns. A holder past its own
+/// deadline asks nothing: the counterpart where it waits aborts it,
+/// which breaks the cycle with no victim here.
 #[must_use]
 pub fn seat_questions(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<SeatQuestion> {
+    let local = rows.shard();
     let holders: Vec<CoreHolder<'_>> = in_flight_holders(
         rows.members
             .values()
             .filter(|row| !row.deadline.passed(anchor)),
+        local,
     )
     .collect();
     if holders.is_empty() {
@@ -1960,24 +1989,25 @@ pub fn seat_questions(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<Seat
         if waiting.settlement != Settlement::Shared {
             continue;
         }
-        let mut seat: Option<ProvisionalCells> = None;
+        let pinned = pins_of(waiting.declared, local);
+        // The waiting member's pins on each counterpart, taken once.
+        let mut seats: BTreeMap<ShardId, Pins> = BTreeMap::new();
         for holder in holders
             .iter()
-            .filter(|holder| holder.tx < row.tx && holder.refuses(&waiting))
+            .filter(|holder| holder.tx < row.tx && holder.refuses(&waiting, &pinned))
         {
-            let seat = seat.get_or_insert_with(|| {
-                let mut cells = ProvisionalCells::default();
-                cells.claim(waiting.declared);
-                cells
-            });
-            if !seat.blocks(holder.holds) {
-                continue;
+            for shard in holder.shared(&waiting) {
+                let seat = seats
+                    .entry(shard)
+                    .or_insert_with(|| pins_of(waiting.declared, shard));
+                if pins_conflict(seat, &pins_of(holder.holds, shard)) {
+                    questions.push(SeatQuestion {
+                        shard,
+                        waiting: row.tx,
+                        holder: holder.tx,
+                    });
+                }
             }
-            questions.extend(holder.shared(&waiting).map(|shard| SeatQuestion {
-                shard,
-                waiting: row.tx,
-                holder: holder.tx,
-            }));
         }
     }
     questions
@@ -3909,7 +3939,7 @@ mod tests {
 
         let standing = holding(stated(false), false);
         assert_eq!(
-            in_flight_holders(standing.members.values())
+            in_flight_holders(standing.members.values(), shard)
                 .map(|holder| holder.tx)
                 .collect::<Vec<_>>(),
             vec![tx(1)],
@@ -5159,11 +5189,27 @@ mod tests {
         );
     }
 
+    /// A write of a cell under `PEER`'s prefix and of one outside it, so
+    /// two members declaring it contend on the shard asking and on `PEER`
+    /// alike.
+    fn spanning_write() -> Vec<(DeclaredKey, Mode)> {
+        vec![(cell(1, 1), WRITE), (cell(0x91, 1), WRITE)]
+    }
+
     /// A family of one core member in flight holding `declared`, and one
     /// pending beside it that declares the same and waits on `PEER`'s
     /// bundle.
     fn held_beside_pending(held: u8, waiting: u8, declared: &[(DeclaredKey, Mode)]) -> MemberIndex {
-        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        held_beside_pending_on(ShardId::ROOT, (held, declared), (waiting, declared))
+    }
+
+    /// [`held_beside_pending`] on `local`, each member declaring its own.
+    fn held_beside_pending_on(
+        local: ShardId,
+        (held, holds): (u8, &[(DeclaredKey, Mode)]),
+        (waiting, declared): (u8, &[(DeclaredKey, Mode)]),
+    ) -> MemberIndex {
+        let mut rows = MemberIndex::empty(local);
         let in_flight = MemberRow {
             tx: tx(held),
             deadline: far(),
@@ -5174,7 +5220,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
             },
-            holds: Capped::new(declared.to_vec()).expect("within the cap"),
+            holds: Capped::new(holds.to_vec()).expect("within the cap"),
             reach: Capped::from_array([PEER]),
             awaits: Capped::from_array([PEER]),
             charge: CHARGE,
@@ -5247,7 +5293,7 @@ mod tests {
     /// the whole reading.
     #[test]
     fn the_later_member_of_a_proven_hold_cycle_is_aborted() {
-        let declared = vec![(cell(1, 1), WRITE)];
+        let declared = spanning_write();
         let family = |held: u8, waiting: u8| held_beside_pending(held, waiting, &declared);
         let crossed = crossed_reading;
         let reading = seat_reading;
@@ -5319,7 +5365,7 @@ mod tests {
     /// leg, it holds no seat there to read.
     #[test]
     fn a_reading_wounds_nobody_through_a_lapsed_or_leg_holder() {
-        let declared = vec![(cell(1, 1), WRITE)];
+        let declared = spanning_write();
         let claims = [crossed_reading(1, 2)];
         let lapse = Deadline::of(ms(0));
 
@@ -5382,7 +5428,7 @@ mod tests {
     /// proves nothing either way.
     #[test]
     fn a_holder_standing_beside_a_verdict_leaf_proves_no_cycle() {
-        let declared = vec![(cell(1, 1), WRITE)];
+        let declared = spanning_write();
         let rows = held_beside_pending(1, 2, &declared);
         let (seat, row, unseated, leaf) = (
             seat_leaf(PEER, tx(2)),
@@ -5419,6 +5465,71 @@ mod tests {
             wounded(&rows, ms(0), &[unread, leaf_alone]),
             BTreeSet::from([tx(2)]),
             "and the leaf read in another claim at the same anchor completes it",
+        );
+    }
+
+    /// The crossed pair, asked about on the holder's shard: H1 in flight
+    /// writes a key W reads here, and on `PEER` W reserves a vault H1
+    /// debits, which the queue there reads both ways while W waits. The
+    /// question is put on `PEER`'s pins of each, and the reading of W
+    /// seated there and H1 unseated wounds W.
+    #[test]
+    fn a_crossed_reserve_and_debit_pair_is_wounded() {
+        let here = ShardId::leaf(1, 0);
+        let (key, vault) = (cell(1, 1), cell(0x91, 1));
+        let rows = held_beside_pending_on(
+            here,
+            (1, &[(key, WRITE), (vault, DEBIT)]),
+            (2, &[(key, Mode::Read), (vault, RESERVE)]),
+        );
+        assert_eq!(
+            seat_questions(&rows, ms(0)),
+            vec![SeatQuestion {
+                shard: PEER,
+                waiting: tx(2),
+                holder: tx(1),
+            }],
+        );
+        assert_eq!(
+            wounded(&rows, ms(0), &[crossed_reading(1, 2)]),
+            BTreeSet::from([tx(2)]),
+        );
+
+        // Reading the vault on both sides, the two conflict here alone, so
+        // an unseated H1 on `PEER` is only not yet ready there.
+        let reading = held_beside_pending_on(
+            here,
+            (1, &[(key, WRITE), (vault, Mode::Read)]),
+            (2, &[(key, Mode::Read), (vault, Mode::Read)]),
+        );
+        assert!(seat_questions(&reading, ms(0)).is_empty());
+    }
+
+    /// A pair that conflicts only on a counterpart's keys asks nothing
+    /// here: the holder stands ahead of the waiting member on no key this
+    /// shard owns, so the waiting member is not kept out here, and no
+    /// reading there makes the two a cycle. The contention count skips it
+    /// too.
+    #[test]
+    fn a_pair_contending_only_on_another_shards_keys_is_not_wounded() {
+        let here = ShardId::leaf(1, 0);
+        let declared = [(cell(1, 1), Mode::Read), (cell(0x91, 1), WRITE)];
+        let rows = held_beside_pending_on(here, (1, &declared), (2, &declared));
+        assert!(seat_questions(&rows, ms(0)).is_empty());
+        assert!(wounded(&rows, ms(0), &[crossed_reading(1, 2)]).is_empty());
+        let mut held = Held::default();
+        held.engaged.insert((PEER, tx(2)));
+        assert!(contentions(&rows, &[], ms(0), &held).is_empty());
+
+        let local_write = [(cell(1, 1), WRITE), (cell(0x91, 1), WRITE)];
+        let contending = held_beside_pending_on(here, (1, &local_write), (2, &local_write));
+        assert_eq!(
+            contentions(&contending, &[], ms(0), &held),
+            vec![Contention {
+                waiting: tx(2),
+                holder: tx(1),
+            }],
+            "the same pair contending here is counted",
         );
     }
 
@@ -6757,7 +6868,7 @@ mod tests {
             .collect();
         assert!(written.contains(&row) && written.contains(&leaf) && !written.contains(&unseated));
 
-        let declared = vec![(cell(1, 1), WRITE)];
+        let declared = spanning_write();
         let rows = held_beside_pending(1, 2, &declared);
         let leaves: Vec<SubstateKey> = written
             .into_iter()
@@ -7369,6 +7480,122 @@ mod tests {
                     ..block(4)
                 });
                 assert!(!rows.members.contains_key(&tx(core)), "on {shard:?}");
+            }
+        }
+
+        /// The crossed pair: H1 and W span A and C, H1 the earlier hash.
+        /// On A, H1 writes a key W reads, H1 placed first; on C, W
+        /// reserves a vault H1 debits, W placed first. Each is named where
+        /// it sits first, and the pair ends well short of either deadline
+        /// and of C's window:
+        ///
+        /// - W named on C leaves its reservation in flight there, read one
+        ///   way, so H1 heads and runs on C beside it;
+        /// - W left unnamed at its head on C keeps H1 behind it both ways,
+        ///   and A's question about holder H1 and waiting W, read off C's
+        ///   committed seats, wounds W on A.
+        #[test]
+        fn a_crossed_reserve_and_debit_pair_ends_before_either_deadline() {
+            const H1: u8 = 1;
+            const W: u8 = 2;
+            const A: ShardId = ShardId::leaf(1, 0);
+            const C: ShardId = PEER;
+            assert!(tx(H1) < tx(W));
+            let (k_a, vault) = (cell(0x01, 1), cell(0x91, 1));
+            let deadline = Deadline::of(clock(1).plus(MAX_VALIDITY_RANGE));
+            let spanning = |there: ShardId, engages: &[ShardId], declared| MemberTerms {
+                reach: Capped::from_array([there]),
+                awaits: Capped::from_array([there]),
+                ..leg(declared, engages)
+            };
+            let h1 = |there| spanning(there, &[], vec![(k_a, WRITE), (vault, DEBIT)]);
+            let w = |there, engages: &[ShardId]| {
+                spanning(there, engages, vec![(k_a, READ), (vault, RESERVE)])
+            };
+            let on = |shard: ShardId, height: u64| MemberInputs {
+                shard,
+                ..block(height)
+            };
+            // C folded as its store writes it, so its seats can be read.
+            let fold = |rows: &mut MemberIndex,
+                        written: &mut BTreeSet<SubstateKey>,
+                        inputs: &MemberInputs| {
+                for (key, change) in member_writes(&*rows, inputs) {
+                    let leaf = entry_leaf_key(&ProtocolHasher, key);
+                    if change.is_some() {
+                        written.insert(leaf);
+                    } else {
+                        written.remove(&leaf);
+                    }
+                }
+                rows.advance(inputs);
+            };
+
+            for w_named_on_c in [true, false] {
+                let w_on_c = w(A, if w_named_on_c { &[] } else { &[A] });
+                let mut a = MemberIndex::empty(A);
+                let mut c = MemberIndex::empty(C);
+                let mut written = BTreeSet::new();
+                for (rows, first, second, on_shard) in [
+                    (&mut a, (H1, h1(C)), (W, w(C, &[])), A),
+                    (&mut c, (W, w_on_c.clone()), (H1, h1(A)), C),
+                ] {
+                    for (height, (seed, terms)) in [(1, first), (2, second)] {
+                        let mut next = on(on_shard, height);
+                        commit(&mut next, seed, &terms, deadline);
+                        if on_shard == C {
+                            fold(rows, &mut written, &next);
+                        } else {
+                            rows.advance(&next);
+                        }
+                    }
+                }
+                assert_eq!(a.members[&tx(W)].head, None, "W behind H1 on A");
+                assert_eq!(c.members[&tx(H1)].head, None, "H1 behind W on C");
+                assert_eq!(named(&a, clock(3)).get(&tx(H1)), RUNS);
+                a.advance(&with_lines(on(A, 3), vec![run(H1, &h1(C))]));
+
+                if w_named_on_c {
+                    assert_eq!(named(&c, clock(3)).get(&tx(W)), RUNS);
+                    fold(
+                        &mut c,
+                        &mut written,
+                        &with_lines(on(C, 3), vec![run(W, &w_on_c)]),
+                    );
+                    assert!(c.members[&tx(H1)].head.is_some(), "beside W in flight");
+                    assert_eq!(named(&c, clock(4)).get(&tx(H1)), RUNS);
+                    continue;
+                }
+
+                assert_eq!(named(&c, clock(3)).get(&tx(W)), None, "unready on C");
+                fold(&mut c, &mut written, &on(C, 3));
+                let question = SeatQuestion {
+                    shard: C,
+                    waiting: tx(W),
+                    holder: tx(H1),
+                };
+                assert_eq!(seat_questions(&a, clock(4)), vec![question]);
+                let leaves: Vec<SubstateKey> = question
+                    .keys()
+                    .into_iter()
+                    .filter(|key| written.contains(key))
+                    .collect();
+                let reading = proven_claim(C, 3, &leaves, &question.keys());
+                let victims = wounded(&a, clock(4), from_ref(&reading));
+                assert_eq!(victims, BTreeSet::from([tx(W)]));
+                let live = |_, _| Evidence::Live { terminating: false };
+                let (lines, _) =
+                    lines_and_missing(&a, clock(4), &Held::default(), &live, false, &victims);
+                assert!(
+                    lines.iter().any(|line| matches!(
+                        line,
+                        TickLine::Member { tx: named, joins: Joins::Aborted, .. }
+                            if *named == tx(W)
+                    )),
+                    "W is aborted unnamed on A: {lines:?}",
+                );
+                let window = c.members[&tx(W)].blocked_at.expect("W refuses H1 on C");
+                assert!(clock(4) < window.plus(NAMING_WINDOW) && clock(4) < deadline.at());
             }
         }
 
