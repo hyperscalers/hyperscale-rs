@@ -760,25 +760,34 @@ impl StateClaim {
     /// absence its absence, and a held value must hash to the presence
     /// the proof reconstructs for its key.
     ///
+    /// The proof must also be the one its own keys restrict it to, so a
+    /// claim admitted here can be cut by key wherever a block carrying it
+    /// needs to: [`Self::restrict`] keeps a whole claim without asking,
+    /// so the proof's own `restrict` is asked directly.
+    ///
     /// # Errors
     ///
     /// As [`StateProofError`] lists them: a proof that does not decode,
     /// misses or exceeds the claim's keys, or reconstructs another root,
-    /// and [`StateProofError::ReadingMismatch`] for a reading the proof
-    /// does not bear out.
+    /// [`StateProofError::ReadingMismatch`] for a reading the proof does
+    /// not bear out, and [`StateProofError::Noncanonical`] for a proof
+    /// its keys do not restrict it to.
     pub fn verify(&self) -> Result<(), StateProofError> {
+        let keys = self.keys();
         let proven =
             self.proof
-                .exact_inclusions(self.anchor.state_root, self.anchor.shard, &self.keys())?;
-        if proven
+                .exact_inclusions(self.anchor.state_root, self.anchor.shard, &keys)?;
+        if !proven
             .iter()
             .zip(self.cells.iter())
             .all(|((_, proved), (_, stated))| *proved == stated.inclusion())
         {
-            Ok(())
-        } else {
-            Err(StateProofError::ReadingMismatch)
+            return Err(StateProofError::ReadingMismatch);
         }
+        if self.proof.restrict(&keys).ok().as_ref() != Some(&self.proof) {
+            return Err(StateProofError::Noncanonical);
+        }
+        Ok(())
     }
 
     /// The cells this claim answers for.
@@ -1274,6 +1283,65 @@ mod tests {
         assert!(whole.restrict(|_| false).is_none());
         assert_eq!(whole.restrict(|_| true), Some(whole.clone()));
         assert!(piece.wire_weight() < whole.wire_weight());
+    }
+
+    /// A proof that bears out every reading and reconstructs the root,
+    /// but carries its empty siblings as explicit zero hashes, decodes
+    /// to the tree a fresh proof describes and is not that proof's
+    /// bytes. A cut of the claim would rebuild the fresh bytes, so the
+    /// claim is refused where it is verified.
+    #[test]
+    fn a_claim_whose_proof_does_not_restrict_to_itself_fails_verify() {
+        use hyperscale_jmt::MultiProof;
+
+        let (held, missing) = (test_key(1), test_key(2));
+        // A neighbour under the same owner puts a run of one-sided
+        // branches above the two, each with an empty sibling.
+        let neighbour = SubstateKey {
+            owner: held.owner,
+            local: LocalKey([0x81; 16]),
+        };
+        let claim = proven_claim(ShardId::ROOT, 3, &[held, neighbour], &[held, missing]);
+        assert_eq!(claim.verify(), Ok(()));
+
+        let bytes = claim.proof.as_bytes();
+        let decoded = MultiProof::decode(bytes).expect("a fixture proof decodes");
+        let empty = decoded
+            .siblings
+            .iter()
+            .filter(|sibling| **sibling == [0u8; 32])
+            .count();
+        assert!(empty > 0, "the fixture proof skips an empty sibling");
+        let count = decoded.siblings.len();
+        let bitmap = count.div_ceil(8);
+        let carried = (count - empty) * 32;
+        let at = bytes.len() - carried - bitmap;
+        let mut padded = bytes[..at].to_vec();
+        padded.extend(std::iter::repeat_n(0xFF_u8, bitmap));
+        if count % 8 != 0 {
+            let last = padded.len() - 1;
+            padded[last] = (1u8 << (count % 8)) - 1;
+        }
+        for sibling in &decoded.siblings {
+            padded.extend_from_slice(sibling);
+        }
+        assert_eq!(
+            MultiProof::decode(&padded).expect("the padded proof decodes"),
+            decoded,
+            "the same tree, other bytes"
+        );
+
+        let mut padding = claim;
+        padding.proof = MerkleInclusionProof::new(padded);
+        assert_eq!(
+            padding
+                .proof
+                .exact_inclusions(padding.anchor.state_root, ShardId::ROOT, &padding.keys())
+                .map(|inclusions| inclusions.len()),
+            Ok(2),
+            "it proves every reading"
+        );
+        assert_eq!(padding.verify(), Err(StateProofError::Noncanonical));
     }
 
     fn crossing(seed: u8) -> CrossingId {

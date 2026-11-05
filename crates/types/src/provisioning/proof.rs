@@ -72,6 +72,11 @@ pub enum StateProofError {
     /// A reading stated beside the proof is not what the proof says.
     #[error("state proof disagrees with the reading stated for a key")]
     ReadingMismatch,
+    /// The proof is not the one its own keys restrict it to: bytes a
+    /// fresh proof over those keys would not carry, which a cut of the
+    /// claim would then fail to keep.
+    #[error("state proof is not the proof its own keys restrict it to")]
+    Noncanonical,
 }
 
 /// A state proof read back against an anchor's root.
@@ -321,6 +326,8 @@ mod tests {
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
     use hyperscale_jmt::{Key as JmtKey, LeafValue, MemoryStore, NodeKey};
+    use proptest::collection::vec;
+    use proptest::prelude::*;
 
     use super::*;
     use crate::state_key::jmt_value_hash;
@@ -539,6 +546,69 @@ mod tests {
             MerkleInclusionProof::new(vec![0xff; 8]).restrict(&[held]),
             Err(StateProofError::Malformed)
         );
+    }
+
+    /// A key of a small space: four owners, two pairs sharing their
+    /// leading bits, and four local halves, so lookups end beside one
+    /// another at empty slots and at divergent leaves alike.
+    fn spaced((owner, local): (u8, u8)) -> SubstateKey {
+        let first = [0x10, 0x11, 0x90, 0x91][usize::from(owner % 4)];
+        SubstateKey {
+            owner: Address::new([first; 31], AddressClass::Component),
+            local: LocalKey([local % 4; 16]),
+        }
+    }
+
+    fn spaced_all(drawn: &[(u8, u8)]) -> Vec<SubstateKey> {
+        let mut keys: Vec<SubstateKey> = drawn.iter().copied().map(spaced).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    proptest! {
+        /// A proof that verifies over its keys, whether proven over them
+        /// at once or joined from two proofs over halves of them, is the
+        /// proof its keys restrict it to, and restricts to every
+        /// nonempty subset of them as a fresh proof over that subset
+        /// would read, byte for byte.
+        #[test]
+        fn a_verified_proof_restricts_to_every_nonempty_subset(
+            present in vec((0u8..4, 0u8..4), 1..8),
+            asked in vec((0u8..4, 0u8..4), 1..7),
+            split in any::<u8>(),
+        ) {
+            let present = spaced_all(&present);
+            let asked = spaced_all(&asked);
+            let (root, whole) = tree_and_proof(&present, &asked);
+            let at = usize::from(split) % asked.len();
+            let joined = if at == 0 {
+                whole.clone()
+            } else {
+                let (left, right) = asked.split_at(at);
+                MerkleInclusionProof::union([
+                    &tree_and_proof(&present, left).1,
+                    &tree_and_proof(&present, right).1,
+                ])
+                .expect("two proofs over one root join")
+            };
+            prop_assert_eq!(&joined, &whole);
+            prop_assert!(whole.exact_inclusions(root, ShardId::ROOT, &asked).is_ok());
+            prop_assert_eq!(whole.restrict(&asked), Ok(whole.clone()));
+            for mask in 1u32..(1 << asked.len()) {
+                let subset: Vec<SubstateKey> = asked
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, _)| mask & (1 << at) != 0)
+                    .map(|(_, key)| *key)
+                    .collect();
+                let cut = whole.restrict(&subset).expect("a verified proof restricts");
+                prop_assert_eq!(&cut, &tree_and_proof(&present, &subset).1);
+                prop_assert!(cut.exact_inclusions(root, ShardId::ROOT, &subset).is_ok());
+                let again = cut.restrict(&subset);
+                prop_assert_eq!(again.as_ref(), Ok(&cut));
+            }
+        }
     }
 
     #[test]

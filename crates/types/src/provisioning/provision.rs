@@ -444,7 +444,9 @@ impl Verify<&ProvisionContext> for Provision {
             .proof
             .inclusions(ctx.anchor.state_root, source_shard, &keys)
             .map_err(|error| match error {
-                StateProofError::Malformed => ProvisionVerifyError::MalformedProof,
+                StateProofError::Malformed | StateProofError::Noncanonical => {
+                    ProvisionVerifyError::MalformedProof
+                }
                 StateProofError::MissingClaim
                 | StateProofError::RootMismatch
                 | StateProofError::ExtraClaim

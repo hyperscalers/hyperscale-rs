@@ -319,19 +319,37 @@ pub(crate) fn within_the_cap(
 /// reading goes with the `Never`; one whose ends this chain both holds
 /// is read there for its other settlements too, and stays. A parent
 /// claim left reading nothing goes, and the read mark it raised with it.
-#[must_use]
+///
+/// The cut holds apart from every input naming reads. A remote claim
+/// loses only `Never` cells; a local one also loses the record keys of
+/// crossings whose remote `Never` it cut, and the `Never` cells of
+/// crossings with both ends here. An answer cell names no record, so it
+/// is no arrival, and hearing and the wound read only verdict, member
+/// row, committed marker and seat cells. A record key is an arrival, but
+/// no `Pending` row waits on a crossing its consumer answered `Never`:
+/// the consumer's row was fated before the answer was written, and a
+/// recommit within retention is refused, whichever shard the consumer's
+/// row now stands on.
+///
+/// # Errors
+///
+/// [`Unrestricted`] where a remote claim keeps some cells and its proof
+/// cannot be cut down to them. Every ingress refuses a claim whose proof
+/// its own keys do not restrict it to, so an admitted claim never does;
+/// the proposal is abandoned rather than carry a claim the cut left
+/// whole.
 pub fn without_refused_reclaims(
     claims: Vec<StateClaim>,
     members: &MemberInputs,
     merged: &StateWrites,
     parent: &(impl Substates + ?Sized),
-) -> Vec<StateClaim> {
+) -> Result<Vec<StateClaim>, Unrestricted> {
     let local = members.shard;
     let standing: BTreeSet<SubstateKey> = reclaim_stands(&claims, members, merged, parent)
         .into_iter()
         .collect();
     if standing.is_empty() {
-        return claims;
+        return Ok(claims);
     }
     let refused = |claim: &StateClaim, key: SubstateKey| {
         claim.crossing_of(key).is_some_and(|id| {
@@ -354,33 +372,50 @@ pub fn without_refused_reclaims(
     let cut = |claim: &StateClaim, key: SubstateKey| {
         refused(claim, key) || (claim.anchor.shard == local && returned_alone.contains(&key))
     };
-    claims
-        .into_iter()
-        .filter_map(|claim| {
-            if !claim.keys().into_iter().any(|key| cut(&claim, key)) {
-                return Some(claim);
-            }
-            if claim.anchor.shard != local {
-                return claim.restrict(|key| !cut(&claim, key));
-            }
-            // Read at the parent under the empty proof, so the reading is
-            // dropped from the claim rather than cut from a proof.
-            let cells: Vec<(SubstateKey, Stated)> = claim
-                .cells
-                .iter()
-                .filter(|(key, _)| !cut(&claim, *key))
-                .cloned()
-                .collect();
-            let named: Vec<(SubstateKey, CrossingId)> = claim
-                .crossings
-                .iter()
-                .filter(|(key, _)| !cut(&claim, *key))
-                .copied()
-                .collect();
-            (!cells.is_empty())
-                .then(|| StateClaim::new(claim.anchor, cells, claim.proof.clone()).naming(named))
-        })
-        .collect()
+    let mut kept = Vec::with_capacity(claims.len());
+    for claim in claims {
+        let keys = claim.keys();
+        if !keys.iter().any(|key| cut(&claim, *key)) {
+            kept.push(claim);
+            continue;
+        }
+        if keys.iter().all(|key| cut(&claim, *key)) {
+            continue;
+        }
+        if claim.anchor.shard != local {
+            let piece = claim
+                .restrict(|key| !cut(&claim, key))
+                .ok_or(Unrestricted {
+                    anchor: claim.anchor,
+                })?;
+            kept.push(piece);
+            continue;
+        }
+        // Read at the parent under the empty proof, so the reading is
+        // dropped from the claim rather than cut from a proof.
+        let cells: Vec<(SubstateKey, Stated)> = claim
+            .cells
+            .iter()
+            .filter(|(key, _)| !cut(&claim, *key))
+            .cloned()
+            .collect();
+        let named: Vec<(SubstateKey, CrossingId)> = claim
+            .crossings
+            .iter()
+            .filter(|(key, _)| !cut(&claim, *key))
+            .copied()
+            .collect();
+        kept.push(StateClaim::new(claim.anchor, cells, claim.proof).naming(named));
+    }
+    Ok(kept)
+}
+
+/// A remote claim [`without_refused_reclaims`] keeps some cells of and
+/// cannot cut its proof down to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unrestricted {
+    /// The claim's anchor.
+    pub anchor: Anchor,
 }
 
 /// What each fee vault this shard holds is charged, judged against one
@@ -1919,7 +1954,8 @@ mod tests {
                 &block.members,
                 &merged,
                 parent,
-            );
+            )
+            .expect("the fixture's claims restrict");
             assert!(
                 reclaimed(&cut, PRODUCER, block.members.committed).is_empty()
                     && !reads(&cut, record),
@@ -2064,7 +2100,8 @@ mod tests {
             &block.members,
             &outright,
             &parent,
-        );
+        )
+        .expect("the fixture's claims restrict");
         assert!(reclaimed(&cut, PRODUCER, block.members.committed).is_empty());
         assert!(!reads(
             &cut,

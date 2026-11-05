@@ -60,8 +60,8 @@ use hyperscale_types::{
 };
 
 use crate::parent_checks::{
-    AtParent, ParentRefusal, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
-    within_the_cap, without_refused_reclaims,
+    AtParent, ParentRefusal, PayerCharges, ProposalClaims, Unrestricted, proposal_claims,
+    refused_at_parent, within_the_cap, without_refused_reclaims,
 };
 use crate::tick_members::{derived_terms, stated_terms, states_entry};
 
@@ -220,6 +220,25 @@ pub struct ProposalResult {
     pub additions: AnswerAdditions,
 }
 
+/// Why no proposal was built for a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unproposed {
+    /// The store has persisted past the parent: a block at this height
+    /// is already committed here, so there is nothing to propose.
+    PersistedPast(PersistedPastAnchor),
+    /// A claim the block would carry keeps some cells past the reclaim
+    /// cut and its proof cannot be cut down to them. Every ingress
+    /// refuses such a claim, so this is a defect, and the round is left
+    /// to another proposer rather than carry the claim whole.
+    Unrestricted(Unrestricted),
+}
+
+impl From<PersistedPastAnchor> for Unproposed {
+    fn from(past: PersistedPastAnchor) -> Self {
+        Self::PersistedPast(past)
+    }
+}
+
 /// Build a proposal block, always computing the state root via `prepare_block_commit`.
 ///
 /// Uses the overlay (the view's pending snapshots) when the JMT hasn't committed the
@@ -233,9 +252,10 @@ pub struct ProposalResult {
 ///
 /// # Errors
 ///
-/// [`PersistedPastAnchor`] when the store has persisted past the parent
-/// before the block's sweep could be walked: a block at this height is
-/// already committed here, so there is nothing to propose.
+/// [`Unproposed::PersistedPast`] when the store has persisted past the
+/// parent before the block's sweep could be walked, and
+/// [`Unproposed::Unrestricted`] when the reclaim cut cannot cut a
+/// claim's proof.
 ///
 /// # Panics
 ///
@@ -279,7 +299,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     manifest: &ManifestInputs,
     timeout_cert: Option<TimeoutCertificate>,
     standing: Option<&StandingAnswers>,
-) -> Result<ProposalResult, PersistedPastAnchor> {
+) -> Result<ProposalResult, Unproposed> {
     // The proposer builds on an anchored view of its parent — the state
     // this block's settling movements land on, the pending chain its
     // priors are judged against, and the reads execution accumulated.
@@ -397,7 +417,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         &shard_prefix_path(local_shard),
     );
     let state_claims: Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK> = Capped::new(
-        without_refused_reclaims(state_claims.into_inner(), &members, &merged, &anchored),
+        without_refused_reclaims(state_claims.into_inner(), &members, &merged, &anchored)
+            .map_err(Unproposed::Unrestricted)?,
     )
     .expect("cutting a reading adds no claim");
     // What the claims say off the claims carried, as every voter reads
@@ -1838,13 +1859,23 @@ where
             // this height; the slot has nothing left to fill.
             let result = match built {
                 Ok(result) => result,
-                Err(past) => {
+                Err(Unproposed::PersistedPast(past)) => {
                     tracing::debug!(
                         shard = ?shard_id,
                         height = height.inner(),
                         round = round.inner(),
                         persisted = past.persisted.inner(),
                         "Skipping a proposal whose parent the store has persisted past"
+                    );
+                    return;
+                }
+                Err(Unproposed::Unrestricted(unrestricted)) => {
+                    tracing::error!(
+                        shard = ?shard_id,
+                        height = height.inner(),
+                        round = round.inner(),
+                        anchor = ?unrestricted.anchor,
+                        "Abandoning a proposal round: an admitted claim's proof would not cut"
                     );
                     return;
                 }
