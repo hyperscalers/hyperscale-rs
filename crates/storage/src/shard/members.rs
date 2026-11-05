@@ -19,7 +19,10 @@
 //! it, read both ways against a member still waiting and one way against
 //! one in flight or stated. A determined member or a leg waits behind
 //! every place standing on its keys, and a head that refuses someone is
-//! aborted unnamed once its naming window closes.
+//! aborted unnamed once its naming window closes. A halt recovery's
+//! crossing block orphans the keyed members waiting unnamed whose head
+//! the lost tail may have set and served: each leaves the queue for good
+//! and is aborted unnamed.
 //! Verdict leaves are keyed as member rows are too, and stand exactly
 //! while a row says yes or accepted: from this shard's own certificate
 //! succeeding for a member its counterparts share the verdict on, until
@@ -65,10 +68,10 @@ use hyperscale_types::{
     Finalization, GlobalReceiptHash, Hash, Heard, Hearing, Holds, Inclusion, Joins,
     MAX_PREFIXES_PER_TX, MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection,
     MemberFamily, MemberTerms, Modes, Movement, Owes, Pin, PinClass, PinKey, Pins, Reach, ReadMark,
-    Reserves, Said, SettledEntries, Settlement, ShardId, ShardTrie, StateClaim, StateWrites,
-    StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TickManifest, Transaction,
-    TxHash, TxOutcome, VerdictQuestion, Verifiable, Verified, WeightedTimestamp, entry_leaf_key,
-    member_order, pins_of, said_at, verdict_leaf,
+    RecoveryBand, RecoveryBands, Reserves, Said, SettledEntries, Settlement, ShardId, ShardTrie,
+    StateClaim, StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
+    TickManifest, Transaction, TxHash, TxOutcome, VerdictQuestion, Verifiable, Verified,
+    WeightedTimestamp, entry_leaf_key, member_order, pins_of, said_at, verdict_leaf,
 };
 use hyperscale_vm_effects::{ProtocolHasher, fee_hold_key, protocol_resource};
 
@@ -77,8 +80,8 @@ use crate::shard::crossings::record_arrivals;
 use crate::shard::fee_holds::FeeTerms;
 use crate::shard::queue::{
     AWAITED_RANK, Head, PinIndex, PinMemo, PinsChunk, Place, RowEntries, WAITER_RANK, class_span,
-    pin_chunks, queue_order, shared_standing, standing_waiter, tick_of_pins, tick_pins_order,
-    tick_pins_span, waiter_span,
+    keyed, pin_chunks, queue_order, shared_standing, standing_waiter, tick_of_pins,
+    tick_pins_order, tick_pins_span, waiter_span,
 };
 use crate::shard::sweep::committed_tx_cell_key;
 use crate::shard::writes::{entry_leaf_value, fold_state_writes};
@@ -662,6 +665,11 @@ pub struct MemberRow {
     /// The parent-QC clock of the first block whose fold found this row,
     /// unnamed, refusing someone on a key it pins. Set once.
     pub blocked_at: Option<WeightedTimestamp>,
+    /// Whether a halt recovery's crossing block orphaned it: it stood
+    /// unnamed on shared, keyed terms where the lost tail may have made
+    /// it head and served it. Set once, with its place and head cleared;
+    /// it is never placed again, never heads, and leaves by an abort.
+    pub orphaned: bool,
 }
 
 impl MemberRow {
@@ -703,7 +711,32 @@ impl MemberRow {
             queued: None,
             head: None,
             blocked_at: None,
+            orphaned: false,
         }
+    }
+
+    /// Whether a crossing block at `height` whose marker carries `bands`
+    /// orphans this row on `local`: one an earlier block committed,
+    /// standing `Pending` on terms a counterpart shares the verdict on,
+    /// keyed here, not orphaned already, and either not head or head in
+    /// some band. A head no band covers was made head in a block the
+    /// recovered chain keeps, so the part it served is one counterparts
+    /// still admit.
+    #[must_use]
+    pub fn orphaned_by(&self, bands: &[RecoveryBand], local: ShardId, height: BlockHeight) -> bool {
+        let Some(waiting) = self.waiting.as_ref() else {
+            return false;
+        };
+        !self.orphaned
+            && self.height < height
+            && self.state == RowState::Pending
+            && waiting.settlement == Settlement::Shared
+            && keyed(&pins_of(&waiting.declared, local))
+            && self.head.is_none_or(|head| {
+                bands
+                    .iter()
+                    .any(|band| band.orphans(head.height, head.clock))
+            })
     }
 
     /// Whether the row holds a seat: held by a tick and settled against
@@ -958,6 +991,24 @@ impl MemberInputs {
         Self {
             heard: AnchorReadings::among(claims, windows),
             arrivals: record_arrivals(claims),
+            ..self
+        }
+    }
+
+    /// These inputs of a block's content with `marker`, the block's
+    /// recovery marker where it carries one, as their one line: known
+    /// before naming, so a fold of the content orphans what one fold of
+    /// the block does, and naming never reads an orphan as head.
+    ///
+    /// # Panics
+    ///
+    /// Never: one line is within the manifest's cap.
+    #[must_use]
+    pub fn marked(self, marker: Option<TickLine>) -> Self {
+        Self {
+            manifest: Arc::new(
+                Capped::new(marker.into_iter().collect()).expect("one line fits a manifest"),
+            ),
             ..self
         }
     }
@@ -1554,13 +1605,37 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         completed
     }
 
+    /// Orphan every row a recovery marker of `bands` orphans
+    /// ([`MemberRow::orphaned_by`]): each leaves its place and its head,
+    /// and so its entries and its seat. Read over the rows the state
+    /// holds, before anything else of the block moves one.
+    fn orphan(&mut self, bands: &[RecoveryBand], height: BlockHeight) {
+        let id = self.family.id(MemberCollection::Members);
+        let rows: Vec<MemberRow> = self
+            .state
+            .entries_in_range(self.family.owner(), id, 0, u128::MAX, usize::MAX)
+            .into_iter()
+            .filter_map(|(_, bytes)| from_slice(&bytes).ok())
+            .collect();
+        for mut row in rows {
+            if !row.orphaned_by(bands, self.shard, height) {
+                continue;
+            }
+            row.orphaned = true;
+            row.queued = None;
+            row.head = None;
+            self.set_member(row.tx, Some(row));
+        }
+    }
+
     /// Place the shared rows the block places, and test each for head.
     ///
     /// The rows placed are each shared row the block commits that pays
     /// the fee here or waits on no record, and each one whose last record
-    /// the block's claims read, in hash order. A transaction the block
-    /// commits and a line of it runs, with no terms entry, stands here
-    /// on the line's terms as a `Pending` row until the line names it.
+    /// the block's claims read, in hash order; never an orphan. A
+    /// transaction the block commits and a line of it runs, with no terms
+    /// entry, stands here on the line's terms as a `Pending` row until
+    /// the line names it.
     fn place(
         &mut self,
         inputs: &MemberInputs,
@@ -1576,6 +1651,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             .filter(|&tx| {
                 self.member(tx).is_some_and(|row| {
                     row.queued.is_none()
+                        && !row.orphaned
                         && row.state == RowState::Pending
                         && row.waiting.as_ref().is_some_and(|waiting| {
                             waiting.settlement == Settlement::Shared
@@ -1666,6 +1742,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 queued: None,
                 head: None,
                 blocked_at: None,
+                orphaned: false,
             };
             self.set_member(*tx, Some(row));
             standing.push(*tx);
@@ -2219,6 +2296,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         queued,
                         head,
                         blocked_at,
+                        orphaned: self.member(*tx).is_some_and(|row| row.orphaned),
                     };
                     self.set_member(*tx, Some(row));
                     members.push(*tx);
@@ -2226,7 +2304,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         composed.determined_unsettled = true;
                     }
                 }
-                TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => {}
+                TickLine::Fate { .. }
+                | TickLine::Discard { .. }
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. } => {}
             }
         }
         if !members.is_empty() {
@@ -2547,7 +2628,8 @@ fn unshared_commits(
             TickLine::Member { .. }
             | TickLine::Fate { .. }
             | TickLine::Discard { .. }
-            | TickLine::End { .. } => None,
+            | TickLine::End { .. }
+            | TickLine::Recovered { .. } => None,
         })
         .collect();
     let committed: BTreeSet<TxHash> = inputs.transactions.iter().map(|(tx, _)| *tx).collect();
@@ -2649,10 +2731,11 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
 enum Pass {
     /// The block whole, as committed or carried.
     Block,
-    /// A block's content ahead of its lines, which a fold of the block
-    /// with them follows: the determined members and legs it commits
-    /// take their waiter places there, and its refusals are taken there
-    /// over the rows it leaves standing, so this fold takes neither.
+    /// A block's content ahead of its lines, its recovery marker the one
+    /// line it may carry, which a fold of the block with them follows:
+    /// the determined members and legs it commits take their waiter
+    /// places there, and its refusals are taken there over the rows it
+    /// leaves standing, so this fold takes neither.
     /// Naming reads no `blocked_at` a block sets: one set by the block
     /// is the block's own clock, and no window closes within it.
     Content,
@@ -2676,6 +2759,11 @@ fn fold(
             .map(|(height, pins)| (*height, Some(Arc::clone(pins))))
             .collect();
         family.every_tick_pins = true;
+    }
+    for line in inputs.manifest.iter() {
+        if let TickLine::Recovered { bands } = line {
+            family.orphan(bands, inputs.height);
+        }
     }
     for settled in &inputs.settled {
         family.settle(settled);
@@ -2736,7 +2824,7 @@ fn fold(
         match line {
             TickLine::Fate { tx, .. } => fated.push(*tx),
             TickLine::End { tx } => ended.push(*tx),
-            TickLine::Member { .. } | TickLine::Discard { .. } => {}
+            TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::Recovered { .. } => {}
         }
     }
     family.fate(&fated);
@@ -2871,6 +2959,8 @@ pub fn verdict_changes(
                     moved.extend(held.members.iter().copied());
                 }
             }
+            // An orphan stands `Pending` before and after: no leaf.
+            TickLine::Recovered { .. } => {}
         }
     }
     leaf_changes(shard, moved, prior, after)
@@ -3239,6 +3329,19 @@ impl MemberIndex {
             }
         }
         heard
+    }
+
+    /// The recovery marker a crossing block at `height` over these rows,
+    /// its parent's, names where the snapshot at the parent's anchor
+    /// holds `bands` for the shard: present exactly where it orphans a
+    /// row ([`MemberRow::orphaned_by`]). Such a row holds no tick, so the
+    /// marker and the block's discards number at most the rows standing.
+    #[must_use]
+    pub fn recovery_marker(&self, bands: RecoveryBands, height: BlockHeight) -> Option<TickLine> {
+        self.members
+            .values()
+            .any(|row| row.orphaned_by(&bands, self.shard, height))
+            .then_some(TickLine::Recovered { bands })
     }
 
     /// The rows the claims of `inputs` change, each as it stands once it
@@ -9144,6 +9247,264 @@ mod tests {
                 Some(at(2, WAITER_RANK + 1)),
                 "the leg counts in the waiter run's index"
             );
+        }
+
+        /// The band of a recovery whose frontier is `frontier` and whose
+        /// bridge opens at `bridge`'s clock.
+        fn band(frontier: u64, bridge: u64) -> RecoveryBand {
+            RecoveryBand {
+                attested_frontier: BlockHeight::new(frontier),
+                bridge_start: clock(bridge),
+            }
+        }
+
+        fn bands(bands: &[RecoveryBand]) -> RecoveryBands {
+            Capped::new(bands.to_vec()).expect("a few bands")
+        }
+
+        fn marker(of: &[RecoveryBand]) -> TickLine {
+            TickLine::Recovered { bands: bands(of) }
+        }
+
+        /// The seeds of the rows [`before_a_crossing`] stands.
+        const HEAD_LOW: u8 = 1;
+        const BEHIND: u8 = 2;
+        const BAND_HEAD: u8 = 4;
+        const WAITER: u8 = 5;
+        const CONSUMER: u8 = 6;
+        const OWN: u8 = 7;
+        const UNKEYED: u8 = 9;
+
+        /// The frontier and the bridge clock of [`CROSSING_BAND`].
+        const CROSSING_BAND: (u64, u64) = (1, 4);
+
+        /// Rows a halted chain holds at its crossing block's parent: a
+        /// head at the frontier and a keyed row behind it, committed at
+        /// height 1; and at height 3, above the frontier and below the
+        /// bridge, a keyed head, a head serving no key here, a determined
+        /// waiter, and a keyed consumer whose record has not arrived.
+        fn before_a_crossing() -> Entries {
+            let mut store = Entries::default();
+            let mut first = block(1);
+            commit(
+                &mut first,
+                HEAD_LOW,
+                terms(&Kind::Payer(vec![]), &[write(A)]),
+            );
+            commit(&mut first, BEHIND, terms(&Kind::Payer(vec![]), &[read(A)]));
+            store.fold(&first);
+            let mut third = block(3);
+            commit(
+                &mut third,
+                BAND_HEAD,
+                terms(&Kind::Payer(vec![]), &[write(C)]),
+            );
+            commit(
+                &mut third,
+                UNKEYED,
+                terms(&Kind::Payer(vec![]), &[reserve(B)]),
+            );
+            commit(&mut third, WAITER, terms(&Kind::Determined, &[write(5)]));
+            commit(
+                &mut third,
+                CONSUMER,
+                terms(&Kind::Consumer(vec![7]), &[read(6)]),
+            );
+            store.fold(&third);
+            assert_eq!(
+                headed(&store, HEAD_LOW),
+                Some((BlockHeight::new(1), clock(1)))
+            );
+            assert_eq!(row(&store, BEHIND).head, None);
+            assert_eq!(
+                headed(&store, BAND_HEAD),
+                Some((BlockHeight::new(3), clock(3)))
+            );
+            assert!(row(&store, UNKEYED).head.is_some());
+            assert_eq!(row(&store, CONSUMER).queued, None, "its record is owed");
+            store
+        }
+
+        /// The crossing block at height 5 over [`before_a_crossing`],
+        /// committing a keyed row of its own behind [`HEAD_LOW`] and
+        /// naming the marker of [`CROSSING_BAND`].
+        fn crossing_block() -> MemberInputs {
+            let (frontier, bridge) = CROSSING_BAND;
+            let mut crossing = block(5);
+            commit(&mut crossing, OWN, terms(&Kind::Payer(vec![]), &[read(A)]));
+            lines(&mut crossing, vec![marker(&[band(frontier, bridge)])]);
+            crossing
+        }
+
+        fn crossed() -> Entries {
+            let mut store = before_a_crossing();
+            store.fold(&crossing_block());
+            store
+        }
+
+        /// The marker orphans every keyed row standing unnamed on shared
+        /// terms that the parent holds without a head or with a head in
+        /// the band, and no other: not a head at the frontier, a head
+        /// serving no key here, a determined waiter, or a row the
+        /// crossing block commits. An orphan holds no place and no head,
+        /// and the marker is present exactly because it orphans one.
+        #[test]
+        fn the_recovery_marker_orphans_every_keyed_row_unheaded_or_headed_in_a_band() {
+            let (frontier, bridge) = CROSSING_BAND;
+            let parent = MemberIndex::load(&before_a_crossing(), LOCAL);
+            assert_eq!(
+                parent.recovery_marker(bands(&[band(frontier, bridge)]), BlockHeight::new(5)),
+                Some(marker(&[band(frontier, bridge)])),
+            );
+
+            let store = crossed();
+            for seed in [BEHIND, BAND_HEAD, CONSUMER] {
+                let orphan = row(&store, seed);
+                assert!(orphan.orphaned, "{seed} is orphaned");
+                assert_eq!((orphan.queued, orphan.head), (None, None), "{seed}");
+                assert_eq!(orphan.state, RowState::Pending);
+            }
+            for seed in [HEAD_LOW, UNKEYED, WAITER, OWN] {
+                assert!(!row(&store, seed).orphaned, "{seed} is not orphaned");
+            }
+            assert_eq!(
+                headed(&store, HEAD_LOW),
+                Some((BlockHeight::new(1), clock(1)))
+            );
+            assert!(row(&store, OWN).queued.is_some(), "placed at its commit");
+        }
+
+        /// An orphan never heads: the head ahead of it leaves, the block
+        /// is dirty, and the rows behind are tested again, but the orphan
+        /// stands nowhere to be tested.
+        #[test]
+        fn an_orphaned_row_never_heads() {
+            let mut store = crossed();
+            assert_eq!(
+                row(&store, OWN).head,
+                None,
+                "behind the head at the frontier"
+            );
+            let mut next = block(6);
+            lines(&mut next, vec![fate(HEAD_LOW)]);
+            store.fold(&next);
+            assert_eq!(headed(&store, OWN), Some((BlockHeight::new(6), clock(6))));
+            let orphan = row(&store, BEHIND);
+            assert_eq!((orphan.queued, orphan.head), (None, None));
+            assert_eq!(count(&store, MemberCollection::Behind), 0);
+        }
+
+        /// A head in the band held a seat at the parent; orphaned, it
+        /// holds none, so no counterpart reads it seated.
+        #[test]
+        fn an_orphaned_band_head_holds_no_seat() {
+            let parent = before_a_crossing();
+            assert!(row(&parent, BAND_HEAD).seated());
+            assert!(seated_in(&parent, BAND_HEAD));
+            let store = crossed();
+            assert!(!row(&store, BAND_HEAD).seated());
+            assert!(!seated_in(&store, BAND_HEAD));
+            assert!(
+                seated_in(&store, HEAD_LOW),
+                "the head at the frontier keeps its seat"
+            );
+        }
+
+        /// A head in the band leaves `Serves` with its head: the keyed
+        /// head at the frontier is the only serve left.
+        #[test]
+        fn an_orphaned_band_head_leaves_no_serves_entry() {
+            assert_eq!(count(&before_a_crossing(), MemberCollection::Serves), 2);
+            let store = crossed();
+            assert_eq!(count(&store, MemberCollection::Serves), 1);
+            assert_eq!(
+                count(&store, MemberCollection::Queue),
+                3,
+                "the head at the frontier's, the row it commits', and the unkeyed head's"
+            );
+        }
+
+        /// The record an orphan waited on arrives later, and the orphan
+        /// is not placed again.
+        #[test]
+        fn an_orphan_whose_record_arrives_is_not_placed() {
+            let mut store = crossed();
+            let mut next = block(6);
+            next.arrivals.insert((record(7), tx(CONSUMER)));
+            store.fold(&next);
+            let orphan = row(&store, CONSUMER);
+            assert!(orphan.waiting.expect("pending").unarrived.is_empty());
+            assert_eq!((orphan.queued, orphan.head), (None, None));
+            assert!(orphan.orphaned);
+        }
+
+        /// A crossing block whose content frees a row behind, folded as a
+        /// proposer and a voter fold it, its content seeded with the
+        /// marker and then the block as carried, leaves what one fold of
+        /// the block leaves: the row is orphaned before the freed pins
+        /// could head it, and a row the block commits and places behind
+        /// another is not orphaned by the second fold.
+        #[test]
+        fn a_crossing_block_folded_twice_writes_what_one_fold_does() {
+            const DETERMINED: u8 = 1;
+            const FREED: u8 = 2;
+            const OWN_HEAD: u8 = 3;
+            const OWN_BEHIND: u8 = 4;
+
+            let mut parent = Entries::default();
+            let determined = terms(&Kind::Determined, &[write(A)]);
+            let mut first = block(1);
+            commit(&mut first, DETERMINED, determined.clone());
+            parent.fold(&first);
+            let mut second = block(2);
+            lines(&mut second, vec![run(DETERMINED, &determined)]);
+            parent.fold(&second);
+            let mut third = block(3);
+            commit(&mut third, FREED, terms(&Kind::Payer(vec![]), &[read(A)]));
+            parent.fold(&third);
+            assert_eq!(row(&parent, FREED).head, None, "the tick's write is owed");
+
+            let marked = marker(&[band(0, 4)]);
+            let mut next = MemberInputs {
+                committed: clock(4),
+                ..settling(4, 2, TickHalf::Determined, &[DETERMINED])
+            };
+            commit(
+                &mut next,
+                OWN_HEAD,
+                terms(&Kind::Payer(vec![]), &[write(B)]),
+            );
+            commit(
+                &mut next,
+                OWN_BEHIND,
+                terms(&Kind::Payer(vec![]), &[read(B)]),
+            );
+            lines(&mut next, vec![marked.clone()]);
+            let carrying = carried(&next);
+            let content = carrying.clone().marked(Some(marked));
+
+            let mut voter = MemberIndex::load(&parent, LOCAL);
+            voter.advance_content(&content);
+            voter.advance(&carrying);
+            let mut twice = Entries(parent.0.clone());
+            twice.fold_content(&content);
+            twice.fold(&carrying);
+            let mut once = Entries(parent.0.clone());
+            once.fold(&carrying);
+            assert_eq!(twice.0, once.0);
+            assert_eq!(voter, MemberIndex::load(&once, LOCAL));
+
+            assert!(row(&once, FREED).orphaned);
+            assert_eq!(row(&once, FREED).head, None);
+            let (head, behind) = if tx(OWN_HEAD) < tx(OWN_BEHIND) {
+                (OWN_HEAD, OWN_BEHIND)
+            } else {
+                (OWN_BEHIND, OWN_HEAD)
+            };
+            assert!(row(&once, head).head.is_some());
+            assert_eq!(row(&once, behind).head, None, "a read and a write of B");
+            assert!(!row(&once, behind).orphaned);
+            assert!(row(&once, behind).queued.is_some());
         }
 
         /// A cell in [`PEER`]'s key space.

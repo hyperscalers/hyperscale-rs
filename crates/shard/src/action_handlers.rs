@@ -744,7 +744,8 @@ impl Naming<'_> {
                 self.shard,
                 transactions.iter().map(|tx| &**tx),
             ),
-        );
+        )
+        .marked(self.manifest.marker.clone());
         let mut rows = self.parent.clone();
         rows.advance_content(&pending);
         let (lines, contended, proven) = match self.manifest.kind {
@@ -757,6 +758,7 @@ impl Naming<'_> {
                         inputs: self.committed,
                         evidence: &|shard, committed| self.committed.evidence(shard, committed),
                         recovery: self.manifest.recovery,
+                        marker: self.manifest.marker.as_ref(),
                         wounded: &victims,
                     },
                     &self.committed.siblings,
@@ -835,7 +837,10 @@ impl Named {
             .iter()
             .filter_map(|line| match line {
                 TickLine::Member { tx, joins, .. } => Some((*tx, joins.dispatched())),
-                TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+                TickLine::Fate { .. }
+                | TickLine::Discard { .. }
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. } => None,
             })
             .collect();
         let mut weight: usize = self

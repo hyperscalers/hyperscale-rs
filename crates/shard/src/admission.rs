@@ -1787,6 +1787,7 @@ pub(crate) mod fixtures {
                     queued: None,
                     head: None,
                     blocked_at: None,
+                    orphaned: false,
                 };
                 members.members.insert(tx, row);
                 let held = members.ticks.entry(tick).or_insert(TickRow {
@@ -2707,6 +2708,7 @@ mod state_claim_tests {
             queued: None,
             head: None,
             blocked_at: None,
+            orphaned: false,
         }
     }
 

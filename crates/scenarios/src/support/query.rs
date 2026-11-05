@@ -609,9 +609,10 @@ pub fn chain_mentions(
                 .fated
                 .extend(block.tick_manifest().iter().filter_map(|line| match line {
                     TickLine::Fate { tx, .. } => at(*tx),
-                    TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => {
-                        None
-                    }
+                    TickLine::Member { .. }
+                    | TickLine::Discard { .. }
+                    | TickLine::End { .. }
+                    | TickLine::Recovered { .. } => None,
                 }));
             mentions
                 .run
@@ -620,7 +621,8 @@ pub fn chain_mentions(
                     TickLine::Member { .. }
                     | TickLine::Fate { .. }
                     | TickLine::Discard { .. }
-                    | TickLine::End { .. } => None,
+                    | TickLine::End { .. }
+                    | TickLine::Recovered { .. } => None,
                 }));
             for record in block.abandonment_records().iter() {
                 mentions

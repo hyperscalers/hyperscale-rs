@@ -66,7 +66,10 @@ pub fn run_by(lines: &[TickLine]) -> BTreeSet<TxHash> {
         .iter()
         .filter_map(|line| match line {
             TickLine::Member { tx, joins, .. } => joins.dispatched().then_some(*tx),
-            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+            TickLine::Fate { .. }
+            | TickLine::Discard { .. }
+            | TickLine::End { .. }
+            | TickLine::Recovered { .. } => None,
         })
         .collect()
 }
@@ -177,7 +180,10 @@ pub fn ends_licensed(
         .iter()
         .filter_map(|line| match line {
             TickLine::End { tx } => Some(*tx),
-            TickLine::Member { .. } | TickLine::Fate { .. } | TickLine::Discard { .. } => None,
+            TickLine::Member { .. }
+            | TickLine::Fate { .. }
+            | TickLine::Discard { .. }
+            | TickLine::Recovered { .. } => None,
         })
         .collect();
     ends_stand(&ended, rows, parent, views, budget).map_err(|unlicensed| match unlicensed {

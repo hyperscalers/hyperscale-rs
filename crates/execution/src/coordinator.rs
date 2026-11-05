@@ -1685,12 +1685,15 @@ impl ExecutionCoordinator {
                     cause: DiscardCause::Recovery,
                 } => self.discard_recovered(*tick),
                 TickLine::Fate { tx, .. } => self.let_go(*tx),
+                // An orphan stands unnamed; the abort that ends it is a
+                // member line of its own.
                 TickLine::Member { .. }
                 | TickLine::Discard {
                     cause: DiscardCause::Abandoned(_),
                     ..
                 }
-                | TickLine::End { .. } => {}
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. } => {}
             }
         }
         let (admitted, in_hand) = self.candidates.take_named(lines, &self.provisioning);

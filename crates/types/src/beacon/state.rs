@@ -42,8 +42,8 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey, Epoch,
-    EpochWindows, NetworkDefinition, QuorumCertificate, Randomness, SeedRing, SettledTxsRoot,
-    ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
+    EpochWindows, NetworkDefinition, QuorumCertificate, Randomness, RecoveryBand, SeedRing,
+    SettledTxsRoot, ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
     WeightedTimestamp,
 };
 
@@ -787,6 +787,17 @@ impl RecoveryBinding {
     ) -> bool {
         windows.epoch_for(anchor).inner() < self.bridge().inner()
             && height.inner() > self.attested_frontier.inner()
+    }
+
+    /// This recovery's band as a crossing block's marker carries it, its
+    /// bridge placed on the epoch grid `windows`: a band orphans exactly
+    /// what [`Self::orphans`] does, wherever the grid has a crossing.
+    #[must_use]
+    pub const fn band(self, windows: EpochWindows) -> RecoveryBand {
+        RecoveryBand {
+            attested_frontier: self.attested_frontier,
+            bridge_start: windows.window_of(self.bridge()).start,
+        }
     }
 
     /// The newest completed recovery in a shard's `history`.

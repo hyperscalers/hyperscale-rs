@@ -836,6 +836,53 @@ fn a_determined_lines_weight_bounds_its_encoding_at_every_pin_count() {
     }
 }
 
+/// A recovery marker at every band count up to its cap decodes to the
+/// marker encoded and weighs what bounds its encoding, and one at its
+/// cap beside a discard for every other line the manifest holds fits
+/// the section's budget.
+#[test]
+fn a_recovery_marker_weighs_what_bounds_its_encoding() {
+    use hyperscale_types::{MAX_RECOVERY_BANDS, RecoveryBand, TICK_BAND_BYTES, TickId};
+
+    for count in 0..=MAX_RECOVERY_BANDS {
+        let marker = TickLine::Recovered {
+            bands: Capped::new(
+                (0..count)
+                    .map(|_| RecoveryBand {
+                        attested_frontier: BlockHeight::new(u64::MAX),
+                        bridge_start: WeightedTimestamp::from_millis(u64::MAX),
+                    })
+                    .collect(),
+            )
+            .expect("a list under the cap"),
+        };
+        let encoded = hbor_to_vec(&marker).expect("a marker encodes");
+        assert_eq!(
+            hbor_from_slice::<TickLine>(&encoded).expect("a marker decodes"),
+            marker,
+        );
+        assert!(
+            encoded.len() <= marker.wire_weight(),
+            "a marker of {count} bands encodes to {}, over its weight {}",
+            encoded.len(),
+            marker.wire_weight(),
+        );
+        assert_eq!(
+            marker.wire_weight(),
+            TICK_LINE_BYTES + count * TICK_BAND_BYTES
+        );
+        if count == MAX_RECOVERY_BANDS {
+            let discard = TickLine::Discard {
+                tick: TickId::new(ShardId::leaf(9, 300), BlockHeight::new(u64::MAX)),
+                cause: DiscardCause::Recovery,
+            };
+            assert!(tick_manifest_admits_block(
+                marker.wire_weight() + (MAX_TICK_LINES_PER_BLOCK - 1) * discard.wire_weight()
+            ));
+        }
+    }
+}
+
 /// An end line decodes to the line encoded, weighs the bare line it is
 /// charged as, which bounds its encoding, and a manifest of them at the
 /// line cap fits the section's budget and decodes whole.

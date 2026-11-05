@@ -923,7 +923,10 @@ const fn exits(line: &TickLine) -> Option<TxHash> {
             ..
         }
         | TickLine::Fate { tx, .. } => Some(*tx),
-        TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+        TickLine::Member { .. }
+        | TickLine::Discard { .. }
+        | TickLine::End { .. }
+        | TickLine::Recovered { .. } => None,
     }
 }
 
@@ -991,6 +994,10 @@ pub struct ManifestInputs {
     /// recovery's bridge, which discards every tick its parent's rows
     /// hold.
     pub recovery: bool,
+    /// The crossing block's recovery marker over its parent's rows,
+    /// where it orphans one: the block's content is folded with it, and
+    /// it is the block's first line.
+    pub marker: Option<TickLine>,
     /// What the block's manifest names.
     pub kind: ManifestKind,
 }
@@ -1011,6 +1018,11 @@ pub enum Standing<'a> {
     /// [`NAMING_WINDOW`] since the later of its head and its first
     /// refusal. Aborted on those terms, whatever its deadline.
     Windowed(Judged<'a>),
+    /// Committed and named by no tick yet, and orphaned by a halt
+    /// recovery's crossing block: the lost tail may have served it, so
+    /// it never heads again. Aborted on those terms, whatever its
+    /// deadline.
+    Orphaned(Judged<'a>),
     /// Held by a tick that lets go of it on its abort: a member a
     /// counterpart's verdict can discard, which a departure covers and
     /// which the tick does not hold as its own abandonment. Judged on
@@ -1031,16 +1043,18 @@ pub enum Standing<'a> {
 
 impl<'a> Standing<'a> {
     /// How `row`, committed and named by no tick, stands at `anchor`:
-    /// wounded where the block's claims prove it the victim of a hold
-    /// cycle, and windowed where it stands head and its naming window
-    /// has closed.
+    /// orphaned where a recovery's crossing block orphaned it, wounded
+    /// where the block's claims prove it the victim of a hold cycle, and
+    /// windowed where it stands head and its naming window has closed.
     fn waiting(row: &'a MemberRow, wounded: &BTreeSet<TxHash>, anchor: WeightedTimestamp) -> Self {
         let judged = Judged::of_row(row);
         let windowed = row
             .head
             .zip(row.blocked_at)
             .is_some_and(|(head, blocked)| anchor >= head.clock.max(blocked).plus(NAMING_WINDOW));
-        if wounded.contains(&row.tx) {
+        if row.orphaned {
+            Self::Orphaned(judged)
+        } else if wounded.contains(&row.tx) {
             Self::Wounded(judged)
         } else if windowed {
             Self::Windowed(judged)
@@ -1052,7 +1066,10 @@ impl<'a> Standing<'a> {
     /// The remote shards the transaction reaches.
     const fn reach(&self) -> &'a Reach {
         match self {
-            Self::Pending(judged) | Self::Wounded(judged) | Self::Windowed(judged) => judged.reach,
+            Self::Pending(judged)
+            | Self::Wounded(judged)
+            | Self::Windowed(judged)
+            | Self::Orphaned(judged) => judged.reach,
             Self::Held { reach, .. } | Self::Released { reach, .. } => reach,
         }
     }
@@ -1063,7 +1080,10 @@ impl<'a> Standing<'a> {
     /// abort is its exit.
     const fn leg(&self) -> bool {
         match self {
-            Self::Pending(judged) | Self::Wounded(judged) | Self::Windowed(judged) => judged.leg,
+            Self::Pending(judged)
+            | Self::Wounded(judged)
+            | Self::Windowed(judged)
+            | Self::Orphaned(judged) => judged.leg,
             Self::Held { .. } | Self::Released { .. } => false,
         }
     }
@@ -1108,10 +1128,12 @@ impl<'a> Standing<'a> {
 /// shard keeps can certify it, and no other line names its members in
 /// that block. The discard releases each member in flight and keeps each
 /// stated one, which owes nothing a certificate gives and leaves only on
-/// what its siblings' state says.
+/// what its siblings' state says. Its marker, where it carries one,
+/// orphans the rows the lost tail may have served, and each orphan is
+/// aborted as the budget lets, in this block or a later one.
 ///
-/// The lines are listed as the budget is charged: a recovery's
-/// discards; the fates in transaction order, each after the
+/// The lines are listed as the budget is charged: a recovery's marker
+/// and discards; the fates in transaction order, each after the
 /// `Unanswerable` discard of the tick holding its member, the two taken
 /// together so both fit or neither is named; the member lines; the
 /// `Abandoned` discards. Nothing is named past the first refusal. The
@@ -1143,6 +1165,9 @@ pub struct Naming<'a> {
     /// Whether the block is a recovery's crossing block, which discards
     /// every tick the rows hold.
     pub recovery: bool,
+    /// The crossing block's recovery marker, where it orphans a row:
+    /// named first, and already folded into `rows` with the content.
+    pub marker: Option<&'a TickLine>,
     /// The pending members the block's claims prove the victims of a
     /// hold cycle. See [`wounded`].
     pub wounded: &'a BTreeSet<TxHash>,
@@ -1161,6 +1186,7 @@ fn lines_over(
         inputs,
         evidence,
         recovery,
+        marker,
         wounded,
     } = naming;
     let mut candidates = Vec::new();
@@ -1200,6 +1226,12 @@ fn lines_over(
     }
     let mut budget = ManifestBudget::default();
     let mut lines = Vec::new();
+    if let Some(marker) = marker {
+        if !budget.take(marker) {
+            return (lines, missing, budget);
+        }
+        lines.push(marker.clone());
+    }
     let recoveries = recovered.into_iter().map(|height| {
         let discard = TickLine::Discard {
             tick: TickId::new(rows.shard(), height),
@@ -1537,6 +1569,7 @@ impl Nameable<'_> {
             Standing::Pending(_)
             | Standing::Wounded(_)
             | Standing::Windowed(_)
+            | Standing::Orphaned(_)
             | Standing::Released { .. } => None,
         };
         (line, discard)
@@ -1574,9 +1607,9 @@ impl Nameable<'_> {
 /// whenever it then commits. A leg past its deadline is not named at all:
 /// its fate ends it at the close of its leg entry window. A candidate a
 /// tick holds or let go of is one [`Exit::of`] found due an abort, and is
-/// named `Aborted` whatever its deadline. A [`Standing::Wounded`] or
-/// [`Standing::Windowed`] candidate is named `Aborted` as one past its
-/// deadline is. An abort line carries the
+/// named `Aborted` whatever its deadline. A [`Standing::Wounded`],
+/// [`Standing::Windowed`] or [`Standing::Orphaned`] candidate is named
+/// `Aborted` as one past its deadline is. An abort line carries the
 /// candidate's deadline and the crossings it answers `Never` for, so a
 /// replica holding nothing of the transaction seats and settles it, and
 /// a line running a member whose settlement is shared with a sibling
@@ -1620,6 +1653,7 @@ pub fn select_members<'a>(
                 candidate.standing,
                 Standing::Wounded(_)
                     | Standing::Windowed(_)
+                    | Standing::Orphaned(_)
                     | Standing::Held { .. }
                     | Standing::Released { .. }
             )
@@ -1807,7 +1841,10 @@ pub fn contentions(
         .iter()
         .filter_map(|line| match line {
             TickLine::Member { tx, .. } => Some(*tx),
-            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+            TickLine::Fate { .. }
+            | TickLine::Discard { .. }
+            | TickLine::End { .. }
+            | TickLine::Recovered { .. } => None,
         })
         .collect();
     let in_lines = lines.iter().filter_map(|line| match line {
@@ -1824,7 +1861,8 @@ pub fn contentions(
         }
         | TickLine::Fate { .. }
         | TickLine::Discard { .. }
-        | TickLine::End { .. } => None,
+        | TickLine::End { .. }
+        | TickLine::Recovered { .. } => None,
     });
     let holders: Vec<CoreHolder<'_>> = in_flight_holders(rows.members.values(), local)
         .chain(in_lines)
@@ -2051,10 +2089,11 @@ mod tests {
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
         Derived, EPOCH_DURATION, EntryKey, Epoch, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash,
         Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK,
-        MAX_TICK_MANIFEST_BYTES, MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkId, Owes,
-        PrincipalAddr, ProtocolHasher, ReadMark, Routing, Said, StatedTerms, TICK_LINE_BYTES,
-        TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange, TransactionEnvelope,
-        Unpublished, entry_leaf_key, said_at, tick_manifest_admits_members,
+        MAX_TICK_MANIFEST_BYTES, MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection,
+        NetworkId, Owes, PrincipalAddr, ProtocolHasher, ReadMark, RecoveryBand, RecoveryBands,
+        Routing, Said, StatedTerms, TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf,
+        TimestampRange, TransactionEnvelope, Unpublished, entry_leaf_key, said_at,
+        tick_manifest_admits_members,
     };
     use hyperscale_vm_effects::{Hash32, IntentHash};
     use hyperscale_vm_types::Moves;
@@ -2078,6 +2117,7 @@ mod tests {
                 inputs,
                 evidence,
                 recovery,
+                marker: None,
                 wounded,
             },
             &BTreeMap::new(),
@@ -2342,6 +2382,7 @@ mod tests {
             queued: None,
             head: None,
             blocked_at: None,
+            orphaned: false,
         }
     }
 
@@ -2815,7 +2856,8 @@ mod tests {
                 TickLine::Member { tx, .. } => *tx,
                 other @ (TickLine::Discard { .. }
                 | TickLine::Fate { .. }
-                | TickLine::End { .. }) => {
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. }) => {
                     panic!("{other:?}")
                 }
             })
@@ -2884,7 +2926,8 @@ mod tests {
                 }
                 other @ (TickLine::Discard { .. }
                 | TickLine::Fate { .. }
-                | TickLine::End { .. }) => panic!("{other:?}"),
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. }) => panic!("{other:?}"),
             })
             .collect()
         };
@@ -3104,6 +3147,7 @@ mod tests {
             queued: None,
             head: None,
             blocked_at: None,
+            orphaned: false,
         };
         let mut rows = MemberIndex::empty(ShardId::ROOT);
         for held in [
@@ -3175,6 +3219,7 @@ mod tests {
             queued: None,
             head: None,
             blocked_at: None,
+            orphaned: false,
         }
     }
 
@@ -4180,8 +4225,243 @@ mod tests {
             TickLine::Discard {
                 cause: DiscardCause::Recovery,
                 ..
-            } => false,
+            }
+            | TickLine::Recovered { .. } => false,
         })
+    }
+
+    /// The transaction of the `at`th of many rows.
+    fn many(at: usize) -> TxHash {
+        TxHash::from(Hash::from_bytes(&(at as u64).to_be_bytes()))
+    }
+
+    /// A core member a sibling on `PEER` shares the verdict on, writing a
+    /// cell this shard owns, committed at `height` anchored at `height`
+    /// seconds, and head of the queue there where `headed`.
+    fn keyed_core(tx: TxHash, height: u64, headed: bool) -> MemberRow {
+        let row = MemberRow {
+            tx,
+            committed: ms(height * 1_000),
+            height: BlockHeight::new(height),
+            ..unplaced(0, far(), &leg(vec![(cell(1, 1), WRITE)], &[]))
+        };
+        if headed { placed_head(row) } else { row }
+    }
+
+    /// The band of a recovery whose frontier is `frontier` and whose
+    /// bridge opens at `bridge` seconds.
+    fn band(frontier: u64, bridge: u64) -> RecoveryBand {
+        RecoveryBand {
+            attested_frontier: BlockHeight::new(frontier),
+            bridge_start: ms(bridge * 1_000),
+        }
+    }
+
+    fn bands(of: &[RecoveryBand]) -> RecoveryBands {
+        Capped::new(of.to_vec()).expect("a few bands")
+    }
+
+    /// Every row a recovery orphans is aborted, unnamed: the crossing
+    /// block names its marker first and then as many aborts as the
+    /// member cap lets, and the rest wait for the block after it, which
+    /// aborts them.
+    #[test]
+    fn orphaned_rows_abort_across_blocks_within_the_member_cap() {
+        const LEFT: usize = 3;
+        let count = MAX_NAMED_MEMBERS_PER_TICK + LEFT;
+        let mut rows = rows_of((0..count).map(|at| keyed_core(many(at), 1, false)));
+        let marker = rows
+            .recovery_marker(bands(&[band(0, 5)]), BlockHeight::new(3))
+            .expect("every row is unheaded and keyed");
+        naming(&mut rows, 3, vec![marker.clone()]);
+        assert!(rows.members.values().all(|row| row.orphaned));
+        let aborts = |lines: &[TickLine]| {
+            lines
+                .iter()
+                .filter(|line| {
+                    matches!(
+                        line,
+                        TickLine::Member {
+                            joins: Joins::Aborted,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+
+        let (crossing, missing, _) = member_lines(
+            Naming {
+                rows: &rows,
+                anchor: ms(6_000),
+                inputs: &Held::default(),
+                evidence: &|_, _| Evidence::Live { terminating: false },
+                recovery: true,
+                marker: Some(&marker),
+                wounded: &BTreeSet::new(),
+            },
+            &BTreeMap::new(),
+        );
+        assert!(missing.is_empty());
+        assert_eq!(crossing[0], marker, "the marker is named first");
+        assert_eq!(aborts(&crossing), MAX_NAMED_MEMBERS_PER_TICK);
+        assert_eq!(crossing.len(), MAX_NAMED_MEMBERS_PER_TICK + 1);
+        naming(&mut rows, 3, crossing);
+
+        let (after, missing) = lines_at(
+            &rows,
+            ms(7_000),
+            Evidence::Live { terminating: false },
+            false,
+        );
+        assert!(missing.is_empty());
+        assert_eq!(aborts(&after), LEFT, "the rest abort a block later");
+        assert_eq!(after.len(), LEFT);
+        naming(&mut rows, 4, after);
+        assert!(
+            rows.members.values().all(|row| matches!(
+                row.state,
+                RowState::InFlight {
+                    joins: Joins::Aborted,
+                    ..
+                }
+            )),
+            "every orphan stands in the tick that aborts it",
+        );
+    }
+
+    /// A row made head at or below the frontier was made head where the
+    /// recovered chain keeps it: no marker orphans it, and the crossing
+    /// block runs it as any head. One made head just above the frontier,
+    /// below the bridge, is orphaned.
+    #[test]
+    fn a_row_head_at_or_below_the_frontier_survives_a_recovery_crossing() {
+        let rows = rows_of([keyed_core(tx(1), 2, true)]);
+        assert_eq!(
+            rows.recovery_marker(bands(&[band(2, 5)]), BlockHeight::new(6)),
+            None
+        );
+        let (lines, missing) = lines_at(
+            &rows,
+            ms(6_000),
+            Evidence::Live { terminating: false },
+            true,
+        );
+        assert!(missing.is_empty());
+        assert!(
+            matches!(
+                &lines[..],
+                [TickLine::Member { tx: ran, joins: Joins::Executes, .. }] if *ran == tx(1)
+            ),
+            "the head at the frontier runs: {lines:?}"
+        );
+
+        let above = rows_of([keyed_core(tx(1), 3, true)]);
+        assert!(
+            above
+                .recovery_marker(bands(&[band(2, 5)]), BlockHeight::new(6))
+                .is_some()
+        );
+    }
+
+    /// A chained recovery's marker carries the band of the recovery it
+    /// superseded: a head above the older frontier and below the older
+    /// bridge, at or below the newer frontier, is orphaned by the older
+    /// band alone.
+    #[test]
+    fn a_superseded_recoverys_band_orphans_a_head_in_it() {
+        let (superseded, newest) = (band(2, 5), band(6, 20));
+        let mut rows = rows_of([keyed_core(tx(1), 4, true)]);
+        assert_eq!(
+            rows.recovery_marker(bands(&[newest]), BlockHeight::new(21)),
+            None,
+            "the newest band alone keeps it"
+        );
+        let marker = rows
+            .recovery_marker(bands(&[superseded, newest]), BlockHeight::new(21))
+            .expect("the superseded band orphans it");
+        naming(&mut rows, 21, vec![marker]);
+        let orphan = &rows.members[&tx(1)];
+        assert!(orphan.orphaned);
+        assert_eq!((orphan.queued, orphan.head), (None, None));
+    }
+
+    /// A crossing block over rows that each hold a tick carries no
+    /// marker: nothing is orphaned, so its discards alone fill the
+    /// manifest's lines, one per tick at the drain's cap. A marker beside
+    /// them would leave a tick standing past the crossing.
+    #[test]
+    fn a_crossing_block_with_every_row_held_carries_no_marker() {
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        for at in 0..MAX_TICK_LINES_PER_BLOCK {
+            let tick = BlockHeight::new(at as u64 + 1);
+            let row = MemberRow {
+                tx: many(at),
+                state: RowState::Stated {
+                    tick,
+                    receipt: GlobalReceiptHash::ZERO,
+                },
+                ..standing(0, far(), RowState::Pending, false)
+            };
+            rows.members.insert(row.tx, row);
+            rows.ticks.insert(
+                tick,
+                TickRow {
+                    members: Capped::from_array([many(at)]),
+                    determined_unsettled: false,
+                    awaiting: 1,
+                },
+            );
+        }
+        let crossing = BlockHeight::new(MAX_TICK_LINES_PER_BLOCK as u64 + 1);
+        let every = bands(&[band(0, u64::MAX / 1_000)]);
+        assert_eq!(rows.recovery_marker(every.clone(), crossing), None);
+
+        let live = Evidence::Live { terminating: false };
+        let (lines, missing) = lines_at(&rows, ms(1), live, true);
+        assert!(missing.is_empty());
+        assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK, "a discard per tick");
+
+        let forced = TickLine::Recovered { bands: every };
+        let (overfull, _, _) = member_lines(
+            Naming {
+                rows: &rows,
+                anchor: ms(1),
+                inputs: &Held::default(),
+                evidence: &|_, _| live,
+                recovery: true,
+                marker: Some(&forced),
+                wounded: &BTreeSet::new(),
+            },
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            overfull.len() - 1,
+            MAX_TICK_LINES_PER_BLOCK - 1,
+            "a marker beside them leaves a tick's discard out"
+        );
+    }
+
+    /// A terminal fates every row, so no head outlives it: the rows it
+    /// leaves root no `Serves` entry.
+    #[test]
+    fn a_terminal_roots_no_head() {
+        use hyperscale_storage::Substates;
+
+        let mut rows = rows_of([keyed_core(tx(1), 1, true), keyed_core(tx(2), 1, true)]);
+        let (owner, serves) = MemberCollection::Serves.of(ShardId::ROOT);
+        assert!(
+            !rows
+                .entries_in_range(owner, serves, 0, u128::MAX, 8)
+                .is_empty()
+        );
+        let fates = terminal_fates(&rows);
+        naming(&mut rows, 2, fates);
+        assert!(rows.members.is_empty());
+        assert!(
+            rows.entries_in_range(owner, serves, 0, u128::MAX, 8)
+                .is_empty()
+        );
     }
 
     /// The seeds of the rows [`before_a_halt`] stands.
@@ -5017,6 +5297,7 @@ mod tests {
                 queued: None,
                 head: None,
                 blocked_at: None,
+                orphaned: false,
             },
         );
         rows.ticks.insert(
@@ -5154,6 +5435,7 @@ mod tests {
             queued: None,
             head: None,
             blocked_at: None,
+            orphaned: false,
         };
         let in_flight = RowState::InFlight {
             tick: BlockHeight::new(2),
@@ -5256,6 +5538,7 @@ mod tests {
             queued: None,
             head: None,
             blocked_at: None,
+            orphaned: false,
         };
         let pending = stating(waiting, far(), &leg(declared.to_vec(), &[PEER]));
         for member in [in_flight, pending] {
@@ -6075,6 +6358,7 @@ mod tests {
                 inputs: &Held::default(),
                 evidence: &|_, _| Evidence::Live { terminating: false },
                 recovery: false,
+                marker: None,
                 wounded: &BTreeSet::new(),
             },
             views,
@@ -6207,6 +6491,7 @@ mod tests {
             inputs: &Held::default(),
             evidence: &evidence,
             recovery: false,
+            marker: None,
             wounded: &BTreeSet::new(),
         };
         let (lines, missing, budget) = licensed_lines(naming, &views);
@@ -6468,6 +6753,7 @@ mod tests {
                     inputs: &sets,
                     evidence: &|shard, committed| sets.evidence(shard, committed),
                     recovery: false,
+                    marker: None,
                     wounded: &BTreeSet::new(),
                 },
                 &BTreeMap::new(),
@@ -6531,6 +6817,7 @@ mod tests {
                 inputs: sets,
                 evidence: &|shard, committed| sets.evidence(shard, committed),
                 recovery: false,
+                marker: None,
                 wounded: &BTreeSet::new(),
             },
             &views,
@@ -6973,6 +7260,7 @@ mod tests {
                 inputs: &Held::default(),
                 evidence: &live,
                 recovery: true,
+                marker: None,
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),
@@ -6994,6 +7282,7 @@ mod tests {
                 inputs: &Held::default(),
                 evidence: &live,
                 recovery: true,
+                marker: None,
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),
@@ -7109,7 +7398,10 @@ mod tests {
                 .iter()
                 .filter_map(|line| match line {
                     TickLine::Member { tx, joins, .. } => Some((*tx, *joins)),
-                    TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+                    TickLine::Fate { .. }
+                    | TickLine::Discard { .. }
+                    | TickLine::End { .. }
+                    | TickLine::Recovered { .. } => None,
                 })
                 .collect()
         }

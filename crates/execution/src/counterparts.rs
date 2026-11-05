@@ -2085,7 +2085,10 @@ impl Counterparts {
             .iter()
             .filter_map(|line| match line {
                 TickLine::Fate { tx, .. } => self.ledger.fated(*tx),
-                TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+                TickLine::Member { .. }
+                | TickLine::Discard { .. }
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. } => None,
             })
             .collect();
         settled.extend(self.ledger.closes());

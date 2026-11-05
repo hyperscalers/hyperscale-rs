@@ -934,6 +934,7 @@ impl<'w> Naming<'w> {
                 inputs: &self.inputs,
                 evidence: &|_, _| Evidence::Readable,
                 recovery: false,
+                marker: None,
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),

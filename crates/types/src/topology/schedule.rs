@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use crate::{
     Anchor, BlockHeader, BlockHeight, CertifiedBlockHeader, Epoch, EpochWindows, PriceTable,
-    RecoveryBinding, ReshapeThresholds, SeedRing, ShardAnchor, ShardForkProof, ShardId, ShardTrie,
-    TopologySnapshot, ValidatorId, WeightedTimestamp,
+    RecoveryBands, RecoveryBinding, ReshapeThresholds, SeedRing, ShardAnchor, ShardForkProof,
+    ShardId, ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
 /// A window this schedule does not hold as the fold before it first
@@ -997,6 +997,37 @@ impl TopologySchedule {
             .recovery_bindings(shard)
             .next_back()
             .is_some_and(|newest| parent < newest.bridge() && newest.bridge() <= anchor)
+    }
+
+    /// The bands a recovery marker of `shard`'s block carries, where the
+    /// block is the shard's [`crossing_block`](Self::crossing_block):
+    /// every binding `committee`, the snapshot at the parent's anchor,
+    /// holds for the shard, oldest first, each bridge placed on this
+    /// schedule's grid. `None` on any other block.
+    ///
+    /// # Panics
+    ///
+    /// Never: a snapshot holds at most the history the beacon keeps and
+    /// one pending binding, which [`MAX_RECOVERY_BANDS`] counts.
+    ///
+    /// [`MAX_RECOVERY_BANDS`]: crate::MAX_RECOVERY_BANDS
+    #[must_use]
+    pub fn recovery_bands(
+        &self,
+        committee: &TopologySnapshot,
+        shard: ShardId,
+        parent_anchor_wt: WeightedTimestamp,
+        anchor_wt: WeightedTimestamp,
+    ) -> Option<RecoveryBands> {
+        if !self.crossing_block(committee, shard, parent_anchor_wt, anchor_wt) {
+            return None;
+        }
+        let windows = self.windows();
+        let bands = committee
+            .recovery_bindings(shard)
+            .map(|binding| binding.band(windows))
+            .collect();
+        Some(RecoveryBands::new(bands).expect("a snapshot's bindings fit a marker"))
     }
 
     /// The highest height at which no work of `shard` is
@@ -4043,6 +4074,73 @@ mod tests {
             ValidatorSet::new(vec![]),
         ));
         assert!(!sched.crossing_block(&plain, shard, at(40), at(41)));
+    }
+
+    /// A crossing block's marker carries every binding the snapshot at
+    /// its parent's anchor holds for the shard, oldest first: a full
+    /// stamped history and the pending binding not yet stamped, each
+    /// band orphaning exactly what its binding does. No other block
+    /// carries one.
+    #[test]
+    fn a_marker_carries_every_binding_the_snapshot_holds() {
+        use crate::{MAX_RECOVERY_BANDS, RECOVERY_HISTORY_DEPTH};
+
+        let shard = ShardId::leaf(1, 0);
+        let binding = |rotated_at: u64, frontier: u64| RecoveryBinding {
+            rotated_at: Epoch::new(rotated_at),
+            attested_frontier: BlockHeight::new(frontier),
+            completed: true,
+        };
+        let history: Vec<RecoveryBinding> = (0..RECOVERY_HISTORY_DEPTH as u64)
+            .map(|at| binding(10 * (at + 1), 5 * (at + 1)))
+            .collect();
+        let pending_at = 10 * (RECOVERY_HISTORY_DEPTH as u64 + 1);
+        let pending_frontier = 5 * (RECOVERY_HISTORY_DEPTH as u64 + 1);
+        let head = Arc::new(
+            TopologySnapshot::new(NetworkDefinition::simulator(), 2, ValidatorSet::new(vec![]))
+                .with_recoveries(std::iter::once((shard, history)).collect())
+                .with_pending_recoveries(
+                    std::iter::once((
+                        shard,
+                        halt_recovery_at(pending_at, &[], BlockHeight::new(pending_frontier)),
+                    ))
+                    .collect(),
+                ),
+        );
+        let windows = EpochWindows::new(0, 1000);
+        let sched = TopologySchedule::new(windows, Epoch::new(pending_at + 1), Arc::clone(&head));
+        let at = |epoch: u64| WeightedTimestamp::from_millis(epoch * 1_000 + 100);
+
+        let bands = sched
+            .recovery_bands(&head, shard, at(pending_at), at(pending_at + 1))
+            .expect("the block crosses the newest bridge");
+        let bindings: Vec<RecoveryBinding> = head.recovery_bindings(shard).collect();
+        assert_eq!(bindings.len(), MAX_RECOVERY_BANDS);
+        assert_eq!(bands.len(), MAX_RECOVERY_BANDS);
+        for (band, binding) in bands.iter().zip(&bindings) {
+            assert_eq!(band.attested_frontier, binding.attested_frontier);
+            assert_eq!(band.bridge_start, windows.window_of(binding.bridge()).start);
+            for height in 0..=60 {
+                for epoch in 0..=60 {
+                    for ms in [0, 999] {
+                        let clock = WeightedTimestamp::from_millis(epoch * 1_000 + ms);
+                        let height = BlockHeight::new(height);
+                        assert_eq!(
+                            band.orphans(height, clock),
+                            binding.orphans(windows, height, clock),
+                            "{binding:?} at {height:?}, {clock:?}",
+                        );
+                    }
+                }
+            }
+        }
+        for (parent, block) in [(pending_at + 1, pending_at + 2), (3, 4)] {
+            assert_eq!(
+                sched.recovery_bands(&head, shard, at(parent), at(block)),
+                None,
+                "a block anchored in {block} over one in {parent} carries no marker",
+            );
+        }
     }
 
     /// Only the crossing block crosses: a block past it, while the

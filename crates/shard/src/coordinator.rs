@@ -2994,7 +2994,14 @@ impl ShardCoordinator {
                 "a block between the committed tip and the parent is not held".into(),
             ));
         };
-        let pending = self.voted_inputs(topology_schedule, committee, block, anchor);
+        let marker = if kind == ManifestKind::Members {
+            self.voted_marker(topology_schedule, committee, block, &ancestry.rows)?
+        } else {
+            None
+        };
+        let pending = self
+            .voted_inputs(topology_schedule, committee, block, anchor)
+            .marked(marker.clone());
         // A legs half is judged over the parent's rows advanced by the
         // block's claims alone, before any finalization of the block
         // settles: its names accept on what the siblings' state says.
@@ -3039,7 +3046,7 @@ impl ShardCoordinator {
                 committee,
                 block,
                 &ancestry,
-                &rows,
+                (&rows, marker.as_ref()),
                 &verdicts,
             )?;
             (lines, Some(budget))
@@ -3088,10 +3095,52 @@ impl ShardCoordinator {
         })
     }
 
+    /// The recovery marker `block` must carry first: the one `parent`,
+    /// the rows at its parent, and `committee`, the snapshot at the
+    /// parent's anchor, give a crossing block that orphans a row, and
+    /// none on any other block. Known before naming, so the block's
+    /// content is folded with it.
+    ///
+    /// # Errors
+    ///
+    /// Deferred while the parent's anchor is not held; refused where the
+    /// block carries another marker, or none where one is owed.
+    fn voted_marker(
+        &self,
+        topology_schedule: &TopologySchedule,
+        committee: &TopologySnapshot,
+        block: &Block,
+        parent: &MemberIndex,
+    ) -> Result<Option<TickLine>, Withheld> {
+        let Some(parent_anchor) = self.block_anchor(block.header().parent_block_hash()) else {
+            return Err(Withheld::deferred("the parent's anchor is not held".into()));
+        };
+        let marker = topology_schedule
+            .recovery_bands(
+                committee,
+                self.local_shard,
+                parent_anchor,
+                block.header().parent_qc().weighted_timestamp(),
+            )
+            .and_then(|bands| parent.recovery_marker(bands, block.height()));
+        let carried = block
+            .tick_manifest()
+            .first()
+            .filter(|line| matches!(line, TickLine::Recovered { .. }));
+        if carried != marker.as_ref() {
+            return Err(Withheld::Refused(format!(
+                "the block carries the recovery marker {carried:?} where its parent's rows give \
+                 {marker:?}"
+            )));
+        }
+        Ok(marker)
+    }
+
     /// The member lines the chain up to `block`'s parent names over
-    /// `rows`, the family after the block's own content, acting on the
-    /// `verdicts` the block carries for its stated rows, and what they
-    /// leave of the manifest's budget.
+    /// `rows`, the family after the block's own content folded with
+    /// `marker`, the block's recovery marker where it carries one, acting
+    /// on the `verdicts` the block carries for its stated rows, and what
+    /// they leave of the manifest's budget.
     ///
     /// # Errors
     ///
@@ -3104,7 +3153,7 @@ impl ShardCoordinator {
         committee: &TopologySnapshot,
         block: &Block,
         ancestry: &Ancestry,
-        rows: &MemberIndex,
+        (rows, marker): (&MemberIndex, Option<&TickLine>),
         verdicts: &BTreeMap<TxHash, Decision>,
     ) -> Result<(Vec<TickLine>, ManifestBudget), Withheld> {
         let own = OwnContent::of(
@@ -3134,6 +3183,7 @@ impl ShardCoordinator {
                 inputs: &sets,
                 evidence: &|shard, committed| sets.evidence(shard, committed),
                 recovery,
+                marker,
                 wounded: &victims,
             },
             verdicts,
@@ -3161,6 +3211,17 @@ impl ShardCoordinator {
         payload: Option<&ProposalPayload>,
     ) -> Option<ManifestInputs> {
         let ancestry = self.ancestry(topology_schedule.windows(), parent)?;
+        let kind = self.manifest_kind(topology_schedule, parent, anchor)?;
+        let bands = topology_schedule.recovery_bands(
+            committee,
+            self.local_shard,
+            self.block_anchor(parent)?,
+            anchor,
+        );
+        let recovery = bands.is_some();
+        let marker = bands
+            .filter(|_| kind == ManifestKind::Members)
+            .and_then(|bands| ancestry.rows.recovery_marker(bands, height));
         let rows = self.rows_under(
             &ancestry,
             topology_schedule.windows(),
@@ -3168,6 +3229,7 @@ impl ShardCoordinator {
             height,
             anchor,
             payload,
+            marker.as_ref(),
         );
         let mut held = committed_sets(
             &rows,
@@ -3183,16 +3245,11 @@ impl ShardCoordinator {
             topology_schedule,
             anchor,
         );
-        let recovery = topology_schedule.crossing_block(
-            committee,
-            self.local_shard,
-            self.block_anchor(parent)?,
-            anchor,
-        );
         Some(ManifestInputs {
             committed: held,
             recovery,
-            kind: self.manifest_kind(topology_schedule, parent, anchor)?,
+            marker,
+            kind,
         })
     }
 
@@ -3206,7 +3263,9 @@ impl ShardCoordinator {
     /// rows in everything but what its claims say, and nothing read off
     /// them may turn on a reading. Folded as content, as a proposer and
     /// a voter fold the block ahead of its lines: a determined member
-    /// the block commits takes no waiter place here.
+    /// the block commits takes no waiter place here, and the block's
+    /// recovery `marker`, where it carries one, orphans what it orphans.
+    #[allow(clippy::too_many_arguments)] // the block's parts the rows fold, beside its committee
     fn rows_under(
         &self,
         ancestry: &Ancestry,
@@ -3215,28 +3274,37 @@ impl ShardCoordinator {
         height: BlockHeight,
         anchor: WeightedTimestamp,
         payload: Option<&ProposalPayload>,
+        marker: Option<&TickLine>,
     ) -> MemberIndex {
         let local = self.local_shard;
         let mut rows = ancestry.rows.clone();
-        if let Some(payload) = payload {
-            rows.advance_content(&MemberInputs::deriving(
+        if payload.is_none() && marker.is_none() {
+            return rows;
+        }
+        let (transactions, finalizations, records) =
+            payload.map_or((&[][..], &[][..], &[][..]), |payload| {
+                (
+                    &payload.transactions[..],
+                    &payload.finalizations[..],
+                    &payload.abandonment_records[..],
+                )
+            });
+        rows.advance_content(
+            &MemberInputs::deriving(
                 local,
                 height,
                 anchor,
-                payload.transactions.iter().map(|tx| &**tx),
+                transactions.iter().map(|tx| &**tx),
                 MemberSections {
-                    certificates: &payload.finalizations,
-                    records: &payload.abandonment_records,
+                    certificates: finalizations,
+                    records,
                     claims: &[],
                 },
                 windows,
-                derived_terms(
-                    committee,
-                    local,
-                    payload.transactions.iter().map(|tx| &**tx),
-                ),
-            ));
-        }
+                derived_terms(committee, local, transactions.iter().map(|tx| &**tx)),
+            )
+            .marked(marker.cloned()),
+        );
         rows
     }
 
@@ -10487,16 +10555,16 @@ mod tests {
         MAX_TICK_MANIFEST_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK,
         MAX_UNSETTLED_TXS, MemberTerms, MerkleInclusionProof, Mode, Modes, NetworkDefinition,
         NetworkId, NetworkParams, Owes, PROGRESS_WAIT_MULTIPLIER, Pin, PrincipalAddr,
-        ProvisionTxRoot, RETENTION_HORIZON, ReadFence, ReadMark, Reading, RevealChain, Role,
-        RoutePrefix, Routing, Said, SectionRoots, SettledTxSet, SettledTxsRoot, SettledWrites,
-        Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
-        StateWrites, StatedTerms, SubstateClaim, SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS,
-        TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine,
-        TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
-        TransactionEnvelope, TxOutcome, Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_MAX,
-        ValidatorId, ValidatorInfo, ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp,
-        WitnessSources, decide, encode_amount, pins_of, read_amount, receipt_hash_of, said_at,
-        test_utils, tick_terms_admit_block, verdict_leaf,
+        ProvisionTxRoot, RETENTION_HORIZON, ReadFence, ReadMark, Reading, RecoveryBand,
+        RevealChain, Role, RoutePrefix, Routing, Said, SectionRoots, SettledTxSet, SettledTxsRoot,
+        SettledWrites, Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield,
+        StateClaimsRoot, StateWrites, StatedTerms, SubstateClaim, SweepFrontier, SyncHint,
+        TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_RESERVE_BYTES, Terms,
+        TickHalf, TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot,
+        Transaction, TransactionDecision, TransactionEnvelope, TxOutcome, Unresolved, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, ValidatorInfo, ValidatorSet, Value, VoteCount,
+        VrfProof, WeightedTimestamp, WitnessSources, decide, encode_amount, pins_of, read_amount,
+        receipt_hash_of, said_at, test_utils, tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{
@@ -11611,9 +11679,250 @@ mod tests {
     /// parent's rows hold, refusing the same lines without it.
     #[test]
     fn a_crossing_block_names_the_recovery_discard_on_proposer_and_voter() {
+        let (state, plain, parent, [_held, first, second]) = one_of_three_in_flight();
+        let recovered = recovered_over(&plain);
+        let committee = Arc::clone(recovered.head());
+        let anchor = WeightedTimestamp::from_millis(2_000);
+        let inputs = state
+            .manifest_inputs(
+                &recovered,
+                &committee,
+                parent,
+                BlockHeight::new(3),
+                anchor,
+                None,
+            )
+            .expect("the tip is held");
+        assert!(inputs.recovery, "the proposer reads the crossing");
+        assert_eq!(
+            inputs.marker, None,
+            "no row is the lost tail's to have served"
+        );
+        let plain_committee = Arc::clone(plain.head());
+        assert!(
+            !state
+                .manifest_inputs(
+                    &plain,
+                    &plain_committee,
+                    parent,
+                    BlockHeight::new(3),
+                    anchor,
+                    None
+                )
+                .expect("the tip is held")
+                .recovery
+        );
+
+        let child = |lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(3), parent, 2_000),
+                &[],
+                lines,
+            )
+        };
+        let discard = TickLine::Discard {
+            tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+            cause: DiscardCause::Recovery,
+        };
+        let crossing = child(vec![discard.clone(), member(&first), member(&second)]);
+        let admitted = state.check_tick_manifest(&recovered, &committee, &crossing);
+        assert!(admitted.is_ok(), "{admitted:?}");
+        assert!(matches!(
+            state.check_tick_manifest(
+                &recovered,
+                &committee,
+                &child(vec![member(&first), member(&second)])
+            ),
+            Err(Withheld::Refused(_))
+        ));
+        assert!(
+            matches!(
+                state.check_tick_manifest(
+                    &recovered,
+                    &committee,
+                    &child(vec![
+                        crossing_marker(),
+                        discard,
+                        member(&first),
+                        member(&second)
+                    ])
+                ),
+                Err(Withheld::Refused(_))
+            ),
+            "a marker that orphans nothing is refused"
+        );
+    }
+
+    /// The marker [`recovered_over`]'s crossing block carries: its one
+    /// band, the frontier at genesis and the bridge opening at two
+    /// seconds.
+    fn crossing_marker() -> TickLine {
+        TickLine::Recovered {
+            bands: Capped::from_array([RecoveryBand {
+                attested_frontier: BlockHeight::GENESIS,
+                bridge_start: WeightedTimestamp::from_millis(2_000),
+            }]),
+        }
+    }
+
+    /// A core member a sibling on another shard shares the verdict on,
+    /// committed at height 1 and waiting unplaced on a cell this shard
+    /// owns, beside the line aborting it unnamed.
+    fn unheaded_core() -> (MemberRow, TickLine) {
+        use hyperscale_storage::Waiting;
+        use hyperscale_types::{Holds, LocalKey, Reach};
+        use hyperscale_vm_types::Moves;
+
+        let declared: Holds = Capped::from_array([(
+            DeclaredKey::Cell(SubstateKey {
+                owner: Address::new([0x31; 31], AddressClass::Component),
+                local: LocalKey([1; 16]),
+            }),
+            Mode::Write { moves: Moves::Both },
+        )]);
+        let peer: Reach = Capped::from_array([ShardId::leaf(1, 1)]);
+        let row = MemberRow {
+            tx: TxHash::from(Hash::from_bytes(b"an unheaded core")),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 2)),
+            committed: WeightedTimestamp::from_millis(1_000),
+            height: BlockHeight::new(1),
+            state: RowState::Pending,
+            holds: Capped::empty(),
+            reach: peer.clone(),
+            awaits: peer.clone(),
+            charge: stub_abort_charge(9),
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            owes: Owes::default(),
+            waiting: Some(Waiting {
+                leg: false,
+                settlement: Settlement::Shared,
+                declared,
+                engages: Capped::empty(),
+                waits: false,
+                staged: 0,
+                unarrived: Capped::empty(),
+            }),
+            covered: false,
+            executed: false,
+            hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
+            orphaned: false,
+        };
+        let abort = TickLine::Member {
+            staged: 0,
+            tx: row.tx,
+            joins: Joins::Aborted,
+            settlement: Settlement::Awaited,
+            holds: Capped::empty(),
+            pins: Capped::empty(),
+            reach: peer,
+            awaits: Capped::empty(),
+            charge: row.charge,
+            share: 0,
+            reserves: Capped::empty(),
+            deadline: row.deadline,
+            crossings: Capped::empty(),
+        };
+        (row, abort)
+    }
+
+    /// A voter refuses a crossing block that omits the marker where the
+    /// marker orphans a row, or carries another one, and admits it with
+    /// the marker its parent's rows and committee give, named first and
+    /// followed by the orphan's abort. The proposer seeds its manifest
+    /// with the same marker.
+    #[test]
+    fn a_voter_refuses_a_crossing_block_without_its_marker() {
+        let (mut state, plain, parent, [_held, first, second]) = one_of_three_in_flight();
+        let (orphan, abort) = unheaded_core();
+        state.member_rows.insert_row(orphan);
+        let recovered = recovered_over(&plain);
+        let committee = Arc::clone(recovered.head());
+        let inputs = state
+            .manifest_inputs(
+                &recovered,
+                &committee,
+                parent,
+                BlockHeight::new(3),
+                WeightedTimestamp::from_millis(2_000),
+                None,
+            )
+            .expect("the tip is held");
+        assert_eq!(
+            inputs.marker,
+            Some(crossing_marker()),
+            "the proposer seeds it"
+        );
+
+        let child = |lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(3), parent, 2_000),
+                &[],
+                lines,
+            )
+        };
+        let discard = TickLine::Discard {
+            tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+            cause: DiscardCause::Recovery,
+        };
+        let admitted = state.check_tick_manifest(
+            &recovered,
+            &committee,
+            &child(vec![
+                crossing_marker(),
+                discard.clone(),
+                abort.clone(),
+                member(&first),
+                member(&second),
+            ]),
+        );
+        assert!(admitted.is_ok(), "{admitted:?}");
+
+        let other = TickLine::Recovered {
+            bands: Capped::from_array([RecoveryBand {
+                attested_frontier: BlockHeight::new(1),
+                bridge_start: WeightedTimestamp::from_millis(2_000),
+            }]),
+        };
+        for (refused, why) in [
+            (
+                vec![
+                    discard.clone(),
+                    abort.clone(),
+                    member(&first),
+                    member(&second),
+                ],
+                "the marker omitted",
+            ),
+            (
+                vec![discard.clone(), member(&first), member(&second)],
+                "the marker and the orphan's abort omitted",
+            ),
+            (
+                vec![other, discard, abort, member(&first), member(&second)],
+                "another marker",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(&recovered, &committee, &child(refused)),
+                    Err(Withheld::Refused(_))
+                ),
+                "{why}",
+            );
+        }
+    }
+
+    /// `plain` with a halt recovery of the root shard seated at epoch 1
+    /// and its frontier at genesis, so a block anchored in epoch 2 over a
+    /// parent anchored below it is the crossing block.
+    fn recovered_over(plain: &TopologySchedule) -> TopologySchedule {
         use hyperscale_types::{RecoveryBinding, RecoveryCause, ShardRecovery};
 
-        let (state, plain, parent, [_held, first, second]) = one_of_three_in_flight();
         let head = (**plain.head())
             .clone()
             .with_recoveries(BTreeMap::from([(
@@ -11641,56 +11950,7 @@ mod tests {
         for epoch in 0..=3 {
             recovered.insert(Epoch::new(epoch), Arc::new(head.clone()));
         }
-        let committee = Arc::clone(recovered.head());
-        let anchor = WeightedTimestamp::from_millis(2_000);
-        let inputs = state
-            .manifest_inputs(
-                &recovered,
-                &committee,
-                parent,
-                BlockHeight::new(3),
-                anchor,
-                None,
-            )
-            .expect("the tip is held");
-        assert!(inputs.recovery, "the proposer reads the crossing");
-        let plain_committee = Arc::clone(plain.head());
-        assert!(
-            !state
-                .manifest_inputs(
-                    &plain,
-                    &plain_committee,
-                    parent,
-                    BlockHeight::new(3),
-                    anchor,
-                    None
-                )
-                .expect("the tip is held")
-                .recovery
-        );
-
-        let child = |lines: Vec<TickLine>| {
-            carrying(
-                block_chained_on(BlockHeight::new(3), parent, 2_000),
-                &[],
-                lines,
-            )
-        };
-        let discard = TickLine::Discard {
-            tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
-            cause: DiscardCause::Recovery,
-        };
-        let crossing = child(vec![discard, member(&first), member(&second)]);
-        let admitted = state.check_tick_manifest(&recovered, &committee, &crossing);
-        assert!(admitted.is_ok(), "{admitted:?}");
-        assert!(matches!(
-            state.check_tick_manifest(
-                &recovered,
-                &committee,
-                &child(vec![member(&first), member(&second)])
-            ),
-            Err(Withheld::Refused(_))
-        ));
+        recovered
     }
 
     /// A voter refuses a block whose manifest carries an end line: the
@@ -13608,6 +13868,7 @@ mod tests {
             height,
             anchor,
             Some(&selected),
+            None,
         );
 
         let block = proposed_on_tip(
@@ -13653,6 +13914,7 @@ mod tests {
             height,
             anchor,
             Some(&payload),
+            None,
         );
         let row = &gathered.members[&determined.hash()];
         assert_eq!(row.state, RowState::Pending);
@@ -14826,7 +15088,10 @@ mod tests {
             .iter()
             .filter_map(|line| match line {
                 TickLine::Member { tx, .. } => Some(*tx),
-                TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+                TickLine::Fate { .. }
+                | TickLine::Discard { .. }
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. } => None,
             })
             .collect()
     }

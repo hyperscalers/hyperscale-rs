@@ -357,7 +357,10 @@ fn burn_without_its_hold(
     });
     let fated = manifest.iter().filter_map(|line| match line {
         TickLine::Fate { tx, charge } => Some((*tx, charge.vault)),
-        TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+        TickLine::Member { .. }
+        | TickLine::Discard { .. }
+        | TickLine::End { .. }
+        | TickLine::Recovered { .. } => None,
     });
     charged.chain(fated).find(|(tx, vault)| {
         key_under_prefix(&vault.to_bytes(), prefix)

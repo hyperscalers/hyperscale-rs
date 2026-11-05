@@ -2404,6 +2404,7 @@ mod tests {
             queued: None,
             head: None,
             blocked_at: None,
+            orphaned: false,
         }
     }
 

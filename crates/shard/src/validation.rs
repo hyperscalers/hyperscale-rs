@@ -461,7 +461,10 @@ pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
         .iter()
         .filter_map(|line| match line {
             TickLine::Member { staged, .. } => Some(*staged),
-            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+            TickLine::Fate { .. }
+            | TickLine::Discard { .. }
+            | TickLine::End { .. }
+            | TickLine::Recovered { .. } => None,
         })
         .fold(0u64, u64::saturating_add);
     if staged > MAX_TICK_STAGED_BYTES {
@@ -571,7 +574,7 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
     // chain up to its parent.
     if let Some(line) = block.tick_manifest().iter().find(|line| match line {
         TickLine::Fate { .. } | TickLine::End { .. } => false,
-        TickLine::Member { .. } | TickLine::Discard { .. } => true,
+        TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::Recovered { .. } => true,
     }) {
         return Err(format!(
             "coast block past the terminal window carries tick lines other than fates and ends: {line:?}"
@@ -765,6 +768,7 @@ pub mod tests {
             queued: None,
             head: None,
             blocked_at: None,
+            orphaned: false,
         }
     }
 
@@ -2927,6 +2931,7 @@ pub mod tests {
                     inputs: &CommittedSets::default(),
                     evidence: &|_, _| Evidence::Live { terminating: false },
                     recovery: false,
+                    marker: None,
                     wounded: &BTreeSet::new(),
                 },
                 &BTreeMap::new(),
@@ -4866,6 +4871,7 @@ pub mod tests {
                 inputs: &arrived,
                 evidence: &|_, _| Evidence::Live { terminating: false },
                 recovery: false,
+                marker: None,
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),
@@ -4907,6 +4913,7 @@ pub mod tests {
                 inputs: arrived,
                 evidence: &|_, _| Evidence::Live { terminating: false },
                 recovery: true,
+                marker: None,
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),
@@ -4984,6 +4991,7 @@ pub mod tests {
                                 inputs: arrived,
                                 evidence: &|_, _| said,
                                 recovery: false,
+                                marker: None,
                                 wounded: &BTreeSet::new(),
                             },
                             &BTreeMap::new(),
@@ -5193,6 +5201,7 @@ pub mod tests {
                             inputs: arrived,
                             evidence: &|_, _| said,
                             recovery,
+                            marker: None,
                             wounded: &BTreeSet::new(),
                         },
                         &BTreeMap::new(),

@@ -98,6 +98,7 @@ fn lines_at(sim: &ExecutionSim, anchor: WeightedTimestamp) -> Vec<TickLine> {
             inputs: &CommittedSets::default(),
             evidence: &|_, _| Evidence::Live { terminating: false },
             recovery: false,
+            marker: None,
             wounded: &BTreeSet::new(),
         },
         &BTreeMap::new(),
