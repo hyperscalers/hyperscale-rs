@@ -3202,7 +3202,9 @@ impl ShardCoordinator {
     /// against the parent's read frontier and beside the readings taken
     /// at the parent, so these rows hear nothing: they are the block's
     /// rows in everything but what its claims say, and nothing read off
-    /// them may turn on a reading.
+    /// them may turn on a reading. Folded as content, as a proposer and
+    /// a voter fold the block ahead of its lines: a determined member
+    /// the block commits takes no waiter place here.
     fn rows_under(
         &self,
         ancestry: &Ancestry,
@@ -3215,7 +3217,7 @@ impl ShardCoordinator {
         let local = self.local_shard;
         let mut rows = ancestry.rows.clone();
         if let Some(payload) = payload {
-            rows.advance(&MemberInputs::deriving(
+            rows.advance_content(&MemberInputs::deriving(
                 local,
                 height,
                 anchor,
@@ -13622,6 +13624,60 @@ mod tests {
         folded.advance(&MemberInputs::of(&block, windows));
         assert_eq!(gathered_over, folded);
         assert!(hearing_of(&folded, &tx).is_empty());
+    }
+
+    /// The rows a proposer gathers over fold the block as content: a
+    /// determined member it commits stands `Pending` with no waiter
+    /// place, which only the fold of the block with its lines gives.
+    #[test]
+    fn the_rows_inputs_are_gathered_over_place_no_waiter() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"gathered tip"));
+        let (state, schedule) =
+            committed_through(from, [block_chained_on(BlockHeight::new(1), from, 1_000)]);
+        let windows = schedule.windows();
+        let committee = Arc::clone(schedule.head());
+        let ancestry = state
+            .ancestry(windows, state.committed_hash)
+            .expect("the tip is held");
+        let determined = test_transaction(2);
+        let payload = payload_of(std::slice::from_ref(&determined), Vec::new());
+        let height = state.committed_height.next();
+        let anchor = WeightedTimestamp::from_millis(1_500);
+
+        let gathered = state.rows_under(
+            &ancestry,
+            windows,
+            &committee,
+            height,
+            anchor,
+            Some(&payload),
+        );
+        let row = &gathered.members[&determined.hash()];
+        assert_eq!(row.state, RowState::Pending);
+        assert_eq!(row.queued, None, "no waiter place");
+
+        let mut whole = ancestry.rows;
+        whole.advance(&MemberInputs::deriving(
+            ShardId::ROOT,
+            height,
+            anchor,
+            payload.transactions.iter().map(|tx| &**tx),
+            MemberSections {
+                certificates: &payload.finalizations,
+                records: &payload.abandonment_records,
+                claims: &[],
+            },
+            windows,
+            derived_terms(
+                &committee,
+                ShardId::ROOT,
+                payload.transactions.iter().map(|tx| &**tx),
+            ),
+        ));
+        assert!(
+            whole.members[&determined.hash()].queued.is_some(),
+            "a fold of the block without its lines would place it",
+        );
     }
 
     /// Proposer and voter count one block alike: a block that settles the

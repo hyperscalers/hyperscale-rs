@@ -916,6 +916,18 @@ impl MemberInputs {
         }
     }
 
+    /// These inputs with what their claims say read off `claims`
+    /// instead, their anchors marked on the `windows` grid: the inputs
+    /// of the block carrying `claims`, as its voters read them.
+    #[must_use]
+    pub fn carrying(self, claims: &[StateClaim], windows: EpochWindows) -> Self {
+        Self {
+            heard: AnchorReadings::among(claims, windows),
+            arrivals: record_arrivals(claims),
+            ..self
+        }
+    }
+
     /// What a block of these sections writes before any line of it is
     /// named, each transaction standing on the entry of `terms` that
     /// names it: the rows a proposer names its lines over and a voter
@@ -1735,9 +1747,9 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 
     /// Release `tx` from its tick, in flight or stated: `Released`,
     /// holding nothing, keeping nothing it heard, and standing nowhere
-    /// in the queue. Its place and head go too, so a release leaves the
-    /// same row whether or not a fold of the block's content made it head
-    /// first.
+    /// in the queue. Its place, head and block go too, so a release
+    /// leaves the same row whether or not a fold of the block's content
+    /// made it head first.
     fn release(&mut self, tx: TxHash) {
         if let Some(mut row) = self.member(tx) {
             let Some((_, _, settlement)) = row.state.held() else {
@@ -1748,6 +1760,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             row.hearing = Capped::empty();
             row.queued = None;
             row.head = None;
+            row.blocked_at = None;
             self.set_member(tx, Some(row));
         }
     }
@@ -9537,7 +9550,13 @@ mod tests {
                         }
                     }
                     self.places.retain(|tx, _| after.members.contains_key(tx));
-                    self.blocked.retain(|tx, _| after.members.contains_key(tx));
+                    // A release drops what blocked a row with its place.
+                    self.blocked.retain(|tx, _| {
+                        after
+                            .members
+                            .get(tx)
+                            .is_some_and(|row| !matches!(row.state, RowState::Released { .. }))
+                    });
                 }
 
                 /// Whether `row` stands in `Queue` here, by its state
@@ -10163,7 +10182,9 @@ mod tests {
         fn steady(shape: Shape) -> BTreeMap<&'static str, (usize, usize)> {
             let mut store = Store::default();
             let mut index = MemberIndex::empty(LOCAL);
-            let last = 6;
+            // The first block at which a shared batch is named, stated,
+            // accepted and ended in one: every shape's steady state.
+            let last = 5;
             for height in 1..last {
                 let (_, carried) = block_at(shape, height);
                 store.apply(&member_writes(&store, &carried));
@@ -10202,23 +10223,61 @@ mod tests {
             tallied
         }
 
-        #[test]
-        fn steady_state_member_writes_per_block() {
-            let run = steady(Shape::RunWhereCommitted);
-            for name in ["Queue", "Waiters", "Behind", "Serves"] {
-                assert_eq!(
-                    run.get(name),
-                    None,
-                    "a run where committed writes no {name}"
+        /// `shape`'s steady block writes exactly the collections
+        /// `expected` names, each within a quarter of the entries and
+        /// bytes measured for it.
+        fn writes_within(shape: Shape, expected: &[(&str, usize, usize)]) {
+            let tallied = steady(shape);
+            assert_eq!(
+                tallied.keys().copied().collect::<Vec<_>>(),
+                expected.iter().map(|(name, ..)| *name).collect::<Vec<_>>(),
+                "{shape:?} writes these collections and no other",
+            );
+            let near =
+                |got: usize, measured: usize| got * 4 >= measured * 3 && got * 4 <= measured * 5;
+            for &(name, entries, bytes) in expected {
+                let (got_entries, got_bytes) = tallied[name];
+                assert!(
+                    near(got_entries, entries),
+                    "{shape:?} {name}: {got_entries} entries, measured {entries}",
+                );
+                assert!(
+                    near(got_bytes, bytes),
+                    "{shape:?} {name}: {got_bytes} bytes, measured {bytes}",
                 );
             }
-            assert_eq!(
-                run.get("TickPins").map(|(entries, _)| *entries),
-                Some(2),
-                "one tick's pins written and one deleted"
+        }
+
+        #[test]
+        fn steady_state_member_writes_per_block() {
+            const B: usize = BATCH as usize;
+            // One tick's pins written and one deleted, and its row and
+            // the settled one's.
+            let ticks = [("TickPins", 2, 51 * B), ("Ticks", 2, 32 * B)];
+            writes_within(
+                Shape::RunWhereCommitted,
+                &[("Members", 2 * B, 160 * B), ticks[0], ticks[1]],
             );
-            steady(Shape::NamedALater);
-            steady(Shape::Shared);
+            writes_within(
+                Shape::NamedALater,
+                &[
+                    ("Members", 3 * B, 487 * B),
+                    ticks[0],
+                    ticks[1],
+                    ("Waiters", 6 * B, 147 * B),
+                ],
+            );
+            writes_within(
+                Shape::Shared,
+                &[
+                    ("Members", 5 * B, 1_355 * B),
+                    ("Queue", 10 * B, 245 * B),
+                    ("Seats", 2 * B, 32 * B),
+                    ("Staged", 2 * B, 38 * B),
+                    ticks[1],
+                    ("Verdicts", 3 * B, 116 * B),
+                ],
+            );
         }
     }
 }

@@ -448,7 +448,9 @@ impl PinIndex {
         self.live.contains_key(&order) || self.gone.contains(&order)
     }
 
-    /// The stored entries in `from..=hi`, at most `limit` of them.
+    /// The stored entries in `from..=hi`, at most `limit` of them: none
+    /// where `from` is past `hi`, as [`Substates::entries_in_range`]
+    /// answers.
     fn stored(
         &mut self,
         state: &(impl Substates + ?Sized),
@@ -456,6 +458,9 @@ impl PinIndex {
         hi: u128,
         limit: usize,
     ) -> Vec<(u128, Vec<u8>)> {
+        if from > hi {
+            return Vec::new();
+        }
         if matches!(self.whole, Whole::Unread) {
             let read =
                 state.entries_in_range(self.owner, self.collection, 0, u128::MAX, WHOLE_READ + 1);
@@ -719,6 +724,25 @@ mod tests {
                 queue_order(key, class, place),
                 Capped::new(named).expect("two at most"),
             )
+        }
+
+        /// A range whose start is past its end holds nothing, whether the
+        /// collection was read whole or is sought.
+        #[test]
+        fn a_range_past_its_end_is_empty() {
+            for sought in [false, true] {
+                let mut held = BTreeMap::from([(5u128, Vec::new())]);
+                if sought {
+                    for at in 0..=WHOLE_READ as u128 {
+                        held.insert((0xF0u128 << 120) | at, Vec::new());
+                    }
+                }
+                let state = Stored(held);
+                let mut index =
+                    PinIndex::new(&MemberFamily::of(ShardId::ROOT), MemberCollection::Queue);
+                assert_eq!(index.stored(&state, 0, 5, usize::MAX).len(), 1);
+                assert!(index.stored(&state, 6, 5, usize::MAX).is_empty());
+            }
         }
 
         proptest! {

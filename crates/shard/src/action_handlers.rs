@@ -400,6 +400,10 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         without_refused_reclaims(state_claims.into_inner(), &members, &merged, &anchored),
     )
     .expect("cutting a reading adds no claim");
+    // What the claims say off the claims carried, as every voter reads
+    // them: a record read only for a return the cut took back arrives
+    // nowhere.
+    let members = members.carrying(&state_claims, frontier.windows);
     let additions = answer_additions(
         &members,
         &state_claims,
