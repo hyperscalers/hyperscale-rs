@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_types::{
-    Anchor, BlockHash, BlockHeight, Provision, ProvisionTxRootsMap, ShardId, SubstateKey,
-    ValidatorId, WeightedTimestamp,
+    Anchor, BlockHash, BlockHeight, Provision, ProvisionTxRootsMap, ShardId, ShardTrie,
+    SharedTransactions, SubstateKey, ValidatorId, WeightedTimestamp,
 };
 
-use super::{Delegated, ProvisionsRequest};
+use super::Delegated;
 
 /// Provision work, run on the throughput dispatch pool.
 #[derive(Debug, Clone, strum::IntoStaticStr)]
@@ -38,19 +38,27 @@ pub enum ProvisionAction {
         signer: ValidatorId,
     },
 
-    /// Fetch state entries and broadcast provisions for all cross-shard txs in a block.
+    /// Fetch state entries and broadcast the parts a committed block
+    /// serves: those of the cross-shard transactions it commits, and of
+    /// the members it makes head, which it serves the targets sharing
+    /// their verdicts.
     ///
-    /// Only the block proposer emits this (once per block). Delegated to the
-    /// execution pool where it fetches entries, generates merkle proofs, builds
-    /// per-shard provision batches, groups by target shard, and returns batches via
+    /// Only the block proposer emits this (once per block), wherever the
+    /// header roots any target. Delegated to the execution pool where it
+    /// derives the block's requests over its state, fetches entries,
+    /// generates merkle proofs, builds per-shard provision batches, groups
+    /// by target shard, and returns batches via
     /// `ProtocolEvent::OutboundProvisionBroadcast` for network broadcast.
     FetchAndBroadcastProvisions {
         /// The committed block whose state is being attested to. Anchors
         /// state reads via `PendingChain::view_at`. Merkle proofs are
         /// generated against this block's state root.
         block_hash: BlockHash,
-        /// One entry per cross-shard tx that needs provisioning.
-        requests: Vec<ProvisionsRequest>,
+        /// The block's transactions.
+        transactions: SharedTransactions,
+        /// The trie the block's transactions are routed under: the one
+        /// its header's roots were computed under.
+        trie: ShardTrie,
         /// Shard producing the provisions (this validator's shard).
         source_shard: ShardId,
         /// Source-shard block height the provisions are anchored to.
@@ -62,7 +70,8 @@ pub enum ProvisionAction {
         /// The block header's `provision_tx_roots`: a target's parts are
         /// sent only when their leaves walk to its entry.
         claimed: ProvisionTxRootsMap,
-        /// Per-shard recipients for provision broadcasts (excluding self).
+        /// Per-shard recipients for provision broadcasts (excluding self):
+        /// one entry for each target the header roots.
         shard_recipients: HashMap<ShardId, Vec<ValidatorId>>,
         /// The signer preferred to sign the envelopes: the block's proposer.
         signer: ValidatorId,

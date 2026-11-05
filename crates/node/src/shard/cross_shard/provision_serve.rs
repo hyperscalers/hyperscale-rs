@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_provisions::{
-    Owed, ProvisionStore, build_part, provision_request, served_keys, served_leaf,
+    Owed, ProvisionStore, block_requests, build_part, served_keys, served_leaf,
 };
-use hyperscale_storage::{PendingChain, ShardStorage};
+use hyperscale_storage::{PendingChain, ShardStorage, Substates};
 use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::request::GetProvisionsRequest;
 use hyperscale_types::network::response::GetProvisionResponse;
@@ -212,7 +212,7 @@ pub fn owed_leaves<S: ShardStorage>(
             }
         }
     };
-    let requests = requests_under(trie, block, local_shard, target_shard);
+    let requests = requests_under(&state, trie, block, local_shard, target_shard);
     let owed = Owed::of(&state, &requests, target_shard);
     if owed.root() == Some(claimed) {
         return Some(Owing::Leaves(OwedLeaves::new(
@@ -267,7 +267,7 @@ pub fn build_served_parts<S: ShardStorage>(
     let Some(state) = view.served_snapshot() else {
         return Vec::new();
     };
-    let requests = requests_under(&owed.trie, block, local_shard, target_shard);
+    let requests = requests_under(&state, &owed.trie, block, local_shard, target_shard);
     if requests.len() != owed.leaves.len() {
         return Vec::new();
     }
@@ -327,27 +327,32 @@ fn held_block<S: ShardStorage>(
     Some(certified)
 }
 
-/// The requests `block`'s transactions owe `target_shard` routed under
-/// `trie`, in block order, each narrowed to that one target and at the
-/// clock the block commits them at: the same rule the proposer committed
-/// the header's root by.
+/// The requests `block` owes `target_shard` routed under `trie` over
+/// `state`, the state it left, in request order, each narrowed to that
+/// one target: the same rule the proposer committed the header's root
+/// by, its transactions' and its heads'.
 fn requests_under(
+    state: &impl Substates,
     trie: &ShardTrie,
     block: &Block,
     local_shard: ShardId,
     target_shard: ShardId,
 ) -> Vec<ProvisionsRequest> {
-    let clock = block.header().parent_qc().weighted_timestamp();
-    block
-        .transactions()
-        .iter()
-        .filter_map(|tx| provision_request(trie, tx, local_shard, clock))
-        .filter(|request| request.targets.contains(&target_shard))
-        .map(|mut request| {
-            request.targets = vec![target_shard];
-            request
-        })
-        .collect()
+    block_requests(
+        state,
+        trie,
+        local_shard,
+        block.height(),
+        block.header().parent_qc().weighted_timestamp(),
+        block.transactions(),
+    )
+    .into_iter()
+    .filter(|request| request.targets.contains(&target_shard))
+    .map(|mut request| {
+        request.targets = vec![target_shard];
+        request
+    })
+    .collect()
 }
 
 /// The answer to `req` from the parts this node built as the source
@@ -378,10 +383,11 @@ pub fn outbound_answer(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+    use hyperscale_engine::tick_select::terms_of;
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_provisions::provision_tx_roots;
     use hyperscale_storage::test_helpers::{
-        commit_settled_at, make_test_block_with_anchor_wt, make_test_certified,
+        commit_folding, commit_settled_at, make_test_block_with_anchor_wt, make_test_certified,
         make_test_certified_signed,
     };
     use hyperscale_storage::{
@@ -395,10 +401,11 @@ mod tests {
     };
     use hyperscale_types::{
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
-        Epoch, EpochWindows, FrontierInputs, NetworkDefinition, PrincipalAddr, ProvisionTxRoot,
-        ProvisionTxRootsMap, RecoveryCause, ShardRecovery, SubstateEntry, SubstateKey,
-        SweepFrontier, TimestampRange, TopologySnapshot, Transaction, TxHash, ValidatorSet,
-        Verifiable, WeightedTimestamp, provision_leaf, served_digest,
+        Deadline, DeclaredKey, Epoch, EpochWindows, FrontierInputs, Joins, NetworkDefinition,
+        PrincipalAddr, ProvisionTxRoot, ProvisionTxRootsMap, RecoveryCause, ShardRecovery,
+        StatedTerms, SubstateEntry, SubstateKey, SweepFrontier, TickLine, TimestampRange,
+        TopologySnapshot, Transaction, TxHash, ValidatorSet, Verifiable, WeightedTimestamp,
+        provision_leaf, served_digest,
     };
 
     use super::*;
@@ -424,11 +431,13 @@ mod tests {
         ))
     }
 
-    /// The provision roots `tx` owes at `state` from [`LOCAL`] routed
-    /// under `trie`, committed by a block anchored at `anchor_ms`.
+    /// The provision roots the block at `height` committing `tx` owes at
+    /// `state`, the state it leaves, from [`LOCAL`] routed under `trie`,
+    /// the block anchored at `anchor_ms`.
     fn roots_of(
         state: &impl Substates,
         trie: &ShardTrie,
+        height: BlockHeight,
         anchor_ms: u64,
         tx: &Transaction,
     ) -> ProvisionTxRootsMap {
@@ -436,10 +445,128 @@ mod tests {
             state,
             trie,
             LOCAL,
+            height,
             WeightedTimestamp::from_millis(anchor_ms),
             &[Verifiable::from(tx.clone())],
         )
         .expect("the test derives its transaction")
+    }
+
+    /// What the block at `height` anchored at `anchor_ms` folds into
+    /// [`LOCAL`]'s tick membership committing `tx` on its terms under
+    /// `classified`: a row nothing stands ahead of, which the block makes
+    /// head and so serves its sharing targets from.
+    fn committing(
+        tx: &Transaction,
+        height: BlockHeight,
+        anchor_ms: u64,
+        classified: &ShardTrie,
+    ) -> MemberInputs {
+        MemberInputs {
+            height,
+            committed: WeightedTimestamp::from_millis(anchor_ms),
+            transactions: vec![(tx.hash(), Deadline::of_transaction(tx))],
+            terms: vec![StatedTerms {
+                tx: tx.hash(),
+                terms: terms_of(tx, &snapshot_of(classified), LOCAL),
+            }],
+            ..MemberInputs::still(LOCAL)
+        }
+    }
+
+    /// Commit `tx` to `storage` in a block at `height` anchored at
+    /// `anchor_ms` and certified under `signed`, folding its member, its
+    /// header's roots made under `classified` over the state it leaves.
+    /// Answers the roots.
+    fn commit_member_block(
+        storage: &Arc<SimShardStorage>,
+        height: BlockHeight,
+        anchor_ms: u64,
+        tx: &Transaction,
+        classified: &ShardTrie,
+        signed: Epoch,
+    ) -> ProvisionTxRootsMap {
+        commit_folded(
+            storage,
+            &Folded {
+                anchor_ms,
+                transactions: std::slice::from_ref(tx),
+                members: &committing(tx, height, anchor_ms, classified),
+                classified,
+                signed,
+            },
+        )
+    }
+
+    /// A block a test commits: anchored at `anchor_ms`, carrying
+    /// `transactions`, folding `members` at their height, its roots made
+    /// under `classified`, certified under `signed`.
+    struct Folded<'a> {
+        anchor_ms: u64,
+        transactions: &'a [Transaction],
+        members: &'a MemberInputs,
+        classified: &'a ShardTrie,
+        signed: Epoch,
+    }
+
+    /// Commit `block` to `storage`, its header's roots made over the
+    /// state it leaves. Answers the roots.
+    fn commit_folded(storage: &Arc<SimShardStorage>, block: &Folded<'_>) -> ProvisionTxRootsMap {
+        let Folded {
+            anchor_ms,
+            transactions,
+            members,
+            classified,
+            signed,
+        } = *block;
+        let height = members.height;
+        let (_, jmt_snapshot, _) = storage.prepare_block_commit(
+            ParentAnchor {
+                state_root: storage.state_root(),
+                height: storage.jmt_height(),
+                state: &storage.snapshot(),
+                pending: &[],
+                base_reads: None,
+            },
+            &[],
+            ChainWrites {
+                creations: &[],
+                removals: &[],
+                sweep_frontier: SweepFrontier::ZERO,
+                frontier: &FrontierInputs::still(ShardId::ROOT),
+                state_claims: &[],
+                members,
+            },
+            height,
+        );
+        let derived: Vec<Verifiable<Transaction>> = transactions
+            .iter()
+            .map(|tx| Verifiable::from(tx.clone()))
+            .collect();
+        let roots = provision_tx_roots(
+            &PreparedBlockView {
+                parent: &storage.snapshot(),
+                block: &jmt_snapshot,
+            },
+            classified,
+            LOCAL,
+            height,
+            WeightedTimestamp::from_millis(anchor_ms),
+            &derived,
+        )
+        .expect("the test derives its transactions");
+        commit_folding(
+            &**storage,
+            &make_test_certified_signed(
+                block_carrying(height, anchor_ms, transactions, roots.clone()),
+                signed,
+            ),
+            &[],
+            &[],
+            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            members,
+        );
+        roots
     }
 
     /// A live test block at `height` anchored at `anchor_ms` carrying `tx`
@@ -451,8 +578,21 @@ mod tests {
         tx: &Transaction,
         roots: ProvisionTxRootsMap,
     ) -> Block {
-        let decoded = Transaction::new(tx.body().clone());
-        assert!(!decoded.is_routed());
+        block_carrying(height, anchor_ms, std::slice::from_ref(tx), roots)
+    }
+
+    /// [`block_committing`] carrying every one of `txs`, in order.
+    fn block_carrying(
+        height: BlockHeight,
+        anchor_ms: u64,
+        txs: &[Transaction],
+        roots: ProvisionTxRootsMap,
+    ) -> Block {
+        let decoded: Vec<Verifiable<Transaction>> = txs
+            .iter()
+            .map(|tx| Verifiable::from(Transaction::new(tx.body().clone())))
+            .collect();
+        assert!(decoded.iter().all(|tx| !tx.as_unverified().is_routed()));
         let Block::Live {
             header,
             certificates,
@@ -473,7 +613,7 @@ mod tests {
         });
         Block::Live {
             header,
-            transactions: Arc::new(Capped::from_array([Verifiable::from(decoded)])),
+            transactions: Arc::new(Capped::new(decoded).expect("a few transactions")),
             certificates,
             provisions,
             abandonment_records,
@@ -522,16 +662,17 @@ mod tests {
                 1_000,
                 validity(),
             );
-            let request = provision_request(
-                &trie,
-                &Verifiable::from(tx.clone()),
-                LOCAL,
-                WeightedTimestamp::ZERO,
-            )
-            .expect("the transaction reads a cell here");
-            let [key] = request.local_keys[..] else {
-                panic!("one cell read here: {:?}", request.local_keys)
+            let [key] = tx.routing().provision_keys[..]
+                .iter()
+                .filter_map(DeclaredKey::cell)
+                .collect::<Vec<_>>()[..]
+            else {
+                panic!("one cell read here")
             };
+            // The block commits the member and makes it head: nothing
+            // stands ahead of it, so it serves the payer's shard, which
+            // shares its verdict, from this block.
+            let members = committing(&tx, HEIGHT, 0, &trie);
             let storage = Arc::new(SimShardStorage::default());
             let (_, jmt_snapshot, _) = storage.prepare_block_commit(
                 ParentAnchor {
@@ -548,7 +689,7 @@ mod tests {
                     sweep_frontier: SweepFrontier::ZERO,
                     frontier: &FrontierInputs::still(ShardId::ROOT),
                     state_claims: &[],
-                    members: &MemberInputs::still(ShardId::ROOT),
+                    members: &members,
                 },
                 HEIGHT,
             );
@@ -558,6 +699,7 @@ mod tests {
                     block: &jmt_snapshot,
                 },
                 &trie,
+                HEIGHT,
                 0,
                 &tx,
             );
@@ -714,7 +856,8 @@ mod tests {
         let trie = ShardTrie::uniform(1);
         let (local, payer_shard) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
         // A payer on the other shard, and a write here: this shard owes
-        // the payer the engagement its vote waits for.
+        // the payer the part its member shares the verdict on, from the
+        // block that makes it head.
         let payer = PrincipalAddr::new([0x80; 31]);
         let held = PrincipalAddr::new([0x10; 31]);
         let routed = stub_transaction(payer, &[payer.address(), held.address()], 1_000, validity());
@@ -724,16 +867,8 @@ mod tests {
 
         let height = BlockHeight::new(1);
         let storage = Arc::new(SimShardStorage::default());
-        let roots = roots_of(&storage.snapshot(), &trie, 0, &routed);
+        let roots = commit_member_block(&storage, height, 0, &routed, &trie, Epoch::new(0));
         let claimed = roots[&payer_shard];
-        let block = block_committing(height, 0, &routed, roots);
-        commit_settled_at(
-            &*storage,
-            &make_test_certified(block),
-            &[],
-            &[],
-            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
-        );
         let pending_chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
 
         let Some(Owing::Leaves(owed)) = owed_leaves(
@@ -774,12 +909,123 @@ mod tests {
                 .map(Provision::tx_hash)
                 .collect::<Vec<_>>(),
             vec![hash],
-            "the stored block's transaction owes the payer shard its engagement",
+            "the stored block's head owes the payer shard its part",
         );
         assert_eq!(
             served.count.map(|count| count.root()),
             Some(claimed),
             "and the count witness wraps to the header's root",
+        );
+    }
+
+    /// A member made head by a later block than the one that committed
+    /// it is served by that later block: its part to the shard sharing
+    /// its verdict walks to that block's root, though the block commits
+    /// no transaction, and binds the clock that committed it. The
+    /// committing block serves it to nobody.
+    #[test]
+    fn a_late_head_is_served_by_the_block_that_made_it() {
+        install_stub_protocol_statics();
+        let trie = ShardTrie::uniform(1);
+        let held = PrincipalAddr::new([0x10; 31]).address();
+        let writing = |payer: u8| {
+            let payer = PrincipalAddr::new([payer; 31]);
+            stub_transaction(payer, &[payer.address(), held], 1_000, validity())
+        };
+        let mut both = [writing(0x80), writing(0x90)];
+        both.sort_by_key(Transaction::hash);
+        let [first, second] = both.clone();
+        let storage = Arc::new(SimShardStorage::default());
+        let committing_both = MemberInputs {
+            height: HEIGHT,
+            committed: WeightedTimestamp::from_millis(1_000),
+            transactions: both
+                .iter()
+                .map(|tx| (tx.hash(), Deadline::of_transaction(tx)))
+                .collect(),
+            terms: both
+                .iter()
+                .map(|tx| StatedTerms {
+                    tx: tx.hash(),
+                    terms: terms_of(tx, &snapshot_of(&trie), LOCAL),
+                })
+                .collect(),
+            ..MemberInputs::still(LOCAL)
+        };
+        let fold = |anchor_ms, transactions: &[Transaction], members: &MemberInputs| {
+            commit_folded(
+                &storage,
+                &Folded {
+                    anchor_ms,
+                    transactions,
+                    members,
+                    classified: &trie,
+                    signed: Epoch::new(0),
+                },
+            )
+        };
+        // Both write the cell here, so the first placed heads and the
+        // second waits behind it.
+        let at_commit = fold(1_000, &both, &committing_both);
+        let terms = terms_of(&first, &snapshot_of(&trie), LOCAL);
+        let aborting_first = MemberInputs {
+            height: HEIGHT.next(),
+            committed: WeightedTimestamp::from_millis(2_000),
+            manifest: Arc::new(Capped::from_array([TickLine::Member {
+                staged: 0,
+                tx: first.hash(),
+                joins: Joins::Aborted,
+                settlement: terms.settlement,
+                pins: Capped::empty(),
+                holds: Capped::empty(),
+                reach: terms.reach,
+                awaits: terms.awaits,
+                charge: terms.charge,
+                share: terms.share,
+                reserves: terms.reserves,
+                deadline: Deadline::of_transaction(&first),
+                crossings: Capped::empty(),
+            }])),
+            ..MemberInputs::still(LOCAL)
+        };
+        let at_head = fold(2_000, &[], &aborting_first);
+
+        let pending_chain = Arc::new(PendingChain::new(
+            Arc::clone(&storage),
+            BlockHeight::GENESIS,
+        ));
+        let served = |height| {
+            let Some(Owing::Leaves(owed)) = owed_leaves(
+                &pending_chain,
+                &StubVmStatics,
+                LOCAL,
+                &one_window(&trie),
+                height,
+                PAYER_SHARD,
+            ) else {
+                panic!("the held block at {height:?} owes the payer shard")
+            };
+            build_served_parts(
+                &pending_chain,
+                &StubVmStatics,
+                LOCAL,
+                &owed,
+                height,
+                PAYER_SHARD,
+                &[0, 1],
+            )
+            .into_iter()
+            .filter_map(|(_, served)| served.part)
+            .map(|part| (part.tx_hash(), part.block_height(), part.clock()))
+            .collect::<Vec<_>>()
+        };
+        assert!(at_commit.contains_key(&PAYER_SHARD) && at_head.contains_key(&PAYER_SHARD));
+        let committed = WeightedTimestamp::from_millis(1_000);
+        assert_eq!(served(HEIGHT), vec![(first.hash(), HEIGHT, committed)]);
+        assert_eq!(
+            served(HEIGHT.next()),
+            vec![(second.hash(), HEIGHT.next(), committed)],
+            "the second is served by the block making it head, at the clock committing it",
         );
     }
 
@@ -892,15 +1138,8 @@ mod tests {
             );
             HEIGHT.next()
         });
-        let roots = roots_of(&storage.snapshot(), classified, anchor_ms, &tx);
+        let roots = commit_member_block(&storage, height, anchor_ms, &tx, classified, signed);
         assert!(roots.contains_key(&target));
-        commit_settled_at(
-            &*storage,
-            &make_test_certified_signed(block_committing(height, anchor_ms, &tx, roots), signed),
-            &[],
-            &[],
-            &witness,
-        );
         let pending_chain = Arc::new(PendingChain::new(storage, BlockHeight::GENESIS));
         assert_eq!(
             pending_chain

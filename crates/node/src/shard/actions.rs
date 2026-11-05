@@ -804,8 +804,9 @@ mod tests {
     use hyperscale_types::{
         Address, AddressClass, BlockHash, BlockHeight, ChainOrigin, CheckOutcome, ConsensusReceipt,
         Finalization, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, SWEEP_BUCKET_MS,
-        SettledWrites, StateWrites, StoredReceipt, SubstateKey, SweepBucket, SweepFrontier, TickId,
-        TxHash, ValidatorId, Verifiable, VerificationKind, WeightedTimestamp, shard_prefix_path,
+        SettledWrites, ShardTrie, StateWrites, StoredReceipt, SubstateKey, SweepBucket,
+        SweepFrontier, TickId, TxHash, ValidatorId, Verifiable, VerificationKind,
+        WeightedTimestamp, shard_prefix_path,
     };
 
     use super::{SignerResolution, resolve_signer};
@@ -1056,7 +1057,8 @@ mod tests {
     fn provisions_preferring(signer: ValidatorId) -> ProvisionAction {
         ProvisionAction::FetchAndBroadcastProvisions {
             block_hash: BlockHash::ZERO,
-            requests: Vec::new(),
+            transactions: Arc::default(),
+            trie: ShardTrie::uniform(0),
             source_shard: SHARD,
             block_height: BlockHeight::new(1),
             source_block_ts: WeightedTimestamp::ZERO,

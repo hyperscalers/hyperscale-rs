@@ -676,6 +676,10 @@ mod tests {
             (None, self.finalized)
         }
 
+        fn served_at(&self, _: ShardId, _: ShardId, _: TxHash) -> Option<BlockHeight> {
+            None
+        }
+
         fn chain_burn(&self, _: ShardId, _: TxHash) -> Option<BlockHeight> {
             self.burned
         }

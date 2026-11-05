@@ -2216,6 +2216,7 @@ impl ShardCoordinatorSim {
                         },
                         &judgement.provisions.trie,
                         self.shard,
+                        block_height,
                         parent_weighted_timestamp,
                         &transactions,
                     )

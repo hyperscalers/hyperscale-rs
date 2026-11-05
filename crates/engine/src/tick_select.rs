@@ -104,9 +104,13 @@ pub fn divided_requirements(
     // Every member admits the whole manifest, and admission resolves a
     // component call against the target's own record — a declared read
     // of its leaf, provisioned by the shard holding it. So a member waits
-    // for the commit-time bundle of every remote shard holding a
-    // component the transaction calls, which is where the records it
-    // cannot read itself arrive. A principal has no record to read, so a
+    // for the bundle of every remote shard holding a component the
+    // transaction calls, which is where the records it cannot read itself
+    // arrive. That shard serves a leg, which shares no verdict with its
+    // core, from the block committing the transaction, and a core
+    // sibling from the block making its member there head, so the leg's
+    // bundle never waits on the record the leg writes. A principal has no
+    // record to read, so a
     // transaction reaching only accounts waits on nobody here, and a
     // shard that only takes delivery commits nothing and sends no bundle.
     if let Some(trie) = classified.placement() {
@@ -406,6 +410,20 @@ pub fn crossings_consumed(member: &Member) -> Crossings {
     .expect("a star's edges are capped")
 }
 
+/// Which half settles `member`: its own where no sibling's verdict can
+/// discard its effects, one it shares with its siblings where it is a
+/// whole or core member, and the one it awaits otherwise.
+#[must_use]
+pub fn settlement_of(member: &Member) -> Settlement {
+    if !member.abortable() {
+        Settlement::Alone
+    } else if matches!(member.role(), Role::Whole | Role::Core) {
+        Settlement::Shared
+    } else {
+        Settlement::Awaited
+    }
+}
+
 /// The terms of `member`, `tx`'s member classified under `trie`, priced
 /// at `prices`.
 ///
@@ -425,13 +443,7 @@ pub fn terms_of_member(
     let local = member.local();
     let classified = member.classified();
     let reach = remote(member.reach().iter().copied(), local);
-    let settlement = if !member.abortable() {
-        Settlement::Alone
-    } else if matches!(member.role(), Role::Whole | Role::Core) {
-        Settlement::Shared
-    } else {
-        Settlement::Awaited
-    };
+    let settlement = settlement_of(member);
     let (engages, crossings, waits) = if !member.reaches_beyond() {
         (Capped::empty(), Capped::empty(), false)
     } else if classified.decomposed() {

@@ -181,7 +181,8 @@ pub fn pin_chunks(pins: &[Pin]) -> Vec<PinsChunk> {
 
 /// What a row's pins are taken off: what it waits on while `Pending`,
 /// and what it holds after.
-const fn pinned_holds(row: &MemberRow) -> &Holds {
+#[must_use]
+pub const fn pinned_holds(row: &MemberRow) -> &Holds {
     match (&row.state, &row.waiting) {
         (RowState::Pending, Some(waiting)) => &waiting.declared,
         _ => &row.holds,
@@ -299,6 +300,54 @@ pub fn keyed(pins: &[Pin]) -> bool {
     pins.iter().any(|pin| !pin.modes.served().is_empty())
 }
 
+/// Whether a member settling on `settlement` and pinning `pins` here is
+/// served from its head: shared and keyed.
+///
+/// The one rule both serves read. The committing block's serve leaves
+/// out the targets such a member shares its verdict with, and its
+/// `Serves` entry, standing from its head, serves exactly those, so each
+/// target is served once.
+#[must_use]
+pub fn served_from_head(settlement: Settlement, pins: &[Pin]) -> bool {
+    settlement == Settlement::Shared && keyed(pins)
+}
+
+/// The order keys every `Serves` entry under `height` lies in.
+fn serves_span(height: BlockHeight) -> (u128, u128) {
+    let base = u128::from(height.inner()) << 64;
+    (base, base | u128::from(u64::MAX))
+}
+
+/// The rows the block at `height` made head on `shard` that it serves
+/// from there: those whose `Serves` entry stands under `height` in
+/// `state`, in rank order, each read out of `state`.
+///
+/// `state` is the one the block left, or any later one the rows still
+/// stand in: an entry stands while its row stands placed.
+#[must_use]
+pub fn served_rows(
+    state: &(impl Substates + ?Sized),
+    shard: ShardId,
+    height: BlockHeight,
+) -> Vec<MemberRow> {
+    let (owner, serves) = MemberCollection::Serves.of(shard);
+    let (lo, hi) = serves_span(height);
+    state
+        .entries_in_range(owner, serves, lo, hi, usize::MAX)
+        .into_iter()
+        .filter_map(|(_, bytes)| from_slice::<TxHash>(&bytes).ok())
+        .filter_map(|tx| {
+            let entry = MemberCollection::Members.entry(shard, tx);
+            state
+                .entries_in_range(entry.owner, entry.collection, entry.order, entry.order, 1)
+                .into_iter()
+                .next()
+                .and_then(|(_, bytes)| from_slice::<MemberRow>(&bytes).ok())
+                .filter(|row| row.tx == tx)
+        })
+        .collect()
+}
+
 /// The entries one row implies in the row-derived collections.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RowEntries {
@@ -380,7 +429,7 @@ impl RowEntries {
                 .then(|| (u128::from(place.packed()), row.tx)),
             serves: row
                 .head
-                .filter(|_| keyed(pins))
+                .filter(|_| served_from_head(Settlement::Shared, pins))
                 .map(|head| (serves_order(head), row.tx)),
             waiters: BTreeMap::new(),
         }

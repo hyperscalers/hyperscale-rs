@@ -30,6 +30,7 @@ use hyperscale_production::testing::Probe;
 use hyperscale_production::{LocalValidator, Node, NodeHandle, shard_data_dir};
 use hyperscale_scenarios::query::{
     RanAs, chain_burn, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
+    served_at,
 };
 use hyperscale_storage::{BeaconChainReader, ShardChainReader, SubstateStore, VersionedStore};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
@@ -822,6 +823,12 @@ impl Harness {
     ) {
         self.read_any(shard, |store| chain_fate(store, hash))
             .unwrap_or((None, None))
+    }
+
+    /// [`served_at`] over `target`'s live store: the block of `source`'s
+    /// that served it `hash`'s part. `None` if no host serves `target`.
+    pub fn served_at(&self, source: ShardId, target: ShardId, hash: TxHash) -> Option<BlockHeight> {
+        self.read_any(target, |store| served_at(store, source, hash))?
     }
 
     /// [`chain_burn`] over the live store the runner writes to. `None` if

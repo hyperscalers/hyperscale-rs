@@ -569,8 +569,9 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
 
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
     // Each leaf binds the keys its part serves out of the state this
-    // block leaves, which the header's state root commits, and the
-    // block's clock, which commits its transactions.
+    // block leaves, which the header's state root commits, and the clock
+    // of the block that committed its transaction. That state holds the
+    // members the block makes head, which it serves from here.
     let provision_tx_roots = provision_tx_roots(
         &PreparedBlockView {
             parent: &anchored,
@@ -578,6 +579,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         },
         topology_snapshot.shard_trie(),
         local_shard,
+        height,
         anchor,
         &transactions,
     )
@@ -1516,6 +1518,7 @@ where
                     },
                     &judgement.provisions.trie,
                     ctx.shard,
+                    block_height,
                     parent_weighted_timestamp,
                     &transactions,
                 )
@@ -2207,6 +2210,7 @@ mod tests {
 
     use hyperscale_core::{Parallelism, ParentJudgement, ProvisionJudgement};
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_engine::tick_select::terms_of;
     use hyperscale_engine::{ExecutionMode, Executor};
     use hyperscale_hbor::Capped;
     use hyperscale_network::{
@@ -2229,12 +2233,12 @@ mod tests {
         Address, AddressClass, AggregateSignature, BeaconBlockHash, BeaconChainConfig, BeaconState,
         BeaconWitnessEvent, BodyRoot, BodyRootVerifyError, CertifiedBeaconBlock, CollectionId,
         CommittedAt, Deadline, DeclaredKey, DeclaredRange, DerivationError, Derived, EntryKey,
-        ExecutionOutcome, GlobalReceiptHash, GossipMessage, LocalKey, MessageClass, NetworkMessage,
-        PriceTable, PrincipalAddr, ProposerTimestamp, ProtocolHasher, ProvisionTxRoot,
-        ProvisionTxRootsMap, ReadFence, Request, Role, RoutingCommittees, SettledWrites,
-        ShardCommittee, ShardTrie, Signer, SignerBitfield, Stake, StateWrites, TickHalf, TickId,
-        TimestampRange, TransactionEnvelope, TxOutcome, entry_leaf_key, provision_leaf,
-        receipt_hash_of, served_digest,
+        ExecutionOutcome, GlobalReceiptHash, GossipMessage, Joins, LocalKey, MessageClass, Mode,
+        NetworkMessage, PriceTable, PrincipalAddr, ProposerTimestamp, ProtocolHasher,
+        ProvisionTxRoot, ProvisionTxRootsMap, ReadFence, Request, Role, RoutingCommittees,
+        SettledWrites, ShardCommittee, ShardTrie, Signer, SignerBitfield, Stake, StateWrites,
+        StatedTerms, TickHalf, TickId, TimestampRange, TransactionEnvelope, TxOutcome,
+        entry_leaf_key, provision_leaf, receipt_hash_of, served_digest,
     };
 
     use super::*;
@@ -3409,12 +3413,15 @@ mod tests {
 
     /// A block at height 1 over an empty store, carrying one transaction
     /// that reads a cell here for a payer on the other shard: what this
-    /// shard owes the payer is the one part serving that cell.
+    /// shard owes the payer is the one part serving that cell, from this
+    /// block, which commits the member and makes it head.
     struct Judged {
         storage: Arc<SimShardStorage>,
         pending_chain: Arc<PendingChain<SimShardStorage>>,
         trie: ShardTrie,
         tx: Verifiable<Transaction>,
+        /// What the block folds into tick membership.
+        members: MemberInputs,
         /// The state root the block leaves, and the map that state gives.
         root: StateRoot,
         honest: ProvisionTxRootsMap,
@@ -3452,6 +3459,15 @@ mod tests {
                 )
                 .expect("nothing is persisted");
             let anchored = view.snapshot();
+            let members = MemberInputs {
+                height: BlockHeight::new(1),
+                transactions: vec![(tx.hash(), Deadline::of_transaction(&tx))],
+                terms: vec![StatedTerms {
+                    tx: tx.hash(),
+                    terms: terms_of(&tx, &TestCommittee::new(4, 7).topology_snapshot(2), LOCAL),
+                }],
+                ..MemberInputs::still(LOCAL)
+            };
             let (root, jmt_snapshot, _) = view.base().prepare_block_commit(
                 ParentAnchor {
                     state_root: view.base().state_root(),
@@ -3467,7 +3483,7 @@ mod tests {
                     sweep_frontier,
                     frontier: &FrontierInputs::still(LOCAL),
                     state_claims: &[],
-                    members: &MemberInputs::still(LOCAL),
+                    members: &members,
                 },
                 BlockHeight::new(1),
             );
@@ -3478,6 +3494,7 @@ mod tests {
                 },
                 &trie,
                 LOCAL,
+                BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 std::slice::from_ref(&tx),
             )
@@ -3488,6 +3505,7 @@ mod tests {
                 pending_chain,
                 trie,
                 tx,
+                members,
                 root,
                 honest,
                 sweep_frontier,
@@ -3533,7 +3551,7 @@ mod tests {
                 parent_sweep_frontier: SweepFrontier::ZERO,
                 claimed_sweep_frontier: self.sweep_frontier,
                 frontier: FrontierInputs::still(LOCAL),
-                members: MemberInputs::still(LOCAL),
+                members: self.members.clone(),
                 parent_judgement: judgement,
                 state_claims: Vec::new(),
             };
@@ -3662,6 +3680,7 @@ mod tests {
                 &state.snapshot(),
                 &block.trie,
                 LOCAL,
+                BlockHeight::new(1),
                 WeightedTimestamp::ZERO,
                 std::slice::from_ref(&tx)
             ),
@@ -3682,6 +3701,234 @@ mod tests {
         let (outcome, seated) = block.check(underived(&block), None);
         assert!(matches!(outcome, CheckOutcome::Checked { .. }));
         assert!(seated);
+    }
+
+    /// A block committing no transaction over `parent` (its hash, height,
+    /// state root and sweep frontier) at `anchor`, folding `members`.
+    fn prepared(
+        pending_chain: &Arc<PendingChain<SimShardStorage>>,
+        parent: (BlockHash, BlockHeight, StateRoot, SweepFrontier),
+        anchor: WeightedTimestamp,
+        members: &MemberInputs,
+    ) -> Prepared {
+        let (hash, height, state_root, frontier) = parent;
+        let view = pending_chain.view_at(hash, height);
+        let (removals, sweep_frontier) = view
+            .sweep_for_block(BlockSweep::of_child(frontier, false), anchor)
+            .expect("nothing is persisted past the parent");
+        let anchored = view.snapshot();
+        let (root, jmt_snapshot, _) = view.base().prepare_block_commit(
+            ParentAnchor {
+                state_root,
+                height,
+                state: &anchored,
+                pending: view.pending_snapshots(),
+                base_reads: None,
+            },
+            &[],
+            ChainWrites {
+                creations: &[],
+                removals: &removals,
+                sweep_frontier,
+                frontier: &FrontierInputs::still(LOCAL),
+                state_claims: &[],
+                members,
+            },
+            members.height,
+        );
+        let roots = provision_tx_roots(
+            &PreparedBlockView {
+                parent: &anchored,
+                block: &jmt_snapshot,
+            },
+            &ShardTrie::uniform(1),
+            LOCAL,
+            members.height,
+            anchor,
+            &[],
+        )
+        .expect("no transaction to derive");
+        Prepared {
+            root,
+            sweep_frontier,
+            jmt_snapshot,
+            roots,
+        }
+    }
+
+    /// What [`prepared`] makes of a block: its state root, the sweep
+    /// frontier it claims, the state it leaves, and its provision roots.
+    struct Prepared {
+        root: StateRoot,
+        sweep_frontier: SweepFrontier,
+        jmt_snapshot: Arc<JmtSnapshot>,
+        roots: ProvisionTxRootsMap,
+    }
+
+    /// A transaction paid on [`PAYER_SHARD`] from `[payer; 31]` that
+    /// writes a cell here.
+    fn writing_held(payer: u8) -> Verifiable<Transaction> {
+        let payer = PrincipalAddr::new([payer; 31]);
+        Verifiable::from(stub_transaction(
+            payer,
+            &[payer.address(), PrincipalAddr::new([0x10; 31]).address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        ))
+    }
+
+    /// What block 1 folds committing `txs` on their terms under
+    /// `committee`, on [`LOCAL`].
+    fn committing_on_their_terms(
+        txs: &[Verifiable<Transaction>],
+        committee: &TopologySnapshot,
+    ) -> MemberInputs {
+        MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: txs
+                .iter()
+                .map(|tx| (tx.hash(), Deadline::of_transaction(tx)))
+                .collect(),
+            terms: txs
+                .iter()
+                .map(|tx| StatedTerms {
+                    tx: tx.hash(),
+                    terms: terms_of(tx, committee, LOCAL),
+                })
+                .collect(),
+            ..MemberInputs::still(LOCAL)
+        }
+    }
+
+    /// The line aborting `tx`'s member on [`LOCAL`] unnamed, on its
+    /// terms under `committee`.
+    fn abort_line(tx: &Verifiable<Transaction>, committee: &TopologySnapshot) -> TickLine {
+        let terms = terms_of(tx, committee, LOCAL);
+        TickLine::Member {
+            staged: 0,
+            tx: tx.hash(),
+            joins: Joins::Aborted,
+            settlement: terms.settlement,
+            pins: Capped::empty(),
+            holds: Capped::empty(),
+            reach: terms.reach,
+            awaits: terms.awaits,
+            charge: terms.charge,
+            share: terms.share,
+            reserves: terms.reserves,
+            deadline: Deadline::of_transaction(tx),
+            crossings: Capped::empty(),
+        }
+    }
+
+    /// A voter judging a block that commits no transaction derives the
+    /// parts of the members it makes head from their rows alone: the
+    /// proposer's map is its own, the block seats, and a claim omitting
+    /// the head's part is refused.
+    #[test]
+    fn a_voter_roots_late_heads_without_their_bodies() {
+        install_stub_protocol_statics();
+        let committee = TestCommittee::new(4, 7).topology_snapshot(2);
+        let trie = committee.shard_trie().clone();
+        let mut both = [writing_held(0x80), writing_held(0x90)];
+        both.sort_by_key(|tx| tx.hash());
+        let storage = Arc::new(SimShardStorage::default());
+        let pending_chain = Arc::new(PendingChain::new(
+            Arc::clone(&storage),
+            BlockHeight::GENESIS,
+        ));
+
+        // Block 1 commits both, which write the cell here: the first
+        // placed heads, the second waits behind it.
+        let committing = committing_on_their_terms(&both, &committee);
+        let first = prepared(
+            &pending_chain,
+            (
+                BlockHash::ZERO,
+                BlockHeight::GENESIS,
+                storage.state_root(),
+                SweepFrontier::ZERO,
+            ),
+            WeightedTimestamp::ZERO,
+            &committing,
+        );
+        let first_hash = BlockHash::from_raw(Hash::from_bytes(b"committing both"));
+        pending_chain.insert(
+            first_hash,
+            ChainEntry {
+                parent_block_hash: BlockHash::ZERO,
+                height: BlockHeight::new(1),
+                settled_txs: Vec::new(),
+                jmt_snapshot: Arc::clone(&first.jmt_snapshot),
+                certified_block: None,
+            },
+        );
+
+        // Block 2 commits nothing and aborts the head, so the second
+        // heads there.
+        let aborting = MemberInputs {
+            height: BlockHeight::new(2),
+            manifest: Arc::new(Capped::from_array([abort_line(&both[0], &committee)])),
+            ..MemberInputs::still(LOCAL)
+        };
+        let parent = (
+            first_hash,
+            BlockHeight::new(1),
+            first.root,
+            first.sweep_frontier,
+        );
+        let second = prepared(&pending_chain, parent, WeightedTimestamp::ZERO, &aborting);
+        let honest = second.roots.clone();
+        assert!(
+            honest.contains_key(&PAYER_SHARD),
+            "the block roots the part of the member it makes head",
+        );
+
+        let check = |claimed: ProvisionTxRootsMap| StateRootCheck {
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"heading the second")),
+            transactions: Arc::new(Capped::empty()),
+            parent_block_hash: first_hash,
+            parent_state_root: first.root,
+            parent_block_height: BlockHeight::new(1),
+            expected_root: second.root,
+            finalizations: Vec::new(),
+            creations: Vec::new(),
+            block_height: BlockHeight::new(2),
+            claimed_split_child_roots: None,
+            split_child_roots_required: false,
+            terminal_settled_txs_required: false,
+            claimed_terminal_settled_txs: None,
+            parent_weighted_timestamp: WeightedTimestamp::ZERO,
+            settled_txs_window_floor: None,
+            parent_sweep_frontier: first.sweep_frontier,
+            claimed_sweep_frontier: second.sweep_frontier,
+            frontier: FrontierInputs::still(LOCAL),
+            members: aborting.clone(),
+            parent_judgement: Some(ParentJudgement {
+                fence: ReadFence::default(),
+                coasting: false,
+                provisions: ProvisionJudgement {
+                    claimed,
+                    trie: trie.clone(),
+                },
+            }),
+            state_claims: Vec::new(),
+        };
+        let (outcome, seated) = state_root_verdict(&storage, &pending_chain, check(honest));
+        assert!(
+            matches!(outcome, CheckOutcome::Checked { .. }) && seated,
+            "the voter's map is the proposer's: {outcome:?}",
+        );
+        let (outcome, seated) = state_root_verdict(
+            &storage,
+            &pending_chain,
+            check(ProvisionTxRootsMap::default()),
+        );
+        assert_eq!(outcome, CheckOutcome::Refused);
+        assert!(!seated);
     }
 
     /// The collection the ranged reader's interval sits in.
@@ -3799,6 +4046,17 @@ mod tests {
         .expect("nothing is persisted past the parent")
     }
 
+    /// `stub` declaring a fresh read of `interval` besides what it reads
+    /// and writes.
+    fn reading_interval(stub: Transaction, interval: DeclaredRange) -> Transaction {
+        let mut routing = stub.routing().clone();
+        let range = DeclaredKey::Range(interval);
+        routing.provision_keys.push(range);
+        routing.declared_modes.push((range, Mode::Read));
+        routing.declared_modes.sort_unstable();
+        stub.with_routing(&StubVmStatics, routing)
+    }
+
     /// A proposal whose cross-shard transaction reads a declared interval
     /// both it and its pipelined, unpersisted parent write into commits
     /// the entries the interval holds after the block, read through the
@@ -3815,26 +4073,25 @@ mod tests {
         let held = PrincipalAddr::new([0x10; 31]).address();
         assert_eq!(trie.shard_for_prefix(held), LOCAL);
         assert_eq!(trie.shard_for_prefix(payer.address()), PAYER_SHARD);
-        let interval = DeclaredRange {
-            owner: held,
-            collection: COLLECTION,
-            lo: 0,
-            hi: 20,
-            cap: 8,
-        };
-        let stub = stub_transaction_with_reads(
-            payer,
-            &[held],
-            &[payer.address()],
-            1_000,
-            TimestampRange::new(
-                WeightedTimestamp::ZERO,
-                WeightedTimestamp::from_millis(60_000),
+        let tx = reading_interval(
+            stub_transaction_with_reads(
+                payer,
+                &[held],
+                &[payer.address()],
+                1_000,
+                TimestampRange::new(
+                    WeightedTimestamp::ZERO,
+                    WeightedTimestamp::from_millis(60_000),
+                ),
             ),
+            DeclaredRange {
+                owner: held,
+                collection: COLLECTION,
+                lo: 0,
+                hi: 20,
+                cap: 8,
+            },
         );
-        let mut routing = stub.routing().clone();
-        routing.provision_keys.push(DeclaredKey::Range(interval));
-        let tx = stub.with_routing(&StubVmStatics, routing);
 
         // The persisted store holds orders 0, 5 and 30; the parent adds
         // 1 and 3 and deletes 5; the block adds 2 and 25 and deletes 3.

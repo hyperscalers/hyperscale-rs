@@ -43,9 +43,10 @@ pub struct WantedRecord {
     pub arms_at: Option<WeightedTimestamp>,
 }
 
-/// The environment a source block's bundle carries for the transactions
-/// that block committed: the clock, checked against the commit-proven
-/// source header at verification.
+/// The environment a source's part carries for a transaction: the clock
+/// of the source block that committed it, which the part's leaf binds
+/// under the root of the block that served it, whether that block
+/// committed it or made its member head.
 ///
 /// One field, and it stays a record because what a bundle carries about
 /// the environment is a set rather than a value — a seed is the
@@ -59,7 +60,9 @@ pub struct SourceAnchor {
 }
 
 /// What one source shard's committed part carried for a transaction:
-/// the part read off the source block that committed it.
+/// the part read off the source block that served it, the block that
+/// committed the transaction or, for a member that shares this shard's
+/// verdict, the block that made it head there.
 #[derive(Debug, Clone)]
 pub struct Absorbed {
     /// The height of the source block the part was read off.
@@ -473,7 +476,7 @@ mod tests {
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         BlockHeight, Hash, LeafPath, MAX_PROVISION_WEIGHT, MerkleInclusionProof, ProvisionParts,
-        ShardTrie,
+        ShardTrie, Transaction, Verifiable,
     };
     use hyperscale_vm_types::{LegShape, ProtocolHasher};
 
@@ -904,6 +907,161 @@ mod tests {
                 Requirement::CommittedState(third),
             ]),
             "the inbound leg waits on nothing but the records of the venues it calls",
+        );
+    }
+
+    /// The route of [`fixtures::route`] as a routed transaction paid on
+    /// leaf 0: each core node writes a cell of its own component, the
+    /// inbound leg debits the payer.
+    fn routed_route() -> Verifiable<Transaction> {
+        use hyperscale_types::test_utils::{StubVmStatics, stub_transaction};
+        use hyperscale_types::{
+            Address, DeclaredKey, Mode, PrincipalAddr, Routing, TimestampRange,
+        };
+        use hyperscale_vm_types::Moves;
+
+        let payer = PrincipalAddr::new([0x11; 31]);
+        let cell = |owner| DeclaredKey::substate(owner, [0xC0; 16]);
+        let writes = [cell(fixtures::owner_at(1)), cell(fixtures::owner_at(2))];
+        let vault = DeclaredKey::substate(payer.address(), [0xFE; 16]);
+        let mut declared_modes: Vec<(DeclaredKey, Mode)> = writes
+            .iter()
+            .map(|key| (*key, Mode::Write { moves: Moves::Both }))
+            .chain([(vault, Mode::Delta { moves: Moves::Out })])
+            .collect();
+        declared_modes.sort_unstable();
+        let mut write_keys: Vec<DeclaredKey> = declared_modes.iter().map(|(key, _)| *key).collect();
+        write_keys.sort_unstable();
+        let mut write_prefixes: Vec<Address> = write_keys.iter().map(DeclaredKey::owner).collect();
+        write_prefixes.sort_unstable();
+        write_prefixes.dedup();
+        let routing = Routing {
+            read_keys: Vec::new(),
+            write_keys,
+            read_prefixes: Vec::new(),
+            write_prefixes,
+            provision_keys: writes.to_vec(),
+            provision_prefixes: writes.iter().map(DeclaredKey::owner).collect(),
+            declared_modes,
+        };
+        let validity = TimestampRange::new(
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::from_millis(60_000),
+        );
+        Verifiable::from(
+            stub_transaction(payer, &[], 1_000, validity)
+                .with_routing(&StubVmStatics, routing)
+                .with_legs(&StubVmStatics, fixtures::route()),
+        )
+    }
+
+    /// A leg calling a core of two shards waits on both cores' parts, and
+    /// each core serves the leg's shard from the block that commits the
+    /// transaction there: the leg shares no verdict with the core, so its
+    /// part is never held to a core's head, and the core never waits on
+    /// a record the leg could only write once that head came. Each core
+    /// serves its sibling no part at its commit.
+    #[test]
+    fn a_leg_calling_a_two_shard_core_engages_at_the_cores_commit() {
+        use hyperscale_engine::tick_select::member_of;
+        use hyperscale_provisions::provision_request;
+
+        let trie = fixtures::trie();
+        let tx = routed_route();
+        let (leg, cores) = (fixtures::leaf(0), [fixtures::leaf(1), fixtures::leaf(2)]);
+        let member = member_of(&tx, &trie, leg);
+        assert_eq!(member.role(), Role::Leg);
+        let required = divided_requirements(tx.legs(), member.classified(), leg);
+        assert_eq!(
+            required,
+            cores
+                .iter()
+                .map(|&core| Requirement::CommittedState(core))
+                .collect(),
+            "the leg waits on each core shard's part",
+        );
+
+        let mut tracker = ProvisioningTracker::new();
+        tracker.record_required(tx.hash(), required);
+        for (at, &core) in cores.iter().enumerate() {
+            let committed = 1_000 * (at as u64 + 1);
+            let request = provision_request(&trie, &tx, core, anchor(committed).clock)
+                .expect("the core serves the leg's shard at its commit");
+            assert_eq!(
+                request.targets,
+                vec![leg],
+                "{core:?} serves the leg alone at commit"
+            );
+            assert!(!tracker.is_fully_provisioned(tx.hash()));
+            tracker.absorb_provisions(&part(core, 3 + at as u64, committed, tx.hash(), &[]));
+        }
+        assert!(
+            tracker.is_fully_provisioned(tx.hash()),
+            "the cores' commit-time parts are all the leg waits on",
+        );
+        assert_eq!(
+            tracker.transaction_clock(tx.hash(), &member, anchor(9_000).clock),
+            Some(anchor(9_000).clock),
+            "and the leg runs under its own clock",
+        );
+    }
+
+    /// A core's part to a leg's shard serves only the cells the core's
+    /// own shard holds of what the transaction declares, and the leg's
+    /// dispatch carries each core's part as served at its commit: the
+    /// records the leg admits the manifest against, and nothing either
+    /// core read for its sibling.
+    #[test]
+    fn a_leg_reads_only_component_records_of_a_core_part() {
+        use hyperscale_provisions::provision_request;
+        use hyperscale_types::DeclaredKey;
+
+        let trie = fixtures::trie();
+        let tx = routed_route();
+        let (leg, cores) = (fixtures::leaf(0), [fixtures::leaf(1), fixtures::leaf(2)]);
+        let mut tracker = ProvisioningTracker::new();
+        tracker.record_required(
+            tx.hash(),
+            cores
+                .iter()
+                .map(|&core| Requirement::CommittedState(core))
+                .collect(),
+        );
+        for (at, &core) in cores.iter().enumerate() {
+            let request = provision_request(&trie, &tx, core, anchor(1_000).clock)
+                .expect("the core serves the leg's shard at its commit");
+            let owner = fixtures::owner_at(u8::try_from(at + 1).expect("a leaf path"));
+            assert_eq!(
+                request.local_keys,
+                vec![
+                    DeclaredKey::substate(owner, [0xC0; 16])
+                        .cell()
+                        .expect("a cell")
+                ],
+                "{core:?} serves its own component's cell to {leg:?}, and nothing else",
+            );
+            let entries: Vec<(SubstateKey, Option<u8>)> = request
+                .local_keys
+                .iter()
+                .map(|key| (*key, Some(7)))
+                .collect();
+            tracker.absorb_provisions(&part(core, 3, 1_000, tx.hash(), &entries));
+        }
+        let carried: Vec<SubstateKey> = tracker
+            .provisions_for(tx.hash())
+            .iter()
+            .flat_map(|entries| entries.iter().map(|entry| entry.key).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(
+            carried,
+            [1u8, 2]
+                .map(|path| {
+                    DeclaredKey::substate(fixtures::owner_at(path), [0xC0; 16])
+                        .cell()
+                        .expect("a cell")
+                })
+                .to_vec(),
+            "the leg's dispatch carries each core's own cells as served at its commit",
         );
     }
 

@@ -97,13 +97,15 @@ pub struct BookRoute {
     charges: Charges,
 }
 
-/// What one route's oracle read: the book's committing height, the asks
-/// standing in the interval there, and what the route bought and paid.
+/// What one route's oracle read: the height of the book's block that
+/// served the venue its part, the asks standing in the interval there,
+/// and what the route bought and paid.
 #[derive(Debug)]
 pub struct RouteFill {
     /// The route's hash.
     pub hash: TxHash,
-    /// The height the book's shard committed the route at.
+    /// The height of the book's block that made the route's member there
+    /// head, which served the venue's shard its part.
     pub source_height: BlockHeight,
     /// The asks standing in the fill's interval at that height.
     pub standing: usize,
@@ -248,15 +250,15 @@ impl BookRoute {
 
     /// One route, between a local fill on the book's shard just before it
     /// and one beside it, held to its closed form: the trader banks the
-    /// venue's quote for the lowest [`FILL_CAP`] asks the book's
-    /// committing block left standing, and the change of the walk over
-    /// them.
+    /// venue's quote for the lowest [`FILL_CAP`] asks the book's block
+    /// that served the venue its part left standing, and the change of
+    /// the walk over them.
     ///
     /// # Panics
     ///
     /// Panics if the route or a local fill does not accept within
     /// `budget`, if fewer than [`FILL_CAP`] asks stood in the interval at
-    /// the book's committing height, if the venue's shard banks other
+    /// that block's height, if the venue's shard banks other
     /// base than the book's shard removed from its asks, or if the
     /// venue's reserve or the trader's balance does not settle at the
     /// closed form.
@@ -350,10 +352,19 @@ impl BookRoute {
             );
         }
 
+        // The venue's member shares the core's verdict, so the book's
+        // shard serves it from the block that makes the book's member
+        // head: the ladder that block left is the one both walk.
+        let venue_shard = owning_shard(c, unit_reserve.owner);
+        assert!(
+            c.run_until(budget, |c| c
+                .served_at(BOOK_SHARD, venue_shard, hash)
+                .is_some()),
+            "{label}: the venue's shard must commit the book's part of the route",
+        );
         let source_height = c
-            .chain_fate(BOOK_SHARD, hash)
-            .0
-            .unwrap_or_else(|| panic!("{label}: the book's shard committed the route"));
+            .served_at(BOOK_SHARD, venue_shard, hash)
+            .unwrap_or_else(|| panic!("{label}: the venue's shard committed the book's part"));
         let standing = c
             .entries_at(BOOK_SHARD, ladder(&self.book, u32::MAX), source_height)
             .unwrap_or_else(|| panic!("{label}: the book's shard holds {source_height:?}"));

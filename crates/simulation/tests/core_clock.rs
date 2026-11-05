@@ -74,27 +74,22 @@ fn book_route_cluster(seed: u64) -> SimCluster {
 }
 
 /// A local fill the book's shard has run but not yet settled when it
-/// commits a route leaves the route's two core members walking two
-/// ladders.
+/// commits a route leaves the route's book member behind the fill's
+/// tick, and both core members walk the ladder the block making it head
+/// left.
 ///
 /// The book's committee loses its first execution votes, so the fills
 /// beside the route run in their own block's tick and certify only after
-/// the route commits. The book's bundle serves the ladder its committing
-/// block left, which is the settled base and holds none of the fills.
-/// The book's own member reads the ladder through its tick, which layers
-/// every tick before it, the fills' included. Nothing holds the ladder
-/// for a pending core member either: a pending row holds nothing, and a
-/// fill committed after the route reads the same way. So the venue's
-/// shard prices the walk over one ladder and the book's shard over
-/// another, and each applies its own half: the book's change goes to the
-/// trader off the walk the book's shard ran, and the venue banks the
-/// base off the walk the venue's shard ran.
+/// the route commits. The book's member reads the ladder, so it heads
+/// only once the fills' ticks have settled, and the book's shard serves
+/// the venue's its part from that block: the ladder it left holds the
+/// fills' output, which is what the book's member reads through its
+/// tick.
 ///
-/// The route must settle at the closed form over the ladder the book's
-/// committing block left, with the quote and the base conserved, as one
-/// run of the core would.
+/// The route must settle at the closed form over the ladder that block
+/// left, with the quote and the base conserved, as one run of the core
+/// would.
 #[test]
-#[ignore = "a core member's tick view of its own cells is not what its bundle served"]
 fn a_core_member_reads_its_own_cells_as_its_bundle_served_them() {
     let mut cluster = book_route_cluster(sim_seed(42));
     cluster.run_faultable(|c| {
@@ -129,28 +124,24 @@ fn a_core_member_reads_its_own_cells_as_its_bundle_served_them() {
 /// shard holds the route pending until it fetches the venue's part.
 const LOST_PROVISIONS: usize = 64;
 
-/// A local fill the book's shard commits after a route and runs while the
-/// route waits on the venue's part leaves the route's two core members
-/// walking two ladders.
+/// A local fill the book's shard commits after a route, while the route
+/// waits on the venue's part, settles before the route reads the ladder.
 ///
 /// The venue's committee loses its first provision broadcasts, so the
 /// book's shard holds the route pending until it fetches the venue's
 /// part. A local fill submitted once the book's shard has committed the
 /// route commits after it. The book's member of the route pays nowhere
 /// and consumes the trader's escrow, so the book places it only at the
-/// block whose claims read the trader's record, which lands after the
-/// fill commits: the fill is named in its own block and runs, and the
-/// route heads once the fill's tick settles. The book's bundle serves
-/// the ladder its committing block left, which the later fill never
-/// touched; the book's own member reads the ladder through its tick,
-/// which layers the fill's output. So the venue banks the base of one
-/// walk and the book's vault gives up the base of another.
+/// block whose claims read the trader's record, which may land before or
+/// after the fill commits. Either way the route heads only once nothing
+/// placed ahead of it, and no tick below its place, still moves the
+/// ladder, and the book's shard serves the venue's member its part from
+/// that block: both walk one ladder.
 ///
 /// The route must bank one base on both shards, as one run of the core
 /// would.
 #[test]
-#[ignore = "a fill committed before a non-payer route's record lands runs ahead of it while the route's part is served at commit"]
-fn a_fill_committed_after_the_route_waits_for_the_route() {
+fn a_route_placed_after_a_fill_waits_for_the_fill() {
     let mut cluster = book_route_cluster(sim_seed(42));
     cluster.run_faultable(|c| {
         let mut route = BookRoute::stand_up(c);

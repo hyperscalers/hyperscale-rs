@@ -316,9 +316,12 @@ pub struct ParticipationChange {
     pub effective_epoch: Epoch,
 }
 
-/// A single cross-shard transaction's provisioning needs.
+/// A single cross-shard transaction's provisioning needs from one source
+/// block: the block committing it, or the block making its member head.
 ///
-/// Collected per-block and emitted via [`ProvisionAction::FetchAndBroadcastProvisions`].
+/// Derived per block wherever a part is built or a root counted, the
+/// broadcast [`ProvisionAction::FetchAndBroadcastProvisions`] runs
+/// included.
 #[derive(Debug, Clone)]
 pub struct ProvisionsRequest {
     /// Transaction hash (for correlation).

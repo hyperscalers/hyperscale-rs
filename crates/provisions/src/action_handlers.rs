@@ -13,7 +13,6 @@ use std::ops::ControlFlow;
 
 use hyperscale_core::{
     ActionContext, ProtocolEvent, ProvisionAction, ProvisionRefusal, ProvisionVerdict,
-    ProvisionsRequest,
 };
 use hyperscale_hbor::Capped;
 use hyperscale_jmt::TreeReader as JmtTreeReader;
@@ -24,14 +23,15 @@ use hyperscale_types::network::encoded_len;
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
     Anchor, MAX_FETCH_RESPONSE_BYTES, MAX_TXS_PER_BLOCK, PROVISION_FRAMING_BYTES, Provision,
-    ProvisionContext, ProvisionTxRootsMap, ProvisionsSenderMessage, ShardId, Stopwatch,
-    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, signed_bytes,
+    ProvisionContext, ProvisionTxRootsMap, ProvisionsSenderMessage, ShardId, ShardTrie, Stopwatch,
+    Transaction, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, signed_bytes,
 };
 use tracing::warn;
 
 use crate::build::{Owed, build_owed_until};
 use crate::content::keys_over_requests;
 use crate::crossing_push::push_crossing_readings;
+use crate::requests::block_requests;
 
 /// One target shard's parts, packed into notifications, and who receives
 /// them.
@@ -72,27 +72,44 @@ pub(crate) fn pack(parts: Vec<Provision>) -> Vec<Vec<Provision>> {
     packs
 }
 
+/// The source block a broadcast sends the parts of: its transactions,
+/// routed under `trie`, committed at `source_block_ts`, its parent-QC
+/// weighted timestamp, and the roots its header claims.
+#[derive(Clone, Copy)]
+pub(crate) struct Broadcast<'b> {
+    pub(crate) source_shard: ShardId,
+    pub(crate) source_block_ts: WeightedTimestamp,
+    pub(crate) transactions: &'b [Verifiable<Transaction>],
+    pub(crate) trie: &'b ShardTrie,
+    pub(crate) claimed: &'b ProvisionTxRootsMap,
+}
+
 /// Build per-target-shard parts for the cross-shard broadcast.
 ///
-/// Loops over the recipient map (sorted by shard id for deterministic
-/// ordering) and builds each target's parts out of `view`, the view
-/// anchored at the source block, once the leaves its served keys make
-/// walk to `claimed`, the block header's own roots. A target whose
+/// Derives the block's requests ([`block_requests`]) over its own state,
+/// then loops over the recipient map (sorted by shard id for
+/// deterministic ordering) and builds each target's parts out of `view`,
+/// the view anchored at the source block, once the leaves its served keys
+/// make walk to `claimed`, the block header's own roots. A target whose
 /// leaves do not, or none of whose parts builds, is skipped, and so is
 /// every target where the view does not hold the block's state: nothing
 /// leaves this source that its own header does not commit.
 pub(crate) fn fetch_and_broadcast_provision<S, H>(
     view: &SubstateView<S>,
-    source_shard: ShardId,
-    source_block_ts: WeightedTimestamp,
-    requests: &[ProvisionsRequest],
-    claimed: &ProvisionTxRootsMap,
+    block: &Broadcast<'_>,
     shard_recipients: &HashMap<ShardId, Vec<ValidatorId>, H>,
 ) -> Vec<ProvisionBatch>
 where
     S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
     H: BuildHasher,
 {
+    let Broadcast {
+        source_shard,
+        source_block_ts,
+        transactions,
+        trie,
+        claimed,
+    } = *block;
     let mut sorted_recipients: Vec<_> = shard_recipients.iter().collect();
     sorted_recipients.sort_by_key(|(shard, _)| **shard);
 
@@ -104,6 +121,15 @@ where
         );
         return Vec::new();
     };
+    let requests = block_requests(
+        &state,
+        trie,
+        source_shard,
+        view.anchor_height(),
+        source_block_ts,
+        transactions,
+    );
+    let requests = requests.as_slice();
     let keys = keys_over_requests(&state, requests);
     let mut batches = Vec::with_capacity(sorted_recipients.len());
     for (target_shard, recipients) in sorted_recipients {
@@ -187,7 +213,8 @@ where
         }
         ProvisionAction::FetchAndBroadcastProvisions {
             block_hash,
-            requests,
+            transactions,
+            trie,
             source_shard,
             block_height,
             source_block_ts,
@@ -198,17 +225,20 @@ where
             let view = ctx.pending_chain.view_at(block_hash, block_height);
             let batches = fetch_and_broadcast_provision(
                 &view,
-                source_shard,
-                source_block_ts,
-                &requests,
-                &claimed,
+                &Broadcast {
+                    source_shard,
+                    source_block_ts,
+                    transactions: &transactions,
+                    trie: &trie,
+                    claimed: &claimed,
+                },
                 &shard_recipients,
             );
-            if batches.is_empty() && !requests.is_empty() {
+            if batches.is_empty() && !claimed.is_empty() {
                 warn!(
                     source_shard = source_shard.inner(),
                     block_height = block_height.inner(),
-                    requests = requests.len(),
+                    targets = claimed.len(),
                     "provision broadcast built no batches"
                 );
             }
@@ -289,16 +319,23 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_engine::tick_select::terms_of;
     use hyperscale_network::compression::compress;
-    use hyperscale_storage::test_helpers::{make_settled_writes, state_key};
-    use hyperscale_storage::{GenesisCommit, PendingChain};
+    use hyperscale_storage::test_helpers::{
+        headed_at, make_settled_writes, pending_row, serving_entries, state_key,
+    };
+    use hyperscale_storage::{GenesisCommit, MemberRow, PendingChain};
     use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::test_utils::{TestCommittee, test_prefix, test_principal};
     use hyperscale_types::{
-        BlockHeight, Hash, LeafPath, MAX_WIRE_MESSAGE_BYTES, MerkleInclusionProof, ProvisionParts,
-        ProvisionTxRoot, TxHash, provision_leaf, served_digest,
+        BlockHeight, DeclaredKey, Hash, LeafPath, MAX_WIRE_MESSAGE_BYTES, MerkleInclusionProof,
+        Mode, ProvisionParts, ProvisionTxRoot, SettledWrites, TxHash, provision_leaf,
+        served_digest,
     };
 
     use super::*;
+    use crate::provision_tx_roots;
+    use crate::test_fixtures::{CREDIT, WRITE, cell, shaped};
 
     /// A part carrying a three MiB proof: two fit one pack, three do not.
     fn heavy(index: u32) -> Provision {
@@ -336,58 +373,160 @@ mod tests {
         assert!(pack(Vec::new()).is_empty());
     }
 
+    const SOURCE: ShardId = ShardId::leaf(1, 0);
+    const TARGET: ShardId = ShardId::leaf(1, 1);
+
+    /// A member that reads a cell of the source's and writes one of the
+    /// target's, paid on the target's shard.
+    fn reading_member() -> Verifiable<Transaction> {
+        shaped(
+            test_principal(0x81),
+            &[
+                (DeclaredKey::Cell(state_key(7, 1)), Mode::Read),
+                (cell(test_prefix(0x81), 1), WRITE),
+            ],
+            Vec::new(),
+        )
+    }
+
+    /// The source's genesis view: the cell [`reading_member`] reads, and
+    /// `rows` standing with their `Serves` entries.
+    fn genesis_view(rows: &[MemberRow]) -> Arc<SubstateView<SimShardStorage>> {
+        let storage = SimShardStorage::default();
+        let (cells, _) = make_settled_writes(7, 1, vec![1]).into_parts();
+        let (_, entries) = serving_entries(SOURCE, rows).into_parts();
+        let seeded = SettledWrites::from_parts(cells, entries);
+        storage.install_genesis(&seeded, &seeded);
+        let chain = Arc::new(PendingChain::new(Arc::new(storage), BlockHeight::GENESIS));
+        chain.view_at_persisted_tip()
+    }
+
+    /// `tx`'s row on the source, committed by the genesis block and made
+    /// head there.
+    fn headed_at_genesis(tx: &Verifiable<Transaction>) -> MemberRow {
+        let terms = terms_of(tx, &TestCommittee::new(4, 1).topology_snapshot(2), SOURCE);
+        headed_at(
+            pending_row(
+                tx.hash(),
+                BlockHeight::GENESIS,
+                WeightedTimestamp::ZERO,
+                &terms,
+            ),
+            BlockHeight::GENESIS,
+            WeightedTimestamp::ZERO,
+        )
+    }
+
+    /// What the source's genesis block in `view` sends under `claimed`
+    /// for `transactions`, to the target.
+    fn sent(
+        view: &SubstateView<SimShardStorage>,
+        transactions: &[Verifiable<Transaction>],
+        claimed: &ProvisionTxRootsMap,
+    ) -> Vec<ProvisionBatch> {
+        fetch_and_broadcast_provision(
+            view,
+            &Broadcast {
+                source_shard: SOURCE,
+                source_block_ts: WeightedTimestamp::ZERO,
+                transactions,
+                trie: &ShardTrie::uniform(1),
+                claimed,
+            },
+            &HashMap::from([(TARGET, vec![ValidatorId::new(1)])]),
+        )
+    }
+
+    /// The roots the source's genesis block in `view` claims for
+    /// `transactions`.
+    fn honest_roots(
+        view: &SubstateView<SimShardStorage>,
+        transactions: &[Verifiable<Transaction>],
+    ) -> ProvisionTxRootsMap {
+        provision_tx_roots(
+            &view.served_snapshot().expect("genesis is held"),
+            &ShardTrie::uniform(1),
+            SOURCE,
+            BlockHeight::GENESIS,
+            WeightedTimestamp::ZERO,
+            transactions,
+        )
+        .expect("routed")
+    }
+
     /// A source whose parts' leaves do not walk to its own header's root
     /// for a target sends that target nothing, so nothing reaches the
     /// outbound cache either; the same parts under the root they make
     /// are sent.
     #[test]
     fn a_proposer_whose_parts_fail_its_own_root_sends_nothing() {
-        let target = ShardId::leaf(1, 1);
-        let storage = SimShardStorage::default();
-        let seeded = make_settled_writes(7, 1, vec![1]);
-        storage.install_genesis(&seeded, &seeded);
-        let chain = Arc::new(PendingChain::new(Arc::new(storage), BlockHeight::GENESIS));
-        let view = chain.view_at_persisted_tip();
-        let request = ProvisionsRequest {
-            tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
-            clock: WeightedTimestamp::ZERO,
-            targets: vec![target],
-            local_keys: vec![state_key(7, 1)],
-            local_ranges: Vec::new(),
-        };
-        let requests = std::slice::from_ref(&request);
-        let recipients = HashMap::from([(target, vec![ValidatorId::new(1)])]);
-        let roots = |root| ProvisionTxRootsMap::new([(target, root)].into()).expect("one target");
-        let send = |claimed: &ProvisionTxRootsMap| {
-            fetch_and_broadcast_provision(
-                &view,
-                ShardId::leaf(1, 0),
-                WeightedTimestamp::ZERO,
-                requests,
-                claimed,
-                &recipients,
-            )
-        };
+        let member = reading_member();
+        let view = genesis_view(&[headed_at_genesis(&member)]);
+        let roots = |root| ProvisionTxRootsMap::new([(TARGET, root)].into()).expect("one target");
 
         let stripped = roots(ProvisionTxRoot::over(&[provision_leaf(
-            request.tx_hash,
-            request.clock,
+            member.hash(),
+            WeightedTimestamp::ZERO,
             served_digest(std::iter::empty()),
         )]));
-        assert!(send(&stripped).is_empty(), "a root over a stripped part");
         assert!(
-            send(&ProvisionTxRootsMap::default()).is_empty(),
+            sent(&view, &[], &stripped).is_empty(),
+            "a root over a stripped part"
+        );
+        assert!(
+            sent(&view, &[], &ProvisionTxRootsMap::default()).is_empty(),
             "a header owing the target nothing"
         );
 
-        let state = view.served_snapshot().expect("genesis is held");
-        let owed = Owed::of(&state, requests, target);
-        let honest = roots(owed.root().expect("the target is owed a part"));
-        let [batch] = &send(&honest)[..] else {
+        let [batch] = &sent(&view, &[], &honest_roots(&view, &[]))[..] else {
             panic!("the target's parts are sent under its own root")
         };
-        assert_eq!(batch.target_shard, target);
+        assert_eq!(batch.target_shard, TARGET);
         assert_eq!(batch.packs.concat().len(), 1);
+    }
+
+    /// A block committing no cross-shard transaction that makes a member
+    /// head roots that member's part, and its broadcast sends it.
+    #[test]
+    fn a_block_of_late_heads_alone_broadcasts_their_parts() {
+        let member = reading_member();
+        let view = genesis_view(&[headed_at_genesis(&member)]);
+        let claimed = honest_roots(&view, &[]);
+        assert!(claimed.contains_key(&TARGET), "the head's part is rooted");
+        let [batch] = &sent(&view, &[], &claimed)[..] else {
+            panic!("the head's part is sent")
+        };
+        let parts = batch.packs.concat();
+        assert_eq!(
+            parts.iter().map(Provision::tx_hash).collect::<Vec<_>>(),
+            vec![member.hash()]
+        );
+    }
+
+    /// A block's broadcast sends the parts of the members it makes head
+    /// after those of the transactions it commits, under one root.
+    #[test]
+    fn the_broadcast_sends_the_parts_of_late_heads() {
+        let member = reading_member();
+        let view = genesis_view(&[headed_at_genesis(&member)]);
+        let own = shaped(
+            test_principal(0x82),
+            &[
+                (cell(test_prefix(0x01), 1), CREDIT),
+                (cell(test_prefix(0x82), 1), WRITE),
+            ],
+            Vec::new(),
+        );
+        let transactions = std::slice::from_ref(&own);
+        let claimed = honest_roots(&view, transactions);
+        let [batch] = &sent(&view, transactions, &claimed)[..] else {
+            panic!("the target's parts are sent")
+        };
+        let parts = batch.packs.concat();
+        assert_eq!(
+            parts.iter().map(Provision::tx_hash).collect::<Vec<_>>(),
+            vec![own.hash(), member.hash()]
+        );
     }
 
     /// The frame caps a notification's compressed length, and compression

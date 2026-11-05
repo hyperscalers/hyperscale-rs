@@ -28,18 +28,18 @@ use hyperscale_types::{
     CommittedAt, ConsensusReceipt, Deadline, Decision, DiscardCause, EntryKey, EntryLeaf, Epoch,
     EpochWindows, Event, ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs,
     GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LocalKey,
-    MAX_SWEEP_PER_BLOCK, MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths,
-    PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable, ProposerTimestamp,
-    ProtocolHasher, Provision, ProvisionHash, QuorumCertificate, RETENTION_HORIZON, Randomness,
-    RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark, Reading, Role, Round,
-    SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement, ShardAnchor, ShardId,
-    ShardTrie, ShardWitnessPayload, SiblingView, SignerBitfield, Source, SpcCert, SpcView,
-    SplitChildRoots, Stake, StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt,
-    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, TickLine,
-    Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId,
-    Value, Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
-    compute_global_receipt_root, compute_merkle_root, decide, encode_amount, entry_leaf_key,
-    read_amount, receipt_hash_of, shard_prefix_path, value_of, verdict_leaf,
+    MAX_SWEEP_PER_BLOCK, MemberCollection, MemberTerms, MerkleInclusionProof, Movement, PcQc2,
+    PcQc3, PcSignerLengths, PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable,
+    ProposerTimestamp, ProtocolHasher, Provision, ProvisionHash, QuorumCertificate,
+    RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
+    Reading, Role, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement,
+    ShardAnchor, ShardId, ShardTrie, ShardWitnessPayload, SiblingView, SignerBitfield, Source,
+    SpcCert, SpcView, SplitChildRoots, Stake, StateClaim, StateRoot, StateWrites, Stated,
+    StatedTerms, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
+    TickHalf, TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
+    UnsettledTx, ValidatorId, Value, Verifiable, Verified, VotePosition, WeightedTimestamp,
+    WitnessSources, compute_global_receipt_root, compute_merkle_root, decide, encode_amount,
+    entry_leaf_key, read_amount, receipt_hash_of, shard_prefix_path, value_of, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingId, CrossingLeaf, FeeHold, Hash32, IntentHash, Terms,
@@ -48,6 +48,7 @@ use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
 use crate::shard::chain_floor::{FloorInputs, chain_floor};
 use crate::shard::members::{AnchorReadings, SettledHalf, VerdictLeaf, verdict_hash};
+use crate::shard::serves_order;
 use crate::shard::sweep::{sweep_for_block, sweep_through};
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::shard::vote_registers::carry_signed_rounds;
@@ -678,7 +679,9 @@ fn commit_with_members<S: TestStore>(
     )
 }
 
-fn commit_folding<S: TestStore>(
+/// Commit `certified` as [`commit_settled_at`] does, folding `members`
+/// into tick membership.
+pub fn commit_folding<S: TestStore>(
     storage: &S,
     certified: &Arc<Verified<CertifiedBlock>>,
     creations: &[(SubstateKey, Vec<u8>)],
@@ -6588,6 +6591,65 @@ pub fn placed_head(row: MemberRow) -> MemberRow {
         }),
         ..row
     }
+}
+
+/// The row the block at `height` committing `tx` on `terms` at
+/// `committed` writes, standing `Pending` and unplaced, its deadline one
+/// no fixture reaches.
+#[must_use]
+pub fn pending_row(
+    tx: TxHash,
+    height: BlockHeight,
+    committed: WeightedTimestamp,
+    terms: &MemberTerms,
+) -> MemberRow {
+    let far = Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 2));
+    MemberRow::pending(tx, far, committed, height, terms)
+}
+
+/// `row` placed by its committing block and made head by the block at
+/// `height`, whose parent-QC clock is `clock`.
+#[must_use]
+pub fn headed_at(row: MemberRow, height: BlockHeight, clock: WeightedTimestamp) -> MemberRow {
+    let placed = placed_head(row);
+    MemberRow {
+        head: placed.head.map(|head| Head {
+            height,
+            clock,
+            ..head
+        }),
+        ..placed
+    }
+}
+
+/// The entries `rows`, built by hand, stand on in `shard`'s family as
+/// far as a serve reads them: each row, and the `Serves` entry of each
+/// that is head.
+///
+/// # Panics
+///
+/// Never: a row and a hash encode.
+#[must_use]
+pub fn serving_entries(shard: ShardId, rows: &[MemberRow]) -> SettledWrites {
+    let mut entries = BTreeMap::new();
+    for row in rows {
+        entries.insert(
+            MemberCollection::Members.entry(shard, row.tx),
+            Some(to_vec(row).expect("a row encodes")),
+        );
+        if let Some(head) = row.head {
+            let (owner, collection) = MemberCollection::Serves.of(shard);
+            entries.insert(
+                EntryKey {
+                    owner,
+                    collection,
+                    order: serves_order(head),
+                },
+                Some(to_vec(&row.tx).expect("a hash encodes")),
+            );
+        }
+    }
+    SettledWrites::from_parts(BTreeMap::new(), entries)
 }
 
 /// The yes receipt a stating half carries for `tx` under `hash`, writing

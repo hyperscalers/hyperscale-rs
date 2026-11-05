@@ -613,20 +613,19 @@ pub fn contested_publish_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// rival's publish, signed for the widest window, is still in flight.
 const CONTESTED_LIFE: Duration = Duration::from_secs(30);
 
-/// A publish its package's shard refuses after the payer's shard
-/// completed it still pays, and leaves its payer's vault free.
+/// A publish its package's shard refuses still pays, and leaves its
+/// payer's vault free.
 ///
 /// Two payers on one shard publish the same artifact, whose package cell
 /// the other shard keeps, so each publish runs whole on both shards and
 /// either shard can refuse it. The package's shard is cut off from the
 /// payers' shard's state and certificates, so it never reads the
 /// rival's publish accepted there and its own row stays stated holding
-/// the package cell, and the payer's publish, committed behind it,
-/// waits on that hold until its deadline and is aborted unrun. The
-/// payers' shard reads everything: it accepts the rival's publish, runs
-/// the payer's to completion and states it, and then reads the package
-/// shard's abort, on which it aborts its own row, discarding what it
-/// wrote, the burn and the end of the fee hold among it.
+/// the package cell, and the payer's publish, committed behind it, never
+/// heads there: it waits on that hold until its deadline and is aborted
+/// unrun. The package's shard serves the payers' shard the payer's part
+/// only from the block that would make it head, so the payers' shard
+/// never runs it either, and aborts it at the same deadline.
 ///
 /// What a chain owes the payer then is what it owes any refused attempt:
 /// the price once, no fee hold left standing for it, and a vault whose
@@ -635,10 +634,10 @@ const CONTESTED_LIFE: Duration = Duration::from_secs(30);
 /// # Panics
 ///
 /// Panics if the rival's publish is not in flight on the package's shard
-/// when the payer's ends, if the payers' shard does not complete the
-/// payer's publish, if the package's shard does not abort it, if the
-/// payer is not charged its price exactly once, if its fee hold stands,
-/// or if a transfer of everything the vault has left does not accept.
+/// when the payer's ends, if either shard completes the payer's publish
+/// or does not abort it, if the payer is not charged its price exactly
+/// once, if its fee hold stands, or if a transfer of everything the vault
+/// has left does not accept.
 pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
@@ -710,7 +709,7 @@ pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableC
         "the rival's publish must still be in flight on the package's shard: {:?}",
         c.chain_fate(REMOTE_SHARD, first_hash),
     );
-    assert_completed_then_refused(c, publish_hash);
+    assert_completed_on_neither(c, publish_hash);
     c.clear_drops();
 
     let context = "a publish its package's shard refused";
@@ -756,24 +755,19 @@ fn artifact_kept_on<C: Cluster>(c: &C, shard: ShardId) -> Vec<u8> {
         .unwrap_or_else(|| panic!("no artifact's package cell falls on {shard:?}"))
 }
 
-/// Assert the payers' shard attested `publish` completed, the package's
-/// shard attested only a refusal of it, and both ended it aborted.
-fn assert_completed_then_refused<C: Cluster>(c: &C, publish: TxHash) {
-    let ran = c.ran(PAYER_SHARD, publish);
-    assert!(
-        ran.iter().any(|ran| ran.succeeded),
-        "the payers' shard must have completed the publish before it was refused: {ran:?}",
-    );
-    let refused = c.ran(REMOTE_SHARD, publish);
-    assert!(
-        !refused.is_empty() && refused.iter().all(|ran| !ran.succeeded),
-        "the package's shard must have refused the publish: {refused:?}",
-    );
+/// Assert neither shard attested `publish` completed, and both ended it
+/// aborted.
+fn assert_completed_on_neither<C: Cluster>(c: &C, publish: TxHash) {
     for shard in [PAYER_SHARD, REMOTE_SHARD] {
+        let ran = c.ran(shard, publish);
+        assert!(
+            ran.iter().all(|ran| !ran.succeeded),
+            "{shard:?} must not complete a publish the package's shard never served: {ran:?}",
+        );
         assert_eq!(
             c.chain_fate(shard, publish).1.map(|(_, decision)| decision),
             Some(TransactionDecision::Aborted),
-            "{shard:?} ends the publish its package's shard refused as aborted",
+            "{shard:?} ends the publish the package's shard held behind the rival as aborted",
         );
     }
 }

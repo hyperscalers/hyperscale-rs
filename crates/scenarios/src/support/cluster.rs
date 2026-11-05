@@ -418,6 +418,13 @@ pub trait Cluster {
         Option<(BlockHeight, TransactionDecision)>,
     );
 
+    /// The height of the block of `source`'s that served `target` its
+    /// part of `tx`: the `source_height` of the engagement `target`'s
+    /// chain committed for `(source, tx)`, read off the target since the
+    /// source's row is gone once the transaction settles. `None` until
+    /// the target commits one.
+    fn served_at(&self, source: ShardId, target: ShardId, tx: TxHash) -> Option<BlockHeight>;
+
     /// The height at which `shard`'s chain burned `tx`'s price, if it
     /// has: the block carrying the finalization of the member that held
     /// its row, or its fate. Apart from [`chain_fate`](Self::chain_fate)'s

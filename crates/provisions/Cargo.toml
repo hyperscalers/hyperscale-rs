@@ -31,6 +31,7 @@ hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true
 hyperscale-storage-rocksdb.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
+hyperscale-vm-types.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

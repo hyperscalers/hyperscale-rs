@@ -559,6 +559,10 @@ impl Cluster for ProdCluster {
         self.inner.chain_fate(shard, tx)
     }
 
+    fn served_at(&self, source: ShardId, target: ShardId, tx: TxHash) -> Option<BlockHeight> {
+        self.inner.served_at(source, target, tx)
+    }
+
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {
         self.inner.chain_burn(shard, tx)
     }

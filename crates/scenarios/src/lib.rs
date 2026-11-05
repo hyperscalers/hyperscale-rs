@@ -144,8 +144,8 @@ pub use route::{
     both_venues_read_a_routes_record_inside_the_finalization_delay, core_load_genesis_accounts,
     core_routes_under_load, crossed_route_genesis_accounts, late_certificate_genesis_accounts,
     ring_route_genesis_accounts, route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
-    routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
-    routes_seated_the_other_way_lose_the_later_to_the_cycle,
+    routes_seated_in_opposite_order_both_abort_at_their_windows,
+    routes_seated_the_other_way_both_abort_at_their_windows,
     standing_answers_level_off_under_sustained_load, stated_venues_hear_each_others_yes_by_asking,
     stated_venues_hear_each_others_yes_by_push,
 };

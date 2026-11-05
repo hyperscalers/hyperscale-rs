@@ -63,7 +63,6 @@ use hyperscale_metrics::{
     record_batch_unavailable, record_crossing_push_dropped, record_early_vote_refused,
     record_pushes_placed_on_carry, record_unresolvable_tx,
 };
-use hyperscale_provisions::build_provision_requests;
 use hyperscale_storage::{
     FeeTerms, ProvisionalTx, QueueHolds, RECENT_HEADER_REPLAY, RecoveredState, TickResolution,
     declared_reservations,
@@ -3701,20 +3700,32 @@ impl ExecutionCoordinator {
         let proposer = header.proposer();
         if runnable && self.signers.contains(&proposer) {
             let local_shard = self.local_shard;
-            // The block commits the transactions it pushes, so its own
-            // parent-QC reading is both their clock and its timestamp.
-            let clock = header.parent_qc().weighted_timestamp();
-            if let Some((requests, shard_recipients)) =
-                build_provision_requests(window, transactions, &self.signers, local_shard, clock)
-            {
+            // A block owes a part wherever its header roots a target: for
+            // a transaction it commits, or for a member it makes head,
+            // which a block committing no cross-shard transaction can.
+            let claimed = header.provision_tx_roots();
+            if !claimed.is_empty() {
+                let shard_recipients = claimed
+                    .keys()
+                    .map(|&target| {
+                        let recipients = window
+                            .committee_for_shard(target)
+                            .iter()
+                            .copied()
+                            .filter(|v| !self.signers.contains(v))
+                            .collect();
+                        (target, recipients)
+                    })
+                    .collect();
                 actions.push(Action::Provisions(
                     ProvisionAction::FetchAndBroadcastProvisions {
                         block_hash,
-                        requests,
+                        transactions: Arc::clone(transactions),
+                        trie: window.shard_trie().clone(),
                         source_shard: local_shard,
                         block_height: height,
-                        source_block_ts: clock,
-                        claimed: header.provision_tx_roots().clone(),
+                        source_block_ts: header.parent_qc().weighted_timestamp(),
+                        claimed: claimed.clone(),
                         shard_recipients,
                         signer: proposer,
                     },
@@ -5372,12 +5383,12 @@ mod tests {
         ExecutionCertificateContext, ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash,
         Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
         MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr,
-        QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryBinding, RecoveryCause, Role,
-        SEED_WINDOW_EPOCHS, SeedRing, SeedSource, SettledTxsRoot, Settlement, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt,
-        SubstateKey, TerminalEvidence, TickHalf, TimestampRange, TransactionDecision, TxResolution,
-        UnsettledTx, ValidatorInfo, ValidatorSet, Verify, VoteCount, Window,
-        compute_global_receipt_root, receipt_hash_of, signed_bytes,
+        ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryBinding,
+        RecoveryCause, Role, SEED_WINDOW_EPOCHS, SeedRing, SeedSource, SettledTxsRoot, Settlement,
+        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated,
+        StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TimestampRange,
+        TransactionDecision, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Verify,
+        VoteCount, Window, compute_global_receipt_root, receipt_hash_of, signed_bytes,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, CrossingId, Hash32, IntentHash, Kind, ProtocolHasher, Terms,
@@ -18977,12 +18988,66 @@ mod tests {
         }
     }
 
+    /// The targets and the trie of each provision broadcast `actions`
+    /// carry.
+    fn broadcasts_of(actions: Vec<Action>) -> Vec<(Vec<ShardId>, ShardTrie)> {
+        actions
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Provisions(ProvisionAction::FetchAndBroadcastProvisions {
+                    shard_recipients,
+                    trie,
+                    ..
+                }) => Some((shard_recipients.into_keys().collect(), trie)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `block` with its header rooting a part for each of `targets`.
+    fn rooting(block: Block, targets: &[ShardId]) -> Block {
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+        } = block
+        else {
+            unreachable!("a live block")
+        };
+        let leaf = Hash::from_bytes(b"leaf");
+        let roots = targets
+            .iter()
+            .map(|&target| (target, ProvisionTxRoot::over(&[leaf])))
+            .collect::<BTreeMap<_, _>>();
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                provision_tx_roots: Capped::new(roots).expect("a few targets"),
+                ..header.into_parts()
+            }),
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+        }
+    }
+
     /// The first block past a halt recovery extends the halted tip, so
     /// its committee anchor sits below the bridge, and its proposer
     /// classified it under the window the fresh committee was seated in,
-    /// where the payer's shard has grown. The proposer's commit asks its
-    /// provisions of the target the header's roots name, not the one the
-    /// committee anchor's own window routes the payer to.
+    /// where the payer's shard has grown. The proposer's commit sends its
+    /// provisions to the targets the header's roots name, routed under the
+    /// window its committee signed, not the one the committee anchor's own
+    /// window routes the payer by.
     #[test]
     fn a_block_past_a_recovery_bridge_gossips_under_the_bridged_committee() {
         install_stub_protocol_statics();
@@ -19039,17 +19104,25 @@ mod tests {
         let proposer = ValidatorId::new(0);
         // A block of the halted suffix, certified below the bridge by the
         // committee that halted, routes under its own window.
-        for (certified_ms, signed, routed) in [
-            (22_500, Epoch::new(21), target),
-            (3_500, Epoch::new(2), ShardId::leaf(1, 1)),
+        for (certified_ms, signed, routed, trie) in [
+            (22_500, Epoch::new(21), target, grown),
+            (
+                3_500,
+                Epoch::new(2),
+                ShardId::leaf(1, 1),
+                ShardTrie::uniform(1),
+            ),
         ] {
             let mut state = make_test_state_for_shard(proposer, local);
-            let block = make_live_block_on_shard(
-                local,
-                BlockHeight::new(1),
-                certified_ms,
-                proposer,
-                vec![tx.clone()],
+            let block = rooting(
+                make_live_block_on_shard(
+                    local,
+                    BlockHeight::new(1),
+                    certified_ms,
+                    proposer,
+                    vec![tx.clone()],
+                ),
+                &[routed],
             );
             let certified = test_certify(block, certified_ms);
             let qc = certified.qc();
@@ -19073,20 +19146,72 @@ mod tests {
                 &certified,
                 WeightedTimestamp::from_millis(2_500),
             );
-            let targets: Vec<ShardId> = effects
-                .actions
-                .iter()
-                .filter_map(|action| match action {
-                    Action::Provisions(ProvisionAction::FetchAndBroadcastProvisions {
-                        shard_recipients,
-                        ..
-                    }) => Some(shard_recipients.keys().copied()),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-            assert_eq!(targets, vec![routed], "certified at {certified_ms}ms");
+            assert_eq!(
+                broadcasts_of(effects.actions),
+                vec![(vec![routed], trie)],
+                "certified at {certified_ms}ms"
+            );
         }
+    }
+
+    /// The proposer broadcasts wherever its block's header roots a
+    /// target, to every target it roots: a block committing no
+    /// transaction roots the parts of the members it makes head. A block
+    /// rooting nothing broadcasts nothing, whatever it commits.
+    #[test]
+    fn a_block_of_late_heads_alone_broadcasts_their_parts() {
+        install_stub_protocol_statics();
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let schedule =
+            TopologySchedule::single(Arc::new(TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &ValidatorSet::new(Vec::new()),
+                ShardTrie::uniform(1)
+                    .leaves()
+                    .map(|shard| (shard, Vec::new()))
+                    .collect(),
+                HashMap::new(),
+                BTreeMap::new(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+            )));
+        let proposer = ValidatorId::new(0);
+        let payer = PrincipalAddr::new([0x80; 31]);
+        let crossing = stub_transaction_with_reads(
+            payer,
+            &[PrincipalAddr::new([0x10; 31]).address()],
+            &[payer.address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let broadcasts = |transactions: Vec<Transaction>, targets: &[ShardId]| {
+            let mut state = make_test_state_for_shard(proposer, local);
+            let block = rooting(
+                make_live_block_on_shard(local, BlockHeight::new(1), 1_000, proposer, transactions),
+                targets,
+            );
+            broadcasts_of(
+                state
+                    .commit_block_composing(
+                        &schedule,
+                        &test_certify(block, 1_000),
+                        WeightedTimestamp::from_millis(1_000),
+                    )
+                    .actions,
+            )
+        };
+        assert_eq!(
+            broadcasts(Vec::new(), &[remote]),
+            vec![(vec![remote], ShardTrie::uniform(1))],
+        );
+        assert!(broadcasts(vec![crossing], &[]).is_empty());
     }
 
     /// The signers and anchors `actions` sign `tick_id`'s vote under,

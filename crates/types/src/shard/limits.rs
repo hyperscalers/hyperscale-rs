@@ -59,7 +59,10 @@ const _: () = assert!(
 /// `tx_outcomes` array inside any one
 /// [`ExecutionCertificate`](crate::ExecutionCertificate) for a tick from
 /// this block, and the [`Provision`](crate::Provision) parts this block
-/// owes any one target.
+/// owes any one target for the transactions it carries. The parts it
+/// owes for the members it makes head come besides, so the parts one
+/// block roots for one target can pass it: notifications split across
+/// messages, and a fetch caps the indices it asks for.
 pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 
 /// Hard cap on the sweepable cells one block's transactions may create

@@ -2457,6 +2457,7 @@ dependencies = [
  "hyperscale-storage-rocksdb",
  "hyperscale-types",
  "hyperscale-vm-effects",
+ "hyperscale-vm-types",
  "papaya",
  "proptest",
  "serde",

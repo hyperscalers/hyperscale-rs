@@ -495,6 +495,32 @@ pub fn chain_fate(
     (committed, finalized.or(fated))
 }
 
+/// Walk `store`'s committed chain for the source block that served it
+/// `tx`'s part from `source`: the `source_height` of the first engagement
+/// a block of it committed for the pair.
+///
+/// The block committing a member serves the targets that do not share
+/// its verdict, and the block making it head the ones that do; each
+/// target is served once, so this names the one block that served it.
+#[must_use]
+pub fn served_at(store: &impl CommittedChain, source: ShardId, tx: TxHash) -> Option<BlockHeight> {
+    let tip = store.tip();
+    let mut height = store.first().max(BlockHeight::new(1));
+    while height <= tip {
+        if let Some(certified) = store.block(height)
+            && let Some(engagement) = certified
+                .block()
+                .engagements()
+                .iter()
+                .find(|engagement| engagement.source == source && engagement.tx_hash == tx)
+        {
+            return Some(engagement.source_height);
+        }
+        height = height.next();
+    }
+    None
+}
+
 /// Walk `store`'s committed chain for the block that burned `tx`'s
 /// price there, apart from any decision on it.
 ///

@@ -23,7 +23,7 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_scenarios::query::{
     ChainMentions, ClaimsSection, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership,
     chain_mentions, claims_sections, declines_naming, reads_record, record_wait, records_naming,
-    retirements_by_holder,
+    retirements_by_holder, served_at,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
@@ -1260,6 +1260,10 @@ impl Cluster for SimCluster {
         Option<(BlockHeight, TransactionDecision)>,
     ) {
         chain_fate(&self.history(shard), tx)
+    }
+
+    fn served_at(&self, source: ShardId, target: ShardId, tx: TxHash) -> Option<BlockHeight> {
+        served_at(&self.history(target), source, tx)
     }
 
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {

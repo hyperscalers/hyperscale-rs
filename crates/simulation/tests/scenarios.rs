@@ -142,8 +142,8 @@ use hyperscale_scenarios::{
     register_validator_pools_a_node, register_without_capacity_is_rejected,
     registered_validator_activates_onto_a_shard, ring_route_genesis_accounts,
     route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
-    routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
-    routes_seated_the_other_way_lose_the_later_to_the_cycle,
+    routes_seated_in_opposite_order_both_abort_at_their_windows,
+    routes_seated_the_other_way_both_abort_at_their_windows,
     sealed_rounds_settle_on_the_seed_they_committed_to, second_splitter_genesis_accounts,
     securify_retires_the_key_at_the_payer_shard, single_transfer,
     split_boundary_admits_an_uncommitted_precut_tx,
@@ -1642,15 +1642,15 @@ fn both_venues_read_a_routes_record_inside_the_finalization_delay_sim() {
 /// on the venues' and traders' hosts, and the second trader needs a shard
 /// of its own.
 #[test]
-fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle_sim() {
+fn routes_seated_in_opposite_order_both_abort_at_their_windows_sim() {
     let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
-    cluster.run_faultable(routes_seated_in_opposite_order_lose_the_later_to_the_cycle);
+    cluster.run_faultable(routes_seated_in_opposite_order_both_abort_at_their_windows);
 }
 
 #[test]
-fn routes_seated_the_other_way_lose_the_later_to_the_cycle_sim() {
+fn routes_seated_the_other_way_both_abort_at_their_windows_sim() {
     let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
-    cluster.run_faultable(routes_seated_the_other_way_lose_the_later_to_the_cycle);
+    cluster.run_faultable(routes_seated_the_other_way_both_abort_at_their_windows);
 }
 
 /// Two stated venues cut off from each other's certificates and pushes:

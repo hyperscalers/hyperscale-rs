@@ -80,7 +80,7 @@ use crate::shard::crossings::record_arrivals;
 use crate::shard::fee_holds::FeeTerms;
 use crate::shard::queue::{
     AWAITED_RANK, Head, PinIndex, PinMemo, PinsChunk, Place, RowEntries, WAITER_RANK, class_span,
-    keyed, pin_chunks, queue_order, shared_standing, standing_waiter, tick_of_pins,
+    pin_chunks, queue_order, served_from_head, shared_standing, standing_waiter, tick_of_pins,
     tick_pins_order, tick_pins_span, waiter_span,
 };
 use crate::shard::sweep::committed_tx_cell_key;
@@ -675,7 +675,7 @@ pub struct MemberRow {
 impl MemberRow {
     /// The row a block writes for a transaction it commits and does not
     /// run, on the terms it states.
-    fn pending(
+    pub(crate) fn pending(
         tx: TxHash,
         deadline: Deadline,
         committed: WeightedTimestamp,
@@ -730,8 +730,7 @@ impl MemberRow {
         !self.orphaned
             && self.height < height
             && self.state == RowState::Pending
-            && waiting.settlement == Settlement::Shared
-            && keyed(&pins_of(&waiting.declared, local))
+            && served_from_head(waiting.settlement, &pins_of(&waiting.declared, local))
             && self.head.is_none_or(|head| {
                 bands
                     .iter()

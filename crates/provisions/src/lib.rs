@@ -26,6 +26,8 @@ mod pipeline;
 mod queue;
 mod requests;
 mod store;
+#[cfg(test)]
+mod test_fixtures;
 mod verification;
 mod verified_headers;
 
@@ -35,6 +37,6 @@ pub use build::{Owed, build_part};
 pub use content::{Unrouted, leaves_over_requests, provision_tx_roots, served_keys, served_leaf};
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};
-pub use requests::{ShardRecipients, build_provision_requests, provision_request};
+pub use requests::{ShardRecipients, block_requests, provision_request};
 pub use store::ProvisionStore;
 pub use verified_headers::VerifiedHeaderBuffer;
