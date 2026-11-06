@@ -15146,34 +15146,49 @@ mod tests {
     /// lets go of the read still out.
     #[test]
     fn a_carried_arrival_abandons_its_read_at_the_next_commit() {
-        let schedule = two_shard_topology();
-        let (mut state, trie, record_key, cell, filed_at) = a_delivery_waiting_on_a_crossing();
-        let armed = filed_at.plus(MAX_FINALIZATION_DELAY);
-        let anchor = proven_anchor_of(PEER, 10, armed);
-        state.counterparts.proven_anchors.record(anchor);
-        let wanted = state.wanted_records();
-        assert_eq!(
-            record_asks(
-                &state
-                    .counterparts
-                    .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
-                record_key
-            ),
-            vec![anchor],
-        );
+        for carries in [false, true] {
+            let (mut state, schedule, trie, record_key, _, carrying_at, carried) =
+                a_body_awaiting_a_push();
+            let armed = carrying_at.ts;
+            let anchor = proven_anchor_of(PEER, 10, armed);
+            state.counterparts.proven_anchors.record(anchor);
+            let wanted = state.wanted_records();
+            assert_eq!(
+                record_asks(
+                    &state
+                        .counterparts
+                        .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
+                    record_key
+                ),
+                vec![anchor],
+            );
 
-        state.provisioning.handed(record_key, cell);
-        let abandoned: Vec<Anchor> = commit_empty_on(&mut state, &schedule, HOME, 1, armed)
-            .iter()
-            .filter_map(|action| match action {
-                Action::AbandonFetch(FetchIds::RecordProofs(ids)) => Some(ids.iter()),
-                _ => None,
-            })
-            .flatten()
-            .filter(|(_, _, key)| *key == record_key)
-            .map(|(_, anchor, _)| *anchor)
-            .collect();
-        assert_eq!(abandoned, vec![anchor]);
+            let claims = if carries { vec![carried] } else { vec![] };
+            commit_carrying(&mut state, &schedule, 1, armed.as_millis(), claims);
+            // A commit composes its tick from the candidates, so the
+            // candidate behind the want is stood up again: only the
+            // arrival may end the want here.
+            state.candidates.register_member(
+                Verified::new_unchecked_for_test(straddling_transaction(1)),
+                Member::whole(HOME),
+                armed,
+                &trie,
+                PriceTable::GENESIS,
+            );
+            let abandoned: Vec<Anchor> =
+                commit_carrying(&mut state, &schedule, 2, armed.as_millis(), vec![])
+                    .iter()
+                    .filter_map(|action| match action {
+                        Action::AbandonFetch(FetchIds::RecordProofs(ids)) => Some(ids.iter()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter(|(_, _, key)| *key == record_key)
+                    .map(|(_, anchor, _)| *anchor)
+                    .collect();
+            let let_go = if carries { vec![anchor] } else { vec![] };
+            assert_eq!(abandoned, let_go, "carries: {carries}");
+        }
     }
 
     /// Whether `state` holds, to offer, a live reading of the record at
