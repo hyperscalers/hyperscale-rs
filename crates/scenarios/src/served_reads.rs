@@ -19,7 +19,7 @@ use hyperscale_types::{
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD};
 use crate::straddler::{isolate_crossing_intake, isolate_provision_intake};
 use crate::support::conservation::{Charges, World};
-use crate::support::query::held;
+use crate::support::query::{held, held_at};
 use crate::support::tx::{
     build_resource_transfer_tx, build_route_presenting_tx, build_sponsored_route_presenting_tx,
     build_swap_tx, validity_around,
@@ -175,6 +175,14 @@ impl Stage {
             whole - asked < ended && ended < whole,
             "the holder ends at one balance: {ended} of {whole}, {asked} spent",
         );
+    }
+
+    /// What the venues pool of the unit between them.
+    fn pooled_units<C: Cluster>(&self, c: &C) -> u128 {
+        self.venues
+            .iter()
+            .map(|venue| held_at(c, reserve_cell(&venue.meta, self.unit)))
+            .sum()
     }
 
     /// Submit [`Self::presenting_route`] with [`AWAY`]'s bundle held off
@@ -343,8 +351,9 @@ pub fn two_members_reading_what_the_other_reserves_both_settle<C: Cluster>(c: &m
 /// Panics if the leg does not pay, if the route does not stand head, if
 /// the reclaim does not land with the route unnamed, if the route does
 /// not accept, if the holder does not end at what the reclaim and the
-/// route leave, if a member's own part is not the one its counterpart
-/// absorbed, or if either side is not conserved.
+/// route leave, if the route's own part is not held to the one its
+/// counterpart absorbed, or differs from it, or if either side is not
+/// conserved.
 pub fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards<C: FaultableCluster>(
     c: &mut C,
 ) {
@@ -404,8 +413,8 @@ pub fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards<C: Faultabl
     );
     stage.assert_route_spent(c, before, asked);
     assert!(
-        c.run_until(epochs(4), |c| c.served_parts_agreed() > 0),
-        "the oracle must have read a part",
+        c.run_until(epochs(4), |c| c.served_part_agreed(HOME, route)),
+        "the oracle must have compared the route's part",
     );
     stage.assert_conserved(c, "a reclaim onto a served till");
 }
@@ -425,9 +434,9 @@ pub fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards<C: Faultabl
 ///
 /// Panics if the route does not stand head, if the credit does not land
 /// with the route unnamed, if the route does not accept, if the holder
-/// does not end at what the credit and the route leave, if a member's
-/// own part is not the one its counterpart absorbed, or if either side
-/// is not conserved.
+/// does not end at what the credit and the route leave, if the route's
+/// own part is not held to the one its counterpart absorbed, or differs
+/// from it, or if either side is not conserved.
 pub fn an_owed_credit_onto_a_served_vault_composes<C: FaultableCluster>(c: &mut C) {
     let mut stage = Stage::stand_up(c);
     let holder = stage.cast[0].1;
@@ -455,6 +464,7 @@ pub fn an_owed_credit_onto_a_served_vault_composes<C: FaultableCluster>(c: &mut 
         "the courier's units must land",
     );
     let credited = held(c, courier, stage.unit) / 2;
+    let pooled = stage.pooled_units(c);
     let route = stage.stand_a_route_head(c, asked);
 
     let delivery = build_resource_transfer_tx(
@@ -489,9 +499,20 @@ pub fn an_owed_credit_onto_a_served_vault_composes<C: FaultableCluster>(c: &mut 
         "the route must accept",
     );
     stage.assert_route_spent(c, before + credited, asked);
+    // The route's net is far smaller than the credit, so the bound above
+    // holds with the credit lost: only the units the venues kept say
+    // exactly where the vault ends.
     assert!(
-        c.run_until(epochs(4), |c| c.served_parts_agreed() > 0),
-        "the oracle must have read a part",
+        c.run_until(epochs(4), |c| held(c, holder.address(), stage.unit)
+            + stage.pooled_units(c)
+            == before + credited + pooled),
+        "the vault must end at the credit less what the venues kept: {} held, {} pooled",
+        held(c, holder.address(), stage.unit),
+        stage.pooled_units(c),
+    );
+    assert!(
+        c.run_until(epochs(4), |c| c.served_part_agreed(HOME, route)),
+        "the oracle must have compared the route's part",
     );
     stage.assert_conserved(c, "an owed credit onto a served vault");
 }
@@ -506,8 +527,8 @@ pub fn an_owed_credit_onto_a_served_vault_composes<C: FaultableCluster>(c: &mut 
 /// # Panics
 ///
 /// Panics if the route does not accept, if no shard names it in its head
-/// block, if a member's own part is not the one its counterpart absorbed,
-/// or if either side is not conserved.
+/// block, if that shard's part is not held to the one its counterpart
+/// absorbed, or differs from it, or if either side is not conserved.
 pub fn a_member_named_in_its_head_block_reads_one_part<C: Cluster>(c: &mut C) {
     let mut stage = Stage::stand_up(c);
     let holder = stage.cast[0].1;
@@ -520,17 +541,21 @@ pub fn a_member_named_in_its_head_block_reads_one_part<C: Cluster>(c: &mut C) {
         TransactionDecision::Accept,
         "the route must accept",
     );
+    let named_at_head = |c: &C, shard: ShardId| {
+        c.ran_line(shard, route)
+            .is_some_and(|(tick, served)| served == Some(tick))
+    };
     assert!(
-        c.run_until(epochs(4), |c| [HOME, AWAY].iter().any(|&shard| c
-            .ran_line(shard, route)
-            .is_some_and(|(tick, served)| { served == Some(tick) }))),
+        c.run_until(epochs(4), |c| named_at_head(c, HOME)
+            || named_at_head(c, AWAY)),
         "one shard must name the route in the block making it head: {:?} {:?}",
         c.ran_line(HOME, route),
         c.ran_line(AWAY, route),
     );
+    let shard = if named_at_head(c, HOME) { HOME } else { AWAY };
     assert!(
-        c.run_until(epochs(4), |c| c.served_parts_agreed() > 0),
-        "the oracle must have read a part",
+        c.run_until(epochs(4), |c| c.served_part_agreed(shard, route)),
+        "the oracle must have compared the route's part on {shard:?}",
     );
     stage.assert_conserved(c, "a member named in its head block");
 }

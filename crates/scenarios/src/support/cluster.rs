@@ -468,6 +468,13 @@ pub trait Cluster {
         0
     }
 
+    /// Whether this cluster has held `tx`'s member on `shard` to the part
+    /// a counterpart absorbed. False where it does not hold them to it.
+    fn served_part_agreed(&self, shard: ShardId, tx: TxHash) -> bool {
+        let _ = (shard, tx);
+        false
+    }
+
     /// The height at which `shard`'s chain burned `tx`'s price, if it
     /// has: the block carrying the finalization of the member that held
     /// its row, or its fate. Apart from [`chain_fate`](Self::chain_fate)'s

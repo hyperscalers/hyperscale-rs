@@ -151,6 +151,8 @@ struct ServedParts {
     absorbed: BTreeMap<(ShardId, ShardId, TxHash), (BlockHeight, Vec<SubstateEntry>)>,
     /// The parts held to each other so far.
     agreed: usize,
+    /// The members those parts were read for, by source and transaction.
+    compared: BTreeSet<(ShardId, TxHash)>,
 }
 
 impl Drop for SimCluster {
@@ -726,6 +728,7 @@ impl SimCluster {
                 "a shared member's own part differs from its counterpart's: {member:?}",
             );
             self.served_parts.agreed += 1;
+            self.served_parts.compared.insert((member.0, member.2));
         }
     }
 
@@ -1451,6 +1454,10 @@ impl Cluster for SimCluster {
 
     fn served_parts_agreed(&self) -> usize {
         self.served_parts.agreed
+    }
+
+    fn served_part_agreed(&self, shard: ShardId, tx: TxHash) -> bool {
+        self.served_parts.compared.contains(&(shard, tx))
     }
 
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {
