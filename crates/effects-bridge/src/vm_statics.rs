@@ -489,23 +489,23 @@ impl<'a> CallEnvelope<'a> {
 ///
 /// # Errors
 ///
-/// [`DerivationError::Refused`] on a debiting delta or a write whose
-/// target is a principal's protocol vault, or on a reservation above
-/// [`MAX_DECLARED_RESERVE`].
+/// [`DerivationError::Refused`] on a debiting delta, a write or a read
+/// whose target is a principal's protocol vault, or on a reservation
+/// above [`MAX_DECLARED_RESERVE`].
 fn admit_declared_debits(declared: &EffectSet) -> Result<(), DerivationError> {
     for effect in declared.iter() {
-        let debits_outside_a_reservation = match effect.mode {
+        let reaches_past_a_reservation = match effect.mode {
             Mode::Delta { moves } => moves.debits(),
-            Mode::Write { .. } => true,
-            Mode::Read | Mode::Reserve { .. } => false,
+            Mode::Write { .. } | Mode::Read => true,
+            Mode::Reserve { .. } => false,
         };
         if let EffectTarget::Point(cell) = effect.target
-            && debits_outside_a_reservation
+            && reaches_past_a_reservation
             && is_protocol_vault(&cell)
         {
             return Err(DerivationError::Refused(format!(
-                "{cell:?} is a principal's protocol vault, debited only by a reservation or the \
-                 fee"
+                "{cell:?} is a principal's protocol vault, read by no body and debited only by a \
+                 reservation or the fee"
             )));
         }
         if let Mode::Reserve { amount } = effect.mode
@@ -1322,10 +1322,11 @@ mod tests {
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
-        Answered, Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg,
-        GraphNode, Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash,
-        ManifestGraph, Member, MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket,
-        StoredRule, ValueRef, child_key, never, nullifier_expiry_ms, nullifier_key,
+        Answered, Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef,
+        GrantedBehaviour, GraphArg, GraphNode, Hash32, Hasher, Holding, InstanceMeta,
+        InstanceRegistry, Intent, IntentHash, ManifestGraph, Member, MetadataCache, PackageHash,
+        ResourceGrants, ResourceKind, ResourceMeta, RuleBytes, SignedIntent, Socket, StoredRule,
+        ValueRef, child_key, never, nullifier_expiry_ms, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::wrap_publish;
     use hyperscale_vm_stdlib::account;
@@ -1416,16 +1417,106 @@ mod tests {
         }
     }
 
+    /// A read of a principal's protocol vault is refused, the payer's own
+    /// or anyone's, so no served set holds a vault that fee holds and
+    /// burns land on.
+    #[test]
+    fn a_declared_read_of_a_protocol_vault_is_refused() {
+        for vault in [protocol_vault(), vault_key(payer(), *PROTOCOL_RESOURCE)] {
+            let refusal = admit_declared_debits(&declaring(&[(vault, Mode::Read)]))
+                .expect_err("a read of a protocol vault is refused");
+            assert!(
+                matches!(&refusal, DerivationError::Refused(reason)
+                    if reason.contains("read by no body")),
+                "{refusal:?}",
+            );
+        }
+        admit_declared_debits(&declaring(&[(vault_key(payer(), RES_X), Mode::Read)]))
+            .expect("a principal's vault of another resource is read as any cell is");
+    }
+
+    /// A presentation of a vault as a badge reads it, so presenting the
+    /// protocol resource refuses at derivation, and any other resource
+    /// presents.
+    #[test]
+    fn presenting_the_protocol_resource_as_a_badge_is_refused() {
+        let presenting = |resource: ResourceAddr| {
+            let mut present = withdraw(composer_addr(), resource, 0);
+            present.method = "present_badge".into();
+            present.args = vec![GraphArg::Literal(Value::Address(resource.address()))];
+            envelope(&intent_tree(composer_addr(), vec![present]), &[])
+        };
+        let refusal = statics()
+            .derive(&presenting(*PROTOCOL_RESOURCE))
+            .expect_err("the protocol resource is no badge");
+        assert!(
+            matches!(&refusal, DerivationError::Refused(reason)
+                if reason.contains("read by no body")),
+            "{refusal:?}",
+        );
+        statics()
+            .derive(&presenting(RES_X))
+            .expect("any other resource presents");
+    }
+
+    /// A resource whose movement rule asks the mover's balance of the
+    /// protocol resource makes a principal mover read its protocol vault,
+    /// so the movement refuses. The same rule over any other resource
+    /// admits it.
+    #[test]
+    fn a_rule_asking_a_protocol_balance_refuses_a_principal_mover() {
+        let moving = |badge: ResourceAddr| {
+            let mut rules = ResourceGrants::new();
+            rules.set(
+                GrantedBehaviour::Withdraw,
+                RuleBytes::try_from(&StoredRule::held(badge, Holding::Balance))
+                    .expect("a rule within the caps encodes"),
+            );
+            let meta = ResourceMeta {
+                namespace: Address::new([0x6A; 31], AddressClass::Component),
+                kind: ResourceKind::Fungible,
+                material: Capped::new(vec![Bytes::new(b"governed".to_vec()).unwrap()]).unwrap(),
+                rules,
+            };
+            let governed = meta.address(&ProtocolHasher);
+            let mut tree = intent_tree(
+                composer_addr(),
+                vec![
+                    withdraw(composer_addr(), governed, 1),
+                    deposit_edge(bob_addr(), 0, governed),
+                ],
+            );
+            tree.resources = Capped::new(vec![meta]).unwrap();
+            envelope(&tree, &[])
+        };
+        let refusal = statics()
+            .derive(&moving(*PROTOCOL_RESOURCE))
+            .expect_err("the mover reads its protocol vault");
+        assert!(
+            matches!(&refusal, DerivationError::Refused(reason)
+                if reason.contains("read by no body")),
+            "{refusal:?}",
+        );
+        statics()
+            .derive(&moving(RES_X))
+            .expect("a rule over any other resource admits the mover");
+    }
+
     #[test]
     fn a_reservation_and_a_credit_of_one_are_admitted() {
-        let vault = protocol_vault();
+        admit_declared_debits(&declaring(&[
+            (protocol_vault(), Mode::Reserve { amount: 7 }),
+            (protocol_vault(), IN),
+        ]))
+        .expect("a reservation and a credit of a protocol vault are admitted");
+        let vault = vault_key(PrincipalAddr::new([0x52; 31]), RES_X);
         let declared = declaring(&[
             (vault, Mode::Reserve { amount: 7 }),
             (vault, IN),
             (vault, Mode::Read),
         ]);
         admit_declared_debits(&declared)
-            .expect("a reservation, a credit and a read of a protocol vault are admitted");
+            .expect("a reservation, a credit and a read of any other vault are admitted");
         let access = classify_declared_access(&declared, payer());
         let on_vault: Vec<Mode> = access
             .declared_modes
