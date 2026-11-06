@@ -762,8 +762,7 @@ impl StateClaim {
     ///
     /// The proof must also be the one its own keys restrict it to, so a
     /// claim admitted here can be cut by key wherever a block carrying it
-    /// needs to: [`Self::restrict`] keeps a whole claim without asking,
-    /// so the proof's own `restrict` is asked directly.
+    /// needs to, and a cut that keeps every cell gives it back unchanged.
     ///
     /// # Errors
     ///
@@ -831,7 +830,9 @@ impl StateClaim {
     /// The cut proof is the one a fresh fetch over the kept keys would
     /// bring, so the piece is a claim in its own right: what a proposer
     /// carries when the whole does not fit, and what a composer holds
-    /// once a block has carried the rest.
+    /// once a block has carried the rest. That holds of a cut that keeps
+    /// every cell too: a proof that arrived with more than its claim
+    /// reads comes out as the one [`Self::verify`] takes.
     #[must_use]
     pub fn restrict(&self, keep: impl Fn(SubstateKey) -> bool) -> Option<Self> {
         let cells: Vec<(SubstateKey, Stated)> = self
@@ -842,9 +843,6 @@ impl StateClaim {
             .collect();
         if cells.is_empty() {
             return None;
-        }
-        if cells.len() == self.cells.len() {
-            return Some(self.clone());
         }
         let keys: Vec<SubstateKey> = cells.iter().map(|(key, _)| *key).collect();
         let proof = self.proof.restrict(&keys).ok()?;
@@ -1331,7 +1329,7 @@ mod tests {
             "the same tree, other bytes"
         );
 
-        let mut padding = claim;
+        let mut padding = claim.clone();
         padding.proof = MerkleInclusionProof::new(padded);
         assert_eq!(
             padding
@@ -1342,6 +1340,28 @@ mod tests {
             "it proves every reading"
         );
         assert_eq!(padding.verify(), Err(StateProofError::Noncanonical));
+
+        let recut = padding.restrict(|_| true).expect("every cell kept");
+        assert_eq!(recut.verify(), Ok(()), "a whole cut rebuilds the proof");
+        assert_eq!(recut, claim, "the claim a fresh fetch would have built");
+    }
+
+    /// A proof claiming keys its claim does not read comes out of a cut
+    /// that keeps every cell as the proof over those cells alone.
+    #[test]
+    fn a_whole_cut_drops_the_claims_its_cells_do_not_read() {
+        let (read, extra) = (test_key(1), test_key(2));
+        let wide = proven_claim(ShardId::ROOT, 3, &[read, extra], &[read, extra]);
+        let narrower = StateClaim::new(
+            wide.anchor,
+            [(read, wide.reading(read).expect("read"))],
+            wide.proof,
+        );
+        assert_eq!(narrower.verify(), Err(StateProofError::ExtraClaim));
+
+        let recut = narrower.restrict(|_| true).expect("the cell kept");
+        assert_eq!(recut.verify(), Ok(()));
+        assert!(recut.wire_weight() < narrower.wire_weight());
     }
 
     fn crossing(seed: u8) -> CrossingId {

@@ -364,7 +364,10 @@ impl HeldClaims {
         self.claims = std::mem::take(&mut self.claims)
             .into_iter()
             .filter_map(|(claim, speaks_for)| {
-                let Some(keys) = carried.get(&claim.anchor) else {
+                let met = carried
+                    .get(&claim.anchor)
+                    .filter(|keys| claim.cells.iter().any(|(key, _)| keys.contains(key)));
+                let Some(keys) = met else {
                     return Some((claim, speaks_for));
                 };
                 claim
@@ -7403,11 +7406,15 @@ mod tests {
         key: SubstateKey,
         cell: &CrossingCell,
     ) -> StateClaim {
+        // A proof over the whole keyspace, so any key may sit on any
+        // producer here: past ingress nothing reads it against a shard.
+        let (state_root, proof) =
+            state_and_proof_holding(ShardId::ROOT, &[(key, cell.to_bytes())], &[key]);
         StateClaim {
             anchor: Anchor {
                 shard: producer,
                 height: BlockHeight::new(height),
-                state_root: StateRoot::from_raw(Hash::ZERO),
+                state_root,
                 ts: WeightedTimestamp::from_millis(height * 1_000),
             },
             cells: Capped::new(vec![(
@@ -7417,7 +7424,7 @@ mod tests {
             .expect("one cell"),
             crossings: Capped::empty(),
             verdicts: Capped::empty(),
-            proof: MerkleInclusionProof::dummy(),
+            proof,
         }
     }
 
@@ -8093,6 +8100,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A holder may answer one key with a proof of more. A read of the
+    /// one key stands down on that arrival, so what is held has to be
+    /// the claim a block admits, or nothing here would carry the record.
+    #[test]
+    fn an_answer_proving_more_than_its_key_is_held_as_a_block_admits_it() {
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let (extra, _, _) = escrowed_record(0xA2, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (state_root, proof) = state_and_proof_holding(
+            PRODUCER,
+            &[(key, cell.to_bytes())],
+            &sorted(vec![key, extra]),
+        );
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(3),
+            state_root,
+            ts: WeightedTimestamp::from_millis(3_000),
+        };
+        consumer.proven_anchors.record(anchor);
+
+        Door::Fetch.bring(
+            &mut consumer,
+            &want,
+            &(anchor, proof),
+            key,
+            Some(&cell),
+            now,
+        );
+
+        let held = consumer.state_claims(&CarriedClaims::default());
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].keys(), vec![key]);
+        assert_eq!(held[0].verify(), Ok(()));
     }
 
     /// A read that comes back absent found a record its producer has not
