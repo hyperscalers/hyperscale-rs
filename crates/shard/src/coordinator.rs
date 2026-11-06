@@ -146,8 +146,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::tick_select::{
-    ManifestBudget, ManifestInputs, ManifestKind, Naming, SeatQuestion, Unlicensed, accepting,
-    carried_verdicts, member_lines, seat_questions, terminal_fates, wounded,
+    Crossing, ManifestBudget, ManifestInputs, ManifestKind, Naming, SeatQuestion, Unlicensed,
+    accepting, carried_verdicts, member_lines, seat_questions, terminal_fates, wounded,
 };
 use hyperscale_metrics::{
     record_accepted_rows_toward_a_sibling, record_blocks_from_stated_to_heard,
@@ -206,7 +206,7 @@ use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::standing_answers::HeldAnswers;
 use crate::sync_claims::{Carrier, ClaimOutcome, SyncClaims};
 use crate::tick_members::{
-    Ancestry, OfferedLegs, OwnContent, committed_sets, derived_terms, ends_licensed, hearing_rows,
+    Ancestry, BlockContent, OfferedLegs, OwnContent, committed_sets, ends_licensed, hearing_rows,
     legs_licensed, legs_that_stand, sibling_view, sibling_views, stated_terms,
 };
 use crate::timeout_keeper::{Seating, TimeoutKeeper};
@@ -342,6 +342,29 @@ impl ProposalFrame<'_> {
     /// substate count is resolved.
     fn rounds_justified(&self, round: Round) -> bool {
         round <= self.parent_qc.round().next() || self.timeout_cert.is_some()
+    }
+}
+
+/// What a voter judges a block's tick manifest over, beside the rows
+/// its content leaves.
+#[derive(Clone, Copy)]
+struct Voting<'a> {
+    /// The schedule the block's windows and recovery bands are read off.
+    schedule: &'a TopologySchedule,
+    /// The block's committee: the snapshot
+    /// [`TopologySchedule::live_committee`] resolves at its parent's
+    /// anchor.
+    committee: &'a TopologySnapshot,
+    /// The block judged.
+    block: &'a Block,
+    /// The chain from the committed tip to the block's parent.
+    ancestry: &'a Ancestry,
+}
+
+impl Voting<'_> {
+    /// The block's parent-QC clock.
+    fn anchor(&self) -> WeightedTimestamp {
+        self.block.header().parent_qc().weighted_timestamp()
     }
 }
 
@@ -2926,32 +2949,27 @@ impl ShardCoordinator {
             .map(|rows| TxsInFlight::new(rows.members.len() as u64)))
     }
 
-    /// What `block` folds into its parent's rows, named over every
-    /// transaction of the block standing on the terms this voter derives
-    /// for it, as the proposer named them.
-    fn voted_inputs(
-        &self,
-        topology_schedule: &TopologySchedule,
-        committee: &TopologySnapshot,
-        block: &Block,
-        anchor: WeightedTimestamp,
-    ) -> MemberInputs {
-        MemberInputs::deriving(
-            self.local_shard,
-            block.height(),
-            anchor,
+    /// What `voting`'s block folds into its parent's rows ahead of its
+    /// lines, as the proposer named them: every transaction of the block
+    /// standing on the terms this voter derives for it, with `crossing`'s
+    /// marker.
+    fn voted_inputs(&self, voting: &Voting<'_>, crossing: &Crossing) -> MemberInputs {
+        let block = voting.block;
+        BlockContent {
+            shard: self.local_shard,
+            height: block.height(),
+            anchor: voting.anchor(),
+            windows: voting.schedule.windows(),
+            committee: voting.committee,
+            crossing,
+        }
+        .inputs(
             block.transactions().iter().map(Verifiable::as_unverified),
             MemberSections {
                 certificates: block.certificates(),
                 records: block.abandonment_records(),
                 claims: block.state_claims(),
             },
-            topology_schedule.windows(),
-            derived_terms(
-                committee,
-                self.local_shard,
-                block.transactions().iter().map(Verifiable::as_unverified),
-            ),
         )
     }
 
@@ -2994,14 +3012,18 @@ impl ShardCoordinator {
                 "a block between the committed tip and the parent is not held".into(),
             ));
         };
-        let marker = if kind == ManifestKind::Members {
-            self.voted_marker(topology_schedule, committee, block, &ancestry.rows)?
-        } else {
-            None
+        let voting = Voting {
+            schedule: topology_schedule,
+            committee,
+            block,
+            ancestry: &ancestry,
         };
-        let pending = self
-            .voted_inputs(topology_schedule, committee, block, anchor)
-            .marked(marker.clone());
+        let crossing = if kind == ManifestKind::Members {
+            self.voted_crossing(&voting)?
+        } else {
+            Crossing::None
+        };
+        let pending = self.voted_inputs(&voting, &crossing);
         // A legs half is judged over the parent's rows advanced by the
         // block's claims alone, before any finalization of the block
         // settles: its names accept on what the siblings' state says.
@@ -3041,14 +3063,8 @@ impl ShardCoordinator {
                         "what the exit of {tx:?} is judged on is not held here"
                     )),
                 })?;
-            let (lines, budget) = self.expected_member_lines(
-                topology_schedule,
-                committee,
-                block,
-                &ancestry,
-                (&rows, marker.as_ref()),
-                &verdicts,
-            )?;
+            let (lines, budget) =
+                self.expected_member_lines(&voting, &rows, &crossing, &verdicts)?;
             (lines, Some(budget))
         };
         if named != &expected[..] {
@@ -3095,86 +3111,77 @@ impl ShardCoordinator {
         })
     }
 
-    /// The recovery marker `block` must carry first: the one `parent`,
-    /// the rows at its parent, and `committee`, the snapshot at the
-    /// parent's anchor, give a crossing block that orphans a row, and
-    /// none on any other block. Known before naming, so the block's
-    /// content is folded with it.
+    /// What `voting`'s block of member lines must do across a recovery's
+    /// bridge: what its parent's rows and its committee, the snapshot
+    /// [`TopologySchedule::live_committee`] resolves at the parent's
+    /// anchor, give it. Known before naming, so the block's content is
+    /// folded with its marker, which it must carry first where it is
+    /// owed one, and carry nowhere else.
     ///
     /// # Errors
     ///
     /// Deferred while the parent's anchor is not held; refused where the
     /// block carries another marker, or none where one is owed.
-    fn voted_marker(
-        &self,
-        topology_schedule: &TopologySchedule,
-        committee: &TopologySnapshot,
-        block: &Block,
-        parent: &MemberIndex,
-    ) -> Result<Option<TickLine>, Withheld> {
+    fn voted_crossing(&self, voting: &Voting<'_>) -> Result<Crossing, Withheld> {
+        let block = voting.block;
         let Some(parent_anchor) = self.block_anchor(block.header().parent_block_hash()) else {
             return Err(Withheld::deferred("the parent's anchor is not held".into()));
         };
-        let marker = topology_schedule
-            .recovery_bands(
-                committee,
+        let crossing = Crossing::over(
+            voting.schedule.recovery_bands(
+                voting.committee,
                 self.local_shard,
                 parent_anchor,
-                block.header().parent_qc().weighted_timestamp(),
-            )
-            .and_then(|bands| parent.recovery_marker(bands, block.height()));
+                voting.anchor(),
+            ),
+            &voting.ancestry.rows,
+            block.height(),
+        );
         let carried = block
             .tick_manifest()
             .first()
             .filter(|line| matches!(line, TickLine::Recovered { .. }));
-        if carried != marker.as_ref() {
+        if carried != crossing.marker() {
             return Err(Withheld::Refused(format!(
                 "the block carries the recovery marker {carried:?} where its parent's rows give \
-                 {marker:?}"
+                 {:?}",
+                crossing.marker()
             )));
         }
-        Ok(marker)
+        Ok(crossing)
     }
 
-    /// The member lines the chain up to `block`'s parent names over
-    /// `rows`, the family after the block's own content folded with
-    /// `marker`, the block's recovery marker where it carries one, acting
-    /// on the `verdicts` the block carries for its stated rows, and what
-    /// they leave of the manifest's budget.
+    /// The member lines the chain up to `voting`'s parent names over
+    /// `rows`, the family after the block's own content folded under
+    /// `crossing`, acting on the `verdicts` the block carries for its
+    /// stated rows, and what they leave of the manifest's budget.
     ///
     /// # Errors
     ///
-    /// Deferred while the parent's anchor is not held, or while the
-    /// evidence of a shard a held or released member reaches is not yet
-    /// folded.
+    /// Deferred while the evidence of a shard a held or released member
+    /// reaches is not yet folded.
     fn expected_member_lines(
         &self,
-        topology_schedule: &TopologySchedule,
-        committee: &TopologySnapshot,
-        block: &Block,
-        ancestry: &Ancestry,
-        (rows, marker): (&MemberIndex, Option<&TickLine>),
+        voting: &Voting<'_>,
+        rows: &MemberIndex,
+        crossing: &Crossing,
         verdicts: &BTreeMap<TxHash, Decision>,
     ) -> Result<(Vec<TickLine>, ManifestBudget), Withheld> {
+        let block = voting.block;
         let own = OwnContent::of(
             block.engagements().iter().copied().collect(),
             record_arrivals(block.state_claims()),
         );
-        let anchor = block.header().parent_qc().weighted_timestamp();
+        let anchor = voting.anchor();
         let sets = committed_sets(
             rows,
-            ancestry,
+            voting.ancestry,
             &own,
             &self.dedup_index,
             anchor,
-            committee,
-            topology_schedule,
+            voting.committee,
+            voting.schedule,
         );
-        let Some(parent_anchor) = self.block_anchor(block.header().parent_block_hash()) else {
-            return Err(Withheld::deferred("the parent's anchor is not held".into()));
-        };
-        let recovery =
-            topology_schedule.crossing_block(committee, self.local_shard, parent_anchor, anchor);
         let victims = wounded(rows, anchor, block.state_claims());
         let (lines, missing, budget) = member_lines(
             Naming {
@@ -3182,8 +3189,7 @@ impl ShardCoordinator {
                 anchor,
                 inputs: &sets,
                 evidence: &|shard, committed| sets.evidence(shard, committed),
-                recovery,
-                marker,
+                crossing,
                 wounded: &victims,
             },
             verdicts,
@@ -3200,7 +3206,6 @@ impl ShardCoordinator {
     /// over: what committed content up to the parent says of every
     /// member it may name. `None` while a block between the committed
     /// tip and the parent is not held.
-    #[allow(clippy::too_many_arguments)] // the block's parts the rows fold, beside its committee
     fn manifest_inputs(
         &self,
         topology_schedule: &TopologySchedule,
@@ -3218,18 +3223,22 @@ impl ShardCoordinator {
             self.block_anchor(parent)?,
             anchor,
         );
-        let recovery = bands.is_some();
-        let marker = bands
-            .filter(|_| kind == ManifestKind::Members)
-            .and_then(|bands| ancestry.rows.recovery_marker(bands, height));
-        let rows = self.rows_under(
+        let crossing = if kind == ManifestKind::Members {
+            Crossing::over(bands, &ancestry.rows, height)
+        } else {
+            Crossing::None
+        };
+        let rows = Self::rows_under(
             &ancestry,
-            topology_schedule.windows(),
-            committee,
-            height,
-            anchor,
+            &BlockContent {
+                shard: self.local_shard,
+                height,
+                anchor,
+                windows: topology_schedule.windows(),
+                committee,
+                crossing: &crossing,
+            },
             payload,
-            marker.as_ref(),
         );
         let mut held = committed_sets(
             &rows,
@@ -3247,15 +3256,14 @@ impl ShardCoordinator {
         );
         Some(ManifestInputs {
             committed: held,
-            recovery,
-            marker,
+            crossing,
             kind,
         })
     }
 
     /// The rows at `ancestry`'s parent advanced by `payload`'s
-    /// transactions, finalizations and records, as the block at `height`
-    /// anchored at `anchor` would carry them, and by none of its claims.
+    /// transactions, finalizations and records, as the block `content`
+    /// folds would carry them, and by none of its claims.
     ///
     /// The claims a block carries are settled only where it is built,
     /// against the parent's read frontier and beside the readings taken
@@ -3264,21 +3272,14 @@ impl ShardCoordinator {
     /// them may turn on a reading. Folded as content, as a proposer and
     /// a voter fold the block ahead of its lines: a determined member
     /// the block commits takes no waiter place here, and the block's
-    /// recovery `marker`, where it carries one, orphans what it orphans.
-    #[allow(clippy::too_many_arguments)] // the block's parts the rows fold, beside its committee
+    /// recovery marker, where it carries one, orphans what it orphans.
     fn rows_under(
-        &self,
         ancestry: &Ancestry,
-        windows: EpochWindows,
-        committee: &TopologySnapshot,
-        height: BlockHeight,
-        anchor: WeightedTimestamp,
+        content: &BlockContent<'_>,
         payload: Option<&ProposalPayload>,
-        marker: Option<&TickLine>,
     ) -> MemberIndex {
-        let local = self.local_shard;
         let mut rows = ancestry.rows.clone();
-        if payload.is_none() && marker.is_none() {
+        if payload.is_none() && content.crossing.marker().is_none() {
             return rows;
         }
         let (transactions, finalizations, records) =
@@ -3289,22 +3290,14 @@ impl ShardCoordinator {
                     &payload.abandonment_records[..],
                 )
             });
-        rows.advance_content(
-            &MemberInputs::deriving(
-                local,
-                height,
-                anchor,
-                transactions.iter().map(|tx| &**tx),
-                MemberSections {
-                    certificates: finalizations,
-                    records,
-                    claims: &[],
-                },
-                windows,
-                derived_terms(committee, local, transactions.iter().map(|tx| &**tx)),
-            )
-            .marked(marker.cloned()),
-        );
+        rows.advance_content(&content.inputs(
+            transactions.iter().map(|tx| &**tx),
+            MemberSections {
+                certificates: finalizations,
+                records,
+                claims: &[],
+            },
+        ));
         rows
     }
 
@@ -10575,6 +10568,7 @@ mod tests {
     use crate::action_handlers::{Named, Naming, build_proposal};
     use crate::admission::{RecordsSection, Section, TransactionsSection, admit_all};
     use crate::parent_checks::{AtParent, proposal_claims, refused_at_parent, within_the_cap};
+    use crate::tick_members::derived_terms;
 
     impl ShardCoordinator {
         /// This replica, opened on the chain it was built over, with
@@ -11693,10 +11687,10 @@ mod tests {
                 None,
             )
             .expect("the tip is held");
-        assert!(inputs.recovery, "the proposer reads the crossing");
         assert_eq!(
-            inputs.marker, None,
-            "no row is the lost tail's to have served"
+            inputs.crossing,
+            Crossing::Discards,
+            "the proposer reads the crossing, and no row is the lost tail's to have served"
         );
         let plain_committee = Arc::clone(plain.head());
         assert!(
@@ -11710,7 +11704,8 @@ mod tests {
                     None
                 )
                 .expect("the tip is held")
-                .recovery
+                .crossing
+                .discards()
         );
 
         let child = |lines: Vec<TickLine>| {
@@ -11853,8 +11848,8 @@ mod tests {
             )
             .expect("the tip is held");
         assert_eq!(
-            inputs.marker,
-            Some(crossing_marker()),
+            inputs.crossing,
+            Crossing::Marked(Box::new(crossing_marker())),
             "the proposer seeds it"
         );
 
@@ -13861,14 +13856,17 @@ mod tests {
         let parent = state.committed_hash;
         let height = state.committed_height.next();
         let ancestry = state.ancestry(windows, parent).expect("the tip is held");
-        let gathered_over = state.rows_under(
+        let gathered_over = ShardCoordinator::rows_under(
             &ancestry,
-            windows,
-            &committee,
-            height,
-            anchor,
+            &BlockContent {
+                shard: state.local_shard,
+                height,
+                anchor,
+                windows,
+                committee: &committee,
+                crossing: &Crossing::None,
+            },
             Some(&selected),
-            None,
         );
 
         let block = proposed_on_tip(
@@ -13907,14 +13905,17 @@ mod tests {
         let height = state.committed_height.next();
         let anchor = WeightedTimestamp::from_millis(1_500);
 
-        let gathered = state.rows_under(
+        let gathered = ShardCoordinator::rows_under(
             &ancestry,
-            windows,
-            &committee,
-            height,
-            anchor,
+            &BlockContent {
+                shard: state.local_shard,
+                height,
+                anchor,
+                windows,
+                committee: &committee,
+                crossing: &Crossing::None,
+            },
             Some(&payload),
-            None,
         );
         let row = &gathered.members[&determined.hash()];
         assert_eq!(row.state, RowState::Pending);
@@ -15041,14 +15042,17 @@ mod tests {
         let manifest = ManifestInputs::default();
         let naming = Naming {
             parent: rows,
-            shard: local,
-            height: BlockHeight::new(2),
-            anchor: WeightedTimestamp::from_millis(2_000),
-            committee,
+            content: BlockContent {
+                shard: local,
+                height: BlockHeight::new(2),
+                anchor: WeightedTimestamp::from_millis(2_000),
+                windows: EpochWindows::new(0, 0),
+                committee,
+                crossing: &manifest.crossing,
+            },
             certificates: &[],
             records: &[],
             claims: &[],
-            windows: EpochWindows::new(0, 0),
             manifest: &manifest,
             committed: &manifest.committed,
         };

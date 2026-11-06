@@ -9,10 +9,12 @@
 use std::collections::{BTreeSet, HashSet};
 
 use hyperscale_engine::tick_select::{
-    CommittedSets, Judged, ManifestBudget, SiblingViews, Unlicensed, accepting, ends_stand,
-    legs_stand, terms_of,
+    CommittedSets, Crossing, Judged, ManifestBudget, SiblingViews, Unlicensed, accepting,
+    ends_stand, legs_stand, terms_of,
 };
-use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, record_arrivals};
+use hyperscale_storage::{
+    MemberIndex, MemberInputs, MemberRow, MemberSections, RowState, record_arrivals,
+};
 use hyperscale_types::{
     Block, BlockHeight, Engagement, EpochWindows, Finalization, MemberTerms, Reshaping, Settlement,
     ShardId, SiblingView, Source, StatedTerms, SubstateKey, TickHalf, TickLine, TopologySchedule,
@@ -38,6 +40,50 @@ pub fn derived_terms<'a>(
             terms: terms_of(tx, committee, local),
         })
         .collect()
+}
+
+/// What a block's content is folded under ahead of its lines, as its
+/// proposer names them and every voter judges them: one builder, so the
+/// content a block's lines are named over and judged over is derived
+/// and marked in one place.
+#[derive(Clone, Copy)]
+pub struct BlockContent<'a> {
+    /// The committing chain.
+    pub shard: ShardId,
+    /// The block's height.
+    pub height: BlockHeight,
+    /// The block's parent-QC clock.
+    pub anchor: WeightedTimestamp,
+    /// The epoch grid the claims' anchors are marked on.
+    pub windows: EpochWindows,
+    /// The committee the block's transactions are classified under.
+    pub committee: &'a TopologySnapshot,
+    /// What the block does across a recovery's bridge: its marker, where
+    /// it carries one, is the content's one line.
+    pub crossing: &'a Crossing,
+}
+
+impl BlockContent<'_> {
+    /// What a block of `transactions` and `sections` writes before any
+    /// line of it is named: each transaction on the terms derived for it
+    /// under the block's committee, and the block's recovery marker as
+    /// its one line, so a fold of the content orphans what the block's
+    /// does.
+    pub fn inputs<'t, I>(&self, transactions: I, sections: MemberSections<'_>) -> MemberInputs
+    where
+        I: IntoIterator<Item = &'t Transaction> + Clone,
+    {
+        MemberInputs::deriving(
+            self.shard,
+            self.height,
+            self.anchor,
+            transactions.clone(),
+            sections,
+            self.windows,
+            derived_terms(self.committee, self.shard, transactions),
+        )
+        .marked(self.crossing.marker().cloned())
+    }
 }
 
 /// The terms section of a block whose transactions derive `derived` and

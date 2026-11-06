@@ -41,8 +41,8 @@ use hyperscale_types::{
     BlockProposalMessage, BlockVote, BlockVoteMessage, BodyRootContext, CertificateRoot,
     CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError,
     CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, DeferOn,
-    Derivation, Engagement, EngagementRoot, Epoch, EpochWindows, Finalization, FrontierInputs,
-    Hash, LeafRoot, LocalReceiptRoot, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    Derivation, Engagement, EngagementRoot, Epoch, Finalization, FrontierInputs, Hash, LeafRoot,
+    LocalReceiptRoot, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, ProposerTimestamp, Provision,
     ProvisionHash, ProvisionTxRootsJudged, ProvisionTxRootsMap, ProvisionsRoot, QcContext,
@@ -63,7 +63,7 @@ use crate::parent_checks::{
     AtParent, ParentRefusal, PayerCharges, ProposalClaims, Unrestricted, proposal_claims,
     refused_at_parent, within_the_cap, without_refused_reclaims,
 };
-use crate::tick_members::{derived_terms, stated_terms, states_entry};
+use crate::tick_members::{BlockContent, stated_terms, states_entry};
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
@@ -367,6 +367,14 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         committed
     };
     let committed = committed_over(&state_claims);
+    let content = BlockContent {
+        shard: local_shard,
+        height,
+        anchor,
+        windows: frontier.windows,
+        committee: topology_snapshot,
+        crossing: &manifest.crossing,
+    };
     let Named {
         mut rows,
         mut pending,
@@ -375,14 +383,10 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         proven,
     } = (Naming {
         parent: &parent_rows,
-        shard: local_shard,
-        height,
-        anchor,
-        committee: topology_snapshot,
+        content,
         certificates: &certificates,
         records: &abandonment_records,
         claims: &state_claims,
-        windows: frontier.windows,
         manifest,
         committed: &committed,
     })
@@ -434,14 +438,10 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         let recut = committed_over(&state_claims);
         let renamed = Naming {
             parent: &parent_rows,
-            shard: local_shard,
-            height,
-            anchor,
-            committee: topology_snapshot,
+            content,
             certificates: &certificates,
             records: &abandonment_records,
             claims: &state_claims,
-            windows: frontier.windows,
             manifest,
             committed: &recut,
         }
@@ -684,22 +684,15 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
 pub(crate) struct Naming<'a> {
     /// Tick membership at the parent.
     pub(crate) parent: &'a MemberIndex,
-    /// The proposing chain.
-    pub(crate) shard: ShardId,
-    /// The block's height.
-    pub(crate) height: BlockHeight,
-    /// The block's parent-QC clock.
-    pub(crate) anchor: WeightedTimestamp,
-    /// The committee the block is classified under.
-    pub(crate) committee: &'a TopologySnapshot,
+    /// What the block's content is folded under, its crossing the one
+    /// `manifest` gathered.
+    pub(crate) content: BlockContent<'a>,
     /// The finalizations the block carries.
     pub(crate) certificates: &'a [Verifiable<Finalization>],
     /// The boundary records the block carries.
     pub(crate) records: &'a [AbandonmentRecord],
     /// The state claims the block carries.
     pub(crate) claims: &'a [StateClaim],
-    /// The epoch grid the claims' anchors are marked on.
-    pub(crate) windows: EpochWindows,
     /// What the coordinator gathered of the members the block may name.
     pub(crate) manifest: &'a ManifestInputs,
     /// What committed content says of them, the block's own bundles and
@@ -730,37 +723,27 @@ impl Naming<'_> {
     /// If a transaction is not routed, or declares more accesses than a
     /// member holds: selection offers neither.
     pub(crate) fn over(&self, transactions: &[Verified<Transaction>]) -> Named {
-        let pending = MemberInputs::deriving(
-            self.shard,
-            self.height,
-            self.anchor,
+        let anchor = self.content.anchor;
+        let pending = self.content.inputs(
             transactions.iter().map(|tx| &**tx),
             MemberSections {
                 certificates: self.certificates,
                 records: self.records,
                 claims: self.claims,
             },
-            self.windows,
-            derived_terms(
-                self.committee,
-                self.shard,
-                transactions.iter().map(|tx| &**tx),
-            ),
-        )
-        .marked(self.manifest.marker.clone());
+        );
         let mut rows = self.parent.clone();
         rows.advance_content(&pending);
         let (lines, contended, proven) = match self.manifest.kind {
             ManifestKind::Members => {
-                let victims = wounded(&rows, self.anchor, self.claims);
+                let victims = wounded(&rows, anchor, self.claims);
                 let (mut lines, _, budget) = licensed_lines(
                     tick_select::Naming {
                         rows: &rows,
-                        anchor: self.anchor,
+                        anchor,
                         inputs: self.committed,
                         evidence: &|shard, committed| self.committed.evidence(shard, committed),
-                        recovery: self.manifest.recovery,
-                        marker: self.manifest.marker.as_ref(),
+                        crossing: self.content.crossing,
                         wounded: &victims,
                     },
                     &self.committed.siblings,
@@ -773,7 +756,7 @@ impl Naming<'_> {
                     &self.committed.siblings,
                     budget,
                 ));
-                let contended = contentions(&rows, &lines, self.anchor, self.committed).len();
+                let contended = contentions(&rows, &lines, anchor, self.committed).len();
                 let proven = lines
                     .iter()
                     .filter(
@@ -815,7 +798,7 @@ impl Naming<'_> {
         transactions: &mut Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK>,
     ) -> Named {
         let named = self.over(transactions);
-        let dropped = named.past_terms_budget(transactions, self.committee);
+        let dropped = named.past_terms_budget(transactions, self.content.committee);
         if dropped.is_empty() {
             return named;
         }

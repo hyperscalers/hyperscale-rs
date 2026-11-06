@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use common::sim::{ExecutionSim, LEFT, Schedule, amount, cell_of, counter};
-use hyperscale_engine::tick_select::{CommittedSets, Naming, member_lines};
+use hyperscale_engine::tick_select::{CommittedSets, Crossing, Naming, member_lines};
 use hyperscale_hbor::Capped;
 use hyperscale_storage::RowState;
 use hyperscale_types::test_utils::{
@@ -97,8 +97,7 @@ fn lines_at(sim: &ExecutionSim, anchor: WeightedTimestamp) -> Vec<TickLine> {
             anchor,
             inputs: &CommittedSets::default(),
             evidence: &|_, _| Evidence::Live { terminating: false },
-            recovery: false,
-            marker: None,
+            crossing: &Crossing::None,
             wounded: &BTreeSet::new(),
         },
         &BTreeMap::new(),

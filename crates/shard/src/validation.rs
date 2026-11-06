@@ -625,7 +625,7 @@ pub mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::{
-        CommittedSets, Naming, awaited_core, member_lines, member_of, staged_past_cap,
+        CommittedSets, Crossing, Naming, awaited_core, member_lines, member_of, staged_past_cap,
     };
     use hyperscale_hbor::{Capped, from_slice, to_vec};
     use hyperscale_storage::test_helpers::{
@@ -2904,7 +2904,6 @@ pub mod tests {
     /// hold it to no clock: the first block names their aborts.
     #[test]
     fn released_rows_leave_the_count_and_the_drain_from_their_deadline() {
-        use hyperscale_engine::tick_select::{CommittedSets, Naming, member_lines};
         use hyperscale_storage::SettledHalf;
         use hyperscale_types::{Evidence, TickHalf};
 
@@ -2930,8 +2929,7 @@ pub mod tests {
                     anchor,
                     inputs: &CommittedSets::default(),
                     evidence: &|_, _| Evidence::Live { terminating: false },
-                    recovery: false,
-                    marker: None,
+                    crossing: &Crossing::None,
                     wounded: &BTreeSet::new(),
                 },
                 &BTreeMap::new(),
@@ -4870,8 +4868,7 @@ pub mod tests {
                 anchor,
                 inputs: &arrived,
                 evidence: &|_, _| Evidence::Live { terminating: false },
-                recovery: false,
-                marker: None,
+                crossing: &Crossing::None,
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),
@@ -4912,8 +4909,7 @@ pub mod tests {
                 anchor,
                 inputs: arrived,
                 evidence: &|_, _| Evidence::Live { terminating: false },
-                recovery: true,
-                marker: None,
+                crossing: &Crossing::Discards,
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),
@@ -4990,8 +4986,7 @@ pub mod tests {
                                 anchor,
                                 inputs: arrived,
                                 evidence: &|_, _| said,
-                                recovery: false,
-                                marker: None,
+                                crossing: &Crossing::None,
                                 wounded: &BTreeSet::new(),
                             },
                             &BTreeMap::new(),
@@ -5200,8 +5195,11 @@ pub mod tests {
                             anchor,
                             inputs: arrived,
                             evidence: &|_, _| said,
-                            recovery,
-                            marker: None,
+                            crossing: &if recovery {
+                                Crossing::Discards
+                            } else {
+                                Crossing::None
+                            },
                             wounded: &BTreeSet::new(),
                         },
                         &BTreeMap::new(),

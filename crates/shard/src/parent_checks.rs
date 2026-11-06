@@ -2124,6 +2124,7 @@ mod tests {
         use hyperscale_types::{Joins, MemberTerms, Settlement, StatedTerms, TickLine};
 
         use crate::action_handlers::Naming;
+        use crate::tick_members::BlockContent;
 
         let (refused, waited) = (returnable(0), returnable(1));
         let lands = producing(
@@ -2187,14 +2188,17 @@ mod tests {
             committed.arrived.extend(record_arrivals(claims));
             Naming {
                 parent: &rows,
-                shard: PRODUCER,
-                height: BlockHeight::new(2),
-                anchor: members.committed,
-                committee: &snapshot,
+                content: BlockContent {
+                    shard: PRODUCER,
+                    height: BlockHeight::new(2),
+                    anchor: members.committed,
+                    windows: windows(),
+                    committee: &snapshot,
+                    crossing: &manifest.crossing,
+                },
                 certificates: &[],
                 records: &[],
                 claims,
-                windows: windows(),
                 manifest: &manifest,
                 committed: &committed,
             }

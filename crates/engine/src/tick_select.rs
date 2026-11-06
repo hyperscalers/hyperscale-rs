@@ -27,9 +27,9 @@ use hyperscale_types::{
     AbortCharge, Anchor, BlockHeight, Crossings, Deadline, Decision, DeclaredKey, DiscardCause,
     Evidence, Formed, Hears, Holds, Inclusion, Joins, MAX_STAGED_RECEIPT_BYTES,
     MAX_TICK_LINES_PER_BLOCK, MAX_TICK_STAGED_BYTES, MemberTerms, Mode, NAMING_WINDOW, Pin, Pins,
-    PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, SiblingView, Source,
-    StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash, Value,
-    WeightedTimestamp, Window, decide, is_protocol_vault, pins_of, staged_yes_bound,
+    PriceTable, Reach, RecoveryBands, Reserves, Role, Settlement, ShardId, ShardTrie, SiblingView,
+    Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
+    Value, WeightedTimestamp, Window, decide, is_protocol_vault, pins_of, staged_yes_bound,
     tick_manifest_admits_block, tick_manifest_admits_members, value_of, verdict_leaf,
 };
 #[cfg(test)]
@@ -1002,16 +1002,55 @@ pub fn carried_verdicts(
 pub struct ManifestInputs {
     /// What committed content up to the parent says of the members.
     pub committed: CommittedSets,
-    /// Whether the block is its shard's crossing block past a halt
-    /// recovery's bridge, which discards every tick its parent's rows
-    /// hold.
-    pub recovery: bool,
-    /// The crossing block's recovery marker over its parent's rows,
-    /// where it orphans one: the block's content is folded with it, and
-    /// it is the block's first line.
-    pub marker: Option<TickLine>,
+    /// What the block does across a halt recovery's bridge.
+    pub crossing: Crossing,
     /// What the block's manifest names.
     pub kind: ManifestKind,
+}
+
+/// What a block of member lines does across a halt recovery's bridge,
+/// read once per block off the schedule and its parent's rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Crossing {
+    /// It is not its shard's crossing block.
+    #[default]
+    None,
+    /// It is its shard's crossing block, and orphans no row: it discards
+    /// every tick its parent's rows hold.
+    Discards,
+    /// It is its shard's crossing block, and this recovery marker over
+    /// its parent's rows orphans one: it discards every tick, its content
+    /// is folded with the marker, and the marker is its first line.
+    Marked(Box<TickLine>),
+}
+
+impl Crossing {
+    /// What a block at `height` over `parent`, its parent's rows, does
+    /// where the schedule gives it `bands`: the recovery bands of a
+    /// crossing block, or `None` on any other block.
+    #[must_use]
+    pub fn over(bands: Option<RecoveryBands>, parent: &MemberIndex, height: BlockHeight) -> Self {
+        bands.map_or(Self::None, |bands| {
+            parent
+                .recovery_marker(bands, height)
+                .map_or(Self::Discards, |marker| Self::Marked(Box::new(marker)))
+        })
+    }
+
+    /// Whether the block discards every tick its parent's rows hold.
+    #[must_use]
+    pub const fn discards(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// The block's recovery marker, where it carries one.
+    #[must_use]
+    pub const fn marker(&self) -> Option<&TickLine> {
+        match self {
+            Self::Marked(marker) => Some(&**marker),
+            Self::None | Self::Discards => None,
+        }
+    }
 }
 
 /// Where a candidate stands, as its row says, with what judging it
@@ -1135,14 +1174,14 @@ impl<'a> Standing<'a> {
 /// beside the lines, so a voter, which cannot judge a manifest without
 /// it, defers.
 ///
-/// On a recovery's crossing block (`recovery`) every tick the rows hold
-/// is discarded: each was anchored below the bridge, so no committee the
-/// shard keeps can certify it, and no other line names its members in
-/// that block. The discard releases each member in flight and keeps each
-/// stated one, which owes nothing a certificate gives and leaves only on
-/// what its siblings' state says. Its marker, where it carries one,
-/// orphans the rows the lost tail may have served, and each orphan is
-/// aborted as the budget lets, in this block or a later one.
+/// On a recovery's crossing block ([`Crossing::discards`]) every tick the
+/// rows hold is discarded: each was anchored below the bridge, so no
+/// committee the shard keeps can certify it, and no other line names its
+/// members in that block. The discard releases each member in flight and
+/// keeps each stated one, which owes nothing a certificate gives and
+/// leaves only on what its siblings' state says. Its marker, where it
+/// carries one, orphans the rows the lost tail may have served, and each
+/// orphan is aborted as the budget lets, in this block or a later one.
 ///
 /// The lines are listed as the budget is charged: a recovery's marker
 /// and discards; the fates in transaction order, each after the
@@ -1174,12 +1213,11 @@ pub struct Naming<'a> {
     /// Asked of each shard a member reaches, at the clock its row was
     /// committed at.
     pub evidence: &'a dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
-    /// Whether the block is a recovery's crossing block, which discards
-    /// every tick the rows hold.
-    pub recovery: bool,
-    /// The crossing block's recovery marker, where it orphans a row:
-    /// named first, and already folded into `rows` with the content.
-    pub marker: Option<&'a TickLine>,
+    /// What the block does across a recovery's bridge: a crossing block
+    /// discards every tick the rows hold, and its marker, where it
+    /// carries one, is named first and already folded into `rows` with
+    /// the content.
+    pub crossing: &'a Crossing,
     /// The pending members the block's claims prove the victims of a
     /// hold cycle. See [`wounded`].
     pub wounded: &'a BTreeSet<TxHash>,
@@ -1197,14 +1235,13 @@ fn lines_over(
         anchor,
         inputs,
         evidence,
-        recovery,
-        marker,
+        crossing,
         wounded,
     } = naming;
     let mut candidates = Vec::new();
     let mut missing = Vec::new();
     let mut fated: Vec<(Option<TickLine>, TickLine)> = Vec::new();
-    let recovered: Vec<BlockHeight> = if recovery {
+    let recovered: Vec<BlockHeight> = if crossing.discards() {
         rows.ticks.keys().copied().collect()
     } else {
         Vec::new()
@@ -1238,7 +1275,7 @@ fn lines_over(
     }
     let mut budget = ManifestBudget::default();
     let mut lines = Vec::new();
-    if let Some(marker) = marker {
+    if let Some(marker) = crossing.marker() {
         if !budget.take(marker) {
             return (lines, missing, budget);
         }
@@ -2128,8 +2165,11 @@ mod tests {
                 anchor,
                 inputs,
                 evidence,
-                recovery,
-                marker: None,
+                crossing: &if recovery {
+                    Crossing::Discards
+                } else {
+                    Crossing::None
+                },
                 wounded,
             },
             &BTreeMap::new(),
@@ -4308,8 +4348,7 @@ mod tests {
                 anchor: ms(6_000),
                 inputs: &Held::default(),
                 evidence: &|_, _| Evidence::Live { terminating: false },
-                recovery: true,
-                marker: Some(&marker),
+                crossing: &Crossing::Marked(Box::new(marker.clone())),
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),
@@ -4441,8 +4480,7 @@ mod tests {
                 anchor: ms(1),
                 inputs: &Held::default(),
                 evidence: &|_, _| live,
-                recovery: true,
-                marker: Some(&forced),
+                crossing: &Crossing::Marked(Box::new(forced)),
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),
@@ -6369,8 +6407,7 @@ mod tests {
                 anchor: ms(5_500),
                 inputs: &Held::default(),
                 evidence: &|_, _| Evidence::Live { terminating: false },
-                recovery: false,
-                marker: None,
+                crossing: &Crossing::None,
                 wounded: &BTreeSet::new(),
             },
             views,
@@ -6502,8 +6539,7 @@ mod tests {
             anchor,
             inputs: &Held::default(),
             evidence: &evidence,
-            recovery: false,
-            marker: None,
+            crossing: &Crossing::None,
             wounded: &BTreeSet::new(),
         };
         let (lines, missing, budget) = licensed_lines(naming, &views);
@@ -6764,8 +6800,7 @@ mod tests {
                     anchor: ms(0),
                     inputs: &sets,
                     evidence: &|shard, committed| sets.evidence(shard, committed),
-                    recovery: false,
-                    marker: None,
+                    crossing: &Crossing::None,
                     wounded: &BTreeSet::new(),
                 },
                 &BTreeMap::new(),
@@ -6828,8 +6863,7 @@ mod tests {
                 anchor: IN_A_LATER_LIFE,
                 inputs: sets,
                 evidence: &|shard, committed| sets.evidence(shard, committed),
-                recovery: false,
-                marker: None,
+                crossing: &Crossing::None,
                 wounded: &BTreeSet::new(),
             },
             &views,
@@ -7271,8 +7305,7 @@ mod tests {
                 anchor: ms(5_000),
                 inputs: &Held::default(),
                 evidence: &live,
-                recovery: true,
-                marker: None,
+                crossing: &Crossing::Discards,
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),
@@ -7293,8 +7326,7 @@ mod tests {
                 anchor: ms(5_000),
                 inputs: &Held::default(),
                 evidence: &live,
-                recovery: true,
-                marker: None,
+                crossing: &Crossing::Discards,
                 wounded: &BTreeSet::new(),
             },
             &BTreeMap::new(),

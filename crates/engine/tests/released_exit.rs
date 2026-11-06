@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_engine::tick_select::{CommittedSets, Naming, member_lines};
+use hyperscale_engine::tick_select::{CommittedSets, Crossing, Naming, member_lines};
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::MemberIndex;
 use hyperscale_storage::test_helpers::test_a_sibling_reads_a_released_rows_abort_as_an_exit;
@@ -25,8 +25,7 @@ fn named(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<TickLine> {
             anchor,
             inputs: &CommittedSets::default(),
             evidence: &|_, _| Evidence::Live { terminating: false },
-            recovery: false,
-            marker: None,
+            crossing: &Crossing::None,
             wounded: &BTreeSet::new(),
         },
         &BTreeMap::new(),
