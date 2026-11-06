@@ -320,12 +320,19 @@ fn await_record_reads<C: Cluster>(
 }
 
 /// The longest a route's record may take to reach a venue whose push was
-/// lost, at the latency these scenarios run at.
+/// lost, at the latency these scenarios run at, while the holder's chain
+/// carries a load.
 const LOST_RECORD_BOUND: Duration = Duration::from_secs(10);
 
-/// A record whose push is lost to one venue is read and carried inside
-/// [`LOST_RECORD_BOUND`] of the venue's commit: the read arms on the
-/// holder's clock, well short of the finalization delay.
+/// [`LOST_RECORD_BOUND`] on an idle holder: the 5 s cold grace, about
+/// 4.2 s of proven anchor lag at three idle block steps, and the read.
+const IDLE_LOST_RECORD_BOUND: Duration = Duration::from_secs(12);
+
+/// A record lost to one venue on an idle holder is read inside
+/// [`IDLE_LOST_RECORD_BOUND`] of the venue's commit.
+///
+/// The read arms on the holder's clock, well short of the finalization
+/// delay.
 ///
 /// Requires disjoint committees, as the cut is keyed on them.
 ///
@@ -333,7 +340,7 @@ const LOST_RECORD_BOUND: Duration = Duration::from_secs(10);
 ///
 /// Panics if a venue misses its budget standing up, if the cut never
 /// fires, or if the record takes longer.
-pub fn a_lost_record_is_read_inside_ten_seconds<C: FaultableCluster>(c: &mut C) {
+pub fn a_lost_record_is_read_inside_twelve_seconds<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
@@ -343,8 +350,81 @@ pub fn a_lost_record_is_read_inside_ten_seconds<C: FaultableCluster>(c: &mut C) 
     assert!(lost.fired() > 0, "the push must actually have been lost");
     println!("record read: a lost record reached its venue in {wait:?}");
     assert!(
+        wait < IDLE_LOST_RECORD_BOUND,
+        "a lost record must be read inside {IDLE_LOST_RECORD_BOUND:?}, and took {wait:?}",
+    );
+}
+
+/// How long [`LocalTransfers`] run before a busy holder's route goes in,
+/// so its heights are at the loaded rate from the route's first block.
+const BUSY_HOLDER_LEAD: Duration = Duration::from_secs(3);
+
+/// The holder heights a second under which a chain is not loaded: an idle
+/// chain steps about every 1.3 s, a loaded one about every 0.3 s.
+const LOADED_HEIGHTS_PER_SECOND: f64 = 2.0;
+
+/// A record lost to one venue on a holder carrying transfers throughout
+/// is read inside [`LOST_RECORD_BOUND`] of the venue's commit.
+///
+/// The holder's anchors move at the loaded rate, which takes the idle
+/// block steps out of the proven anchor's lag.
+///
+/// Requires disjoint committees, as the cut is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the cut never
+/// fires, if the holder passes fewer than [`LOADED_HEIGHTS_PER_SECOND`]
+/// while the record is awaited, or if the record takes longer.
+pub fn a_lost_record_on_a_busy_holder_is_read_inside_ten_seconds<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let mut transfers = LocalTransfers {
+        payer: &traders[1],
+        to: traders[2].1,
+        sent: 0,
+    };
+    let underway = c.now() + BUSY_HOLDER_LEAD;
+    transfers.run_until(c, BUSY_HOLDER_LEAD, |c| c.now() >= underway);
+    let lost = isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD);
+    let holder_height = |c: &C| {
+        c.committed_height(TRADER_SHARD)
+            .map_or(0, BlockHeight::inner)
+    };
+    let from_height = holder_height(c);
+    let from = c.now();
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let carried = |c: &C| {
+        records
+            .iter()
+            .map(|record| c.record_wait(FIRST_VENUE_SHARD, route, *record))
+            .collect::<Option<Vec<Duration>>>()
+    };
+    assert!(
+        transfers.run_until(c, MAX_FINALIZATION_DELAY * 2, |c| carried(c).is_some()),
+        "the venue must carry a reading of the record",
+    );
+    let wait = carried(c)
+        .and_then(|waits| waits.into_iter().max())
+        .expect("every read is in");
+    let passed = holder_height(c).saturating_sub(from_height);
+    let rate = f64::from(u32::try_from(passed).expect("a short run"))
+        / c.now().saturating_sub(from).as_secs_f64();
+    assert!(lost.fired() > 0, "the push must actually have been lost");
+    println!(
+        "record read: a lost record reached its venue in {wait:?} on a busy holder, at \
+         {rate:.2} heights a second",
+    );
+    assert!(
+        rate > LOADED_HEIGHTS_PER_SECOND,
+        "the holder must stay loaded while the record is awaited, and passed {rate:.2} heights \
+         a second against {LOADED_HEIGHTS_PER_SECOND}",
+    );
+    assert!(
         wait < LOST_RECORD_BOUND,
-        "a lost record must be read inside {LOST_RECORD_BOUND:?}, and took {wait:?}",
+        "a lost record on a busy holder must be read inside {LOST_RECORD_BOUND:?}, and took \
+         {wait:?}",
     );
 }
 
@@ -702,7 +782,9 @@ const DEAD_HOLDER_ROUTES: usize = 300;
 /// never reaches more wanted keys than the fetch has places, if the reads
 /// open toward it are over `asks_per_holder` a validator or under half
 /// that, if the cut never fires, or if the record takes longer than
-/// [`LOST_RECORD_BOUND`].
+/// [`IDLE_LOST_RECORD_BOUND`]: the lost record's holder carries this one
+/// route, so it pays an idle holder's stages, the cold grace, the proven
+/// anchor's lag and the read.
 pub fn a_dead_holder_leaves_room_for_a_lost_record<C: FaultableCluster>(
     c: &mut C,
     traders: usize,
@@ -769,7 +851,7 @@ pub fn a_dead_holder_leaves_room_for_a_lost_record<C: FaultableCluster>(
     assert!(lost.fired() > 0, "the push must actually have been lost");
     println!("record read: {wait:?} for a lost record beside a dead holder");
     assert!(
-        wait < LOST_RECORD_BOUND,
+        wait < IDLE_LOST_RECORD_BOUND,
         "a dead holder must leave room for a lost record, which took {wait:?}",
     );
     c.heal_all();

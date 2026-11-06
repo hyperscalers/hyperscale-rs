@@ -54,7 +54,9 @@ use hyperscale_scenarios::{
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
-    a_lost_answer_push_is_read_at_the_consumers_boundary, a_lost_record_is_read_inside_ten_seconds,
+    a_lost_answer_push_is_read_at_the_consumers_boundary,
+    a_lost_record_is_read_inside_twelve_seconds,
+    a_lost_record_on_a_busy_holder_is_read_inside_ten_seconds,
     a_mass_decline_brings_every_payment_home,
     a_merged_pair_returns_a_crossing_its_consumer_never_took,
     a_native_post_quantum_account_pays_its_own_way, a_newcomer_founds_its_own_pool,
@@ -1737,8 +1739,14 @@ fn both_venues_read_a_routes_record_inside_the_finalization_delay_sim() {
 }
 
 #[test]
-fn a_lost_record_is_read_inside_ten_seconds_sim() {
-    route_cluster_on_dedicated_hosts().run_faultable(a_lost_record_is_read_inside_ten_seconds);
+fn a_lost_record_is_read_inside_twelve_seconds_sim() {
+    route_cluster_on_dedicated_hosts().run_faultable(a_lost_record_is_read_inside_twelve_seconds);
+}
+
+#[test]
+fn a_lost_record_on_a_busy_holder_is_read_inside_ten_seconds_sim() {
+    route_cluster_on_dedicated_hosts()
+        .run_faultable(a_lost_record_on_a_busy_holder_is_read_inside_ten_seconds);
 }
 
 #[test]
