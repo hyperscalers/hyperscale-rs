@@ -4235,19 +4235,18 @@ impl Counterparts {
     }
 
     /// Keep a pushed claim's cells while something here wants them, and
-    /// say whether the claim is done with: `false` where nothing wants
-    /// it yet and something may come to. `records` is the wanted set as
-    /// the coordinator derives it now, since a push lands between the
-    /// commits and probes that otherwise refresh it. A claim carrying
-    /// nothing wanted costs no memory here: a push that lands before
-    /// its consumer's transaction commits here, or before any body
-    /// reports its record, is the caller's to hold for the want. One
-    /// carrying only escrowed records past their taking
+    /// hand back what of it may yet come to be wanted, cut to those
+    /// cells. `records` is the wanted set as the coordinator derives it
+    /// now, since a push lands between the commits and probes that
+    /// otherwise refresh it. A cell nothing wants yet costs no memory
+    /// here: a push that lands before its consumer's transaction commits
+    /// here, or before any body reports its record, is the caller's to
+    /// hold for the want. An escrowed record past its taking
     /// ([`past_its_taking`]) is held for no want, since none can be
-    /// filed for it, and neither is one carrying only the consumer's
-    /// `Taken` of records this shard holds: a pushed `Taken` is pacing
-    /// for its producer, which retires only on a reading at a boundary
-    /// of the consumer's shard.
+    /// filed for it, and neither is the consumer's `Taken` of a record
+    /// this shard holds: a pushed `Taken` is pacing for its producer,
+    /// which retires only on a reading at a boundary of the consumer's
+    /// shard. A claim past the retention horizon hands back nothing.
     ///
     /// Two kinds of record are kept that nothing here asks for: an owed
     /// record this shard's fold credits ([`owed_here`]), and an escrowed
@@ -4262,18 +4261,18 @@ impl Counterparts {
     /// What is kept is cut to the keys not already held at the anchor,
     /// so the section stays one proof per claim, disjoint per anchor,
     /// and each arrival's read counts the push as an ask answered at its
-    /// anchor. The rule is [`Self::kept_for_wants`]', and a claim it
-    /// keeps nothing of that reads a wanted key is done with: every
-    /// commit would release it from the caller's hold while the want
-    /// lives, only to decline it again.
+    /// anchor. The rule is [`Self::kept_for_wants`]', and a wanted key it
+    /// declines is not handed back: every commit would release it from
+    /// the caller's hold while the want lives, only to decline it again.
     pub(crate) fn offer_pushed(
         &mut self,
-        claim: &StateClaim,
+        pushed: StateClaim,
         records: &[WantedRecord],
         now: WeightedTimestamp,
-    ) -> bool {
+    ) -> Option<StateClaim> {
+        let claim = &pushed;
         if now.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON {
-            return false;
+            return None;
         }
         self.want(records);
         self.clock = now;
@@ -4282,17 +4281,21 @@ impl Counterparts {
         let local = self.ledger.local();
         let for_wants = self.kept_for_wants(claim);
         let mut wanted = for_wants.keys();
-        if wanted.is_empty() {
-            return claim
-                .keys()
-                .into_iter()
-                .any(|key| self.wanted.contains(&key))
-                || claim.keys().into_iter().all(|key| {
-                    held_record(claim, key)
+        let undecided: BTreeSet<SubstateKey> = claim
+            .keys()
+            .into_iter()
+            .filter(|key| {
+                !wanted.contains(key)
+                    && !self.wanted.contains(key)
+                    && !self.rows.retires_on(*key)
+                    && !held_record(claim, *key)
                         .is_some_and(|(_, cell)| past_its_taking(&cell, local, now))
-                        || self.rows.retires_on(key)
-                });
+            })
+            .collect();
+        if undecided.len() == claim.cells.len() {
+            return Some(pushed);
         }
+        let remainder = claim.restrict(|key| undecided.contains(&key));
         for held in self.fetched.claims() {
             if held.anchor == anchor {
                 for key in held.keys() {
@@ -4309,11 +4312,8 @@ impl Counterparts {
         for refused in self.cap_unsolicited(anchor.shard, unasked) {
             wanted.remove(&refused);
         }
-        if wanted.is_empty() {
-            return true;
-        }
         let Some(kept) = claim.restrict(|key| wanted.contains(&key)) else {
-            return false;
+            return remainder;
         };
         // An owed record addressed here names its own crossing, which
         // is what the fold credits it under.
@@ -4334,7 +4334,7 @@ impl Counterparts {
             self.records.pushed(*key, anchor);
         }
         let _ = self.fetched.hold(kept);
-        true
+        remainder
     }
 
     /// Drop the claims no transaction they answered for still needs,
@@ -4585,6 +4585,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::parked_claims::ParkedClaims;
 
     impl Counterparts {
         /// Read `proof` against `anchor` for `keys` and take it, as a
@@ -4599,6 +4600,17 @@ mod tests {
             let checked = CheckedStateProof::check(anchor, keys.to_vec(), proof.clone())
                 .expect("a fetch's answer reads under its anchor");
             self.take_fetched_proof(&checked, values);
+        }
+
+        /// Offer a pushed claim, and say whether none of it is left for
+        /// the caller to hold.
+        fn done_with_push(
+            &mut self,
+            claim: &StateClaim,
+            records: &[WantedRecord],
+            now: WeightedTimestamp,
+        ) -> bool {
+            self.offer_pushed(claim.clone(), records, now).is_none()
         }
     }
 
@@ -5254,7 +5266,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x71, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        assert!(producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now));
+        assert!(producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now));
         assert_eq!(paused_from(&producer, record), Some(40_000));
         assert!(
             !pushes(&mut producer, record, 1),
@@ -5273,7 +5285,7 @@ mod tests {
         let now = WeightedTimestamp::from_millis(40_000);
         let recorder = MemoryRecorder::new();
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
             read_at_boundary(&mut producer, (&id, &cell), &[], 40, 50_000);
         });
         assert_eq!(paused_from(&producer, record), None);
@@ -5298,10 +5310,10 @@ mod tests {
         let pushed = pushed_taken(&id, &cell, cell.tx, 40_000);
         let recorder = MemoryRecorder::new();
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed, &[], now);
+            producer.done_with_push(&pushed, &[], now);
             read_at_boundary(&mut producer, (&id, &cell), &[], 40, 50_000);
-            producer.offer_pushed(&pushed, &[], now);
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 50_000), &[], now);
+            producer.done_with_push(&pushed, &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 50_000), &[], now);
         });
         assert_eq!(paused_from(&producer, record), None);
         assert_eq!(recorder.counter("repush_paused", Some("set")), 1);
@@ -5310,7 +5322,7 @@ mod tests {
             "the record is pushed again"
         );
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 55_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 55_000), &[], now);
         });
         assert_eq!(paused_from(&producer, record), Some(55_000));
         assert_eq!(recorder.counter("repush_paused", Some("set")), 2);
@@ -5324,7 +5336,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x73, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         read_at_boundary(&mut producer, (&id, &cell), &[], 40, 40_000);
         assert_eq!(paused_from(&producer, record), Some(40_000));
         assert!(!pushes(&mut producer, record, 1));
@@ -5339,7 +5351,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x74, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         let boundary = Anchor {
             shard: CONSUMER,
             height: BlockHeight::new(40),
@@ -5365,7 +5377,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x75, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         read_at_boundary(
             &mut producer,
             (&id, &cell),
@@ -5386,7 +5398,7 @@ mod tests {
         let record = id.record_key(&ProtocolHasher);
         let stranger = TxHash::from(Hash::from_bytes(b"another transaction"));
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, stranger, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, stranger, 40_000), &[], now);
         assert_eq!(paused_from(&producer, record), None);
         assert!(pushes(&mut producer, record, 1));
     }
@@ -5414,7 +5426,7 @@ mod tests {
         );
         producer.derive_asks(&ShardTrie::from_leaves([CONSUMER, PRODUCER]));
         let (paused, id, cell) = &records[0];
-        producer.offer_pushed(
+        producer.done_with_push(
             &pushed_taken(id, cell, cell.tx, 40_000),
             &[],
             WeightedTimestamp::from_millis(40_000),
@@ -5445,15 +5457,15 @@ mod tests {
         let now = WeightedTimestamp::from_millis(40_000);
         let recorder = MemoryRecorder::new();
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 35_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 35_000), &[], now);
         });
         assert_eq!(paused_from(&producer, record), Some(40_000));
         assert_eq!(recorder.counter("repush_paused", Some("set")), 1);
         let later = WeightedTimestamp::from_millis(45_000);
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 45_000), &[], later);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 45_000), &[], later);
         });
         assert_eq!(paused_from(&producer, record), Some(45_000));
         assert_eq!(recorder.counter("repush_paused", Some("set")), 2);
@@ -5521,7 +5533,7 @@ mod tests {
         let (mut producer, id, cell, taken, _) = escrowed_producer(&rows, 0x7C, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         let (left, right) = CONSUMER.children();
         let split = ShardTrie::from_leaves([left, right, PRODUCER]);
         assert!([left, right].contains(&split.shard_for_prefix(taken.owner)));
@@ -5540,7 +5552,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x7D, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         let boundary = Anchor {
             shard: CONSUMER,
             height: BlockHeight::new(40),
@@ -5580,7 +5592,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x7A, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         rows.restart();
         producer.derive_asks(&ShardTrie::from_leaves([CONSUMER, PRODUCER]));
         assert!(producer.rows.rejudge, "the read was whole");
@@ -6806,7 +6818,7 @@ mod tests {
         let retired = StateClaim::new(suffix, [(record, Inclusion::Absent)], suffix_proof.clone());
         let during = WeightedTimestamp::from_millis(EPOCH_MS + 16_000);
         assert!(
-            !counterparts.offer_pushed(&retired, &[], during),
+            !counterparts.done_with_push(&retired, &[], during),
             "a fresh absence of the record is nothing this shard keeps to offer",
         );
         counterparts.on_proof_fetched(suffix, &[record], &suffix_proof, &[]);
@@ -6845,7 +6857,7 @@ mod tests {
             "a mark at a lower height in a later epoch passes the frontier's floor",
         );
         assert!(
-            !counterparts.offer_pushed(&pushed, &[], now),
+            !counterparts.done_with_push(&pushed, &[], now),
             "with the Taken standing the recovered chain's push is dropped",
         );
         let offered = counterparts.offers(&CarriedClaims::default()).state_claims;
@@ -6859,7 +6871,7 @@ mod tests {
         // Had the Taken gone on the retirement, the same push would be
         // kept and would credit the record a second time.
         rows.remove(taken);
-        assert!(counterparts.offer_pushed(&pushed, &[], now));
+        assert!(counterparts.done_with_push(&pushed, &[], now));
         let offered = counterparts.offers(&CarriedClaims::default()).state_claims;
         let writes = owed_credits(&offered, &StateWrites::default(), &NoCells);
         assert_eq!(
@@ -7259,7 +7271,7 @@ mod tests {
             proof,
         );
         assert!(
-            producer.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000)),
+            producer.done_with_push(&pushed, &[], WeightedTimestamp::from_millis(2_000)),
             "the claim is done with: nothing parks it",
         );
         assert!(
@@ -7344,7 +7356,7 @@ mod tests {
                 ReadFrontier::default(),
             );
             let kept =
-                counterparts.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000));
+                counterparts.done_with_push(&pushed, &[], WeightedTimestamp::from_millis(2_000));
             (kept, counterparts.state_claims(&CarriedClaims::default()))
         };
 
@@ -7546,7 +7558,7 @@ mod tests {
 
         let (early, _, early_cell) = escrowed_record(0xF0, 100_001);
         assert!(
-            !consumer.offer_pushed(&pushed_record(PRODUCER, 1, early, &early_cell), &[], now),
+            !consumer.done_with_push(&pushed_record(PRODUCER, 1, early, &early_cell), &[], now),
             "short of its validity end nothing here wants an unasked record",
         );
 
@@ -7559,7 +7571,7 @@ mod tests {
                 .to_bytes(),
         );
         assert!(
-            consumer.offer_pushed(
+            consumer.done_with_push(
                 &pushed_record(PRODUCER, 2, declined, &declined_cell),
                 &[],
                 now
@@ -7581,7 +7593,7 @@ mod tests {
                 .to_bytes(),
         );
         assert!(
-            consumer.offer_pushed(
+            consumer.done_with_push(
                 &pushed_record(PRODUCER, 2, declined, &declined_cell),
                 &[],
                 now
@@ -7621,7 +7633,7 @@ mod tests {
         let record = |seed: u8| escrowed_record(seed, u64::from(seed) * 1_000);
         for seed in 5..=20u8 {
             let (key, _, cell) = record(seed);
-            assert!(consumer.offer_pushed(
+            assert!(consumer.done_with_push(
                 &pushed_record(PRODUCER, u64::from(seed), key, &cell),
                 &[],
                 now
@@ -7638,7 +7650,7 @@ mod tests {
         assert!(one_lineage(child, PRODUCER));
         for producer in [PRODUCER, child] {
             assert!(
-                consumer.offer_pushed(
+                consumer.done_with_push(
                     &pushed_record(producer, 30, younger, &younger_cell),
                     &[],
                     now
@@ -7648,12 +7660,20 @@ mod tests {
             assert_eq!(held(&consumer), sixteen);
         }
         let (again, _, again_cell) = record(7);
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 31, again, &again_cell), &[], now));
+        assert!(consumer.done_with_push(
+            &pushed_record(PRODUCER, 31, again, &again_cell),
+            &[],
+            now
+        ));
         assert_eq!(consumer.state_claims(&CarriedClaims::default()).len(), 16);
 
         // An older one takes the youngest's place.
         let (older, _, older_cell) = record(1);
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 32, older, &older_cell), &[], now));
+        assert!(consumer.done_with_push(
+            &pushed_record(PRODUCER, 32, older, &older_cell),
+            &[],
+            now
+        ));
         let mut expected = sixteen;
         expected.remove(&record(20).0);
         expected.insert(older);
@@ -7666,7 +7686,7 @@ mod tests {
             tx: younger_cell.tx,
             filed_at: now,
         }];
-        assert!(consumer.offer_pushed(
+        assert!(consumer.done_with_push(
             &pushed_record(PRODUCER, 33, younger, &younger_cell),
             &wanted,
             now
@@ -7705,7 +7725,7 @@ mod tests {
             pushed_record(asked, 40, awaited, &awaited_cell),
             pushed_record(asked, 30, also_unasked, &also_unasked_cell),
         ] {
-            assert!(consumer.offer_pushed(&claim, &wanted, now));
+            assert!(consumer.done_with_push(&claim, &wanted, now));
         }
         let offered: Vec<(ShardId, u64)> = consumer
             .state_claims(&CarriedClaims::default())
@@ -7724,7 +7744,7 @@ mod tests {
             pushed_record(asked, 30, also_unasked, &also_unasked_cell),
             pushed_record(PRODUCER, 5, unasked, &unasked_cell),
         ] {
-            assert!(unasking.offer_pushed(&claim, &[], now));
+            assert!(unasking.done_with_push(&claim, &[], now));
         }
         let offered: Vec<(ShardId, u64)> = unasking
             .state_claims(&CarriedClaims::default())
@@ -7783,7 +7803,7 @@ mod tests {
         rows.put(row, vec![1]);
         for height in 1..=64 {
             assert!(
-                consumer.offer_pushed(&pushed_record(PRODUCER, height, key, &cell), &[], now),
+                consumer.done_with_push(&pushed_record(PRODUCER, height, key, &cell), &[], now),
                 "past its validity end the record is held for no later want",
             );
             assert!(
@@ -7793,7 +7813,7 @@ mod tests {
         }
 
         rows.remove(row);
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 65, key, &cell), &[], now));
+        assert!(consumer.done_with_push(&pushed_record(PRODUCER, 65, key, &cell), &[], now));
         assert_eq!(named(&consumer), vec![(key, id)]);
     }
 
@@ -7810,7 +7830,7 @@ mod tests {
         for seed in 5..=20u8 {
             let (key, _, cell) = record(seed);
             rows.put(member_row_leaf(CONSUMER, cell.tx), vec![1]);
-            assert!(consumer.offer_pushed(
+            assert!(consumer.done_with_push(
                 &pushed_record(PRODUCER, u64::from(seed), key, &cell),
                 &[],
                 now
@@ -7818,7 +7838,7 @@ mod tests {
             assert!(consumer.state_claims(&CarriedClaims::default()).is_empty());
         }
         let (younger, younger_id, younger_cell) = record(21);
-        assert!(consumer.offer_pushed(
+        assert!(consumer.done_with_push(
             &pushed_record(PRODUCER, 30, younger, &younger_cell),
             &[],
             now
@@ -7828,7 +7848,7 @@ mod tests {
         for seed in 5..=20u8 {
             let (key, _, cell) = record(seed);
             rows.remove(member_row_leaf(CONSUMER, cell.tx));
-            assert!(consumer.offer_pushed(
+            assert!(consumer.done_with_push(
                 &pushed_record(PRODUCER, 40 + u64::from(seed), key, &cell),
                 &[],
                 now
@@ -7852,7 +7872,7 @@ mod tests {
             let mut consumer = consuming(rows);
             let claim = pushed_record(PRODUCER, 7, key, &cell);
             consumer.proven_anchors.record(claim.anchor);
-            assert!(consumer.offer_pushed(&claim, &[], now));
+            assert!(consumer.done_with_push(&claim, &[], now));
             consumer
         };
 
@@ -7909,7 +7929,7 @@ mod tests {
             .collect();
         for seed in 1..=17u8 {
             let (key, _, cell) = record(seed);
-            assert!(consumer.offer_pushed(
+            assert!(consumer.done_with_push(
                 &pushed_record(PRODUCER, u64::from(seed), key, &cell),
                 &wanted,
                 now
@@ -7997,7 +8017,7 @@ mod tests {
         let offered = |wanted: &[WantedRecord]| {
             let rows = Arc::new(TestRows::default());
             let mut consumer = consuming(&rows);
-            assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 2, key, &cell), wanted, now));
+            assert!(consumer.done_with_push(&pushed_record(PRODUCER, 2, key, &cell), wanted, now));
             assert_eq!(offered_keys(&consumer), BTreeSet::from([key]));
             named(&consumer)
         };
@@ -8099,7 +8119,7 @@ mod tests {
                         Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits"))
                     });
                     let claim = StateClaim::new(*anchor, [(key, stated)], proof.clone());
-                    consumer.offer_pushed(&claim, wanted, now)
+                    consumer.done_with_push(&claim, wanted, now)
                 }
             }
         }
@@ -8181,9 +8201,7 @@ mod tests {
 
     /// Any member of the anchor's committee may push a proven absence of
     /// a wanted key. It keeps nothing, is done with rather than parked,
-    /// and the armed key is still asked. Beside a key nothing wants it
-    /// takes the claim with it: parked, a wanted key would release the
-    /// claim on every commit.
+    /// and the armed key is still asked.
     #[test]
     fn an_absent_push_does_not_suppress_the_read() {
         let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
@@ -8219,7 +8237,82 @@ mod tests {
             [(key, Inclusion::Absent), (beside, Inclusion::Absent)],
             proof,
         );
-        assert!(consumer.offer_pushed(&mixed, &want, now));
+        assert_eq!(
+            consumer
+                .offer_pushed(mixed, &want, now)
+                .map(|rest| rest.keys()),
+            Some(vec![beside]),
+            "a key nothing wants yet is handed back without the declined one",
+        );
+    }
+
+    /// A push may carry a record whose want is filed beside one whose
+    /// want is not. The first is kept and the second parks alone, so a
+    /// commit of the first want leaves it parked, and it arrives when
+    /// its own want files, with no read behind it.
+    #[test]
+    fn a_pushed_record_filed_after_its_push_arrives_from_the_parked_part() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (filed, _, filed_cell) = escrowed_record(0xA1, 200_000);
+        let (unfiled, _, unfiled_cell) = escrowed_record(0xA2, 200_000);
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (state_root, proof) = state_and_proof_holding(
+            PRODUCER,
+            &[
+                (filed, filed_cell.to_bytes()),
+                (unfiled, unfiled_cell.to_bytes()),
+            ],
+            &sorted(vec![filed, unfiled]),
+        );
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(3),
+            state_root,
+            ts: WeightedTimestamp::from_millis(3_000),
+        };
+        consumer.proven_anchors.record(anchor);
+        let held =
+            |cell: &CrossingCell| Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits"));
+        let push = StateClaim::new(
+            anchor,
+            [(filed, held(&filed_cell)), (unfiled, held(&unfiled_cell))],
+            proof,
+        );
+        assert_eq!(push.verify(), Ok(()));
+
+        let first = [armed_want(filed, filed_cell.tx)];
+        let rest = consumer
+            .offer_pushed(push, &first, now)
+            .expect("the unfiled record is left to hold");
+        assert_eq!(rest.keys(), vec![unfiled]);
+        assert_eq!(rest.verify(), Ok(()));
+        assert_eq!(offered_keys(&consumer), BTreeSet::from([filed]));
+
+        let mut parked = ParkedClaims::new();
+        parked.hold_early(rest).expect("room to park");
+        assert!(
+            parked.release_early(&BTreeSet::from([filed])).is_empty(),
+            "the filed want's commits leave it parked",
+        );
+
+        let both = [
+            armed_want(filed, filed_cell.tx),
+            armed_want(unfiled, unfiled_cell.tx),
+        ];
+        let released = parked.release_early(&BTreeSet::from([unfiled]));
+        assert_eq!(released.len(), 1);
+        assert!(consumer.done_with_push(&released[0], &both, now));
+        assert_eq!(offered_keys(&consumer), BTreeSet::from([filed, unfiled]));
+        assert!(
+            record_asks(&consumer.probe(&trie, now, &both, windows)).is_empty(),
+            "its arrival stands for the read",
+        );
+        for claim in consumer.state_claims(&CarriedClaims::default()) {
+            assert_eq!(claim.verify(), Ok(()));
+        }
     }
 
     /// A wanted key holding the record of another transaction is kept
@@ -8559,7 +8652,7 @@ mod tests {
             id.answer(later, Answered::Never, 36_000).to_bytes(),
         );
         let mut consumer = consuming(&rows);
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 4, key, &cell), &[], end));
+        assert!(consumer.done_with_push(&pushed_record(PRODUCER, 4, key, &cell), &[], end));
         let mut block = consumer.state_claims(&CarriedClaims::default());
         assert_eq!(named(&consumer), vec![(key, id)]);
         block.push(StateClaim::new(
@@ -8582,7 +8675,7 @@ mod tests {
 
         rows.put(decline, own.clone());
         assert!(Issuer::from(&cell).answered_by(&id, Answered::Never, &own));
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 5, key, &cell), &[], end));
+        assert!(consumer.done_with_push(&pushed_record(PRODUCER, 5, key, &cell), &[], end));
         assert!(
             consumer
                 .state_claims(&CarriedClaims::default())

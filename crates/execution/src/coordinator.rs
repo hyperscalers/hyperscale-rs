@@ -3001,8 +3001,8 @@ impl ExecutionCoordinator {
             Some(proven) if proven == anchor => {
                 if claim.verdicts.is_empty() {
                     let wanted = self.wanted_records();
-                    if !self.counterparts.offer_pushed(&claim, &wanted, now)
-                        && let Err(reason) = self.parked_claims.hold_early(claim)
+                    if let Some(early) = self.counterparts.offer_pushed(claim, &wanted, now)
+                        && let Err(reason) = self.parked_claims.hold_early(early)
                     {
                         record_crossing_push_dropped(reason);
                     }
