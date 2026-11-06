@@ -3530,7 +3530,7 @@ impl ExecutionCoordinator {
         // ask them; the strands no counterpart can answer for any more
         // are let go of below.
         let trie = window.snapshot.shard_trie();
-        let wanted = self.wanted_records();
+        let wanted = self.provisioning.wanted_past(block.state_claims());
         actions.extend(self.release_early_pushes(topology_schedule, &wanted));
         let committed =
             self.counterparts
@@ -15145,7 +15145,7 @@ mod tests {
     /// An arrival a block carried ends the want, and the commit after it
     /// lets go of the read still out.
     #[test]
-    fn a_carried_arrival_abandons_its_read_at_the_next_commit() {
+    fn a_carried_arrival_abandons_its_read_in_its_commit() {
         for carries in [false, true] {
             let (mut state, schedule, trie, record_key, _, carrying_at, carried) =
                 a_body_awaiting_a_push();
@@ -15164,19 +15164,8 @@ mod tests {
             );
 
             let claims = if carries { vec![carried] } else { vec![] };
-            commit_carrying(&mut state, &schedule, 1, armed.as_millis(), claims);
-            // A commit composes its tick from the candidates, so the
-            // candidate behind the want is stood up again: only the
-            // arrival may end the want here.
-            state.candidates.register_member(
-                Verified::new_unchecked_for_test(straddling_transaction(1)),
-                Member::whole(HOME),
-                armed,
-                &trie,
-                PriceTable::GENESIS,
-            );
             let abandoned: Vec<Anchor> =
-                commit_carrying(&mut state, &schedule, 2, armed.as_millis(), vec![])
+                commit_carrying(&mut state, &schedule, 1, armed.as_millis(), claims)
                     .iter()
                     .filter_map(|action| match action {
                         Action::AbandonFetch(FetchIds::RecordProofs(ids)) => Some(ids.iter()),
@@ -15189,6 +15178,36 @@ mod tests {
             let let_go = if carries { vec![anchor] } else { vec![] };
             assert_eq!(abandoned, let_go, "carries: {carries}");
         }
+    }
+
+    /// The commit of the block carrying a held push cuts the reading
+    /// from what is held before its arrival folds, and the want it is
+    /// about to end asks nothing in between.
+    #[test]
+    fn a_block_carrying_an_arrival_draws_no_ask_in_its_commit() {
+        let (mut state, schedule, _, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.counterparts.proven_anchors.record(anchor);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim.clone()])
+                .is_empty()
+        );
+        assert!(holds_record(&state, record_key, cell.tx));
+        assert_eq!(
+            state.wanted_records().len(),
+            1,
+            "a held push leaves the want standing",
+        );
+        let due = proven_anchor_of(PEER, 12, anchor.ts);
+        state.counterparts.proven_anchors.record(due);
+
+        let actions = commit_carrying(&mut state, &schedule, 1, anchor.ts.as_millis(), vec![claim]);
+        assert_eq!(record_asks(&actions, record_key), Vec::<Anchor>::new());
+        assert!(
+            !holds_record(&state, record_key, cell.tx),
+            "the block cut it"
+        );
+        assert!(state.wanted_records().is_empty(), "and its fold ended it");
     }
 
     /// Whether `state` holds, to offer, a live reading of the record at

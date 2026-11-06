@@ -325,21 +325,40 @@ impl ProvisioningTracker {
         wanted
     }
 
+    /// [`Self::wanted_records`] as a committing block's `state_claims`
+    /// leave it: a want the block's fold ends asks nothing of this
+    /// commit, which cuts its reading from what is held and folds its
+    /// arrival only after everything that reads the wants has run.
+    pub(crate) fn wanted_past(&self, state_claims: &[StateClaim]) -> Vec<WantedRecord> {
+        let arriving = self.arrivals_in(state_claims);
+        let mut wanted = self.wanted_records();
+        wanted.retain(|want| !arriving.contains_key(&want.key));
+        wanted
+    }
+
     /// Fold the crossing records a committed block's claims read, for
     /// the requirements filed here.
     ///
     /// Every claim the block carries is read, whatever question this
     /// replica had open, so a reading pushed to the proposer folds with
-    /// no ask ever put. A live record naming the requirement's own
-    /// transaction as its issuer is the arrival; a tombstone, a bare
-    /// presence and a record of another transaction are not. Read after
-    /// the block's transactions are registered, so a reading that rides
-    /// in the transaction's own block counts, and only for requirements
-    /// already filed, so a reading in a block before the transaction's
-    /// commit here is never an arrival and the key is read again.
+    /// no ask ever put. Read after the block's transactions are
+    /// registered, so a reading that rides in the transaction's own block
+    /// counts, and only for requirements already filed, so a reading in a
+    /// block before the transaction's commit here is never an arrival and
+    /// the key is read again.
     pub(crate) fn fold_record_readings(&mut self, state_claims: &[StateClaim]) {
+        let arriving = self.arrivals_in(state_claims);
+        self.arrived.extend(arriving);
+    }
+
+    /// The arrivals `state_claims` hold for the requirements filed here
+    /// with none yet. A live record naming the requirement's own
+    /// transaction as its issuer is the arrival; a tombstone, a bare
+    /// presence and a record of another transaction are not.
+    fn arrivals_in(&self, state_claims: &[StateClaim]) -> BTreeMap<SubstateKey, Arrival> {
+        let mut arrivals = BTreeMap::new();
         if state_claims.is_empty() {
-            return;
+            return arrivals;
         }
         for (tx_hash, (_, required)) in &self.required {
             for requirement in required {
@@ -352,10 +371,11 @@ impl ProvisioningTracker {
                 if let Some((_, cell)) = live_record(state_claims, *key)
                     && cell.tx == *tx_hash
                 {
-                    self.arrived.insert(*key, Arrival { cell });
+                    arrivals.insert(*key, Arrival { cell });
                 }
             }
         }
+        arrivals
     }
 
     // ─── Batch absorption ───────────────────────────────────────────────
