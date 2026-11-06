@@ -334,13 +334,7 @@ fn a_proof_replayed_from_another_records_read_is_refused() {
         let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
         let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
         cut_record_pushes(c);
-        // The replay goes to the first ask of other keys, which may be
-        // a ledger, seat or boundary ask as well as a record read.
-        let refused = |c: &SimCluster| {
-            c.metric("fetch_responses_refused", Some("record_proof"))
-                + c.metric("fetch_responses_refused", Some("state_proof"))
-        };
-        let refused_before = refused(c);
+        let refused_before = c.metric("fetch_responses_refused", Some("record_proof"));
 
         // The first honest answer is kept with the question it answered,
         // and served once to whoever asks a different one. Lying on the
@@ -360,6 +354,19 @@ fn a_proof_replayed_from_another_records_read_is_refused() {
                     host,
                     "state_proof.request",
                     Arc::new(move |asked: &[u8], honest: &[u8]| {
+                        // Only an answer bringing the value of the one
+                        // key asked is kept or lied over, so a record
+                        // read's answer is replayed at another record
+                        // read. A boundary ask reads a record among
+                        // other cells, and a ledger or seat ask brings
+                        // no value.
+                        let one_key = hbor_from_slice::<GetStateProofRequest>(asked)
+                            .is_ok_and(|request| request.keys.len() == 1);
+                        let brings_its_value = hbor_from_slice::<GetStateProofResponse>(honest)
+                            .is_ok_and(|response| !response.values.is_empty());
+                        if !(one_key && brings_its_value) {
+                            return honest.to_vec();
+                        }
                         let mut held = kept.lock().unwrap_or_else(PoisonError::into_inner);
                         // Another question is other keys: the same keys
                         // asked again at a later height over an unchanged
@@ -402,8 +409,8 @@ fn a_proof_replayed_from_another_records_read_is_refused() {
         // values held to what it proves for them, is the rule under
         // test, and refusing the replay is where it runs.
         assert!(
-            refused(c) > refused_before,
-            "the replayed proof was never refused",
+            c.metric("fetch_responses_refused", Some("record_proof")) > refused_before,
+            "the replayed proof was never refused as a record read's",
         );
     });
 }
