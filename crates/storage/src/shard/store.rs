@@ -3,7 +3,7 @@
 //! This module defines the storage abstraction used by runners to persist
 //! substate state.
 
-use hyperscale_types::{BlockHeight, DeclaredRange, StateRoot, SubstateKey};
+use hyperscale_types::{BlockHeight, DeclaredRange, StateRoot, SubstateKey, WeightedTimestamp};
 
 use crate::Substates;
 
@@ -159,7 +159,9 @@ pub trait VersionedStore: SubstateStore {
     fn snapshot_at(&self, height: BlockHeight) -> Self::Versioned;
 
     /// Hold history at `height`: the oldest version this node's own
-    /// readers still name, which the retention floor may not pass.
+    /// readers still name, which the retention floor may not pass. And
+    /// measure the horizon from no later than `clock`, the anchor of the
+    /// last block this node has seated.
     ///
     /// The horizon answers what a *counterpart* is licensed to ask for,
     /// and it is measured against the tip's clock — which a halted
@@ -170,10 +172,19 @@ pub trait VersionedStore: SubstateStore {
     /// what they name, and there is one publisher — the tick chain,
     /// which already refuses to evict a fold below the same number.
     ///
+    /// The clock covers what the hold cannot: a block seated after the
+    /// last publication may name a height below it, and a write can
+    /// outrun the seating. Such a block's anchor is at or past `clock`,
+    /// and a height it names lies within the horizon of its anchor, so
+    /// it lies within the horizon of `clock` too.
+    ///
+    /// The two go together, the height first, so a reader that sees a
+    /// clock sees the height published with it or a later one.
+    ///
     /// Not persisted: a restarted node's readers start where its store
     /// does, and a hold outliving the reader that took it would retain
     /// history nothing reads.
-    fn hold_retention_at(&self, height: BlockHeight);
+    fn hold_retention_at(&self, height: BlockHeight, clock: WeightedTimestamp);
 
     /// Committed substate byte total after the commit at `height`,
     /// or `None` if no commit at that height recorded one (never

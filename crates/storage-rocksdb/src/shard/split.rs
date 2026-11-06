@@ -268,9 +268,10 @@ impl RocksDbShardStorage {
         // A child's history begins here, and its genesis QC carries the
         // chain origin's anchor: dating it is what puts the floor at the
         // adoption rather than below everything the parent held. The hold
-        // goes with it — every reader that named a version beneath the
-        // adoption belonged to the chain this one replaces.
+        // and its clock go with it — every reader that named a version
+        // beneath the adoption belonged to the chain this one replaces.
         self.retention_hold.store(u64::MAX, Ordering::Relaxed);
+        self.retention_clock.store(u64::MAX, Ordering::Release);
         let floor = self.advance_retention_floor(
             batch,
             genesis.height().inner(),

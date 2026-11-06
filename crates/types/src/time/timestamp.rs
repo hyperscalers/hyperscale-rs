@@ -53,6 +53,9 @@ impl WeightedTimestamp {
     /// Genesis / zero timestamp.
     pub const ZERO: Self = Self(0);
 
+    /// The clock past every other: a bound that binds nothing.
+    pub const MAX: Self = Self(u64::MAX);
+
     /// Wrap a raw ms value. Prefer
     /// [`QuorumCertificate::weighted_timestamp`](crate::QuorumCertificate::weighted_timestamp)
     /// at produce sites.

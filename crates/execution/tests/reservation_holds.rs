@@ -159,6 +159,7 @@ fn request_for(tx: &Verified<Transaction>) -> CrossShardExecutionRequest {
             BTreeSet::from([local, counterpart]),
         ),
         arrivals: Vec::new(),
+        served_at: None,
     }
 }
 

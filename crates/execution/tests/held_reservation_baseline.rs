@@ -157,6 +157,7 @@ fn abortable(tx: &Verified<Transaction>) -> CrossShardExecutionRequest {
             BTreeSet::from([local, counterpart]),
         ),
         arrivals: Vec::new(),
+        served_at: None,
     }
 }
 
@@ -216,7 +217,7 @@ fn an_inflight_reservation_is_subtracted_from_a_later_debit_of_its_vault() {
     chain.append(BlockHeight::new(1), output, &[]);
     for tick in 2..=4 {
         let below = BlockHeight::new(tick - 1);
-        chain.prune_persisted(below, BlockHeight::GENESIS);
+        chain.prune_persisted(below, BlockHeight::GENESIS, None, WeightedTimestamp::MAX);
         let view = chain.view_at(below);
         let holds = view.holds();
         assert_eq!(
@@ -336,5 +337,5 @@ impl VersionedStore for Store {
         None
     }
 
-    fn hold_retention_at(&self, _height: BlockHeight) {}
+    fn hold_retention_at(&self, _height: BlockHeight, _clock: WeightedTimestamp) {}
 }

@@ -847,9 +847,12 @@ fn build_shard_io<S: ShardStorage>(
     tick_chain.seed_stated(replica.shard_coordinator().member_rows());
     // Held from the first commit on: a restart replays from below the
     // tip, and the first commit dates a version before any persists.
+    let execution = replica.execution_coordinator();
     tick_chain.prune_persisted(
         tree_height,
-        replica.execution_coordinator().baseline_floor(),
+        execution.baseline_floor(),
+        execution.served_floor(),
+        execution.committed_ts(),
     );
     let mut block_commit = BlockCommitCoordinator::new(shard, tree_height);
     let boundary_pins = Arc::new(BoundaryPins::new(

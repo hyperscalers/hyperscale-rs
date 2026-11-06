@@ -1642,7 +1642,7 @@ mod tests {
             None
         }
 
-        fn hold_retention_at(&self, _height: BlockHeight) {}
+        fn hold_retention_at(&self, _height: BlockHeight, _clock: WeightedTimestamp) {}
     }
 
     impl TreeReader for StubStore {

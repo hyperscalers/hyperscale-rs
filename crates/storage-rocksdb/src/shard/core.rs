@@ -105,6 +105,11 @@ pub struct RocksDbShardStorage {
     /// node's readers start where its store does.
     pub(crate) retention_hold: Arc<AtomicU64>,
 
+    /// The anchor the hold was published under, which bounds the tip's
+    /// clock for the cutoff; `u64::MAX` until one holds. Stored after the
+    /// hold and read before it, so a reader of a clock sees its hold.
+    pub(crate) retention_clock: Arc<AtomicU64>,
+
     /// The crossing index rows each persisted write put or removed.
     /// Process-local: a reopened store starts a new line, and its
     /// readers read the rows whole once.
@@ -330,6 +335,7 @@ impl RocksDbShardStorage {
             checkpoints,
             vote_registers: Arc::new(Mutex::new(HashMap::new())),
             retention_hold: Arc::new(AtomicU64::new(u64::MAX)),
+            retention_clock: Arc::new(AtomicU64::new(u64::MAX)),
             crossing_journal: Arc::new(Mutex::new(CrossingJournal::new())),
             credit_burns: Arc::new(Mutex::new(CreditBurns::default())),
         })

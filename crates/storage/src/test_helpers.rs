@@ -4109,7 +4109,12 @@ where
     );
     let (block, inputs) = owed_block(2, vec![owed.claim(7, owed.held())], None);
     commit_raising(credited, block, &inputs);
-    chain.prune_persisted(BlockHeight::new(2), BlockHeight::GENESIS);
+    chain.prune_persisted(
+        BlockHeight::new(2),
+        BlockHeight::GENESIS,
+        None,
+        WeightedTimestamp::MAX,
+    );
     assert_eq!(
         baseline_at(&chain, 2, owed.vault()),
         SEED + Owed::AMOUNT,
@@ -4188,7 +4193,12 @@ where
         "block 3 is unwritten, so the tick at height 4 has no baseline yet",
     );
     commit_finalizing(charged, 3, 2, refused, charge);
-    chain.prune_persisted(BlockHeight::new(3), BlockHeight::new(3));
+    chain.prune_persisted(
+        BlockHeight::new(3),
+        BlockHeight::new(3),
+        None,
+        WeightedTimestamp::MAX,
+    );
     assert_eq!(
         baseline_at(&chain, 3, vault),
         CREDIT,
@@ -5833,6 +5843,12 @@ pub fn test_a_ticks_probe_outlives_a_raised_floor<S: TestStore + VersionedStore>
     let snapshot = chain.view_at(anchor).snapshot();
 
     chain.raise_floor(BlockHeight::new(2), ShardId::leaf(0, 0));
+    chain.prune_persisted(
+        BlockHeight::new(2),
+        BlockHeight::new(2),
+        None,
+        WeightedTimestamp::MAX,
+    );
     for height in 3..=10u64 {
         commit_writes_at(storage, &SettledWrites::default(), paced(height, 2));
     }

@@ -222,7 +222,7 @@ impl VersionedStore for StubBase {
         None
     }
 
-    fn hold_retention_at(&self, _height: BlockHeight) {}
+    fn hold_retention_at(&self, _height: BlockHeight, _clock: WeightedTimestamp) {}
 }
 
 /// A tick dispatched but not yet completed.
@@ -352,8 +352,17 @@ impl ExecutionSim {
     /// `height`, as a host does when it opens a shard: the chain learns
     /// what its base carries, as the coordinator built over it did.
     fn seat_on_store_at(&self, height: BlockHeight) {
-        self.chain
-            .prune_persisted(height, self.coord.baseline_floor());
+        self.hold_baselines(height);
+    }
+
+    /// Publish what the shard loop publishes when a write lands.
+    fn hold_baselines(&self, persisted: BlockHeight) {
+        self.chain.prune_persisted(
+            persisted,
+            self.coord.baseline_floor(),
+            self.coord.served_floor(),
+            self.coord.committed_ts(),
+        );
     }
 
     /// Acknowledge the write of every block committed so far, in the
@@ -361,8 +370,7 @@ impl ExecutionSim {
     /// covers, then the coordinator releases the tick that was waiting
     /// to read it.
     fn acknowledge_writes(&mut self) {
-        self.chain
-            .prune_persisted(self.height, self.coord.baseline_floor());
+        self.hold_baselines(self.height);
         let actions = self.coord.on_block_persisted(&self.topology, self.height);
         self.absorb(actions);
     }
@@ -693,6 +701,7 @@ impl ExecutionSim {
                 Action::RaiseTickFloor { floor } => {
                     self.chain.raise_floor(floor, self.local_shard);
                     self.chain.seed_stated(&self.member_rows());
+                    self.hold_baselines(self.chain.persisted());
                 }
                 _ => {}
             }

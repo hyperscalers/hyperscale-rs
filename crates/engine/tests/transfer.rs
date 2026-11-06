@@ -198,7 +198,7 @@ impl VersionedStore for MapDb {
         None
     }
 
-    fn hold_retention_at(&self, _height: BlockHeight) {}
+    fn hold_retention_at(&self, _height: BlockHeight, _clock: WeightedTimestamp) {}
 }
 
 /// The genesis package set this binary runs on.
@@ -640,7 +640,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
     for (height, (seed, from)) in [(31u8, payer_a), (32, payer_b)].into_iter().enumerate() {
         let tick = BlockHeight::new(height as u64 + 1);
         let below = BlockHeight::new(height as u64);
-        chain.prune_persisted(below, BlockHeight::GENESIS);
+        chain.prune_persisted(below, BlockHeight::GENESIS, None, WeightedTimestamp::MAX);
         let baseline = chain.view_at(below);
         let executed = execute_batch_on(&baseline.snapshot(), &executor, &[pay(seed, from)]);
         let updates = executed[0]
@@ -2053,7 +2053,7 @@ fn chain_owing_a_payment(
         },
         &[],
     );
-    chain.prune_persisted(height, BlockHeight::GENESIS);
+    chain.prune_persisted(height, BlockHeight::GENESIS, None, WeightedTimestamp::MAX);
     chain
 }
 
@@ -2241,9 +2241,12 @@ fn a_harvested_tick_lands_no_take_its_abandoned_tail_declined() {
 
     let crossing_parent = tail.next();
     halted.chain.raise_floor(crossing_parent, halted.consumer);
-    halted
-        .chain
-        .prune_persisted(crossing_parent, BlockHeight::GENESIS);
+    halted.chain.prune_persisted(
+        crossing_parent,
+        BlockHeight::GENESIS,
+        None,
+        WeightedTimestamp::MAX,
+    );
     let past = halted.chain.view_at(crossing_parent).snapshot();
     for answered in [Answered::Taken, Answered::Never] {
         assert_eq!(
@@ -4338,7 +4341,12 @@ fn a_publish_behind_its_payers_unsettled_spend_settles_within_the_vault() {
     let vault = vault_key(payer, *PROTOCOL_RESOURCE);
     let mut merged = StateWrites::default();
 
-    chain.prune_persisted(BlockHeight::GENESIS, BlockHeight::GENESIS);
+    chain.prune_persisted(
+        BlockHeight::GENESIS,
+        BlockHeight::GENESIS,
+        None,
+        WeightedTimestamp::MAX,
+    );
     let baseline = chain.view_at(BlockHeight::GENESIS);
     let moved = execute_batch_on(&baseline.snapshot(), &executor, &[spend]).remove(0);
     let ConsensusReceipt::Succeeded { writes, .. } = &moved.consensus else {
@@ -4354,7 +4362,12 @@ fn a_publish_behind_its_payers_unsettled_spend_settles_within_the_vault() {
         &[],
     );
 
-    chain.prune_persisted(BlockHeight::new(1), BlockHeight::GENESIS);
+    chain.prune_persisted(
+        BlockHeight::new(1),
+        BlockHeight::GENESIS,
+        None,
+        WeightedTimestamp::MAX,
+    );
     let baseline = chain.view_at(BlockHeight::new(1));
     let published = execute_batch_on(&baseline.snapshot(), &executor, &[publish]).remove(0);
     assert!(
@@ -4662,7 +4675,12 @@ fn a_hold_the_overlay_released_is_not_held() {
         },
         &[],
     );
-    chain.prune_persisted(BlockHeight::new(1), BlockHeight::GENESIS);
+    chain.prune_persisted(
+        BlockHeight::new(1),
+        BlockHeight::GENESIS,
+        None,
+        WeightedTimestamp::MAX,
+    );
 
     let left = funded - 100 - price;
     let rest = held_transfer(left - price, TRANSFER_FEE);

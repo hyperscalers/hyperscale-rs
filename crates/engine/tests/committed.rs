@@ -775,7 +775,7 @@ impl VersionedStore for MapDb {
         None
     }
 
-    fn hold_retention_at(&self, _height: BlockHeight) {}
+    fn hold_retention_at(&self, _height: BlockHeight, _clock: WeightedTimestamp) {}
 }
 
 /// What the window's backing holds, and what each redemption hands in:
@@ -1218,7 +1218,12 @@ impl Window {
         below: u64,
         tx: &Verified<Transaction>,
     ) -> (ExecutedTx, StateWrites) {
-        chain.prune_persisted(BlockHeight::new(below), BlockHeight::GENESIS);
+        chain.prune_persisted(
+            BlockHeight::new(below),
+            BlockHeight::GENESIS,
+            None,
+            WeightedTimestamp::MAX,
+        );
         let view = chain.view_at(BlockHeight::new(below));
         let holds = view.holds();
         let ctx = TickBatchContext {

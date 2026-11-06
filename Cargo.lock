@@ -2214,6 +2214,7 @@ dependencies = [
  "hyperscale-provisions",
  "hyperscale-shard",
  "hyperscale-storage",
+ "hyperscale-storage-memory",
  "hyperscale-transactions",
  "hyperscale-types",
  "hyperscale-vm-effects",

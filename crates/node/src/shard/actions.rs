@@ -76,6 +76,7 @@ where
                 self.io
                     .tick_chain
                     .seed_stated(self.replica.shard_coordinator().member_rows());
+                self.hold_execution_baselines(self.io.tick_chain.persisted());
             }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────

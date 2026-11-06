@@ -428,6 +428,14 @@ enum Queued {
 }
 
 impl PendingTick {
+    /// The lowest height this tick reads a member's own part at.
+    fn served_floor(&self) -> Option<BlockHeight> {
+        self.requests
+            .iter()
+            .filter_map(|request| request.served_at)
+            .min()
+    }
+
     /// The packages this tick's members run that do not resolve on this
     /// node.
     fn missing_code(&self, code: &dyn CodeAvailability) -> Vec<Hash> {
@@ -699,6 +707,11 @@ pub struct ExecutionCoordinator {
     /// Whether a dispatched tick's `ExecutionBatchCompleted` is still
     /// outstanding.
     tick_in_flight: bool,
+
+    /// The lowest height the tick out at dispatch reads a member's own
+    /// part at. Cleared only by its batch coming back, whether it ran or
+    /// goes back to the queue, so a run outliving a terminal keeps it.
+    in_flight_served: Option<BlockHeight>,
 
     /// Whether the committed tip is past this chain's terminal window.
     ///
@@ -972,6 +985,7 @@ impl ExecutionCoordinator {
             code,
             persisted: persisted_base,
             tick_in_flight: false,
+            in_flight_served: None,
             terminated: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
@@ -1131,6 +1145,29 @@ impl ExecutionCoordinator {
     pub fn baseline_floor(&self) -> BlockHeight {
         self.last_completed_tick
             .max(self.dispatch_from.prev().unwrap_or(BlockHeight::GENESIS))
+    }
+
+    /// The lowest height a tick this coordinator has still to run reads
+    /// a member's own part at: the queued ticks it can run, and the one
+    /// out at dispatch. A held tick reads nothing, since its certificate
+    /// seats it.
+    #[must_use]
+    pub fn served_floor(&self) -> Option<BlockHeight> {
+        self.pending_ticks
+            .iter()
+            .filter_map(|queued| match queued {
+                Queued::Run(pending) => pending.served_floor(),
+                Queued::Held(_) => None,
+            })
+            .chain(self.in_flight_served)
+            .min()
+    }
+
+    /// The anchor of the last block this coordinator folded, which every
+    /// tick not yet seated is anchored at or past.
+    #[must_use]
+    pub const fn committed_ts(&self) -> WeightedTimestamp {
+        self.committed_ts
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1899,6 +1936,7 @@ impl ExecutionCoordinator {
         );
         record_batch_unavailable();
         self.tick_in_flight = false;
+        self.in_flight_served = None;
         self.pending_ticks.push_front(Queued::Run(PendingTick {
             tick,
             tick_ts,
@@ -1926,6 +1964,7 @@ impl ExecutionCoordinator {
         outcome: TickBatchOutcome,
     ) -> Vec<Action> {
         self.tick_in_flight = false;
+        self.in_flight_served = None;
         self.last_completed_tick = self.last_completed_tick.max(tick);
         let mut actions = Vec::new();
 
@@ -4539,6 +4578,7 @@ impl ExecutionCoordinator {
             return Vec::new();
         };
         self.tick_in_flight = true;
+        self.in_flight_served = tick.served_floor();
         let fates: Vec<TickResolution> = self
             .pending_tick_resolutions
             .iter()
@@ -10996,6 +11036,211 @@ mod tests {
         );
         sched.insert_lookahead(Epoch::new(t), seeded_snapshot(windows, 1..=t - 1));
         sched
+    }
+
+    /// The tick at `height` over `sched`, its one member `tx` served from
+    /// `served_at`.
+    fn served_tick(sched: &TopologySchedule, height: u64, served_at: u64, tx: u8) -> PendingTick {
+        let mut tick = queued_tick(
+            sched,
+            SERVED_WINDOW,
+            height,
+            &test_transaction(tx),
+            sched.windows().window_of(Epoch::new(SERVED_WINDOW)).start,
+        );
+        tick.requests[0].served_at = Some(BlockHeight::new(served_at));
+        tick
+    }
+
+    /// What a batch that ran nothing reports for the tick at `height`.
+    fn empty_outcome(height: u64) -> TickBatchOutcome {
+        TickBatchOutcome {
+            tick_id: TickId::new(ShardId::ROOT, BlockHeight::new(height)),
+            results: Vec::new(),
+            tx_outcomes: Vec::new(),
+            refusal_receipts: Vec::new(),
+        }
+    }
+
+    /// The window [`served_tick`] seats in.
+    const SERVED_WINDOW: u64 = 70;
+
+    /// A queued tick holds the lowest height any of its members reads a
+    /// part at, and the lowest over every queued tick stands until that
+    /// tick leaves the queue.
+    #[test]
+    fn the_served_floor_holds_an_unrun_ticks_head_height() {
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        assert_eq!(state.served_floor(), None, "nothing queued holds nothing");
+
+        let mut lower = served_tick(&sched, 8, 6, 1);
+        let mut second = lower.requests[0].clone();
+        second.served_at = Some(BlockHeight::new(3));
+        lower.requests.push(second);
+        let plain = {
+            let mut tick = served_tick(&sched, 9, 9, 3);
+            tick.requests[0].served_at = None;
+            tick
+        };
+        state.pending_ticks.extend([
+            Queued::Run(lower),
+            Queued::Run(served_tick(&sched, 9, 5, 2)),
+            Queued::Run(plain),
+        ]);
+        assert_eq!(state.served_floor(), Some(BlockHeight::new(3)));
+
+        state.pending_ticks.pop_front();
+        assert_eq!(state.served_floor(), Some(BlockHeight::new(5)));
+    }
+
+    /// A tick this node cannot run is seated from its certificate and
+    /// reads no part, so it holds nothing.
+    #[test]
+    fn the_served_floor_ignores_a_tick_that_cannot_run() {
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        state.pending_ticks.extend([
+            Queued::Held(TickId::new(ShardId::ROOT, BlockHeight::new(7))),
+            Queued::Run(served_tick(&sched, 8, 5, 1)),
+        ]);
+        assert_eq!(state.served_floor(), Some(BlockHeight::new(5)));
+        state.pending_ticks.pop_back();
+        assert_eq!(state.served_floor(), None);
+    }
+
+    /// A dispatched tick keeps its term until its batch comes back, a
+    /// terminal in between included, and a tick sent back to the queue
+    /// takes the term with it.
+    #[test]
+    fn the_in_flight_tick_keeps_its_served_term() {
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        state.persisted = BlockHeight::new(1);
+        state
+            .pending_ticks
+            .push_back(Queued::Run(served_tick(&sched, 2, 1, 1)));
+        let held = Some(BlockHeight::new(1));
+
+        let actions = state.on_beacon_block_persisted(&sched).actions;
+        let requests = actions
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
+                    env, requests, ..
+                }) => Some((env, requests)),
+                _ => None,
+            })
+            .expect("the fold dispatches the tick");
+        assert!(state.pending_ticks.is_empty());
+        assert_eq!(state.served_floor(), held, "out at dispatch");
+
+        let (env, requests) = requests;
+        state.on_execution_batch_unavailable(
+            BlockHeight::new(2),
+            WeightedTimestamp::ZERO,
+            env,
+            requests,
+            Vec::new(),
+            Hash::ZERO,
+        );
+        assert_eq!(state.in_flight_served, None, "the queue has it back");
+        assert_eq!(state.served_floor(), held);
+
+        state.on_beacon_block_persisted(&sched);
+        assert_eq!(state.served_floor(), held, "out at dispatch again");
+
+        state.terminate();
+        assert_eq!(state.served_floor(), held, "a run outlives a terminal");
+
+        state.on_execution_batch_completed(&sched, BlockHeight::new(2), empty_outcome(2));
+        assert_eq!(state.served_floor(), None, "its batch came back");
+    }
+
+    /// A stall carries the store's tip clock far past a block naming a
+    /// member, and the block's successor lands before anything has
+    /// published the block's term: the stale hold sits above the head
+    /// height, whose date stands a whisker inside the horizon of the
+    /// naming block's anchor. The seating clock keeps it through both
+    /// writes, the publication then holds it through the rest of the
+    /// stall, and it goes once the tick has run.
+    #[test]
+    fn a_stall_before_a_naming_blocks_certificate_retires_nothing() {
+        use hyperscale_storage::test_helpers::commit_writes_at;
+        use hyperscale_storage::{TickChain, VersionedStore};
+        use hyperscale_storage_memory::SimShardStorage;
+        use hyperscale_types::SettledWrites;
+
+        const HEAD: u64 = 2;
+        const NAMING: u64 = 10;
+        let horizon = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
+        let step = (horizon - 1) / (NAMING - HEAD);
+        let anchor = |height: u64| WeightedTimestamp::from_millis(height * step);
+        let stalled = anchor(NAMING).plus(Duration::from_secs(200));
+        let empty = SettledWrites::default();
+
+        let store = SimShardStorage::default();
+        let chain = TickChain::new(Arc::new(store.clone()));
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        for height in 1..NAMING {
+            commit_writes_at(&store, &empty, anchor(height));
+        }
+
+        // Tick 9 is out, tick 8 the last back. The last publication saw
+        // block 9 written and held nothing of the head height.
+        let tip = BlockHeight::new(NAMING - 1);
+        state.persisted = tip;
+        state.last_completed_tick = BlockHeight::new(8);
+        state.tick_in_flight = true;
+        state.committed_ts = anchor(NAMING - 1);
+        let publish = |state: &ExecutionCoordinator, persisted: BlockHeight| {
+            chain.prune_persisted(
+                persisted,
+                state.baseline_floor(),
+                state.served_floor(),
+                state.committed_ts(),
+            );
+        };
+        publish(&state, tip);
+        assert_eq!(state.served_floor(), None);
+        assert_eq!(state.baseline_floor(), BlockHeight::new(8));
+
+        // The naming block seats behind the tick out, and its own write
+        // and its child's land before any publication.
+        state.committed_ts = anchor(NAMING);
+        state
+            .pending_ticks
+            .push_back(Queued::Run(served_tick(&sched, NAMING, HEAD, 1)));
+        commit_writes_at(&store, &empty, anchor(NAMING));
+        commit_writes_at(&store, &empty, stalled);
+        let head = BlockHeight::new(HEAD);
+        assert!(
+            store.snapshot_held_at(head).is_some(),
+            "the seating clock keeps a height a block not yet published names",
+        );
+
+        // The fold reaches the stall's far side and the flush publishes the
+        // term, which is all that holds the height from here.
+        state.committed_ts = stalled;
+        publish(&state, BlockHeight::new(NAMING + 1));
+        commit_writes_at(&store, &empty, stalled.plus(Duration::from_secs(200)));
+        assert!(store.snapshot_held_at(head).is_some());
+
+        // Tick 9 comes back, the naming tick goes out and comes back, and
+        // with its term gone the next write retires the height.
+        state.on_execution_batch_completed(&sched, tip, empty_outcome(NAMING - 1));
+        state.on_block_persisted(&sched, BlockHeight::new(NAMING + 1));
+        assert!(state.pending_ticks.is_empty(), "the naming tick went out");
+        assert_eq!(state.served_floor(), Some(head));
+        state.on_execution_batch_completed(&sched, BlockHeight::new(NAMING), empty_outcome(NAMING));
+        assert_eq!(state.served_floor(), None);
+        publish(&state, BlockHeight::new(NAMING + 1));
+        commit_writes_at(&store, &empty, stalled.plus(Duration::from_secs(400)));
+        assert!(
+            store.snapshot_held_at(head).is_none(),
+            "once the tick has run the height ages out as any other",
+        );
     }
 
     /// The block height each dispatch in `actions` runs a tick at.

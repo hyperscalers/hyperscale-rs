@@ -9,6 +9,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BlockHeight, DeclaredRange, Hash, StateRoot, SubstateKey, SweepBucket, SweepFrontier,
+    WeightedTimestamp,
 };
 
 use super::core::SimShardStorage;
@@ -105,8 +106,10 @@ impl VersionedStore for SimShardStorage {
             .copied()
     }
 
-    fn hold_retention_at(&self, height: BlockHeight) {
-        write_or_recover(&self.state).retention_hold = height.inner();
+    fn hold_retention_at(&self, height: BlockHeight, clock: WeightedTimestamp) {
+        let mut state = write_or_recover(&self.state);
+        state.retention_hold = height.inner();
+        state.retention_clock = clock;
     }
 }
 

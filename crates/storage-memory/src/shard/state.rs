@@ -88,6 +88,9 @@ pub struct SharedState {
     /// The oldest version this node's own readers still name;
     /// `u64::MAX` until one holds. The floor never passes it.
     pub(crate) retention_hold: u64,
+    /// The anchor that hold was published under, which bounds the tip's
+    /// clock for the cutoff; [`WeightedTimestamp::MAX`] until one holds.
+    pub(crate) retention_clock: WeightedTimestamp,
     /// Committed substate byte total per version, written in
     /// lockstep with each applied snapshot. Consensus-critical:
     /// shard-witness derivation reads it, so it must be identical on
@@ -123,6 +126,7 @@ impl SharedState {
             self.retention_floor,
             version,
             self.retention_hold,
+            self.retention_clock,
             tip_ts,
             self.version_time
                 .range(self.retention_floor..)
@@ -221,6 +225,7 @@ impl SharedState {
             holding_pins: OrdSet::new(),
             retention_floor: 0,
             retention_hold: u64::MAX,
+            retention_clock: WeightedTimestamp::MAX,
             substate_bytes: OrdMap::new(),
             package_artifacts: OrdMap::new(),
             sweep_index: SweepRows::default(),

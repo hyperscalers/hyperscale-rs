@@ -72,11 +72,17 @@ where
     }
 
     /// Hold the tick chain and the store's history at the lowest baseline
-    /// the replica's execution still reads, with the base known to carry
+    /// the replica's execution still reads, and the store's history at the
+    /// lowest part it still reads, with the base known to carry
     /// `persisted`.
     pub(in crate::shard) fn hold_execution_baselines(&self, persisted: BlockHeight) {
-        let executed = self.replica.execution_coordinator().baseline_floor();
-        self.io.tick_chain.prune_persisted(persisted, executed);
+        let execution = self.replica.execution_coordinator();
+        self.io.tick_chain.prune_persisted(
+            persisted,
+            execution.baseline_floor(),
+            execution.served_floor(),
+            execution.committed_ts(),
+        );
     }
 
     /// Feed `CommittedStateRestored` to the state machine, then derive

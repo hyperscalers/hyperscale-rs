@@ -223,6 +223,11 @@ pub struct CrossShardExecutionRequest {
     /// consume, read off the record cells they proved. Empty for a
     /// member that runs the whole shape.
     pub arrivals: Vec<EscrowedValue>,
+    /// The height whose state serves this member's own part: its row's
+    /// head height, off the line that runs it, where a counterpart shares
+    /// its verdict and reads keys of this shard. The tick waits for this
+    /// height to be written, and the store holds it until the tick is run.
+    pub served_at: Option<BlockHeight>,
 }
 
 /// A change to the local vnode's reshape-observer duty, carried on

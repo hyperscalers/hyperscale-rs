@@ -318,6 +318,7 @@ impl TickCandidates {
                     prices: PriceTable::GENESIS,
                     member: candidate.member.clone(),
                     arrivals,
+                    served_at: None,
                 },
                 membership: Membership::of(&candidate.member),
                 committed_prices: candidate.committed_prices,

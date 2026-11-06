@@ -53,6 +53,17 @@
 //! is, names a version that has just gone. The hold is what the floor
 //! cannot pass however far the clock jumps.
 //!
+//! A hold can only name what this node has seated. A block seated since
+//! it was published may name a version below it, and the block's own
+//! write, or a later one, can land first: a commit fired past a
+//! persistence lag follows its write, and a stall moves the tip's clock
+//! ahead of every block behind it. So the hold carries the anchor of the
+//! last block seated, and the cutoff stands no later than that clock's
+//! horizon. A block not yet in a publication is anchored at or past it,
+//! and a version such a block names is dated within the horizon of the
+//! block's anchor, so no retirement reaches it. Staleness only lowers
+//! the cutoff.
+//!
 //! # Versions this store never committed
 //!
 //! The floor is the first *dated* version at or above where it stands, so
@@ -89,17 +100,21 @@ pub struct Retired {
 ///
 /// `hold` is the oldest version this node's own readers still name, and
 /// stops the scan the same way the cutoff does: a version a reader is
-/// anchored at is retained whatever its age. A store nothing has held
-/// passes `u64::MAX` and the horizon is the whole rule.
+/// anchored at is retained whatever its age. `clock` is the anchor of the
+/// last block this node had seated when it published that hold, and bounds
+/// the tip's clock for the cutoff. A store nothing has held passes
+/// `u64::MAX` and [`WeightedTimestamp::MAX`], and the horizon of the tip
+/// is the whole rule.
 #[must_use]
 pub fn retire_dated(
     floor: u64,
     version: u64,
     hold: u64,
+    clock: WeightedTimestamp,
     tip_ts: WeightedTimestamp,
     dated: impl IntoIterator<Item = (u64, u64)>,
 ) -> Retired {
-    let cutoff = tip_ts.minus(RETENTION_HORIZON).as_millis();
+    let cutoff = tip_ts.min(clock).minus(RETENTION_HORIZON).as_millis();
     let versions: Vec<u64> = dated
         .into_iter()
         .take_while(|(dated, ts)| *dated < version && *dated < hold && *ts < cutoff)
@@ -124,7 +139,7 @@ mod tests {
         let step = horizon_ms() / 2;
         let dated = (1..=5u64).map(|v| (v, v * step));
         let tip = WeightedTimestamp::from_millis(6 * step);
-        let retired = retire_dated(1, 6, u64::MAX, tip, dated);
+        let retired = retire_dated(1, 6, u64::MAX, WeightedTimestamp::MAX, tip, dated);
         assert_eq!(retired.versions, vec![1, 2, 3]);
         assert_eq!(retired.floor, 4);
     }
@@ -134,7 +149,8 @@ mod tests {
     #[test]
     fn nothing_retired_leaves_the_floor_and_the_commit_itself_is_never_read() {
         let tip = WeightedTimestamp::from_millis(horizon_ms());
-        let stood = retire_dated(3, 4, u64::MAX, tip, [(3, horizon_ms() - 1)]);
+        let unbound = WeightedTimestamp::MAX;
+        let stood = retire_dated(3, 4, u64::MAX, unbound, tip, [(3, horizon_ms() - 1)]);
         assert_eq!(
             stood,
             Retired {
@@ -142,7 +158,7 @@ mod tests {
                 floor: 3
             }
         );
-        let stopped = retire_dated(0, 2, u64::MAX, tip, [(2, 0), (3, 0)]);
+        let stopped = retire_dated(0, 2, u64::MAX, unbound, tip, [(2, 0), (3, 0)]);
         assert_eq!(stopped.versions, Vec::<u64>::new());
         assert_eq!(stopped.floor, 0);
     }
@@ -154,7 +170,7 @@ mod tests {
         let step = horizon_ms() / 2;
         let dated = (1..=5u64).map(|v| (v, v * step));
         let tip = WeightedTimestamp::from_millis(6 * step);
-        let held = retire_dated(1, 6, 2, tip, dated);
+        let held = retire_dated(1, 6, 2, WeightedTimestamp::MAX, tip, dated);
         assert_eq!(held.versions, vec![1]);
         assert_eq!(held.floor, 2);
     }
@@ -166,9 +182,56 @@ mod tests {
         let step = horizon_ms() / 2;
         let dated = (1..=5u64).map(|v| (v, v * step));
         let tip = WeightedTimestamp::from_millis(6 * step);
-        let held = retire_dated(1, 6, 1, tip, dated);
+        let held = retire_dated(1, 6, 1, WeightedTimestamp::MAX, tip, dated);
         assert_eq!(held.versions, Vec::<u64>::new());
         assert_eq!(held.floor, 1);
+    }
+
+    /// A served height the coordinator holds below the floor names
+    /// nothing the store still has: the scan retires nothing, leaves the
+    /// floor where it stood, and asks nothing of the height.
+    #[test]
+    fn a_hold_below_the_floor_retires_nothing_and_panics_nowhere() {
+        let step = horizon_ms() / 2;
+        let tip = WeightedTimestamp::from_millis(9 * step);
+        let dated = (5..=8u64).map(|v| (v, v * step));
+        let held = retire_dated(5, 9, 2, WeightedTimestamp::MAX, tip, dated);
+        assert_eq!(held.versions, Vec::<u64>::new());
+        assert_eq!(held.floor, 5);
+    }
+
+    /// A stall carries the tip's clock past what this node has seated:
+    /// the cutoff stands a horizon behind the seating clock, so a version
+    /// a block not yet seated can name stays, and the tip's clock retires
+    /// it once the seating clock has caught up.
+    #[test]
+    fn retirement_stops_at_the_seating_clock() {
+        let step = horizon_ms() / 2;
+        let tip = WeightedTimestamp::from_millis(9 * step);
+        let dated = (1..=8u64).map(|v| (v, v * step));
+        let seated = WeightedTimestamp::from_millis(4 * step);
+
+        let stalled = retire_dated(1, 9, u64::MAX, seated, tip, dated.clone());
+        assert_eq!(stalled.versions, vec![1], "two steps behind the clock");
+        assert_eq!(stalled.floor, 2);
+
+        let unbound = retire_dated(1, 9, u64::MAX, WeightedTimestamp::MAX, tip, dated.clone());
+        assert_eq!(unbound.floor, 7, "the tip's clock alone reaches further");
+
+        let caught_up = retire_dated(1, 9, u64::MAX, tip, tip, dated);
+        assert_eq!(caught_up, unbound, "a clock at the tip binds nothing");
+    }
+
+    /// A clock past the tip's binds nothing either: the cutoff is the
+    /// lower of the two.
+    #[test]
+    fn the_tips_clock_bounds_a_seating_clock_ahead_of_it() {
+        let step = horizon_ms() / 2;
+        let tip = WeightedTimestamp::from_millis(4 * step);
+        let dated = (1..=3u64).map(|v| (v, v * step));
+        let ahead = WeightedTimestamp::from_millis(100 * step);
+        let retired = retire_dated(1, 4, u64::MAX, ahead, tip, dated);
+        assert_eq!(retired.versions, vec![1]);
     }
 
     /// The clock jumping a whole halt ahead retires every version
@@ -178,9 +241,10 @@ mod tests {
     fn a_clock_that_jumps_a_halt_does_not_retire_what_is_held() {
         let dated = (1067..=1068u64).map(|v| (v, v));
         let tip = WeightedTimestamp::from_millis(1069 + horizon_ms());
-        let jumped = retire_dated(1067, 1069, u64::MAX, tip, dated.clone());
+        let unbound = WeightedTimestamp::MAX;
+        let jumped = retire_dated(1067, 1069, u64::MAX, unbound, tip, dated.clone());
         assert_eq!(jumped.floor, 1069, "the floor arrives at the tip");
-        let held = retire_dated(1067, 1069, 1067, tip, dated);
+        let held = retire_dated(1067, 1069, 1067, unbound, tip, dated);
         assert_eq!(held.floor, 1067);
     }
 }

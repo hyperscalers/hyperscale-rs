@@ -14,7 +14,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Block, BlockHeight, DeclaredRange, Hash, QuorumCertificate, StateRoot, SubstateKey,
-    SweepBucket, SweepFrontier, Verified,
+    SweepBucket, SweepFrontier, Verified, WeightedTimestamp,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
@@ -124,8 +124,10 @@ impl VersionedStore for RocksDbShardStorage {
         self.substate_bytes_at_version(height.inner())
     }
 
-    fn hold_retention_at(&self, height: BlockHeight) {
+    fn hold_retention_at(&self, height: BlockHeight, clock: WeightedTimestamp) {
         self.retention_hold.store(height.inner(), Ordering::Relaxed);
+        self.retention_clock
+            .store(clock.as_millis(), Ordering::Release);
     }
 
     fn retention_floor(&self) -> u64 {
