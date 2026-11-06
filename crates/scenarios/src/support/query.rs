@@ -16,7 +16,7 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::{ShardChainReader, member_row_leaf, record_arrivals};
 use hyperscale_types::{
-    Address, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline,
+    Address, Anchor, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline,
     DeclaredRange, Epoch, EpochWindows, ExecutionOutcome, Inclusion, MAX_FINALIZATION_DELAY,
     MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape, RETENTION_HORIZON,
     ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateClaim, StateRoot,
@@ -917,6 +917,49 @@ pub fn record_wait(store: &impl CommittedChain, tx: TxHash, key: SubstateKey) ->
         height = height.next();
     }
     None
+}
+
+/// The anchor of the first claim of `store`'s committed chain holding the
+/// value at `key`.
+#[must_use]
+pub fn record_reading_anchor(store: &impl CommittedChain, key: SubstateKey) -> Option<Anchor> {
+    let tip = store.tip();
+    let mut height = store.first().max(BlockHeight::new(1));
+    while height <= tip {
+        let carried = store.block(height).and_then(|certified| {
+            certified
+                .block()
+                .state_claims()
+                .iter()
+                .find(|claim| claim.held(key).is_some())
+                .map(|claim| claim.anchor)
+        });
+        if carried.is_some() {
+            return carried;
+        }
+        height = height.next();
+    }
+    None
+}
+
+/// How many claims of `store`'s committed chain read `key` absent.
+#[must_use]
+pub fn absent_record_readings(store: &impl CommittedChain, key: SubstateKey) -> usize {
+    let tip = store.tip();
+    let mut absent = 0;
+    let mut height = store.first().max(BlockHeight::new(1));
+    while height <= tip {
+        if let Some(certified) = store.block(height) {
+            absent += certified
+                .block()
+                .state_claims()
+                .iter()
+                .filter(|claim| claim.reading(key) == Some(Inclusion::Absent))
+                .count();
+        }
+        height = height.next();
+    }
+    absent
 }
 
 /// Walk `store`'s committed chain for every crossing refusal naming

@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
+use hyperscale_execution::RECORD_PUSH_GRACE_FLOOR;
 use hyperscale_node::event::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
@@ -29,13 +30,13 @@ use hyperscale_scenarios::tx::{
 use hyperscale_scenarios::{
     Budget, Ceiling, Certificates, Cluster, ContendedLoad, CoreLoad, FIRST_VENUE_SHARD,
     FaultableCluster, HOT_POOL_ADOPT_IF, HotPool, LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES,
-    PAYER_SHARD, Pair, RoutePayer, ScenarioConfig, Spend, VENUE_SHARD, WIDE_VENUE_SHARD,
-    a_book_route_reads_its_range_across_a_split,
+    PAYER_SHARD, Pair, RecordReadCost, RoutePayer, ScenarioConfig, Spend, VENUE_SHARD,
+    WIDE_VENUE_SHARD, a_book_route_reads_its_range_across_a_split,
     a_consumer_never_committing_declines_a_pushed_record,
     a_core_stated_at_a_halt_is_accepted_on_both_venues,
     a_crossing_a_merge_converges_finishes_on_the_successor,
-    a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
-    a_delivery_is_owed_when_its_deliverer_splits,
+    a_crossing_the_consumer_refuses_is_declined, a_dead_holder_leaves_room_for_a_lost_record,
+    a_delivery_cut_off_past_its_window_is_owed, a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_its_record_arrives,
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_fates_what_it_could_not_run,
@@ -48,11 +49,13 @@ use hyperscale_scenarios::{
     a_harvested_tick_over_a_discarded_tick_settles_nothing,
     a_healed_network_delivers_past_the_old_window,
     a_held_core_keeps_its_sponsors_hold_until_it_aborts,
+    a_killed_proposer_costs_a_route_no_more_than_a_read,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
-    a_lost_answer_push_is_read_at_the_consumers_boundary, a_mass_decline_brings_every_payment_home,
+    a_lost_answer_push_is_read_at_the_consumers_boundary, a_lost_record_is_read_inside_ten_seconds,
+    a_mass_decline_brings_every_payment_home,
     a_merged_pair_returns_a_crossing_its_consumer_never_took,
     a_native_post_quantum_account_pays_its_own_way, a_newcomer_founds_its_own_pool,
     a_payer_cannot_spend_one_balance_twice, a_payer_publishes_beside_its_unsettled_spend,
@@ -62,11 +65,13 @@ use hyperscale_scenarios::{
     a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
     a_published_package_runs_where_it_was_never_committed,
     a_pushed_taken_holds_its_records_repush_past_its_validity_end,
+    a_read_that_finds_no_record_yet_reads_again,
     a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
     a_recovered_venue_keeps_what_its_sibling_accepted,
     a_recovery_stalled_beside_a_cancelled_split_is_drawn_again,
     a_replica_that_missed_the_credit_commits_it_from_the_block,
+    a_restart_with_wants_past_the_clock_asks_each_once,
     a_restarted_genesis_host_resumes_beside_a_newcomer,
     a_retained_terminated_loop_releases_its_hosts_schedule,
     a_route_a_halting_venue_could_read_is_settled_before_the_halt,
@@ -90,6 +95,7 @@ use hyperscale_scenarios::{
     a_split_under_steady_core_load_lands_without_a_cancel,
     a_sponsor_spends_its_balance_beside_its_held_cores_abort,
     a_stall_past_the_finalization_delay_states_every_member_of_its_tick,
+    a_stalled_holder_draws_one_ask_per_key,
     a_survivor_that_read_a_discarded_tail_gets_its_escrow_back,
     a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
@@ -137,11 +143,12 @@ use hyperscale_scenarios::{
     merge_seats_full_keeper_committee, merge_straddler_atomic, merge_train_genesis_accounts,
     merged_pair_genesis_accounts, merging_caller_genesis_accounts,
     minority_fragment_rejoins_after_partition, more_records_than_the_cap_are_declined_in_turn,
-    multi_vnode_progress, nullifier_race_admits_exactly_one, participant_count_sweep,
-    partition_halts_and_heals, partition_heals_at_exact_quorum, pending_leg_genesis_accounts,
+    multi_vnode_progress, nullifier_race_admits_exactly_one,
+    one_lost_height_among_delivered_pushes, participant_count_sweep, partition_halts_and_heals,
+    partition_heals_at_exact_quorum, pending_leg_genesis_accounts,
     pool_capacity_caps_registrations, pool_transfer_moves_operatorship,
     preview_reports_resource_changes, publish_beside_spend_genesis_accounts,
-    re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
+    re_registration_of_a_live_validator_is_a_no_op, read_bound, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
     registered_validator_activates_onto_a_shard, ring_route_genesis_accounts,
     route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
@@ -1449,9 +1456,14 @@ const CORE_LOAD_TRADERS: usize = 8;
 /// `seconds` on [`dedicated_route_cluster`], so a venue shard's reads of
 /// the other cross the wire, and report what the claims sections and
 /// the rows carried.
-fn core_load(pairs: usize, routes_per_second: usize, seconds: u64, certificates: Certificates) {
+fn core_load(
+    pairs: usize,
+    routes_per_second: usize,
+    seconds: u64,
+    certificates: Certificates,
+) -> RecordReadCost {
     let mut cluster = dedicated_route_cluster(&core_load_genesis_accounts(CORE_LOAD_TRADERS));
-    cluster.run_faultable(|cluster| {
+    let cost = cluster.run_faultable(|cluster| {
         core_routes_under_load(
             cluster,
             CoreLoad {
@@ -1461,9 +1473,29 @@ fn core_load(pairs: usize, routes_per_second: usize, seconds: u64, certificates:
                 duration: Duration::from_secs(seconds),
                 certificates,
             },
-        );
+        )
     });
     println!("core load [8 process]: {}", resident());
+    cost
+}
+
+/// A healthy load's pushes land before the holder's clock passes the
+/// grace, so it reads next to nothing. Swept across seeds, so it holds a
+/// bound on the reads and not their absence: a late key costs its asks
+/// and no more, and the spans have to stay under the floor that leaves
+/// room for one.
+#[test]
+fn core_routes_read_no_pushed_record_sim() {
+    let cost = core_load(4, 1, 30, Certificates::Flow);
+    assert!(
+        cost.asks <= read_bound(cost.routes),
+        "a healthy load reads its records at most {} times: {cost:?}",
+        read_bound(cost.routes),
+    );
+    assert!(
+        cost.largest_span_ms < RECORD_PUSH_GRACE_FLOOR.as_secs_f64() * 1_000.0,
+        "the spans must stay below the floor: {cost:?}",
+    );
 }
 
 /// What this process holds resident, as the system reports it: a load's
@@ -1699,7 +1731,58 @@ fn dedicated_route_cluster(accounts: &[(PrincipalAddr, u128)]) -> SimCluster {
 #[test]
 fn both_venues_read_a_routes_record_inside_the_finalization_delay_sim() {
     let mut cluster = route_cluster_on_dedicated_hosts();
-    both_venues_read_a_routes_record_inside_the_finalization_delay(&mut cluster, epochs(40));
+    cluster.run_faultable(|cluster| {
+        both_venues_read_a_routes_record_inside_the_finalization_delay(cluster, epochs(40));
+    });
+}
+
+#[test]
+fn a_lost_record_is_read_inside_ten_seconds_sim() {
+    route_cluster_on_dedicated_hosts().run_faultable(a_lost_record_is_read_inside_ten_seconds);
+}
+
+#[test]
+fn a_read_that_finds_no_record_yet_reads_again_sim() {
+    route_cluster_on_dedicated_hosts().run_faultable(a_read_that_finds_no_record_yet_reads_again);
+}
+
+#[test]
+fn one_lost_height_among_delivered_pushes_sim() {
+    route_cluster_on_dedicated_hosts().run_faultable(one_lost_height_among_delivered_pushes);
+}
+
+#[test]
+fn a_killed_proposer_costs_a_route_no_more_than_a_read_sim() {
+    let killed_pushes = (0..4)
+        .filter(|victim| {
+            route_cluster_on_dedicated_hosts().run_faultable(|cluster| {
+                a_killed_proposer_costs_a_route_no_more_than_a_read(cluster, *victim)
+            })
+        })
+        .count();
+    assert!(
+        killed_pushes > 0,
+        "a member's turn must have come up: some run has to lose the push",
+    );
+}
+
+#[test]
+fn a_dead_holder_leaves_room_for_a_lost_record_sim() {
+    dedicated_route_cluster(&contended_load_genesis_accounts(CONTENDED_LOAD_TRADERS))
+        .run_faultable(|cluster| {
+            a_dead_holder_leaves_room_for_a_lost_record(cluster, CONTENDED_LOAD_TRADERS);
+        });
+}
+
+#[test]
+fn a_stalled_holder_draws_one_ask_per_key_sim() {
+    route_cluster_on_dedicated_hosts().run_faultable(a_stalled_holder_draws_one_ask_per_key);
+}
+
+#[test]
+fn a_restart_with_wants_past_the_clock_asks_each_once_sim() {
+    route_cluster_on_dedicated_hosts()
+        .run_faultable(a_restart_with_wants_past_the_clock_asks_each_once);
 }
 
 /// Two routes seated in opposite order on the two venues: the cut is keyed

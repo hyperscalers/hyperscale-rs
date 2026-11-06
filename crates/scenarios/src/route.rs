@@ -36,7 +36,8 @@ use crate::straddler::{
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::{
-    report_accepted_measures, report_claims_recarried, report_crossing_measures,
+    Crash, CrashableCluster, RestartableCluster, report_accepted_measures, report_claims_recarried,
+    report_crossing_measures,
 };
 use crate::support::query::{
     ChainMentions, ClaimsSection, Readings, assert_reclaimed_leg, await_leg_fated, declared_price,
@@ -217,37 +218,14 @@ pub fn a_route_settles_across_two_venues<C: FaultableCluster>(
 /// writes no record into the core, if either venue's chain carries no
 /// reading of it within budget, or if either carried it a finalization
 /// delay or more past its own commit of the route.
-pub fn both_venues_read_a_routes_record_inside_the_finalization_delay<C: Cluster>(
+pub fn both_venues_read_a_routes_record_inside_the_finalization_delay<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
 ) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
-    let (key, account) = &traders[0];
-    let tx = build_route_tx(
-        key,
-        *account,
-        (&first.meta, &second.meta),
-        *PROTOCOL_RESOURCE,
-        ROUTE_INPUT,
-        0,
-        validity_around(c.now()),
-    );
-    let records: Vec<SubstateKey> = records_by_road(
-        &c.with_derivation(|derivation| tx.try_derived(derivation))
-            .expect("a scenario route derives")
-            .legs,
-    )
-    .into_iter()
-    .filter(|(_, road)| *road == RecordRoad::IntoTheCore)
-    .map(|(record, _)| record)
-    .collect();
-    assert!(
-        !records.is_empty(),
-        "a route through two venues writes a record into its core",
-    );
-    let route = Charges::default().submit(c, tx);
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
 
     let waits = |c: &C| -> Vec<(ShardId, Option<Duration>)> {
         [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
@@ -270,6 +248,593 @@ pub fn both_venues_read_a_routes_record_inside_the_finalization_delay<C: Cluster
             "venue {venue:?} must hold the trader's record inside one finalization delay of \
              committing the route, and waited {wait:?}: {:?}",
             waits(c),
+        );
+    }
+    let asks = c.metric("record_asks", None);
+    assert!(
+        asks <= read_bound(1),
+        "a healthy route's pushes land before any read is armed: {asks} reads",
+    );
+}
+
+/// Submit a route of `trader`'s through `venues`, paying in `amount`, and
+/// hand back its hash and the records it writes into its core.
+fn submit_core_route<C: Cluster>(
+    c: &mut C,
+    (first, second): (&StockedVenue, &StockedVenue),
+    (key, account): &(Ed25519PrivateKey, PrincipalAddr),
+    amount: u128,
+) -> (TxHash, Vec<SubstateKey>) {
+    let tx = build_route_tx(
+        key,
+        *account,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        amount,
+        0,
+        validity_around(c.now()),
+    );
+    let records = core_records(c, &tx);
+    (Charges::default().submit(c, tx), records)
+}
+
+/// The records `tx` writes into its core.
+fn core_records<C: Cluster>(c: &C, tx: &Transaction) -> Vec<SubstateKey> {
+    let records: Vec<SubstateKey> = records_by_road(
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
+            .expect("a scenario route derives")
+            .legs,
+    )
+    .into_iter()
+    .filter(|(_, road)| *road == RecordRoad::IntoTheCore)
+    .map(|(record, _)| record)
+    .collect();
+    assert!(
+        !records.is_empty(),
+        "a route through two venues writes a record into its core",
+    );
+    records
+}
+
+/// Run until `venue`'s chain carries every one of `records` for `route`
+/// and hand back the longest it waited.
+fn await_record_reads<C: Cluster>(
+    c: &mut C,
+    venue: ShardId,
+    route: TxHash,
+    records: &[SubstateKey],
+) -> Duration {
+    let waits = |c: &C| {
+        records
+            .iter()
+            .map(|record| c.record_wait(venue, route, *record))
+            .collect::<Option<Vec<Duration>>>()
+    };
+    assert!(
+        c.run_until(epochs(40), |c| waits(c).is_some()),
+        "{venue:?} must carry a reading of every record of {route:?}",
+    );
+    waits(c)
+        .and_then(|waits| waits.into_iter().max())
+        .expect("every read is in")
+}
+
+/// The longest a route's record may take to reach a venue whose push was
+/// lost, at the latency these scenarios run at.
+const LOST_RECORD_BOUND: Duration = Duration::from_secs(10);
+
+/// A record whose push is lost to one venue is read and carried inside
+/// [`LOST_RECORD_BOUND`] of the venue's commit: the read arms on the
+/// holder's clock, well short of the finalization delay.
+///
+/// Requires disjoint committees, as the cut is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the cut never
+/// fires, or if the record takes longer.
+pub fn a_lost_record_is_read_inside_ten_seconds<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let lost = isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD);
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let wait = await_record_reads(c, FIRST_VENUE_SHARD, route, &records);
+    assert!(lost.fired() > 0, "the push must actually have been lost");
+    println!("record read: a lost record reached its venue in {wait:?}");
+    assert!(
+        wait < LOST_RECORD_BOUND,
+        "a lost record must be read inside {LOST_RECORD_BOUND:?}, and took {wait:?}",
+    );
+}
+
+/// What a reread takes past the ladder's next rung: the answer's round
+/// trip, and the block that carries the arrival.
+const REREAD_ALLOWANCE: Duration = Duration::from_secs(2);
+
+/// The ladder's gap in holder heights once `passed` heights have gone by
+/// since a key's first ask: 2 past the first ask, doubling on each rung.
+const fn ladder_gap(passed: u64) -> u64 {
+    let mut gap = 2;
+    let mut rung = gap;
+    while rung <= passed {
+        gap *= 2;
+        rung += gap;
+    }
+    gap
+}
+
+/// How finely a scenario watches for a state only a moment separates
+/// from what follows it, well under a block.
+const FINE_POLL: Duration = Duration::from_millis(50);
+
+/// The gap between [`LocalTransfers`], about a loaded block.
+const LOCAL_TRANSFER_GAP: Duration = Duration::from_millis(300);
+
+/// Transfers between two accounts of one shard, which pass that shard's
+/// heights at the loaded rate and not at an idle block a second.
+struct LocalTransfers<'a> {
+    payer: &'a (Ed25519PrivateKey, PrincipalAddr),
+    to: PrincipalAddr,
+    sent: u128,
+}
+
+impl LocalTransfers<'_> {
+    /// Run `c` with the transfers flowing until `done`, for at most
+    /// `within`. Hands back whether `done` held.
+    fn run_until<C: Cluster>(
+        &mut self,
+        c: &mut C,
+        within: Duration,
+        done: impl Fn(&C) -> bool,
+    ) -> bool {
+        let deadline = c.now() + within;
+        while !done(c) && c.now() < deadline {
+            self.sent += 1;
+            let (key, from) = self.payer;
+            c.submit(build_transfer_tx(
+                key,
+                *from,
+                self.to,
+                self.sent,
+                validity_around(c.now()),
+            ));
+            let next = c.now() + LOCAL_TRANSFER_GAP;
+            let _ = c.run_polling(epochs(1), FINE_POLL, |c| c.now() >= next || done(c));
+        }
+        done(c)
+    }
+}
+
+/// How long a leg's votes are dropped from the first of them, short of
+/// their 8 s retry, so the retry goes through and finishes the leg past
+/// the venue's first read.
+const VOTES_HELD: Duration = Duration::from_millis(7_500);
+
+/// A read that finds no record yet holds nothing and asks again.
+///
+/// The leg's votes are dropped, so the venue's first read comes back
+/// absent, and no block ever carries the absence. What this bounds is the
+/// ladder: the record is carried within one ladder gap of its leg
+/// finalizing, the gap read off the holder heights since the first ask
+/// and timed at the rate the holder passed them, plus
+/// [`REREAD_ALLOWANCE`]. The trader's chain carries transfers throughout,
+/// so those heights pass at the loaded rate. A leg's lateness sets how
+/// far up the ladder it lands, so the wait is not a constant: it grows
+/// with the gap, up to the finalization delay.
+///
+/// Requires disjoint committees, as the cuts are keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if no read went out
+/// while the leg was held, if a block carries an absent reading of the
+/// record, or if the reread takes longer than the ladder's gap and
+/// [`REREAD_ALLOWANCE`].
+pub fn a_read_that_finds_no_record_yet_reads_again<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let mut transfers = LocalTransfers {
+        payer: &traders[1],
+        to: traders[2].1,
+        sent: 0,
+    };
+    let leg_hosts = c.committee_hosts(TRADER_SHARD);
+    let _ = isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD);
+    let held_leg = c.drop_type_between(&leg_hosts, &leg_hosts, "execution.vote");
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let within = MAX_FINALIZATION_DELAY;
+    assert!(
+        transfers.run_until(c, within, |_| held_leg.fired() > 0),
+        "the leg's votes must be held",
+    );
+    let released = c.now() + VOTES_HELD;
+    transfers.run_until(c, within, |c| c.now() >= released);
+    c.clear_drops();
+    let _ = isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD);
+
+    let written = |c: &C| records.iter().all(|record| stands_at(c, *record));
+    let read_or_written = |c: &C| c.metric("record_asks", None) > 0 || written(c);
+    assert!(
+        transfers.run_until(c, within, read_or_written),
+        "the read must go out or the record stand",
+    );
+    let asked = c.now();
+    let holder_height = |c: &C| {
+        c.committed_height(TRADER_SHARD)
+            .map_or(0, BlockHeight::inner)
+    };
+    let asked_height = holder_height(c);
+    assert!(!written(c), "the read must go out before the record stands");
+    assert!(
+        transfers.run_until(c, within, written),
+        "the leg finalizes past the first read",
+    );
+    let written_height = holder_height(c);
+    let written = c.now();
+    assert!(
+        c.metric("fetch_completed", Some("record_proof")) > 0,
+        "the first read must have come back before the record stood",
+    );
+    assert!(
+        transfers.run_until(c, within, |c| records
+            .iter()
+            .all(|record| c.record_wait(FIRST_VENUE_SHARD, route, *record).is_some())),
+        "the venue must carry a reading of the record",
+    );
+    let waited = c.now().saturating_sub(written);
+    let gap = ladder_gap(written_height.saturating_sub(asked_height));
+    let passed = written_height.saturating_sub(asked_height).max(1);
+    let per_height = written.saturating_sub(asked) / u32::try_from(passed).expect("a short run");
+    let ladder =
+        (per_height * u32::try_from(gap).expect("a short run")).min(MAX_FINALIZATION_DELAY);
+    let bound = ladder + REREAD_ALLOWANCE;
+    println!(
+        "record read: record written {:?} past the first read, {passed} holder heights, ladder \
+         gap {gap} heights at {per_height:?} each is {ladder:?}; carried {waited:?} past the \
+         record, bound {bound:?}",
+        written.saturating_sub(asked),
+    );
+    assert!(
+        waited < bound,
+        "the ladder's next rung must read the record, and it took {waited:?} against {bound:?}",
+    );
+    for record in records {
+        assert_eq!(
+            c.absent_record_readings(FIRST_VENUE_SHARD, record),
+            0,
+            "an absent reading of a wanted record takes no place in a block",
+        );
+    }
+}
+
+/// One route's push is lost while another's, a height above it, lands.
+///
+/// The read of the first raises the holder's read frontier past what was
+/// sent below it, which costs the second at most a read of its own.
+///
+/// The push is lost to both venues, so each places the two routes alike:
+/// lost to one, the venues would hear them in opposite order and the
+/// later hash would lose to the cycle, as a route does.
+///
+/// Requires disjoint committees, as the cut is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the cut never
+/// fires, if either route is not accepted on both venues, or if either
+/// record takes longer than [`LOST_RECORD_BOUND`].
+pub fn one_lost_height_among_delivered_pushes<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let lost = [
+        isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD),
+        isolate_pushed_readings(c, SECOND_VENUE_SHARD, TRADER_SHARD),
+    ];
+    let (early, early_records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let next = c.now() + Duration::from_secs(1);
+    let _ = c.run_until(epochs(1), |c| c.now() >= next);
+    let (late, late_records) = submit_core_route(c, (&first, &second), &traders[1], ROUTE_INPUT);
+    assert!(
+        c.run_polling(epochs(10), FINE_POLL, |c| early_records
+            .iter()
+            .all(|record| stands_at(c, *record))
+            && lost.iter().any(|cut| cut.fired() > 0)),
+        "the early leg finalizes, and its push is lost",
+    );
+    assert!(
+        !late_records.iter().any(|record| stands_at(c, *record)),
+        "the late leg's push must go out with the way clear",
+    );
+    c.clear_drops();
+
+    for (route, records) in [(early, &early_records), (late, &late_records)] {
+        let wait = await_record_reads(c, FIRST_VENUE_SHARD, route, records);
+        println!("record read: {route:?} reached its venue in {wait:?}");
+        assert!(
+            wait < LOST_RECORD_BOUND,
+            "{route:?} must be read inside {LOST_RECORD_BOUND:?}, and took {wait:?}",
+        );
+        for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+            assert!(
+                c.run_until(epochs(40), |c| accepted_on(c, shard, route)),
+                "{route:?} must be accepted on {shard:?}",
+            );
+        }
+    }
+}
+
+/// The longest a record may take to reach a venue when the block that
+/// should have pushed it lost its proposer: a read, and room for the view
+/// change.
+const KILLED_PROPOSER_BOUND: Duration = Duration::from_secs(12);
+
+/// A crash takes one block's pusher with no type drop in play.
+///
+/// The trader committee's member at `victim` dies as the first record
+/// stands, so when that member's turn is the next the block's push dies
+/// with it. Every route still accepts, and the worst a record pays is a
+/// read.
+///
+/// A trader member's turn cannot be read from here, so a run names one
+/// member and the suite runs each. Hands back whether this run killed the
+/// push: every venue read that record at an anchor past the one a push
+/// stands at, so the read and not the push delivered it.
+///
+/// Requires disjoint committees, so the crash touches only the trader's
+/// shard.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if a route is not
+/// accepted on both venues, or if a record takes longer than
+/// [`KILLED_PROPOSER_BOUND`].
+pub fn a_killed_proposer_costs_a_route_no_more_than_a_read<C>(c: &mut C, victim: usize) -> bool
+where
+    C: FaultableCluster + CrashableCluster,
+{
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let victim = c.committee_hosts(TRADER_SHARD)[victim];
+    let routes: Vec<(TxHash, Vec<SubstateKey>)> = traders
+        .iter()
+        .map(|trader| submit_core_route(c, (&first, &second), trader, ROUTE_INPUT))
+        .collect();
+    let written =
+        |c: &C, records: &[SubstateKey]| records.iter().all(|record| stands_at(c, *record));
+    assert!(
+        c.run_polling(epochs(10), FINE_POLL, |c| routes
+            .iter()
+            .any(|(_, records)| written(c, records))),
+        "a leg finalizes",
+    );
+    let height = c
+        .committed_height(TRADER_SHARD)
+        .expect("the trader's shard runs");
+    let first = routes
+        .iter()
+        .find(|(_, records)| written(c, records))
+        .map(|(_, records)| records.clone())
+        .expect("a leg has finalized");
+    c.crash(victim, Crash::Process, epochs(2));
+
+    let mut longest = Duration::ZERO;
+    for (route, records) in &routes {
+        for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+            longest = longest.max(await_record_reads(c, venue, *route, records));
+            assert!(
+                c.run_until(epochs(40), |c| accepted_on(c, venue, *route)),
+                "{route:?} must be accepted on {venue:?}",
+            );
+        }
+    }
+    let read = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+        .into_iter()
+        .all(|venue| {
+            first.iter().all(|record| {
+                c.record_reading_anchor(venue, *record)
+                    .is_some_and(|anchor| anchor.height > height)
+            })
+        });
+    println!(
+        "record read: the longest record took {longest:?} past a killed proposer; the first \
+         record came by a read: {read}",
+    );
+    assert!(
+        longest < KILLED_PROPOSER_BOUND,
+        "a killed proposer must cost no more than a read, and a record took {longest:?}",
+    );
+    read
+}
+
+/// More wanted keys than the record fetch has places.
+const DEAD_HOLDER_ROUTES: usize = 260;
+
+/// A holder nobody can reach pins no more of the record fetch than its
+/// share: with more keys wanted of it than the fetch has places, a lost
+/// record at a healthy holder is still read in time.
+///
+/// Requires a grown four-shard cluster over
+/// [`contended_load_genesis_accounts`] of `traders`.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the dead holder
+/// never reaches more wanted keys than the fetch has places, if the cut
+/// never fires, or if the record takes longer than
+/// [`LOST_RECORD_BOUND`].
+pub fn a_dead_holder_leaves_room_for_a_lost_record<C: FaultableCluster>(c: &mut C, traders: usize) {
+    let cast = LoadCast::stand_up(c, DEAD_HOLDER_ROUTES + 1, &traders_on_both_shards(traders));
+    let walked = [BlockHeight::GENESIS, BlockHeight::GENESIS];
+    let mut flight = Flight::over(DEAD_HOLDER_ROUTES + 1, walked);
+    let window = validity_around(c.now());
+    for pair in 0..DEAD_HOLDER_ROUTES {
+        cast.send(
+            c,
+            &mut flight,
+            TradersOn::First,
+            (pair, Heading::Out),
+            window,
+            Duration::ZERO,
+        );
+    }
+    let wanted = |c: &C| {
+        c.metric_quantile_above("wanted_records", None, 1.0, 0.0)
+            .unwrap_or(0.0)
+    };
+    assert!(
+        c.run_until(epochs(4), |c| wanted(c) > 256.0),
+        "more keys must be wanted of the holder than the fetch has places: {}",
+        wanted(c),
+    );
+    let dead = c.committee_hosts(TRADER_SHARD);
+    let others: Vec<usize> = (0..c.host_count())
+        .filter(|host| !dead.contains(host))
+        .collect();
+    c.partition(&dead, &others);
+
+    let lost = isolate_pushed_readings(c, FIRST_VENUE_SHARD, SECOND_TRADER_SHARD);
+    let hash = cast.send(
+        c,
+        &mut flight,
+        TradersOn::Second,
+        (DEAD_HOLDER_ROUTES, Heading::Out),
+        window,
+        Duration::ZERO,
+    );
+    let records = core_records(c, &flight.routes[&hash]);
+    let wait = await_record_reads(c, FIRST_VENUE_SHARD, hash, &records);
+    assert!(lost.fired() > 0, "the push must actually have been lost");
+    println!("record read: {wait:?} for a lost record beside a dead holder");
+    assert!(
+        wait < LOST_RECORD_BOUND,
+        "a dead holder must leave room for a lost record, which took {wait:?}",
+    );
+    c.heal_all();
+}
+
+/// How many record reads stand open across the cluster.
+fn record_reads_open<C: FaultableCluster>(c: &C) -> u64 {
+    let count = |name| c.metric(name, Some("record_proof"));
+    count("fetch_started").saturating_sub(count("fetch_completed") + count("fetch_abandoned"))
+}
+
+/// How long a holder stalls: past the finalization delay, so everything
+/// in flight arms on the clock.
+const HOLDER_STALL: Duration = Duration::from_secs(26);
+
+/// A holder stalled past the finalization delay draws one read per key
+/// and per validator, however long it stalls, and takes no place from
+/// the other asks.
+///
+/// Requires disjoint committees, as the partition is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if more reads stand
+/// open than there are wants, if no state proof lands past the stall, or
+/// if a route is not accepted once it ends.
+pub fn a_stalled_holder_draws_one_ask_per_key<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let routes: Vec<(TxHash, Vec<SubstateKey>)> = traders
+        .iter()
+        .map(|trader| submit_core_route(c, (&first, &second), trader, ROUTE_INPUT))
+        .collect();
+    let filed = c.now() + Duration::from_secs(2);
+    let _ = c.run_until(epochs(1), |c| c.now() >= filed);
+
+    let stalled = c.committee_hosts(TRADER_SHARD);
+    let others: Vec<usize> = (0..c.host_count())
+        .filter(|host| !stalled.contains(host))
+        .collect();
+    c.partition(&stalled, &others);
+    let keys: usize = routes.iter().map(|(_, records)| records.len()).sum();
+    let venue_validators =
+        c.committee_hosts(FIRST_VENUE_SHARD).len() + c.committee_hosts(SECOND_VENUE_SHARD).len();
+    let wants = u64::try_from(keys * venue_validators).expect("a small count");
+    let resume = c.now() + HOLDER_STALL;
+    let mut most = 0;
+    while c.now() < resume {
+        let next = c.now() + Duration::from_secs(1);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+        most = most.max(record_reads_open(c));
+    }
+    c.heal_all();
+    let proofs = c.metric("fetch_completed", Some("state_proof"));
+    for _ in 0..8 {
+        let next = c.now() + Duration::from_secs(1);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+        most = most.max(record_reads_open(c));
+    }
+    println!("record read: at most {most} reads open of {wants} wants across a stall");
+    assert!(
+        most <= wants,
+        "one read stands for a key, and {most} stood for {wants} wants",
+    );
+    for (route, _) in routes {
+        for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+            assert!(
+                c.run_until(epochs(40), |c| accepted_on(c, venue, route)),
+                "{route:?} must be accepted on {venue:?}",
+            );
+        }
+    }
+    assert!(
+        c.run_until(epochs(10), |c| c
+            .metric("fetch_completed", Some("state_proof"))
+            > proofs),
+        "a state proof must still land past the stall",
+    );
+}
+
+/// A consumer restarted with wants past the finalization delay asks each
+/// of them at first sight, once per key, and its route still accepts.
+///
+/// Requires disjoint committees, as the held leg is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if more reads stand
+/// open than there are wants, or if a route is not accepted.
+pub fn a_restart_with_wants_past_the_clock_asks_each_once<C>(c: &mut C)
+where
+    C: FaultableCluster + RestartableCluster,
+{
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let leg_hosts = c.committee_hosts(TRADER_SHARD);
+    let _ = c.drop_type_between(&leg_hosts, &leg_hosts, "execution.vote");
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let filed = c.now() + Duration::from_secs(2);
+    let _ = c.run_until(epochs(1), |c| c.now() >= filed);
+
+    c.stop_host(c.committee_hosts(FIRST_VENUE_SHARD)[0], epochs(1));
+    let past_the_clock = c.now() + MAX_FINALIZATION_DELAY + Duration::from_secs(4);
+    let venue_validators =
+        c.committee_hosts(FIRST_VENUE_SHARD).len() + c.committee_hosts(SECOND_VENUE_SHARD).len();
+    let wants = u64::try_from(records.len() * venue_validators).expect("a small count");
+    let mut most = 0;
+    while c.now() < past_the_clock {
+        let next = c.now() + Duration::from_secs(1);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+        most = most.max(record_reads_open(c));
+    }
+    c.clear_drops();
+    println!("record read: at most {most} reads open of {wants} wants across a restart");
+    assert!(
+        most <= wants,
+        "one read stands for a key, and {most} stood for {wants} wants",
+    );
+    for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            c.run_until(epochs(40), |c| accepted_on(c, venue, route)),
+            "{route:?} must be accepted on {venue:?}",
         );
     }
 }
@@ -3717,10 +4282,9 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
     ("fetch_completed", LOAD_FETCHES),
     ("fetch_abandoned", LOAD_FETCHES),
     ("fetch_retried", LOAD_FETCHES),
-    (
-        "fetch_items_sent",
-        &[Some("state_proof"), Some("record_proof")],
-    ),
+    // Counted by the server under the wire request's name, which a record
+    // read shares with every other state proof.
+    ("fetch_items_sent", &[Some("state_proof")]),
     ("fetch_responses_refused", LOAD_FETCHES),
 ];
 
@@ -4295,7 +4859,7 @@ fn assert_load_conserved(conserved: [(&'static str, u128, u128, u128); 2]) {
 /// never fires, if either side of the pair is not conserved, if a route
 /// is still undecided once its window and the drain have passed, or if
 /// any route is not accepted.
-pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
+pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) -> RecordReadCost {
     let wall = Instant::now();
     let cast = LoadCast::stand_up(c, load.pairs, &[(TRADER_SHARD, load.traders)]);
     let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
@@ -4320,9 +4884,11 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
         ],
     };
     let mut flight = Flight::over(load.pairs, [opened_at[0], opened_at[1]]);
+    let mut cold = ColdAsks::from(opened);
     while c.now() < opened + load.duration {
         cast.offer(c, load, &mut flight);
         flight.tick(c, "offering");
+        cold.read(c);
     }
     assert!(
         cuts.iter().all(|cut| cut.fired() > 0),
@@ -4354,6 +4920,8 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
         wall: [wall.elapsed(), offering],
     }
     .report(c);
+    let reads = RecordReadCost::read(c, flight.routes.len(), cold, [&before, &after]);
+    reads.report();
 
     assert_load_conserved(conserved);
     assert!(
@@ -4378,6 +4946,112 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
             .iter()
             .find(|(_, decision)| **decision != TransactionDecision::Accept),
     );
+    reads
+}
+
+/// How long a load runs before its asks count: it stands up only venue
+/// shards, so the trader's shard has pushed nothing and every key of its
+/// runs at the grace's floor until the first pushes land.
+const COLD_START: Duration = Duration::from_secs(15);
+
+/// `record_asks` as it stood [`COLD_START`] into an offering.
+#[derive(Debug, Clone, Copy)]
+struct ColdAsks {
+    until: Duration,
+    read: Option<u64>,
+}
+
+impl ColdAsks {
+    fn from(opened: Duration) -> Self {
+        Self {
+            until: opened + COLD_START,
+            read: None,
+        }
+    }
+
+    /// Take the reading if the cold start has passed and none is taken.
+    fn read<C: FaultableCluster>(&mut self, c: &C) {
+        if c.now() >= self.until {
+            self.read
+                .get_or_insert_with(|| c.metric("record_asks", None));
+        }
+    }
+}
+
+/// The most record reads a healthy load of `routes` may draw: one late
+/// key, two ladder rounds at four validators, plus the same per hundred
+/// routes.
+#[must_use]
+pub const fn read_bound(routes: usize) -> u64 {
+    8 * (1 + routes as u64 / 100)
+}
+
+/// What a load's record reads came to.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordReadCost {
+    /// The routes offered.
+    pub routes: usize,
+    /// Reads put in the first [`COLD_START`] of the offering.
+    pub cold: u64,
+    /// Reads put from then to the end of the run.
+    pub delta: u64,
+    /// Every read of the run.
+    pub asks: u64,
+    /// The largest span a kept push took, in milliseconds, an eighth
+    /// above the truth at most.
+    pub largest_span_ms: f64,
+    /// The median span, as closely.
+    pub median_span_ms: f64,
+    /// The median grace derived over the run, in milliseconds, and the
+    /// largest.
+    pub grace_ms: [f64; 2],
+}
+
+impl RecordReadCost {
+    /// What the reads between `before` and `after` came to.
+    fn read<C: FaultableCluster>(
+        c: &C,
+        routes: usize,
+        cold: ColdAsks,
+        [before, after]: [&LoadCounters; 2],
+    ) -> Self {
+        let asks = after.since(before, "record_asks", None);
+        let cold = cold.read.map_or(asks, |at| {
+            at.saturating_sub(before.since(&LoadCounters::default(), "record_asks", None))
+        });
+        let quantile = |name, q| {
+            c.metric_quantile_above(name, None, q, f64::NEG_INFINITY)
+                .unwrap_or(0.0)
+        };
+        Self {
+            routes,
+            cold,
+            delta: asks.saturating_sub(cold),
+            asks,
+            largest_span_ms: quantile("record_push_span", 1.0),
+            median_span_ms: quantile("record_push_span", 0.5),
+            grace_ms: [
+                quantile("record_push_grace", 0.5),
+                quantile("record_push_grace", 1.0),
+            ],
+        }
+    }
+
+    fn report(&self) {
+        println!(
+            "core load [6 record reads]: {} routes, record_asks {} in the first {COLD_START:?} \
+             and {} after, bound {}; push span median {:.0}ms, largest {:.0}ms; grace median \
+             {:.0}ms, largest {:.0}ms",
+            self.routes,
+            self.cold,
+            self.delta,
+            read_bound(self.routes),
+            self.median_span_ms,
+            self.largest_span_ms,
+            self.grace_ms[0],
+            self.grace_ms[1],
+        );
+    }
 }
 
 /// Epochs an aborted route's input gets to come home to its trader, as
@@ -4677,11 +5351,13 @@ pub fn contended_routes_through_one_pair_under_load<C: FaultableCluster>(
     let mut flight = Flight::over(load.pairs, [opened_at[0], opened_at[1]]);
     let mut twins = Vec::new();
     let mut places = PlacesSeen::default();
+    let mut cold = ColdAsks::from(opened);
     while c.now() < opened + load.duration {
         cast.offer_twins(c, load, &mut flight, &mut twins);
         watch_seats(&meter, &flight);
         flight.tick(c, "offering");
         places.read(c, &flight);
+        cold.read(c);
     }
     let dropped = lost.fired();
     c.clear_drops();
@@ -4728,6 +5404,8 @@ pub fn contended_routes_through_one_pair_under_load<C: FaultableCluster>(
         wall: [wall.elapsed(), offering],
     }
     .report(c);
+
+    RecordReadCost::read(c, flight.routes.len(), cold, [&before, &after]).report();
 
     let label = "contended load";
     let read = TwinsRead::over(c, &flight, &places, &twins);

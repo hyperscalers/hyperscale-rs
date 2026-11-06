@@ -22,9 +22,9 @@ use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_scenarios::query::{
-    ChainMentions, ClaimsSection, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership,
-    chain_mentions, claims_sections, declines_naming, reads_record, record_wait, records_naming,
-    retirements_by_holder, served_at,
+    ChainMentions, ClaimsSection, CommittedChain, RanAs, absent_record_readings, chain_burn,
+    chain_fate, chain_membership, chain_mentions, claims_sections, declines_naming, reads_record,
+    record_reading_anchor, record_wait, records_naming, retirements_by_holder, served_at,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
@@ -43,11 +43,11 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::request::GetStateProofRequest;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
-    ConsensusReceipt, DeclaredRange, Derivation, Epoch, Event, Heard, LocalKey, PrincipalAddr,
-    ReshapeThresholds, ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
-    Verified, WeightedTimestamp, shard_prefix_path,
+    Address, Anchor, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock,
+    ChainOrigin, ConsensusReceipt, DeclaredRange, Derivation, Epoch, Event, Heard, LocalKey,
+    PrincipalAddr, ReshapeThresholds, ShardId, Signer, StandingAnswers, StandingToward, StateRoot,
+    SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    ValidatorId, Verified, WeightedTimestamp, shard_prefix_path,
 };
 
 use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
@@ -970,6 +970,15 @@ impl Cluster for SimCluster {
         self.run_until_polled(budget, SLICE, cond)
     }
 
+    fn run_polling(
+        &mut self,
+        budget: Budget,
+        poll: Duration,
+        cond: impl Fn(&Self) -> bool,
+    ) -> bool {
+        self.run_until_polled(budget, poll, cond)
+    }
+
     fn now(&self) -> Duration {
         self.runner.chain_now()
     }
@@ -1247,6 +1256,14 @@ impl Cluster for SimCluster {
 
     fn record_wait(&self, shard: ShardId, tx: TxHash, key: SubstateKey) -> Option<Duration> {
         record_wait(&self.history(shard), tx, key)
+    }
+
+    fn absent_record_readings(&self, shard: ShardId, key: SubstateKey) -> usize {
+        absent_record_readings(&self.history(shard), key)
+    }
+
+    fn record_reading_anchor(&self, shard: ShardId, key: SubstateKey) -> Option<Anchor> {
+        record_reading_anchor(&self.history(shard), key)
     }
 
     fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)> {

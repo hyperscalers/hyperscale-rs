@@ -8,10 +8,10 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_storage::{MemberRow, RowState};
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, ChainOrigin, ConsensusReceipt, DeclaredRange, Derivation,
-    Epoch, Event, Heard, PriceTable, ShardId, Signer, StandingAnswers, StandingToward, StateRoot,
-    SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    TxsInFlight, ValidatorId, WeightedTimestamp,
+    Address, Anchor, BeaconState, BlockHeight, ChainOrigin, ConsensusReceipt, DeclaredRange,
+    Derivation, Epoch, Event, Heard, PriceTable, ShardId, Signer, StandingAnswers, StandingToward,
+    StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
+    TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
 };
 
 use super::Budget;
@@ -107,6 +107,18 @@ pub trait Cluster {
     /// Sim drives its logical clock (and pumps reshape); production blocks on a
     /// poll loop while reshape advances organically via the supervisor.
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool;
+
+    /// [`Self::run_until`] reading `cond` every `poll` of the cluster's
+    /// clock where it can, for a state a slower poll would step over.
+    fn run_polling(
+        &mut self,
+        budget: Budget,
+        poll: Duration,
+        cond: impl Fn(&Self) -> bool,
+    ) -> bool {
+        let _ = poll;
+        self.run_until(budget, cond)
+    }
 
     /// Chain time on the cluster's own clock, as Unix time — for building
     /// transaction validity windows. Sim returns its logical clock from the
@@ -393,6 +405,23 @@ pub trait Cluster {
     /// its consumer had to wait out a clock for rides a block at least
     /// that clock past the commit that filed the want.
     fn record_wait(&self, _shard: ShardId, _tx: TxHash, _key: SubstateKey) -> Option<Duration> {
+        None
+    }
+
+    /// How many claims of `shard`'s chain read the record at `key`
+    /// absent, or zero where this cluster keeps no chain it walks that
+    /// way.
+    fn absent_record_readings(&self, _shard: ShardId, _key: SubstateKey) -> usize {
+        0
+    }
+
+    /// The anchor of the first claim of `shard`'s chain holding the value
+    /// at `key`, or `None` until one does or where this cluster keeps no
+    /// chain it walks that way.
+    ///
+    /// A push stands at the block that wrote the record, so a reading at
+    /// a later anchor came by a read.
+    fn record_reading_anchor(&self, _shard: ShardId, _key: SubstateKey) -> Option<Anchor> {
         None
     }
 
