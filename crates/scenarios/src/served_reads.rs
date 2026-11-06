@@ -21,7 +21,7 @@ use crate::straddler::{isolate_crossing_intake, isolate_provision_intake};
 use crate::support::conservation::{Charges, World};
 use crate::support::query::held;
 use crate::support::tx::{
-    build_route_presenting_tx, build_sponsored_route_presenting_tx, build_swap_paying_tx,
+    build_resource_transfer_tx, build_route_presenting_tx, build_sponsored_route_presenting_tx,
     build_swap_tx, validity_around,
 };
 use crate::support::wait::await_tx_terminal;
@@ -413,9 +413,10 @@ pub fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards<C: Faultabl
 /// An owed credit landing between a member's head and its naming lands
 /// on a vault the member debits, and composes with the debit.
 ///
-/// The courier on [`AWAY`] swaps into units and has them paid to the
-/// holder on [`HOME`], whose fold credits them. A route presenting the
-/// holder's vault and withdrawing from it stands head first, so its part
+/// The courier on [`AWAY`] holds units and sends them to the holder on
+/// [`HOME`], through no venue, so nothing the route holds on [`AWAY`]
+/// stands in its way, and [`HOME`]'s fold credits them. A route presenting
+/// the holder's vault and withdrawing from it stands head first, so its part
 /// lacks the credit, the view its tick reads the holds on holds it, and
 /// the settlement of its withdraw lands on the vault as the credit left
 /// it: the fold differential compares a credit the part never saw.
@@ -432,23 +433,43 @@ pub fn an_owed_credit_onto_a_served_vault_composes<C: FaultableCluster>(c: &mut 
     let holder = stage.cast[0].1;
     let before = held(c, holder.address(), stage.unit);
     let asked = before / 2;
-    let route = stage.stand_a_route_head(c, asked);
-
-    let delivery = build_swap_paying_tx(
+    let courier = stage.courier.1.address();
+    let stocking = build_swap_tx(
         &stage.courier.0,
         stage.courier.1,
         &stage.venues[1].meta,
-        (*PROTOCOL_RESOURCE, ROUTE_INPUT),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let stocking = stage.submit(c, stocking);
+    ends_as(
+        c,
+        stocking,
+        TransactionDecision::Accept,
+        "the courier must stock up",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| held(c, courier, stage.unit) > 0),
+        "the courier's units must land",
+    );
+    let credited = held(c, courier, stage.unit) / 2;
+    let route = stage.stand_a_route_head(c, asked);
+
+    let delivery = build_resource_transfer_tx(
+        &stage.courier.0,
+        stage.courier.1,
+        (stage.unit, credited),
         holder,
         validity_around(c.now()),
     );
     let delivery = stage.submit(c, delivery);
     assert!(
         c.run_until(epochs(8), |c| held(c, holder.address(), stage.unit)
-            > before),
+            == before + credited),
         "the owed credit must land on the holder's vault",
     );
-    let credited = held(c, holder.address(), stage.unit) - before;
     assert!(
         heads(c, HOME, route),
         "the credit must land with the route still unnamed",

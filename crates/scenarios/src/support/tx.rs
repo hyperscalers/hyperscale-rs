@@ -2305,24 +2305,23 @@ pub fn build_swap_tx(
     })
 }
 
-/// [`build_swap_tx`] whose proceeds go to `to`.
+/// A transfer of `amount` of `resource` from `from` to `to`, through no
+/// venue.
 ///
 /// # Panics
 ///
 /// As [`build_swap_tx`].
 #[must_use]
-pub fn build_swap_paying_tx(
+pub fn build_resource_transfer_tx(
     payer: &Ed25519PrivateKey,
     from: PrincipalAddr,
-    venue: &InstanceMeta,
-    (paying, amount): (ResourceAddr, u128),
+    (resource, amount): (ResourceAddr, u128),
     to: PrincipalAddr,
     validity: TimestampRange,
 ) -> Transaction {
-    build_venue_tx(payer, venue, validity, &|pool, b| {
-        let funds = account::withdraw(b, from, paying, amount)?;
-        let bought = pool.swap(b, funds, 0)?;
-        account::deposit(b, to, bought)
+    build_venues_tx(payer, None, &[], validity, &|_, b| {
+        let funds = account::withdraw(b, from, resource, amount)?;
+        account::deposit(b, to, funds)
     })
 }
 
