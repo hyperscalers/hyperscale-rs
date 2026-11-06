@@ -56,21 +56,24 @@ const PUSH_SPAN_HEIGHTS: usize = 32;
 /// record should take. A small tail outruns it, each a read that holds
 /// nothing.
 ///
-/// The median, since one late push, one contended leg or a member
-/// delaying its turns moves it nowhere, where a maximum would hand that
-/// lever to one member. Honest pushes land first and a held key takes no
-/// sample, so a member controls only the heights it withholds.
+/// The median, since one late push or one contended leg moves it nowhere,
+/// where a maximum would hand that lever to one member. A member is not
+/// held off by it: it picks the anchor height of each claim it withholds
+/// and can take any share of the window its keys buy, and past half the
+/// median follows it. [`RECORD_PUSH_GRACE_CEILING`] is what bounds that.
 fn grace_over(samples: &[Duration]) -> Duration {
     median_of(samples).map_or(RECORD_PUSH_GRACE_FLOOR, |median| {
         (median * 3 / 2).clamp(RECORD_PUSH_GRACE_FLOOR, RECORD_PUSH_GRACE_CEILING)
     })
 }
 
-/// The median of `spans`, `None` where there are none.
+/// The lower median of `spans`, `None` where there are none: a tie goes
+/// low, so one late span beside an honest one does not win a height, and
+/// holding half the heights does not win the window.
 fn median_of(spans: &[Duration]) -> Option<Duration> {
     let mut spans = spans.to_vec();
     spans.sort_unstable();
-    spans.get(spans.len() / 2).copied()
+    spans.get(spans.len().saturating_sub(1) / 2).copied()
 }
 
 /// How long one holder's pushes have been taking, by the holder height
@@ -623,6 +626,59 @@ mod tests {
                 .contains_key(&BlockHeight::new(1)),
             "below the window",
         );
+    }
+
+    /// Feed a full window, honest at 6 s, then `windows` more in which
+    /// `late_of_32` heights of every 32 are a member's, each span as long
+    /// as the grace it reads, so the member spends all the grace gives it.
+    fn ratcheted(windows: u64, late_of_32: u64) -> Duration {
+        let secs = Duration::from_secs;
+        let mut reads = RecordReads::new();
+        heard(&mut reads, 1, &[secs(6); 32]);
+        for height in 33..33 + windows * 32 {
+            let span = if (height - 33) % 32 < late_of_32 {
+                reads.grace(HOLDER)
+            } else {
+                secs(6)
+            };
+            heard(&mut reads, height, &[span]);
+        }
+        reads.grace(HOLDER)
+    }
+
+    /// A member holding half a holder's heights, each span as late as the
+    /// grace lets it, leaves the grace at the honest figure however long
+    /// it keeps at it. One height past half and the median is its own,
+    /// which climbs by 3/2 a window to the ceiling: that is what the
+    /// ceiling is for.
+    #[test]
+    fn half_the_heights_do_not_ratchet_the_grace() {
+        let secs = Duration::from_secs;
+        assert_eq!(ratcheted(8, 16), secs(9), "half is not enough");
+        assert_eq!(ratcheted(8, 17), RECORD_PUSH_GRACE_CEILING, "past half is");
+    }
+
+    /// A late span beside an honest one at the same height does not win
+    /// it, and a late height has to outnumber its honest spans.
+    #[test]
+    fn a_tie_at_a_height_goes_to_the_earlier_span() {
+        let secs = Duration::from_secs;
+        assert_eq!(median_of(&[secs(6), secs(15)]), Some(secs(6)));
+        assert_eq!(median_of(&[secs(15), secs(6), secs(15)]), Some(secs(15)));
+        assert_eq!(median_of(&[]), None);
+
+        let mut reads = RecordReads::new();
+        for height in 1..=33 {
+            for span in [secs(6), secs(15)] {
+                reads.pushed(
+                    test_key(1),
+                    anchor(height, 0),
+                    span,
+                    WeightedTimestamp::ZERO,
+                );
+            }
+        }
+        assert_eq!(reads.grace(HOLDER), secs(9));
     }
 
     /// A holder's spans go a horizon after its last sample, which leaves

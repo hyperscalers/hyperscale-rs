@@ -4343,8 +4343,9 @@ impl Counterparts {
         // How far the holder's clock stands past each filing as the first
         // push of a key lands: what the grace is compared against, so a
         // push landing inside the grace draws no ask, whatever the
-        // latency. A key already held takes no sample, so a member can
-        // move the grace only with the heights it withholds.
+        // latency. A key already held takes no sample, so a member moves
+        // the grace only with the keys it withheld, at the anchor heights
+        // it picks for them, and the grace's ceiling bounds what that buys.
         let reached = self
             .proven_anchors
             .newest_licensed(anchor.shard, now, ..)
