@@ -21,6 +21,7 @@ use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
+use hyperscale_provisions::own_served_entries;
 use hyperscale_scenarios::query::{
     ChainMentions, ClaimsSection, CommittedChain, RanAs, absent_record_readings, chain_burn,
     chain_fate, chain_membership, chain_mentions, claims_sections, declines_naming, reads_record,
@@ -43,11 +44,12 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::request::GetStateProofRequest;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, Anchor, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock,
-    ChainOrigin, ConsensusReceipt, DeclaredRange, Derivation, Epoch, Event, Heard, LocalKey,
-    PrincipalAddr, ReshapeThresholds, ShardId, Signer, StandingAnswers, StandingToward, StateRoot,
-    SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    ValidatorId, Verified, WeightedTimestamp, shard_prefix_path,
+    Address, Anchor, BeaconChainConfig, BeaconState, Block, BlockHeader, BlockHeight,
+    CertifiedBlock, ChainOrigin, ConsensusReceipt, DeclaredRange, Derivation, Epoch, Event, Heard,
+    LocalKey, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StandingAnswers, StandingToward,
+    StateRoot, SubstateEntry, SubstateKey, TickLine, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
+    shard_prefix_path,
 };
 
 use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
@@ -124,6 +126,31 @@ pub struct SimCluster {
     /// The beacon epoch this cluster's chain runs, which a [`Budget`]
     /// counts in.
     epoch: Duration,
+    /// Every member's own part against the part a counterpart absorbed.
+    served_parts: ServedParts,
+}
+
+/// The served reads oracle: at each shared tick, the entries the source
+/// reads as its own part are the entries a counterpart absorbed.
+///
+/// It walks the archive, so it reads what the chains committed. A part's
+/// entries travel in the blocks that absorb them, and the source's are
+/// read back out of its store at the line's head height, through the
+/// function the tick reads them with. A store that has since retired the
+/// height leaves that member unread: the walk runs every slice, and a
+/// tick's height is held until it has run.
+#[derive(Default)]
+struct ServedParts {
+    /// The next height to walk, by shard.
+    walked: BTreeMap<ShardId, BlockHeight>,
+    /// What each line running a member says the source read, by source,
+    /// target and transaction.
+    read: BTreeMap<(ShardId, ShardId, TxHash), (BlockHeight, Vec<SubstateEntry>)>,
+    /// What each target's blocks absorbed, by source, target and
+    /// transaction: the height serving it and its entries, ascending.
+    absorbed: BTreeMap<(ShardId, ShardId, TxHash), (BlockHeight, Vec<SubstateEntry>)>,
+    /// The parts held to each other so far.
+    agreed: usize,
 }
 
 impl Drop for SimCluster {
@@ -405,6 +432,7 @@ impl SimCluster {
             recorder: MemoryRecorder::new(),
             tuning,
             member_rules: Vec::new(),
+            served_parts: ServedParts::default(),
             one_identity_per_host: args.dedicated_pool_hosts && config.vnodes_per_host == 1,
             epoch: beacon_chain_config.epoch_duration(),
         };
@@ -495,6 +523,27 @@ impl SimCluster {
             seed,
             accounts,
             GenesisPackages::protocol(),
+            false,
+            false,
+            Some(processing),
+        )
+    }
+
+    /// [`Self::with_grown_packages`] with every pool's work taking time
+    /// as `processing` says.
+    #[must_use]
+    pub fn with_grown_packages_and_processing(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+        processing: ProcessingTimes,
+    ) -> Self {
+        Self::grown(
+            config,
+            seed,
+            accounts,
+            packages,
             false,
             false,
             Some(processing),
@@ -630,11 +679,99 @@ impl SimCluster {
             self.runner.run_until(next);
             self.assert_beacon_cadence();
             self.assert_one_identity_per_host();
+            self.hold_served_parts();
             if cond(self) {
                 return true;
             }
         }
         cond(self)
+    }
+
+    /// Walk every chain past where the last walk stopped, and hold each
+    /// member's own part to what its counterpart absorbed.
+    ///
+    /// # Panics
+    ///
+    /// If the two differ, or come from different heights: a shared member
+    /// read other bytes than its counterpart.
+    fn hold_served_parts(&mut self) {
+        let shards: Vec<ShardId> = self.runner.archive().shards().collect();
+        for shard in shards {
+            let chain = self.history(shard);
+            let (tip, first) = (chain.tip(), chain.first().max(BlockHeight::new(1)));
+            let from = self
+                .served_parts
+                .walked
+                .get(&shard)
+                .copied()
+                .unwrap_or(first);
+            let mut height = from;
+            while height <= tip {
+                if let Some(certified) = self.history(shard).block(height) {
+                    self.note_served_parts(shard, certified.block());
+                }
+                height = height.next();
+            }
+            self.served_parts.walked.insert(shard, height);
+        }
+        let read = std::mem::take(&mut self.served_parts.read);
+        for (member, (at, entries)) in read {
+            let Some((served, absorbed)) = self.served_parts.absorbed.get(&member) else {
+                self.served_parts.read.insert(member, (at, entries));
+                continue;
+            };
+            assert_eq!(
+                (at, &entries),
+                (*served, absorbed),
+                "a shared member's own part differs from its counterpart's: {member:?}",
+            );
+            self.served_parts.agreed += 1;
+        }
+    }
+
+    /// Take in what `block` of `shard`'s says of parts: each line running
+    /// a member from its head height, read back from the store that holds
+    /// it, and each part the block absorbed.
+    fn note_served_parts(&mut self, shard: ShardId, block: &Block) {
+        let parts = self
+            .tallest_store(shard)
+            .map_or_else(Vec::new, |store| store.provisions_at(block.height()));
+        for part in parts {
+            let (source, tx) = (part.source_shard(), part.tx_hash());
+            let (height, entries) = self
+                .served_parts
+                .absorbed
+                .entry((source, shard, tx))
+                .or_insert_with(|| (part.block_height(), Vec::new()));
+            *height = part.block_height();
+            entries.extend(part.entries().iter().cloned());
+            entries.sort_by_key(|entry| entry.key);
+        }
+        for line in block.tick_manifest().iter() {
+            let TickLine::Member {
+                tx,
+                holds,
+                awaits,
+                served_at: Some(head),
+                ..
+            } = line
+            else {
+                continue;
+            };
+            let Some(state) = self
+                .tallest_store(shard)
+                .and_then(|store| store.snapshot_held_at(*head))
+            else {
+                continue;
+            };
+            let part = own_served_entries(&state, shard, *tx, holds)
+                .expect("a range a member declares names entries with leaves");
+            for target in awaits.iter() {
+                self.served_parts
+                    .read
+                    .insert((shard, *target, *tx), (*head, part.entries.clone()));
+            }
+        }
     }
 
     /// Run a fault `scenario` with the in-memory recorder scoped, so
@@ -1283,6 +1420,37 @@ impl Cluster for SimCluster {
 
     fn served_at(&self, source: ShardId, target: ShardId, tx: TxHash) -> Option<BlockHeight> {
         served_at(&self.history(target), source, tx)
+    }
+
+    fn ran_line(&self, shard: ShardId, tx: TxHash) -> Option<(BlockHeight, Option<BlockHeight>)> {
+        let chain = self.history(shard);
+        let mut height = chain.first().max(BlockHeight::new(1));
+        while height <= chain.tip() {
+            let served = chain.block(height).and_then(|certified| {
+                certified
+                    .block()
+                    .tick_manifest()
+                    .iter()
+                    .find_map(|line| match line {
+                        TickLine::Member {
+                            tx: named,
+                            joins,
+                            served_at,
+                            ..
+                        } if *named == tx && joins.dispatched() => Some(*served_at),
+                        _ => None,
+                    })
+            });
+            if let Some(served) = served {
+                return Some((height, served));
+            }
+            height = height.next();
+        }
+        None
+    }
+
+    fn served_parts_agreed(&self) -> usize {
+        self.served_parts.agreed
     }
 
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {

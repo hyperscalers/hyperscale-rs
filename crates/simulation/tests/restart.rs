@@ -30,8 +30,9 @@ use hyperscale_scenarios::{
     ScenarioConfig, VENUE_SHARD, a_late_settled_nullifier_still_refuses_its_intent,
     a_rejoined_producer_reads_a_lost_answer_at_a_boundary,
     a_restart_beside_a_departed_parent_store_resumes,
+    a_restart_between_head_and_tick_reads_the_same_part as restart_between_head_and_tick,
     a_restart_mid_handoff_keeping_its_stores_catches_the_child_up, epochs, grind_onto,
-    split_lifecycle, stand_up_venue, venue_genesis_accounts,
+    served_reads_genesis_accounts, split_lifecycle, stand_up_venue, venue_genesis_accounts,
 };
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{
@@ -43,7 +44,7 @@ use hyperscale_types::{
     TRANSACTION_EVIDENCE_HORIZON, TickHalf, TickId, TransactionDecision, TransactionStatus, TxHash,
     verdict_leaf,
 };
-use support::{SimCluster, committee_member_host, seeded};
+use support::{SimCluster, committee_member_host, seeded, sim_seed};
 
 /// A venue on one shard and its callers on the other, resharding
 /// disarmed so the committees a restart bounces are the ones that were
@@ -2254,3 +2255,30 @@ seeded!(
     seed_2 = 2,
     seed_42 = 42,
 );
+
+/// A restart of a shard's whole committee with a shared member head and
+/// unnamed: the replay holds the head height, and the tick reads from it
+/// the part the counterpart reads.
+#[test]
+fn a_restart_between_head_and_tick_reads_the_same_part() {
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            shard_size: 4,
+            vnodes_per_host: 1,
+            pool_surplus: 14,
+            num_shards: 4,
+            split_bytes: u64::MAX,
+            latency: Duration::from_millis(150),
+        },
+        sim_seed(42),
+        &served_reads_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(|c| {
+        restart_between_head_and_tick(c, |c, shard| {
+            for host in c.committee_hosts(shard) {
+                c.restart_host(host);
+            }
+        });
+    });
+}

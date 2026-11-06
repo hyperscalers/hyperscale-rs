@@ -11,19 +11,25 @@
 
 mod support;
 
+use std::time::Duration;
+
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::{
     BookRoute, ScenarioConfig, a_cycle_through_a_payer_core_aborts_at_the_window,
     a_hot_venue_runs_every_swap_where_it_commits,
     a_leg_reserving_a_read_vault_settles_before_the_read,
+    a_member_named_in_its_head_block_reads_one_part,
+    a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards,
     a_route_whose_venue_never_commits_frees_the_ladder,
     a_stalled_venue_aborts_its_route_at_the_window,
     a_whole_members_part_is_served_by_the_block_settling_an_earlier_writer,
-    book_route_genesis_accounts, contested_publish_genesis_accounts, departing_venue_split_bytes,
-    epochs, payer_cycle_genesis_accounts, served_reads_genesis_accounts,
+    an_owed_credit_onto_a_served_vault_composes, book_route_genesis_accounts,
+    contested_publish_genesis_accounts, departing_venue_split_bytes, epochs,
+    payer_cycle_genesis_accounts, served_reads_genesis_accounts,
     sponsored_routes_crossed_through_their_legs_abort_at_the_window,
     two_members_reading_what_the_other_reserves_both_settle, venue_genesis_accounts,
 };
+use hyperscale_simulation::ProcessingTimes;
 use support::{SimCluster, sim_seed};
 
 /// The book route's four quarters, grown on dedicated pool hosts.
@@ -35,7 +41,7 @@ fn book_route_cluster(seed: u64) -> SimCluster {
             pool_surplus: 18,
             num_shards: 4,
             split_bytes: departing_venue_split_bytes(),
-            latency: std::time::Duration::from_millis(150),
+            latency: Duration::from_millis(150),
         },
         seed,
         &book_route_genesis_accounts(),
@@ -53,7 +59,7 @@ fn payer_cycle_cluster(seed: u64) -> SimCluster {
             pool_surplus: 14,
             num_shards: 4,
             split_bytes: u64::MAX,
-            latency: std::time::Duration::from_millis(150),
+            latency: Duration::from_millis(150),
         },
         seed,
         &payer_cycle_genesis_accounts(),
@@ -108,7 +114,7 @@ fn a_hot_venue_names_every_swap_once_it_is_ready() {
             pool_surplus: 4,
             num_shards: 2,
             split_bytes: u64::MAX,
-            latency: std::time::Duration::from_millis(150),
+            latency: Duration::from_millis(150),
         },
         sim_seed(42),
         &venue_genesis_accounts(),
@@ -121,18 +127,23 @@ fn a_hot_venue_names_every_swap_once_it_is_ready() {
 /// first, every committee on hosts of its own.
 fn served_reads_cluster(seed: u64) -> SimCluster {
     SimCluster::with_grown_packages_on_dedicated_pool_hosts(
-        &ScenarioConfig {
-            shard_size: 4,
-            vnodes_per_host: 1,
-            pool_surplus: 14,
-            num_shards: 4,
-            split_bytes: u64::MAX,
-            latency: std::time::Duration::from_millis(150),
-        },
+        &served_reads_config(),
         seed,
         &served_reads_genesis_accounts(),
         GenesisPackages::with_fixtures(),
     )
+}
+
+/// Four quarters with no reshape in sight.
+const fn served_reads_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 14,
+        num_shards: 4,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+    }
 }
 
 /// Two members each reading the vault the other reserves settle in the
@@ -141,6 +152,42 @@ fn served_reads_cluster(seed: u64) -> SimCluster {
 fn two_members_reading_what_the_other_reserves_both_settle_sim() {
     let mut cluster = served_reads_cluster(sim_seed(42));
     two_members_reading_what_the_other_reserves_both_settle(&mut cluster);
+}
+
+/// A reclaim onto a vault a head reads and reserves leaves both shards
+/// reading one balance.
+#[test]
+fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards_sim() {
+    let mut cluster = served_reads_cluster(sim_seed(42));
+    cluster.run_faultable(a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards);
+}
+
+/// An owed credit onto a vault a head debits composes with the debit.
+#[test]
+fn an_owed_credit_onto_a_served_vault_composes_sim() {
+    let mut cluster = served_reads_cluster(sim_seed(42));
+    cluster.run_faultable(an_owed_credit_onto_a_served_vault_composes);
+}
+
+/// A member named in its head block waits for that block's write, on a
+/// disk that trails every commit, and reads the part its counterpart
+/// reads.
+#[test]
+fn a_member_named_in_its_head_block_reads_one_part_sim() {
+    let mut cluster = SimCluster::with_grown_packages_and_processing(
+        &served_reads_config(),
+        sim_seed(42),
+        &served_reads_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+        ProcessingTimes {
+            consensus: Duration::from_millis(1),
+            throughput: Duration::from_millis(1),
+            io: Duration::from_millis(600),
+            tail_per_million: 0,
+            tail: Duration::ZERO,
+        },
+    );
+    a_member_named_in_its_head_block_reads_one_part(&mut cluster);
 }
 
 /// A member reading a vault a leg reserves heads once the leg settles,
@@ -162,7 +209,7 @@ fn a_whole_members_part_is_served_by_the_block_settling_an_earlier_writer_sim() 
             pool_surplus: 4,
             num_shards: 2,
             split_bytes: u64::MAX,
-            latency: std::time::Duration::from_millis(150),
+            latency: Duration::from_millis(150),
         },
         sim_seed(42),
         &contested_publish_genesis_accounts(),

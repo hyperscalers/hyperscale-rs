@@ -198,7 +198,11 @@ pub use route_reshape::{
     split_train_genesis_accounts,
 };
 pub use served_reads::{
-    a_leg_reserving_a_read_vault_settles_before_the_read, served_reads_genesis_accounts,
+    a_leg_reserving_a_read_vault_settles_before_the_read,
+    a_member_named_in_its_head_block_reads_one_part,
+    a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards,
+    a_restart_between_head_and_tick_reads_the_same_part,
+    an_owed_credit_onto_a_served_vault_composes, served_reads_genesis_accounts,
     two_members_reading_what_the_other_reserves_both_settle,
 };
 pub use straddler::{

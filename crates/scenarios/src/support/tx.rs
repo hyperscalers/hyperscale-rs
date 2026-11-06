@@ -2305,6 +2305,27 @@ pub fn build_swap_tx(
     })
 }
 
+/// [`build_swap_tx`] whose proceeds go to `to`.
+///
+/// # Panics
+///
+/// As [`build_swap_tx`].
+#[must_use]
+pub fn build_swap_paying_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    venue: &InstanceMeta,
+    (paying, amount): (ResourceAddr, u128),
+    to: PrincipalAddr,
+    validity: TimestampRange,
+) -> Transaction {
+    build_venue_tx(payer, venue, validity, &|pool, b| {
+        let funds = account::withdraw(b, from, paying, amount)?;
+        let bought = pool.swap(b, funds, 0)?;
+        account::deposit(b, to, bought)
+    })
+}
+
 /// [`build_swap_tx`] of the protocol resource, with its fee paid by
 /// `sponsor`, which attests the root first: the fee reserves and burns
 /// against the sponsor's vault, on whichever shard holds it.

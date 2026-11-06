@@ -454,6 +454,20 @@ pub trait Cluster {
     /// the target commits one.
     fn served_at(&self, source: ShardId, target: ShardId, tx: TxHash) -> Option<BlockHeight>;
 
+    /// The tick of `shard`'s that ran `tx`, and the head height its line
+    /// names. `None` until `shard`'s chain names it to run.
+    fn ran_line(&self, shard: ShardId, tx: TxHash) -> Option<(BlockHeight, Option<BlockHeight>)> {
+        let _ = (shard, tx);
+        None
+    }
+
+    /// How many members' own parts this cluster has held to the part a
+    /// counterpart sharing their verdict absorbed. Zero where it does not
+    /// hold them to it.
+    fn served_parts_agreed(&self) -> usize {
+        0
+    }
+
     /// The height at which `shard`'s chain burned `tx`'s price, if it
     /// has: the block carrying the finalization of the member that held
     /// its row, or its fate. Apart from [`chain_fate`](Self::chain_fate)'s

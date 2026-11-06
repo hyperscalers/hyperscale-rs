@@ -45,8 +45,7 @@ use hyperscale_types::{
 /// retention rule out, or a range names an entry with no leaf. Either
 /// is a defect every replica may share, and running on anything else
 /// would split the member from its counterparts.
-#[must_use]
-pub fn own_parts<S: ShardStorage>(
+fn own_parts<S: ShardStorage>(
     chain: &TickChain<S>,
     shard: ShardId,
     requests: &[CrossShardExecutionRequest],

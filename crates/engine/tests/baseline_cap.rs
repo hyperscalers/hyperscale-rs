@@ -7,12 +7,13 @@
 //! a store holding more entries in the interval than the declaration's
 //! cap, and asserts what the full store says is true.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::account_address;
-use hyperscale_effects_bridge::vm_statics::config_key;
+use hyperscale_effects_bridge::vm_statics::{config_key, vault_key};
 use hyperscale_engine::genesis::{GenesisPackages, draw_key, genesis_world_with_pools};
-use hyperscale_engine::legs::Member;
+use hyperscale_engine::legs::{Classified, Member};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, PointReads, ServedPart,
     TickBatchContext, TickEnvironment, TickTxInput, genesis_writes,
@@ -30,7 +31,7 @@ use hyperscale_types::{
     PriceTable, PrincipalAddr, ProtocolHasher, ProvisionalHolds, Randomness, ResourceAddr,
     SeedRing, SeedSource, SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateEntry,
     SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp, absorb_committed_cells,
-    encode_amount, entry_leaf_key,
+    encode_amount, entry_leaf_key, range_lift,
 };
 use hyperscale_vm_effects::{
     Composed, Hash32, InstanceMeta, IntentHeader, IntentTree, SlotId, Value, child_key,
@@ -860,6 +861,119 @@ fn a_served_key_absent_at_the_head_reads_absent_without_provisions() {
         "the book's config reads absent: {:?}",
         unread[0].metadata,
     );
+}
+
+/// The part the shard holding the book serves `tx`, out of `state`: the
+/// declared cells and each declared range's lift under the book.
+fn remote_part(state: &SimShardStorage, tx: &Verified<Transaction>) -> Arc<Vec<SubstateEntry>> {
+    let owner = Address::from(book_addr());
+    let mut keys = BTreeSet::new();
+    for (declared, _) in &tx.routing().declared_modes {
+        if declared.owner() != owner {
+            continue;
+        }
+        keys.extend(declared.cell());
+        if let Some(range) = declared.range() {
+            let lift = range_lift(range.lo, range.hi, range.cap);
+            keys.extend(
+                state
+                    .entries_in_range(range.owner, range.collection, range.lo, range.hi, lift)
+                    .into_iter()
+                    .map(|(order, _)| {
+                        entry_leaf_key(
+                            &ProtocolHasher,
+                            EntryKey {
+                                owner: range.owner,
+                                collection: range.collection,
+                                order,
+                            },
+                        )
+                    }),
+            );
+        }
+    }
+    Arc::new(
+        keys.into_iter()
+            .map(|key| {
+                SubstateEntry::new(
+                    key,
+                    state
+                        .cell(key)
+                        .map(|leaf| Bytes::new(leaf).expect("a leaf fits an entry")),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// On a shard that does not own the book, a group-mate's walk of the
+/// ladder is the outbound record of a verdict the book's shard can still
+/// refuse, and threads to nobody: each of two fills batched here walks the
+/// ladder its own part serves, whichever runs first. The first's removals
+/// reaching the second would leave it two asks past the page.
+#[test]
+fn a_group_mates_remote_write_does_not_reach_a_members_part() {
+    let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
+    let storage = sealed_book(&executor, 1);
+    let trie = ShardTrie::uniform_from_count(2);
+    let local = trie.shard_for_prefix(principal(SETTLER).address());
+    let book_shard = trie.shard_for_prefix(Address::from(book_addr()));
+    assert_ne!(local, book_shard, "the fills cross to the book's shard");
+
+    let derived = |tx: Transaction| {
+        tx.try_derived(executor.derivation().as_ref())
+            .expect("a fixture transaction derives");
+        Verified::<Transaction>::from_persisted(tx)
+    };
+    let (first, second) = (derived(filling_asks(1)), derived(filling_asks(2)));
+    let parts = [
+        vec![remote_part(&storage, &first)],
+        vec![remote_part(&storage, &second)],
+    ];
+    let chain = TickChain::new(Arc::new(storage.clone()));
+    let snapshot = Arc::new(chain.view_at(storage.jmt_height()).snapshot());
+    let ctx = TickBatchContext {
+        local_shard: local,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
+        points: Some(Arc::clone(&snapshot) as Arc<dyn PointReads>),
+    };
+    let inputs: Vec<TickTxInput<'_>> = [(&first, &parts[0]), (&second, &parts[1])]
+        .into_iter()
+        .map(|(tx, part)| TickTxInput {
+            tx_hash: tx.hash(),
+            transaction: tx,
+            provisions: part,
+            clock: ctx.tick_ts,
+            prices: PriceTable::GENESIS,
+            member: Member::of(
+                Classified::whole(),
+                local,
+                BTreeSet::from([local, book_shard]),
+            ),
+            arrivals: &[],
+            served_part: None,
+        })
+        .collect();
+    let executed = executor
+        .execute_tick_batch(&ctx, &*snapshot, &inputs)
+        .expect("the harness engine holds every package it runs");
+
+    let bought = vault_key(principal(SETTLER), BOOK_BASE_RESOURCE);
+    for run in &executed {
+        let ConsensusReceipt::Succeeded { writes, .. } = &run.consensus else {
+            panic!("the fill settles: {:?} {:?}", run.consensus, run.metadata);
+        };
+        let moved = writes.movements.get(&bought).expect("the fill banks base");
+        assert_eq!(
+            moved.credit,
+            u128::from(FILL_CAP),
+            "each walk reads the whole page of its own part",
+        );
+    }
 }
 
 /// A walk that removes every ask its page shows stops at the page: the

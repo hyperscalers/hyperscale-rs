@@ -12,18 +12,20 @@
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::RowState;
 use hyperscale_types::{
-    Ed25519PrivateKey, PrincipalAddr, ResourceAddr, ShardId, Transaction, TransactionDecision,
-    TransactionStatus, TxHash,
+    Ed25519PrivateKey, PrincipalAddr, ResourceAddr, ShardId, TimestampRange, Transaction,
+    TransactionDecision, TransactionStatus, TxHash,
 };
 
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD};
+use crate::straddler::{isolate_crossing_intake, isolate_provision_intake};
 use crate::support::conservation::{Charges, World};
 use crate::support::query::held;
 use crate::support::tx::{
-    build_route_presenting_tx, build_sponsored_route_presenting_tx, build_swap_tx, validity_around,
+    build_route_presenting_tx, build_sponsored_route_presenting_tx, build_swap_paying_tx,
+    build_swap_tx, validity_around,
 };
 use crate::support::wait::await_tx_terminal;
-use crate::support::{Cluster, FaultableCluster, epochs};
+use crate::support::{Budget, Cluster, FaultableCluster, epochs};
 use crate::venue::{
     PROVIDER_FUNDING, SWAPPER_FUNDING, StockedVenue, accepted, grind_onto, reserve_cell,
     stand_up_venue,
@@ -55,6 +57,7 @@ pub fn served_reads_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
             .into_iter()
             .map(|(_, account)| (account, SWAPPER_FUNDING)),
     );
+    accounts.push((grind_onto(AWAY, &mut taken).1, SWAPPER_FUNDING));
     accounts
 }
 
@@ -68,6 +71,9 @@ fn cast(taken: &mut Vec<u8>) -> [(Ed25519PrivateKey, PrincipalAddr); 2] {
 struct Stage {
     venues: Vec<StockedVenue>,
     cast: [(Ed25519PrivateKey, PrincipalAddr); 2],
+    /// An account on [`AWAY`], which sends the cast what lands on them
+    /// from there.
+    courier: (Ed25519PrivateKey, PrincipalAddr),
     unit: ResourceAddr,
     protocol_resource: World,
     units: World,
@@ -88,6 +94,7 @@ impl Stage {
             .map(|&shard| stand_up_venue(c, shard, &mut taken))
             .collect();
         let cast = cast(&mut taken);
+        let courier = grind_onto(AWAY, &mut taken);
         let unit = venues[0].unit;
         for (key, account) in &cast {
             accepted(
@@ -113,7 +120,9 @@ impl Stage {
             World::open(
                 c,
                 resource,
-                cast.iter().map(|(_, account)| account.address()),
+                cast.iter()
+                    .chain([&courier])
+                    .map(|(_, account)| account.address()),
                 venues
                     .iter()
                     .map(|venue| reserve_cell(&venue.meta, resource)),
@@ -124,6 +133,7 @@ impl Stage {
         Self {
             venues,
             cast,
+            courier,
             unit,
             protocol_resource,
             units,
@@ -134,6 +144,52 @@ impl Stage {
     /// Submit `tx`, owing its price.
     fn submit<C: Cluster>(&mut self, c: &mut C, tx: Transaction) -> TxHash {
         self.charges.submit(c, tx)
+    }
+
+    /// A route of the first of the cast, through both venues, presenting
+    /// its vault of units as a badge and withdrawing `asked` of them: a
+    /// `Read` and a `Reserve` on one served key.
+    fn presenting_route(&self, asked: u128, validity: TimestampRange) -> Transaction {
+        let (key, holder) = &self.cast[0];
+        build_route_presenting_tx(
+            key,
+            *holder,
+            (&self.venues[0].meta, &self.venues[1].meta),
+            (self.unit, asked),
+            validity,
+        )
+    }
+
+    /// Hold the holder to a route's withdraw of `asked` out of `whole`:
+    /// the vault ends below `whole`, short of what the two swaps bring
+    /// back of `asked`, and above `whole - asked`, which is every other
+    /// balance's leaving it.
+    fn assert_route_spent<C: Cluster>(&self, c: &mut C, whole: u128, asked: u128) {
+        let holder = self.cast[0].1.address();
+        assert!(
+            c.run_until(epochs(4), |c| held(c, holder, self.unit) != whole),
+            "the route must settle on the holder's vault",
+        );
+        let ended = held(c, holder, self.unit);
+        assert!(
+            whole - asked < ended && ended < whole,
+            "the holder ends at one balance: {ended} of {whole}, {asked} spent",
+        );
+    }
+
+    /// Submit [`Self::presenting_route`] with [`AWAY`]'s bundle held off
+    /// [`HOME`], and run until it stands head there, named by no line:
+    /// the state of its head block is what it reads from then on, and
+    /// nothing is due to run it until `held_back` is let go.
+    fn stand_a_route_head<C: FaultableCluster>(&mut self, c: &mut C, asked: u128) -> TxHash {
+        let _held_back = isolate_provision_intake(c, HOME, AWAY);
+        let route = self.presenting_route(asked, validity_around(c.now()));
+        let route = self.submit(c, route);
+        assert!(
+            c.run_until(epochs(4), |c| heads(c, HOME, route)),
+            "the route must stand head on its payer's shard",
+        );
+        route
     }
 
     /// Hold both worlds to settling, `context` naming what ran.
@@ -172,6 +228,10 @@ fn ends_as<C: Cluster>(c: &mut C, tx: TxHash, decision: TransactionDecision, con
         "{context}",
     );
 }
+
+/// What a run past a refusal takes to bring a boundary above it into the
+/// beacon's record, which a reclaim reads it at.
+const ANSWER_BOUNDARY: Budget = epochs(3);
 
 /// Two members reading what the other reserves both settle, in the
 /// order they were placed.
@@ -261,6 +321,241 @@ pub fn two_members_reading_what_the_other_reserves_both_settle<C: Cluster>(c: &m
          against {second_committed:?}",
     );
     stage.assert_conserved(c, "two members reading what the other reserves");
+}
+
+/// A reclaim landing between a member's head and its naming moves the
+/// vault the member reads and reserves, and both shards still read one
+/// balance.
+///
+/// A swap out of the holder's vault of units asks a floor past any
+/// pool's reach, and the venue refuses it. A reclaim reads that refusal
+/// at a boundary the beacon recorded, a long way off on this chain's
+/// epochs, so the reading is held back from [`HOME`] until the first of
+/// them comes up. A route presenting that vault and withdrawing from it
+/// then stands head there, its part read at a height where the leg's
+/// units are gone. The reading is let through, and the reclaim credits
+/// the vault with the route still unnamed, so the tick's view holds what
+/// the part does not. The route then runs: both shards read the part,
+/// and the reclaim composes with its reservation at settlement.
+///
+/// # Panics
+///
+/// Panics if the leg does not pay, if the route does not stand head, if
+/// the reclaim does not land with the route unnamed, if the route does
+/// not accept, if the holder does not end at what the reclaim and the
+/// route leave, if a member's own part is not the one its counterpart
+/// absorbed, or if either side is not conserved.
+pub fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let mut stage = Stage::stand_up(c);
+    let holder = stage.cast[0].1;
+    let before = held(c, holder.address(), stage.unit);
+    let (issued, asked) = (before / 2, before / 4);
+    let answer = isolate_crossing_intake(c, HOME, AWAY);
+    let refused = build_swap_tx(
+        &stage.cast[0].0,
+        holder,
+        &stage.venues[1].meta,
+        stage.unit,
+        issued,
+        issued * 1_000_000,
+        validity_around(c.now()),
+    );
+    stage.submit(c, refused);
+    assert!(
+        c.run_until(epochs(8), |c| held(c, holder.address(), stage.unit)
+            == before - issued),
+        "the refused swap's leg must pay out of the vault first",
+    );
+    let _ = c.run_until(ANSWER_BOUNDARY, |_| false);
+    assert!(
+        answer.fired() > 0,
+        "the venue's refusal must have come up for reading",
+    );
+
+    let route = stage.stand_a_route_head(c, asked);
+    let reclaimed = c.metric("reclaims_folded", None);
+    assert_eq!(
+        held(c, holder.address(), stage.unit),
+        before - issued,
+        "the refusal must not have landed yet",
+    );
+    c.clear_drops();
+    let _still_held_back = isolate_provision_intake(c, HOME, AWAY);
+    assert!(
+        c.run_until(epochs(8), |c| held(c, holder.address(), stage.unit)
+            == before),
+        "the reclaim must land",
+    );
+    assert!(
+        heads(c, HOME, route),
+        "the reclaim must land with the route still unnamed: {:?}",
+        c.chain_fate(HOME, route),
+    );
+    assert!(c.metric("reclaims_folded", None) > reclaimed);
+
+    c.clear_drops();
+    ends_as(
+        c,
+        route,
+        TransactionDecision::Accept,
+        "the route must accept",
+    );
+    stage.assert_route_spent(c, before, asked);
+    assert!(
+        c.run_until(epochs(4), |c| c.served_parts_agreed() > 0),
+        "the oracle must have read a part",
+    );
+    stage.assert_conserved(c, "a reclaim onto a served till");
+}
+
+/// An owed credit landing between a member's head and its naming lands
+/// on a vault the member debits, and composes with the debit.
+///
+/// The courier on [`AWAY`] swaps into units and has them paid to the
+/// holder on [`HOME`], whose fold credits them. A route presenting the
+/// holder's vault and withdrawing from it stands head first, so its part
+/// lacks the credit, the view its tick reads the holds on holds it, and
+/// the settlement of its withdraw lands on the vault as the credit left
+/// it: the fold differential compares a credit the part never saw.
+///
+/// # Panics
+///
+/// Panics if the route does not stand head, if the credit does not land
+/// with the route unnamed, if the route does not accept, if the holder
+/// does not end at what the credit and the route leave, if a member's
+/// own part is not the one its counterpart absorbed, or if either side
+/// is not conserved.
+pub fn an_owed_credit_onto_a_served_vault_composes<C: FaultableCluster>(c: &mut C) {
+    let mut stage = Stage::stand_up(c);
+    let holder = stage.cast[0].1;
+    let before = held(c, holder.address(), stage.unit);
+    let asked = before / 2;
+    let route = stage.stand_a_route_head(c, asked);
+
+    let delivery = build_swap_paying_tx(
+        &stage.courier.0,
+        stage.courier.1,
+        &stage.venues[1].meta,
+        (*PROTOCOL_RESOURCE, ROUTE_INPUT),
+        holder,
+        validity_around(c.now()),
+    );
+    let delivery = stage.submit(c, delivery);
+    assert!(
+        c.run_until(epochs(8), |c| held(c, holder.address(), stage.unit)
+            > before),
+        "the owed credit must land on the holder's vault",
+    );
+    let credited = held(c, holder.address(), stage.unit) - before;
+    assert!(
+        heads(c, HOME, route),
+        "the credit must land with the route still unnamed",
+    );
+
+    c.clear_drops();
+    ends_as(
+        c,
+        delivery,
+        TransactionDecision::Accept,
+        "the delivery must accept",
+    );
+    ends_as(
+        c,
+        route,
+        TransactionDecision::Accept,
+        "the route must accept",
+    );
+    stage.assert_route_spent(c, before + credited, asked);
+    assert!(
+        c.run_until(epochs(4), |c| c.served_parts_agreed() > 0),
+        "the oracle must have read a part",
+    );
+    stage.assert_conserved(c, "an owed credit onto a served vault");
+}
+
+/// A member named in the block that makes it head, where that block's
+/// write trails its commit, reads one part with its counterpart.
+///
+/// The route's core on [`AWAY`] commits behind [`HOME`]'s bundle, so its
+/// head and its naming fall in one block there, or the shard's disk has
+/// it wait for that block's write before it reads the part.
+///
+/// # Panics
+///
+/// Panics if the route does not accept, if no shard names it in its head
+/// block, if a member's own part is not the one its counterpart absorbed,
+/// or if either side is not conserved.
+pub fn a_member_named_in_its_head_block_reads_one_part<C: Cluster>(c: &mut C) {
+    let mut stage = Stage::stand_up(c);
+    let holder = stage.cast[0].1;
+    let before = held(c, holder.address(), stage.unit);
+    let route = stage.presenting_route(before / 2, validity_around(c.now()));
+    let route = stage.submit(c, route);
+    ends_as(
+        c,
+        route,
+        TransactionDecision::Accept,
+        "the route must accept",
+    );
+    assert!(
+        c.run_until(epochs(4), |c| [HOME, AWAY].iter().any(|&shard| c
+            .ran_line(shard, route)
+            .is_some_and(|(tick, served)| { served == Some(tick) }))),
+        "one shard must name the route in the block making it head: {:?} {:?}",
+        c.ran_line(HOME, route),
+        c.ran_line(AWAY, route),
+    );
+    assert!(
+        c.run_until(epochs(4), |c| c.served_parts_agreed() > 0),
+        "the oracle must have read a part",
+    );
+    stage.assert_conserved(c, "a member named in its head block");
+}
+
+/// A restart of the committee between a member's head and its tick leaves
+/// the tick reading the part its counterpart reads.
+///
+/// `restart` takes [`HOME`]'s committee down and back with the route head
+/// and unnamed. The store keeps the head height, the replay seats the
+/// row, and the line that then runs it reads the part from that height.
+///
+/// # Panics
+///
+/// Panics if the route does not stand head, if it does not accept, if a
+/// member's own part is not the one its counterpart absorbed, or if
+/// either side is not conserved.
+pub fn a_restart_between_head_and_tick_reads_the_same_part<C: FaultableCluster>(
+    c: &mut C,
+    restart: impl FnOnce(&mut C, ShardId),
+) {
+    let mut stage = Stage::stand_up(c);
+    let holder = stage.cast[0].1;
+    let before = held(c, holder.address(), stage.unit);
+    let asked = before / 2;
+    let route = stage.stand_a_route_head(c, asked);
+    let served_before = c.ran_line(HOME, route);
+    assert_eq!(served_before, None, "the route is unnamed at the restart");
+
+    restart(c, HOME);
+    assert!(
+        c.run_until(epochs(8), |c| heads(c, HOME, route)),
+        "the restarted shard must still hold the route head",
+    );
+    c.clear_drops();
+    ends_as(
+        c,
+        route,
+        TransactionDecision::Accept,
+        "the route must accept",
+    );
+    stage.assert_route_spent(c, before, asked);
+    assert!(
+        c.run_until(epochs(4), |c| c.served_parts_agreed() > 0),
+        "the oracle must have read a part",
+    );
+    stage.assert_conserved(c, "a restart between head and tick");
 }
 
 /// A leg reserving a vault settles before a member that reads the vault
