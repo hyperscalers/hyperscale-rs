@@ -8,7 +8,7 @@
 //! `FetchBinding` trait, and the [`ScopedAnswer`] and [`SolicitedAnswer`]
 //! response boundaries live in [`crate::fetch`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_hbor::Capped;
@@ -20,13 +20,13 @@ use hyperscale_types::network::request::{
 };
 use hyperscale_types::network::response::{
     GetFinalizationsResponse, GetLocalProvisionsResponse, GetProvisionResponse,
-    GetSettledTxsResponse, GetStateProofResponse, LocalProvisionEntry,
+    GetSettledTxsResponse, GetStateProofResponse, LocalProvisionEntry, ServedValue,
 };
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BlockHeight, CheckedStateProof, Finalization, FinalizationHash, HeaderSource,
     Provision, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, VerdictCells, Verifiable,
-    settled_txs_root_from_hashes,
+    WeightedTimestamp, settled_txs_root_from_hashes,
 };
 
 use crate::event::ShardScopedInput;
@@ -50,6 +50,10 @@ pub type StateProofFetch = Fetch<(Anchor, SubstateKey)>;
 /// Verdict-question fetch keyed by the anchor asked at and the three
 /// cells the question reads there.
 pub type VerdictProofFetch = Fetch<(Anchor, VerdictCells)>;
+/// Record-read fetch keyed by the clock the want was filed at, then the
+/// anchor asked at and the record's key, so its queue drains oldest
+/// filed first.
+pub type RecordProofFetch = Fetch<(WeightedTimestamp, Anchor, SubstateKey)>;
 /// Settled-set fetch keyed by the departed shard's terminal evidence:
 /// the terminal the window is reconstructed from and the root the list
 /// must recompute to.
@@ -266,22 +270,33 @@ impl ScopedAnswer for StateProofBinding {
         keys: Vec<Self::Key>,
         response: GetStateProofResponse,
     ) -> Result<ProtocolEvent, Refusal> {
-        let proof = response.proof.ok_or(Refusal::NotHeld)?;
-        let proof = CheckedStateProof::check(scope, keys, proof)
-            .map_err(|_| Refusal::Unusable("unusable_proof"))?;
-        let values = response.values.into_inner();
-        for (key, bytes) in &values {
-            let proven = proof
-                .inclusions()
-                .iter()
-                .find(|(asked, _)| asked == key)
-                .map(|(_, inclusion)| inclusion.value_hash());
-            if proven != Some(Some(jmt_value_hash(bytes))) {
-                return Err(Refusal::Unusable("value_off_its_proof"));
-            }
-        }
+        let (proof, values) = checked_state_proof(scope, keys, response)?;
         Ok(ProtocolEvent::FetchedStateProofVerified { proof, values })
     }
+}
+
+/// The proof `response` carries for `keys`, read against `scope`, with
+/// its served values each held to the presence the proof reconstructs.
+fn checked_state_proof(
+    scope: Anchor,
+    keys: Vec<SubstateKey>,
+    response: GetStateProofResponse,
+) -> Result<(CheckedStateProof, Vec<ServedValue>), Refusal> {
+    let proof = response.proof.ok_or(Refusal::NotHeld)?;
+    let proof = CheckedStateProof::check(scope, keys, proof)
+        .map_err(|_| Refusal::Unusable("unusable_proof"))?;
+    let values = response.values.into_inner();
+    for (key, bytes) in &values {
+        let proven = proof
+            .inclusions()
+            .iter()
+            .find(|(asked, _)| asked == key)
+            .map(|(_, inclusion)| inclusion.value_hash());
+        if proven != Some(Some(jmt_value_hash(bytes))) {
+            return Err(Refusal::Unusable("value_off_its_proof"));
+        }
+    }
+    Ok((proof, values))
 }
 
 /// Marker type for the fetch of siblings' verdict cells.
@@ -357,6 +372,88 @@ impl ScopedAnswer for VerdictProofBinding {
 /// Every cell `questions` read, three a question.
 fn cells_of(questions: &[VerdictCells]) -> Vec<SubstateKey> {
     questions.iter().flat_map(VerdictCells::keys).collect()
+}
+
+/// Marker type for the fetch of crossing records a consumer here waits
+/// on.
+///
+/// A read is a state-proof request on the wire, and its answer lands as
+/// one. It is a fetch of its own so that record reads, which a stalled
+/// holder can pile up by the thousand, take no place from a seat, ledger
+/// or boundary ask, and so its queue drains in the order the wants were
+/// filed rather than the order of their keys, which an address can
+/// grind.
+pub struct RecordProofBinding;
+
+impl FetchBinding for RecordProofBinding {
+    type Id = (WeightedTimestamp, Anchor, SubstateKey);
+
+    const NAME: &'static str = "record_proof";
+
+    type Ids = FetchIds;
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::RecordProofs(ids)
+    }
+}
+
+impl<S: ShardStorage> FetchedBy<ShardIo<S>> for RecordProofBinding {
+    fn fetch_mut(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.cross_shard.record_proof
+    }
+
+    fn dispatch_chunk<N: Network>(
+        ids: Vec<Self::Id>,
+        route: Route,
+        network: &N,
+        reply: &ShardReply,
+    ) {
+        dispatch_scoped::<Self, N, _>(ids, route, network, reply);
+    }
+}
+
+impl ScopedAnswer for RecordProofBinding {
+    type Scope = Anchor;
+    type Key = (WeightedTimestamp, SubstateKey);
+    type Request = GetStateProofRequest;
+
+    fn split((filed_at, anchor, key): Self::Id) -> (Self::Scope, Self::Key) {
+        (anchor, (filed_at, key))
+    }
+
+    fn join(scope: Self::Scope, (filed_at, key): Self::Key) -> Self::Id {
+        (filed_at, scope, key)
+    }
+
+    fn request(scope: Self::Scope, keys: &[Self::Key]) -> Self::Request {
+        StateProofBinding::request(scope, &records_of(keys))
+    }
+
+    /// Checked as a state proof is, and a record proven present must
+    /// come with its value. An honest server answers `not_found` rather
+    /// than a bare presence, and a read answered with one would retire
+    /// its ask at no cost to the peer.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: GetStateProofResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let (proof, values) = checked_state_proof(scope, records_of(&keys), response)?;
+        let bare = proof.inclusions().iter().any(|(key, inclusion)| {
+            inclusion.value_hash().is_some() && !values.iter().any(|(served, _)| served == key)
+        });
+        if bare {
+            return Err(Refusal::Unusable("value_missing"));
+        }
+        Ok(ProtocolEvent::FetchedStateProofVerified { proof, values })
+    }
+}
+
+/// The record keys `reads` ask, in key order and each once: the order a
+/// filing-ordered chunk does not have.
+fn records_of(reads: &[(WeightedTimestamp, SubstateKey)]) -> Vec<SubstateKey> {
+    let keys: BTreeSet<SubstateKey> = reads.iter().map(|(_, key)| *key).collect();
+    keys.into_iter().collect()
 }
 
 /// Marker type for the settled-set fetch against a departed shard's

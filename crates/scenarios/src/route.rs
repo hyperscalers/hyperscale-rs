@@ -3659,8 +3659,13 @@ impl Display for CoreLoadSample {
 }
 
 /// The fetches a load's readings ride: a row's ask of its sibling's
-/// verdict cells and a consumer's read of a crossing's cells.
-const LOAD_FETCHES: &[Option<&str>] = &[Some("verdict_proof"), Some("state_proof")];
+/// verdict cells, the seat, ledger and boundary asks, and a consumer's
+/// read of a crossing's record.
+const LOAD_FETCHES: &[Option<&str>] = &[
+    Some("verdict_proof"),
+    Some("state_proof"),
+    Some("record_proof"),
+];
 
 /// Every counter a load's report reads, with the labels it reads each
 /// under.
@@ -3710,7 +3715,10 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
     ("fetch_completed", LOAD_FETCHES),
     ("fetch_abandoned", LOAD_FETCHES),
     ("fetch_retried", LOAD_FETCHES),
-    ("fetch_items_sent", &[Some("state_proof")]),
+    (
+        "fetch_items_sent",
+        &[Some("state_proof"), Some("record_proof")],
+    ),
     ("fetch_responses_refused", LOAD_FETCHES),
 ];
 
@@ -5656,10 +5664,8 @@ impl CoreLoadRun<'_> {
             ],
         );
         println!(
-            "core load [7 computed]: a verdict ask is served as a state proof, so its answers \
-             are counted in fetch_items_sent{{state_proof}} with the record reads' and under no \
-             label of their own; no counter tells a verdict reading that arrived by push from \
-             one that was asked for"
+            "core load [7 computed]: no counter tells a verdict reading that arrived by push \
+             from one that was asked for"
         );
     }
 

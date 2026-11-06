@@ -21,11 +21,11 @@ mod state_proof_serve;
 
 pub use fetch::{
     FinalizationBinding, FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch,
-    ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding,
-    StateProofFetch, VerdictProofBinding, VerdictProofFetch,
+    ProvisionBinding, ProvisionFetch, RecordProofBinding, RecordProofFetch, SettledTxsBinding,
+    SettledTxsFetch, StateProofBinding, StateProofFetch, VerdictProofBinding, VerdictProofFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
-use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
+use hyperscale_execution::{MAX_RECORD_ASKS_PER_HOLDER, MAX_VERDICT_ASKS_PER_SIBLING};
 use hyperscale_types::{LocalTimestamp, MAX_TXS_PER_BLOCK};
 pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::{
@@ -62,6 +62,9 @@ pub struct CrossShardState {
     /// `state_proof` so asks a silent sibling never answers take none of
     /// its places.
     pub(crate) verdict_proof: VerdictProofFetch,
+    /// Fetch of the crossing records consumers here wait on, apart from
+    /// `state_proof` so a backlog of reads takes none of its places.
+    pub(crate) record_proof: RecordProofFetch,
     /// Settled-set fetch against departed shards' terminals (rotates
     /// through the terminal committee).
     pub(crate) settled_txs: SettledTxsFetch,
@@ -97,6 +100,16 @@ const VERDICT_PROOF_FETCH: FetchConfig = FetchConfig {
 
 const _: () = assert!(VERDICT_QUESTIONS_PER_REQUEST == MAX_VERDICT_ASKS_PER_SIBLING);
 
+/// What the fetch of crossing records may hold in flight: the shape of
+/// the state-proof fetch. At a 300 ms round trip that drains about 850
+/// reads a second, about what a consumer's blocks can carry, so a faster
+/// drain would only queue in what it holds to offer. The asker keeps at
+/// most one request's reads out toward any one holder, so three holders
+/// that never answer leave a place.
+const RECORD_PROOF_FETCH: FetchConfig = STATE_PROOF_FETCH;
+
+const _: () = assert!(RECORD_PROOF_FETCH.max_ids_per_request == MAX_RECORD_ASKS_PER_HOLDER);
+
 impl CrossShardState {
     /// Build cross-shard state for a freshly hosted shard.
     #[must_use]
@@ -125,6 +138,7 @@ impl CrossShardState {
             ),
             state_proof: StateProofFetch::new("state_proof", STATE_PROOF_FETCH),
             verdict_proof: VerdictProofFetch::new("verdict_proof", VERDICT_PROOF_FETCH),
+            record_proof: RecordProofFetch::new("record_proof", RECORD_PROOF_FETCH),
             settled_txs: SettledTxsFetch::new(
                 "settled_txs",
                 FetchConfig {
@@ -148,6 +162,7 @@ impl CrossShardState {
             || self.local_provision.has_pending()
             || self.state_proof.has_pending()
             || self.verdict_proof.has_pending()
+            || self.record_proof.has_pending()
             || self.settled_txs.has_pending()
     }
 
@@ -171,12 +186,13 @@ mod tests {
 
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        Anchor, BlockHeight, MAX_TXS_PER_BLOCK, ShardId, StateRoot, VerdictCells, WeightedTimestamp,
+        Anchor, BlockHeight, MAX_TXS_PER_BLOCK, ShardId, StateRoot, SubstateKey, VerdictCells,
+        WeightedTimestamp,
     };
 
     use super::{
-        CrossShardState, MAX_VERDICT_ASKS_PER_SIBLING, ProvisionBinding, STATE_PROOF_FETCH,
-        StateProofFetch, VERDICT_PROOF_FETCH, VerdictProofFetch,
+        CrossShardState, MAX_VERDICT_ASKS_PER_SIBLING, ProvisionBinding, RECORD_PROOF_FETCH,
+        STATE_PROOF_FETCH, StateProofFetch, VERDICT_PROOF_FETCH, VerdictProofFetch,
     };
     use crate::config::NodeConfig;
     use crate::fetch::{Fetch, FetchConfig, FetchInput, FetchOutput, SolicitedAnswer};
@@ -357,6 +373,69 @@ mod tests {
             vec![asked],
             "the ask toward the healthy sibling goes out once, whole",
         );
+    }
+
+    /// `count` record reads put to `shard` at one header, the nth filed
+    /// nth, and their keys running the other way.
+    fn reads(shard: ShardId, count: u8) -> Vec<(WeightedTimestamp, Anchor, SubstateKey)> {
+        (0..count)
+            .map(|nth| {
+                (
+                    WeightedTimestamp::from_millis(u64::from(nth)),
+                    header(shard, 1),
+                    test_key(u8::MAX - nth),
+                )
+            })
+            .collect()
+    }
+
+    /// A record fetch filled by a holder that never answers takes no
+    /// place of the state-proof fetch's: a seat ask goes out at once.
+    #[test]
+    fn a_full_record_fetch_leaves_a_seat_ask_dispatchable() {
+        let silent = ShardId::leaf(1, 0);
+        let mut state = CrossShardState::new(&NodeConfig::default());
+        let filling = RECORD_PROOF_FETCH.max_in_flight;
+        let mut unanswered = reads(silent, u8::MAX);
+        let mut more = reads(silent, u8::MAX);
+        for (filed_at, _, _) in &mut more {
+            *filed_at = filed_at.plus(std::time::Duration::from_secs(1));
+        }
+        unanswered.extend(more);
+        ask_in_vain(&mut state.record_proof, silent, unanswered, 16);
+        assert_eq!(state.record_proof.in_flight_count(), filling);
+
+        let sent = state.state_proof.handle(FetchInput::Request {
+            ids: vec![(header(silent, 1), test_key(1))],
+            shard: silent,
+            preferred: None,
+            class: None,
+        });
+        assert!(
+            matches!(sent.as_slice(), [FetchOutput::Send { .. }]),
+            "the seat ask is dispatched: {sent:?}",
+        );
+    }
+
+    /// Reads dispatch in the order their wants were filed, whatever
+    /// their keys.
+    #[test]
+    fn record_reads_dispatch_oldest_filed_first() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = CrossShardState::new(&NodeConfig::default());
+        let per_request = u8::try_from(RECORD_PROOF_FETCH.max_ids_per_request).expect("small");
+        let asked = reads(shard, per_request + 1);
+        let sent = state.record_proof.handle(FetchInput::Request {
+            ids: asked.iter().rev().copied().collect(),
+            shard,
+            preferred: None,
+            class: None,
+        });
+        let dispatched: Vec<_> = sent
+            .into_iter()
+            .flat_map(|FetchOutput::Send { ids, .. }| ids)
+            .collect();
+        assert_eq!(dispatched, asked, "oldest filed first");
     }
 
     /// One request carries as many questions as expand to no more keys

@@ -15035,13 +15035,13 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::StateProofs(ids),
+                    ids: FetchIds::RecordProofs(ids),
                     shard,
                     ..
                 }) if *shard == PEER => Some(
                     ids.iter()
-                        .filter(|(_, key)| *key == record)
-                        .map(|(anchor, _)| *anchor)
+                        .filter(|(_, _, key)| *key == record)
+                        .map(|(_, anchor, _)| *anchor)
                         .collect::<Vec<_>>(),
                 ),
                 _ => None,
@@ -15140,6 +15140,40 @@ mod tests {
             )
             .is_empty(),
         );
+    }
+
+    /// An arrival a block carried ends the want, and the commit after it
+    /// lets go of the read still out.
+    #[test]
+    fn a_carried_arrival_abandons_its_read_at_the_next_commit() {
+        let schedule = two_shard_topology();
+        let (mut state, trie, record_key, cell, filed_at) = a_delivery_waiting_on_a_crossing();
+        let armed = filed_at.plus(MAX_FINALIZATION_DELAY);
+        let anchor = proven_anchor_of(PEER, 10, armed);
+        state.counterparts.proven_anchors.record(anchor);
+        let wanted = state.wanted_records();
+        assert_eq!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
+                record_key
+            ),
+            vec![anchor],
+        );
+
+        state.provisioning.handed(record_key, cell);
+        let abandoned: Vec<Anchor> = commit_empty_on(&mut state, &schedule, HOME, 1, armed)
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::RecordProofs(ids)) => Some(ids.iter()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(_, _, key)| *key == record_key)
+            .map(|(_, anchor, _)| *anchor)
+            .collect();
+        assert_eq!(abandoned, vec![anchor]);
     }
 
     /// Whether `state` holds, to offer, a live reading of the record at

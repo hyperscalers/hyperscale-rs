@@ -769,6 +769,68 @@ mod tests {
         );
     }
 
+    /// A record read comes back with the record, or with its absence. A
+    /// presence with no value would retire the ask at no cost to the
+    /// peer, so it is refused as unusable, which rotates and scores it.
+    /// A plain state proof takes one, since it asks of cells that carry
+    /// no value.
+    #[test]
+    fn a_record_read_answered_with_a_bare_presence_is_refused() {
+        use hyperscale_types::{Address, AddressClass, Anchor, ResourceAddr};
+        use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms, TxHash as VmTxHash};
+
+        use crate::fetch::{Refusal, ScopedAnswer};
+        use crate::shard::cross_shard::{RecordProofBinding, StateProofBinding};
+
+        let id = CrossingId {
+            producer: Address::new([0x5A; 31], AddressClass::Component),
+            consumer: Address::new([0x5C; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x5A; 32])),
+            local: 1,
+            output: 0,
+        };
+        let key = id.record_key(&ProtocolHasher);
+        let value = id
+            .cell(
+                VmTxHash(Hash32([0xC0; 32])),
+                ResourceAddr::new([0xE0; 31]),
+                500,
+                1_000,
+                Terms::Owed,
+            )
+            .to_bytes();
+        let (chain, root) = chain_holding(&[1_000], &[(key, value)]);
+        let anchor = Anchor {
+            shard: SHARD,
+            height: BlockHeight::new(1),
+            state_root: root,
+            ts: WeightedTimestamp::from_millis(1_000),
+        };
+        let filed = WeightedTimestamp::from_millis(500);
+        let answer = || {
+            serve_state_proof_request(
+                &chain,
+                &GetStateProofRequest::new(
+                    BlockHeight::new(1),
+                    Capped::new(vec![key]).expect("a list written out in a test"),
+                ),
+            )
+        };
+        let bare = || {
+            GetStateProofResponse::found(
+                answer().proof.expect("the height is held"),
+                Capped::empty(),
+            )
+        };
+
+        assert!(RecordProofBinding::answer(anchor, vec![(filed, key)], answer()).is_ok());
+        assert!(matches!(
+            RecordProofBinding::answer(anchor, vec![(filed, key)], bare()),
+            Err(Refusal::Unusable("value_missing")),
+        ));
+        assert!(StateProofBinding::answer(anchor, vec![key], bare()).is_ok());
+    }
+
     /// The committed cell of a transaction the chain committed proves
     /// present under the height's root, one it never saw proves absent,
     /// and a height not held answers `not_found`.

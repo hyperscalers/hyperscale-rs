@@ -21,8 +21,8 @@ use hyperscale_engine::legs::Member;
 use hyperscale_engine::tick_select::Requirement;
 use hyperscale_storage::live_record;
 use hyperscale_types::{
-    BlockHeight, MAX_FINALIZATION_DELAY, Provision, RETENTION_HORIZON, Role, ShardId, StateClaim,
-    SubstateEntry, SubstateKey, TxHash, Verified, WeightedTimestamp,
+    BlockHeight, Provision, RETENTION_HORIZON, Role, ShardId, StateClaim, SubstateEntry,
+    SubstateKey, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingCell;
 
@@ -34,13 +34,11 @@ pub struct WantedRecord {
     pub key: SubstateKey,
     /// The transaction the record must name as its issuer.
     pub tx: TxHash,
-    /// The committed clock past which the read arms on the clock alone:
-    /// one finalization delay past the commit that filed the want, for
-    /// a requirement filed here, by when the producer's leg has
-    /// finalized or never will and a push that was coming has come.
-    /// `None` where only the producer's certificate arms it. The
-    /// certificate arms either sooner.
-    pub arms_at: Option<WeightedTimestamp>,
+    /// The committed clock of the commit that filed the want. Its read
+    /// arms one finalization delay past it on the clock alone, by when
+    /// the producer's leg has finalized or never will and a push that
+    /// was coming has come, and its reads drain oldest filed first.
+    pub filed_at: WeightedTimestamp,
 }
 
 /// The environment a source's part carries for a transaction: the clock
@@ -299,9 +297,8 @@ impl ProvisioningTracker {
     }
 
     /// Every crossing a candidate here waits on with no arrival for it,
-    /// with the transaction the record must name and the clock its read
-    /// arms on: one finalization delay past the commit that filed it,
-    /// so a pushed reading has its chance to land before any ask.
+    /// with the transaction the record must name and the clock of the
+    /// commit that filed it, which its read is paced from.
     ///
     /// The records alone, and not the shard a requirement might name:
     /// who holds a record now is its own prefix, read against the
@@ -319,7 +316,7 @@ impl ProvisioningTracker {
                     wanted.push(WantedRecord {
                         key: *key,
                         tx: *tx_hash,
-                        arms_at: Some(filed_at.plus(MAX_FINALIZATION_DELAY)),
+                        filed_at: *filed_at,
                     });
                 }
             }
@@ -800,7 +797,7 @@ mod tests {
         both.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), tx));
         assert!(both.is_fully_provisioned(tx));
 
-        // The want names what arms it: the commit that filed it.
+        // The want names the commit that filed it.
         let mut waiting = ProvisioningTracker::new();
         waiting.advance_clock(WeightedTimestamp::from_millis(7_000));
         waiting.record_required(tx, BTreeSet::from([requirement]));
@@ -809,7 +806,7 @@ mod tests {
             vec![WantedRecord {
                 key: record,
                 tx,
-                arms_at: Some(WeightedTimestamp::from_millis(7_000).plus(MAX_FINALIZATION_DELAY)),
+                filed_at: WeightedTimestamp::from_millis(7_000),
             }]
         );
         let _ = LocalKey([0; 16]);

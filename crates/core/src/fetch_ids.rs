@@ -13,7 +13,7 @@
 use hyperscale_types::{
     Address, Anchor, BeaconBlockHash, BlockHash, BlockHeight, Epoch, FinalizationHash, Hash,
     LeafIndex, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId,
-    VerdictCells,
+    VerdictCells, WeightedTimestamp,
 };
 
 /// A batch of ids under the shard-loop binding that fetches them, keyed
@@ -39,9 +39,15 @@ pub enum FetchIds {
     /// Verdict questions as `(anchor, cells)`: the three cells one
     /// question reads on a sibling, asked together so an answer holds
     /// each question whole. Fetched apart from [`Self::StateProofs`], so
-    /// one that never returns holds no place a record, seat or sibling
-    /// probe needs.
+    /// one that never returns holds no place a seat or sibling probe
+    /// needs.
     VerdictProofs(Vec<(Anchor, VerdictCells)>),
+    /// Crossing record reads as `(filed_at, anchor, key)`: the committed
+    /// clock the want was filed at, so the oldest wants go first, and
+    /// the proven anchor and record key the read asks. Fetched apart
+    /// from [`Self::StateProofs`], so a backlog of them holds no place a
+    /// seat, ledger or boundary ask needs.
+    RecordProofs(Vec<(WeightedTimestamp, Anchor, SubstateKey)>),
     /// Departed shards' settled sets, by the terminal each is checked
     /// against.
     SettledTxs(Vec<TerminalEvidence>),

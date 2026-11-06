@@ -16,8 +16,8 @@ use crate::fetch::{
 };
 use crate::shard::consensus::ProposalBinding;
 use crate::shard::cross_shard::{
-    FinalizationBinding, LocalProvisionBinding, ProvisionBinding, SettledTxsBinding,
-    StateProofBinding, VerdictProofBinding,
+    FinalizationBinding, LocalProvisionBinding, ProvisionBinding, RecordProofBinding,
+    SettledTxsBinding, StateProofBinding, VerdictProofBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -35,6 +35,7 @@ macro_rules! every_fetch_binding {
             RemoteProvisions => ProvisionBinding,
             StateProofs => StateProofBinding,
             VerdictProofs => VerdictProofBinding,
+            RecordProofs => RecordProofBinding,
             SettledTxs => SettledTxsBinding,
             Proposals => ProposalBinding,
         }

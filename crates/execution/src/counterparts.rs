@@ -50,7 +50,7 @@ use hyperscale_vm_effects::{
 
 use crate::ledger::{Ledger, Question, Unanswerable};
 use crate::provisioning::WantedRecord;
-use crate::record_reads::RecordReads;
+use crate::record_reads::{RecordAsk, RecordReads};
 
 /// What one block's abandonment records may still spend.
 ///
@@ -447,6 +447,11 @@ fn verdict_cells(question: &VerdictQuestion) -> VerdictCells {
 /// as its three cells, and a request names no more cells than a
 /// state-proof request.
 pub const MAX_VERDICT_ASKS_PER_SIBLING: usize = 21;
+
+/// How many record reads stand toward one holder at once, its oldest
+/// filed first: one request's, so holders that never answer leave the
+/// fetch's other places to the rest.
+pub const MAX_RECORD_ASKS_PER_HOLDER: usize = 64;
 
 /// How many verdict claims one proposal is offered, as they are held.
 ///
@@ -2151,7 +2156,7 @@ impl Counterparts {
         }
         // The reads still worth pacing: the records something here
         // waits on.
-        self.records.sweep(now, &self.wanted);
+        let ended = self.records.sweep(now, &self.wanted);
         self.count_carried(block);
         // A reading the chain now carries is everybody's: its answers
         // are folded here, and nothing offers it again. Retired by key
@@ -2166,6 +2171,9 @@ impl Counterparts {
         let mut actions = Vec::new();
         if !released.is_empty() {
             actions.push(Action::AbandonFetch(FetchIds::StateProofs(released)));
+        }
+        if !ended.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::RecordProofs(ended)));
         }
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
@@ -2364,8 +2372,9 @@ impl Counterparts {
         self.want(records);
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         self.ask_entries(now, &mut wanted);
-        self.ask_wanted_records(trie, now, records, windows, &mut wanted);
-        fetches(wanted)
+        let mut actions = self.ask_wanted_records(trie, now, records, windows);
+        actions.extend(fetches(wanted));
+        actions
     }
 
     /// Ask each counterpart a seat question the committed tip stands,
@@ -2733,30 +2742,83 @@ impl Counterparts {
     /// chain holds itself, nor while the want's arrival, fetched or
     /// pushed, is already held to offer. Another reading of the key
     /// held here answers nothing the want asks.
+    ///
+    /// One ask stands for a key: a later one takes the earlier's place,
+    /// and one whose key has its arrival held, or has moved to another
+    /// holder, is let go of here, whichever way the arrival came. The
+    /// oldest filed go first, and no more than
+    /// [`MAX_RECORD_ASKS_PER_HOLDER`] stand toward one holder, so a
+    /// holder that never answers takes no place from another's. Filing
+    /// order is the chain's, where key order is an address's to grind.
     fn ask_wanted_records(
         &mut self,
         trie: &ShardTrie,
         now: WeightedTimestamp,
         records: &[WantedRecord],
         windows: EpochWindows,
-        wanted: &mut BTreeMap<Anchor, Vec<SubstateKey>>,
-    ) {
-        for record in records {
-            let holder = trie.shard_for_prefix(record.key.owner);
-            if holder == self.ledger.local() {
+    ) -> Vec<Action> {
+        let mut filed: Vec<(&WantedRecord, ShardId)> = records
+            .iter()
+            .map(|record| (record, trie.shard_for_prefix(record.key.owner)))
+            .collect();
+        filed.sort_unstable_by_key(|(record, _)| (record.filed_at, record.key));
+        let mut abandoned: Vec<RecordAsk> = Vec::new();
+        for (record, holder) in &filed {
+            let moved = self
+                .records
+                .out(record.key)
+                .is_some_and(|at| at.shard != *holder);
+            if moved || self.fetched.reads_arrival(*holder, record.key, record.tx) {
+                abandoned.extend(self.records.take_out(record.key));
+            }
+        }
+        let local = self.ledger.local();
+        let mut live: BTreeMap<ShardId, usize> = BTreeMap::new();
+        let mut asks: BTreeMap<ShardId, Vec<RecordAsk>> = BTreeMap::new();
+        for (record, holder) in filed {
+            if holder == local {
                 continue;
             }
             self.records.arm(record, holder, now);
-            let Some(anchor) = self.newest_above_floor(holder, now, windows) else {
-                continue;
-            };
             if self.fetched.reads_arrival(holder, record.key, record.tx) {
                 continue;
             }
-            if self.records.due(record.key, anchor) {
-                wanted.entry(anchor).or_default().push(record.key);
+            let Some(anchor) = self.newest_above_floor(holder, now, windows) else {
+                continue;
+            };
+            let live = live
+                .entry(holder)
+                .or_insert_with(|| self.records.live(holder));
+            if self.records.out(record.key).is_none() && *live >= MAX_RECORD_ASKS_PER_HOLDER {
+                continue;
             }
+            if !self.records.due(record.key, anchor) {
+                continue;
+            }
+            let ask = (record.filed_at, anchor, record.key);
+            let replaced = self.records.put(ask);
+            if replaced == Some(ask) {
+                continue;
+            }
+            match replaced {
+                Some(replaced) => abandoned.push(replaced),
+                None => *live += 1,
+            }
+            asks.entry(holder).or_default().push(ask);
         }
+        let mut actions = Vec::new();
+        if !abandoned.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::RecordProofs(abandoned)));
+        }
+        actions.extend(asks.into_iter().map(|(shard, ids)| {
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::RecordProofs(ids),
+                shard,
+                preferred: None,
+                class: None,
+            })
+        }));
+        actions
     }
 
     /// The newest anchor of `shard` this validator has commit-proven
@@ -3517,6 +3579,9 @@ impl Counterparts {
         let keys = checked.keys();
         let proof = checked.proof();
         let inclusions = checked.inclusions();
+        for key in keys {
+            self.records.answered(*key, anchor);
+        }
         let answered: Vec<Question> = self
             .probes
             .values_mut()
@@ -7589,7 +7654,7 @@ mod tests {
         let wanted = [WantedRecord {
             key: younger,
             tx: younger_cell.tx,
-            arms_at: None,
+            filed_at: now,
         }];
         assert!(consumer.offer_pushed(
             &pushed_record(PRODUCER, 33, younger, &younger_cell),
@@ -7621,7 +7686,7 @@ mod tests {
         let wanted = [WantedRecord {
             key: awaited,
             tx: awaited_cell.tx,
-            arms_at: None,
+            filed_at: now,
         }];
         let asked = ShardId::leaf(2, 3);
         // The unasked producer's anchor is the oldest held.
@@ -7828,7 +7893,7 @@ mod tests {
                 WantedRecord {
                     key,
                     tx: cell.tx,
-                    arms_at: None,
+                    filed_at: now,
                 }
             })
             .collect();
@@ -7916,7 +7981,7 @@ mod tests {
             [WantedRecord {
                 key,
                 tx,
-                arms_at: None,
+                filed_at: now,
             }]
         };
         let offered = |wanted: &[WantedRecord]| {
@@ -7940,12 +8005,13 @@ mod tests {
         );
     }
 
-    /// A want of `key` for `tx`, armed from the start of the clock.
+    /// A want of `key` for `tx` filed at the start of the clock, so
+    /// armed at any clock past one finalization delay.
     fn armed_want(key: SubstateKey, tx: TxHash) -> WantedRecord {
         WantedRecord {
             key,
             tx,
-            arms_at: Some(WeightedTimestamp::ZERO),
+            filed_at: WeightedTimestamp::ZERO,
         }
     }
 
@@ -7981,9 +8047,9 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::StateProofs(ids),
+                    ids: FetchIds::RecordProofs(ids),
                     ..
-                }) => Some(ids.clone()),
+                }) => Some(ids.iter().map(|(_, anchor, key)| (*anchor, *key))),
                 _ => None,
             })
             .flatten()
@@ -8156,6 +8222,174 @@ mod tests {
                 "{door:?}: an arrival held stands the read down",
             );
         }
+    }
+
+    /// The record reads `actions` let go of.
+    fn record_abandons(actions: &[Action]) -> Vec<RecordAsk> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::RecordProofs(ids)) => Some(ids.iter().copied()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// An arrival held stands the read down at the next commit, however
+    /// it came: a push, or a fetch answered at an older anchor than the
+    /// ask still out. A read the fetch still holds goes with it.
+    #[test]
+    fn a_held_arrival_abandons_its_id_at_the_next_commit() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        for door in [Door::Fetch, Door::Push] {
+            let (key, _, cell) = escrowed_record(0xA1, 200_000);
+            let want = [armed_want(key, cell.tx)];
+            let rows = Arc::new(TestRows::default());
+            let mut consumer = consuming(&rows);
+
+            let older = producer_read(3, Some(&cell), key);
+            consumer.proven_anchors.record(older.0);
+            assert_eq!(
+                record_asks(&consumer.probe(&trie, now, &want, windows)),
+                vec![(older.0, key)],
+            );
+            let (newer, _) = producer_read(5, Some(&cell), key);
+            consumer.proven_anchors.record(newer);
+            let replaced = consumer.probe(&trie, now, &want, windows);
+            assert_eq!(record_asks(&replaced), vec![(newer, key)]);
+            assert_eq!(
+                record_abandons(&replaced),
+                vec![(want[0].filed_at, older.0, key)],
+                "{door:?}: the newer ask takes the older's place",
+            );
+
+            assert!(door.bring(&mut consumer, &want, &older, key, Some(&cell), now));
+            assert_eq!(
+                consumer.records.out(key),
+                Some(newer),
+                "{door:?}: an answer at another anchor leaves the ask out",
+            );
+            let next = consumer.probe(&trie, now, &want, windows);
+            assert!(record_asks(&next).is_empty(), "{door:?}");
+            assert_eq!(
+                record_abandons(&next),
+                vec![(want[0].filed_at, newer, key)],
+                "{door:?}",
+            );
+            assert_eq!(consumer.records.live(PRODUCER), 0, "{door:?}");
+        }
+    }
+
+    /// No more than the cap of asks stand toward one holder, whatever
+    /// armed them. The cap takes the oldest filed, not the lowest keys,
+    /// and a key past it goes out when a place frees.
+    #[test]
+    fn a_holder_takes_its_oldest_filed_up_to_the_cap() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let count = u8::try_from(MAX_RECORD_ASKS_PER_HOLDER + 1).expect("small");
+        let mut wants: Vec<WantedRecord> = (0..count)
+            .map(|seed| {
+                let (key, _, cell) = escrowed_record(seed, 200_000);
+                WantedRecord {
+                    key,
+                    tx: cell.tx,
+                    filed_at: WeightedTimestamp::from_millis(u64::from(seed)),
+                }
+            })
+            .collect();
+        wants.sort_unstable_by_key(|want| (want.key, want.tx));
+        let youngest = wants
+            .iter()
+            .max_by_key(|want| want.filed_at)
+            .expect("a want")
+            .key;
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (anchor, _) = producer_read(3, None, youngest);
+        consumer.proven_anchors.record(anchor);
+
+        let asked = record_asks(&consumer.probe(&trie, now, &wants, windows));
+        assert_eq!(asked.len(), MAX_RECORD_ASKS_PER_HOLDER);
+        assert!(!asked.contains(&(anchor, youngest)));
+        assert_eq!(consumer.records.live(PRODUCER), MAX_RECORD_ASKS_PER_HOLDER);
+        assert!(
+            record_asks(&consumer.probe(&trie, now, &wants, windows)).is_empty(),
+            "no place has freed",
+        );
+
+        let oldest = wants
+            .iter()
+            .min_by_key(|want| want.filed_at)
+            .expect("a want")
+            .key;
+        let (_, freed) = producer_read(3, None, oldest);
+        consumer.on_proof_fetched(anchor, &[oldest], &freed, &[]);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &wants, windows)),
+            vec![(anchor, youngest)],
+            "an answer frees a place for the next filed",
+        );
+    }
+
+    /// A read the frontier reset, with the holder's newest anchor where
+    /// it was, is asked as the very ask still out: nothing is put, and
+    /// nothing abandoned that would kill it.
+    #[test]
+    fn a_reset_at_an_unmoved_anchor_leaves_the_ask_out_alone() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (anchor, _) = producer_read(3, None, key);
+        consumer.proven_anchors.record(anchor);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(anchor, key)],
+        );
+
+        consumer.records.reset(key);
+        let again = consumer.probe(&trie, now, &want, windows);
+        assert!(record_asks(&again).is_empty(), "{again:?}");
+        assert!(record_abandons(&again).is_empty(), "{again:?}");
+        assert_eq!(consumer.records.out(key), Some(anchor));
+    }
+
+    /// A holder's prefix moved by a cut: the ask at the old holder is let
+    /// go of at the next pass, and counts under neither.
+    #[test]
+    fn a_holders_cut_lets_go_of_the_ask_at_the_old_holder() {
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (anchor, _) = producer_read(3, None, key);
+        consumer.proven_anchors.record(anchor);
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(anchor, key)],
+        );
+
+        let cut = ShardTrie::from_leaves([CONSUMER, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
+        let holder = cut.shard_for_prefix(key.owner);
+        let next = consumer.probe(&cut, now, &want, windows);
+        assert_eq!(
+            record_abandons(&next),
+            vec![(want[0].filed_at, anchor, key)]
+        );
+        assert!(record_asks(&next).is_empty(), "no anchor of the new holder");
+        assert_eq!(consumer.records.live(PRODUCER), 0);
+        assert_eq!(consumer.records.live(holder), 0);
     }
 
     /// Unsolicited records held at a wanted key answer to the one cap,

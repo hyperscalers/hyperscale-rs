@@ -268,7 +268,7 @@ fn a_host_answering_a_records_read_with_rubbish_is_rotated_past() {
         let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
         let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
         cut_record_pushes(c);
-        let refused_before = c.metric("fetch_responses_refused", Some("state_proof"));
+        let refused_before = c.metric("fetch_responses_refused", Some("record_proof"));
 
         // Every host of the shard the record is read from lies once
         // and then answers honestly. Picking one host to lie always is
@@ -303,7 +303,7 @@ fn a_host_answering_a_records_read_with_rubbish_is_rotated_past() {
             "the rubbish has to have been served, or nothing was attacked",
         );
         assert!(
-            c.metric("fetch_responses_refused", Some("state_proof")) > refused_before,
+            c.metric("fetch_responses_refused", Some("record_proof")) > refused_before,
             "the rubbish was never refused, so the swap landing says nothing",
         );
     });
@@ -334,7 +334,13 @@ fn a_proof_replayed_from_another_records_read_is_refused() {
         let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
         let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
         cut_record_pushes(c);
-        let refused_before = c.metric("fetch_responses_refused", Some("state_proof"));
+        // The replay goes to the first ask of other keys, which may be
+        // a ledger, seat or boundary ask as well as a record read.
+        let refused = |c: &SimCluster| {
+            c.metric("fetch_responses_refused", Some("record_proof"))
+                + c.metric("fetch_responses_refused", Some("state_proof"))
+        };
+        let refused_before = refused(c);
 
         // The first honest answer is kept with the question it answered,
         // and served once to whoever asks a different one. Lying on the
@@ -396,7 +402,7 @@ fn a_proof_replayed_from_another_records_read_is_refused() {
         // values held to what it proves for them, is the rule under
         // test, and refusing the replay is where it runs.
         assert!(
-            c.metric("fetch_responses_refused", Some("state_proof")) > refused_before,
+            refused(c) > refused_before,
             "the replayed proof was never refused",
         );
     });
@@ -427,7 +433,7 @@ fn a_record_value_its_proof_does_not_cover_is_refused() {
         cut_record_pushes(c);
         let refused_before = c.metric(
             "fetch_responses_refused",
-            Some("state_proof:value_off_its_proof"),
+            Some("record_proof:value_off_its_proof"),
         );
 
         // Every host tampers with the first record value it is asked for
@@ -472,7 +478,7 @@ fn a_record_value_its_proof_does_not_cover_is_refused() {
         assert!(
             c.metric(
                 "fetch_responses_refused",
-                Some("state_proof:value_off_its_proof")
+                Some("record_proof:value_off_its_proof")
             ) > refused_before,
             "the tampered value was never refused on its proof",
         );
