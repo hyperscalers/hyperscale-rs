@@ -230,6 +230,8 @@ pub struct Metrics {
     pub pushes_placed_on_carry: Counter,
     /// Records consumers here wait on with no arrival for, at a commit.
     pub wanted_records: Gauge,
+    pub record_push_span: Histogram,
+    pub record_push_grace: Gauge,
     /// Proposals a leader made at once rather than holding an empty
     /// block, by the condition that forced it.
     pub eager_proposals: CounterVec,
@@ -1030,6 +1032,19 @@ impl Metrics {
             )
             .unwrap(),
 
+            record_push_span: register_histogram!(
+                "hyperscale_record_push_span_seconds",
+                "Seconds of a holder's proven clock from a want's filing to its pushed arrival",
+                vec![0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 30.0]
+            )
+            .unwrap(),
+
+            record_push_grace: register_gauge!(
+                "hyperscale_record_push_grace_seconds",
+                "Seconds past a want's filing a holder's record is read, as last derived"
+            )
+            .unwrap(),
+
             eager_proposals: register_counter_vec!(
                 "hyperscale_eager_proposals_total",
                 "Proposals a leader made at once rather than holding an empty block, by reason",
@@ -1544,6 +1559,16 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn set_wanted_records(&self, count: usize) {
         self.metrics.wanted_records.set(count as f64);
+    }
+
+    fn record_record_push_span(&self, millis: u64) {
+        self.metrics
+            .record_push_span
+            .observe(millis as f64 / 1_000.0);
+    }
+
+    fn set_record_push_grace(&self, millis: u64) {
+        self.metrics.record_push_grace.set(millis as f64 / 1_000.0);
     }
 
     fn record_fenced_claim(&self, reading: &str, carried: bool) {

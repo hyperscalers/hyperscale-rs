@@ -1733,9 +1733,10 @@ fn fenced_cells(claim: &StateClaim) -> impl Iterator<Item = SubstateKey> + '_ {
 /// that keeps each key.
 #[derive(Debug, Default)]
 struct KeptForWants {
-    /// The keys it reads as the arrival of a want here: a live record
-    /// the wanting transaction issued.
-    arrivals: BTreeSet<SubstateKey>,
+    /// The keys it reads as the arrival of a want here, a live record
+    /// the wanting transaction issued, each with that transaction and
+    /// its want's filing.
+    arrivals: BTreeMap<SubstateKey, (TxHash, WeightedTimestamp)>,
     /// The escrowed records nothing here waits on that the fold could
     /// decline, with each one's validity end: held under
     /// [`MAX_UNSOLICITED_RECORDS_PER_PRODUCER`].
@@ -1749,7 +1750,7 @@ impl KeptForWants {
     /// Every key kept, by whichever rule.
     fn keys(&self) -> BTreeSet<SubstateKey> {
         self.arrivals
-            .iter()
+            .keys()
             .chain(&self.rows)
             .copied()
             .chain(self.unasked.iter().map(|(_, key)| *key))
@@ -2016,11 +2017,12 @@ pub struct Counterparts {
     /// record is kept to offer against.
     wanted: BTreeSet<SubstateKey>,
 
-    /// Each of `wanted` with the transaction whose member waits on it.
+    /// Each of `wanted` with the transaction whose member waits on it,
+    /// and the clock the want was filed at.
     /// A record is an arrival only for the transaction that issued it,
     /// so a record another transaction left at a wanted key is one
     /// nothing here waits on.
-    wanted_of: BTreeSet<(SubstateKey, TxHash)>,
+    wanted_of: BTreeMap<(SubstateKey, TxHash), WeightedTimestamp>,
 
     /// The reads of those records this validator has put, with their
     /// pacing.
@@ -2099,7 +2101,7 @@ impl Counterparts {
             clock: WeightedTimestamp::ZERO,
             frontier,
             wanted: BTreeSet::new(),
-            wanted_of: BTreeSet::new(),
+            wanted_of: BTreeMap::new(),
             records: RecordReads::new(),
             local_crossings: BTreeSet::new(),
             probes: BTreeMap::new(),
@@ -2597,7 +2599,7 @@ impl Counterparts {
         self.wanted = records.iter().map(|record| record.key).collect();
         self.wanted_of = records
             .iter()
-            .map(|record| (record.key, record.tx))
+            .map(|record| ((record.key, record.tx), record.filed_at))
             .collect();
     }
 
@@ -2737,8 +2739,7 @@ impl Counterparts {
     /// The fallback read, for a record no push has brought. Every
     /// validator derives the wanted set and asks for itself, so f
     /// validators withholding their fetch cannot suppress the read; the
-    /// pacing is [`RecordReads`]', armed on the evidence that the
-    /// producer's leg has finalized or never will. Asked at the newest
+    /// arming and the pacing are [`RecordReads`]'. Asked at the newest
     /// anchor of the holder this validator has commit-proven where that
     /// anchor is at or above the read frontier's floor, since a reading
     /// below it is one every voter refuses, and never of a shard this
@@ -2787,11 +2788,12 @@ impl Counterparts {
             if holder == local {
                 continue;
             }
-            self.records.arm(record, holder, now);
+            let newest = self.newest_above_floor(holder, now, windows);
+            self.records.arm(record, holder, now, newest);
             if self.fetched.reads_arrival(holder, record.key, record.tx) {
                 continue;
             }
-            let Some(anchor) = self.newest_above_floor(holder, now, windows) else {
+            let Some(anchor) = newest else {
                 continue;
             };
             let live = live
@@ -3740,10 +3742,12 @@ impl Counterparts {
         let local = self.ledger.local();
         let mut kept = KeptForWants::default();
         for key in claim.keys() {
-            let arrival = live_record(std::slice::from_ref(claim), key)
-                .is_some_and(|(_, cell)| self.wanted_of.contains(&(key, cell.tx)));
-            if arrival {
-                kept.arrivals.insert(key);
+            let arrival = live_record(std::slice::from_ref(claim), key).and_then(|(_, cell)| {
+                let filed_at = self.wanted_of.get(&(key, cell.tx))?;
+                Some((cell.tx, *filed_at))
+            });
+            if let Some(arrival) = arrival {
+                kept.arrivals.insert(key, arrival);
             } else if let Some((_, end)) = self.unsolicited(claim, key) {
                 kept.unasked.push((end, key));
             } else if self.rows.awaited.contains(&key)
@@ -4103,7 +4107,7 @@ impl Counterparts {
             self.clock,
             self.index.as_ref(),
         )?;
-        (!self.wanted_of.contains(&(key, issuer.tx)))
+        (!self.wanted_of.contains_key(&(key, issuer.tx)))
             .then_some((id, WeightedTimestamp::from_millis(issuer.validity_end_ms)))
     }
 
@@ -4330,8 +4334,20 @@ impl Counterparts {
                 kept.crossings.iter().copied().chain(owed).collect();
             kept.naming(named)
         };
-        for key in wanted.intersection(&for_wants.arrivals) {
-            self.records.pushed(*key, anchor);
+        // How far the holder's clock stands past each filing as the first
+        // push of a key lands: what the grace is compared against, so a
+        // push landing inside the grace draws no ask, whatever the
+        // latency. A key already held takes no sample, so a member can
+        // move the grace only with the heights it withholds.
+        let reached = self
+            .proven_anchors
+            .newest_licensed(anchor.shard, now, ..)
+            .map_or(anchor.ts, |newest| newest.ts);
+        for (key, (tx, filed_at)) in &for_wants.arrivals {
+            if wanted.contains(key) && !self.fetched.reads_arrival(anchor.shard, *key, *tx) {
+                let span = reached.elapsed_since(*filed_at);
+                self.records.pushed(*key, anchor, span, now);
+            }
         }
         let _ = self.fetched.hold(kept);
         remainder
@@ -8422,6 +8438,25 @@ mod tests {
                 "{door:?}",
             );
             assert_eq!(consumer.records.live(PRODUCER), 0, "{door:?}");
+        }
+    }
+
+    /// A key takes one sample, from the push that first brought it: a
+    /// copy at a later anchor is held and moves no grace, so a member
+    /// cannot stretch a span by repeating what it or an honest proposer
+    /// already delivered.
+    #[test]
+    fn a_held_arrival_pushed_again_takes_no_second_sample() {
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        for (height, sampled) in [(3, 1), (5, 1)] {
+            let read = producer_read(height, Some(&cell), key);
+            consumer.proven_anchors.record(read.0);
+            assert!(Door::Push.bring(&mut consumer, &want, &read, key, Some(&cell), now));
+            assert_eq!(consumer.records.sampled_heights(PRODUCER), sampled);
         }
     }
 

@@ -11,6 +11,16 @@
 //! holder's clock between asks. One ask stands for a key at a time: a
 //! later one takes the earlier's place, so no key queues twice.
 //!
+//! Two clocks arm a read. The holder's own, read off its newest proven
+//! anchor, arms a key once that anchor stands a grace past the want's
+//! filing, where the grace is derived from how long the holder's pushes
+//! have been taking: nothing committed says when a leg ran, so the read
+//! itself is the only verifiable answer, and a read that lands before
+//! the push it stands in for is a wasted one. This node's committed
+//! clock arms it one finalization delay past the filing whatever the
+//! holder's headers do, which catches a holder whose headers stopped
+//! with the record already written.
+//!
 //! Node-local, like the asking itself: what a validator asks for is its
 //! own business, and what the answer licenses is a claim riding into a
 //! block where every replica folds the same bytes. A restarted,
@@ -19,14 +29,107 @@
 //! whose arming evidence is already in hand is asked at once.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
-use hyperscale_metrics::record_record_ask;
+use hyperscale_metrics::{record_record_ask, record_record_push_span, set_record_push_grace};
 use hyperscale_types::{
-    Anchor, MAX_FINALIZATION_DELAY, RETENTION_HORIZON, ShardId, SubstateKey, TxHash,
+    Anchor, BlockHeight, MAX_FINALIZATION_DELAY, RETENTION_HORIZON, ShardId, SubstateKey, TxHash,
     WeightedTimestamp,
 };
 
 use crate::provisioning::WantedRecord;
+
+/// The least grace a holder's records get, and all of it before any push
+/// has been heard: a quiet window must not arm into a normal leg.
+pub const RECORD_PUSH_GRACE_FLOOR: Duration = Duration::from_secs(5);
+
+/// The most grace a holder's records get, which keeps a lost record
+/// inside a route's naming window on any network.
+pub const RECORD_PUSH_GRACE_CEILING: Duration = Duration::from_secs(15);
+
+/// How many of a holder's heights the grace is derived over, about 11 s
+/// of its blocks.
+const PUSH_SPAN_HEIGHTS: usize = 32;
+
+/// The grace over a holder's height samples: 3/2 of their median, which
+/// sits above nearly all of its spans and well under the 10 s a lost
+/// record should take. A small tail outruns it, each a read that holds
+/// nothing.
+///
+/// The median, since one late push, one contended leg or a member
+/// delaying its turns moves it nowhere, where a maximum would hand that
+/// lever to one member. Honest pushes land first and a held key takes no
+/// sample, so a member controls only the heights it withholds.
+fn grace_over(samples: &[Duration]) -> Duration {
+    median_of(samples).map_or(RECORD_PUSH_GRACE_FLOOR, |median| {
+        (median * 3 / 2).clamp(RECORD_PUSH_GRACE_FLOOR, RECORD_PUSH_GRACE_CEILING)
+    })
+}
+
+/// The median of `spans`, `None` where there are none.
+fn median_of(spans: &[Duration]) -> Option<Duration> {
+    let mut spans = spans.to_vec();
+    spans.sort_unstable();
+    spans.get(spans.len() / 2).copied()
+}
+
+/// How long one holder's pushes have been taking, by the holder height
+/// each was read at.
+///
+/// One sample a height, the median of the spans of the keys kept at that
+/// anchor. Not one a key, or one claim of 32 keys replaces the window;
+/// not one a claim, or any member can split a batch into many proven
+/// claims with `restrict`. The grace is derived only as a new height
+/// enters, from the heights before it, so a commit walks no list and one
+/// batch moves it by at most one sample.
+#[derive(Debug)]
+struct Spans {
+    heights: BTreeMap<BlockHeight, Vec<Duration>>,
+    grace: Duration,
+    /// The clock of the last span heard, which sweeps a holder gone
+    /// quiet.
+    heard: WeightedTimestamp,
+}
+
+impl Spans {
+    const fn new(now: WeightedTimestamp) -> Self {
+        Self {
+            heights: BTreeMap::new(),
+            grace: RECORD_PUSH_GRACE_FLOOR,
+            heard: now,
+        }
+    }
+
+    /// Take `span`, kept at `height`. Past a full window, a span below
+    /// the lowest height held is dropped.
+    fn sample(&mut self, height: BlockHeight, span: Duration, now: WeightedTimestamp) {
+        self.heard = now;
+        let full = self.heights.len() >= PUSH_SPAN_HEIGHTS;
+        if let Some(spans) = self.heights.get_mut(&height) {
+            spans.push(span);
+            return;
+        }
+        if full
+            && self
+                .heights
+                .first_key_value()
+                .is_some_and(|(lowest, _)| height < *lowest)
+        {
+            return;
+        }
+        let samples: Vec<Duration> = self
+            .heights
+            .values()
+            .filter_map(|spans| median_of(spans))
+            .collect();
+        self.grace = grace_over(&samples);
+        set_record_push_grace(u64::try_from(self.grace.as_millis()).unwrap_or(u64::MAX));
+        self.heights.insert(height, vec![span]);
+        if self.heights.len() > PUSH_SPAN_HEIGHTS {
+            self.heights.pop_first();
+        }
+    }
+}
 
 /// One read as the fetch holds it: the clock its want was filed at, the
 /// holder anchor it asks at, and the record's key.
@@ -39,11 +142,15 @@ enum Evidence {
     /// One finalization delay of committed clock has passed since the
     /// want was filed.
     Clock,
+    /// The holder's newest proven anchor stands a grace past the want's
+    /// filing, on the holder's clock. A push held before then means no
+    /// ask goes out.
+    Grace,
     /// A verified execution certificate from the record's holder named
     /// the transaction. Only a producer whose member is not a leg sends
     /// one: a pure leg's certificate stays home, so its consumer arms on
-    /// the clock, which is when the leg has finalized or never will. The
-    /// push carries the happy path, so this delays only the fallback.
+    /// the clocks. The push carries the happy path, so this delays only
+    /// the fallback.
     Certificate,
 }
 
@@ -68,6 +175,9 @@ pub struct RecordReads {
     /// before the key it arms is wanted is remembered until the key
     /// enters, and swept one horizon past the clock.
     certified: BTreeMap<TxHash, (BTreeSet<ShardId>, WeightedTimestamp)>,
+    /// How long each holder's pushes have been taking. A restarted
+    /// replica or a new holder after a reshape starts at the floor.
+    spans: BTreeMap<ShardId, Spans>,
 }
 
 impl RecordReads {
@@ -103,8 +213,9 @@ impl RecordReads {
 
     /// Drop the reads of keys `live` no longer names, which have been
     /// answered or are nobody's to ask about, and the certificates
-    /// remembered past one horizon of `now`. Hands back the asks still
-    /// out for the keys dropped.
+    /// remembered past one horizon of `now`, and the holders no push has
+    /// been heard from for as long. Hands back the asks still out for
+    /// the keys dropped.
     pub fn sweep(
         &mut self,
         now: WeightedTimestamp,
@@ -117,6 +228,7 @@ impl RecordReads {
             .collect();
         let floor = now.minus(RETENTION_HORIZON);
         self.certified.retain(|_, (_, heard)| *heard >= floor);
+        self.spans.retain(|_, spans| spans.heard >= floor);
         ended
     }
 
@@ -131,19 +243,41 @@ impl RecordReads {
         }
     }
 
-    /// Arm the read of `wanted` where its evidence is in: the clock it
-    /// names has passed, or `holder` has certified its transaction.
-    /// Fresh evidence resets the backoff, so a key the clock armed is
-    /// asked again at once when the holder's certificate lands.
-    pub fn arm(&mut self, wanted: &WantedRecord, holder: ShardId, now: WeightedTimestamp) {
+    /// The grace past a want's filing that `holder`'s records get.
+    fn grace(&self, holder: ShardId) -> Duration {
+        self.spans
+            .get(&holder)
+            .map_or(RECORD_PUSH_GRACE_FLOOR, |spans| spans.grace)
+    }
+
+    /// Arm the read of `wanted` where its evidence is in: `holder` has
+    /// certified its transaction, this chain's clock `now` is one
+    /// finalization delay past its filing, or `anchor`, the holder's
+    /// newest proven, stands the holder's grace past it. Arming is
+    /// sticky, so a grace that falls arms what it has passed.
+    ///
+    /// The one ladder runs across the clocks, so a key the grace armed
+    /// keeps its step when the clock catches it up. Only a certificate
+    /// resets it: a key the clocks armed is asked again at once when the
+    /// holder's certificate lands.
+    pub fn arm(
+        &mut self,
+        wanted: &WantedRecord,
+        holder: ShardId,
+        now: WeightedTimestamp,
+        anchor: Option<Anchor>,
+    ) {
         let by_certificate = self
             .certified
             .get(&wanted.tx)
             .is_some_and(|(shards, _)| shards.contains(&holder));
+        let past_grace = wanted.filed_at.plus(self.grace(holder));
         let evidence = if by_certificate {
             Some(Evidence::Certificate)
         } else if now >= wanted.filed_at.plus(MAX_FINALIZATION_DELAY) {
             Some(Evidence::Clock)
+        } else if anchor.is_some_and(|anchor| anchor.ts >= past_grace) {
+            Some(Evidence::Grace)
         } else {
             None
         };
@@ -152,18 +286,32 @@ impl RecordReads {
             && read.armed != Some(evidence)
         {
             read.armed = Some(evidence);
-            read.step = 0;
+            if evidence == Evidence::Certificate {
+                read.step = 0;
+            }
         }
     }
 
-    /// A pushed reading of `key` at `anchor` was kept: it stands where an
+    /// A pushed arrival of `key` at `anchor` was kept: it stands where an
     /// answered ask would, so the next ask waits one more doubling past
     /// this anchor, and nothing here disarms — only a committed arrival
-    /// ends the want.
-    pub fn pushed(&mut self, key: SubstateKey, anchor: Anchor) {
+    /// ends the want. `span` is how long it took, heard at `now`, which
+    /// goes into the grace of the anchor's shard.
+    pub fn pushed(
+        &mut self,
+        key: SubstateKey,
+        anchor: Anchor,
+        span: Duration,
+        now: WeightedTimestamp,
+    ) {
         let read = self.reads.entry(key).or_default();
         read.last = Some(anchor);
         read.step = read.step.saturating_add(1);
+        record_record_push_span(u64::try_from(span.as_millis()).unwrap_or(u64::MAX));
+        self.spans
+            .entry(anchor.shard)
+            .or_insert_with(|| Spans::new(now))
+            .sample(anchor.height, span, now);
     }
 
     /// Whether `key` is asked at `anchor`, a proven anchor of its holder,
@@ -243,6 +391,15 @@ impl RecordReads {
             .count()
     }
 
+    /// How many of `holder`'s heights have given a sample, for the tests
+    /// that watch the window.
+    #[cfg(test)]
+    pub fn sampled_heights(&self, holder: ShardId) -> usize {
+        self.spans
+            .get(&holder)
+            .map_or(0, |spans| spans.heights.len())
+    }
+
     /// Whether `key` is armed, for the tests that watch the arming.
     #[cfg(test)]
     pub fn is_armed(&self, key: SubstateKey) -> bool {
@@ -297,15 +454,11 @@ mod tests {
         let key = want.key;
         let armed = delay_past(0);
 
-        reads.arm(
-            &want,
-            HOLDER,
-            armed.minus(std::time::Duration::from_millis(1)),
-        );
+        reads.arm(&want, HOLDER, armed.minus(Duration::from_millis(1)), None);
         assert!(!reads.is_armed(key));
         assert!(!reads.due(key, anchor(1, 9_999)), "not before the evidence");
 
-        reads.arm(&want, HOLDER, armed);
+        reads.arm(&want, HOLDER, armed, None);
         assert!(reads.is_armed(key));
         assert!(reads.due(key, anchor(1, 10_000)), "the first ask goes out");
         assert!(
@@ -332,10 +485,10 @@ mod tests {
     }
 
     /// A pure leg's consumer hears no certificate from its producer and
-    /// no push, and still reads: the want filed at commit arms one
-    /// finalization delay later on the clock alone.
+    /// no push, and still reads: the want filed at commit arms a grace
+    /// later, on the holder's clock.
     #[test]
-    fn a_pure_legs_consumer_arms_on_the_finalization_delay() {
+    fn a_pure_legs_consumer_arms_on_the_holders_clock() {
         use hyperscale_engine::tick_select::Requirement;
 
         use crate::provisioning::ProvisioningTracker;
@@ -350,16 +503,161 @@ mod tests {
         let [want] = provisioning.wanted_records().try_into().expect("one want");
 
         let mut reads = RecordReads::new();
-        let armed = filed.plus(MAX_FINALIZATION_DELAY);
-        reads.arm(
-            &want,
-            HOLDER,
-            armed.minus(std::time::Duration::from_millis(1)),
+        let armed = filed.plus(RECORD_PUSH_GRACE_FLOOR).as_millis();
+        reads.arm(&want, HOLDER, filed, Some(anchor(1, armed - 1)));
+        assert!(
+            !reads.is_armed(want.key),
+            "a millisecond short of the grace"
         );
-        assert!(!reads.is_armed(want.key), "not before the delay");
-        reads.arm(&want, HOLDER, armed);
-        assert!(reads.is_armed(want.key));
-        assert!(reads.due(want.key, anchor(1, armed.as_millis())));
+        reads.arm(&want, HOLDER, filed, Some(anchor(1, armed)));
+        assert!(reads.is_armed(want.key), "on the holder's clock alone");
+        assert!(reads.due(want.key, anchor(1, armed)));
+    }
+
+    /// The local clock past the grace arms nothing while the holder's
+    /// anchors stand below it: what the grace reads is the holder's own
+    /// clock, or no anchor at all.
+    #[test]
+    fn a_local_clock_past_the_grace_does_not_arm() {
+        let mut reads = RecordReads::new();
+        let want = wanted(0);
+        let past = WeightedTimestamp::from_millis(0).plus(RECORD_PUSH_GRACE_CEILING);
+        reads.arm(&want, HOLDER, past, Some(anchor(1, 4_999)));
+        assert!(!reads.is_armed(want.key));
+        reads.arm(&want, HOLDER, past, None);
+        assert!(!reads.is_armed(want.key));
+    }
+
+    /// The clock arms a key with no fresh holder anchor, and keeps the
+    /// grace's step: one key's asks stay on one ladder.
+    #[test]
+    fn the_clock_arms_with_no_anchor_and_keeps_the_ladder() {
+        let mut reads = RecordReads::new();
+        let want = wanted(0);
+        let key = want.key;
+        reads.arm(&want, HOLDER, delay_past(0), None);
+        assert!(reads.is_armed(key), "no anchor stands past the grace");
+
+        let mut laddered = RecordReads::new();
+        let at = anchor(1, 5_000);
+        laddered.arm(&want, HOLDER, at.ts, Some(at));
+        assert!(laddered.due(key, at));
+        assert!(laddered.due(key, anchor(3, 5_001)));
+        laddered.arm(&want, HOLDER, delay_past(0), None);
+        assert!(
+            !laddered.due(key, anchor(5, 5_002)),
+            "the third ask still waits four heights",
+        );
+        assert!(laddered.due(key, anchor(7, 5_003)));
+    }
+
+    /// `spans`, one height each, from `HOLDER`'s height `from`.
+    fn heard(reads: &mut RecordReads, from: u64, spans: &[Duration]) {
+        for (height, span) in (from..).zip(spans) {
+            reads.pushed(
+                test_key(1),
+                anchor(height, 0),
+                *span,
+                WeightedTimestamp::ZERO,
+            );
+        }
+    }
+
+    /// The floor before any sample. Then 3/2 of the median of the
+    /// heights before the newest, held at both clamps, and unmoved by a
+    /// quarter of the heights running late.
+    #[test]
+    fn the_grace_is_three_halves_of_the_median_within_its_clamps() {
+        let secs = Duration::from_secs;
+        let mut reads = RecordReads::new();
+        assert_eq!(reads.grace(HOLDER), RECORD_PUSH_GRACE_FLOOR, "cold");
+        heard(&mut reads, 1, &[secs(6)]);
+        assert_eq!(
+            reads.grace(HOLDER),
+            RECORD_PUSH_GRACE_FLOOR,
+            "a height counts once the next one enters",
+        );
+        heard(&mut reads, 2, &[secs(6), secs(6), secs(6)]);
+        assert_eq!(reads.grace(HOLDER), secs(9));
+
+        let mut quiet = RecordReads::new();
+        heard(&mut quiet, 1, &[Duration::from_secs(1); 8]);
+        assert_eq!(quiet.grace(HOLDER), RECORD_PUSH_GRACE_FLOOR, "the floor");
+        let mut slow = RecordReads::new();
+        heard(&mut slow, 1, &[Duration::from_secs(60); 8]);
+        assert_eq!(slow.grace(HOLDER), RECORD_PUSH_GRACE_CEILING, "the ceiling");
+
+        let mut late = RecordReads::new();
+        let window = [secs(6), secs(6), secs(6), secs(30)].repeat(8);
+        heard(&mut late, 1, &window);
+        assert_eq!(late.grace(HOLDER), secs(9), "a quarter of the heights late");
+    }
+
+    /// One height, one sample, however its keys reach here: a claim of
+    /// 64 keys or the same batch split across 64 claims moves the window
+    /// by the one height they were read at. The window then evicts its
+    /// lowest height, and a span below it is dropped.
+    #[test]
+    fn a_batch_moves_the_window_by_one_height() {
+        let secs = Duration::from_secs;
+        let mut reads = RecordReads::new();
+        heard(&mut reads, 1, &[secs(6); 32]);
+        for _ in 0..64 {
+            reads.pushed(
+                test_key(2),
+                anchor(33, 0),
+                secs(40),
+                WeightedTimestamp::ZERO,
+            );
+        }
+        let spans = &reads.spans[&HOLDER];
+        assert_eq!(spans.heights.len(), PUSH_SPAN_HEIGHTS);
+        assert_eq!(spans.heights.keys().next(), Some(&BlockHeight::new(2)));
+        heard(&mut reads, 34, &[secs(6)]);
+        assert_eq!(reads.grace(HOLDER), secs(9), "the batch is one sample");
+
+        heard(&mut reads, 1, &[secs(40)]);
+        assert!(
+            !reads.spans[&HOLDER]
+                .heights
+                .contains_key(&BlockHeight::new(1)),
+            "below the window",
+        );
+    }
+
+    /// A holder's spans go a horizon after its last sample, which leaves
+    /// a new holder at the floor.
+    #[test]
+    fn a_quiet_holders_spans_are_swept() {
+        let mut reads = RecordReads::new();
+        heard(&mut reads, 1, &[Duration::from_secs(8); 4]);
+        let at_the_horizon = WeightedTimestamp::ZERO.plus(RETENTION_HORIZON);
+        let _ = reads.sweep(at_the_horizon, &BTreeSet::new());
+        assert_eq!(reads.grace(HOLDER), Duration::from_secs(12));
+        let past_it = at_the_horizon.plus(Duration::from_millis(1));
+        let _ = reads.sweep(past_it, &BTreeSet::new());
+        assert_eq!(reads.grace(HOLDER), RECORD_PUSH_GRACE_FLOOR);
+    }
+
+    /// A replayed commit whose clock is past the grace puts one ask,
+    /// however often it passes the key, and the arrival folded next
+    /// stands it down.
+    #[test]
+    fn a_replayed_commit_puts_at_most_one_ask() {
+        let mut reads = RecordReads::new();
+        let want = wanted(0);
+        let at = anchor(1, 5_000);
+        for _ in 0..3 {
+            reads.arm(&want, HOLDER, at.ts, Some(at));
+            if reads.due(want.key, at) {
+                assert_eq!(reads.put((want.filed_at, at, want.key)), None);
+            }
+        }
+        assert_eq!(reads.live(HOLDER), 1);
+        assert_eq!(
+            reads.take_out(want.key),
+            Some((want.filed_at, at, want.key))
+        );
     }
 
     /// A holder's certificate arms a read the clock has not, resets the
@@ -372,19 +670,19 @@ mod tests {
         let key = want.key;
         let now = WeightedTimestamp::from_millis(5_000);
 
-        reads.arm(&want, HOLDER, now);
+        reads.arm(&want, HOLDER, now, None);
         assert!(
             !reads.is_armed(key),
             "nothing but a certificate arms this one"
         );
         reads.certified(ShardId::leaf(1, 1), [want.tx], now);
-        reads.arm(&want, HOLDER, now);
+        reads.arm(&want, HOLDER, now, None);
         assert!(
             !reads.is_armed(key),
             "another shard's certificate is not the holder's"
         );
         reads.certified(HOLDER, [want.tx], now);
-        reads.arm(&want, HOLDER, now);
+        reads.arm(&want, HOLDER, now, None);
         assert!(reads.is_armed(key));
         assert!(reads.due(key, anchor(1, 5_000)));
         assert!(reads.due(key, anchor(3, 5_001)));
@@ -397,12 +695,12 @@ mod tests {
         let clocked = wanted(0);
         let now = delay_past(0);
         let mut by_clock = RecordReads::new();
-        by_clock.arm(&clocked, HOLDER, now);
+        by_clock.arm(&clocked, HOLDER, now, None);
         assert!(by_clock.due(key, anchor(1, 5_000)));
         assert!(by_clock.due(key, anchor(3, 5_001)));
         assert!(!by_clock.due(key, anchor(5, 5_002)));
         by_clock.certified(HOLDER, [clocked.tx], now);
-        by_clock.arm(&clocked, HOLDER, now);
+        by_clock.arm(&clocked, HOLDER, now, None);
         assert!(
             by_clock.due(key, anchor(5, 5_003)),
             "the certificate resets the step"
@@ -413,16 +711,15 @@ mod tests {
         let mut early = RecordReads::new();
         early.certified(HOLDER, [want.tx], now);
         early.sweep(now.plus(RETENTION_HORIZON), &BTreeSet::new());
-        early.arm(&want, HOLDER, now.plus(RETENTION_HORIZON));
+        early.arm(&want, HOLDER, now.plus(RETENTION_HORIZON), None);
         assert!(early.is_armed(key), "still remembered at the horizon");
         let mut late = RecordReads::new();
         late.certified(HOLDER, [want.tx], now);
         late.sweep(
-            now.plus(RETENTION_HORIZON)
-                .plus(std::time::Duration::from_millis(1)),
+            now.plus(RETENTION_HORIZON).plus(Duration::from_millis(1)),
             &BTreeSet::new(),
         );
-        late.arm(&want, HOLDER, now);
+        late.arm(&want, HOLDER, now, None);
         assert!(!late.is_armed(key), "and forgotten past it");
     }
 
@@ -433,7 +730,7 @@ mod tests {
         let mut reads = RecordReads::new();
         let want = wanted(0);
         let now = delay_past(0);
-        reads.arm(&want, HOLDER, now);
+        reads.arm(&want, HOLDER, now, None);
         assert!(reads.due(want.key, anchor(1, 1)));
         let _ = reads.sweep(now, &BTreeSet::new());
         assert!(!reads.is_armed(want.key));
@@ -453,7 +750,7 @@ mod tests {
     fn a_re_ask_replaces_the_ask_out() {
         let mut reads = RecordReads::new();
         let want = wanted(0);
-        reads.arm(&want, HOLDER, delay_past(0));
+        reads.arm(&want, HOLDER, delay_past(0), None);
         let (first, second) = (anchor(1, 1), anchor(3, 2));
         assert_eq!(ask(&mut reads, &want, first), None);
         assert_eq!(reads.live(HOLDER), 1);
@@ -474,14 +771,14 @@ mod tests {
         let id = (want.filed_at, at, want.key);
 
         let mut reads = RecordReads::new();
-        reads.arm(&want, HOLDER, delay_past(0));
+        reads.arm(&want, HOLDER, delay_past(0), None);
         let _ = ask(&mut reads, &want, at);
         assert_eq!(reads.take_out(want.key), Some(id));
         assert_eq!(reads.take_out(want.key), None, "handed back once");
         assert_eq!(reads.live(HOLDER), 0);
 
         let mut reads = RecordReads::new();
-        reads.arm(&want, HOLDER, delay_past(0));
+        reads.arm(&want, HOLDER, delay_past(0), None);
         let _ = ask(&mut reads, &want, at);
         assert_eq!(
             reads.sweep(delay_past(0), &BTreeSet::from([want.key])),
@@ -497,7 +794,7 @@ mod tests {
     fn only_the_ask_out_is_answered() {
         let mut reads = RecordReads::new();
         let want = wanted(0);
-        reads.arm(&want, HOLDER, delay_past(0));
+        reads.arm(&want, HOLDER, delay_past(0), None);
         let (first, second) = (anchor(1, 1), anchor(3, 2));
         let _ = ask(&mut reads, &want, first);
         let _ = ask(&mut reads, &want, second);
@@ -514,7 +811,7 @@ mod tests {
     fn a_reset_replaces_the_ask_out_and_keeps_one_at_the_same_anchor() {
         let mut reads = RecordReads::new();
         let want = wanted(0);
-        reads.arm(&want, HOLDER, delay_past(0));
+        reads.arm(&want, HOLDER, delay_past(0), None);
         let at = anchor(1, 1);
         let id = (want.filed_at, at, want.key);
         let _ = ask(&mut reads, &want, at);
@@ -536,7 +833,7 @@ mod tests {
         let mut reads = RecordReads::new();
         let want = wanted(0);
         let key = want.key;
-        reads.arm(&want, HOLDER, delay_past(0));
+        reads.arm(&want, HOLDER, delay_past(0), None);
         assert!(reads.due(key, anchor(1, 1)));
         assert!(reads.due(key, anchor(3, 2)));
         assert!(!reads.due(key, anchor(5, 3)), "the third waits four");
@@ -553,8 +850,13 @@ mod tests {
         let mut reads = RecordReads::new();
         let key = test_key(1);
         let wanted = wanted(0);
-        reads.arm(&wanted, HOLDER, delay_past(0));
-        reads.pushed(key, anchor(9, 10_000));
+        reads.arm(&wanted, HOLDER, delay_past(0), None);
+        reads.pushed(
+            key,
+            anchor(9, 10_000),
+            Duration::ZERO,
+            WeightedTimestamp::ZERO,
+        );
         assert!(reads.is_armed(key), "a push never disarms");
         assert!(
             !reads.due(key, anchor(9, 10_000)),

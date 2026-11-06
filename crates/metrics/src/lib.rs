@@ -377,6 +377,18 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// commit.
     fn set_wanted_records(&self, count: usize) {}
 
+    /// The span a kept arrival's push took: its holder's newest proven
+    /// clock less the clock its want was filed at, in milliseconds.
+    fn record_record_push_span(&self, millis: u64) {
+        let _ = millis;
+    }
+
+    /// The grace a holder's records are read past, in milliseconds, as
+    /// a new height's sample moves it.
+    fn set_record_push_grace(&self, millis: u64) {
+        let _ = millis;
+    }
+
     /// A claim the commit fold acts on by its anchor: one carrying a
     /// record presence (`"record"`), either carried by a committed block
     /// or dropped from what a validator held to offer because the block
@@ -1040,6 +1052,18 @@ pub fn record_pushes_placed_on_carry(count: usize) {
 #[inline]
 pub fn set_wanted_records(count: usize) {
     recorder().set_wanted_records(count);
+}
+
+/// Record the span a kept arrival's push took.
+#[inline]
+pub fn record_record_push_span(millis: u64) {
+    recorder().record_record_push_span(millis);
+}
+
+/// Set the grace a holder's records are read past.
+#[inline]
+pub fn set_record_push_grace(millis: u64) {
+    recorder().set_record_push_grace(millis);
 }
 
 /// Record a fenced claim carried by a block or refused by the read

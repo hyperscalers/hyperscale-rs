@@ -534,6 +534,15 @@ impl MetricsRecorder for MemoryRecorder {
         self.observe("wanted_records", None, count as f64);
     }
 
+    fn record_record_push_span(&self, millis: u64) {
+        self.observe("record_push_span", None, millis as f64);
+    }
+
+    fn set_record_push_grace(&self, millis: u64) {
+        self.set("record_push_grace", None, millis as f64);
+        self.observe("record_push_grace", None, millis as f64);
+    }
+
     fn record_fenced_claim(&self, reading: &str, carried: bool) {
         let name = if carried {
             "fenced_claims_carried"

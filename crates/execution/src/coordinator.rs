@@ -5397,6 +5397,7 @@ mod tests {
 
     use super::*;
     use crate::counterparts::TestRows;
+    use crate::record_reads::RECORD_PUSH_GRACE_FLOOR;
 
     impl ExecutionCoordinator {
         /// This coordinator with `signer` attached, before it holds any
@@ -15051,13 +15052,14 @@ mod tests {
     }
 
     /// A record a delivery here waits on is read from the record's
-    /// holder one finalization delay past the commit that filed the
-    /// want, at the holder's newest proven anchor, and not again until
-    /// the holder has moved on; a committed arrival ends the read.
+    /// holder once the holder's clock stands a grace past the commit
+    /// that filed the want, at the holder's newest proven anchor, and
+    /// not again until the holder has moved on; a committed arrival ends
+    /// the read.
     #[test]
-    fn a_record_read_arms_a_finalization_delay_past_the_commit_and_ends_with_the_arrival() {
+    fn a_record_read_arms_a_grace_past_the_commit_and_ends_with_the_arrival() {
         let (mut state, trie, record_key, cell, filed_at) = a_delivery_waiting_on_a_crossing();
-        let armed = filed_at.plus(MAX_FINALIZATION_DELAY);
+        let armed = filed_at.plus(RECORD_PUSH_GRACE_FLOOR);
         let before = armed.minus(Duration::from_millis(1));
         state
             .counterparts
@@ -15073,7 +15075,7 @@ mod tests {
                 record_key
             )
             .is_empty(),
-            "nothing is asked inside one finalization delay of the commit that filed the want",
+            "nothing is asked inside the grace of the commit that filed the want",
         );
 
         let first = proven_anchor_of(PEER, 10, armed);

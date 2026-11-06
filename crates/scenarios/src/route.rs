@@ -629,7 +629,9 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating, lift: Lift) 
     );
 
     the_cycle_ends_by_a_wound(c, [victim, survivor], &venues, (proven, windowed));
-    protocol_resource.assert_settles_within(c, &charges, epochs(8), "crossed holds");
+    // The later route's input comes home off its validity end, however
+    // early the cycle ended.
+    protocol_resource.assert_settles_within(c, &charges, epochs(10), "crossed holds");
     units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
 }
 
