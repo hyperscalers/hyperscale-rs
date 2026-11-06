@@ -191,7 +191,8 @@ fn ends_as<C: Cluster>(c: &mut C, tx: TxHash, decision: TransactionDecision, con
 ///
 /// Panics if a venue or a swap misses its budget, if the first route
 /// does not stand head before the second is submitted, if either route
-/// does not accept, if the second is not served after the first, or if
+/// does not accept, if the second is not served after the first, at or
+/// after the block settling the first and past its own commit, or if
 /// either side is not conserved.
 pub fn two_members_reading_what_the_other_reserves_both_settle<C: Cluster>(c: &mut C) {
     let mut stage = Stage::stand_up(c);
@@ -240,6 +241,24 @@ pub fn two_members_reading_what_the_other_reserves_both_settle<C: Cluster>(c: &m
         "the second is served from a later head than the first: {:?} against {:?}",
         served(c, first),
         served(c, second),
+    );
+    let (second_committed, _) = c.chain_fate(HOME, second);
+    let second_committed = second_committed.expect("the second route commits on its payer's shard");
+    let first_settled = c
+        .chain_fate(HOME, first)
+        .1
+        .map(|(height, _)| height)
+        .expect("the first route settles on its payer's shard");
+    let second_served = served(c, second).expect("the away venue holds the second's part");
+    assert!(
+        second_served >= first_settled,
+        "the second is served no earlier than the block settling the first: {second_served:?} \
+         against {first_settled:?}",
+    );
+    assert!(
+        second_served > second_committed,
+        "the second is served from its head, past the block committing it: {second_served:?} \
+         against {second_committed:?}",
     );
     stage.assert_conserved(c, "two members reading what the other reserves");
 }
