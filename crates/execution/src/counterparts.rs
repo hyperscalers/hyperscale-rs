@@ -2747,8 +2747,8 @@ impl Counterparts {
     /// held here answers nothing the want asks.
     ///
     /// One ask stands for a key: a later one takes the earlier's place,
-    /// and one whose key has its arrival held, or has moved to another
-    /// holder, is let go of here, whichever way the arrival came. The
+    /// and one whose key has every want's arrival held, or has moved to
+    /// another holder, is let go of here, whichever way the arrival came. The
     /// oldest filed go first, and no more than
     /// [`MAX_RECORD_ASKS_PER_HOLDER`] stand toward one holder, so a
     /// holder that never answers takes no place from another's. Filing
@@ -2765,13 +2765,18 @@ impl Counterparts {
             .map(|record| (record, trie.shard_for_prefix(record.key.owner)))
             .collect();
         filed.sort_unstable_by_key(|(record, _)| (record.filed_at, record.key));
+        let unread: BTreeSet<SubstateKey> = filed
+            .iter()
+            .filter(|(record, holder)| !self.fetched.reads_arrival(*holder, record.key, record.tx))
+            .map(|(record, _)| record.key)
+            .collect();
         let mut abandoned: Vec<RecordAsk> = Vec::new();
         for (record, holder) in &filed {
             let moved = self
                 .records
                 .out(record.key)
                 .is_some_and(|at| at.shard != *holder);
-            if moved || self.fetched.reads_arrival(*holder, record.key, record.tx) {
+            if moved || !unread.contains(&record.key) {
                 abandoned.extend(self.records.take_out(record.key));
             }
         }
@@ -8325,6 +8330,45 @@ mod tests {
             );
             assert_eq!(consumer.records.live(PRODUCER), 0, "{door:?}");
         }
+    }
+
+    /// Two transactions may want one key. One's arrival held leaves the
+    /// ask out for the other, which stands until its own arrival.
+    #[test]
+    fn an_arrival_leaves_the_ask_of_another_want_of_its_key() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let other = TxHash::from(Hash::from_bytes(b"another want of the key"));
+        let want = [armed_want(key, cell.tx), armed_want(key, other)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let read = producer_read(3, Some(&cell), key);
+        consumer.proven_anchors.record(read.0);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(read.0, key)],
+        );
+        let (newer, _) = producer_read(5, Some(&cell), key);
+        consumer.proven_anchors.record(newer);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(newer, key)],
+        );
+
+        assert!(Door::Push.bring(&mut consumer, &want, &read, key, Some(&cell), now));
+        assert_eq!(consumer.records.out(key), Some(newer));
+        let next = consumer.probe(&trie, now, &want, windows);
+        assert!(record_abandons(&next).is_empty());
+        assert_eq!(consumer.records.out(key), Some(newer));
+
+        let lone = [armed_want(key, cell.tx)];
+        assert_eq!(
+            record_abandons(&consumer.probe(&trie, now, &lone, windows)),
+            vec![(lone[0].filed_at, newer, key)],
+            "with its last want answered the ask goes",
+        );
     }
 
     /// No more than the cap of asks stand toward one holder, whatever
