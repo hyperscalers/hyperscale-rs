@@ -509,58 +509,91 @@ pub fn a_read_that_finds_no_record_yet_reads_again<C: FaultableCluster>(c: &mut 
     }
 }
 
-/// One route's push is lost while another's, a height above it, lands.
+/// A held push the read frontier passes costs its key a read, no more.
 ///
-/// The read of the first raises the holder's read frontier past what was
-/// sent below it, which costs the second at most a read of its own.
+/// One venue member alone hears a route's push and proposes nothing, so
+/// no block carries it, and the reads that would answer the route are
+/// cut. A second route's push, a height above, then lands everywhere, and
+/// the block carrying it raises the holder's read frontier over what the
+/// member holds: that push is refused and the member reads again, as a
+/// push landing behind a read would be.
 ///
-/// The push is lost to both venues, so each places the two routes alike:
-/// lost to one, the venues would hear them in opposite order and the
-/// later hash would lose to the cycle, as a route does.
+/// Both venues hear the two routes in the same order, so each places them
+/// alike: heard apart, the venues would hold them in opposite order and
+/// the later hash would lose to the cycle, as a route does.
 ///
 /// Requires disjoint committees, as the cut is keyed on them.
 ///
 /// # Panics
 ///
-/// Panics if a venue misses its budget standing up, if the cut never
-/// fires, if either route is not accepted on both venues, or if either
-/// record takes longer than [`LOST_RECORD_BOUND`].
+/// Panics if a venue misses its budget standing up, if a cut never fires,
+/// if no held push is refused, if either route is not accepted on both
+/// venues, or if either record takes longer than [`LOST_RECORD_BOUND`]
+/// past the reads' return.
 pub fn one_lost_height_among_delivered_pushes<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
+    let member = c
+        .beacon_state()
+        .and_then(|state| {
+            state
+                .shard_consensus_members
+                .get(&FIRST_VENUE_SHARD)
+                .cloned()
+        })
+        .expect("the venue has a consensus committee")[0];
+    let hearing = c.host_of(member).expect("the member is hosted");
+    let others: Vec<usize> = c
+        .committee_hosts(FIRST_VENUE_SHARD)
+        .into_iter()
+        .filter(|host| *host != hearing)
+        .collect();
+    let leg_hosts = c.committee_hosts(TRADER_SHARD);
+    let venues = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD];
     let lost = [
-        isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD),
+        c.drop_type_between(&leg_hosts, &others, "crossing.readings"),
         isolate_pushed_readings(c, SECOND_VENUE_SHARD, TRADER_SHARD),
     ];
-    let (early, early_records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
-    let next = c.now() + Duration::from_secs(1);
-    let _ = c.run_until(epochs(1), |c| c.now() >= next);
-    let (late, late_records) = submit_core_route(c, (&first, &second), &traders[1], ROUTE_INPUT);
+    let _ = venues.map(|venue| isolate_state_reads(c, venue, TRADER_SHARD));
+    let _ = c.withhold(&[member], Withheld::Consensus);
+    let (held, held_records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
     assert!(
-        c.run_polling(epochs(10), FINE_POLL, |c| early_records
+        c.run_polling(epochs(10), FINE_POLL, |c| held_records
             .iter()
             .all(|record| stands_at(c, *record))
-            && lost.iter().any(|cut| cut.fired() > 0)),
-        "the early leg finalizes, and its push is lost",
-    );
-    assert!(
-        !late_records.iter().any(|record| stands_at(c, *record)),
-        "the late leg's push must go out with the way clear",
+            && lost.iter().all(|cut| cut.fired() > 0)),
+        "the leg finalizes, and its push is lost to all but one member",
     );
     c.clear_drops();
+    let _ = venues.map(|venue| isolate_state_reads(c, venue, TRADER_SHARD));
+    let (above, above_records) = submit_core_route(c, (&first, &second), &traders[1], ROUTE_INPUT);
+    let refused = |c: &C| c.metric("fenced_claims_refused", Some("record"));
+    assert!(
+        c.run_polling(epochs(10), FINE_POLL, |c| refused(c) > 0),
+        "the block carrying the push above must refuse the one held below it",
+    );
+    println!("record read: {} held pushes refused", refused(c));
+    let _ = c.withhold(&[member], Withheld::Nothing);
+    c.clear_drops();
 
-    for (route, records) in [(early, &early_records), (late, &late_records)] {
-        let wait = await_record_reads(c, FIRST_VENUE_SHARD, route, records);
-        println!("record read: {route:?} reached its venue in {wait:?}");
-        assert!(
-            wait < LOST_RECORD_BOUND,
-            "{route:?} must be read inside {LOST_RECORD_BOUND:?}, and took {wait:?}",
-        );
-        for shard in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+    let lifted = c.now();
+    for (route, records) in [(above, &above_records), (held, &held_records)] {
+        for venue in venues {
+            let _ = await_record_reads(c, venue, route, records);
+            let wait = c.now().saturating_sub(lifted);
+            println!("record read: {route:?} on {venue:?} {wait:?} past the reads' return");
             assert!(
-                c.run_until(epochs(40), |c| accepted_on(c, shard, route)),
-                "{route:?} must be accepted on {shard:?}",
+                wait < LOST_RECORD_BOUND,
+                "{route:?} must be read inside {LOST_RECORD_BOUND:?}, and took {wait:?}",
+            );
+        }
+    }
+    for route in [above, held] {
+        for venue in venues {
+            assert!(
+                c.run_until(epochs(40), |c| accepted_on(c, venue, route)),
+                "{route:?} must be accepted on {venue:?}",
             );
         }
     }
