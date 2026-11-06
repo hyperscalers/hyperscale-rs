@@ -414,8 +414,8 @@ pub const fn tick_manifest_admits_block(weight: usize) -> bool {
 
 /// Bytes one [`TickLine`](crate::TickLine) costs before its holds,
 /// pins, reach, reserves and crossings: a member's transaction,
-/// terms, abort charge, share and deadline.
-pub const TICK_LINE_BYTES: usize = 152;
+/// terms, abort charge, share, deadline and head height.
+pub const TICK_LINE_BYTES: usize = 161;
 
 /// Bytes one hold of a member line costs: a declared access and its
 /// mode.

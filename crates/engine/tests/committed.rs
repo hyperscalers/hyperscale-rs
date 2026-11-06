@@ -366,6 +366,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(&tx),
             crossings: Capped::empty(),
+            served_at: None,
         }])),
         terms,
         witness_sources,
@@ -521,6 +522,7 @@ fn a_follower_applies_its_half_of_the_terminal() {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(&tx),
             crossings: Capped::empty(),
+            served_at: None,
         }]),
     );
     let terminal = on_chain(
@@ -1243,6 +1245,7 @@ impl Window {
             clock: ANCHOR,
             member: self.member(tx),
             arrivals: &[],
+            served_part: None,
         };
         let executed = self
             .executor

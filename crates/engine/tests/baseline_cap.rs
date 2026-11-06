@@ -10,12 +10,14 @@
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::account_address;
+use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_engine::genesis::{GenesisPackages, draw_key, genesis_world_with_pools};
+use hyperscale_engine::legs::Member;
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, PointReads, TickBatchContext,
-    TickEnvironment, genesis_writes,
+    ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, PointReads, ServedPart,
+    TickBatchContext, TickEnvironment, TickTxInput, genesis_writes,
 };
-use hyperscale_hbor::{Capped, from_slice};
+use hyperscale_hbor::{Bytes, Capped, from_slice};
 use hyperscale_storage::test_helpers::block_settling;
 use hyperscale_storage::{
     BoundaryStore, GenesisCommit, NoFeeHolds, SubstateStore, Substates, TickChain,
@@ -23,11 +25,12 @@ use hyperscale_storage::{
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    BlockHeight, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey, Epoch, EpochSeed,
-    EpochWindows, FrontierInputs, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr,
-    ProtocolHasher, ProvisionalHolds, Randomness, ResourceAddr, SeedRing, SeedSource,
-    SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateKey, TimestampRange, Transaction,
-    Verified, WeightedTimestamp, absorb_committed_cells, encode_amount,
+    BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange, Ed25519PrivateKey, EntryKey,
+    Epoch, EpochSeed, EpochWindows, FrontierInputs, MAX_INTENT_VALIDITY_RANGE, NetworkId,
+    PriceTable, PrincipalAddr, ProtocolHasher, ProvisionalHolds, Randomness, ResourceAddr,
+    SeedRing, SeedSource, SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateEntry,
+    SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp, absorb_committed_cells,
+    encode_amount, entry_leaf_key,
 };
 use hyperscale_vm_effects::{
     Composed, Hash32, InstanceMeta, IntentHeader, IntentTree, SlotId, Value, child_key,
@@ -599,6 +602,266 @@ fn signed_book(build: impl FnOnce(IntentBuilder<'_>) -> IntentTree) -> Transacti
     ))
 }
 
+/// The book's escrow of base.
+fn book_escrow() -> SubstateKey {
+    child_key(
+        &ProtocolHasher,
+        Address::from(book_addr()),
+        SlotId(<book::Base as VaultField>::SLOT),
+        &[Value::Address(BOOK_BASE_RESOURCE.address()).canonical_bytes()],
+    )
+}
+
+fn asks_collection() -> CollectionId {
+    collection_id(&ProtocolHasher, book_addr(), book::ASKS, &[])
+}
+
+fn ask_at(ticks: u64) -> EntryKey {
+    EntryKey {
+        owner: book_addr().into(),
+        collection: asks_collection(),
+        order: u128::from(ticks) << 64,
+    }
+}
+
+/// A store holding a sealed book resting [`RESTING`] asks of `size` base
+/// units each, the escrow holding far more than they ask, with the settler
+/// funded.
+fn sealed_book(executor: &Executor, size: u128) -> SimShardStorage {
+    let asks = (1..=RESTING)
+        .map(|ticks| (ask_at(ticks), Some(size.to_le_bytes().to_vec())))
+        .collect();
+    let storage = storage_seeding(
+        &lottery_packages(),
+        &[(principal(SETTLER), 1_000_000_000_000)],
+        vec![(book_escrow(), encode_amount(1_000_000).to_vec())],
+        asks,
+    );
+    let seal = signed_book(|mut root| {
+        instantiate(&mut root, book_addr(), ()).expect("a derivable book answers its seal");
+        root.build_presenting(vec![book_meta()], Vec::new())
+            .expect("the intent declares no hole")
+    });
+    let executed = run_tick(executor, &storage, 1, TickEnvironment::unfolded(), seal);
+    assert!(
+        matches!(&executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
+        "the instantiation settles: {:?} {:?}",
+        executed[0].consensus,
+        executed[0].metadata
+    );
+    absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
+    storage
+}
+
+/// A walk of the book over ticks `from` and up, with enough to buy all
+/// of it.
+fn filling_asks(from: u64) -> Transaction {
+    let filler = principal(SETTLER);
+    signed_book(|mut root| {
+        let payment = account::withdraw(&mut root, filler, *PROTOCOL_RESOURCE, 10_000)
+            .expect("withdraw types");
+        let [bought, change] = book::Book::at(book_addr())
+            .fill_asks(&mut root, from, u64::MAX, payment)
+            .expect("a book answers a fill");
+        account::deposit(&mut root, filler, bought).expect("deposit types");
+        account::deposit(&mut root, filler, change).expect("deposit types");
+        root.build().expect("every output is consumed")
+    })
+}
+
+/// [`filling_asks`] from the lowest tick.
+fn filling_every_ask() -> Transaction {
+    filling_asks(1)
+}
+
+/// The fill's declared interval of the ladder from tick one.
+fn the_fills_range() -> DeclaredRange {
+    DeclaredRange {
+        owner: book_addr().into(),
+        collection: asks_collection(),
+        lo: 1 << 64,
+        hi: u128::from(u64::MAX) << 64 | u128::from(u64::MAX),
+        cap: FILL_CAP,
+    }
+}
+
+/// The part `state` serves of the fill's interval, one past its cap.
+fn part_over(state: &SimShardStorage) -> ServedPart {
+    let range = the_fills_range();
+    let entries = state
+        .entries_in_range(
+            range.owner,
+            range.collection,
+            range.lo,
+            range.hi,
+            usize::try_from(FILL_CAP).unwrap() + 1,
+        )
+        .into_iter()
+        .map(|(order, _)| {
+            let key = entry_leaf_key(
+                &ProtocolHasher,
+                EntryKey {
+                    owner: range.owner,
+                    collection: range.collection,
+                    order,
+                },
+            );
+            let leaf = state.cell(key).expect("an entry has its leaf");
+            SubstateEntry::new(key, Some(Bytes::new(leaf).expect("a leaf fits an entry")))
+        })
+        .collect();
+    ServedPart::new(entries, &[], &[range])
+}
+
+/// Run `txs` as one tick's batch over `baseline`, reading nothing of it
+/// past the batch, and answer each transaction's result in order. `parts`
+/// pairs with `txs`.
+fn run_with_parts(
+    executor: &Executor,
+    baseline: &SimShardStorage,
+    txs: &[Transaction],
+    parts: &[Option<&ServedPart>],
+) -> Vec<ExecutedTx> {
+    let trie = ShardTrie::single();
+    let chain = TickChain::new(Arc::new(baseline.clone()));
+    let snapshot = Arc::new(chain.view_at(baseline.jmt_height()).snapshot());
+    let ctx = TickBatchContext {
+        local_shard: ShardId::ROOT,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
+        points: Some(Arc::clone(&snapshot) as Arc<dyn PointReads>),
+    };
+    let verified: Vec<Verified<Transaction>> = txs
+        .iter()
+        .map(|tx| {
+            tx.try_derived(executor.derivation().as_ref())
+                .expect("a fixture transaction derives");
+            Verified::<Transaction>::from_persisted(tx.clone())
+        })
+        .collect();
+    let inputs: Vec<TickTxInput<'_>> = verified
+        .iter()
+        .zip(parts)
+        .map(|(tx, part)| TickTxInput {
+            tx_hash: tx.hash(),
+            transaction: tx,
+            provisions: &[],
+            clock: ctx.tick_ts,
+            prices: PriceTable::GENESIS,
+            member: Member::whole(ShardId::ROOT),
+            arrivals: &[],
+            served_part: *part,
+        })
+        .collect();
+    let executed = executor
+        .execute_tick_batch(&ctx, &*snapshot, &inputs)
+        .expect("the harness engine holds every package it runs");
+    verified
+        .iter()
+        .map(|tx| {
+            executed
+                .iter()
+                .find(|run| run.tx_hash == tx.hash())
+                .expect("every input has a result")
+                .clone()
+        })
+        .collect()
+}
+
+/// What `run` moved out of the book's escrow.
+fn taken_from_escrow(run: &ExecutedTx) -> u128 {
+    let ConsensusReceipt::Succeeded { writes, .. } = &run.consensus else {
+        panic!("the fill settles: {:?} {:?}", run.consensus, run.metadata);
+    };
+    writes
+        .movements
+        .get(&book_escrow())
+        .map_or(0, |moved| moved.debit)
+}
+
+/// A member's part reads over the baseline whatever a batch-mate's wider
+/// declaration holds there: the baseline rests one base at each tick, and
+/// two at each in the state the part serves, and the member walks the
+/// part's sixty-four asks whether the mate reaches past them or not.
+#[test]
+fn a_batch_mates_wider_range_does_not_reach_a_served_range() {
+    let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
+    let baseline = sealed_book(&executor, 1);
+    let at_head = sealed_book(&executor, 2);
+    let part = part_over(&at_head);
+    let member = filling_every_ask();
+    let mate = filling_asks(RESTING);
+
+    let walked = 2 * u128::from(FILL_CAP);
+    let alone = run_with_parts(
+        &executor,
+        &baseline,
+        std::slice::from_ref(&member),
+        &[Some(&part)],
+    );
+    assert_eq!(taken_from_escrow(&alone[0]), walked);
+
+    let beside = run_with_parts(&executor, &baseline, &[member, mate], &[Some(&part), None]);
+    assert_eq!(
+        taken_from_escrow(&beside[0]),
+        walked,
+        "the mate adds nothing"
+    );
+    assert_eq!(
+        taken_from_escrow(&beside[1]),
+        1,
+        "the mate read the baseline"
+    );
+}
+
+/// A key the part served absent reads absent over a baseline that holds
+/// it, with no provisions in sight: an emptied ladder walks nothing, and
+/// a read of a cell the part proves absent finds nothing.
+#[test]
+fn a_served_key_absent_at_the_head_reads_absent_without_provisions() {
+    let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
+    let baseline = sealed_book(&executor, 1);
+    let fill = filling_every_ask();
+
+    let unserved = run_with_parts(&executor, &baseline, std::slice::from_ref(&fill), &[None]);
+    assert_eq!(taken_from_escrow(&unserved[0]), u128::from(FILL_CAP));
+
+    let empty = ServedPart::new(Vec::new(), &[], &[the_fills_range()]);
+    let emptied = run_with_parts(
+        &executor,
+        &baseline,
+        std::slice::from_ref(&fill),
+        &[Some(&empty)],
+    );
+    assert_eq!(
+        taken_from_escrow(&emptied[0]),
+        0,
+        "no ask stood at the head"
+    );
+
+    let config = config_key(book_addr());
+    assert!(baseline.cell(config).is_some(), "the baseline holds it");
+    let absent = ServedPart::new(
+        vec![SubstateEntry::new(config, None)],
+        &[config],
+        &[the_fills_range()],
+    );
+    let unread = run_with_parts(
+        &executor,
+        &baseline,
+        std::slice::from_ref(&fill),
+        &[Some(&absent)],
+    );
+    assert!(
+        !matches!(&unread[0].consensus, ConsensusReceipt::Succeeded { .. }),
+        "the book's config reads absent: {:?}",
+        unread[0].metadata,
+    );
+}
+
 /// A walk that removes every ask its page shows stops at the page: the
 /// ask past the cap was the successor its lift read, never an entry the
 /// page holds, so the walk never reaches for a sixty-fifth write.
@@ -609,56 +872,9 @@ fn signed_book(build: impl FnOnce(IntentBuilder<'_>) -> IntentTree) -> Transacti
 #[test]
 fn a_removal_from_a_full_page_counts_within_its_first_lift() {
     let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
-    let owner = Address::from(book_addr());
-    let asks = (1..=RESTING)
-        .map(|ticks| {
-            (
-                EntryKey {
-                    owner,
-                    collection: collection_id(&ProtocolHasher, book_addr(), book::ASKS, &[]),
-                    order: u128::from(ticks) << 64,
-                },
-                Some(1u128.to_le_bytes().to_vec()),
-            )
-        })
-        .collect();
-    let escrow = child_key(
-        &ProtocolHasher,
-        owner,
-        SlotId(<book::Base as VaultField>::SLOT),
-        &[Value::Address(BOOK_BASE_RESOURCE.address()).canonical_bytes()],
-    );
-    let storage = storage_seeding(
-        &lottery_packages(),
-        &[(principal(SETTLER), 1_000_000_000_000)],
-        vec![(escrow, encode_amount(u128::from(RESTING)).to_vec())],
-        asks,
-    );
+    let storage = sealed_book(&executor, 1);
 
-    let seal = signed_book(|mut root| {
-        instantiate(&mut root, book_addr(), ()).expect("a derivable book answers its seal");
-        root.build_presenting(vec![book_meta()], Vec::new())
-            .expect("the intent declares no hole")
-    });
-    let executed = run_tick(&executor, &storage, 1, TickEnvironment::unfolded(), seal);
-    assert!(
-        matches!(&executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
-        "the instantiation settles: {:?} {:?}",
-        executed[0].consensus,
-        executed[0].metadata
-    );
-    absorb_committed_cells([&executed[0].consensus], executor.derivation().as_ref());
-
-    let fill = signed_book(|mut root| {
-        let payment = account::withdraw(&mut root, principal(SETTLER), *PROTOCOL_RESOURCE, 10_000)
-            .expect("withdraw types");
-        let [bought, change] = book::Book::at(book_addr())
-            .fill_asks(&mut root, 1, u64::MAX, payment)
-            .expect("a book answers a fill");
-        account::deposit(&mut root, principal(SETTLER), bought).expect("deposit types");
-        account::deposit(&mut root, principal(SETTLER), change).expect("deposit types");
-        root.build().expect("every output is consumed")
-    });
+    let fill = filling_every_ask();
     let executed = run_tick(&executor, &storage, 2, TickEnvironment::unfolded(), fill).remove(0);
     assert!(
         matches!(&executed.consensus, ConsensusReceipt::Succeeded { .. }),

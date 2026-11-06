@@ -234,6 +234,11 @@ pub enum TickLine {
         /// is shared with a sibling, every escrowed crossing it consumes,
         /// which its row keeps while it stands. Empty on every other line.
         crossings: Crossings,
+        /// On a line running a member a sibling shares the verdict on and
+        /// reading keys of this shard, its row's head height: the block
+        /// whose state serves its part, and from which this shard's own
+        /// tick reads those keys. `None` on every other line.
+        served_at: Option<BlockHeight>,
     },
     /// The chain lets a member go with an abort no certificate attests:
     /// its row leaves the family, and its charge is burned where its

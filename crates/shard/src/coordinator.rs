@@ -11410,6 +11410,7 @@ mod tests {
             reserves: terms.reserves,
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -11591,6 +11592,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         };
         let holding_tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
         let mut mispriced = joining(&first, Joins::Executes);
@@ -11821,6 +11823,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: row.deadline,
             crossings: Capped::empty(),
+            served_at: None,
         };
         (row, abort)
     }
@@ -12303,6 +12306,7 @@ mod tests {
                 reserves,
                 deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             }
         };
         let committing = carrying(
@@ -14083,6 +14087,7 @@ mod tests {
                 reserves: Capped::from_array([(FeeTerms::of(held).vault, HELD_RESERVES)]),
                 deadline: Deadline::of_transaction(held),
                 crossings: Capped::empty(),
+                served_at: None,
             }],
         );
         [committing, naming]
@@ -14639,6 +14644,7 @@ mod tests {
             reserves: terms.reserves,
             deadline: Deadline::of_transaction(&tx),
             crossings: Capped::empty(),
+            served_at: Some(BlockHeight::new(2)),
         };
         let child = |lines: Vec<TickLine>| {
             carrying(
@@ -14726,6 +14732,7 @@ mod tests {
                     reserves: terms.reserves.clone(),
                     deadline: Deadline::of_transaction(&tx),
                     crossings: Capped::empty(),
+                    served_at: Some(BlockHeight::new(2)),
                 }],
             )
         };
@@ -14793,6 +14800,7 @@ mod tests {
             reserves: terms.reserves,
             deadline: Deadline::of_transaction(&tx),
             crossings: terms.crossings,
+            served_at: None,
         };
         assert!(
             state
@@ -14906,6 +14914,7 @@ mod tests {
             reserves: terms.reserves,
             deadline: Deadline::of_transaction(&tx),
             crossings: terms.crossings,
+            served_at: None,
         };
         assert!(
             restarted
@@ -15195,6 +15204,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of_transaction(&holder),
                 crossings: Capped::empty(),
+                served_at: None,
             }])),
             ..MemberInputs::still(ShardId::ROOT)
         });
@@ -15546,6 +15556,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of_transaction(tx),
                 crossings: Capped::empty(),
+                served_at: None,
             })
             .collect();
         for lines in [Vec::new(), run_all] {

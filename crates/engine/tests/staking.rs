@@ -1062,6 +1062,7 @@ impl DividedStake {
                 BTreeSet::from([self.payer_shard, self.core, self.sibling]),
             ),
             arrivals,
+            served_part: None,
         };
         self.executor
             .execute_tick_batch(&ctx, store, &[input])
@@ -1284,6 +1285,7 @@ fn a_core_member_is_unaffected_by_a_batch_mates_lists() {
                 clock: WeightedTimestamp::from_millis(1_000),
                 member: Member::of(divided.classified.clone(), divided.core, reach.clone()),
                 arrivals: &handed,
+                served_part: None,
             },
             TickTxInput {
                 prices: PriceTable::GENESIS,
@@ -1293,6 +1295,7 @@ fn a_core_member_is_unaffected_by_a_batch_mates_lists() {
                 clock: WeightedTimestamp::from_millis(1_000),
                 member: Member::of(mate_classified.clone(), divided.core, reach.clone()),
                 arrivals: &[],
+                served_part: None,
             },
         ];
         divided
@@ -1353,6 +1356,7 @@ impl DividedStake {
                 BTreeSet::from([self.payer_shard, self.core, self.sibling]),
             ),
             arrivals,
+            served_part: None,
         }
     }
 

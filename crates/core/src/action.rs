@@ -14,10 +14,10 @@ use hyperscale_engine::legs::Member;
 use hyperscale_storage::{CommittedHere, MemberInputs, TickResolution};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, DeclaredRange, Epoch,
-    EscrowedValue, Finalization, FrontierInputs, HeaderFetchCount, PriceTable, ProvisionTxRootsMap,
-    ReadFence, SettledTxsRoot, ShardId, ShardTrie, SharedTransactions, SplitChildRoots, StateClaim,
-    StateRoot, SubstateEntry, SubstateKey, SweepFrontier, TickId, Transaction, TransactionStatus,
-    TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    EscrowedValue, Finalization, FrontierInputs, HeaderFetchCount, Holds, PriceTable,
+    ProvisionTxRootsMap, ReadFence, SettledTxsRoot, ShardId, ShardTrie, SharedTransactions,
+    SplitChildRoots, StateClaim, StateRoot, SubstateEntry, SubstateKey, SweepFrontier, TickId,
+    Transaction, TransactionStatus, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 pub use provisions::ProvisionAction;
 
@@ -228,6 +228,10 @@ pub struct CrossShardExecutionRequest {
     /// its verdict and reads keys of this shard. The tick waits for this
     /// height to be written, and the store holds it until the tick is run.
     pub served_at: Option<BlockHeight>,
+    /// What the line running it holds: its declaration, where a verdict
+    /// can still discard it. The keys it serves itself are read off these,
+    /// as a counterpart's copy of its part is read off its row.
+    pub holds: Holds,
 }
 
 /// A change to the local vnode's reshape-observer duty, carried on

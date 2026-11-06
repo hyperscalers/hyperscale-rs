@@ -160,6 +160,7 @@ fn request_for(tx: &Verified<Transaction>) -> CrossShardExecutionRequest {
         ),
         arrivals: Vec::new(),
         served_at: None,
+        holds: Capped::empty(),
     }
 }
 

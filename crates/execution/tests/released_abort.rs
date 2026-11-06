@@ -65,6 +65,7 @@ fn aborting(tx: &Transaction) -> TickLine {
         reserves: Capped::empty(),
         deadline: Deadline::of_transaction(tx),
         crossings: Capped::empty(),
+        served_at: None,
     }
 }
 

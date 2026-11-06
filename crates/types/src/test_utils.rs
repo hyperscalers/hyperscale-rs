@@ -570,6 +570,7 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
                 reserves: Capped::empty(),
                 deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             })
             .collect(),
     )

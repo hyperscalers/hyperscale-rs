@@ -985,6 +985,7 @@ mod tests {
                 reserves: terms.reserves,
                 deadline: Deadline::of_transaction(&first),
                 crossings: Capped::empty(),
+                served_at: None,
             }])),
             ..MemberInputs::still(LOCAL)
         };

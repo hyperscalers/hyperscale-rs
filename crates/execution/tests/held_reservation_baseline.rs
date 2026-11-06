@@ -23,7 +23,7 @@ use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
 };
 use hyperscale_execution::action_handlers::accumulate_tick_output;
-use hyperscale_hbor::Bytes;
+use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_storage::{
     Anchored, NoFeeHolds, SubstateStore, Substates, TickChain, TickOutput, VersionedStore,
 };
@@ -158,6 +158,7 @@ fn abortable(tx: &Verified<Transaction>) -> CrossShardExecutionRequest {
         ),
         arrivals: Vec::new(),
         served_at: None,
+        holds: Capped::empty(),
     }
 }
 

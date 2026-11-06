@@ -3811,6 +3811,7 @@ mod tests {
             reserves: terms.reserves,
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 

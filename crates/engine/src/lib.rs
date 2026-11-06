@@ -39,7 +39,7 @@ pub mod sharding;
 pub mod tick_select;
 
 pub use backend::Availability;
-pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
+pub use batch::{ServedPart, TickBatchContext, TickEnvironment, TickTxInput};
 #[cfg(feature = "test-utils")]
 pub use executor::AllCodeRuns;
 pub use executor::{

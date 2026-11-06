@@ -2877,6 +2877,7 @@ pub mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
                 crossings: Capped::empty(),
+                served_at: None,
             }])),
             ..MemberInputs::still(against.local_shard)
         };
@@ -6411,6 +6412,7 @@ pub mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 

@@ -16,22 +16,68 @@ use std::sync::Arc;
 use hyperscale_core::{
     ActionContext, CrossShardExecutionRequest, ExecutionAction, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::{ExecutedTx, PointReads, TickBatchContext, TickTxInput};
+use hyperscale_engine::{ExecutedTx, PointReads, ServedPart, TickBatchContext, TickTxInput};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
+use hyperscale_provisions::own_served_entries;
 use hyperscale_storage::{
-    ProvisionalTx, ShardStorage, TickOutput, declared_reservations, fold_state_writes, staged_yes,
+    ProvisionalTx, ShardStorage, TickChain, TickOutput, declared_reservations, fold_state_writes,
+    staged_yes,
 };
 use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVoteNotification,
 };
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
-    ExecutionCertificatesSenderMessage, ExecutionVote, Finalization, FinalizationContext,
+    ExecutionCertificatesSenderMessage, ExecutionVote, Finalization, FinalizationContext, ShardId,
     StateWrites, Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, Verifiable,
     Verified, shard_prefix_path, signed_bytes,
 };
+
+/// What each of `requests` that serves itself a part reads of it: the
+/// entries a counterpart sharing its verdict absorbed, read at its head
+/// height.
+///
+/// # Panics
+///
+/// If the store does not hold a head height, which the dispatch gate and
+/// retention rule out, or a range names an entry with no leaf. Either
+/// is a defect every replica may share, and running on anything else
+/// would split the member from its counterparts.
+#[must_use]
+pub fn own_parts<S: ShardStorage>(
+    chain: &TickChain<S>,
+    shard: ShardId,
+    requests: &[CrossShardExecutionRequest],
+) -> BTreeMap<TxHash, ServedPart> {
+    let mut snapshots = BTreeMap::new();
+    let mut parts = BTreeMap::new();
+    for request in requests {
+        let Some(head) = request.served_at else {
+            continue;
+        };
+        let state = snapshots.entry(head).or_insert_with(|| {
+            chain.base_at(head).unwrap_or_else(|| {
+                panic!(
+                    "BFT CRITICAL: the store holds no head height {head} a dispatched tick reads"
+                )
+            })
+        });
+        let part = own_served_entries(&*state, shard, request.tx_hash, &request.holds)
+            .unwrap_or_else(|| {
+                panic!(
+                    "BFT CRITICAL: a range of {} names an entry with no leaf at its head height",
+                    request.tx_hash
+                )
+            });
+        parts.insert(
+            request.tx_hash,
+            ServedPart::new(part.entries, &part.cells, &part.ranges),
+        );
+    }
+    parts
+}
 
 // ============================================================================
 // Tick-based execution voting handlers
@@ -288,6 +334,9 @@ where
             // probe past it read through it, so a probe answers at the
             // anchor even once a floor raise lets retention pass it.
             let view_snap = Arc::new(view.snapshot());
+            // Beside it, on the same terms: each height a member reads its
+            // own part at, for as long as the batch runs.
+            let served_parts = own_parts(ctx.tick_chain, ctx.shard, &requests);
             // From the same view as the baseline, so a leg's debit and
             // the hold standing for it are never both visible, nor are a
             // burn and the fee hold it came out of.
@@ -312,6 +361,7 @@ where
                     prices: r.prices,
                     member: r.member.clone(),
                     arrivals: &r.arrivals,
+                    served_part: served_parts.get(&r.tx_hash),
                 })
                 .collect();
             let executed = match ctx

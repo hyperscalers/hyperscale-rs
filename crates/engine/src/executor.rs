@@ -42,8 +42,8 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_kernel::{
     AmountLedger, Baseline, BatchError, BatchTx, EnvInputs, ExecutionMode, FeeBurn, FeeHolds, Job,
-    LegPlan, ManifestWalk, MemoryStore, OverlayStore, OwnerSet, Receipt, StoreError, Substates,
-    WithheldCredits, execute_batch,
+    LegPlan, ManifestWalk, MemoryStore, OverlayStore, OwnerSet, Receipt, ServedReads, StoreError,
+    Substates, WithheldCredits, execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -353,8 +353,15 @@ pub fn materialize_declared(
 /// Returns the reads and how many of them are entries.
 fn provisioned_reads(lists: &[Arc<Vec<SubstateEntry>>]) -> (MemoryStore, usize) {
     let mut reads = MemoryStore::new();
+    let entries = lists.iter().map(|list| absorb_part(&mut reads, list)).sum();
+    (reads, entries)
+}
+
+/// Write `part` into `reads`, and how many of its leaves were collection
+/// entries. An absent cell writes nothing: it reads absent.
+fn absorb_part(reads: &mut MemoryStore, part: &[SubstateEntry]) -> usize {
     let mut entries = 0;
-    for entry in lists.iter().flat_map(|entries| entries.iter()) {
+    for entry in part {
         let Some(value) = entry.value.as_ref() else {
             continue;
         };
@@ -365,7 +372,7 @@ fn provisioned_reads(lists: &[Arc<Vec<SubstateEntry>>]) -> (MemoryStore, usize) 
             reads.write(entry.key, value.clone().into_inner());
         }
     }
-    (reads, entries)
+    entries
 }
 
 /// The VM engine: the genesis-static world, the compiled stdlib guests,
@@ -1369,22 +1376,38 @@ struct MemberInputs<'a> {
     receipt: &'a Receipt,
     fee: Option<(PayerFee, u128)>,
     input: Option<&'a TickTxInput<'a>>,
-    own_reads: Option<&'a MemoryStore>,
+    own_reads: Option<&'a MemberReads>,
     instances: &'a dyn ChainRecords,
     presented: &'a [InstanceMeta],
 }
 
-/// The committed value `key` holds as one member reads it: the batch's
-/// baseline, and beneath it what that member alone was provisioned.
+/// What one member reads that no batch-mate does: what it was provisioned
+/// and the part its own shard serves it, and the keys of that part, which
+/// it reads from there and nowhere else.
+#[derive(Debug)]
+struct MemberReads {
+    store: Arc<MemoryStore>,
+    served: Arc<ServedReads>,
+}
+
+/// The committed value `key` holds as one member reads it: the part alone
+/// on a key its own shard serves it, an absence included, and otherwise
+/// the batch's baseline, and beneath it what that member alone was
+/// provisioned.
 fn member_cell(
     base: &TickBaseline,
-    own_reads: Option<&MemoryStore>,
+    own_reads: Option<&MemberReads>,
     key: SubstateKey,
 ) -> Option<Vec<u8>> {
+    if let Some(own) = own_reads
+        && own.served.cells.contains(&key)
+    {
+        return own.store.cell(key);
+    }
     base.cells
         .get(&key)
         .cloned()
-        .or_else(|| own_reads.and_then(|own| own.cell(key)))
+        .or_else(|| own_reads.and_then(|own| own.store.cell(key)))
 }
 
 /// What a member that ran is charged, and the charge its refusal receipt
@@ -1632,16 +1655,28 @@ impl Executor {
         // provisions and no batch-mate's. Two members can hold one remote
         // cell at different heights of its source, and the shards running
         // a transaction batch it with different neighbours, so a value
-        // read off a neighbour's list would split its receipt.
-        let own_reads: BTreeMap<TxHash, Arc<MemoryStore>> = inputs
+        // read off a neighbour's list would split its receipt. The part
+        // its own shard serves it sits there too, and reads over the
+        // baseline, so a key absent from that part reads absent here as
+        // it does on every counterpart, provisions or none.
+        let own_reads: BTreeMap<TxHash, MemberReads> = inputs
             .iter()
-            .filter(|i| !i.provisions.is_empty())
+            .filter(|i| !i.provisions.is_empty() || i.served_part.is_some())
             .map(|i| {
-                let (reads, entries) = provisioned_reads(i.provisions);
+                let (mut reads, entries) = provisioned_reads(i.provisions);
                 if entries > 0 && i.member.role() == Role::Core {
                     record_provision_range_entries_consumed(ctx.local_shard.inner(), entries);
                 }
-                (i.tx_hash, Arc::new(reads))
+                if let Some(part) = i.served_part {
+                    absorb_part(&mut reads, &part.entries);
+                }
+                let reads = MemberReads {
+                    store: Arc::new(reads),
+                    served: i
+                        .served_part
+                        .map_or_else(Arc::default, |part| Arc::clone(&part.served)),
+                };
+                (i.tx_hash, reads)
             })
             .collect();
         let mut drawn = BTreeMap::new();
@@ -1890,7 +1925,9 @@ impl Executor {
                         .is_none_or(|input| input.member.abortable()),
                 );
                 match own_reads.get(vm_tx) {
-                    Some(own) => batched.with_served_reads(Arc::clone(own), Arc::default()),
+                    Some(own) => {
+                        batched.with_served_reads(Arc::clone(&own.store), Arc::clone(&own.served))
+                    }
                     None => batched,
                 }
             })
@@ -1971,7 +2008,7 @@ impl Executor {
                     receipt,
                     fee: fee_by_tx.get(vm_tx).map(|payer| (*payer, apart(vm_tx))),
                     input: shapes.get(vm_tx).copied(),
-                    own_reads: own_reads.get(vm_tx).map(AsRef::as_ref),
+                    own_reads: own_reads.get(vm_tx),
                     instances: records
                         .get(vm_tx)
                         .expect("every receipt is an input's, which resolves through its own"),
@@ -2074,7 +2111,7 @@ impl Executor {
                     // Refused before any of it ran, so nothing of this
                     // batch wrote its answers: the tick's baseline is
                     // what says whether one already stands.
-                    let own = own_reads.get(&vm_tx).map(AsRef::as_ref);
+                    let own = own_reads.get(&vm_tx);
                     let nevers = never_answers(
                         shapes.get(&vm_tx).copied(),
                         vm_tx,
@@ -2138,6 +2175,7 @@ impl Executor {
                 prices,
                 member: Member::whole(ctx.local_shard),
                 arrivals: &[],
+                served_part: None,
             })
             .collect();
         self.run_batch(ctx, snapshot, &inputs)
@@ -2173,6 +2211,39 @@ mod tests {
 
     use super::*;
     use crate::genesis::vault_key;
+
+    /// A served key answers from the part alone, an absence included,
+    /// over a baseline that holds it. Any other key reads the baseline,
+    /// and the member's own reads only beneath it.
+    #[test]
+    fn member_cell_reads_a_served_key_from_the_part() {
+        let cell = |seed: u8| SubstateKey {
+            owner: Address::new([seed; 31], AddressClass::Component),
+            local: LocalKey([seed; 16]),
+        };
+        let (served, absent, plain, own_only) = (cell(1), cell(2), cell(3), cell(4));
+        let mut base = TickBaseline::default();
+        for key in [served, absent, plain] {
+            base.cells.insert(key, b"view".to_vec());
+        }
+        let mut store = MemoryStore::new();
+        store.write(served, b"part".to_vec());
+        store.write(plain, b"part".to_vec());
+        store.write(own_only, b"part".to_vec());
+        let own = MemberReads {
+            store: Arc::new(store),
+            served: Arc::new(ServedReads {
+                cells: [served, absent].into_iter().collect(),
+                ranges: Vec::new(),
+            }),
+        };
+        let read = |key| member_cell(&base, Some(&own), key);
+        assert_eq!(read(served), Some(b"part".to_vec()));
+        assert_eq!(read(absent), None, "the part proved it absent");
+        assert_eq!(read(plain), Some(b"view".to_vec()));
+        assert_eq!(read(own_only), Some(b"part".to_vec()));
+        assert_eq!(member_cell(&base, None, served), Some(b"view".to_vec()));
+    }
 
     /// A success writing one cell `width` bytes wide, beside the refusal
     /// receipt its member settles if refused: its charge out of the

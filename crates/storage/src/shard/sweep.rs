@@ -1201,6 +1201,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             }])),
             ..MemberInputs::still(shard)
         });

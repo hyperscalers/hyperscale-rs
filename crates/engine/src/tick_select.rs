@@ -22,7 +22,7 @@ use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_terminal_fated_hearing_rows;
 use hyperscale_storage::{
     MemberIndex, MemberRow, QueueHolds, RowState, committed_tx_cell_key, member_row_leaf,
-    pinned_holds, seat_leaf,
+    pinned_holds, seat_leaf, served_from_head,
 };
 use hyperscale_types::{
     AbortCharge, Anchor, BlockHeight, Crossings, Deadline, Decision, DeclaredKey, DiscardCause,
@@ -277,6 +277,8 @@ pub struct Judged<'a> {
     /// which a member a counterpart shares the verdict on needs before a
     /// line runs it.
     head: bool,
+    /// The height its row stood head at, off a row that carries one.
+    head_height: Option<BlockHeight>,
 }
 
 impl<'a> Judged<'a> {
@@ -294,6 +296,7 @@ impl<'a> Judged<'a> {
             waits: terms.waits,
             staged: terms.staged,
             head: false,
+            head_height: None,
         }
     }
 
@@ -327,6 +330,7 @@ impl<'a> Judged<'a> {
             waits: waiting.waits,
             staged: waiting.staged,
             head: row.head.is_some(),
+            head_height: row.head.map(|head| head.height),
         }
     }
 
@@ -1611,6 +1615,7 @@ impl Nameable<'_> {
             } else {
                 self.crossings.clone()
             },
+            served_at: None,
         };
         let discard = match self.standing {
             Standing::Held { tick, .. } => Some(TickLine::Discard {
@@ -1771,6 +1776,9 @@ pub fn select_members<'a>(
             } else {
                 Capped::empty()
             },
+            served_at: judged
+                .head_height
+                .filter(|_| served_from_head(judged.settlement, &pinned)),
         };
 
         if !budget.take(&line) {
@@ -2818,6 +2826,7 @@ mod tests {
             reserves: entry.terms.reserves,
             deadline: far(),
             crossings: Capped::empty(),
+            served_at: None,
         };
         assert!(to_vec(&line).expect("a line encodes").len() <= line.wire_weight());
     }
@@ -2852,6 +2861,7 @@ mod tests {
             reserves: terms.reserves.clone(),
             deadline,
             crossings: Capped::empty(),
+            served_at: None,
         };
         let committing = |stated: Vec<StatedTerms>, lines: Vec<TickLine>| MemberInputs {
             height: at(1),
@@ -2929,6 +2939,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: far(),
             crossings: Capped::empty(),
+            served_at: None,
         };
         rows.advance(&MemberInputs {
             height: at(2),
@@ -3302,6 +3313,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: passed,
                 crossings: Capped::empty(),
+                served_at: None,
             }],
         );
     }
@@ -3343,6 +3355,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             }],
         );
     }
@@ -3418,6 +3431,7 @@ mod tests {
                     reserves: Capped::empty(),
                     deadline,
                     crossings: Capped::empty(),
+                    served_at: None,
                 },
                 TickLine::Discard {
                     tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
@@ -3610,6 +3624,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             },
             TickLine::Discard {
                 tick: TickId::new(ShardId::ROOT, BlockHeight::new(tick)),
@@ -3840,6 +3855,7 @@ mod tests {
             reserves: row.reserves.clone(),
             deadline: row.deadline,
             crossings,
+            served_at: None,
         }
     }
 
@@ -5061,6 +5077,7 @@ mod tests {
                     reserves: core.reserves.clone(),
                     deadline,
                     crossings: core.crossings.clone(),
+                    served_at: None,
                 }],
             );
             let named = &rows.members[&tx(1)];
@@ -5738,6 +5755,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: far(),
                 crossings: Capped::empty(),
+                served_at: None,
             };
             assert_eq!(
                 contentions(&rows, &[named], ms(0), &held),
@@ -5792,6 +5810,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: far(),
             crossings: Capped::empty(),
+            served_at: None,
         };
         assert_eq!(
             contentions(&rows, &[named], ms(0), &held),
@@ -5900,6 +5919,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: far(),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -7843,6 +7863,7 @@ mod tests {
                     reserves: Capped::empty(),
                     deadline: far(),
                     crossings: Capped::empty(),
+                    served_at: None,
                 }])),
                 ..MemberInputs::still(PEER)
             },
@@ -8042,6 +8063,7 @@ mod tests {
                 staged: terms.staged,
                 deadline: far(),
                 crossings: Capped::empty(),
+                served_at: None,
             }
         }
 
@@ -8086,6 +8108,61 @@ mod tests {
         }
 
         const RUNS: Option<&Joins> = Some(&Joins::Executes);
+
+        /// What the line running each member says serves it.
+        fn served_ats(
+            rows: &MemberIndex,
+            anchor: WeightedTimestamp,
+        ) -> BTreeMap<TxHash, Option<BlockHeight>> {
+            let live = |_, _| Evidence::Live { terminating: false };
+            let (lines, _) = lines_and_missing(
+                rows,
+                anchor,
+                &Held::default(),
+                &live,
+                false,
+                &BTreeSet::new(),
+            );
+            lines
+                .iter()
+                .filter_map(|line| match line {
+                    TickLine::Member { tx, served_at, .. } => Some((*tx, *served_at)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A line running a shared member that reads keys of this shard
+        /// carries the height its row stood head at, which is not the height
+        /// that committed it where the member waited. A member only
+        /// crediting here is served from its commit and carries none, nor
+        /// does a member its own certificate settles.
+        #[test]
+        fn a_shared_line_carries_its_head_height() {
+            let writer = shared(vec![(key(1), WRITE)]);
+            let reader = shared(vec![(key(1), READ)]);
+            let crediting = shared(vec![(key(2), CREDIT)]);
+            let determined = alone(vec![(key(3), WRITE)]);
+            let mut rows = committed(&[
+                (1, &writer),
+                (2, &reader),
+                (3, &crediting),
+                (4, &determined),
+            ]);
+
+            let lines = served_ats(&rows, clock(5));
+            assert_eq!(lines[&tx(1)], Some(BlockHeight::new(1)));
+            assert!(!lines.contains_key(&tx(2)), "behind the write");
+            assert_eq!(lines[&tx(3)], None);
+            assert_eq!(lines[&tx(4)], None);
+
+            rows.advance(&with_lines(block(5), vec![gone(1)]));
+            assert_eq!(
+                served_ats(&rows, clock(6))[&tx(2)],
+                Some(BlockHeight::new(5)),
+                "the block that made it head, past the one that committed it",
+            );
+        }
 
         /// A shared member is named only once its row stands head: one
         /// behind an earlier writer waits for it to leave, and one built

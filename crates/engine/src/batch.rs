@@ -17,9 +17,10 @@ use std::sync::Arc;
 
 use hyperscale_storage::FeeHoldReading;
 use hyperscale_types::{
-    EpochWindows, EscrowedValue, ProvisionalHolds, SeedRing, ShardId, ShardTrie, SubstateEntry,
-    TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
+    DeclaredRange, EpochWindows, EscrowedValue, ProvisionalHolds, SeedRing, ShardId, ShardTrie,
+    SubstateEntry, SubstateKey, TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
 };
+use hyperscale_vm_kernel::{ServedRange, ServedReads};
 use hyperscale_vm_types::{PriceTable, SeedWindow};
 
 use crate::executor::PointReads;
@@ -165,6 +166,44 @@ pub struct TickTxInput<'a> {
     /// What committed bundles attested for the edges this shard's legs
     /// consume. Empty for a member that runs whole.
     pub arrivals: &'a [EscrowedValue],
+    /// The part its own shard serves it, where a counterpart shares its
+    /// verdict and reads keys of this shard.
+    pub served_part: Option<&'a ServedPart>,
+}
+
+/// The part a shard serves a member of its own, as the batch reads it:
+/// beneath the baseline with the rest of what the member was handed, and
+/// over it on the keys the part answers for.
+#[derive(Debug, Clone)]
+pub struct ServedPart {
+    pub(crate) entries: Arc<Vec<SubstateEntry>>,
+    pub(crate) served: Arc<ServedReads>,
+}
+
+impl ServedPart {
+    /// The part holding `entries`, which answers for `cells` and `ranges`.
+    #[must_use]
+    pub fn new(
+        entries: Vec<SubstateEntry>,
+        cells: &[SubstateKey],
+        ranges: &[DeclaredRange],
+    ) -> Self {
+        Self {
+            entries: Arc::new(entries),
+            served: Arc::new(ServedReads {
+                cells: cells.iter().copied().collect(),
+                ranges: ranges
+                    .iter()
+                    .map(|range| ServedRange {
+                        owner: range.owner,
+                        collection: range.collection,
+                        lo: range.lo,
+                        hi: range.hi,
+                    })
+                    .collect(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]

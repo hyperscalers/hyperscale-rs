@@ -33,7 +33,7 @@ mod verified_headers;
 
 #[cfg(feature = "test-utils")]
 pub use build::build_provisions;
-pub use build::{Owed, build_part};
+pub use build::{Owed, OwnPart, build_part, own_served_entries};
 pub use content::{Unrouted, leaves_over_requests, provision_tx_roots, served_keys, served_leaf};
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};

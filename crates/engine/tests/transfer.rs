@@ -1370,6 +1370,7 @@ fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
                 BTreeSet::from([near_shard, far_shard]),
             ),
             arrivals,
+            served_part: None,
         };
         let executed = executor
             .execute_tick_batch(&ctx, &snapshot_store, &[input])
@@ -1609,6 +1610,7 @@ fn a_transfer_executes_divided_on_the_payers_shard() {
                 BTreeSet::from([near_shard, far_shard]),
             ),
             arrivals,
+            served_part: None,
         };
         executor
             .execute_tick_batch(&ctx, &snapshot_store, &[input])
@@ -1702,6 +1704,7 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
             clock: WeightedTimestamp::from_millis(1_000),
             member,
             arrivals: &[],
+            served_part: None,
         };
         executor
             .execute_tick_batch(&ctx, store, &[input])
@@ -1841,6 +1844,7 @@ fn a_consumers_taken_read_present_retires_the_record_in_the_fold() {
                 .collect(),
         ),
         arrivals: &[],
+        served_part: None,
     };
     let sent = executor
         .execute_tick_batch(&ctx, &store, &[input])
@@ -1924,6 +1928,7 @@ fn inherited_record() -> Inherited {
                 .collect(),
         ),
         arrivals: &[],
+        served_part: None,
     };
     let sent = executor
         .execute_tick_batch(&ctx, &store, &[input])
@@ -2006,6 +2011,7 @@ fn run_alone(
         clock: WeightedTimestamp::from_millis(1_000),
         member,
         arrivals: &[],
+        served_part: None,
     };
     executor
         .execute_tick_batch(ctx, snapshot, &[input])
@@ -2167,6 +2173,7 @@ impl HaltedOverASpentVault {
             clock: WeightedTimestamp::from_millis(1_000),
             member: self.core.clone(),
             arrivals: &self.arrivals,
+            served_part: None,
         };
         self.executor
             .execute_tick_batch(
@@ -2299,6 +2306,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
                 BTreeSet::from([near_shard, far_shard]),
             ),
             arrivals: &[],
+            served_part: None,
         };
         executor
             .execute_tick_batch(&ctx, &snapshot_store, &[input])
@@ -2512,6 +2520,7 @@ fn a_reservation_is_judged_before_a_batch_mates_credit_lands() {
             clock: WeightedTimestamp::from_millis(1_000),
             member: member_of(tx),
             arrivals: &[],
+            served_part: None,
         })
         .collect();
     let executed = executor
@@ -2588,6 +2597,7 @@ fn run_beside(
             clock: WeightedTimestamp::from_millis(1_000),
             member: member.clone(),
             arrivals: &[],
+            served_part: None,
         })
         .collect();
     let mut executed = executor
@@ -2879,6 +2889,7 @@ fn a_completed_publish_a_counterpart_can_refuse_carries_its_charge_apart() {
             clock: WeightedTimestamp::from_millis(1_000),
             member,
             arrivals: &[],
+            served_part: None,
         };
         executor
             .execute_tick_batch(&ctx, &snapshot_store, &[input])

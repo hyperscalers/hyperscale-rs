@@ -720,6 +720,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                     reserves: widest_reserves(holds),
                     deadline: widest_deadline(),
                     crossings: widest_crossings(crossings),
+                    served_at: Some(BlockHeight::new(u64::MAX)),
                 };
                 let encoded = hbor_to_vec(&line).expect("a member line encodes");
                 assert!(
@@ -773,12 +774,41 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         reserves: widest_reserves(1),
         deadline: widest_deadline(),
         crossings: widest_crossings(1),
+        served_at: Some(BlockHeight::new(u64::MAX)),
     };
     assert_eq!(
         one.wire_weight(),
         TICK_LINE_BYTES + TICK_HOLD_BYTES + TICK_RESERVE_BYTES + TICK_CROSSING_BYTES,
         "one hold costs one hold, one reserved vault one, and one stated crossing one"
     );
+}
+
+/// A line's flat bytes stand fifteen above a running member's widest terms
+/// holding nothing, its head height among them: the margin every other
+/// list's per-item bytes also carry, and no field rides inside it.
+#[test]
+fn a_bare_lines_bytes_stand_a_fixed_margin_over_its_widest_terms() {
+    let bare = TickLine::Member {
+        staged: u64::MAX,
+        tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
+        joins: Joins::Executes,
+        settlement: Settlement::Awaited,
+        holds: Capped::empty(),
+        pins: Capped::empty(),
+        reach: Capped::empty(),
+        awaits: Capped::empty(),
+        charge: widest_charge(),
+        share: u128::MAX,
+        reserves: Capped::empty(),
+        deadline: widest_deadline(),
+        crossings: Capped::empty(),
+        served_at: Some(BlockHeight::new(u64::MAX)),
+    };
+    assert_eq!(
+        hbor_to_vec(&bare).expect("a member line encodes").len() + 15,
+        TICK_LINE_BYTES,
+    );
+    assert_eq!(bare.wire_weight(), TICK_LINE_BYTES);
 }
 
 /// `count` pins at their widest: distinct keys under every mode bit.
@@ -818,6 +848,7 @@ fn a_determined_lines_weight_bounds_its_encoding_at_every_pin_count() {
             reserves: widest_reserves(pins),
             deadline: widest_deadline(),
             crossings: Capped::empty(),
+            served_at: Some(BlockHeight::new(u64::MAX)),
         };
         let encoded = hbor_to_vec(&line).expect("a member line encodes");
         assert!(
@@ -950,6 +981,7 @@ fn a_line_at_the_crossings_cap_fits_an_empty_manifest() {
         reserves: widest_reserves(MAX_HOLDS_PER_MEMBER),
         deadline: widest_deadline(),
         crossings: widest_crossings(MAX_CROSSINGS_PER_TX),
+        served_at: Some(BlockHeight::new(u64::MAX)),
     };
     let encoded = hbor_to_vec(&line).expect("a member line encodes").len();
     assert!(
@@ -1199,6 +1231,7 @@ fn full_manifest() -> Vec<TickLine> {
         reserves: widest_reserves(64),
         deadline: widest_deadline(),
         crossings: widest_crossings(64),
+        served_at: Some(BlockHeight::new(u64::MAX)),
     };
 
     let lines = vec![line.clone(); MAX_TICK_MANIFEST_BYTES / line.wire_weight()];

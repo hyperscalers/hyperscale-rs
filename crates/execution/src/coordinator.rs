@@ -436,6 +436,14 @@ impl PendingTick {
             .min()
     }
 
+    /// The highest height this tick reads a member's own part at.
+    fn served_ceiling(&self) -> Option<BlockHeight> {
+        self.requests
+            .iter()
+            .filter_map(|request| request.served_at)
+            .max()
+    }
+
     /// The packages this tick's members run that do not resolve on this
     /// node.
     fn missing_code(&self, code: &dyn CodeAvailability) -> Vec<Hash> {
@@ -1508,6 +1516,7 @@ impl ExecutionCoordinator {
                 staged: 0,
                 deadline: entry.deadline,
                 crossings: Capped::new(crossings).expect("a star's edges are capped"),
+                served_at: None,
             });
 
             discards.extend(held_by.map(|tick| TickLine::Discard {
@@ -1679,6 +1688,20 @@ impl ExecutionCoordinator {
         requests.push(request);
     }
 
+    /// Whether this node's store reaches every height `lines` read a
+    /// member's own part at. Outside a replay it does, since retirement
+    /// stops short of them; a replay starts where the store's history
+    /// does, and a height below that is gone.
+    fn reads_its_parts(&self, lines: &[TickLine]) -> bool {
+        let Some(reach) = self.dispatch_from.prev() else {
+            return true;
+        };
+        lines.iter().all(|line| match line {
+            TickLine::Member { served_at, .. } => served_at.is_none_or(|x| x >= reach),
+            _ => true,
+        })
+    }
+
     /// Seat the tick the committing block names: its members, its aborts,
     /// its discards and its fates, as the lines say. Seating reads no
     /// baseline, so it runs whether or not the tick can be dispatched;
@@ -1733,6 +1756,9 @@ impl ExecutionCoordinator {
             }
         }
         let (admitted, in_hand) = self.candidates.take_named(lines, &self.provisioning);
+        // A replay's store may not reach a part's height, so the tick goes
+        // the way of one short of a bundle and its certificate seats it.
+        let in_hand = in_hand && self.reads_its_parts(lines);
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
@@ -4482,9 +4508,11 @@ impl ExecutionCoordinator {
     /// `ExecutionBatchCompleted` — by which point the handler has
     /// appended the output to the tick chain.
     ///
-    /// It waits too for the block below the tick to be written. That
-    /// block's commit is in hand by then, and its write never waits on a
-    /// tick, so the wait ends at the `BlockPersisted` that names it.
+    /// It waits too for the block below the tick to be written, and for
+    /// every height a member of it reads its own part at, which a member
+    /// named in its head block places at the tick's own block. Each of
+    /// those commits is in hand by then, and a block's write never waits
+    /// on a tick, so the wait ends at the `BlockPersisted` that names it.
     ///
     /// The tick goes out with every fate recorded for it so far, which
     /// the chain applies under the acquisition that appends its output.
@@ -4535,7 +4563,9 @@ impl ExecutionCoordinator {
         let Some(Queued::Run(head)) = self.pending_ticks.front() else {
             return Vec::new();
         };
-        if head.tick.prev().is_some_and(|below| below > self.persisted) {
+        if head.tick.prev().is_some_and(|below| below > self.persisted)
+            || head.served_ceiling().is_some_and(|x| x > self.persisted)
+        {
             return Vec::new();
         }
         // Running a member whose code this node lacks would reach the
@@ -9315,6 +9345,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         };
         state.commit_block(
             schedule,
@@ -11109,6 +11140,40 @@ mod tests {
         assert_eq!(state.served_floor(), None);
     }
 
+    /// A member named in the block that makes it head reads the state
+    /// that block leaves, so its tick waits for the block's own write,
+    /// where any other tick waits for the block below. The write's own
+    /// event releases it.
+    #[test]
+    fn a_tick_named_in_its_head_block_waits_for_that_block_to_persist() {
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        state.persisted = BlockHeight::new(4);
+        state
+            .pending_ticks
+            .push_back(Queued::Run(served_tick(&sched, 5, 5, 1)));
+        assert_eq!(
+            dispatched_ticks(&state.on_beacon_block_persisted(&sched).actions),
+            Vec::new(),
+            "block 5 is unwritten",
+        );
+        assert_eq!(
+            dispatched_ticks(&state.on_block_persisted(&sched, BlockHeight::new(5))),
+            vec![BlockHeight::new(5)],
+        );
+
+        let mut state = make_test_state();
+        state.persisted = BlockHeight::new(4);
+        state
+            .pending_ticks
+            .push_back(Queued::Run(served_tick(&sched, 5, 4, 1)));
+        assert_eq!(
+            dispatched_ticks(&state.on_beacon_block_persisted(&sched).actions),
+            vec![BlockHeight::new(5)],
+            "an earlier head needs nothing past the block below",
+        );
+    }
+
     /// A dispatched tick keeps its term until its batch comes back, a
     /// terminal in between included, and a tick sent back to the queue
     /// takes the term with it.
@@ -11711,6 +11776,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(&named_tx),
             crossings: Capped::empty(),
+            served_at: None,
         }];
         let live = naming(&test_certify(committing.clone(), 2_000), lines.clone());
         let sealed = naming(&test_certify(committing.into_sealed(), 2_000), lines);
@@ -11781,6 +11847,7 @@ mod tests {
                     reserves: Capped::empty(),
                     deadline: Deadline::of_transaction(&tx),
                     crossings: Capped::empty(),
+                    served_at: None,
                 }],
             ),
             Naming::Manifest,
@@ -11828,6 +11895,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -12025,6 +12093,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -12048,6 +12117,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -12784,6 +12854,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -12891,6 +12962,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         };
         (
             [
@@ -13058,6 +13130,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: held_deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             }],
         ));
 
@@ -13110,6 +13183,82 @@ mod tests {
             Some(TickId::new(ShardId::ROOT, BlockHeight::new(2))),
             "and holds it in the tick a replica that never went down holds it in",
         );
+    }
+
+    /// A replay past its own floor that reaches a tick whose member reads
+    /// a part below that floor holds the tick for its certificate: the
+    /// store no longer has the height, and running on anything else would
+    /// split the member from its counterparts. A part at the floor runs.
+    #[test]
+    fn a_replica_without_the_head_height_seats_the_tick_from_its_certificate() {
+        let schedule = make_test_topology();
+        let replayed = |served_at: u64| {
+            let member = test_transaction(1);
+            let tx = member.hash();
+            let deadline = Deadline::of_transaction(&member);
+            let below = make_live_block(BlockHeight::new(3), 3_000, ValidatorId::new(0), vec![]);
+            let naming_block = make_live_block(
+                BlockHeight::new(4),
+                4_000,
+                ValidatorId::new(0),
+                vec![member],
+            );
+            let naming_block = Verified::<CertifiedBlock>::from_persisted(naming(
+                &test_certify(naming_block, 4_000),
+                vec![TickLine::Member {
+                    staged: 0,
+                    tx,
+                    joins: Joins::Executes,
+                    settlement: Settlement::Alone,
+                    holds: Capped::empty(),
+                    pins: Capped::empty(),
+                    reach: Capped::empty(),
+                    awaits: Capped::empty(),
+                    charge: stub_abort_charge(1),
+                    share: 0,
+                    reserves: Capped::empty(),
+                    deadline,
+                    crossings: Capped::empty(),
+                    served_at: Some(BlockHeight::new(served_at)),
+                }],
+            ));
+            let recovered = RecoveredState {
+                committed_height: BlockHeight::new(4),
+                replay: ReplayWindow {
+                    blocks: vec![replayable(below, 3_000), naming_block],
+                    dispatch_from: BlockHeight::new(3),
+                    anchor_wt: Some(WeightedTimestamp::from_millis(2_000)),
+                },
+                ..RecoveredState::default()
+            };
+            let mut restarted = ExecutionCoordinator::with_shared_stores(
+                ShardId::ROOT,
+                Arc::new(TestCode::default()),
+                Arc::new(CrossingIndexSlot::default()),
+                &recovered,
+                Arc::new(ExecCertStore::new()),
+                Arc::new(FinalizationStore::new()),
+                Arc::new(ProvenAnchors::new()),
+                Arc::new(CounterpartMirror::new()),
+                BlockHeight::GENESIS,
+            )
+            .signed_by(ValidatorId::new(0));
+            restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+            restarted
+        };
+
+        let held = TickId::new(ShardId::ROOT, BlockHeight::new(4));
+        let short = replayed(1);
+        assert!(short.held.contains_key(&held), "held for its certificate");
+        assert!(matches!(
+            short.pending_ticks.front(),
+            Some(Queued::Held(tick)) if *tick == held,
+        ));
+        assert_eq!(short.served_floor(), None, "it reads no part");
+
+        let reached = replayed(2);
+        assert!(!reached.held.contains_key(&held), "the store has it");
+        assert_eq!(reached.served_floor(), Some(BlockHeight::new(2)));
     }
 
     /// A settled tick the replay seats below where it dispatches is
@@ -17918,6 +18067,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of_transaction(&alone),
                 crossings: Capped::empty(),
+                served_at: None,
             },
             TickLine::Discard {
                 tick: tick_id,
@@ -17966,6 +18116,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(transaction),
             crossings,
+            served_at: None,
         }
     }
 

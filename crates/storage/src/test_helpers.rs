@@ -2610,6 +2610,7 @@ fn reserving_chain(first: u64) -> Reserving {
         reserves: stated.terms.reserves.clone(),
         deadline: Deadline::of_transaction(&tx),
         crossings: Capped::empty(),
+        served_at: None,
     };
     let dropped = TickLine::Discard {
         tick: TickId::new(ShardId::ROOT, BlockHeight::new(first + 1)),
@@ -6644,6 +6645,7 @@ fn core_run_at_one(
             reserves: Capped::empty(),
             deadline,
             crossings: Capped::empty(),
+            served_at: None,
         }])),
         ..MemberInputs::still(shard)
     }
@@ -7003,6 +7005,7 @@ fn abort_of_a_released_row(tx: TxHash, counterpart: ShardId, deadline: Deadline)
         reserves: Capped::empty(),
         deadline,
         crossings: Capped::empty(),
+        served_at: None,
     }
 }
 

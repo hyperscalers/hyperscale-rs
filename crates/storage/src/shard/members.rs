@@ -2241,15 +2241,13 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     joins,
                     settlement,
                     holds,
-                    pins: _,
                     reach,
                     awaits,
                     charge,
                     share,
                     reserves,
-                    staged: _,
-                    deadline: _,
                     crossings: line_crossings,
+                    ..
                 } => {
                     if self
                         .keyed(*tx)
@@ -3649,6 +3647,7 @@ mod tests {
             reserves: terms.reserves,
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -3675,6 +3674,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -3736,6 +3736,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -3991,6 +3992,7 @@ mod tests {
                 reserves,
                 deadline,
                 crossings,
+                served_at: None,
             }],
         ));
         store.fold(&stating(3, 2, &[], &[1]));
@@ -4278,6 +4280,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline,
             crossings: Capped::empty(),
+            served_at: None,
         };
         store.fold(&naming(
             3,
@@ -4408,6 +4411,7 @@ mod tests {
                     reserves,
                     deadline,
                     crossings,
+                    served_at: None,
                 }],
             )
         };
@@ -5609,6 +5613,7 @@ mod tests {
                 reserves,
                 deadline,
                 crossings: terms.crossings.clone(),
+                served_at: None,
             }])),
             ..committing(1, &[1])
         };
@@ -5751,6 +5756,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             })
             .collect();
         let block = MemberInputs {
@@ -5808,6 +5814,7 @@ mod tests {
             reserves: row.reserves,
             deadline: row.deadline,
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -6529,6 +6536,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: far(),
                 crossings: Capped::empty(),
+                served_at: None,
             }],
         ));
         store.fold(&stating(3, 2, &[], &[1]));
@@ -7563,6 +7571,7 @@ mod tests {
             reserves: entry.terms.reserves.clone(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -7590,6 +7599,7 @@ mod tests {
             reserves,
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -8172,6 +8182,7 @@ mod tests {
                 } else {
                     Capped::empty()
                 },
+                served_at: None,
             }
         }
 
@@ -11201,6 +11212,7 @@ mod tests {
                 staged: 0,
                 deadline: far(),
                 crossings: Capped::empty(),
+                served_at: None,
             }
         }
 

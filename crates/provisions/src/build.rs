@@ -18,12 +18,57 @@ use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{SubstateStore, SubstateView, Substates, VersionedStore};
 use hyperscale_types::network::encoded_len;
 use hyperscale_types::{
-    Hash, LeafPath, MAX_PROVISION_PART_BYTES, MerkleInclusionProof, Provision, ProvisionCount,
-    ProvisionParts, ProvisionTxRoot, ShardId, SubstateEntry, SubstateKey, WeightedTimestamp,
+    DeclaredKey, DeclaredRange, Hash, LeafPath, MAX_PROVISION_PART_BYTES, MerkleInclusionProof,
+    Mode, Provision, ProvisionCount, ProvisionParts, ProvisionTxRoot, ShardId, SubstateEntry,
+    SubstateKey, TxHash, WeightedTimestamp,
 };
 use tracing::warn;
 
 use crate::content::{served_keys, served_leaf};
+use crate::requests::served_request_keys;
+
+/// What a member reads of the part its own shard serves: the bytes of
+/// every copy of that part, and the keys and ranges they answer for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnPart {
+    /// The part's entries, as a counterpart absorbs them.
+    pub entries: Vec<SubstateEntry>,
+    /// The declared cells it serves.
+    pub cells: Vec<SubstateKey>,
+    /// The declared ranges it serves.
+    pub ranges: Vec<DeclaredRange>,
+}
+
+/// The part of `tx_hash`, a member holding `holds` on `source_shard`, as
+/// `state` serves it.
+///
+/// `state` is the state of the member's head block and `holds` the
+/// declaration its row serves from, so this is the function, the state
+/// and the keys of every sharing counterpart's copy. `None` where a range
+/// names an entry with no leaf.
+#[must_use]
+pub fn own_served_entries(
+    state: &impl Substates,
+    source_shard: ShardId,
+    tx_hash: TxHash,
+    holds: &[(DeclaredKey, Mode)],
+) -> Option<OwnPart> {
+    let (local_keys, local_ranges) = served_request_keys(holds, source_shard);
+    let request = ProvisionsRequest {
+        tx_hash,
+        clock: WeightedTimestamp::ZERO,
+        targets: Vec::new(),
+        local_keys,
+        local_ranges,
+    };
+    let keys = served_keys(state, &request);
+    let entries = read_served(state, source_shard, &request, &keys)?;
+    Some(OwnPart {
+        entries,
+        cells: request.local_keys,
+        ranges: request.local_ranges,
+    })
+}
 
 /// What one source block owes one target out of the state the block
 /// left: the requests naming the target, in leaf order, beside the keys

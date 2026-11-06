@@ -274,7 +274,11 @@ impl TickCandidates {
         let mut in_hand = true;
         for line in lines {
             let TickLine::Member {
-                tx: tx_hash, joins, ..
+                tx: tx_hash,
+                joins,
+                holds,
+                served_at,
+                ..
             } = line
             else {
                 continue;
@@ -318,7 +322,8 @@ impl TickCandidates {
                     prices: PriceTable::GENESIS,
                     member: candidate.member.clone(),
                     arrivals,
-                    served_at: None,
+                    served_at: *served_at,
+                    holds: holds.clone(),
                 },
                 membership: Membership::of(&candidate.member),
                 committed_prices: candidate.committed_prices,
@@ -437,6 +442,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of(ms(60_000)),
                 crossings: Capped::empty(),
+                served_at: None,
             }],
             &ProvisioningTracker::new(),
         );
@@ -472,6 +478,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of(ms(60_000)),
                 crossings: Capped::empty(),
+                served_at: None,
             }],
             &ProvisioningTracker::new(),
         );
@@ -519,6 +526,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of(ms(60_000)),
                 crossings: Capped::empty(),
+                served_at: None,
             }],
             &ProvisioningTracker::new(),
         );
@@ -610,6 +618,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of(ms(60_000)),
             crossings: Capped::empty(),
+            served_at: None,
         };
         let (admitted, _) = candidates.take_named(&members.map(line), &provisioning);
         assert_eq!(admitted.len(), 2);
@@ -665,6 +674,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of(ms(60_000)),
             crossings: Capped::empty(),
+            served_at: None,
         };
         let take = |provisioning: &ProvisioningTracker| {
             let mut candidates = TickCandidates::new(local);
@@ -767,6 +777,7 @@ mod tests {
                     reserves: Capped::empty(),
                     deadline: Deadline::of(ms(60_000)),
                     crossings: Capped::empty(),
+                    served_at: None,
                 }],
                 &provisioning,
             );

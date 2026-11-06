@@ -902,6 +902,15 @@ where
         drop(entries);
     }
 
+    /// The base at `height`, or `None` where it does not hold that height.
+    ///
+    /// A tick reads a member's own part through this, at the height whose
+    /// state serves it. Dispatch waited for that height, and retention
+    /// holds it until the tick has run.
+    pub fn base_at(&self, height: BlockHeight) -> Option<S::Versioned> {
+        self.base.snapshot_held_at(height)
+    }
+
     /// The highest height the settled base is known to carry: the
     /// highest a tick's baseline may be read at.
     #[must_use]

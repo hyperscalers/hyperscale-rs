@@ -455,6 +455,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
