@@ -2926,8 +2926,9 @@ impl ExecutionCoordinator {
     /// A push naming a record this validator never carries, as one whose
     /// `Whole` read after a sync or a restart finds the record already
     /// gone, or one toward a prefix a reshape moved away, is released by
-    /// nothing here. It stays held until the horizon retires it or a
-    /// later push evicts it, within the bound the early buffer holds.
+    /// nothing here. It stays held until the horizon retires it or
+    /// pushes at higher heights take its place, within the bound the
+    /// early buffer holds.
     fn release_carried(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -15442,6 +15443,54 @@ mod tests {
         let wanted = state.wanted_records();
         assert!(state.release_early_pushes(&schedule, &wanted).is_empty());
         assert!(state.parked_claims.is_empty());
+        assert!(holds_record(&state, record_key, cell.tx));
+    }
+
+    /// Eight heights of pushes nothing comes to want leave a newer push
+    /// its place, and its record arrives when the want is filed. Any
+    /// member of a committee can send those eight, so they must not turn
+    /// away what follows them.
+    #[test]
+    fn a_newer_push_parks_past_eight_stale_heights() {
+        let (mut state, schedule, _, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.provisioning.record_required(cell.tx, BTreeSet::new());
+        state.committed_ts = WeightedTimestamp::from_millis(REFUSED_VALIDITY_END_MS - 1);
+        for height in 1..=8u8 {
+            let (stale_key, _, stale_cell) = arrived_record(0x80 + height, REFUSED_VALIDITY_END_MS);
+            let (state_root, proof) = state_and_proof(PEER, &[stale_key], &[stale_key]);
+            let stale_anchor = Anchor {
+                state_root,
+                ..proven_anchor_of(PEER, u64::from(height), anchor.ts)
+            };
+            state.counterparts.proven_anchors.record(stale_anchor);
+            let pushed = StateClaim::new(
+                stale_anchor,
+                [(
+                    stale_key,
+                    Stated::Held(Bytes::new(stale_cell.to_bytes()).unwrap()),
+                )],
+                proof,
+            );
+            assert!(
+                state
+                    .on_crossing_readings(&schedule, vec![pushed])
+                    .is_empty()
+            );
+        }
+        assert_eq!(state.parked_claims.len(), 8, "the stale heights are parked");
+
+        state.counterparts.proven_anchors.record(anchor);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        state.provisioning.record_required(
+            cell.tx,
+            BTreeSet::from([Requirement::Crossing { key: record_key }]),
+        );
+        let wanted = state.wanted_records();
+        assert!(state.release_early_pushes(&schedule, &wanted).is_empty());
         assert!(holds_record(&state, record_key, cell.tx));
     }
 

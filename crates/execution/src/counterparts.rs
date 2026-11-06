@@ -4268,6 +4268,9 @@ impl Counterparts {
     /// anchor. The rule is [`Self::kept_for_wants`]', and a wanted key it
     /// declines is not handed back: every commit would release it from
     /// the caller's hold while the want lives, only to decline it again.
+    /// Nor is an absence, which that rule keeps only for a key the rows
+    /// await now: held for later it would spend a place and a member of
+    /// the committee could fill the hold with absences of any key.
     pub(crate) fn offer_pushed(
         &mut self,
         pushed: StateClaim,
@@ -4291,6 +4294,7 @@ impl Counterparts {
             .filter(|key| {
                 !wanted.contains(key)
                     && !self.wanted.contains(key)
+                    && claim.reading(*key) != Some(Inclusion::Absent)
                     && !self.rows.retires_on(*key)
                     && !held_record(claim, *key)
                         .is_some_and(|(_, cell)| past_its_taking(&cell, local, now))
@@ -6834,8 +6838,8 @@ mod tests {
         let retired = StateClaim::new(suffix, [(record, Inclusion::Absent)], suffix_proof.clone());
         let during = WeightedTimestamp::from_millis(EPOCH_MS + 16_000);
         assert!(
-            !counterparts.done_with_push(&retired, &[], during),
-            "a fresh absence of the record is nothing this shard keeps to offer",
+            counterparts.done_with_push(&retired, &[], during),
+            "a fresh absence of the record is nothing this shard keeps or holds for later",
         );
         counterparts.on_proof_fetched(suffix, &[record], &suffix_proof, &[]);
         assert!(
@@ -8242,15 +8246,25 @@ mod tests {
             "the absence stood for no ask",
         );
 
-        let (beside, _, _) = escrowed_record(0xA2, 200_000);
-        let (state_root, proof) = state_and_proof(PRODUCER, &[], &sorted(vec![key, beside]));
+        let (beside, _, beside_cell) = escrowed_record(0xA2, 200_000);
+        let (state_root, proof) = state_and_proof_holding(
+            PRODUCER,
+            &[(beside, beside_cell.to_bytes())],
+            &sorted(vec![key, beside]),
+        );
         let mixed = StateClaim::new(
             Anchor {
                 state_root,
                 height: BlockHeight::new(4),
                 ..read.0
             },
-            [(key, Inclusion::Absent), (beside, Inclusion::Absent)],
+            [
+                (key, Stated::Inclusion(Inclusion::Absent)),
+                (
+                    beside,
+                    Stated::Held(Bytes::new(beside_cell.to_bytes()).expect("a record fits")),
+                ),
+            ],
             proof,
         );
         assert_eq!(
@@ -8260,6 +8274,20 @@ mod tests {
             Some(vec![beside]),
             "a key nothing wants yet is handed back without the declined one",
         );
+    }
+
+    /// A proven absence of a key nothing here wants can never come to be
+    /// kept, so it takes no place in what the caller holds for later.
+    #[test]
+    fn an_absence_nothing_wants_is_not_handed_back() {
+        let (key, _, _) = escrowed_record(0xA1, 200_000);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let read = producer_read(3, None, key);
+        consumer.proven_anchors.record(read.0);
+        assert!(Door::Push.bring(&mut consumer, &[], &read, key, None, now));
+        assert!(consumer.fetched.is_empty());
     }
 
     /// A push may carry a record whose want is filed beside one whose

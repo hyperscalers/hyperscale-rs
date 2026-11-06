@@ -19,9 +19,11 @@
 //! Bounded on two axes for each kind, and a bound that trips leaves the
 //! reading to the fallback read: per anchor the claims weigh at most one
 //! block's section, and per shard at most [`MAX_PARKED_CLAIM_HEIGHTS`]
-//! heights are held, the highest going first, since it is the one
-//! furthest from proving and a flood ahead of the frontier evicts
-//! itself.
+//! heights are held. An unproven height gives way highest first, since
+//! it is the one furthest from proving and a flood ahead of the frontier
+//! evicts itself. A proven one gives way lowest first: the height pushed
+//! longest ago is the one least likely still wanted, so heights that
+//! nothing comes to want leave a newer push its place.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,18 +65,18 @@ pub struct ParkedClaims {
 /// Which height of a shard gives way when it holds too many.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GivesWay {
-    /// The one furthest from proving or from a want.
+    /// The one furthest from proving.
     Highest,
-    /// The one held longest.
+    /// The one pushed longest ago.
     Lowest,
 }
 
 /// Hold `claim` in `held` under the bounds, or say why not: a claim
 /// whose keys a held claim at the same anchor already covers adds
 /// nothing; one that would take the anchor's claims past a block's
-/// section cannot be carried whole; and one at a height past the
-/// shard's held heights, or one that pushes the shard's highest height
-/// out, is left to the fallback read.
+/// section cannot be carried whole; and past the shard's held heights
+/// one height gives way as `gives_way` says, which left to the fallback
+/// read is the claim itself where that height is its own.
 fn hold(
     held: &mut BTreeMap<(ShardId, BlockHeight), Vec<StateClaim>>,
     claim: StateClaim,
@@ -187,7 +189,7 @@ impl ParkedClaims {
     /// Hold `claim`, at a proven anchor, until a key of its is wanted, or
     /// say why it was not held.
     pub fn hold_early(&mut self, claim: StateClaim) -> Result<(), &'static str> {
-        hold(&mut self.early, claim, GivesWay::Highest)
+        hold(&mut self.early, claim, GivesWay::Lowest)
     }
 
     /// Hold `claim`, verdict leaves at a proven anchor, until a question
@@ -352,6 +354,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             (3..=10).collect::<Vec<_>>(),
             "the lowest height went",
+        );
+    }
+
+    /// Early claims give way lowest height first, so heights nothing
+    /// comes to want never keep a newer push out, and one lower than
+    /// every height held is the one let go.
+    #[test]
+    fn early_claims_give_way_oldest_first() {
+        let mut parked = ParkedClaims::new();
+        for height in 2..=9 {
+            parked.hold_early(claim_at(height, 1_000, 1)).unwrap();
+        }
+        assert_eq!(parked.hold_early(claim_at(1, 1_000, 2)), Err("outlasted"));
+        assert_eq!(parked.hold_early(claim_at(10, 1_000, 3)), Ok(()));
+        assert_eq!(parked.len(), 8);
+        assert!(
+            parked
+                .release_early(&BTreeSet::from([test_key(2)]))
+                .is_empty(),
+            "the lower push went",
+        );
+        assert_eq!(
+            parked.release_early(&BTreeSet::from([test_key(3)])).len(),
+            1,
+            "the newest stayed",
         );
     }
 
