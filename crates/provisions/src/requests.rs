@@ -12,7 +12,7 @@
 //! every other target from the block committing it. Each target is
 //! served it once.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_engine::legs::Member;
@@ -20,11 +20,8 @@ use hyperscale_engine::tick_select::{member_of, settlement_of};
 use hyperscale_storage::{MemberRow, Substates, pinned_holds, served_from_head, served_rows};
 use hyperscale_types::{
     BlockHeight, DeclaredKey, DeclaredRange, Mode, ShardId, ShardTrie, SubstateKey, Transaction,
-    ValidatorId, Verifiable, WeightedTimestamp, pins_of,
+    Verifiable, WeightedTimestamp, pins_of,
 };
-
-/// Per-shard recipient lists for provision broadcasting.
-pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
 
 /// One transaction's provision request from the block committing it.
 ///

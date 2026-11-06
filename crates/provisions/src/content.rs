@@ -108,9 +108,9 @@ pub fn leaves_over_requests(
 ///
 /// The block stands at `height` on `local_shard` with `transactions`,
 /// routed under `trie` and committed at `clock`, its parent-QC weighted
-/// timestamp; `state` is the state it leaves. Each leaf binds the clock of the block that committed its
-/// transaction: `clock` for the block's own, and its row's `committed`
-/// for a member the block makes head.
+/// timestamp; `state` is the state it leaves. Each leaf binds the clock
+/// of the block that committed its transaction: `clock` for the block's
+/// own, and its row's `committed` for a member the block makes head.
 ///
 /// # Errors
 ///
@@ -297,6 +297,74 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(roots(&[tx]).map(|map| map.is_empty()), Ok(true));
+    }
+
+    /// A shared member keyed nowhere here, folded by the real fold, heads
+    /// in the block committing it and roots no `Serves` entry: it is
+    /// served once, by that block's commit.
+    #[test]
+    fn an_unkeyed_shared_row_heads_without_a_serve_and_is_served_at_commit() {
+        use std::collections::BTreeMap;
+
+        use hyperscale_storage::{
+            MemberIndex, MemberInputs, MemberSections, member_writes, served_rows,
+        };
+        use hyperscale_types::{EpochWindows, SettledWrites, Settlement, StatedTerms};
+
+        let window = window(2);
+        let tx = shaped(
+            test_principal(0x01),
+            &[
+                (cell(test_prefix(0x01), 1), CREDIT),
+                (cell(test_prefix(0x81), 1), WRITE),
+            ],
+            Vec::new(),
+        );
+        let terms = terms_of(&tx, &window, LOCAL);
+        assert_eq!(terms.settlement, Settlement::Shared);
+        let inputs = MemberInputs::deriving(
+            LOCAL,
+            HEIGHT,
+            ms(5_000),
+            [tx.as_unverified()],
+            MemberSections {
+                certificates: &[],
+                records: &[],
+                claims: &[],
+            },
+            EpochWindows::new(0, 0),
+            vec![StatedTerms {
+                tx: tx.hash(),
+                terms,
+            }],
+        );
+        let state = Entries::of(&SettledWrites::from_parts(
+            BTreeMap::new(),
+            member_writes(&Entries::empty(), &inputs),
+        ));
+
+        let rows = MemberIndex::load(&state, LOCAL);
+        assert!(
+            rows.members[&tx.hash()].head.is_some(),
+            "nothing ahead of it on its keys"
+        );
+        assert!(
+            served_rows(&state, LOCAL, HEIGHT).is_empty(),
+            "an unkeyed row roots no serve from its head"
+        );
+        let map = roots_on(
+            &state,
+            window.shard_trie(),
+            LOCAL,
+            ms(5_000),
+            std::slice::from_ref(&tx),
+        )
+        .expect("routed");
+        assert_eq!(
+            map[&REMOTE],
+            ProvisionTxRoot::over(&[leaf_of(&tx, ms(5_000))]),
+            "the commit serves it"
+        );
     }
 
     /// A block roots its own transactions' requests in block order and
