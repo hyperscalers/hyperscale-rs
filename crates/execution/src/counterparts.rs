@@ -26,7 +26,8 @@ use hyperscale_metrics::{
 #[cfg(test)]
 use hyperscale_storage::CrossingJournal;
 use hyperscale_storage::{
-    CrossingCursor, committed_tx_cell_key, member_row_leaf, reclaimed, unclaimed_records,
+    CrossingCursor, committed_tx_cell_key, live_record, member_row_leaf, reclaimed,
+    unclaimed_records,
 };
 use hyperscale_types::network::response::ServedValue;
 #[cfg(test)]
@@ -289,15 +290,20 @@ impl CrossingIndex for TestRows {
 ///
 /// The second map is the first one turned over: for each shard and
 /// cell a held claim reads, the anchor of every claim reading it, once
-/// per claim. It is written by every method that adds or removes a
-/// claim and by nothing else, so it holds exactly what a walk of the
-/// claims would find, and a question asked of every held claim is one
-/// lookup.
+/// per claim, with the transaction that issued the record it holds
+/// there, if it holds one. It is written by every method that adds or
+/// removes a claim and by nothing else, so it holds exactly what a walk
+/// of the claims would find, and a question asked of every held claim
+/// is one lookup.
 #[derive(Debug, Default)]
 struct HeldClaims {
     claims: BTreeMap<StateClaim, BTreeSet<TxHash>>,
-    readings: BTreeMap<(ShardId, SubstateKey), Vec<Anchor>>,
+    readings: CellReadings,
 }
+
+/// For each shard and cell, where a held claim reads it and the issuer
+/// of the record held there.
+type CellReadings = BTreeMap<(ShardId, SubstateKey), Vec<(Anchor, Option<TxHash>)>>;
 
 impl HeldClaims {
     /// The held claims, in their own order.
@@ -319,6 +325,14 @@ impl HeldClaims {
     /// Whether a held claim reads `key` on `shard`.
     fn reads(&self, shard: ShardId, key: SubstateKey) -> bool {
         self.readings.contains_key(&(shard, key))
+    }
+
+    /// Whether a held claim reads on `shard` the record `tx` issued at
+    /// `key`, which is what a want of `tx` at `key` arrives as.
+    fn reads_arrival(&self, shard: ShardId, key: SubstateKey, tx: TxHash) -> bool {
+        self.readings
+            .get(&(shard, key))
+            .is_some_and(|read_at| read_at.iter().any(|(_, issuer)| *issuer == Some(tx)))
     }
 
     /// Hold `claim`, where it is not held already, and hand back the
@@ -364,13 +378,15 @@ impl HeldClaims {
         }
     }
 
-    /// Name `claim`'s anchor under every cell it reads.
-    fn note(readings: &mut BTreeMap<(ShardId, SubstateKey), Vec<Anchor>>, claim: &StateClaim) {
+    /// Name `claim`'s anchor under every cell it reads, with the issuer
+    /// of the record it holds there.
+    fn note(readings: &mut CellReadings, claim: &StateClaim) {
         for (key, _) in claim.cells.iter() {
+            let issuer = held_record(claim, *key).map(|(_, cell)| cell.tx);
             readings
                 .entry((claim.anchor.shard, *key))
                 .or_default()
-                .push(claim.anchor);
+                .push((claim.anchor, issuer));
         }
     }
 
@@ -381,7 +397,7 @@ impl HeldClaims {
             let Some(read_at) = self.readings.get_mut(&cell) else {
                 continue;
             };
-            if let Some(held) = read_at.iter().position(|at| *at == claim.anchor) {
+            if let Some(held) = read_at.iter().position(|(at, _)| *at == claim.anchor) {
                 read_at.swap_remove(held);
             }
             if read_at.is_empty() {
@@ -1543,11 +1559,11 @@ fn in_disjoint_spans(claims: impl IntoIterator<Item = StateClaim>) -> Vec<StateC
 /// shard holds is read only at that shard's boundaries, apart from every
 /// other reading.
 ///
-/// Two sites need exactly this set: a fetch that lands is offered in a
-/// block only if something here wants it, and a reading held to offer is
-/// kept only while something here wants it. None of these questions
-/// names a transaction of this chain's, which is why the keys are read
-/// rather than the names.
+/// A reading held to offer is kept only while something here wants it.
+/// What is taken up in the first place is narrower, reading by reading
+/// ([`Counterparts::kept_for_wants`]). None of these questions names a
+/// transaction of this chain's, which is why the keys are read rather
+/// than the names.
 fn wants_reading(
     awaited: &BTreeSet<SubstateKey>,
     wanted: &BTreeSet<SubstateKey>,
@@ -1703,6 +1719,34 @@ fn fenced_cells(claim: &StateClaim) -> impl Iterator<Item = SubstateKey> + '_ {
         )
         .then_some(*key)
     })
+}
+
+/// What [`Counterparts::kept_for_wants`] keeps of a reading, by the rule
+/// that keeps each key.
+#[derive(Debug, Default)]
+struct KeptForWants {
+    /// The keys it reads as the arrival of a want here: a live record
+    /// the wanting transaction issued.
+    arrivals: BTreeSet<SubstateKey>,
+    /// The escrowed records nothing here waits on that the fold could
+    /// decline, with each one's validity end: held under
+    /// [`MAX_UNSOLICITED_RECORDS_PER_PRODUCER`].
+    unasked: Vec<(WeightedTimestamp, SubstateKey)>,
+    /// The keys the crossing rows await, read whichever way, and the
+    /// owed records the fold credits.
+    rows: BTreeSet<SubstateKey>,
+}
+
+impl KeptForWants {
+    /// Every key kept, by whichever rule.
+    fn keys(&self) -> BTreeSet<SubstateKey> {
+        self.arrivals
+            .iter()
+            .chain(&self.rows)
+            .copied()
+            .chain(self.unasked.iter().map(|(_, key)| *key))
+            .collect()
+    }
 }
 
 /// One fetch per anchor, asking every key `wanted` names at it once.
@@ -2686,8 +2730,9 @@ impl Counterparts {
     /// anchor of the holder this validator has commit-proven where that
     /// anchor is at or above the read frontier's floor, since a reading
     /// below it is one every voter refuses, and never of a shard this
-    /// chain holds itself, nor while a reading fetched or pushed is
-    /// already held to offer.
+    /// chain holds itself, nor while the want's arrival, fetched or
+    /// pushed, is already held to offer. Another reading of the key
+    /// held here answers nothing the want asks.
     fn ask_wanted_records(
         &mut self,
         trie: &ShardTrie,
@@ -2705,7 +2750,7 @@ impl Counterparts {
             let Some(anchor) = self.newest_above_floor(holder, now, windows) else {
                 continue;
             };
-            if self.fetched.reads(holder, record.key) {
+            if self.fetched.reads_arrival(holder, record.key, record.tx) {
                 continue;
             }
             if self.records.due(record.key, anchor) {
@@ -3511,19 +3556,46 @@ impl Counterparts {
                 record_sibling_question_pending();
             }
         }
+        let read = StateClaim::new(
+            anchor,
+            inclusions.iter().map(|&(key, inclusion)| {
+                let held = values
+                    .iter()
+                    .find(|(served, _)| *served == key)
+                    .map(|(_, bytes)| Stated::Held(bytes.clone()));
+                (key, held.unwrap_or(Stated::Inclusion(inclusion)))
+            }),
+            proof.clone(),
+        );
+        let mut for_wants = self.kept_for_wants(&read);
+        for_wants
+            .unasked
+            .retain(|(_, key)| !answering.contains(key));
         answering.extend(
-            inclusions
-                .iter()
-                .map(|(key, _)| *key)
-                .filter(|key| !at_boundary.contains(key))
-                .filter(|key| wants_reading(&self.rows.awaited, &self.wanted, *key)),
+            for_wants
+                .keys()
+                .into_iter()
+                .filter(|key| !at_boundary.contains(key)),
         );
         for (reading, victim) in self.answer_seats(anchor, proof, inclusions) {
             self.hold_seat_reading(&reading, victim);
         }
-        if answering.is_empty() {
-            return;
+        if !answering.is_empty() {
+            self.hold_fetched(&read, &answering, speaks_for, for_wants.unasked);
         }
+    }
+
+    /// Hold the cells `answering` of the fetched reading `read`, speaking
+    /// for `speaks_for`, with `unasked` the validity end and key of each
+    /// unsolicited record among them.
+    fn hold_fetched(
+        &mut self,
+        read: &StateClaim,
+        answering: &BTreeSet<SubstateKey>,
+        speaks_for: BTreeSet<TxHash>,
+        unasked: Vec<(WeightedTimestamp, SubstateKey)>,
+    ) {
+        let anchor = read.anchor;
         // A cell a held claim at this anchor already reads is not held
         // twice; the transactions this proof spoke for lean on that
         // claim instead.
@@ -3544,11 +3616,17 @@ impl Counterparts {
                 }
             }
         }
+        let unasked = unasked
+            .into_iter()
+            .filter(|(_, key)| fresh.contains(key))
+            .collect();
+        for refused in self.cap_unsolicited(anchor.shard, unasked) {
+            fresh.remove(&refused);
+        }
         if fresh.is_empty() {
             return;
         }
-        let kept: Vec<SubstateKey> = fresh.iter().copied().collect();
-        let Ok(proof) = proof.restrict(&kept) else {
+        let Some(kept) = read.restrict(|key| fresh.contains(&key)) else {
             tracing::warn!(
                 shard = ?anchor.shard,
                 height = anchor.height.inner(),
@@ -3556,27 +3634,52 @@ impl Counterparts {
             );
             return;
         };
-        let cells = inclusions
-            .iter()
-            .filter(|(key, _)| fresh.contains(key))
-            .map(|&(key, inclusion)| {
-                let held = values
-                    .iter()
-                    .find(|(served, _)| *served == key)
-                    .map(|(_, bytes)| Stated::Held(bytes.clone()));
-                (key, held.unwrap_or(Stated::Inclusion(inclusion)))
-            });
         // Each reading of a crossing's cell names the crossing, off what
         // the asker holds: a held record's answers, and a held answer's
         // record. What the reading licenses the fold to remove is read
-        // off the name, by every replica alike.
-        let named: Vec<(SubstateKey, CrossingId)> = kept
+        // off the name, by every replica alike. An owed record addressed
+        // here names its own, as a pushed one does.
+        let local = self.ledger.local();
+        let named: Vec<(SubstateKey, CrossingId)> = fresh
             .iter()
-            .filter_map(|key| self.crossing_of(*key).map(|id| (*key, id)))
+            .filter_map(|key| {
+                self.crossing_of(*key)
+                    .or_else(|| owed_here(&kept, *key, local, self.index.as_ref()))
+                    .map(|id| (*key, id))
+            })
             .collect();
-        self.fetched
-            .hold(StateClaim::new(anchor, cells, proof).naming(named))
-            .extend(speaks_for);
+        self.fetched.hold(kept.naming(named)).extend(speaks_for);
+    }
+
+    /// What of `claim`, whichever door it came in by, is worth holding
+    /// for what waits here: the one rule for a fetched reading and a
+    /// pushed one.
+    ///
+    /// A record a want's own transaction issued is its arrival. An
+    /// escrowed record nothing here waits on is kept where the fold could
+    /// decline it ([`Self::unsolicited`]), and a key the crossing rows
+    /// await and an owed record the fold credits are kept by those rules.
+    /// A wanted key read any other way, absent above all, holds nothing:
+    /// the fold takes nothing from it, and a block carrying it would
+    /// spend a place to say so. Any member of the anchor's committee can
+    /// send such a reading, so it must leave the want's read running.
+    fn kept_for_wants(&self, claim: &StateClaim) -> KeptForWants {
+        let local = self.ledger.local();
+        let mut kept = KeptForWants::default();
+        for key in claim.keys() {
+            let arrival = live_record(std::slice::from_ref(claim), key)
+                .is_some_and(|(_, cell)| self.wanted_of.contains(&(key, cell.tx)));
+            if arrival {
+                kept.arrivals.insert(key);
+            } else if let Some((_, end)) = self.unsolicited(claim, key) {
+                kept.unasked.push((end, key));
+            } else if self.rows.awaited.contains(&key)
+                || owed_here(claim, key, local, self.index.as_ref()).is_some()
+            {
+                kept.rows.insert(key);
+            }
+        }
+        kept
     }
 
     /// Take a fetched proof at `anchor` into the seat questions it speaks
@@ -4082,10 +4185,14 @@ impl Counterparts {
     /// whose transaction holds a member row here is not one: it is
     /// kept only where that member waits on it, and takes no place
     /// under the cap.
-    /// What is kept is cut to the wanted keys not already held at the
-    /// anchor, so the section stays one proof per claim, disjoint per
-    /// anchor, and each kept key's read counts the push as an ask
-    /// answered at its anchor.
+    ///
+    /// What is kept is cut to the keys not already held at the anchor,
+    /// so the section stays one proof per claim, disjoint per anchor,
+    /// and each arrival's read counts the push as an ask answered at its
+    /// anchor. The rule is [`Self::kept_for_wants`]', and a claim it
+    /// keeps nothing of that reads a wanted key is done with: every
+    /// commit would release it from the caller's hold while the want
+    /// lives, only to decline it again.
     pub(crate) fn offer_pushed(
         &mut self,
         claim: &StateClaim,
@@ -4100,25 +4207,18 @@ impl Counterparts {
         self.pause_on(claim);
         let anchor = claim.anchor;
         let local = self.ledger.local();
-        let unasked: Vec<(WeightedTimestamp, SubstateKey)> = claim
-            .keys()
-            .into_iter()
-            .filter_map(|key| self.unsolicited(claim, key).map(|(_, end)| (end, key)))
-            .collect();
-        let mut wanted: BTreeSet<SubstateKey> = claim
-            .keys()
-            .into_iter()
-            .filter(|key| {
-                wants_reading(&self.rows.awaited, &self.wanted, *key)
-                    || owed_here(claim, *key, local, self.index.as_ref()).is_some()
-            })
-            .chain(unasked.iter().map(|(_, key)| *key))
-            .collect();
+        let for_wants = self.kept_for_wants(claim);
+        let mut wanted = for_wants.keys();
         if wanted.is_empty() {
-            return claim.keys().into_iter().all(|key| {
-                held_record(claim, key).is_some_and(|(_, cell)| past_its_taking(&cell, local, now))
-                    || self.rows.retires_on(key)
-            });
+            return claim
+                .keys()
+                .into_iter()
+                .any(|key| self.wanted.contains(&key))
+                || claim.keys().into_iter().all(|key| {
+                    held_record(claim, key)
+                        .is_some_and(|(_, cell)| past_its_taking(&cell, local, now))
+                        || self.rows.retires_on(key)
+                });
         }
         for held in self.fetched.claims() {
             if held.anchor == anchor {
@@ -4127,9 +4227,11 @@ impl Counterparts {
                 }
             }
         }
-        let unasked: Vec<(WeightedTimestamp, SubstateKey)> = unasked
-            .into_iter()
+        let unasked: Vec<(WeightedTimestamp, SubstateKey)> = for_wants
+            .unasked
+            .iter()
             .filter(|(_, key)| wanted.contains(key))
+            .copied()
             .collect();
         for refused in self.cap_unsolicited(anchor.shard, unasked) {
             wanted.remove(&refused);
@@ -4155,7 +4257,7 @@ impl Counterparts {
                 kept.crossings.iter().copied().chain(owed).collect();
             kept.naming(named)
         };
-        for key in &wanted {
+        for key in wanted.intersection(&for_wants.arrivals) {
             self.records.pushed(*key, anchor);
         }
         let _ = self.fetched.hold(kept);
@@ -5741,8 +5843,7 @@ mod tests {
     #[test]
     fn a_held_claim_is_let_go_once_its_anchor_ages_past_the_horizon() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
-        // No row here names the cells, so each is read unnamed, for the
-        // records a consumer here waits on.
+        // No row here names the cells, so each is read unnamed.
         let (mut producer, _, anchors, _rows) = producing(0, deadline);
         let claim = claim_of(0, deadline);
         let decline = consumer_decline(0, deadline);
@@ -5755,7 +5856,7 @@ mod tests {
             ts: now,
         };
         anchors.record(anchor);
-        producer.wanted = BTreeSet::from([claim]);
+        producer.rows.awaited = BTreeSet::from([claim]);
         producer.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
 
         let at_the_horizon = now.plus(RETENTION_HORIZON);
@@ -5925,7 +6026,7 @@ mod tests {
         ) = answering_many(24);
         let now = WeightedTimestamp::from_millis(400_000);
 
-        // Readings something waits on: a record a consumer here wants,
+        // Readings something waits on: a cell the crossing rows await,
         // read at the producer's fresh header and at another shard's.
         let other = ShardId::leaf(2, 0);
         let wanted = [
@@ -5939,7 +6040,7 @@ mod tests {
                 },
             ),
         ];
-        counterparts.wanted = wanted.iter().map(|(_, _, key)| *key).collect();
+        counterparts.rows.awaited = wanted.iter().map(|(_, _, key)| *key).collect();
         for (shard, height, key) in wanted {
             let (state_root, proof) = state_and_proof(shard, &[], &[key]);
             let anchor = Anchor {
@@ -7839,6 +7940,264 @@ mod tests {
         );
     }
 
+    /// A want of `key` for `tx`, armed from the start of the clock.
+    fn armed_want(key: SubstateKey, tx: TxHash) -> WantedRecord {
+        WantedRecord {
+            key,
+            tx,
+            arms_at: Some(WeightedTimestamp::ZERO),
+        }
+    }
+
+    /// `PRODUCER`'s anchor at `height`, over a tree holding the record
+    /// `leaf`, with a proof of `key` under it.
+    fn producer_read(
+        height: u64,
+        leaf: Option<&CrossingCell>,
+        key: SubstateKey,
+    ) -> (Anchor, MerkleInclusionProof) {
+        let leaves: Vec<(SubstateKey, Vec<u8>)> =
+            leaf.iter().map(|cell| (key, cell.to_bytes())).collect();
+        let (state_root, proof) = state_and_proof_holding(PRODUCER, &leaves, &[key]);
+        (
+            Anchor {
+                shard: PRODUCER,
+                height: BlockHeight::new(height),
+                state_root,
+                ts: WeightedTimestamp::from_millis(height * 1_000),
+            },
+            proof,
+        )
+    }
+
+    /// `cell`'s value, as a server hands it back beside its proof.
+    fn served(key: SubstateKey, cell: &CrossingCell) -> Vec<ServedValue> {
+        vec![(key, Bytes::new(cell.to_bytes()).expect("a record fits"))]
+    }
+
+    /// The `(anchor, key)` of every record read `actions` put.
+    fn record_asks(actions: &[Action]) -> Vec<(Anchor, SubstateKey)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::StateProofs(ids),
+                    ..
+                }) => Some(ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Which door a reading of a record comes in by.
+    #[derive(Clone, Copy, Debug)]
+    enum Door {
+        Fetch,
+        Push,
+    }
+
+    impl Door {
+        /// Bring the reading of `key` at `anchor` in by this door,
+        /// holding `cell` if there is one and absent if not, and say
+        /// whether a push is done with.
+        fn bring(
+            self,
+            consumer: &mut Counterparts,
+            wanted: &[WantedRecord],
+            (anchor, proof): &(Anchor, MerkleInclusionProof),
+            key: SubstateKey,
+            cell: Option<&CrossingCell>,
+            now: WeightedTimestamp,
+        ) -> bool {
+            match self {
+                Self::Fetch => {
+                    consumer.want(wanted);
+                    consumer.clock = now;
+                    let values = cell.map_or_else(Vec::new, |cell| served(key, cell));
+                    consumer.on_proof_fetched(*anchor, &[key], proof, &values);
+                    true
+                }
+                Self::Push => {
+                    let stated = cell.map_or(Stated::Inclusion(Inclusion::Absent), |cell| {
+                        Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits"))
+                    });
+                    let claim = StateClaim::new(*anchor, [(key, stated)], proof.clone());
+                    consumer.offer_pushed(&claim, wanted, now)
+                }
+            }
+        }
+    }
+
+    /// A read that comes back absent found a record its producer has not
+    /// written yet. Nothing folds from that, so it holds no block slot
+    /// and leaves the read running, and the next due anchor is asked.
+    #[test]
+    fn an_absent_reading_of_a_wanted_record_is_not_held() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+
+        let (first, proof) = producer_read(3, None, key);
+        consumer.proven_anchors.record(first);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(first, key)],
+        );
+        consumer.on_proof_fetched(first, &[key], &proof, &[]);
+        assert!(
+            consumer.fetched.is_empty(),
+            "the absence holds nothing to offer",
+        );
+        assert!(consumer.state_claims(&CarriedClaims::default()).is_empty());
+
+        let (next, _) = producer_read(5, None, key);
+        consumer.proven_anchors.record(next);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(next, key)],
+            "the next due anchor is asked again",
+        );
+    }
+
+    /// Any member of the anchor's committee may push a proven absence of
+    /// a wanted key. It keeps nothing, is done with rather than parked,
+    /// and the armed key is still asked. Beside a key nothing wants it
+    /// takes the claim with it: parked, a wanted key would release the
+    /// claim on every commit.
+    #[test]
+    fn an_absent_push_does_not_suppress_the_read() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+
+        let read = producer_read(3, None, key);
+        consumer.proven_anchors.record(read.0);
+        assert!(
+            Door::Push.bring(&mut consumer, &want, &read, key, None, now),
+            "done with, so the caller parks nothing",
+        );
+        assert!(consumer.fetched.is_empty());
+        assert!(consumer.state_claims(&CarriedClaims::default()).is_empty());
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(read.0, key)],
+            "the absence stood for no ask",
+        );
+
+        let (beside, _, _) = escrowed_record(0xA2, 200_000);
+        let (state_root, proof) = state_and_proof(PRODUCER, &[], &sorted(vec![key, beside]));
+        let mixed = StateClaim::new(
+            Anchor {
+                state_root,
+                height: BlockHeight::new(4),
+                ..read.0
+            },
+            [(key, Inclusion::Absent), (beside, Inclusion::Absent)],
+            proof,
+        );
+        assert!(consumer.offer_pushed(&mixed, &want, now));
+    }
+
+    /// A wanted key holding the record of another transaction is kept
+    /// unsolicited through either door, under the one cap, offered named
+    /// so the fold can decline it, and it leaves the want's read running.
+    /// One that nothing could decline yet is held for nothing, and not
+    /// parked. The want's own arrival does stand the read down.
+    #[test]
+    fn another_transactions_record_at_a_wanted_key_is_kept_unsolicited() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let later = TxHash::from(Hash::from_bytes(b"a later transaction"));
+        for door in [Door::Fetch, Door::Push] {
+            let (key, id, cell) = escrowed_record(0xF1, 2_000);
+            let want = [armed_want(key, later)];
+            let rows = Arc::new(TestRows::default());
+            let mut consumer = consuming(&rows);
+            let read = producer_read(3, Some(&cell), key);
+            consumer.proven_anchors.record(read.0);
+            assert!(door.bring(&mut consumer, &want, &read, key, Some(&cell), now));
+            assert_eq!(offered_keys(&consumer), BTreeSet::from([key]), "{door:?}");
+            assert_eq!(named(&consumer), vec![(key, id)], "{door:?}");
+            assert_eq!(
+                record_asks(&consumer.probe(&trie, now, &want, windows)),
+                vec![(read.0, key)],
+                "{door:?}: it is no arrival of the want's, so the read runs",
+            );
+
+            let (young, _, young_cell) = escrowed_record(0xF2, 200_000);
+            let want = [armed_want(young, later)];
+            let rows = Arc::new(TestRows::default());
+            let mut consumer = consuming(&rows);
+            let read = producer_read(3, Some(&young_cell), young);
+            assert!(
+                door.bring(&mut consumer, &want, &read, young, Some(&young_cell), now),
+                "{door:?}: done with, so the caller parks nothing",
+            );
+            assert!(consumer.fetched.is_empty(), "{door:?}");
+
+            let want = [armed_want(young, young_cell.tx)];
+            let mut consumer = consuming(&rows);
+            consumer.proven_anchors.record(read.0);
+            assert!(door.bring(&mut consumer, &want, &read, young, Some(&young_cell), now));
+            assert_eq!(offered_keys(&consumer), BTreeSet::from([young]), "{door:?}");
+            assert!(named(&consumer).is_empty(), "{door:?}");
+            assert!(
+                record_asks(&consumer.probe(&trie, now, &want, windows)).is_empty(),
+                "{door:?}: an arrival held stands the read down",
+            );
+        }
+    }
+
+    /// Unsolicited records held at a wanted key answer to the one cap,
+    /// whichever door each came in by.
+    #[test]
+    fn fetched_unsolicited_records_are_held_under_the_cap() {
+        let now = WeightedTimestamp::from_millis(100_000);
+        let later = TxHash::from(Hash::from_bytes(b"a later transaction"));
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let count = u8::try_from(MAX_UNSOLICITED_RECORDS_PER_PRODUCER + 1).expect("small");
+        for seed in 1..=count {
+            let (key, _, cell) = escrowed_record(seed, u64::from(seed) * 1_000);
+            let want = [armed_want(key, later)];
+            let read = producer_read(u64::from(seed), Some(&cell), key);
+            consumer.proven_anchors.record(read.0);
+            Door::Fetch.bring(&mut consumer, &want, &read, key, Some(&cell), now);
+        }
+        assert_eq!(
+            offered_keys(&consumer),
+            (1..count)
+                .map(|seed| escrowed_record(seed, u64::from(seed) * 1_000).0)
+                .collect(),
+            "the youngest validity end is the one left out",
+        );
+    }
+
+    /// An absence at a key the crossing rows await is a reading of its
+    /// own, through either door.
+    #[test]
+    fn an_absence_at_an_awaited_key_is_still_held() {
+        let now = WeightedTimestamp::from_millis(30_000);
+        for door in [Door::Fetch, Door::Push] {
+            let rows = Arc::new(TestRows::default());
+            let (mut producer, id, cell, taken, _) = escrowed_producer(&rows, 0x52, 36_000);
+            producer.rows.awaited.insert(taken);
+            let read = answered_at(&id, &cell, &[], &[taken], 20, 30_000);
+            assert!(door.bring(&mut producer, &[], &read, taken, None, now));
+            assert!(producer.fetched.reads(CONSUMER, taken), "{door:?}");
+        }
+    }
+
     /// A record whose own transaction lost the decline key is carried
     /// to its consumer's chain and declined there in its own right.
     ///
@@ -8109,8 +8468,7 @@ mod tests {
     #[test]
     fn a_fetched_proof_is_held_as_a_claim_over_its_answering_keys() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
-        // No row here names the cells, so each is read unnamed, for the
-        // records a consumer here waits on.
+        // No row here names the cells, so each is read unnamed.
         let (mut producer, _, anchors, _rows) = producing(0, deadline);
         let (claim0, claim1, claim2) = (
             claim_of(0, deadline),
@@ -8130,7 +8488,7 @@ mod tests {
             ts: now,
         };
         anchors.record(anchor);
-        producer.wanted = BTreeSet::from([claim0, claim1, claim2]);
+        producer.rows.awaited = BTreeSet::from([claim0, claim1, claim2]);
 
         // The fixture tree's leaf value is the key's own bytes; served
         // beside the proof, it rides in the claim as a held reading.
@@ -8177,14 +8535,14 @@ mod tests {
 
     /// Where each cell the held claims read was read, by a walk of
     /// every claim, each cell's anchors in order.
-    fn readings_by_walk(held: &HeldClaims) -> BTreeMap<(ShardId, SubstateKey), Vec<Anchor>> {
-        let mut readings: BTreeMap<(ShardId, SubstateKey), Vec<Anchor>> = BTreeMap::new();
+    fn readings_by_walk(held: &HeldClaims) -> CellReadings {
+        let mut readings = CellReadings::new();
         for claim in held.claims.keys() {
             for key in claim.keys() {
                 readings
                     .entry((claim.anchor.shard, key))
                     .or_default()
-                    .push(claim.anchor);
+                    .push((claim.anchor, held_record(claim, key).map(|(_, c)| c.tx)));
             }
         }
         for read_at in readings.values_mut() {
@@ -8194,7 +8552,7 @@ mod tests {
     }
 
     /// The held claims' readings as kept, each cell's anchors in order.
-    fn readings_kept(held: &HeldClaims) -> BTreeMap<(ShardId, SubstateKey), Vec<Anchor>> {
+    fn readings_kept(held: &HeldClaims) -> CellReadings {
         let mut readings = held.readings.clone();
         for read_at in readings.values_mut() {
             read_at.sort_unstable();
@@ -8241,11 +8599,13 @@ mod tests {
                         .map(|claim| claim.anchor)
                         .collect();
                     assert_eq!(held.reads(shard, key), !walked.is_empty());
-                    let mut read_at = held
+                    let mut read_at: Vec<Anchor> = held
                         .readings
                         .get(&(shard, key))
-                        .cloned()
-                        .unwrap_or_default();
+                        .into_iter()
+                        .flatten()
+                        .map(|(anchor, _)| *anchor)
+                        .collect();
                     read_at.sort_unstable();
                     assert_eq!(read_at, walked);
                 }
