@@ -10,8 +10,8 @@ use hyperscale_storage::test_helpers::{
     make_test_receipt, paced, placeholder_local_ec, position, registers, state_key,
     test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
-    test_a_fresh_store_holds_nothing, test_a_leg_entry_holds_the_floor_to_its_horizon,
-    test_a_legs_own_finalization_keeps_the_floor,
+    test_a_forged_certificate_clock_moves_no_retirement, test_a_fresh_store_holds_nothing,
+    test_a_leg_entry_holds_the_floor_to_its_horizon, test_a_legs_own_finalization_keeps_the_floor,
     test_a_member_row_naming_an_unheld_height_keeps_nothing,
     test_a_package_cell_lands_in_the_artifact_index, test_a_rebuilt_store_carries_signed_rounds,
     test_a_recovery_anchor_reads_back, test_a_replayed_sweep_reads_what_its_block_removed,
@@ -950,6 +950,13 @@ fn a_replay_keeps_a_leg_its_own_finalization_settled() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_a_legs_own_finalization_keeps_the_floor(&storage);
+}
+
+#[test]
+fn a_forged_certificate_clock_moves_no_retirement() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_forged_certificate_clock_moves_no_retirement(&storage);
 }
 
 #[test]

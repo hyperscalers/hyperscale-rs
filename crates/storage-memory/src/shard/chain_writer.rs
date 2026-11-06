@@ -196,7 +196,10 @@ fn build_prepared_commit(
                     block_height_u64,
                     /* write_history */ true,
                 );
-                let floor = s.advance_retention_floor(block_height_u64, qc.weighted_timestamp());
+                let floor = s.advance_retention_floor(
+                    block_height_u64,
+                    block.header().parent_qc().weighted_timestamp(),
+                );
                 s.reclaim_stale_jmt_nodes(&pins);
                 floor
             };

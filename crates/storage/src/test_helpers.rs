@@ -256,15 +256,16 @@ pub fn make_test_block(height: BlockHeight) -> Block {
     make_test_block_with_anchor_wt(height, 0)
 }
 
-/// Build a single-validator test block at `height` stamped `timestamp_ms`.
+/// Build a single-validator test block at `height`, anchored and stamped
+/// at `timestamp_ms`.
 ///
-/// [`make_test_qc`] carries the header's timestamp onto the QC, so this
-/// is how a fixture chain sets the pace its retention floor moves at: a
-/// chain a retention horizon wide per block leaves every prior version
-/// behind, one a fraction of a horizon apart keeps a known number.
+/// A version is dated by its anchor, so this is how a fixture chain sets
+/// the pace its retention floor moves at: a chain a retention horizon wide
+/// per block leaves every prior version behind, one a fraction of a
+/// horizon apart keeps a known number.
 #[must_use]
 pub(crate) fn make_test_block_at(height: BlockHeight, timestamp_ms: u64) -> Block {
-    let mut block = make_test_block_with_anchor_wt(height, 0);
+    let mut block = make_test_block_with_anchor_wt(height, timestamp_ms);
     if let Block::Live { header, .. } = &mut block {
         *header = BlockHeader::new(BlockHeaderParts {
             height,
@@ -5737,6 +5738,69 @@ pub fn test_snapshot_at_below_the_floor_panics<S: TestStore + VersionedStore>(st
         commit_writes_at(storage, &SettledWrites::default(), paced(height, 2));
     }
     let _snapshot = storage.snapshot_at(BlockHeight::new(1));
+}
+
+/// The clock on a block's certifying QC, which no signer signs and a sync
+/// peer can set, neither dates a version nor moves the cutoff.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_forged_certificate_clock_moves_no_retirement<S: TestStore + VersionedStore>(
+    storage: &S,
+) {
+    let commit = |height: u64, anchor: WeightedTimestamp, clock: WeightedTimestamp| {
+        let block = make_test_block_at(BlockHeight::new(height), anchor.as_millis());
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            block.height(),
+            block.header().parent_block_hash(),
+            Round::INITIAL,
+            Epoch::GENESIS,
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            clock,
+        );
+        let certified = CertifiedBlock::new_unchecked(
+            block,
+            Verified::<QuorumCertificate>::new_unchecked_for_test(qc),
+        );
+        commit_settled_at(
+            storage,
+            &Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+                certified,
+            )),
+            &[],
+            &[],
+            &empty_witness(),
+        );
+    };
+    let far_ahead = paced(1_000, 2);
+
+    // Dated low: three versions a sync peer stamped at zero, under a tip
+    // whose own stamp sits a thousand horizons on. Their anchors are
+    // recent, so all of them stay.
+    for height in 1..=3 {
+        commit(height, paced(height, 100), WeightedTimestamp::ZERO);
+    }
+    commit(4, paced(4, 100), far_ahead);
+    assert!(
+        storage.snapshot_held_at(BlockHeight::new(1)).is_some(),
+        "a low date on the certificate retires nothing",
+    );
+
+    // Dated high: a version stamped far ahead does not stop the floor.
+    // The anchors jump, so two blocks fit the horizon again and the tip
+    // at 10 leaves the floor at 8.
+    for height in 5..=10 {
+        commit(height, paced(height, 2), paced(height, 2));
+    }
+    assert!(
+        storage.snapshot_held_at(BlockHeight::new(7)).is_none(),
+        "a high date on the certificate pins nothing",
+    );
+    assert!(storage.snapshot_held_at(BlockHeight::new(8)).is_some());
 }
 
 /// A tick's snapshot still reads at its anchor once a crossing's floor

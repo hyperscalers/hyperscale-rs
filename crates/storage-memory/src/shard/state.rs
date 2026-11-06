@@ -71,8 +71,8 @@ pub struct SharedState {
     /// Per-write prior-value entries for the entry index, mirroring
     /// `state_history` row for row.
     pub(crate) entries_history: EntryHistory,
-    /// Each version's weighted timestamp, from the floor on; what
-    /// [`retire_dated`] reads.
+    /// Each version's anchor, from the floor on; what [`retire_dated`]
+    /// reads.
     pub(crate) version_time: OrdMap<u64, u64>,
     /// The oldest version historical reads are answered at.
     pub(crate) retention_floor: u64,
@@ -110,8 +110,9 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Date `version` and move the floor past what that retires
-    /// ([`retire_dated`]). Returns the floor this commit establishes.
+    /// Date `version` with its header's anchor and move the floor past
+    /// what that retires ([`retire_dated`]). Returns the floor this commit
+    /// establishes.
     pub(crate) fn advance_retention_floor(
         &mut self,
         version: u64,

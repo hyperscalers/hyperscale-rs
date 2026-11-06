@@ -16,6 +16,13 @@
 //! is kept is the writes of the last horizon, which is what a consumer is
 //! licensed to ask about.
 //!
+//! A version's date is its header's anchor, the parent QC's clock, which
+//! the header hash pins and every licence window reads. The clock on the
+//! QC certifying a block is not it: no signer signs that field, and a
+//! synced block's QC is stored as it arrived, so a sync peer would choose
+//! the date. A low date retires a version early, and one high date stops
+//! the scan at that version for good.
+//!
 //! # One floor, four readers
 //!
 //! The floor is stored rather than recomputed. A historical cell read, a

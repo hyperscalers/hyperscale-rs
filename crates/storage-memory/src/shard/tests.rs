@@ -441,6 +441,12 @@ fn a_replay_keeps_a_leg_its_own_finalization_settled() {
 }
 
 #[test]
+fn a_forged_certificate_clock_moves_no_retirement() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_forged_certificate_clock_moves_no_retirement(&storage);
+}
+
+#[test]
 fn a_leg_entry_holds_the_floor_to_its_horizon() {
     let storage = SimShardStorage::default();
     test_helpers::test_a_leg_entry_holds_the_floor_to_its_horizon(&storage);

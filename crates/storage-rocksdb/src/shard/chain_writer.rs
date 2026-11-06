@@ -190,7 +190,7 @@ fn build_prepared_commit(
             let floor = storage.advance_retention_floor(
                 &mut write_batch,
                 block.height().inner(),
-                qc.weighted_timestamp(),
+                block.header().parent_qc().weighted_timestamp(),
             );
             storage.append_block_to_batch(
                 &mut write_batch,

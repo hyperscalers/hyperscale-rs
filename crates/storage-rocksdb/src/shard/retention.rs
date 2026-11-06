@@ -27,9 +27,8 @@ impl RocksDbShardStorage {
         read_retention_floor(&*self.db)
     }
 
-    /// Date `version` with the weighted timestamp of the QC that
-    /// certified it, and move the floor past what that retires
-    /// ([`retire_dated`]).
+    /// Date `version` with its header's anchor, and move the floor past
+    /// what that retires ([`retire_dated`]).
     ///
     /// Written into the batch that advances the tree, so a version is
     /// dated atomically with the state it commits: a date with no tree at
