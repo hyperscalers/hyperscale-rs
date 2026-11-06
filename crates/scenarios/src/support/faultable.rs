@@ -9,10 +9,10 @@
 //!
 //! [`drop_type`]: FaultableCluster::drop_type
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use hyperscale_hbor::{from_slice, to_vec};
@@ -20,7 +20,7 @@ use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     BlockHeight, MAX_CLAIMS_BYTES, MAX_STATE_CLAIMS_BYTES, PendingReshape, ShardId, StateRoot,
-    Transaction, ValidatorId,
+    SubstateKey, Transaction, ValidatorId,
 };
 
 use super::{Budget, Cluster};
@@ -46,6 +46,120 @@ impl FaultHandle {
     #[must_use]
     pub fn fired(&self) -> u64 {
         (self.fired)()
+    }
+}
+
+/// What one host's answers to the watched state proof requests came to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProofTally {
+    /// Requests answered.
+    pub answers: u64,
+    /// Keys those requests asked, watched or not.
+    pub cells: u64,
+    /// The requests' bytes.
+    pub asked_bytes: u64,
+    /// The answers' bytes.
+    pub answer_bytes: u64,
+}
+
+impl ProofTally {
+    /// What was tallied since `earlier`.
+    #[must_use]
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            answers: self.answers.saturating_sub(earlier.answers),
+            cells: self.cells.saturating_sub(earlier.cells),
+            asked_bytes: self.asked_bytes.saturating_sub(earlier.asked_bytes),
+            answer_bytes: self.answer_bytes.saturating_sub(earlier.answer_bytes),
+        }
+    }
+
+    /// This and `other` together.
+    #[must_use]
+    pub const fn plus(self, other: Self) -> Self {
+        Self {
+            answers: self.answers + other.answers,
+            cells: self.cells + other.cells,
+            asked_bytes: self.asked_bytes + other.asked_bytes,
+            answer_bytes: self.answer_bytes + other.answer_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProofLedger {
+    watched: BTreeSet<SubstateKey>,
+    served: BTreeMap<usize, ProofTally>,
+}
+
+impl ProofLedger {
+    fn count(&mut self, host: usize, keys: &[SubstateKey], counted: ProofTally) {
+        if keys.iter().any(|key| self.watched.contains(key)) {
+            let tally = self.served.entry(host).or_default();
+            *tally = tally.plus(counted);
+        }
+    }
+}
+
+/// Counts the state proof requests that name a watched key, by the host
+/// answering them.
+///
+/// A proof request names keys and no reason, so this is how a read of one
+/// kind is told from the other reads sharing its wire type: watch keys only
+/// that kind asks for. A request naming one of them is counted whole.
+#[derive(Debug, Clone, Default)]
+pub struct ProofMeter {
+    ledger: Arc<Mutex<ProofLedger>>,
+}
+
+impl ProofMeter {
+    /// Count requests naming any of `keys` from now on.
+    pub fn watch(&self, keys: impl IntoIterator<Item = SubstateKey>) {
+        self.ledger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .watched
+            .extend(keys);
+    }
+
+    /// Count `host`'s answer of `answer_bytes` to a request of `asked_bytes`
+    /// asking `keys`, if it names a watched key.
+    pub fn count(
+        &self,
+        host: usize,
+        keys: &[SubstateKey],
+        asked_bytes: usize,
+        answer_bytes: usize,
+    ) {
+        let wide = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
+        let counted = ProofTally {
+            answers: 1,
+            cells: wide(keys.len()),
+            asked_bytes: wide(asked_bytes),
+            answer_bytes: wide(answer_bytes),
+        };
+        self.ledger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .count(host, keys, counted);
+    }
+
+    /// What each host has answered so far, by host.
+    #[must_use]
+    pub fn served(&self) -> BTreeMap<usize, ProofTally> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .served
+            .clone()
+    }
+
+    /// What every host has answered so far.
+    #[must_use]
+    pub fn total(&self) -> ProofTally {
+        self.served()
+            .into_values()
+            .fold(ProofTally::default(), ProofTally::plus)
     }
 }
 
@@ -210,6 +324,13 @@ pub trait FaultableCluster: Cluster {
 
     /// Read how many observations a cluster-wide histogram holds.
     fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64;
+
+    /// Have every host count the state proofs it answers into `meter`,
+    /// until [`clear_drops`](Self::clear_drops) takes the meter out with
+    /// the rest. `false` on a harness that cannot read a response's bytes.
+    fn meter_state_proofs(&mut self, _meter: &ProofMeter) -> bool {
+        false
+    }
 }
 
 /// Every host that runs or is about to run a member of `shard`: the

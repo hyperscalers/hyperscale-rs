@@ -27,9 +27,10 @@ use hyperscale_scenarios::tx::{
     unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
-    Budget, Ceiling, Certificates, Cluster, CoreLoad, FIRST_VENUE_SHARD, FaultableCluster,
-    LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, PAYER_SHARD, Pair, RoutePayer, ScenarioConfig,
-    Spend, VENUE_SHARD, WIDE_VENUE_SHARD, a_book_route_reads_its_range_across_a_split,
+    Budget, Ceiling, Certificates, Cluster, ContendedLoad, CoreLoad, FIRST_VENUE_SHARD,
+    FaultableCluster, HOT_POOL_ADOPT_IF, HotPool, LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES,
+    PAYER_SHARD, Pair, RoutePayer, ScenarioConfig, Spend, VENUE_SHARD, WIDE_VENUE_SHARD,
+    a_book_route_reads_its_range_across_a_split,
     a_consumer_never_committing_declines_a_pushed_record,
     a_core_stated_at_a_halt_is_accepted_on_both_venues,
     a_crossing_a_merge_converges_finishes_on_the_successor,
@@ -113,6 +114,7 @@ use hyperscale_scenarios::{
     attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
     beacon_pool_partition_stalls_epoch_production, book_route_genesis_accounts,
     both_venues_read_a_routes_record_inside_the_finalization_delay,
+    contended_load_genesis_accounts, contended_routes_through_one_pair_under_load,
     contested_publish_genesis_accounts, core_load_genesis_accounts, core_routes_under_load,
     cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
     cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
@@ -127,7 +129,7 @@ use hyperscale_scenarios::{
     halted_shard_recovers_by_committee_redraw,
     halted_shard_recovery_agrees_across_retained_and_fresh,
     halted_shard_recovery_replays_a_sweep_its_suffix_walked, halted_shard_straddler_atomic,
-    hot_recipient, hot_venue_clears_swaps, hot_venue_clears_swaps_on,
+    hot_pool_genesis_accounts, hot_recipient, hot_venue_clears_swaps, hot_venue_clears_swaps_on,
     insolvent_payer_engages_nothing, inter_shard_partition_strands_ticks_until_it_heals,
     isolated_validator_still_settles, late_certificate_genesis_accounts,
     late_departing_route_genesis_accounts, livelock_resolves_promptly, liveness_baseline,
@@ -145,8 +147,8 @@ use hyperscale_scenarios::{
     route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
     routes_seated_the_other_way_lose_the_later_to_the_cycle,
-    sealed_rounds_settle_on_the_seed_they_committed_to, second_splitter_genesis_accounts,
-    securify_retires_the_key_at_the_payer_shard, single_transfer,
+    sealed_rounds_settle_on_the_seed_they_committed_to, seat_fetches_on_a_hot_pool,
+    second_splitter_genesis_accounts, securify_retires_the_key_at_the_payer_shard, single_transfer,
     split_boundary_admits_an_uncommitted_precut_tx,
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
@@ -1538,6 +1540,69 @@ fn core_routes_stand_under_load_2048_sim() {
 #[ignore = "GB-scale load (a quarter hour, ~49GB RAM) — run alone with --ignored"]
 fn core_routes_stand_under_load_3200_sim() {
     core_load(3200, 400, 60, Certificates::CutWhileOffered);
+}
+
+/// The traders a contended load's routes are dealt among.
+const CONTENDED_LOAD_TRADERS: usize = 8;
+
+/// The share of crossing readings a contended load drops: enough to skew
+/// what each venue hears first, so the twins invert.
+const CONTENDED_RECORD_LOSS: f64 = 0.2;
+
+/// Offer `twins_per_second` twins through `pairs` venue pairs for
+/// `seconds` on [`dedicated_route_cluster`], so a venue's reads of the
+/// other cross the wire and hold cycles form between the venues.
+fn contended_load(pairs: usize, twins_per_second: usize, seconds: u64) {
+    let mut cluster =
+        dedicated_route_cluster(&contended_load_genesis_accounts(CONTENDED_LOAD_TRADERS));
+    cluster.run_faultable(|cluster| {
+        contended_routes_through_one_pair_under_load(
+            cluster,
+            ContendedLoad {
+                pairs,
+                traders: CONTENDED_LOAD_TRADERS,
+                twins_per_second,
+                duration: Duration::from_secs(seconds),
+                record_loss: CONTENDED_RECORD_LOSS,
+            },
+        );
+    });
+    println!("contended load [process]: {}", resident());
+}
+
+#[test]
+fn contended_routes_lose_only_the_later_hash_sim() {
+    contended_load(4, 1, 60);
+}
+
+/// Ignored, as every load this size is: minutes of wall time, run alone.
+#[test]
+#[ignore = "long wall time"]
+fn contended_routes_lose_only_the_later_hash_32_sim() {
+    contended_load(32, 8, 120);
+}
+
+/// Ignored: a measurement of the ask gap's cost on a hot pool, 500 routes
+/// standing behind one head, that adopts or refuses that gap.
+#[test]
+#[ignore = "long wall time"]
+fn seat_fetches_on_a_hot_pool_sim() {
+    let mut cluster = dedicated_route_cluster(&hot_pool_genesis_accounts());
+    let fetched = cluster.run_faultable(|cluster| {
+        seat_fetches_on_a_hot_pool(
+            cluster,
+            HotPool {
+                routes: 500,
+                duration: Duration::from_mins(1),
+            },
+        )
+    });
+    println!("hot pool [process]: {}", resident());
+    assert!(
+        fetched <= HOT_POOL_ADOPT_IF,
+        "seat fetches at {fetched} bytes a validator a second miss the adopt-if line of \
+         {HOT_POOL_ADOPT_IF}",
+    );
 }
 
 /// Ignored, as every size of the core load is: carrying one lineage to

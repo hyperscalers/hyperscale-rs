@@ -128,8 +128,9 @@ pub use restart::{
     a_restart_mid_handoff_keeping_its_stores_catches_the_child_up,
 };
 pub use route::{
-    Certificates, CoreLoad, FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport,
-    SECOND_VENUE_SHARD, TRADER_SHARD, a_core_stated_at_a_halt_is_accepted_on_both_venues,
+    Certificates, ContendedLoad, CoreLoad, FIRST_VENUE_SHARD, HOT_POOL_ADOPT_IF, HotPool,
+    ROUTE_INPUT, ROUTES, RouteReport, SECOND_VENUE_SHARD, TRADER_SHARD,
+    a_core_stated_at_a_halt_is_accepted_on_both_venues,
     a_crossing_the_consumer_refuses_is_declined, a_recovered_venue_keeps_what_its_sibling_accepted,
     a_route_a_halting_venue_could_read_is_settled_before_the_halt,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
@@ -144,11 +145,13 @@ pub use route::{
     a_stall_past_the_finalization_delay_states_every_member_of_its_tick,
     a_venue_hearing_late_still_loses_the_later_route_fast,
     an_unseen_never_goes_once_its_producers_leg_is_fated,
-    both_venues_read_a_routes_record_inside_the_finalization_delay, core_load_genesis_accounts,
-    core_routes_under_load, crossed_route_genesis_accounts, late_certificate_genesis_accounts,
-    ring_route_genesis_accounts, route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
+    both_venues_read_a_routes_record_inside_the_finalization_delay,
+    contended_load_genesis_accounts, contended_routes_through_one_pair_under_load,
+    core_load_genesis_accounts, core_routes_under_load, crossed_route_genesis_accounts,
+    hot_pool_genesis_accounts, late_certificate_genesis_accounts, ring_route_genesis_accounts,
+    route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
-    routes_seated_the_other_way_lose_the_later_to_the_cycle,
+    routes_seated_the_other_way_lose_the_later_to_the_cycle, seat_fetches_on_a_hot_pool,
     standing_answers_level_off_under_sustained_load, stated_venues_hear_each_others_yes_by_asking,
     stated_venues_hear_each_others_yes_by_push,
 };
@@ -202,7 +205,7 @@ pub use straddler::{
 };
 pub use support::{
     BlockServingCap, Budget, Cluster, Crash, CrashableCluster, DISCARD, FaultHandle,
-    FaultableCluster, MemberEdge, Nemesis, RestartableCluster, ScenarioConfig, assume,
+    FaultableCluster, MemberEdge, Nemesis, ProofMeter, RestartableCluster, ScenarioConfig, assume,
     committees_on_separate_hosts, conservation, discard, epochs, grow_and_hold, grow_to, query,
     submission_shards, tx, vote_reshape_threshold, wait,
 };

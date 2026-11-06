@@ -16,6 +16,7 @@ use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{
     FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment,
 };
+use hyperscale_hbor::from_slice;
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
@@ -28,7 +29,7 @@ use hyperscale_scenarios::query::{
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     BlockServingCap, Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster,
-    MemberEdge, RestartableCluster, ScenarioConfig, grow_and_hold, submission_shards,
+    MemberEdge, ProofMeter, RestartableCluster, ScenarioConfig, grow_and_hold, submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{
@@ -39,6 +40,7 @@ use hyperscale_storage::{
     VersionedStore, answer_route,
 };
 use hyperscale_storage_memory::SimShardStorage;
+use hyperscale_types::network::request::GetStateProofRequest;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
@@ -1552,5 +1554,22 @@ impl FaultableCluster for SimCluster {
 
     fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64 {
         self.recorder.histogram_count(name, label)
+    }
+
+    fn meter_state_proofs(&mut self, meter: &ProofMeter) -> bool {
+        for host in 0..self.host_count() {
+            let meter = meter.clone();
+            let _ = self.rewrite_responses(
+                host,
+                "state_proof.request",
+                Arc::new(move |asked: &[u8], answer: &[u8]| {
+                    if let Ok(request) = from_slice::<GetStateProofRequest>(asked) {
+                        meter.count(host, &request.keys, asked.len(), answer.len());
+                    }
+                    answer.to_vec()
+                }),
+            );
+        }
+        true
     }
 }

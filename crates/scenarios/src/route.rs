@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
-use hyperscale_storage::{FeeTerms, RowState};
+use hyperscale_storage::{FeeTerms, Place, RowState, seat_leaf};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_CLAIMS_BYTES,
@@ -46,7 +46,9 @@ use crate::support::tx::{
     build_route_tx, build_sponsored_route_tx, build_swap_tx, build_transfer_tx, validity_around,
 };
 use crate::support::wait::{await_blocks, await_tx_terminal};
-use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
+use crate::support::{
+    Budget, Cluster, FaultHandle, FaultableCluster, ProofMeter, ProofTally, epochs,
+};
 use crate::venue::{
     PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell,
     stand_up_venue, stand_up_venues_on,
@@ -3478,6 +3480,25 @@ const LOAD_SHARDS: [(&str, ShardId); 3] = [
 /// what [`core_routes_under_load`] has it do.
 #[must_use]
 pub fn core_load_genesis_accounts(traders: usize) -> Vec<(PrincipalAddr, u128)> {
+    load_genesis_accounts(&[(TRADER_SHARD, traders)])
+}
+
+/// A provider on each venue shard and `traders` traders dealt evenly
+/// between the two trader shards, each funded for what
+/// [`contended_routes_through_one_pair_under_load`] has it do.
+#[must_use]
+pub fn contended_load_genesis_accounts(traders: usize) -> Vec<(PrincipalAddr, u128)> {
+    load_genesis_accounts(&traders_on_both_shards(traders))
+}
+
+/// [`core_load_genesis_accounts`] of the traders a hot pool deals its
+/// routes among.
+#[must_use]
+pub fn hot_pool_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    core_load_genesis_accounts(HOT_POOL_TRADERS)
+}
+
+fn load_genesis_accounts(traders: &[(ShardId, usize)]) -> Vec<(PrincipalAddr, u128)> {
     let mut taken = Vec::new();
     let mut accounts = vec![
         (
@@ -3492,14 +3513,28 @@ pub fn core_load_genesis_accounts(traders: usize) -> Vec<(PrincipalAddr, u128)> 
     accounts.extend(
         load_traders(traders, &mut taken)
             .into_iter()
+            .flatten()
             .map(|(_, account)| (account, LOAD_TRADER_FUNDING)),
     );
     accounts
 }
 
-fn load_traders(count: usize, taken: &mut Vec<u8>) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
-    (0..count)
-        .map(|_| grind_onto(TRADER_SHARD, taken))
+/// `traders` dealt evenly between the two trader shards.
+const fn traders_on_both_shards(traders: usize) -> [(ShardId, usize); 2] {
+    [
+        (TRADER_SHARD, traders / 2),
+        (SECOND_TRADER_SHARD, traders - traders / 2),
+    ]
+}
+
+/// The traders ground onto each shard of `shards`, in its order.
+fn load_traders(
+    shards: &[(ShardId, usize)],
+    taken: &mut Vec<u8>,
+) -> Vec<Vec<(Ed25519PrivateKey, PrincipalAddr)>> {
+    shards
+        .iter()
+        .map(|&(shard, count)| (0..count).map(|_| grind_onto(shard, taken)).collect())
         .collect()
 }
 
@@ -3824,11 +3859,11 @@ impl Flight {
         }
         let Self {
             flying,
-            free,
             decided,
             lives,
             ..
         } = self;
+        let mut landed = BTreeSet::new();
         flying.retain(|hash, pair| {
             let Some([first, second]) = lives.get(hash) else {
                 return true;
@@ -3838,9 +3873,19 @@ impl Flight {
             };
             let accepted = TransactionDecision::Accept;
             decided.insert(*hash, if first == accepted { second } else { first });
-            free.push_back(*pair);
+            landed.insert(*pair);
             false
         });
+        self.give_back(landed);
+    }
+
+    /// Free each of `pairs` no route still out runs through.
+    fn give_back(&mut self, pairs: BTreeSet<usize>) {
+        for pair in pairs {
+            if !self.flying.values().any(|out| *out == pair) {
+                self.free.push_back(pair);
+            }
+        }
     }
 
     /// Run the cluster's clock a second on and read the load, printing
@@ -3864,11 +3909,11 @@ impl Flight {
         let Self {
             routes,
             flying,
-            free,
             lives,
             lapsed,
             ..
         } = self;
+        let mut given_up = BTreeSet::new();
         flying.retain(|hash, pair| {
             let carried = lives
                 .get(hash)
@@ -3884,9 +3929,10 @@ impl Flight {
                 return true;
             }
             *lapsed += 1;
-            free.push_back(*pair);
+            given_up.insert(*pair);
             false
         });
+        self.give_back(given_up);
     }
 
     /// How many of the routes the venue shards decided as `wanted`.
@@ -3918,16 +3964,17 @@ fn walked<C: Cluster>(
 struct LoadCast {
     firsts: Vec<StockedVenue>,
     seconds: Vec<StockedVenue>,
-    traders: Vec<(Ed25519PrivateKey, PrincipalAddr)>,
+    /// The traders on each shard they were ground onto.
+    traders: Vec<Vec<(Ed25519PrivateKey, PrincipalAddr)>>,
 }
 
 impl LoadCast {
-    fn stand_up<C: Cluster>(c: &mut C, load: CoreLoad) -> Self {
+    fn stand_up<C: Cluster>(c: &mut C, pairs: usize, traders: &[(ShardId, usize)]) -> Self {
         let mut taken = Vec::new();
         let mut venues = stand_up_venues_on(
             c,
             &[FIRST_VENUE_SHARD, SECOND_VENUE_SHARD],
-            load.pairs,
+            pairs,
             &mut taken,
         );
         let seconds = venues.pop().expect("the second shard's venues");
@@ -3935,7 +3982,7 @@ impl LoadCast {
         Self {
             firsts,
             seconds,
-            traders: load_traders(load.traders, &mut taken),
+            traders: load_traders(traders, &mut taken),
         }
     }
 
@@ -3945,7 +3992,10 @@ impl LoadCast {
         World::open(
             c,
             resource,
-            accounts(&self.traders).map(PrincipalAddr::address),
+            self.traders
+                .iter()
+                .flat_map(|traders| accounts(traders))
+                .map(PrincipalAddr::address),
             self.firsts
                 .iter()
                 .chain(&self.seconds)
@@ -3966,35 +4016,144 @@ impl LoadCast {
                 flight.short += 1;
                 continue;
             };
-            let nth = flight.routes.len();
-            let (key, trader) = &self.traders[nth % self.traders.len()];
-            let route = build_route_tx(
-                key,
-                *trader,
-                (&self.firsts[pair].meta, &self.seconds[pair].meta),
-                *PROTOCOL_RESOURCE,
-                ROUTE_INPUT + u128::try_from(nth).expect("a count of routes"),
-                0,
-                window,
-            );
             let after = step * u32::try_from(slot).unwrap_or(u32::MAX);
-            flight.spread &= c.submit_after(after, route.clone());
-            flight.flying.insert(route.hash(), pair);
-            flight.routes.insert(route.hash(), route);
+            self.send(
+                c,
+                flight,
+                TradersOn::First,
+                (pair, Heading::Out),
+                window,
+                after,
+            );
         }
+    }
+
+    /// Offer the coming second's `load.twins_per_second` twins through
+    /// pairs standing free, the nth of them that far through the second:
+    /// a route each way through one pair, at one instant, from a trader
+    /// on each trader shard.
+    fn offer_twins<C: Cluster>(
+        &self,
+        c: &mut C,
+        load: ContendedLoad,
+        flight: &mut Flight,
+        twins: &mut Vec<Twin>,
+    ) {
+        let window = validity_around(c.now());
+        let step = Duration::from_secs(1)
+            / u32::try_from(load.twins_per_second.max(1)).unwrap_or(u32::MAX);
+        for slot in 0..load.twins_per_second {
+            let Some(pair) = flight.free.pop_front() else {
+                flight.short += 1;
+                continue;
+            };
+            let after = step * u32::try_from(slot).unwrap_or(u32::MAX);
+            let routes = [
+                self.send(
+                    c,
+                    flight,
+                    TradersOn::First,
+                    (pair, Heading::Out),
+                    window,
+                    after,
+                ),
+                self.send(
+                    c,
+                    flight,
+                    TradersOn::Second,
+                    (pair, Heading::Back),
+                    window,
+                    after,
+                ),
+            ];
+            twins.push(Twin {
+                routes,
+                offered: c.now() + after,
+            });
+        }
+    }
+
+    /// Top `flight` up towards `pool.routes` routes out through the one
+    /// pair, by at most [`HOT_POOL_ARRIVALS`] this second.
+    fn offer_hot<C: Cluster>(&self, c: &mut C, pool: HotPool, flight: &mut Flight) {
+        let window = validity_around(c.now());
+        let missing = pool.routes.saturating_sub(flight.flying.len());
+        for _ in 0..missing.min(HOT_POOL_ARRIVALS) {
+            self.send(
+                c,
+                flight,
+                TradersOn::First,
+                (0, Heading::Out),
+                window,
+                Duration::ZERO,
+            );
+        }
+    }
+
+    /// Build the next route, send it through `pair` as `heading` says from
+    /// the next of `traders` once `after` has passed, and put it in the
+    /// air, its amount its own so no two are one transaction.
+    fn send<C: Cluster>(
+        &self,
+        c: &mut C,
+        flight: &mut Flight,
+        traders: TradersOn,
+        (pair, heading): (usize, Heading),
+        window: TimestampRange,
+        after: Duration,
+    ) -> TxHash {
+        let nth = flight.routes.len();
+        let dealt = &self.traders[traders as usize];
+        let (key, trader) = &dealt[nth % dealt.len()];
+        let (first, second) = (&self.firsts[pair].meta, &self.seconds[pair].meta);
+        let route = build_route_tx(
+            key,
+            *trader,
+            match heading {
+                Heading::Out => (first, second),
+                Heading::Back => (second, first),
+            },
+            *PROTOCOL_RESOURCE,
+            ROUTE_INPUT + u128::try_from(nth).expect("a count of routes"),
+            0,
+            window,
+        );
+        let hash = route.hash();
+        flight.spread &= c.submit_after(after, route.clone());
+        flight.flying.insert(hash, pair);
+        flight.routes.insert(hash, route);
+        hash
     }
 }
 
+/// Which of a load's trader shards a route's trader is dealt from.
+#[derive(Clone, Copy)]
+enum TradersOn {
+    First,
+    Second,
+}
+
+/// Which way a route runs through its pair.
+#[derive(Clone, Copy)]
+enum Heading {
+    /// The first shard's venue, then the second's.
+    Out,
+    /// The second shard's venue, then the first's.
+    Back,
+}
+
 /// What the routes of `flight` a chain has charged burned between them:
-/// each one decided other than by an abort, and each one the traders'
-/// chain carries the burn or the fate of from `from` up.
-fn load_burned<C: Cluster>(c: &C, flight: &Flight, from: BlockHeight) -> u128 {
+/// each one decided other than by an abort, and each one its trader's
+/// chain carries the burn or the fate of. `from` is each trader shard
+/// and the height its chain is walked from.
+fn load_burned<C: Cluster>(c: &C, flight: &Flight, from: &[(ShardId, BlockHeight)]) -> u128 {
     let hashes: BTreeSet<TxHash> = flight.routes.keys().copied().collect();
-    let mentions = walked(c, TRADER_SHARD, from, &hashes);
-    let on_the_payers_chain: BTreeSet<TxHash> = mentions
-        .burned
-        .into_iter()
-        .chain(mentions.fated)
+    let on_the_payers_chain: BTreeSet<TxHash> = from
+        .iter()
+        .flat_map(|&(shard, height)| {
+            let mentions = walked(c, shard, height, &hashes);
+            mentions.burned.into_iter().chain(mentions.fated)
+        })
         .map(|(tx, _)| tx)
         .collect();
     flight
@@ -4012,16 +4171,18 @@ fn load_burned<C: Cluster>(c: &C, flight: &Flight, from: BlockHeight) -> u128 {
 }
 
 /// Drive until both sides of the load's pair settle against what its
-/// routes burned, hold them there a few blocks, and read each side:
-/// what it held before, what it holds, and what was burned of it.
+/// routes burned, for up to `settle_within`, hold them there a few
+/// blocks, and read each side: what it held before, what it holds, and
+/// what was burned of it.
 fn load_conserved<C: Cluster>(
     c: &mut C,
     flight: &Flight,
-    from: BlockHeight,
+    from: &[(ShardId, BlockHeight)],
+    settle_within: Duration,
     protocol_resource: &World,
     units: &World,
 ) -> [(&'static str, u128, u128, u128); 2] {
-    let settle_by = c.now() + LOAD_DRAIN;
+    let settle_by = c.now() + settle_within;
     let settled =
         |c: &C| protocol_resource.settles(c, load_burned(c, flight, from)) && units.settles(c, 0);
     while !settled(c) && c.now() < settle_by {
@@ -4039,6 +4200,19 @@ fn load_conserved<C: Cluster>(
         ),
         ("units", units.before(), units.held(c), 0),
     ]
+}
+
+/// Assert each side [`load_conserved`] read holds what it held before,
+/// less what was burned of it.
+fn assert_load_conserved(conserved: [(&'static str, u128, u128, u128); 2]) {
+    for (side, before, held, burned) in conserved {
+        assert_eq!(
+            held + burned,
+            before,
+            "the load's {side} must be conserved: held {held} and burned {burned} against \
+             {before} before",
+        );
+    }
 }
 
 /// Many routes at once, each a core member on both venue shards and none
@@ -4084,7 +4258,7 @@ fn load_conserved<C: Cluster>(
 /// any route is not accepted.
 pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
     let wall = Instant::now();
-    let cast = LoadCast::stand_up(c, load);
+    let cast = LoadCast::stand_up(c, load.pairs, &[(TRADER_SHARD, load.traders)]);
     let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
     let units = cast.world(c, cast.firsts[0].unit);
     println!(
@@ -4123,7 +4297,8 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
     while !flight.flying.is_empty() && c.now() < closed + LOAD_DRAIN {
         flight.tick(c, "draining");
     }
-    let conserved = load_conserved(c, &flight, opened_at[2], &protocol_resource, &units);
+    let payers = [(TRADER_SHARD, opened_at[2])];
+    let conserved = load_conserved(c, &flight, &payers, LOAD_DRAIN, &protocol_resource, &units);
     let after = LoadCounters::read(c);
 
     CoreLoadRun {
@@ -4141,14 +4316,7 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
     }
     .report(c);
 
-    for (side, before, held, burned) in conserved {
-        assert_eq!(
-            held + burned,
-            before,
-            "the load's {side} must be conserved: held {held} and burned {burned} against \
-             {before} before",
-        );
-    }
+    assert_load_conserved(conserved);
     assert!(
         flight.flying.is_empty(),
         "{} of {} routes were still undecided {LOAD_DRAIN:?} past the last offer, the first \
@@ -4171,6 +4339,655 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
             .iter()
             .find(|(_, decision)| **decision != TransactionDecision::Accept),
     );
+}
+
+/// Epochs an aborted route's input gets to come home to its trader, as
+/// [`crossed_routes`] gives it: [`LOAD_DRAIN`] can be a single epoch, which
+/// is too short for it.
+const ABORT_REFUND_EPOCHS: u32 = 8;
+
+/// The message a block's crossing readings are pushed in.
+const CROSSING_READINGS: &str = "crossing.readings";
+
+/// A load of twins: two routes offered at one instant through one venue
+/// pair, each way round.
+#[derive(Debug, Clone, Copy)]
+pub struct ContendedLoad {
+    /// The venue pairs, one twin through each at a time.
+    pub pairs: usize,
+    /// The traders the routes are dealt among, half on each trader shard.
+    pub traders: usize,
+    /// The twins offered each second of the cluster's clock, spread evenly
+    /// across it, as far as pairs stand free to take them.
+    pub twins_per_second: usize,
+    /// How long the load is offered for.
+    pub duration: Duration,
+    /// The share of crossing readings dropped while it is, which skews
+    /// each venue's arrivals so the twins invert.
+    pub record_loss: f64,
+}
+
+/// Two routes offered at one instant through one venue pair.
+#[derive(Debug, Clone, Copy)]
+struct Twin {
+    routes: [TxHash; 2],
+    offered: Duration,
+}
+
+/// What each route's rows on the venue shards were seen to do.
+#[derive(Debug, Default)]
+struct PlacesSeen {
+    /// Where each route was first seen placed on each venue shard.
+    places: BTreeMap<TxHash, [Option<Place>; 2]>,
+    /// When each route, on each venue shard, first refused someone.
+    refusals: BTreeMap<TxHash, [Option<WeightedTimestamp>; 2]>,
+}
+
+impl PlacesSeen {
+    /// Note where each venue shard's queue holds each route out.
+    fn read<C: Cluster>(&mut self, c: &C, flight: &Flight) {
+        let now = WeightedTimestamp::ZERO.plus(c.now());
+        for (venue, shard) in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+            .into_iter()
+            .enumerate()
+        {
+            let rows = c
+                .queued_rows(shard)
+                .expect("the harness reads a venue shard's queue");
+            for route in flight.flying.keys() {
+                let seen = self.places.entry(*route).or_default();
+                let refused = self.refusals.entry(*route).or_default();
+                match rows.get(route) {
+                    Some(row) => {
+                        if let Some(place) = row.queued {
+                            seen[venue].get_or_insert(place);
+                        }
+                        if let Some(at) = row.blocked_at {
+                            refused[venue].get_or_insert(at);
+                        }
+                    }
+                    // A poll is a second of cluster clock, and a row can be
+                    // placed against and wounded inside one: a placed row
+                    // first seen gone takes that poll's clock, which is
+                    // past its refusal.
+                    None if seen[venue].is_some() => {
+                        refused[venue].get_or_insert(now);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// Whether the venues placed the twin in opposite order; `None` where
+    /// either place went unseen.
+    fn inverted(&self, [a, b]: [TxHash; 2]) -> Option<bool> {
+        let (a, b) = (self.places.get(&a)?, self.places.get(&b)?);
+        let first = a[0]?.cmp(&b[0]?);
+        let second = a[1]?.cmp(&b[1]?);
+        Some(first != second)
+    }
+
+    /// The later of the refusals the twin's two heads made, each venue's
+    /// head the route it placed first; `None` where one went unseen.
+    fn later_refusal(&self, [a, b]: [TxHash; 2]) -> Option<WeightedTimestamp> {
+        let (places, refusals) = (
+            [self.places.get(&a)?, self.places.get(&b)?],
+            [self.refusals.get(&a)?, self.refusals.get(&b)?],
+        );
+        let refusal = |venue: usize| {
+            let head = usize::from(places[1][venue]? < places[0][venue]?);
+            refusals[head][venue]
+        };
+        Some(refusal(0)?.max(refusal(1)?))
+    }
+}
+
+/// The millisecond of the cluster's clock `route` had settled on both
+/// venue chains by; `None` until it has.
+fn settled_ms<C: Cluster>(c: &C, flight: &Flight, route: TxHash) -> Option<u64> {
+    let [first, second] = flight.lives.get(&route)?;
+    let clock = |shard, life: &MemberLife| {
+        c.committed_clock(shard, life.settled_at()?)
+            .map(WeightedTimestamp::as_millis)
+    };
+    Some(clock(FIRST_VENUE_SHARD, first)?.max(clock(SECOND_VENUE_SHARD, second)?))
+}
+
+/// What became of one twin.
+struct TwinOutcome {
+    /// Whether the venues placed it in opposite order, where that was
+    /// seen.
+    inverted: Option<bool>,
+    /// The routes that aborted.
+    aborted: Vec<TxHash>,
+    /// How long each route took from its offer to both venue chains
+    /// settling it, by route.
+    resolved: [(TxHash, Option<usize>); 2],
+    /// How long a twin that lost a route took from the later of its heads'
+    /// refusals to both venue chains settling the survivor, in
+    /// milliseconds, where those were seen.
+    since_refusal: Option<usize>,
+}
+
+impl TwinOutcome {
+    fn read<C: Cluster>(c: &C, flight: &Flight, places: &PlacesSeen, twin: &Twin) -> Self {
+        let resolved = twin.routes.map(|route| {
+            let offered = u64::try_from(twin.offered.as_millis()).unwrap_or(u64::MAX);
+            let took = settled_ms(c, flight, route)
+                .and_then(|at| usize::try_from(at.saturating_sub(offered)).ok());
+            (route, took)
+        });
+        let aborted: Vec<TxHash> = twin
+            .routes
+            .into_iter()
+            .filter(|route| flight.decided.get(route) == Some(&TransactionDecision::Aborted))
+            .collect();
+        let survivor = twin
+            .routes
+            .into_iter()
+            .find(|route| !aborted.contains(route))
+            .filter(|_| !aborted.is_empty());
+        let since_refusal = survivor.and_then(|survivor| {
+            let refused = places.later_refusal(twin.routes)?.as_millis();
+            usize::try_from(settled_ms(c, flight, survivor)?.saturating_sub(refused)).ok()
+        });
+        Self {
+            inverted: places.inverted(twin.routes),
+            aborted,
+            resolved,
+            since_refusal,
+        }
+    }
+
+    /// How long each route `keep` picks took to resolve.
+    fn times(&self, keep: impl Fn(&TxHash) -> bool) -> impl Iterator<Item = usize> + '_ {
+        let keep = self
+            .resolved
+            .map(|(route, took)| took.filter(|_| keep(&route)));
+        keep.into_iter().flatten()
+    }
+}
+
+/// `values`, in milliseconds, as their median and 99th percentile.
+fn ms_quantiles(mut values: Vec<usize>) -> String {
+    format!(
+        "p50 {} ms, p99 {} ms (of {})",
+        quantile(&mut values, 500),
+        quantile(&mut values, 990),
+        values.len(),
+    )
+}
+
+/// The aborts that came at a route's own deadline: each route the venues
+/// aborted whose settling was at or past the end of its signed validity.
+fn deadline_aborts<C: Cluster>(c: &C, flight: &Flight) -> usize {
+    flight
+        .decided
+        .iter()
+        .filter(|(_, decision)| **decision == TransactionDecision::Aborted)
+        .filter(|(route, _)| {
+            let deadline = flight.routes[*route]
+                .validity_range()
+                .end_timestamp_exclusive
+                .as_millis();
+            settled_ms(c, flight, **route).is_none_or(|at| at >= deadline)
+        })
+        .count()
+}
+
+/// Print `tally`, the seat fetches of a run, for the `blocks` the venue
+/// chains committed over it and the `askers` that fetched them.
+fn report_seat_fetches(label: &str, tally: ProofTally, blocks: u64, askers: u64) {
+    println!(
+        "{label} [seat fetches, requests naming a route's seat leaf, answered by every host]: \
+         {} fetches of {} cells, {} bytes asked and {} answered; {} fetches a venue block over \
+         {blocks} blocks, {} a validator's venue block over {askers} validators",
+        tally.answers,
+        tally.cells,
+        tally.asked_bytes,
+        tally.answer_bytes,
+        mean(tally.answers, blocks),
+        mean(tally.answers, blocks.saturating_mul(askers)),
+    );
+}
+
+/// The blocks both venue chains committed from `opened` to `settled`, each
+/// a height for every one of [`LOAD_SHARDS`].
+fn venue_blocks(
+    opened: [BlockHeight; LOAD_SHARDS.len()],
+    settled: [BlockHeight; LOAD_SHARDS.len()],
+) -> u64 {
+    (0..2)
+        .map(|venue| settled[venue].inner().saturating_sub(opened[venue].inner()) + 1)
+        .sum()
+}
+
+/// How many venue validators ask seat questions: each venue shard's
+/// committee asks the other.
+fn venue_validators<C: FaultableCluster>(c: &C) -> u64 {
+    [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+        .into_iter()
+        .map(|shard| wide(c.committee_hosts(shard).len()))
+        .sum()
+}
+
+/// Watch the seat leaf of every route out, on both venue shards.
+fn watch_seats(meter: &ProofMeter, flight: &Flight) {
+    meter.watch(flight.flying.keys().flat_map(|route| {
+        [
+            seat_leaf(FIRST_VENUE_SHARD, *route),
+            seat_leaf(SECOND_VENUE_SHARD, *route),
+        ]
+    }));
+}
+
+/// Twins through one venue pair lose only the later hash, and only when
+/// the venues place them in opposite order.
+///
+/// Each second `load.twins_per_second` twins are offered through pairs
+/// standing free: one route from a trader on [`TRADER_SHARD`] through the
+/// first shard's venue and then the second's, and one from a trader on
+/// [`SECOND_TRADER_SHARD`] the other way round. A pair takes another twin
+/// only once both routes have settled on both venue chains, so a route
+/// contends with its twin alone. Dropping `load.record_loss` of the
+/// crossing readings while the load is offered skews what each venue
+/// hears first, so some twins place in opposite order; re-pushes and
+/// answers to asks recover the drops.
+///
+/// On top of what [`core_routes_under_load`] reports, the run reports the
+/// twins, how many the venues placed in opposite order as read off their
+/// queues, the abort fraction, p50 and p99 time to resolve for the twins
+/// the venues agreed on, for the survivors of inverted twins and for
+/// their victims, the wounds and windows, and the seat fetches a venue
+/// block.
+///
+/// Requires a grown four-shard cluster over
+/// [`contended_load_genesis_accounts`] of `load.traders`, on committees
+/// that share no host, one that walks its shards' chains.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if either side of the
+/// pair is not conserved, if a route is still undecided past the drain, if
+/// a head leaves at its window or a route aborts at its deadline, if both
+/// routes of a twin abort, if an aborted route is not the later of its
+/// twin or its twin does not accept, if the aborted outnumber the twins
+/// seen inverted, if no twin inverts, or if the p99 survivor resolves half
+/// a naming window past the later of its heads' refusals.
+pub fn contended_routes_through_one_pair_under_load<C: FaultableCluster>(
+    c: &mut C,
+    load: ContendedLoad,
+) {
+    let wall = Instant::now();
+    let cast = LoadCast::stand_up(c, load.pairs, &traders_on_both_shards(load.traders));
+    let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
+    let units = cast.world(c, cast.firsts[0].unit);
+    let height = |c: &C, shard: ShardId| c.committed_height(shard).unwrap_or(BlockHeight::GENESIS);
+    let opened_at = LOAD_SHARDS.map(|(_, shard)| height(c, shard).next());
+    let payers = [
+        (TRADER_SHARD, opened_at[2]),
+        (SECOND_TRADER_SHARD, height(c, SECOND_TRADER_SHARD).next()),
+    ];
+    let opened = c.now();
+    let before = LoadCounters::read(c);
+    let offering = Instant::now();
+    let meter = ProofMeter::default();
+    let metered = c.meter_state_proofs(&meter);
+    let lost = c.drop_type_with_probability(CROSSING_READINGS, load.record_loss);
+    let mut flight = Flight::over(load.pairs, [opened_at[0], opened_at[1]]);
+    let mut twins = Vec::new();
+    let mut places = PlacesSeen::default();
+    while c.now() < opened + load.duration {
+        cast.offer_twins(c, load, &mut flight, &mut twins);
+        watch_seats(&meter, &flight);
+        flight.tick(c, "offering");
+        places.read(c, &flight);
+    }
+    let dropped = lost.fired();
+    c.clear_drops();
+    c.meter_state_proofs(&meter);
+    let closed_at = LOAD_SHARDS.map(|(_, shard)| height(c, shard));
+    let closed = c.now();
+    let offering = offering.elapsed();
+    let offered = flight.samples.len();
+    while !flight.flying.is_empty() && c.now() < closed + LOAD_DRAIN {
+        flight.tick(c, "draining");
+        places.read(c, &flight);
+    }
+    let epoch =
+        Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch length"));
+    let refund_within = epoch * ABORT_REFUND_EPOCHS;
+    let conserved = load_conserved(
+        c,
+        &flight,
+        &payers,
+        refund_within,
+        &protocol_resource,
+        &units,
+    );
+    let after = LoadCounters::read(c);
+    let heights = [
+        opened_at,
+        closed_at,
+        LOAD_SHARDS.map(|(_, shard)| height(c, shard)),
+    ];
+
+    CoreLoadRun {
+        load: CoreLoad {
+            pairs: load.pairs,
+            traders: load.traders,
+            routes_per_second: load.twins_per_second * 2,
+            duration: load.duration,
+            certificates: Certificates::Flow,
+        },
+        flight: &flight,
+        offered,
+        window: [opened, closed],
+        heights,
+        counters: [&before, &after],
+        wall: [wall.elapsed(), offering],
+    }
+    .report(c);
+
+    let label = "contended load";
+    let read = TwinsRead::over(c, &flight, &places, &twins);
+    read.report(label, &flight, dropped);
+    let delta = |name| after.since(&before, name, None);
+    let windowed = delta("heads_windowed");
+    let deadlines = deadline_aborts(c, &flight);
+    println!(
+        "{label} [wounds and windows, summed over replicas]: hold_inversions_proven {}, \
+         heads_windowed {windowed}; deadline aborts {deadlines}",
+        delta("hold_inversions_proven"),
+    );
+    if metered {
+        let blocks = venue_blocks(opened_at, heights[2]);
+        report_seat_fetches(label, meter.total(), blocks, venue_validators(c));
+    }
+
+    assert_load_conserved(conserved);
+    assert!(
+        flight.flying.is_empty(),
+        "{} of {} routes were still undecided {LOAD_DRAIN:?} past the last offer",
+        flight.flying.len(),
+        flight.routes.len(),
+    );
+    assert_eq!(windowed, 0, "no head leaves at its naming window");
+    assert_eq!(deadlines, 0, "no route aborts at its deadline");
+    read.assert_the_later_hash_lost(&flight);
+    read.assert_survivors_resolved_in_time();
+}
+
+/// The twins of a contended load, read once they have settled.
+struct TwinsRead<'a> {
+    twins: &'a [Twin],
+    outcomes: Vec<TwinOutcome>,
+    /// The twins the venues placed in opposite order.
+    inverted: usize,
+    /// The twins with a place unseen on either venue.
+    unread: usize,
+    /// How long, in milliseconds, each route of a twin the venues placed
+    /// alike took to resolve.
+    uninverted: Vec<usize>,
+    /// How long each route of an inverted twin that did not abort took.
+    survivors: Vec<usize>,
+    /// How long each aborted route took.
+    victims: Vec<usize>,
+    /// How long each twin that lost a route took from the later of its
+    /// heads' refusals to settling its survivor.
+    since_refusal: Vec<usize>,
+}
+
+impl<'a> TwinsRead<'a> {
+    fn over<C: Cluster>(c: &C, flight: &Flight, places: &PlacesSeen, twins: &'a [Twin]) -> Self {
+        let outcomes: Vec<TwinOutcome> = twins
+            .iter()
+            .map(|twin| TwinOutcome::read(c, flight, places, twin))
+            .collect();
+        let count = |wanted: Option<bool>| {
+            outcomes
+                .iter()
+                .filter(|twin| twin.inverted == wanted)
+                .count()
+        };
+        let times = |split: &dyn Fn(&TwinOutcome, &TxHash) -> bool| -> Vec<usize> {
+            outcomes
+                .iter()
+                .flat_map(|twin| twin.times(|route| split(twin, route)).collect::<Vec<_>>())
+                .collect()
+        };
+        let uninverted = times(&|twin, _| twin.inverted == Some(false));
+        let survivors = times(&|twin, route| {
+            (twin.inverted == Some(true) || !twin.aborted.is_empty())
+                && !twin.aborted.contains(route)
+        });
+        let victims = times(&|twin, route| twin.aborted.contains(route));
+        let since_refusal = outcomes
+            .iter()
+            .filter_map(|twin| twin.since_refusal)
+            .collect();
+        Self {
+            twins,
+            inverted: count(Some(true)),
+            unread: count(None),
+            uninverted,
+            survivors,
+            victims,
+            since_refusal,
+            outcomes,
+        }
+    }
+
+    fn report(&self, label: &str, flight: &Flight, dropped: u64) {
+        let aborted = flight.decided_as(TransactionDecision::Aborted);
+        let decided = flight.decided.len();
+        println!(
+            "{label} [twins]: {} offered, {} offers short of a free pair; {} placed in opposite \
+             order, {} with a place unseen; {dropped} crossing readings dropped",
+            self.twins.len(),
+            flight.short,
+            self.inverted,
+            self.unread,
+        );
+        println!(
+            "{label} [aborts]: {aborted} of {decided} decided, {}",
+            percent(wide(aborted), wide(decided)),
+        );
+        println!(
+            "{label} [time to resolve, offer to both venue chains settled]: uninverted {}; \
+             survivors of inverted twins {}; victims {}",
+            ms_quantiles(self.uninverted.clone()),
+            ms_quantiles(self.survivors.clone()),
+            ms_quantiles(self.victims.clone()),
+        );
+        println!(
+            "{label} [survivors, the later refusal to both venue chains settled]: {}",
+            ms_quantiles(self.since_refusal.clone()),
+        );
+    }
+
+    /// Assert each twin lost at most one route, the later hash, and that
+    /// an inversion accounts for every abort and the load inverted one.
+    fn assert_the_later_hash_lost(&self, flight: &Flight) {
+        for (twin, outcome) in self.twins.iter().zip(&self.outcomes) {
+            let [a, b] = twin.routes;
+            match outcome.aborted.as_slice() {
+                [] => {}
+                [victim] => {
+                    let survivor = if *victim == a { b } else { a };
+                    assert_eq!(
+                        *victim,
+                        a.max(b),
+                        "the route a twin loses is the later hash: {twin:?}",
+                    );
+                    assert_eq!(
+                        flight.decided.get(&survivor),
+                        Some(&TransactionDecision::Accept),
+                        "the twin of an aborted route accepts: {twin:?}",
+                    );
+                }
+                both => panic!("at most one route of a twin aborts: {twin:?} lost {both:?}"),
+            }
+        }
+        let aborted = flight.decided_as(TransactionDecision::Aborted);
+        assert!(
+            aborted <= self.inverted + self.unread,
+            "every abort comes of an inversion: {aborted} aborted, {} twins seen inverted, {} \
+             unseen",
+            self.inverted,
+            self.unread,
+        );
+        assert!(
+            self.inverted > 0,
+            "the load must invert a twin, or it measures nothing: raise record_loss",
+        );
+    }
+
+    /// Assert the p99 survivor resolved within half a naming window of the
+    /// later of its heads' refusals.
+    fn assert_survivors_resolved_in_time(&self) {
+        let mut since_refusal = self.since_refusal.clone();
+        let since_refusal = Duration::from_millis(wide(quantile(&mut since_refusal, 990)));
+        assert!(
+            since_refusal < NAMING_WINDOW / 2,
+            "the p99 survivor resolved {since_refusal:?} past the later refusal, past half a \
+             naming window",
+        );
+    }
+}
+
+/// The traders a hot pool's routes are dealt among.
+const HOT_POOL_TRADERS: usize = 32;
+
+/// How many routes a hot pool offers a second as it fills.
+const HOT_POOL_ARRIVALS: usize = 100;
+
+/// The share of its routes, in percent, a hot pool must have waiting
+/// behind a head before its seat fetches are priced.
+const HOT_POOL_STANDING_PERCENT: usize = 75;
+
+/// The seat fetch bytes a validator may spend a second on a hot pool of
+/// 500 waiting routes before a capped ask backoff has to replace the
+/// fixed ask gap.
+pub const HOT_POOL_ADOPT_IF: u64 = 200_000;
+
+/// Many routes in one direction through one venue pair, so about
+/// `routes` rows wait behind each head on the shared pool.
+#[derive(Debug, Clone, Copy)]
+pub struct HotPool {
+    /// The routes kept out at once.
+    pub routes: usize,
+    /// How long they are kept out for.
+    pub duration: Duration,
+}
+
+/// The rows waiting behind a head on `shard`.
+fn waiting_rows<C: Cluster>(c: &C, shard: ShardId) -> usize {
+    c.queued_rows(shard)
+        .expect("the harness reads a venue shard's queue")
+        .values()
+        .filter(|row| row.state == RowState::Pending && row.queued.is_some() && row.head.is_none())
+        .count()
+}
+
+/// What seat questions cost on a hot pool, from
+/// [`HOT_POOL_STANDING_PERCENT`] of its routes waiting to its end.
+///
+/// `pool.routes` routes are kept out through one venue pair for
+/// `pool.duration`, the pool filling at [`HOT_POOL_ARRIVALS`] a second,
+/// and nothing here waits for them to settle: only one runs through a pair
+/// at a time, and the shape is the queue, not the throughput.
+///
+/// The run reports the rows waiting, the seat cells and seat fetch bytes
+/// per validator per second, and the answer bytes per second served by
+/// the busiest venue validator and the mean one, and returns seat fetch
+/// bytes per validator per second.
+///
+/// Requires a grown four-shard cluster over
+/// [`hot_pool_genesis_accounts`], on committees that share no host, one
+/// that walks its shards' chains and meters state proofs.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the harness cannot
+/// meter a state proof, or if the rows waiting never reach
+/// [`HOT_POOL_STANDING_PERCENT`] of `pool.routes`.
+pub fn seat_fetches_on_a_hot_pool<C: FaultableCluster>(c: &mut C, pool: HotPool) -> u64 {
+    let label = "hot pool";
+    let cast = LoadCast::stand_up(c, 1, &[(TRADER_SHARD, HOT_POOL_TRADERS)]);
+    let height = |c: &C, shard: ShardId| c.committed_height(shard).unwrap_or(BlockHeight::GENESIS);
+    let walked = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD].map(|shard| height(c, shard).next());
+    let meter = ProofMeter::default();
+    assert!(
+        c.meter_state_proofs(&meter),
+        "a hot pool is priced off a metered harness",
+    );
+    let mut flight = Flight::over(1, walked);
+    let opened = c.now();
+    let mut waiting = Vec::new();
+    let mut standing = None;
+    while c.now() < opened + pool.duration {
+        cast.offer_hot(c, pool, &mut flight);
+        watch_seats(&meter, &flight);
+        flight.tick(c, label);
+        flight.lapse(c);
+        let behind = waiting_rows(c, FIRST_VENUE_SHARD).min(waiting_rows(c, SECOND_VENUE_SHARD));
+        waiting.push(behind);
+        if standing.is_none() && behind * 100 >= pool.routes * HOT_POOL_STANDING_PERCENT {
+            let venue_heights = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD].map(|s| height(c, s));
+            standing = Some((c.now(), meter.served(), venue_heights));
+        }
+    }
+    let (from, earlier, venue_heights) = standing.unwrap_or_else(|| {
+        panic!(
+            "the rows waiting on the pool never reached {HOT_POOL_STANDING_PERCENT}% of {}: {}",
+            pool.routes,
+            spread(waiting.clone()),
+        )
+    });
+    let seconds = c.now().saturating_sub(from).as_secs().max(1);
+    let served: Vec<ProofTally> = meter
+        .served()
+        .into_iter()
+        .map(|(host, tally)| tally.since(earlier.get(&host).copied().unwrap_or_default()))
+        .collect();
+    let total = served
+        .iter()
+        .copied()
+        .fold(ProofTally::default(), ProofTally::plus);
+    let askers = venue_validators(c).max(1);
+    let per_second = |count: u64| count / seconds;
+    let fetched = per_second((total.asked_bytes + total.answer_bytes) / askers);
+    let most_served = per_second(
+        served
+            .iter()
+            .map(|tally| tally.answer_bytes)
+            .max()
+            .unwrap_or(0),
+    );
+    let blocks: u64 = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+        .into_iter()
+        .zip(venue_heights)
+        .map(|(shard, from)| height(c, shard).inner().saturating_sub(from.inner()))
+        .sum();
+    println!(
+        "{label} [rows waiting behind a head, read each second, the lesser venue]: {}; {} routes \
+         offered, {} settled, {} lapsed",
+        spread(waiting),
+        flight.routes.len(),
+        flight.decided.len(),
+        flight.lapsed,
+    );
+    report_seat_fetches(label, total, blocks, askers);
+    println!(
+        "{label} [seat fetches over the {seconds} s standing]: {} cells and {fetched} bytes a \
+         validator a second against {HOT_POOL_ADOPT_IF}; answers served, {} bytes a second the \
+         mean venue validator, {most_served} the busiest",
+        per_second(total.cells / askers),
+        per_second(total.answer_bytes / askers),
+    );
+    fetched
 }
 
 /// How near its cap a sustained load reads a pair as standing at the
@@ -4233,7 +5050,7 @@ pub fn standing_answers_level_off_under_sustained_load<C: FaultableCluster>(
     load: CoreLoad,
 ) {
     let label = "standing answers level off";
-    let cast = LoadCast::stand_up(c, load);
+    let cast = LoadCast::stand_up(c, load.pairs, &[(TRADER_SHARD, load.traders)]);
     let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
     let units = cast.world(c, cast.firsts[0].unit);
     let epoch =
@@ -4290,16 +5107,10 @@ pub fn standing_answers_level_off_under_sustained_load<C: FaultableCluster>(
         "{label}: no load shard stands an answer {:?} past the last offer",
         c.now().saturating_sub(closed),
     );
-    let conserved = load_conserved(c, &flight, opened_at[2], &protocol_resource, &units);
+    let payers = [(TRADER_SHARD, opened_at[2])];
+    let conserved = load_conserved(c, &flight, &payers, LOAD_DRAIN, &protocol_resource, &units);
     standing_within_the_answer_caps(c);
-    for (side, before, held, burned) in conserved {
-        assert_eq!(
-            held + burned,
-            before,
-            "the load's {side} must be conserved: held {held} and burned {burned} against \
-             {before} before",
-        );
-    }
+    assert_load_conserved(conserved);
     assert!(
         flight.flying.is_empty(),
         "{} of {} routes were still out {LOAD_DRAIN:?} past the last offer",
