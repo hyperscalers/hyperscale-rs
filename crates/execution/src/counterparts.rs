@@ -675,6 +675,13 @@ fn answer_ask_gap(asked: u32) -> u64 {
     (1u64 << asked.saturating_sub(1).min(6)).min(MAX_ANSWER_ASK_GAP)
 }
 
+/// The counterpart heights a seat question is asked at: those this
+/// divides, with no backoff. Every standing question then shares an
+/// anchor, so the cells two of them read are fetched once, and a cycle
+/// forming under a question long since asked is read within this many
+/// heights, well inside the naming window.
+const SEAT_ASK_GAP: u64 = 4;
+
 /// One carried record's re-push pacing on this validator alone.
 ///
 /// A fresh `Taken` a push brings retires nothing, since a recovery of
@@ -1725,19 +1732,18 @@ struct Probe {
 }
 
 /// A seat question this validator put to a counterpart: the header it
-/// was asked at, whether every reading it asked for has come back, how
-/// many times it has been asked, and the readings come back so far.
+/// was asked at, whether every reading it asked for has come back, and
+/// the readings come back so far.
 ///
-/// The fetch layer tracks each key on its own, so one question's four
-/// keys can return in different answers — split across chunks, or folded
+/// The fetch layer tracks each key on its own, so one question's keys
+/// can return in different answers — split across chunks, or folded
 /// into another asker's fetch of the same key. The question closes on
 /// the last of them, and the readings are offered only then, and only
-/// where together they read the cycle.
+/// where together they read the cycle or the victim's leaving.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SeatProbe {
     anchor: Anchor,
     returned: bool,
-    asked: u32,
     parts: Vec<StateClaim>,
 }
 
@@ -2264,15 +2270,16 @@ impl Counterparts {
     }
 
     /// Ask each counterpart a seat question the committed tip stands,
-    /// at its newest commit-proven header standing at `now`.
+    /// at its newest commit-proven header standing at `now` whose height
+    /// [`SEAT_ASK_GAP`] divides.
     ///
-    /// A question is asked once per header, and again at a newer one
-    /// only after the fetch returns without the cycle, backing off as an
-    /// answer does: plain contention reads no cycle, and asking it every
-    /// block would spend a fetch per contended pair per block. One the
-    /// claims this validator holds to offer already prove is not asked
-    /// again, and a question the tip no longer stands lets go of the
-    /// fetches only it was waiting on.
+    /// A question is asked once per header, and again at the next such
+    /// header only after the fetch returns without an answer: plain
+    /// contention reads none, and asking it every block would spend a
+    /// fetch per contended pair per block. One the claims this validator
+    /// holds to offer already prove is not asked again, and a question
+    /// the tip no longer stands lets go of the fetches only it was
+    /// waiting on.
     pub(crate) fn ask_seats(
         &mut self,
         questions: &[SeatQuestion],
@@ -2294,19 +2301,25 @@ impl Counterparts {
             })
             .collect();
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
+        let mut aligned: BTreeMap<ShardId, Option<Anchor>> = BTreeMap::new();
         for question in standing {
             if question.proven_by(self.fetched.claims()) {
                 continue;
             }
-            let Some(anchor) = self.proven_anchors.newest_licensed(question.shard, now, ..) else {
+            let Some(anchor) = *aligned.entry(question.shard).or_insert_with(|| {
+                let newest = self
+                    .proven_anchors
+                    .newest_licensed(question.shard, now, ..)?;
+                let height = newest.height.inner();
+                self.proven_anchors.at(
+                    question.shard,
+                    BlockHeight::new(height - height % SEAT_ASK_GAP),
+                )
+            }) else {
                 continue;
             };
-            let prior = self
-                .seats
-                .get(&question)
-                .map(|probe| (probe.anchor, probe.returned, probe.asked));
-            if prior.is_some_and(|(asked_at, returned, asked)| {
-                !returned || anchor.height.inner() < asked_at.height.inner() + answer_ask_gap(asked)
+            if self.seats.get(&question).is_some_and(|probe| {
+                !probe.returned || anchor.height.inner() <= probe.anchor.height.inner()
             }) {
                 continue;
             }
@@ -2315,7 +2328,6 @@ impl Counterparts {
                 SeatProbe {
                     anchor,
                     returned: false,
-                    asked: prior.map_or(1, |(_, _, asked)| asked.saturating_add(1)),
                     parts: Vec::new(),
                 },
             );
@@ -3515,8 +3527,9 @@ impl Counterparts {
     ///
     /// Each question keeps the part of the proof that reads its own keys,
     /// and closes once every one of them has come back. Its readings are
-    /// held only where together they read the cycle: anything else is
-    /// plain contention, and the question is put again at a newer header.
+    /// held only where together they read the cycle or the victim's
+    /// leaving: anything else is plain contention, and the question is
+    /// put again at a newer header.
     fn answer_seats(
         &mut self,
         anchor: Anchor,
@@ -3548,7 +3561,7 @@ impl Counterparts {
             probe.returned = true;
             let parts = std::mem::take(&mut probe.parts);
             if question.proven_by(&parts) {
-                held.extend(parts.into_iter().map(|part| (part, question.waiting)));
+                held.extend(parts.into_iter().map(|part| (part, question.victim())));
             }
         }
         held
@@ -7932,9 +7945,10 @@ mod tests {
             shard: PRODUCER,
             waiting: TxHash::from(Hash::from_bytes(&[2; 32])),
             holder: cell.tx,
+            validity_end: WeightedTimestamp::from_millis(36_000),
         };
         let keys = question.keys();
-        let [seat, row, ..] = keys;
+        let (seat, row) = (keys[0], keys[1]);
         assert_eq!(row, member_row_leaf(PRODUCER, cell.tx));
         let absent: Vec<SubstateKey> = keys
             .into_iter()
@@ -7942,7 +7956,9 @@ mod tests {
             .collect();
         let whole = holding_the_record(3, record, &[seat, row], &absent);
         let presence = whole.restrict(|key| key == record).expect("one cell");
-        let reading = whole.restrict(|key| key != record).expect("four cells");
+        let reading = whole
+            .restrict(|key| key != record)
+            .expect("the question's cells");
         let _ = counterparts.fetched.hold(presence);
         let _ = counterparts.fetched.hold(reading.clone());
         assert!(question.proven_by(counterparts.fetched.claims()));
@@ -8333,8 +8349,7 @@ mod tests {
 
     /// A seat question whose keys come back in separate answers closes on
     /// the last of them, and its readings are held to offer only where
-    /// together they read the cycle; a question the tip no longer stands
-    /// lets go of the fetch it was waiting on.
+    /// together they read the cycle or the victim's leaving.
     #[test]
     fn a_seat_question_closes_on_its_last_reading_however_they_arrive() {
         let anchors = Arc::new(ProvenAnchors::default());
@@ -8346,17 +8361,25 @@ mod tests {
             ReadFrontier::default(),
         );
         let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let validity_end = WeightedTimestamp::from_millis(36_000);
         let question = SeatQuestion {
             shard: PRODUCER,
             waiting: tx(2),
             holder: tx(1),
+            validity_end,
         };
-        let [seat, row, none, unsaid] = question.keys();
-        let (state_root, _) = state_and_proof(PRODUCER, &[seat, row], &[seat, row, none, unsaid]);
+        let keys = question.keys();
+        assert_eq!(
+            keys.len(),
+            7,
+            "a waiting victim's leaving reads three cells more"
+        );
+        let (seat, row, none) = (keys[0], keys[1], keys[2]);
+        let (state_root, _) = state_and_proof(PRODUCER, &[seat, row], &keys);
         let now = WeightedTimestamp::from_millis(10_000);
         let anchor = Anchor {
             shard: PRODUCER,
-            height: BlockHeight::new(7),
+            height: BlockHeight::new(8),
             state_root,
             ts: now,
         };
@@ -8367,57 +8390,91 @@ mod tests {
             matches!(
                 asked.as_slice(),
                 [Action::Fetch(FetchRequest::Ask { ids: FetchIds::StateProofs(ids), .. })]
-                    if ids.len() == 4
+                    if ids.len() == 7
             ),
-            "the four cells are asked at the newest anchor: {asked:?}",
+            "the seven cells are asked at the newest aligned anchor: {asked:?}",
         );
 
         let (_, first) = state_and_proof(PRODUCER, &[seat, row], &[seat]);
         counterparts.on_proof_fetched(anchor, &[seat], &first, &[]);
         assert!(
             counterparts.fetched.is_empty(),
-            "one reading of four is held back"
+            "one reading of seven is held back"
         );
         let (_, more) = state_and_proof(PRODUCER, &[seat, row], &[row, none]);
         counterparts.on_proof_fetched(anchor, &[row, none], &more, &[]);
         assert!(
             counterparts.fetched.is_empty(),
-            "three readings of four are held back: the holder's verdict leaf is unread",
+            "three readings of seven are held back: the verdict leaves are unread",
         );
-        let (_, rest) = state_and_proof(PRODUCER, &[seat, row], &[unsaid]);
-        counterparts.on_proof_fetched(anchor, &[unsaid], &rest, &[]);
+        let unread = &keys[3..];
+        let (_, rest) = state_and_proof(PRODUCER, &[seat, row], unread);
+        counterparts.on_proof_fetched(anchor, unread, &rest, &[]);
         assert!(
             question.proven_by(counterparts.fetched.claims()),
-            "the last reading closes the question, and the cycle is held to offer",
+            "the last readings close the question, and the cycle is held to offer",
         );
         assert!(
             counterparts.ask_seats(&[question], now).is_empty(),
             "a question the held claims prove is not asked again",
         );
+    }
 
-        // A question still out when the tip stops standing it lets go of
-        // its fetch.
+    /// A question still out when the tip stops standing it lets go of the
+    /// fetches only it was waiting on.
+    #[test]
+    fn a_dropped_seat_question_lets_go_of_the_cells_it_alone_awaits() {
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            Arc::new(TestRows::default()) as _,
+            ReadFrontier::default(),
+        );
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let validity_end = WeightedTimestamp::from_millis(36_000);
+        let question = SeatQuestion {
+            shard: PRODUCER,
+            waiting: tx(2),
+            holder: tx(1),
+            validity_end,
+        };
+        let now = WeightedTimestamp::from_millis(10_000);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(8),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts: now,
+        };
+        anchors.record(anchor);
+        assert_eq!(counterparts.ask_seats(&[question], now).len(), 1);
+
         let other = SeatQuestion {
             shard: PRODUCER,
             waiting: tx(4),
             holder: tx(3),
+            validity_end,
         };
         assert_eq!(counterparts.ask_seats(&[question, other], now).len(), 1);
         let released = counterparts.ask_seats(&[question], now);
         assert!(
             matches!(
                 released.as_slice(),
-                [Action::AbandonFetch(FetchIds::StateProofs(ids))] if ids.len() == 4
+                [Action::AbandonFetch(FetchIds::StateProofs(ids))] if ids.len() == 7
             ),
-            "the dropped question releases its four cells: {released:?}",
+            "the dropped question releases its seven cells: {released:?}",
         );
 
         // One that drops as another asks the same holder's cells at the
-        // same anchor releases only the cell no question is left waiting on.
+        // same anchor releases only the cells no question is left waiting
+        // on: its waiting member's seat, and those of its victim's cells
+        // the other does not read.
         let first = SeatQuestion {
             shard: PRODUCER,
             waiting: tx(6),
             holder: tx(5),
+            validity_end,
         };
         let next = SeatQuestion {
             waiting: tx(7),
@@ -8433,11 +8490,129 @@ mod tests {
             })
             .flatten()
             .collect();
+        let alone: Vec<(Anchor, SubstateKey)> = first
+            .keys()
+            .into_iter()
+            .filter(|key| !next.keys().contains(key))
+            .map(|key| (anchor, key))
+            .collect();
+        assert!(alone.contains(&(anchor, first.keys()[0])));
+        assert!(!alone.contains(&(anchor, first.keys()[1])));
         assert_eq!(
             abandoned,
-            vec![&(anchor, first.keys()[0])],
+            alone.iter().collect::<Vec<_>>(),
             "the holder's cells stay asked for the question taking them over",
         );
+    }
+
+    /// A seat question is asked at the counterpart's newest proven height
+    /// that [`SEAT_ASK_GAP`] divides, and once its fetch returns without
+    /// an answer it is asked again at the next such height and no sooner,
+    /// however many times it has been asked: two questions standing apart
+    /// share every ask's anchor.
+    #[test]
+    fn a_seat_question_is_asked_at_aligned_heights() {
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            Arc::new(TestRows::default()) as _,
+            ReadFrontier::default(),
+        );
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let question = SeatQuestion {
+            shard: PRODUCER,
+            waiting: tx(2),
+            holder: tx(1),
+            validity_end: WeightedTimestamp::from_millis(u64::MAX / 2),
+        };
+        let keys = question.keys();
+        let (seat, row) = (keys[0], keys[1]);
+        let at = |height: u64| {
+            let (state_root, proof) = state_and_proof(PRODUCER, &[seat, row, keys[3]], &keys);
+            (
+                Anchor {
+                    shard: PRODUCER,
+                    height: BlockHeight::new(height),
+                    state_root,
+                    ts: WeightedTimestamp::from_millis(height * 1_000),
+                },
+                proof,
+            )
+        };
+        let asked_at = |actions: &[Action]| -> Vec<BlockHeight> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Fetch(FetchRequest::Ask {
+                        ids: FetchIds::StateProofs(ids),
+                        ..
+                    }) => Some(ids),
+                    _ => None,
+                })
+                .flatten()
+                .map(|(anchor, _)| anchor.height)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let mut proofs = BTreeMap::new();
+        for height in 1..=20 {
+            let (anchor, proof) = at(height);
+            anchors.record(anchor);
+            proofs.insert(height, (anchor, proof));
+        }
+        let now = |height: u64| WeightedTimestamp::from_millis(height * 1_000);
+
+        assert!(
+            counterparts.ask_seats(&[question], now(3)).is_empty(),
+            "no proven height under the clock is aligned but zero, which is not held",
+        );
+        assert_eq!(
+            asked_at(&counterparts.ask_seats(&[question], now(6))),
+            vec![BlockHeight::new(4)],
+            "the newest proven height is 6, so the ask is anchored at 4",
+        );
+        for height in [7, 8, 9] {
+            assert!(
+                counterparts.ask_seats(&[question], now(height)).is_empty(),
+                "a question out is not asked again",
+            );
+        }
+        let (anchor, proof) = &proofs[&4];
+        counterparts.on_proof_fetched(*anchor, &keys, proof, &[]);
+        assert!(counterparts.seats[&question].returned);
+        assert!(
+            counterparts.fetched.is_empty(),
+            "the holder's verdict leaf stands: plain contention",
+        );
+
+        // A second question put now shares the first's next anchor.
+        let other = SeatQuestion {
+            waiting: tx(3),
+            ..question
+        };
+        for round in [8, 12, 16, 20] {
+            assert_eq!(
+                asked_at(&counterparts.ask_seats(&[question, other], now(round + 3))),
+                vec![BlockHeight::new(round)],
+                "every ask in the round is anchored at {round}",
+            );
+            assert!(
+                counterparts
+                    .ask_seats(&[question, other], now(round + 3))
+                    .is_empty(),
+                "and none is repeated before the next aligned height",
+            );
+            let (anchor, proof) = &proofs[&round];
+            counterparts.on_proof_fetched(*anchor, &keys, proof, &[]);
+            assert_eq!(
+                counterparts.seats[&question].anchor.height.inner(),
+                round,
+                "the question is asked again at {round}, with no backoff",
+            );
+        }
     }
 
     /// A seat question answered with the holder's verdict leaf standing
@@ -8459,14 +8634,15 @@ mod tests {
             shard: PRODUCER,
             waiting: tx(2),
             holder: tx(1),
+            validity_end: WeightedTimestamp::from_millis(36_000),
         };
         let keys = question.keys();
-        let [seat, row, _, said] = keys;
-        let (state_root, proof) = state_and_proof(PRODUCER, &[seat, row, said], &keys);
+        let stated = [keys[0], keys[1], keys[3]];
+        let (state_root, proof) = state_and_proof(PRODUCER, &stated, &keys);
         let now = WeightedTimestamp::from_millis(10_000);
         let anchor = Anchor {
             shard: PRODUCER,
-            height: BlockHeight::new(7),
+            height: BlockHeight::new(8),
             state_root,
             ts: now,
         };

@@ -21,16 +21,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_terminal_fated_hearing_rows;
 use hyperscale_storage::{
-    MemberIndex, MemberRow, QueueHolds, RowState, member_row_leaf, seat_leaf,
+    MemberIndex, MemberRow, QueueHolds, RowState, committed_tx_cell_key, member_row_leaf, seat_leaf,
 };
 use hyperscale_types::{
     AbortCharge, Anchor, BlockHeight, Crossings, Deadline, Decision, DeclaredKey, DiscardCause,
-    Evidence, Formed, Hears, Holds, Inclusion, Joins, MAX_STAGED_RECEIPT_BYTES,
+    Evidence, Formed, Hash, Hears, Holds, Inclusion, Joins, MAX_STAGED_RECEIPT_BYTES,
     MAX_TICK_LINES_PER_BLOCK, MAX_TICK_STAGED_BYTES, MemberTerms, Mode, NAMING_WINDOW, Pin, Pins,
-    PriceTable, Reach, RecoveryBands, Reserves, Role, Settlement, ShardId, ShardTrie, SiblingView,
-    Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
-    Value, WeightedTimestamp, Window, decide, is_protocol_vault, pins_of, staged_yes_bound,
-    tick_manifest_admits_block, tick_manifest_admits_members, value_of, verdict_leaf,
+    PriceTable, Reach, RecoveryBands, Reserves, Role, Said, Settlement, ShardId, ShardTrie,
+    SiblingView, Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction,
+    TxHash, Value, WeightedTimestamp, Window, decide, is_protocol_vault, pins_of, said_at,
+    staged_yes_bound, tick_manifest_admits_block, tick_manifest_admits_members, value_of,
+    verdict_leaf,
 };
 #[cfg(test)]
 use hyperscale_types::{Address, CollectionId, ModeKind, compatible};
@@ -1964,14 +1965,18 @@ pub fn contentions(
 /// `waiting` is in flight on the counterpart, which reads it one way,
 /// the counterpart's leg over-reads: a rare spurious unnamed abort.
 ///
-/// A reading anchored at or past `holder`'s deadline proves nothing: by
-/// then the counterpart may have aborted `holder` where it waits, which
-/// leaves its row standing with no seat while the cycle is already
-/// breaking. The anchor's clock is the one that abort is judged by.
+/// A cycle reading anchored at or past `holder`'s deadline proves
+/// nothing: by then the counterpart may have aborted `holder` where it
+/// waits, which leaves its row standing with no seat while the cycle is
+/// already breaking. The anchor's clock is the one that abort is judged
+/// by.
 ///
-/// The victim is the later of the two in hash order. Both shards order
-/// them alike, and only the shard where the victim is pending names it,
-/// so a cycle the deadline is not already breaking loses one member.
+/// The victim is [`SeatQuestion::victim`], the later of the two in hash
+/// order. Both shards order them alike, so a cycle the deadline is not
+/// already breaking loses one member. Whichever shard aborts it first
+/// deletes its row there, and with it the cycle reading the other shard
+/// needs; that shard reads the victim's leaving instead, at any anchor,
+/// since a leaving is final on the chain it is read from.
 #[must_use]
 pub fn wounded(
     rows: &MemberIndex,
@@ -1984,16 +1989,16 @@ pub fn wounded(
     seat_questions(rows, anchor)
         .into_iter()
         .filter(|question| {
-            let Some(lapse) = rows
+            let lapse = rows
                 .members
                 .get(&question.holder)
-                .map(|row| row.deadline.at())
-            else {
-                return false;
-            };
-            question.proven_by(claims.iter().filter(|claim| claim.anchor.ts < lapse))
+                .map(|row| row.deadline.at());
+            question.answered_at(claims, |read, anchor| {
+                question.left(read, anchor.ts)
+                    || lapse.is_some_and(|lapse| anchor.ts < lapse && question.crossed(read))
+            })
         })
-        .map(|question| question.waiting)
+        .map(|question| question.victim())
         .collect()
 }
 
@@ -2002,60 +2007,136 @@ pub fn wounded(
 ///
 /// Whether, at one anchor there, `waiting` is seated and `holder`, which
 /// conflicts with it here, is committed and unseated with no verdict
-/// leaf. See
-/// [`wounded`].
+/// leaf; or whether the victim has left there. See [`wounded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeatQuestion {
     /// The counterpart both members await, where each has a sibling.
     pub shard: ShardId,
-    /// The pending member, the later of the two in hash order.
+    /// The pending member the holder keeps out here.
     pub waiting: TxHash,
-    /// The member in flight here whose holds refuse it.
+    /// The member in flight here whose holds refuse `waiting`.
     pub holder: TxHash,
+    /// The end of the victim's signed validity range, which its
+    /// committed marker on the counterpart is keyed by.
+    pub validity_end: WeightedTimestamp,
 }
 
 impl SeatQuestion {
-    /// The cells it reads on its counterpart: the waiting member's seat,
-    /// the holder's row, the holder's seat and the holder's verdict leaf.
+    /// The member a proven answer aborts: the later of the two in hash
+    /// order, a function of the pair alone, so the two shards of a cycle
+    /// name the same one.
     #[must_use]
-    pub fn keys(&self) -> [SubstateKey; 4] {
-        [
+    pub fn victim(&self) -> TxHash {
+        self.waiting.max(self.holder)
+    }
+
+    /// The cells it reads on its counterpart: the waiting member's seat,
+    /// the holder's row, the holder's seat and the holder's verdict leaf,
+    /// then the victim's verdict leaf, row and committed marker, each
+    /// once.
+    #[must_use]
+    pub fn keys(&self) -> Vec<SubstateKey> {
+        let victim = self.victim();
+        let mut keys = vec![
             seat_leaf(self.shard, self.waiting),
             member_row_leaf(self.shard, self.holder),
             seat_leaf(self.shard, self.holder),
             verdict_leaf(self.shard, self.holder),
-        ]
+        ];
+        for key in [
+            verdict_leaf(self.shard, victim),
+            member_row_leaf(self.shard, victim),
+            committed_tx_cell_key(self.shard, victim, self.validity_end),
+        ] {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
     }
 
     /// Whether `read`, one anchor's readings, answers with the cycle: the
     /// waiting member seated, and the holder committed, unseated and
     /// with no verdict leaf. A holder whose verdict leaf stands proves no
     /// cycle, whatever its seat reads.
-    fn answered_by(&self, read: impl Fn(SubstateKey) -> Option<Inclusion>) -> bool {
-        let [seat, row, unseated, unsaid] = self.keys();
-        matches!(read(seat), Some(Inclusion::Present(_)))
-            && matches!(read(row), Some(Inclusion::Present(_)))
-            && read(unseated) == Some(Inclusion::Absent)
-            && read(unsaid) == Some(Inclusion::Absent)
+    fn crossed(&self, read: &dyn Fn(SubstateKey) -> Option<Inclusion>) -> bool {
+        matches!(
+            read(seat_leaf(self.shard, self.waiting)),
+            Some(Inclusion::Present(_))
+        ) && matches!(
+            read(member_row_leaf(self.shard, self.holder)),
+            Some(Inclusion::Present(_))
+        ) && read(seat_leaf(self.shard, self.holder)) == Some(Inclusion::Absent)
+            && read(verdict_leaf(self.shard, self.holder)) == Some(Inclusion::Absent)
     }
 
-    /// Whether `claims` answer it at one anchor. The readings may sit in
-    /// several claims at that anchor: one anchor is one root, however its
-    /// cells were cut.
+    /// Whether `read`, one anchor's readings at `clock`, reads the victim
+    /// left: its verdict leaf absent, and then its row absent and its
+    /// committed marker present or `clock` at or past its validity end,
+    /// as [`said_at`] reads an absent leaf. A present verdict leaf, a
+    /// stated yes included, is never a leaving here, whatever it holds.
+    ///
+    /// Sound only for a victim no tick here has named: a member accepts
+    /// only on every shard's yes, so one that has given none here cannot
+    /// have been accepted anywhere, and having left the counterpart it
+    /// was aborted or fated there. An accepted member that has since
+    /// ended reads exactly the same, which is why every question asked
+    /// names a victim unnamed here.
+    fn left(
+        &self,
+        read: &dyn Fn(SubstateKey) -> Option<Inclusion>,
+        clock: WeightedTimestamp,
+    ) -> bool {
+        let victim = self.victim();
+        if read(verdict_leaf(self.shard, victim)) != Some(Inclusion::Absent) {
+            return false;
+        }
+        let beside = read(member_row_leaf(self.shard, victim)).zip(read(committed_tx_cell_key(
+            self.shard,
+            victim,
+            self.validity_end,
+        )));
+        said_at(
+            Inclusion::Absent,
+            beside,
+            clock,
+            self.validity_end,
+            Hash::ZERO,
+            Hash::ZERO,
+        ) == Some(Some(Said::Left))
+    }
+
+    /// Whether `claims` answer it at one anchor, with the cycle or the
+    /// victim's leaving.
     #[must_use]
     pub fn proven_by<'c>(&self, claims: impl IntoIterator<Item = &'c StateClaim>) -> bool {
+        self.answered_at(claims, |read, anchor| {
+            self.crossed(read) || self.left(read, anchor.ts)
+        })
+    }
+
+    /// Whether `answers` holds of the readings `claims` give at one
+    /// anchor of the counterpart. The readings may sit in several claims
+    /// at that anchor: one anchor is one root, however its cells were
+    /// cut.
+    fn answered_at<'c>(
+        &self,
+        claims: impl IntoIterator<Item = &'c StateClaim>,
+        answers: impl Fn(&dyn Fn(SubstateKey) -> Option<Inclusion>, Anchor) -> bool,
+    ) -> bool {
         let claims: Vec<&StateClaim> = claims
             .into_iter()
             .filter(|claim| claim.anchor.shard == self.shard)
             .collect();
         let anchors: BTreeSet<Anchor> = claims.iter().map(|claim| claim.anchor).collect();
         anchors.into_iter().any(|anchor| {
-            self.answered_by(|key| {
+            let read = |key: SubstateKey| {
                 claims
                     .iter()
                     .filter(|claim| claim.anchor == anchor)
                     .find_map(|claim| claim.reading(key))
-            })
+            };
+            answers(&read, anchor)
         })
     }
 }
@@ -2111,6 +2192,7 @@ pub fn seat_questions(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<Seat
                         shard,
                         waiting: row.tx,
                         holder: holder.tx,
+                        validity_end: row.deadline.validity_end(),
                     });
                 }
             }
@@ -5822,6 +5904,167 @@ mod tests {
         );
     }
 
+    /// A claim on `PEER` at `height` over every cell the one seat question
+    /// `rows` put reads, proven against a tree holding `leaves`.
+    fn seat_answer_at(rows: &MemberIndex, height: u64, leaves: &[SubstateKey]) -> StateClaim {
+        let [question] = seat_questions(rows, ms(0))[..] else {
+            panic!("the family puts one seat question");
+        };
+        proven_claim(PEER, height, leaves, &question.keys())
+    }
+
+    /// A victim whose verdict leaf and row are gone from the counterpart,
+    /// its committed marker standing, has left there, and is wounded
+    /// without the cycle: the reading the shard that looks second takes,
+    /// once the first has deleted the holder's row with its abort. A
+    /// leaving is final, so a reading past the holder's deadline still
+    /// wounds, where the cycle at that anchor proves nothing.
+    #[test]
+    fn a_victim_left_on_the_counterpart_is_wounded() {
+        let declared = spanning_write();
+        let rows = held_beside_pending(1, 2, &declared);
+        let marker = committed_tx_cell_key(PEER, tx(2), far().validity_end());
+        assert_eq!(
+            wounded(&rows, ms(0), &[seat_answer_at(&rows, 5, &[marker])]),
+            BTreeSet::from([tx(2)]),
+            "the victim's marker stands with neither its row nor its verdict leaf",
+        );
+
+        let mut lapsing = held_beside_pending(1, 2, &declared);
+        if let Some(holder) = lapsing.members.get_mut(&tx(1)) {
+            holder.deadline = Deadline::of(ms(1_000));
+        }
+        let past = lapsing.members[&tx(1)].deadline.at().as_millis() / 1_000 + 1;
+        let crossed = [seat_leaf(PEER, tx(2)), member_row_leaf(PEER, tx(1))];
+        assert!(
+            wounded(&lapsing, ms(0), &[seat_answer_at(&lapsing, past, &crossed)]).is_empty(),
+            "the cycle read past the holder's deadline proves nothing",
+        );
+        assert_eq!(
+            wounded(
+                &lapsing,
+                ms(0),
+                &[seat_answer_at(&lapsing, past, &[marker])]
+            ),
+            BTreeSet::from([tx(2)]),
+            "the victim's leaving read there still does",
+        );
+    }
+
+    /// The survivor's leaving is no answer: with the holder's row gone
+    /// from the counterpart there is no cycle to read, and the victim,
+    /// whose row stands there or who was never committed there, has not
+    /// left.
+    #[test]
+    fn a_survivor_left_on_the_counterpart_wounds_nobody() {
+        let declared = spanning_write();
+        let rows = held_beside_pending(1, 2, &declared);
+        let seat = seat_leaf(PEER, tx(2));
+        let survivor_marker = committed_tx_cell_key(PEER, tx(1), far().validity_end());
+        assert!(
+            wounded(
+                &rows,
+                ms(0),
+                &[seat_answer_at(&rows, 5, &[seat, survivor_marker])],
+            )
+            .is_empty(),
+            "the holder left, and the victim is seated there",
+        );
+        let victim_marker = committed_tx_cell_key(PEER, tx(2), far().validity_end());
+        assert!(
+            wounded(
+                &rows,
+                ms(0),
+                &[seat_answer_at(
+                    &rows,
+                    5,
+                    &[
+                        seat,
+                        member_row_leaf(PEER, tx(2)),
+                        victim_marker,
+                        survivor_marker
+                    ],
+                )],
+            )
+            .is_empty(),
+            "a victim whose row stands there has not left",
+        );
+    }
+
+    /// A victim with no verdict leaf and no row on the counterpart has
+    /// left only where its committed marker stands, or at or past its
+    /// validity end: before that the counterpart may yet commit it. A
+    /// reading that does not say whether the marker stands proves
+    /// nothing.
+    #[test]
+    fn a_leaving_read_without_its_marker_proves_nothing() {
+        let declared = spanning_write();
+        let rows = held_beside_pending(1, 2, &declared);
+        assert!(
+            wounded(&rows, ms(0), &[seat_answer_at(&rows, 5, &[])]).is_empty(),
+            "uncommitted there before its validity end",
+        );
+        let marker = committed_tx_cell_key(PEER, tx(2), far().validity_end());
+        let unread = seat_answer_at(&rows, 5, &[marker])
+            .restrict(|key| key != marker)
+            .expect("the other cells are left");
+        assert!(
+            wounded(&rows, ms(0), &[unread]).is_empty(),
+            "a reading that does not read the marker",
+        );
+
+        let mut ending = held_beside_pending(1, 2, &declared);
+        if let Some(victim) = ending.members.get_mut(&tx(2)) {
+            victim.deadline = Deadline::of(ms(2_000));
+        }
+        assert!(
+            wounded(&ending, ms(0), &[seat_answer_at(&ending, 1, &[])]).is_empty(),
+            "a second before its validity end",
+        );
+        assert_eq!(
+            wounded(&ending, ms(0), &[seat_answer_at(&ending, 2, &[])]),
+            BTreeSet::from([tx(2)]),
+            "at its validity end, the counterpart can no longer commit it",
+        );
+    }
+
+    /// A present verdict leaf is never a leaving for a seat question,
+    /// whatever it holds: a victim stated on the counterpart is about to
+    /// collect this shard's yes, not gone. The verdict reading of the
+    /// same cells takes a leaf that matches neither hash it is given as
+    /// a leaving, so the seat question reads the leaf absent first.
+    #[test]
+    fn a_victim_stated_on_the_counterpart_is_no_leaving() {
+        let declared = spanning_write();
+        let rows = held_beside_pending(1, 2, &declared);
+        let (leaf, row) = (verdict_leaf(PEER, tx(2)), member_row_leaf(PEER, tx(2)));
+        let marker = committed_tx_cell_key(PEER, tx(2), far().validity_end());
+        for leaves in [vec![leaf, row, marker], vec![leaf, marker]] {
+            let stated = seat_answer_at(&rows, 5, &leaves);
+            let Some(held) = stated.reading(leaf) else {
+                panic!("the leaf is read");
+            };
+            assert!(matches!(held, Inclusion::Present(_)));
+            let beside = stated.reading(row).zip(stated.reading(marker));
+            assert_eq!(
+                said_at(
+                    held,
+                    beside,
+                    stated.anchor.ts,
+                    far().validity_end(),
+                    Hash::ZERO,
+                    Hash::ZERO
+                ),
+                Some(Some(Said::Left)),
+                "a leaf matching neither hash reads as a leaving to a verdict question",
+            );
+            assert!(
+                wounded(&rows, ms(0), &[stated]).is_empty(),
+                "but proves nothing to a seat question",
+            );
+        }
+    }
+
     /// The crossed pair, asked about on the holder's shard: H1 in flight
     /// writes a key W reads here, and on `PEER` W reserves a vault H1
     /// debits, which the queue there reads both ways while W waits. The
@@ -5842,6 +6085,7 @@ mod tests {
                 shard: PEER,
                 waiting: tx(2),
                 holder: tx(1),
+                validity_end: far().validity_end(),
             }],
         );
         assert_eq!(
@@ -5891,6 +6135,7 @@ mod tests {
                 shard: PEER,
                 waiting: tx(2),
                 holder: tx(1),
+                validity_end: far().validity_end(),
             }],
         );
         assert_eq!(
@@ -7978,6 +8223,7 @@ mod tests {
                     shard: C,
                     waiting: tx(W),
                     holder: tx(H1),
+                    validity_end: deadline.validity_end(),
                 };
                 assert_eq!(seat_questions(&a, clock(4)), vec![question]);
                 let leaves: Vec<SubstateKey> = question

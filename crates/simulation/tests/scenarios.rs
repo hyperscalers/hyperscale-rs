@@ -178,9 +178,7 @@ use hyperscale_types::{
 };
 #[cfg(feature = "production-epochs")]
 use hyperscale_types::{JailReason, MISSED_PROPOSAL_JAIL_SHARE_BPS, ValidatorStatus};
-#[cfg(feature = "production-epochs")]
-use support::sim_seed;
-use support::{SEED_VAR, SimCluster, seeded};
+use support::{SEED_VAR, SimCluster, seeded, sim_seed};
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
 const fn liveness_config() -> ScenarioConfig {
@@ -1626,7 +1624,7 @@ fn dedicated_route_cluster(accounts: &[(PrincipalAddr, u128)]) -> SimCluster {
             pool_surplus: 14,
             ..cross_shard_config()
         },
-        42,
+        sim_seed(42),
         accounts,
         GenesisPackages::with_fixtures(),
     )
