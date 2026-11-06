@@ -802,15 +802,49 @@ pub fn a_stalled_holder_draws_one_ask_per_key<C: FaultableCluster>(c: &mut C) {
     );
 }
 
+/// Run `c` for `span`, a second at a time, and hand back the most record
+/// reads that stood open at any of them.
+fn most_reads_open<C: FaultableCluster>(c: &mut C, span: Duration) -> u64 {
+    let end = c.now() + span;
+    let mut most = 0;
+    while c.now() < end {
+        let next = c.now() + Duration::from_secs(1);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+        most = most.max(record_reads_open(c));
+    }
+    most
+}
+
+/// One record read a venue validator makes of each of `records`.
+fn wanted_reads<C: FaultableCluster>(c: &C, records: &[SubstateKey]) -> u64 {
+    wide(records.len()) * venue_validators(c)
+}
+
+/// How long past a route's submission a restart comes: its venues have
+/// filed it, and the finalization delay has passed their filing.
+const PAST_THE_CLOCK: Duration = MAX_FINALIZATION_DELAY.saturating_add(Duration::from_secs(6));
+
+/// How long a restarted validator is watched, past the first proven
+/// header of the record's holder it needs to ask at.
+const RESTART_WATCH: Duration = Duration::from_secs(8);
+
 /// A consumer restarted with wants past the finalization delay asks each
 /// of them at first sight, once per key, and its route still accepts.
+///
+/// The restart comes once the wants are past the delay, so the validator
+/// is back at once and holds nothing but what it re-derives. Its own
+/// reads are cut from there, which counts that it asked and leaves its
+/// ids standing. The other validators read on up their ladders, each
+/// read holding nothing as the leg stays held, so what the run bounds is
+/// every validator's one read of each key.
 ///
 /// Requires disjoint committees, as the held leg is keyed on them.
 ///
 /// # Panics
 ///
-/// Panics if a venue misses its budget standing up, if more reads stand
-/// open than there are wants, or if a route is not accepted.
+/// Panics if a venue misses its budget standing up, if the restarted
+/// validator asks nothing, if more reads go out or stand open than there
+/// are wants, or if a route is not accepted.
 pub fn a_restart_with_wants_past_the_clock_asks_each_once<C>(c: &mut C)
 where
     C: FaultableCluster + RestartableCluster,
@@ -821,32 +855,95 @@ where
     let leg_hosts = c.committee_hosts(TRADER_SHARD);
     let _ = c.drop_type_between(&leg_hosts, &leg_hosts, "execution.vote");
     let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
-    let filed = c.now() + Duration::from_secs(2);
-    let _ = c.run_until(epochs(1), |c| c.now() >= filed);
+    let past_the_clock = c.now() + PAST_THE_CLOCK;
+    let _ = c.run_until(epochs(2), |c| c.now() >= past_the_clock);
 
-    c.stop_host(c.committee_hosts(FIRST_VENUE_SHARD)[0], epochs(1));
-    let past_the_clock = c.now() + MAX_FINALIZATION_DELAY + Duration::from_secs(4);
-    let venue_validators =
-        c.committee_hosts(FIRST_VENUE_SHARD).len() + c.committee_hosts(SECOND_VENUE_SHARD).len();
-    let wants = u64::try_from(records.len() * venue_validators).expect("a small count");
-    let mut most = 0;
-    while c.now() < past_the_clock {
-        let next = c.now() + Duration::from_secs(1);
-        let _ = c.run_until(epochs(1), |c| c.now() >= next);
-        most = most.max(record_reads_open(c));
-    }
-    c.clear_drops();
-    println!("record read: at most {most} reads open of {wants} wants across a restart");
+    let restarted = c.committee_hosts(FIRST_VENUE_SHARD)[0];
+    c.stop_host(restarted, epochs(0));
     assert!(
-        most <= wants,
+        c.run_until(epochs(1), |c| c.is_up(restarted)),
+        "the validator must come back",
+    );
+    let own_reads = c.drop_type_between(&[restarted], &leg_hosts, "state_proof.request");
+    let asks = c.metric("record_asks", None);
+    let most = most_reads_open(c, RESTART_WATCH);
+    let asked = c.metric("record_asks", None).saturating_sub(asks);
+    let wants = wanted_reads(c, &records);
+    println!(
+        "record read: {asked} asks past a restart, of its own {}, at most {most} reads open of \
+         {wants} wants",
+        own_reads.fired(),
+    );
+    assert!(
+        own_reads.fired() > 0,
+        "the restarted validator must ask what it re-derived",
+    );
+    assert!(
+        asked <= wants + read_bound(1),
+        "one read goes out for a key, and {asked} went out for {wants} wants",
+    );
+    assert!(
+        most > 0 && most <= wants,
         "one read stands for a key, and {most} stood for {wants} wants",
     );
+    c.clear_drops();
     for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
         assert!(
             c.run_until(epochs(40), |c| accepted_on(c, venue, route)),
             "{route:?} must be accepted on {venue:?}",
         );
     }
+}
+
+/// A read nobody answers gives its place to the next, as the holder's
+/// anchors move under it.
+///
+/// The venues' reads are cut and the leg stays held with the trader's
+/// headers flowing, so each validator climbs its ladder at moving anchors
+/// and no id ever comes back: each re-ask has to let go of the one before
+/// it. Past the cut the route ends and no read stays open.
+///
+/// Requires disjoint committees, as the held leg is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if no read is cut or
+/// replaced, if more reads stand open than there are wants or any stands
+/// open once the route has ended, or if the route is not accepted.
+pub fn a_read_nobody_answers_stands_alone_for_its_key<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let leg_hosts = c.committee_hosts(TRADER_SHARD);
+    let _ = c.drop_type_between(&leg_hosts, &leg_hosts, "execution.vote");
+    let cut = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+        .map(|venue| c.drop_type_between_members(venue, TRADER_SHARD, "state_proof.request"));
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let most = most_reads_open(c, PAST_THE_CLOCK);
+    let wants = wanted_reads(c, &records);
+    let replaced = c.metric("fetch_abandoned", Some("record_proof"));
+    println!("record read: at most {most} reads open of {wants} wants, {replaced} replaced");
+    assert!(
+        cut.iter().all(|cut| cut.fired() > 0),
+        "the reads must have been cut",
+    );
+    assert!(replaced > 0, "a re-ask must let go of the read it replaces");
+    assert!(
+        most <= wants,
+        "one read stands for a key, and {most} stood for {wants} wants",
+    );
+    c.clear_drops();
+    for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            c.run_until(epochs(40), |c| accepted_on(c, venue, route)),
+            "{route:?} must be accepted on {venue:?}",
+        );
+    }
+    assert!(
+        c.run_until(epochs(1), |c| record_reads_open(c) == 0),
+        "no read outlives its want: {} stand open",
+        record_reads_open(c),
+    );
 }
 
 /// The same route with the certificate channel cut: each venue's

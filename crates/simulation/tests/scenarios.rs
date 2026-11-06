@@ -65,7 +65,7 @@ use hyperscale_scenarios::{
     a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
     a_published_package_runs_where_it_was_never_committed,
     a_pushed_taken_holds_its_records_repush_past_its_validity_end,
-    a_read_that_finds_no_record_yet_reads_again,
+    a_read_nobody_answers_stands_alone_for_its_key, a_read_that_finds_no_record_yet_reads_again,
     a_reading_cut_through_a_merge_tears_nothing_and_cuts_nothing,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
     a_recovered_venue_keeps_what_its_sibling_accepted,
@@ -1783,6 +1783,12 @@ fn a_stalled_holder_draws_one_ask_per_key_sim() {
 fn a_restart_with_wants_past_the_clock_asks_each_once_sim() {
     route_cluster_on_dedicated_hosts()
         .run_faultable(a_restart_with_wants_past_the_clock_asks_each_once);
+}
+
+#[test]
+fn a_read_nobody_answers_stands_alone_for_its_key_sim() {
+    route_cluster_on_dedicated_hosts()
+        .run_faultable(a_read_nobody_answers_stands_alone_for_its_key);
 }
 
 /// Two routes seated in opposite order on the two venues: the cut is keyed
