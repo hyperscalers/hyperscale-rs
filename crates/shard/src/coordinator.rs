@@ -11912,6 +11912,55 @@ mod tests {
         }
     }
 
+    /// A crossing block a proposer names through [`Naming::over`] over an
+    /// orphan, under the bridged committee the schedule resolves at the
+    /// parent's anchor, is the block its voter admits: the marker first,
+    /// the recovery's discard, and the orphan's abort.
+    #[test]
+    fn a_proposed_crossing_block_with_an_orphan_is_admitted_by_its_voter() {
+        let (mut state, plain, parent, _) = one_of_three_in_flight();
+        let (orphan, abort) = unheaded_core();
+        state.member_rows.insert_row(orphan);
+        let recovered = recovered_over(&plain);
+        let parent_anchor = state.block_anchor(parent).expect("the parent is held");
+        let committee = Arc::clone(
+            recovered
+                .live_committee(ShardId::ROOT, parent_anchor)
+                .committee()
+                .expect("the parent's anchor resolves a committee")
+                .snapshot,
+        );
+        let height = BlockHeight::new(3);
+        let anchor = WeightedTimestamp::from_millis(2_000);
+        let inputs = state
+            .manifest_inputs(&recovered, &committee, parent, height, anchor, None)
+            .expect("the tip is held");
+        let named = Naming {
+            parent: &state.member_rows,
+            content: BlockContent {
+                shard: ShardId::ROOT,
+                height,
+                anchor,
+                windows: recovered.windows(),
+                committee: &committee,
+                crossing: &inputs.crossing,
+            },
+            certificates: &[],
+            records: &[],
+            claims: &[],
+            manifest: &inputs,
+            committed: &inputs.committed,
+        }
+        .over(&[]);
+        assert_eq!(named.lines.first(), Some(&crossing_marker()));
+        assert!(named.lines.contains(&abort), "{:?}", named.lines);
+        assert!(named.rows.members.values().any(|row| row.orphaned));
+
+        let block = carrying(block_chained_on(height, parent, 2_000), &[], named.lines);
+        let admitted = state.check_tick_manifest(&recovered, &committee, &block);
+        assert!(admitted.is_ok(), "{admitted:?}");
+    }
+
     /// `plain` with a halt recovery of the root shard seated at epoch 1
     /// and its frontier at genesis, so a block anchored in epoch 2 over a
     /// parent anchored below it is the crossing block.

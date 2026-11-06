@@ -1001,14 +1001,16 @@ impl TopologySchedule {
 
     /// The bands a recovery marker of `shard`'s block carries, where the
     /// block is the shard's [`crossing_block`](Self::crossing_block):
-    /// every binding `committee`, the snapshot at the parent's anchor,
-    /// holds for the shard, oldest first, each bridge placed on this
-    /// schedule's grid. `None` on any other block.
+    /// the bindings `committee`, the block's own committee as
+    /// `crossing_block` reads it (for a crossing block, the bridged
+    /// snapshot [`live_committee`](Self::live_committee) resolves at the
+    /// parent's anchor), holds for the shard, oldest first, each bridge
+    /// placed on this schedule's grid. `None` on any other block.
     ///
-    /// # Panics
-    ///
-    /// Never: a snapshot holds at most the history the beacon keeps and
-    /// one pending binding, which [`MAX_RECOVERY_BANDS`] counts.
+    /// A snapshot holds at most the history the beacon keeps and one
+    /// pending binding, which [`MAX_RECOVERY_BANDS`] counts, so the
+    /// marker carries every one. Past that cap it carries the newest, as
+    /// the beacon's own history keeps the newest.
     ///
     /// [`MAX_RECOVERY_BANDS`]: crate::MAX_RECOVERY_BANDS
     #[must_use]
@@ -1023,11 +1025,13 @@ impl TopologySchedule {
             return None;
         }
         let windows = self.windows();
-        let bands = committee
-            .recovery_bindings(shard)
-            .map(|binding| binding.band(windows))
-            .collect();
-        Some(RecoveryBands::new(bands).expect("a snapshot's bindings fit a marker"))
+        let mut bands = RecoveryBands::empty();
+        for binding in committee.recovery_bindings(shard).rev() {
+            if bands.insert(0, binding.band(windows)).is_err() {
+                break;
+            }
+        }
+        Some(bands)
     }
 
     /// The highest height at which no work of `shard` is
@@ -4140,6 +4144,42 @@ mod tests {
                 None,
                 "a block anchored in {block} over one in {parent} carries no marker",
             );
+        }
+    }
+
+    /// A snapshot holding more bindings than a marker carries gives the
+    /// newest, oldest first, rather than failing the block: the history
+    /// the beacon keeps is its newest too.
+    #[test]
+    fn a_marker_past_the_cap_carries_the_newest_bindings() {
+        use crate::MAX_RECOVERY_BANDS;
+
+        let shard = ShardId::leaf(1, 0);
+        let past_the_cap = MAX_RECOVERY_BANDS as u64 + 2;
+        let history: Vec<RecoveryBinding> = (1..=past_the_cap)
+            .map(|at| RecoveryBinding {
+                rotated_at: Epoch::new(10 * at),
+                attested_frontier: BlockHeight::new(5 * at),
+                completed: true,
+            })
+            .collect();
+        let head = Arc::new(
+            TopologySnapshot::new(NetworkDefinition::simulator(), 2, ValidatorSet::new(vec![]))
+                .with_recoveries(std::iter::once((shard, history.clone())).collect()),
+        );
+        let windows = EpochWindows::new(0, 1000);
+        let newest = history.last().expect("a binding").bridge().inner();
+        let sched = TopologySchedule::new(windows, Epoch::new(newest + 1), Arc::clone(&head));
+        let at = |epoch: u64| WeightedTimestamp::from_millis(epoch * 1_000 + 100);
+
+        let bands = sched
+            .recovery_bands(&head, shard, at(newest - 1), at(newest))
+            .expect("the block crosses the newest bridge");
+        let kept = &history[history.len() - MAX_RECOVERY_BANDS..];
+        assert_eq!(bands.len(), MAX_RECOVERY_BANDS);
+        for (band, binding) in bands.iter().zip(kept) {
+            assert_eq!(band.attested_frontier, binding.attested_frontier);
+            assert_eq!(band.bridge_start, windows.window_of(binding.bridge()).start);
         }
     }
 

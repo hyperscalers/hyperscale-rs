@@ -271,8 +271,10 @@ pub enum TickLine {
     /// An orphan holds no place and no seat, never heads again, and
     /// leaves by an abort. Named first, and only where it orphans a row.
     Recovered {
-        /// Every recovery binding the snapshot at the parent's anchor
-        /// holds for the shard, oldest first.
+        /// Every recovery binding the block's committee holds for the
+        /// shard, oldest first: the bridged snapshot
+        /// `TopologySchedule::live_committee` resolves at the parent's
+        /// anchor.
         bands: RecoveryBands,
     },
 }

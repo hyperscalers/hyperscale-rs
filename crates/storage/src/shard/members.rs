@@ -669,6 +669,8 @@ pub struct MemberRow {
     /// unnamed on shared, keyed terms where the lost tail may have made
     /// it head and served it. Set once, with its place and head cleared;
     /// it is never placed again, never heads, and leaves by an abort.
+    /// Read only while the row stands `Pending`; the abort's line writes
+    /// the row in flight without it.
     pub orphaned: bool,
 }
 
@@ -1001,9 +1003,15 @@ impl MemberInputs {
     ///
     /// # Panics
     ///
-    /// Never: one line is within the manifest's cap.
+    /// Where these inputs already carry a line: they are a block's
+    /// content, read before any line of it is named, and never a block's
+    /// whole fold.
     #[must_use]
     pub fn marked(self, marker: Option<TickLine>) -> Self {
+        assert!(
+            self.manifest.is_empty(),
+            "a recovery marker seeds a block's content, which carries no line"
+        );
         Self {
             manifest: Arc::new(
                 Capped::new(marker.into_iter().collect()).expect("one line fits a manifest"),
@@ -1607,15 +1615,23 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// Orphan every row a recovery marker of `bands` orphans
     /// ([`MemberRow::orphaned_by`]): each leaves its place and its head,
     /// and so its entries and its seat. Read over the rows the state
-    /// holds, before anything else of the block moves one.
+    /// holds, before anything else of the block moves one, each decoded
+    /// once into the reads every later step of the fold takes it from, so
+    /// a row this fold cannot read is absent to all of them alike.
     fn orphan(&mut self, bands: &[RecoveryBand], height: BlockHeight) {
         let id = self.family.id(MemberCollection::Members);
-        let rows: Vec<MemberRow> = self
-            .state
-            .entries_in_range(self.family.owner(), id, 0, u128::MAX, usize::MAX)
-            .into_iter()
-            .filter_map(|(_, bytes)| from_slice(&bytes).ok())
-            .collect();
+        let mut rows = Vec::new();
+        for (order, bytes) in
+            self.state
+                .entries_in_range(self.family.owner(), id, 0, u128::MAX, usize::MAX)
+        {
+            let row: Option<MemberRow> = self
+                .read
+                .entry(order)
+                .or_insert_with(|| from_slice(&bytes).ok())
+                .clone();
+            rows.extend(row);
+        }
         for mut row in rows {
             if !row.orphaned_by(bands, self.shard, height) {
                 continue;
@@ -2295,7 +2311,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         queued,
                         head,
                         blocked_at,
-                        orphaned: self.member(*tx).is_some_and(|row| row.orphaned),
+                        orphaned: false,
                     };
                     self.set_member(*tx, Some(row));
                     members.push(*tx);
@@ -3331,10 +3347,12 @@ impl MemberIndex {
     }
 
     /// The recovery marker a crossing block at `height` over these rows,
-    /// its parent's, names where the snapshot at the parent's anchor
-    /// holds `bands` for the shard: present exactly where it orphans a
-    /// row ([`MemberRow::orphaned_by`]). Such a row holds no tick, so the
-    /// marker and the block's discards number at most the rows standing.
+    /// its parent's, names where the block's committee, the bridged
+    /// snapshot `TopologySchedule::live_committee` resolves at the
+    /// parent's anchor, holds `bands` for the shard: present exactly
+    /// where it orphans a row ([`MemberRow::orphaned_by`]). Such a row
+    /// holds no tick, so the marker and the block's discards number at
+    /// most the rows standing.
     #[must_use]
     pub fn recovery_marker(&self, bands: RecoveryBands, height: BlockHeight) -> Option<TickLine> {
         self.members
@@ -9480,7 +9498,11 @@ mod tests {
             );
             lines(&mut next, vec![marked.clone()]);
             let carrying = carried(&next);
-            let content = carrying.clone().marked(Some(marked));
+            let content = MemberInputs {
+                manifest: Arc::new(Capped::empty()),
+                ..carrying.clone()
+            }
+            .marked(Some(marked));
 
             let mut voter = MemberIndex::load(&parent, LOCAL);
             voter.advance_content(&content);
