@@ -4267,6 +4267,7 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
             Some("below_floor"),
             Some("anchor_disagrees"),
             Some("evicted"),
+            Some("outlasted"),
             Some("departed"),
             Some("retired"),
             Some("unhosted"),
@@ -4996,6 +4997,19 @@ pub const fn read_bound(routes: usize) -> u64 {
     8 * (1 + routes as u64 / 100)
 }
 
+/// The largest load offered short of the row held to twice [`read_bound`].
+const SINGLE_BOUND_ROUTES: usize = 1_000;
+
+/// The record reads a load's row allows: [`read_bound`], and twice that
+/// on the largest load, whose tail outruns the grace at 250 ms.
+const fn row_read_bound(routes: usize) -> u64 {
+    if routes > SINGLE_BOUND_ROUTES {
+        2 * read_bound(routes)
+    } else {
+        read_bound(routes)
+    }
+}
+
 /// What a load's record reads came to.
 #[derive(Debug, Clone, Copy)]
 pub struct RecordReadCost {
@@ -5055,7 +5069,7 @@ impl RecordReadCost {
             self.routes,
             self.cold,
             self.delta,
-            read_bound(self.routes),
+            row_read_bound(self.routes),
             self.median_span_ms,
             self.largest_span_ms,
             self.grace_ms[0],
