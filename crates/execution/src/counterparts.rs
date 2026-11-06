@@ -19,9 +19,10 @@ use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_engine::tick_select::SeatQuestion;
 use hyperscale_metrics::{
     record_boundary_cells_asked, record_boundary_claims_carried, record_boundary_drained,
-    record_decline_folded, record_fenced_claim, record_rebuilt_record_entry, record_reclaim_folded,
-    record_records_repushed, record_repush_due, record_repush_paused, record_sibling_absence_read,
-    record_sibling_question_pending, set_standing_answers, set_wanted_records,
+    record_crossing_push_dropped, record_decline_folded, record_fenced_claim,
+    record_rebuilt_record_entry, record_reclaim_folded, record_records_repushed, record_repush_due,
+    record_repush_paused, record_sibling_absence_read, record_sibling_question_pending,
+    set_standing_answers, set_wanted_records,
 };
 #[cfg(test)]
 use hyperscale_storage::CrossingJournal;
@@ -4279,6 +4280,7 @@ impl Counterparts {
     ) -> Option<StateClaim> {
         let claim = &pushed;
         if now.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON {
+            record_crossing_push_dropped("retired");
             return None;
         }
         self.want(records);
@@ -8274,6 +8276,48 @@ mod tests {
             Some(vec![beside]),
             "a key nothing wants yet is handed back without the declined one",
         );
+    }
+
+    /// A push past the horizon is let go of here, keeps nothing, and is
+    /// counted as every other dropped push is.
+    #[test]
+    fn a_push_past_the_horizon_is_counted_retired() {
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let read = producer_read(3, Some(&cell), key);
+        consumer.proven_anchors.record(read.0);
+
+        let recorder = MemoryRecorder::new();
+        let at_the_horizon = read.0.ts.plus(RETENTION_HORIZON);
+        let past_it = at_the_horizon.plus(Duration::from_millis(1));
+        let done = with_recorder(&recorder, || {
+            Door::Push.bring(&mut consumer, &want, &read, key, Some(&cell), past_it)
+        });
+        assert!(done);
+        assert_eq!(
+            recorder.counter("crossing_pushes_dropped", Some("retired")),
+            1
+        );
+        assert!(consumer.fetched.is_empty());
+
+        with_recorder(&recorder, || {
+            Door::Push.bring(
+                &mut consumer,
+                &want,
+                &read,
+                key,
+                Some(&cell),
+                at_the_horizon,
+            )
+        });
+        assert_eq!(
+            recorder.counter("crossing_pushes_dropped", Some("retired")),
+            1,
+            "a push at the horizon still counts as landed",
+        );
+        assert!(!consumer.fetched.is_empty());
     }
 
     /// A proven absence of a key nothing here wants can never come to be
