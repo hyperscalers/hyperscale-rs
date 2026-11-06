@@ -22,9 +22,9 @@ use hyperscale_types::{
     MAX_CLAIMS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_STANDING_ANSWERS,
     MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, NAMING_WINDOW, PrincipalAddr,
-    REATTESTATION_STEP, ResourceAddr, ShardId, ShardTrie, SubstateKey, TimestampRange, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
-    staged_leaf, verdict_leaf,
+    REATTESTATION_STEP, RETENTION_HORIZON, ResourceAddr, ShardId, ShardTrie, SubstateKey,
+    TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    WeightedTimestamp, Window, staged_leaf, verdict_leaf,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
@@ -1350,10 +1350,38 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating, lift: Lift) 
     );
 
     the_cycle_ends_by_a_wound(c, [victim, survivor], &venues, (proven, windowed));
-    // The later route's input comes home off its validity end, however
-    // early the cycle ended.
-    protocol_resource.assert_settles_within(c, &charges, epochs(10), "crossed holds");
+    the_later_comes_home_by(c, &protocol_resource, &charges, validity);
     units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
+}
+
+/// Assert the later route's input is home on the clock its `validity` sets.
+///
+/// It comes home off its validity end, however early the cycle ended:
+/// past one horizon, inside two epochs. The wait is held to that clock and
+/// not to one running from the wound.
+fn the_later_comes_home_by<C: FaultableCluster>(
+    c: &mut C,
+    world: &World,
+    charges: &Charges,
+    validity: TimestampRange,
+) {
+    let validity_end = Duration::from_millis(validity.end_timestamp_exclusive.as_millis());
+    let epoch =
+        Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch length"));
+    let deadline = validity_end + RETENTION_HORIZON + epoch * 2;
+    let _ = c.run_until(epochs(40), |c| {
+        c.now() >= deadline || world.settles(c, charges.burned(c))
+    });
+    let home = c.now();
+    println!(
+        "crossed routes: home at {home:?}, {:?} past the validity end {validity_end:?}",
+        home.saturating_sub(validity_end),
+    );
+    assert!(
+        home < deadline,
+        "the later route's input must be home by {deadline:?} on the clock, and it is {home:?}",
+    );
+    world.assert_settles_within(c, charges, epochs(1), "crossed holds");
 }
 
 /// Assert `victim` aborts and `survivor` accepts, no tick on `venues`
