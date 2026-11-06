@@ -610,9 +610,9 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating, lift: Lift) 
     } else {
         (FIRST_VENUE_SHARD, second_hears)
     };
-    let start = lift_crossed_cuts(c, lift, &heads, (victim, waits_at), late_cut);
+    let (start, proven) = lift_crossed_cuts(c, lift, &heads, (victim, waits_at), late_cut, proven);
     let bound = start.plus(NAMING_WINDOW / 2);
-    let gone = the_later_leaves_both_venues_unnamed_by(c, victim, &venues, bound);
+    let gone = the_later_leaves_both_venues_by(c, victim, &venues, bound);
     let accepted = the_earlier_accepts_on_both_venues_by(c, survivor, &venues, bound);
     let since = |at: WeightedTimestamp| at.as_millis().saturating_sub(start.as_millis());
     println!(
@@ -628,17 +628,20 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating, lift: Lift) 
         NAMING_WINDOW.as_millis(),
     );
 
-    the_cycle_ends_by_a_wound(c, [victim, survivor], (proven, windowed));
+    the_cycle_ends_by_a_wound(c, [victim, survivor], &venues, (proven, windowed));
     protocol_resource.assert_settles_within(c, &charges, epochs(8), "crossed holds");
     units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
 }
 
-/// Assert `victim` aborts and `survivor` accepts, a block having proven
-/// the cycle and no head having left at its window: `proven` and
-/// `windowed` are `hold_inversions_proven` and `heads_windowed` before.
+/// Assert `victim` aborts and `survivor` accepts, no tick on `venues`
+/// having named it to run, a block having proven its abort on each venue
+/// and no head having left at its window: `proven` is the count of
+/// `hold_inversions_proven` short of the second venue's proof, and
+/// `windowed` is `heads_windowed` before.
 fn the_cycle_ends_by_a_wound<C: FaultableCluster>(
     c: &mut C,
     [victim, survivor]: [TxHash; 2],
+    venues: &[ShardId],
     (proven, windowed): (u64, u64),
 ) {
     let resolved = c.run_until(epochs(8), |c| {
@@ -661,9 +664,16 @@ fn the_cycle_ends_by_a_wound<C: FaultableCluster>(
         Some(TransactionStatus::Completed(TransactionDecision::Accept)),
         "the earlier route accepts",
     );
+    for &venue in venues {
+        assert_eq!(
+            named_to_run(c, venue, victim),
+            Vec::new(),
+            "no tick on {venue:?} names the later route to run",
+        );
+    }
     assert!(
         c.metric("hold_inversions_proven", None) > proven,
-        "a block proves the cycle",
+        "a block on the second venue proves the later route's abort",
     );
     assert_eq!(
         c.metric("heads_windowed", None),
@@ -672,9 +682,18 @@ fn the_cycle_ends_by_a_wound<C: FaultableCluster>(
     );
 }
 
+/// The heights on `venue`'s chain of the lines naming `tx` to run, where
+/// the cluster keeps a chain it walks. An aborting line is not among them.
+fn named_to_run<C: Cluster>(c: &C, venue: ShardId, tx: TxHash) -> Vec<(TxHash, BlockHeight)> {
+    c.chain_mentions(venue, BlockHeight::new(1), &BTreeSet::from([tx]))
+        .map_or_else(Vec::new, |mentions| mentions.run)
+}
+
 /// Lift the cuts of [`crossed_routes`] as `lift` says, and return the
-/// clock the later route's bound runs from: the later of the two heads'
-/// refusals where both lift together, and the second lift otherwise.
+/// clock the later route's bound runs from, the later of the two heads'
+/// refusals where both lift together and the second lift otherwise, with
+/// a count of `hold_inversions_proven` that only the second venue's
+/// abort of it can pass, `proven` being the count before.
 ///
 /// Each of `heads` is a venue, the route it heads and the route it holds
 /// behind. `victim` waits at `waits_at`; `late_cut`, the venue and the
@@ -685,7 +704,8 @@ fn lift_crossed_cuts<C: FaultableCluster>(
     heads: &[(ShardId, TxHash, TxHash); 2],
     (victim, waits_at): (TxHash, ShardId),
     (late_venue, late_producer): (ShardId, ShardId),
-) -> WeightedTimestamp {
+    proven: u64,
+) -> (WeightedTimestamp, u64) {
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
     let row_on = |c: &C, venue: ShardId, route: TxHash| {
         c.queued_rows(venue)
@@ -732,7 +752,7 @@ fn lift_crossed_cuts<C: FaultableCluster>(
                 )),
             );
             let later = refused.borrow().values().max().copied();
-            later.expect("both venues refused")
+            (later.expect("both venues refused"), proven + 1)
         }
         Lift::VictimsWaitingVenueFirst => {
             let _standing = isolate_crossing_intake(c, late_venue, late_producer);
@@ -764,8 +784,15 @@ fn lift_crossed_cuts<C: FaultableCluster>(
                     .is_some_and(|row| row.state == RowState::Pending && row.head.is_some()),
                 "the later route must still head the venue hearing late",
             );
+            // Read with the row gone from the first venue, which so names
+            // no further abort of it, and still standing on the late one.
+            let first_venue_proved = c.metric("hold_inversions_proven", None);
+            assert!(
+                first_venue_proved > proven,
+                "a block on the venue hearing first proves the cycle",
+            );
             c.clear_drops();
-            clock(c)
+            (clock(c), first_venue_proved)
         }
     }
 }
@@ -813,9 +840,9 @@ fn the_earlier_accepts_on_both_venues_by<C: Cluster>(
     venues.iter().map(|venue| accepted[venue]).collect()
 }
 
-/// Assert `route` leaves each of `venues` by `bound`, no tick there ever
-/// naming it to run, and return when it was first seen gone from each.
-fn the_later_leaves_both_venues_unnamed_by<C: Cluster>(
+/// Assert `route` leaves each of `venues` by `bound`, and return when it
+/// was first seen gone from each.
+fn the_later_leaves_both_venues_by<C: Cluster>(
     c: &mut C,
     route: TxHash,
     venues: &[ShardId],
@@ -842,11 +869,6 @@ fn the_later_leaves_both_venues_unnamed_by<C: Cluster>(
         assert!(
             gone <= bound,
             "the later route must leave {venue:?} by {bound:?}: gone at {gone:?}",
-        );
-        assert!(
-            c.ran(*venue, route).iter().all(|ran| !ran.succeeded),
-            "the later route is aborted unnamed on {venue:?}: {:?}",
-            c.ran(*venue, route),
         );
     }
     venues.iter().map(|venue| left[venue]).collect()
@@ -953,19 +975,7 @@ pub fn routes_held_in_a_ring_abort_at_the_window<C: FaultableCluster>(c: &mut C)
         Deadline::of(validity.end_timestamp_exclusive).at(),
     );
 
-    let resolved = c.run_until(epochs(8), |c| {
-        routes
-            .iter()
-            .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
-    });
-    assert!(resolved, "the windows must resolve every route");
-    for hash in &routes {
-        assert_eq!(
-            c.tx_status(*hash),
-            Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
-            "a route held in the ring aborts at its window",
-        );
-    }
+    each_aborts_unnamed(c, &heads);
     assert!(
         cut.iter().all(|handle| handle.fired() > 0),
         "each venue must actually have been cut off from its successor's bundles",
@@ -976,9 +986,10 @@ pub fn routes_held_in_a_ring_abort_at_the_window<C: FaultableCluster>(c: &mut C)
         proven,
         "no block can prove a ring off one counterpart's seats",
     );
-    assert_eq!(
-        c.metric("heads_windowed", None),
-        windowed + 3,
+    // Counted per block built, so a round that fails and is built again
+    // counts its window twice.
+    assert!(
+        c.metric("heads_windowed", None) >= windowed + 3,
         "each route leaves its head at its window",
     );
     assert_eq!(
@@ -990,9 +1001,32 @@ pub fn routes_held_in_a_ring_abort_at_the_window<C: FaultableCluster>(c: &mut C)
     units.assert_settles_within(c, &Charges::default(), epochs(8), "a ring of holds");
 }
 
+/// Assert each of `heads`, a route and the venue it headed, aborts with no
+/// tick there having named it to run.
+fn each_aborts_unnamed<C: Cluster>(c: &mut C, heads: &[(ShardId, TxHash)]) {
+    let resolved = c.run_until(epochs(8), |c| {
+        heads
+            .iter()
+            .all(|(_, route)| c.tx_status(*route).is_some_and(|status| status.is_final()))
+    });
+    assert!(resolved, "the windows must resolve every route");
+    for &(venue, route) in heads {
+        assert_eq!(
+            c.tx_status(route),
+            Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
+            "a route held in the ring aborts at its window",
+        );
+        assert_eq!(
+            named_to_run(c, venue, route),
+            Vec::new(),
+            "no tick on {venue:?} names the route it held to run",
+        );
+    }
+}
+
 /// Assert each of `heads`, a route standing head on its venue with a
 /// refusal clock, leaves that venue by an abort named at its naming
-/// window, unnamed and short of `deadline`.
+/// window, short of `deadline`.
 fn each_leaves_its_head_at_its_window<C: Cluster>(
     c: &mut C,
     heads: &[(ShardId, TxHash)],
@@ -1028,18 +1062,13 @@ fn each_leaves_its_head_at_its_window<C: Cluster>(
     // anchored there and folds a block or two later.
     let slack = Duration::from_secs(4);
     for (at, gone) in left.into_inner() {
-        let (venue, route) = heads[at];
+        let (venue, _) = heads[at];
         let closes = refused[at].plus(NAMING_WINDOW);
         assert!(
             gone >= closes && gone <= closes.plus(slack) && gone < deadline,
             "route {at} must leave {venue:?} at its naming window: refused at {:?}, the window \
              closing at {closes:?}, gone at {gone:?}, its deadline {deadline:?}",
             refused[at],
-        );
-        assert!(
-            c.ran(venue, route).iter().all(|ran| !ran.succeeded),
-            "route {at} is aborted unnamed on {venue:?}: {:?}",
-            c.ran(venue, route),
         );
     }
 }
