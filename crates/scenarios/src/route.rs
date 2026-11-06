@@ -695,6 +695,16 @@ pub fn a_dead_holder_leaves_room_for_a_lost_record<C: FaultableCluster>(c: &mut 
         .filter(|host| !dead.contains(host))
         .collect();
     c.partition(&dead, &others);
+    // A cut-off holder's clock stands still, so only the finalization
+    // delay arms what is wanted of it.
+    let asked = c.now() + MAX_FINALIZATION_DELAY + Duration::from_secs(4);
+    assert!(
+        c.run_until(epochs(2), |c| c.now() >= asked),
+        "the cluster's clock must pass the finalization delay",
+    );
+    let open = record_reads_open(c);
+    assert!(open > 0, "the dead holder must have been asked");
+    println!("record read: {open} reads stand open toward a dead holder");
 
     let lost = isolate_pushed_readings(c, FIRST_VENUE_SHARD, SECOND_TRADER_SHARD);
     let hash = cast.send(
