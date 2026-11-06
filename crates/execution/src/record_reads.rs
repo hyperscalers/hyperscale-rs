@@ -105,11 +105,13 @@ impl Spans {
     }
 
     /// Take `span`, kept at `height`. Past a full window, a span below
-    /// the lowest height held is dropped.
+    /// the lowest height held is dropped and counts as nothing heard, so
+    /// a holder whose heights rewound below its window goes quiet and
+    /// sweeps.
     fn sample(&mut self, height: BlockHeight, span: Duration, now: WeightedTimestamp) {
-        self.heard = now;
         let full = self.heights.len() >= PUSH_SPAN_HEIGHTS;
         if let Some(spans) = self.heights.get_mut(&height) {
+            self.heard = now;
             spans.push(span);
             return;
         }
@@ -121,6 +123,7 @@ impl Spans {
         {
             return;
         }
+        self.heard = now;
         let samples: Vec<Duration> = self
             .heights
             .values()
@@ -744,6 +747,26 @@ mod tests {
         let at_the_horizon = WeightedTimestamp::ZERO.plus(RETENTION_HORIZON);
         let _ = reads.sweep(at_the_horizon, &BTreeSet::new());
         assert_eq!(reads.grace(HOLDER), Duration::from_secs(12));
+        let past_it = at_the_horizon.plus(Duration::from_millis(1));
+        let _ = reads.sweep(past_it, &BTreeSet::new());
+        assert_eq!(reads.grace(HOLDER), RECORD_PUSH_GRACE_FLOOR);
+    }
+
+    /// A sample dropped below the window keeps nothing alive: a holder
+    /// that recovered rewinds its heights under a window it can no longer
+    /// reach, and what stood there sweeps a horizon after the last sample
+    /// that counted, however many drop since.
+    #[test]
+    fn a_dropped_sample_does_not_keep_a_window_alive() {
+        let secs = Duration::from_secs;
+        let mut reads = RecordReads::new();
+        heard(&mut reads, 100, &[secs(10); 32]);
+        assert_eq!(reads.grace(HOLDER), RECORD_PUSH_GRACE_CEILING);
+
+        let at_the_horizon = WeightedTimestamp::ZERO.plus(RETENTION_HORIZON);
+        reads.pushed(test_key(1), anchor(1, 0), secs(1), at_the_horizon);
+        assert_eq!(reads.sampled_heights(HOLDER), PUSH_SPAN_HEIGHTS);
+
         let past_it = at_the_horizon.plus(Duration::from_millis(1));
         let _ = reads.sweep(past_it, &BTreeSet::new());
         assert_eq!(reads.grace(HOLDER), RECORD_PUSH_GRACE_FLOOR);
