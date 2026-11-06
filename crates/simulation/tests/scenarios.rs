@@ -98,6 +98,7 @@ use hyperscale_scenarios::{
     a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent,
     a_timed_out_newcomer_is_let_back_in_from_its_own_host,
     a_train_into_a_merging_shard_strands_nothing, a_train_into_a_splitter_strands_nothing,
+    a_venue_hearing_late_still_loses_the_later_route_fast,
     a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
     a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
     a_withheld_boundary_read_is_carried_by_an_honest_validator, abort_converges,
@@ -142,8 +143,8 @@ use hyperscale_scenarios::{
     register_validator_pools_a_node, register_without_capacity_is_rejected,
     registered_validator_activates_onto_a_shard, ring_route_genesis_accounts,
     route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
-    routes_seated_in_opposite_order_both_abort_at_their_windows,
-    routes_seated_the_other_way_both_abort_at_their_windows,
+    routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
+    routes_seated_the_other_way_lose_the_later_to_the_cycle,
     sealed_rounds_settle_on_the_seed_they_committed_to, second_splitter_genesis_accounts,
     securify_retires_the_key_at_the_payer_shard, single_transfer,
     split_boundary_admits_an_uncommitted_precut_tx,
@@ -1640,15 +1641,23 @@ fn both_venues_read_a_routes_record_inside_the_finalization_delay_sim() {
 /// on the venues' and traders' hosts, and the second trader needs a shard
 /// of its own.
 #[test]
-fn routes_seated_in_opposite_order_both_abort_at_their_windows_sim() {
+fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle_sim() {
     let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
-    cluster.run_faultable(routes_seated_in_opposite_order_both_abort_at_their_windows);
+    cluster.run_faultable(routes_seated_in_opposite_order_lose_the_later_to_the_cycle);
 }
 
 #[test]
-fn routes_seated_the_other_way_both_abort_at_their_windows_sim() {
+fn routes_seated_the_other_way_lose_the_later_to_the_cycle_sim() {
     let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
-    cluster.run_faultable(routes_seated_the_other_way_both_abort_at_their_windows);
+    cluster.run_faultable(routes_seated_the_other_way_lose_the_later_to_the_cycle);
+}
+
+/// The crossed routes with the venue where the later route waits hearing
+/// first, and the other only once that route has left it.
+#[test]
+fn a_venue_hearing_late_still_loses_the_later_route_fast_sim() {
+    let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
+    cluster.run_faultable(a_venue_hearing_late_still_loses_the_later_route_fast);
 }
 
 /// Two stated venues cut off from each other's certificates and pushes:

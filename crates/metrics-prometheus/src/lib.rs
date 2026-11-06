@@ -161,6 +161,7 @@ pub struct Metrics {
     pub batches_unavailable: Counter,
     pub hold_contentions: Counter,
     pub hold_inversions_proven: Counter,
+    pub heads_windowed: Counter,
     /// Stated or accepted rows a chain's terminal named; any count is a
     /// cut the quiet gate should have held.
     pub terminal_fated_hearing_rows: Counter,
@@ -833,6 +834,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            heads_windowed: register_counter!(
+                "hyperscale_heads_windowed_total",
+                "Unnamed heads proposed blocks aborted at their naming window"
+            )
+            .unwrap(),
+
             terminal_fated_hearing_rows: register_counter!(
                 "hyperscale_terminal_fated_hearing_rows_total",
                 "Stated or accepted rows a terminal manifest named, per derivation"
@@ -1388,6 +1395,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_hold_inversions_proven(&self, victims: usize) {
         self.metrics.hold_inversions_proven.inc_by(victims as f64);
+    }
+
+    fn record_heads_windowed(&self, heads: usize) {
+        self.metrics.heads_windowed.inc_by(heads as f64);
     }
 
     fn record_terminal_fated_hearing_rows(&self, rows: usize) {

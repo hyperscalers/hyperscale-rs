@@ -12,13 +12,14 @@ use hyperscale_core::{
 };
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{
-    self, CommittedSets, ManifestInputs, ManifestKind, contentions, end_lines, licensed_lines,
-    terminal_fates, wounded,
+    self, CommittedSets, ManifestInputs, ManifestKind, contentions, end_lines, heads_windowed,
+    licensed_lines, terminal_fates, wounded,
 };
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
-    record_hold_contentions, record_hold_inversions_proven, record_intake_capped,
-    record_signature_verification_failure, record_signature_verification_latency,
+    record_heads_windowed, record_hold_contentions, record_hold_inversions_proven,
+    record_intake_capped, record_signature_verification_failure,
+    record_signature_verification_latency,
 };
 use hyperscale_network::{Network, Verdict, VerdictKey};
 use hyperscale_provisions::provision_tx_roots;
@@ -381,6 +382,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         lines,
         contended,
         proven,
+        windowed,
     } = (Naming {
         parent: &parent_rows,
         content,
@@ -393,6 +395,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     .within_terms_budget(&mut transactions);
     record_hold_contentions(contended);
     record_hold_inversions_proven(proven);
+    record_heads_windowed(windowed);
     let transactions = &transactions;
     let tick_manifest: Arc<TickManifest> =
         Arc::new(Capped::new(lines).expect("the budget stops at the line cap"));
@@ -713,6 +716,8 @@ pub(crate) struct Named {
     pub(crate) contended: usize,
     /// The lines that abort the victim of a proven hold cycle.
     pub(crate) proven: usize,
+    /// The lines that abort a head at its naming window.
+    pub(crate) windowed: usize,
 }
 
 impl Naming<'_> {
@@ -734,7 +739,7 @@ impl Naming<'_> {
         );
         let mut rows = self.parent.clone();
         rows.advance_content(&pending);
-        let (lines, contended, proven) = match self.manifest.kind {
+        let (lines, contended, proven, windowed) = match self.manifest.kind {
             ManifestKind::Members => {
                 let victims = wounded(&rows, anchor, self.claims);
                 let (mut lines, _, budget) = licensed_lines(
@@ -763,10 +768,11 @@ impl Naming<'_> {
                         |line| matches!(line, TickLine::Member { tx, .. } if victims.contains(tx)),
                     )
                     .count();
-                (lines, contended, proven)
+                let windowed = heads_windowed(&rows, &lines, anchor, &victims);
+                (lines, contended, proven, windowed)
             }
-            ManifestKind::Fates => (terminal_fates(&rows), 0, 0),
-            ManifestKind::Empty => (Vec::new(), 0, 0),
+            ManifestKind::Fates => (terminal_fates(&rows), 0, 0, 0),
+            ManifestKind::Empty => (Vec::new(), 0, 0, 0),
         };
         Named {
             rows,
@@ -774,6 +780,7 @@ impl Naming<'_> {
             lines,
             contended,
             proven,
+            windowed,
         }
     }
 

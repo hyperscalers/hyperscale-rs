@@ -141,12 +141,16 @@ struct Cycle {
     charges: Charges,
     validity: TimestampRange,
     submitted: Vec<Submitted>,
+    /// The cluster's `hold_inversions_proven` and `heads_windowed` once
+    /// the cast stands, before any route is submitted.
+    proven: u64,
+    windowed: u64,
 }
 
 impl Cycle {
     /// Stand every venue up, swap the sponsor and the trader into stake
     /// units on their own quarters, and open the worlds.
-    fn stand_up<C: Cluster>(c: &mut C) -> Self {
+    fn stand_up<C: FaultableCluster>(c: &mut C) -> Self {
         assert!(
             VENUES.iter().all(|&shard| c.serves_shard(shard)),
             "the grown four-shard topology must seat every quarter",
@@ -200,6 +204,8 @@ impl Cycle {
             charges: Charges::default(),
             validity: validity_around(c.now()),
             submitted: Vec::new(),
+            proven: c.metric("hold_inversions_proven", None),
+            windowed: c.metric("heads_windowed", None),
         }
     }
 
@@ -239,11 +245,12 @@ impl Cycle {
     /// its deadline, one or two aborted, each aborted one gone from a
     /// head it held unnamed within its naming window of the later
     /// refusal and not before the earlier window, its trader holding what
-    /// it held, and both sides conserved.
+    /// it held, and both sides conserved. Its blocked parties are legs,
+    /// which hold no seat, so no wound fires: every abort is a window's.
     ///
     /// `heads` are the rows the cycle armed: each shard where a route
     /// stood head, unnamed and refusing someone.
-    fn assert_ends_at_the_window<C: Cluster>(
+    fn assert_ends_at_the_window<C: FaultableCluster>(
         self,
         c: &mut C,
         heads: &[(ShardId, TxHash)],
@@ -323,6 +330,15 @@ impl Cycle {
             "{context}: the windows must end the cycle with one or two aborts, not {aborted}",
         );
 
+        assert_eq!(
+            c.metric("hold_inversions_proven", None),
+            self.proven,
+            "{context}: no block proves a cycle whose blocked parties are legs",
+        );
+        assert!(
+            c.metric("heads_windowed", None) > self.windowed,
+            "{context}: the cycle ends at a naming window",
+        );
         let Self {
             protocol_resource,
             units,

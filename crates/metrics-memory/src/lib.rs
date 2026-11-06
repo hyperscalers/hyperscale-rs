@@ -407,6 +407,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("hold_inversions_proven", None, victims as u64);
     }
 
+    fn record_heads_windowed(&self, heads: usize) {
+        self.inc("heads_windowed", None, heads as u64);
+    }
+
     fn record_terminal_fated_hearing_rows(&self, rows: usize) {
         self.inc("terminal_fated_hearing_rows", None, rows as u64);
     }

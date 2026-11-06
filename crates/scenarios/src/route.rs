@@ -430,20 +430,24 @@ fn stated_venues_hear_each_other<C: FaultableCluster>(c: &mut C, road: Road) {
     );
 }
 
-/// Two routes each venue heads in the other's order both abort at their
-/// naming windows, before their deadline, conserved.
+/// Two routes each venue heads in the other's order lose only the later
+/// hash, well inside the naming window, and the other accepts on both
+/// venues, conserved.
 ///
 /// Each route's trader sits on a shard of its own, and each venue is cut
 /// off from one trader's record: the second venue from the first route's,
 /// the first venue from the second route's. Every other input flows, so
 /// the first venue places the first route and makes it head, the second
-/// venue the second. Neither can run: a venue serves the route it heads
-/// to the other only from the block that makes it head there, where it
-/// is not yet placed. The cut lifts, each venue places the other route
-/// behind its head, and each head refuses it and takes a clock. Both
-/// heads are aborted unnamed once their naming windows close, so each
-/// route aborts; no venue seats a route the other heads, so no block
-/// proves the cycle.
+/// venue the second, and neither can run: a venue serves the route it
+/// heads to the other only from the block that makes it head there,
+/// where it is not yet placed. The cuts lift, each venue places the other
+/// route behind its head, and each head refuses it and takes a clock.
+/// Each venue then asks the other about its head and the route behind
+/// it, and reads the cycle off the other's seats: the route waiting
+/// there is seated, its head committed and unseated. Both name the later
+/// hash, aborting it unnamed where it waits and where it heads, by half
+/// a naming window past the later refusal; the earlier hash heads on the
+/// venue it waited on, is served and accepts on both.
 ///
 /// Requires disjoint committees, as the cut is keyed on the hosts.
 ///
@@ -451,23 +455,50 @@ fn stated_venues_hear_each_other<C: FaultableCluster>(c: &mut C, road: Road) {
 ///
 /// Panics if either venue misses its budget standing up, if the cut never
 /// fires, if the venues do not head the routes in opposite order, if a
-/// head does not leave its venue at its naming window, if either route
-/// is unresolved at the deadline or accepts, if a block proves the
-/// cycle, or if either side of the pair is not conserved.
-pub fn routes_seated_in_opposite_order_both_abort_at_their_windows<C: FaultableCluster>(c: &mut C) {
-    crossed_routes(c, Seating::AsSubmitted);
+/// block proves anything while the cuts stand, if the later route does
+/// not leave both venues unnamed within half a naming window of the
+/// later refusal or the earlier one does not accept on both in that
+/// time, if no block proves the cycle or a head leaves at its window, or
+/// if either side of the pair is not conserved.
+pub fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle<C: FaultableCluster>(c: &mut C) {
+    crossed_routes(c, Seating::AsSubmitted, Lift::Together);
 }
 
 /// The same cycle with each venue heading the other's route.
 ///
-/// As [`routes_seated_in_opposite_order_both_abort_at_their_windows`],
+/// As [`routes_seated_in_opposite_order_lose_the_later_to_the_cycle`],
 /// with the venues heading the routes the other way.
 ///
 /// # Panics
 ///
-/// As [`routes_seated_in_opposite_order_both_abort_at_their_windows`].
-pub fn routes_seated_the_other_way_both_abort_at_their_windows<C: FaultableCluster>(c: &mut C) {
-    crossed_routes(c, Seating::Swapped);
+/// As [`routes_seated_in_opposite_order_lose_the_later_to_the_cycle`].
+pub fn routes_seated_the_other_way_lose_the_later_to_the_cycle<C: FaultableCluster>(c: &mut C) {
+    crossed_routes(c, Seating::Swapped, Lift::Together);
+}
+
+/// The crossed routes with one venue hearing late: the later route still
+/// loses fast on both.
+///
+/// Only the cut on the venue where the later route waits lifts. That
+/// venue places it behind its head, proves the cycle off the other's
+/// seats and aborts it, which deletes its row there and with it the
+/// cycle reading the other venue would need. The other cut lifts only
+/// once the route has left the first venue. The other venue then places
+/// the earlier route behind the later, its head, and reads the later's
+/// leaving off the first venue: verdict leaf and row gone, committed
+/// marker standing. It aborts the later route unnamed, and the earlier
+/// heads, is served and accepts on both venues, all within half a naming
+/// window of the second lift. Without the leaving the later route would
+/// hold its head until its window closed.
+///
+/// Requires disjoint committees, as the cut is keyed on the hosts.
+///
+/// # Panics
+///
+/// As [`routes_seated_in_opposite_order_lose_the_later_to_the_cycle`],
+/// the bound running from the second lift.
+pub fn a_venue_hearing_late_still_loses_the_later_route_fast<C: FaultableCluster>(c: &mut C) {
+    crossed_routes(c, Seating::AsSubmitted, Lift::VictimsWaitingVenueFirst);
 }
 
 /// Which route each venue seats in [`crossed_routes`].
@@ -479,9 +510,20 @@ enum Seating {
     Swapped,
 }
 
+/// When the cuts of [`crossed_routes`] lift.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lift {
+    /// Both at once.
+    Together,
+    /// The cut on the venue where the later route waits first, and the
+    /// other once that route has left that venue.
+    VictimsWaitingVenueFirst,
+}
+
 /// Two routes headed in opposite order on the two venues as `seating`
-/// says, the cycle between them ended by both naming windows.
-fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
+/// says, the cuts lifting as `lift` says, the cycle between them ended by
+/// a wound of the later hash.
+fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating, lift: Lift) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
@@ -520,6 +562,7 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
         Seating::Swapped => [routes[1], routes[0]],
     };
     let proven = c.metric("hold_inversions_proven", None);
+    let windowed = c.metric("heads_windowed", None);
     let row_on = |c: &C, venue: ShardId, route: TxHash| {
         c.queued_rows(venue)
             .and_then(|rows| rows.get(&route).cloned())
@@ -528,6 +571,18 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
         (FIRST_VENUE_SHARD, held_first, held_second),
         (SECOND_VENUE_SHARD, held_second, held_first),
     ];
+    let [victim, survivor] = if routes[0] > routes[1] {
+        routes
+    } else {
+        [routes[1], routes[0]]
+    };
+    // The later route waits where the earlier heads.
+    let (waits_at, heads_at) = if held_first == survivor {
+        (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD)
+    } else {
+        (SECOND_VENUE_SHARD, FIRST_VENUE_SHARD)
+    };
+    let venues = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD];
 
     // While the cut stands each venue heads the route whose record it
     // heard, and the other route is not placed there.
@@ -542,49 +597,257 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
         }),
         "each venue must head the route whose record it heard, the other unplaced there",
     );
-    c.clear_drops();
-
-    // Once both records arrive, each venue places the other route behind
-    // its head, which refuses it.
-    assert!(
-        c.run_until(epochs(8), |c| {
-            heads.iter().all(|&(venue, own, other)| {
-                row_on(c, venue, own).is_some_and(|row| {
-                    row.state == RowState::Pending && row.head.is_some() && row.blocked_at.is_some()
-                }) && row_on(c, venue, other).is_some_and(|row| {
-                    row.state == RowState::Pending && row.queued.is_some() && row.head.is_none()
-                })
-            })
-        }),
-        "each venue must hold the other route behind its head, refusing it",
+    assert_eq!(
+        c.metric("hold_inversions_proven", None),
+        proven,
+        "no venue seats the route the other heads while the cuts stand, so nothing is proven",
     );
-    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
-    each_leaves_its_head_at_its_window(c, &heads.map(|(venue, own, _)| (venue, own)), deadline);
 
+    let late_cut = if heads_at == SECOND_VENUE_SHARD {
+        (SECOND_VENUE_SHARD, first_hears)
+    } else {
+        (FIRST_VENUE_SHARD, second_hears)
+    };
+    let start = lift_crossed_cuts(c, lift, &heads, (victim, waits_at), late_cut);
+    let bound = start.plus(NAMING_WINDOW / 2);
+    let gone = the_later_leaves_both_venues_unnamed_by(c, victim, &venues, bound);
+    let accepted = the_earlier_accepts_on_both_venues_by(c, survivor, &venues, bound);
+    let since = |at: WeightedTimestamp| at.as_millis().saturating_sub(start.as_millis());
+    println!(
+        "crossed routes, lifted {}: from {start:?}, the later gone from {:?} at +{:?} ms, the \
+         earlier accepted at +{:?} ms, against a window of {} ms",
+        match lift {
+            Lift::Together => "together",
+            Lift::VictimsWaitingVenueFirst => "the waiting venue first",
+        },
+        venues,
+        gone.iter().map(|at| since(*at)).collect::<Vec<_>>(),
+        accepted.iter().map(|at| since(*at)).collect::<Vec<_>>(),
+        NAMING_WINDOW.as_millis(),
+    );
+
+    the_cycle_ends_by_a_wound(c, [victim, survivor], (proven, windowed));
+    protocol_resource.assert_settles_within(c, &charges, epochs(8), "crossed holds");
+    units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
+}
+
+/// Assert `victim` aborts and `survivor` accepts, a block having proven
+/// the cycle and no head having left at its window: `proven` and
+/// `windowed` are `hold_inversions_proven` and `heads_windowed` before.
+fn the_cycle_ends_by_a_wound<C: FaultableCluster>(
+    c: &mut C,
+    [victim, survivor]: [TxHash; 2],
+    (proven, windowed): (u64, u64),
+) {
     let resolved = c.run_until(epochs(8), |c| {
-        routes
+        [victim, survivor]
             .iter()
             .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
     });
     assert!(
-        resolved && WeightedTimestamp::ZERO.plus(c.now()) < deadline,
-        "the cycle must resolve before the deadline: {:?}",
-        routes.map(|hash| c.tx_status(hash)),
+        resolved,
+        "both routes must resolve: {:?}",
+        [victim, survivor].map(|hash| c.tx_status(hash)),
     );
-    for hash in routes {
-        assert_eq!(
-            c.tx_status(hash),
-            Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
-            "each route aborts at its naming window where it heads",
+    assert_eq!(
+        c.tx_status(victim),
+        Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
+        "the later route aborts",
+    );
+    assert_eq!(
+        c.tx_status(survivor),
+        Some(TransactionStatus::Completed(TransactionDecision::Accept)),
+        "the earlier route accepts",
+    );
+    assert!(
+        c.metric("hold_inversions_proven", None) > proven,
+        "a block proves the cycle",
+    );
+    assert_eq!(
+        c.metric("heads_windowed", None),
+        windowed,
+        "no head leaves at its naming window",
+    );
+}
+
+/// Lift the cuts of [`crossed_routes`] as `lift` says, and return the
+/// clock the later route's bound runs from: the later of the two heads'
+/// refusals where both lift together, and the second lift otherwise.
+///
+/// Each of `heads` is a venue, the route it heads and the route it holds
+/// behind. `victim` waits at `waits_at`; `late_cut`, the venue and the
+/// producer it is cut off from, stands until the victim has left there.
+fn lift_crossed_cuts<C: FaultableCluster>(
+    c: &mut C,
+    lift: Lift,
+    heads: &[(ShardId, TxHash, TxHash); 2],
+    (victim, waits_at): (TxHash, ShardId),
+    (late_venue, late_producer): (ShardId, ShardId),
+) -> WeightedTimestamp {
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let row_on = |c: &C, venue: ShardId, route: TxHash| {
+        c.queued_rows(venue)
+            .and_then(|rows| rows.get(&route).cloned())
+    };
+    // Once a venue hears both records it places the other route behind
+    // its head, which refuses it and takes the clock of that block: a head
+    // refusing nobody while the cuts stood. Seen venue by venue, since the
+    // wound can take the later route's row from one venue before the
+    // other has placed. A poll is a second of cluster clock, and a head
+    // can be placed against and wounded inside one; a venue whose head is
+    // first seen already gone takes that poll's clock, which is past its
+    // refusal.
+    let refused: RefCell<BTreeMap<ShardId, WeightedTimestamp>> = RefCell::new(BTreeMap::new());
+    let placed = |c: &C, on: &[ShardId]| {
+        for &(venue, own, _) in heads {
+            let head = row_on(c, venue, own)
+                .filter(|row| row.state == RowState::Pending && row.head.is_some());
+            let seen = match head {
+                Some(row) => row.blocked_at,
+                None => Some(clock(c)),
+            };
+            if on.contains(&venue)
+                && let Some(seen) = seen
+            {
+                refused.borrow_mut().entry(venue).or_insert(seen);
+            }
+        }
+        on.iter().all(|venue| refused.borrow().contains_key(venue))
+    };
+    c.clear_drops();
+    match lift {
+        Lift::Together => {
+            let venues = heads.map(|(venue, _, _)| venue);
+            assert!(
+                c.run_until(epochs(8), |c| placed(c, &venues)),
+                "each venue must hold the other route behind its head, refusing it: refused \
+                 {:?}, rows {:?}",
+                refused.borrow(),
+                heads.map(|(venue, own, other)| (
+                    venue,
+                    row_on(c, venue, own).map(|row| (row.state, row.head, row.blocked_at)),
+                    row_on(c, venue, other).map(|row| (row.state, row.queued, row.head)),
+                )),
+            );
+            let later = refused.borrow().values().max().copied();
+            later.expect("both venues refused")
+        }
+        Lift::VictimsWaitingVenueFirst => {
+            let _standing = isolate_crossing_intake(c, late_venue, late_producer);
+            assert!(
+                c.run_until(epochs(8), |c| placed(c, &[waits_at])),
+                "the venue hearing first must hold the later route behind its head",
+            );
+            // Its row gone, not only aborted: an aborted row standing
+            // unseated until its tick settles still reads as the cycle.
+            assert!(
+                c.run_until(epochs(8), |c| row_on(c, waits_at, victim).is_none()),
+                "the later route's row must leave the venue where it waits",
+            );
+            let first_refused = refused.borrow()[&waits_at];
+            assert!(
+                clock(c) <= first_refused.plus(NAMING_WINDOW / 2),
+                "the venue hearing first must wound the later route off the other's seats: \
+                 refused at {first_refused:?}, gone by {:?}",
+                clock(c),
+            );
+            // A dozen heights on, three seat asks apart, so no anchor the
+            // venue hearing late asks at still holds the row.
+            assert!(
+                await_blocks(c, waits_at, 12, epochs(8)),
+                "the venue where the later route waited must keep committing",
+            );
+            assert!(
+                row_on(c, late_venue, victim)
+                    .is_some_and(|row| row.state == RowState::Pending && row.head.is_some()),
+                "the later route must still head the venue hearing late",
+            );
+            c.clear_drops();
+            clock(c)
+        }
+    }
+}
+
+/// Assert `route` accepts on each of `venues` by `bound`, and return when
+/// each chain was first seen holding the accept.
+fn the_earlier_accepts_on_both_venues_by<C: Cluster>(
+    c: &mut C,
+    route: TxHash,
+    venues: &[ShardId],
+    bound: WeightedTimestamp,
+) -> Vec<WeightedTimestamp> {
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let accepted: RefCell<BTreeMap<ShardId, WeightedTimestamp>> = RefCell::new(BTreeMap::new());
+    let all_accepted = c.run_until(epochs(8), |c| {
+        for &venue in venues {
+            if matches!(
+                c.chain_fate(venue, route).1,
+                Some((_, TransactionDecision::Accept))
+            ) {
+                accepted
+                    .borrow_mut()
+                    .entry(venue)
+                    .or_insert_with(|| clock(c));
+            }
+        }
+        accepted.borrow().len() == venues.len()
+    });
+    assert!(
+        all_accepted,
+        "the earlier route must accept on every venue: {:?}",
+        venues
+            .iter()
+            .map(|venue| c.chain_fate(*venue, route))
+            .collect::<Vec<_>>(),
+    );
+    let accepted = accepted.into_inner();
+    for venue in venues {
+        let at = accepted[venue];
+        assert!(
+            at <= bound,
+            "the earlier route must accept on {venue:?} by {bound:?}: accepted at {at:?}",
         );
     }
-    assert_eq!(
-        c.metric("hold_inversions_proven", None),
-        proven,
-        "no venue seats a route the other heads, so no block proves the cycle",
-    );
-    protocol_resource.assert_settles_within(c, &charges, epochs(8), "crossed holds");
-    units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
+    venues.iter().map(|venue| accepted[venue]).collect()
+}
+
+/// Assert `route` leaves each of `venues` by `bound`, no tick there ever
+/// naming it to run, and return when it was first seen gone from each.
+fn the_later_leaves_both_venues_unnamed_by<C: Cluster>(
+    c: &mut C,
+    route: TxHash,
+    venues: &[ShardId],
+    bound: WeightedTimestamp,
+) -> Vec<WeightedTimestamp> {
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let left: RefCell<BTreeMap<ShardId, WeightedTimestamp>> = RefCell::new(BTreeMap::new());
+    let all_left = c.run_until(epochs(8), |c| {
+        for &venue in venues {
+            let waits = c.queued_rows(venue).is_some_and(|rows| {
+                rows.get(&route)
+                    .is_some_and(|row| row.state == RowState::Pending)
+            });
+            if !waits {
+                left.borrow_mut().entry(venue).or_insert_with(|| clock(c));
+            }
+        }
+        left.borrow().len() == venues.len()
+    });
+    assert!(all_left, "the later route must leave every venue");
+    let left = left.into_inner();
+    for venue in venues {
+        let gone = left[venue];
+        assert!(
+            gone <= bound,
+            "the later route must leave {venue:?} by {bound:?}: gone at {gone:?}",
+        );
+        assert!(
+            c.ran(*venue, route).iter().all(|ran| !ran.succeeded),
+            "the later route is aborted unnamed on {venue:?}: {:?}",
+            c.ran(*venue, route),
+        );
+    }
+    venues.iter().map(|venue| left[venue]).collect()
 }
 
 /// Three routes held in a ring of three venues abort at their naming
@@ -659,6 +922,7 @@ pub fn routes_held_in_a_ring_abort_at_the_window<C: FaultableCluster>(c: &mut C)
         .collect();
     let proven = c.metric("hold_inversions_proven", None);
     let contended = c.metric("hold_contentions", None);
+    let windowed = c.metric("heads_windowed", None);
 
     // Each venue holds its own route head, unnamed and refusing, and the
     // route arriving from the venue before it placed behind it.
@@ -709,6 +973,11 @@ pub fn routes_held_in_a_ring_abort_at_the_window<C: FaultableCluster>(c: &mut C)
         c.metric("hold_inversions_proven", None),
         proven,
         "no block can prove a ring off one counterpart's seats",
+    );
+    assert_eq!(
+        c.metric("heads_windowed", None),
+        windowed + 3,
+        "each route leaves its head at its window",
     );
     assert_eq!(
         c.metric("hold_contentions", None),
@@ -3369,6 +3638,7 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
     ("block_commit_deferred", &[None]),
     ("hold_contentions", &[None]),
     ("hold_inversions_proven", &[None]),
+    ("heads_windowed", &[None]),
     ("transactions_aborted", &[None]),
     ("unresolvable_txs", &[None]),
     ("expected_tx_dropped", &[None]),
@@ -4528,6 +4798,7 @@ impl CoreLoadRun<'_> {
                 "block_commit_deferred",
                 "hold_contentions",
                 "hold_inversions_proven",
+                "heads_windowed",
                 "transactions_aborted",
                 "unresolvable_txs",
                 "expected_tx_dropped",

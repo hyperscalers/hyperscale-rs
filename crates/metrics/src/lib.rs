@@ -248,6 +248,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// of a hold cycle.
     fn record_hold_inversions_proven(&self, victims: usize) {}
 
+    /// Unnamed heads a proposed block aborts at their naming window,
+    /// which tells a cycle a window ended from one a wound ended.
+    fn record_heads_windowed(&self, heads: usize) {}
+
     /// Stated or accepted rows a terminal's manifest fated or ended, one
     /// count per row at each derivation of that manifest: the proposer's,
     /// each voter's and each re-proposal's, so a nonzero total scales with
@@ -900,6 +904,12 @@ pub fn record_hold_contentions(pairs: usize) {
 #[inline]
 pub fn record_hold_inversions_proven(victims: usize) {
     recorder().record_hold_inversions_proven(victims);
+}
+
+/// Record the heads a proposed block aborts at their naming window.
+#[inline]
+pub fn record_heads_windowed(heads: usize) {
+    recorder().record_heads_windowed(heads);
 }
 
 /// Record the hearing rows one derivation of a terminal's manifest named.
