@@ -7,8 +7,9 @@
 //! decides when that read is put: a key arms on the first evidence that
 //! the producer's leg has run or never will, and once armed is asked at
 //! a proven anchor of the record's holder, backing off in the holder's
-//! heights and never waiting longer than one finalization delay of the
-//! holder's clock between asks. One ask stands for a key at a time: a
+//! heights and never waiting longer than one finalization delay between
+//! asks, of the holder's clock or of this chain's where the holder's
+//! has stopped. One ask stands for a key at a time: a
 //! later one takes the earlier's place, so no key queues twice.
 //!
 //! Two clocks arm a read. The holder's own, read off its newest proven
@@ -159,12 +160,13 @@ enum Evidence {
 
 /// One record's read: whether it is armed and by what, how many asks
 /// have gone out since it was armed, the holder anchor the last one was
-/// put at, and the ask still out for the key, if one is.
+/// put at with this chain's clock as it was, and the ask still out for
+/// the key, if one is.
 #[derive(Debug, Default)]
 struct Read {
     armed: Option<Evidence>,
     step: u32,
-    last: Option<Anchor>,
+    last: Option<(Anchor, WeightedTimestamp)>,
     out: Option<(WeightedTimestamp, Anchor)>,
 }
 
@@ -308,7 +310,7 @@ impl RecordReads {
         now: WeightedTimestamp,
     ) {
         let read = self.reads.entry(key).or_default();
-        read.last = Some(anchor);
+        read.last = Some((anchor, now));
         read.step = read.step.saturating_add(1);
         record_record_push_span(u64::try_from(span.as_millis()).unwrap_or(u64::MAX));
         self.spans
@@ -325,7 +327,14 @@ impl RecordReads {
     /// holder's clock past it, so a record a producer is slow to write
     /// is asked less and less often while one the consumer is about to
     /// need is asked at least once per finality delay.
-    pub fn due(&mut self, key: SubstateKey, anchor: Anchor) -> bool {
+    ///
+    /// A holder whose headers froze runs neither of those out, so one
+    /// finalization delay of this chain's clock `now` past the last ask
+    /// also calls one, at any anchor above the last: the record may
+    /// stand in the last block it wrote. At the anchor of the last ask
+    /// there is nothing new to read, so a frozen holder draws one such
+    /// ask and no more.
+    pub fn due_at(&mut self, key: SubstateKey, anchor: Anchor, now: WeightedTimestamp) -> bool {
         let Some(read) = self.reads.get_mut(&key) else {
             return false;
         };
@@ -334,14 +343,16 @@ impl RecordReads {
         }
         let due = match read.last {
             None => true,
-            Some(last) => {
+            Some((last, asked_at)) => {
                 let gap = 1u64 << read.step.min(32);
                 anchor.height.inner() >= last.height.inner().saturating_add(gap)
                     || anchor.ts.elapsed_since(last.ts) >= MAX_FINALIZATION_DELAY
+                    || (anchor.height > last.height
+                        && now.elapsed_since(asked_at) >= MAX_FINALIZATION_DELAY)
             }
         };
         if due {
-            read.last = Some(anchor);
+            read.last = Some((anchor, now));
             read.step = read.step.saturating_add(1);
         }
         due
@@ -392,6 +403,13 @@ impl RecordReads {
             .values()
             .filter(|read| read.out.is_some_and(|(_, at)| at.shard == holder))
             .count()
+    }
+
+    /// [`Self::due_at`] with this chain's clock level with the holder's,
+    /// for the tests that watch the ladder.
+    #[cfg(test)]
+    pub fn due(&mut self, key: SubstateKey, anchor: Anchor) -> bool {
+        self.due_at(key, anchor, anchor.ts)
     }
 
     /// How many of `holder`'s heights have given a sample, for the tests
@@ -552,6 +570,42 @@ mod tests {
             "the third ask still waits four heights",
         );
         assert!(laddered.due(key, anchor(7, 5_003)));
+    }
+
+    /// A key the grace armed and walked up the ladder, whose holder then
+    /// froze short of the next rung, still asks: one finalization delay
+    /// of this chain's clock past the last ask, at the newest anchor
+    /// held. Its holder's clock has stopped, and the record may stand in
+    /// the last block it wrote. A frozen holder draws that one ask and
+    /// no more, and the ask at an anchor the last one stood at draws none.
+    #[test]
+    fn a_frozen_holder_is_asked_on_this_chains_clock() {
+        let mut reads = RecordReads::new();
+        let want = wanted(0);
+        let key = want.key;
+        let first = anchor(1, 5_000);
+        reads.arm(&want, HOLDER, first.ts, Some(first));
+        assert!(reads.due(key, first));
+        assert!(reads.due(key, anchor(3, 6_000)));
+        assert!(reads.due(key, anchor(7, 7_000)));
+        assert!(reads.due(key, anchor(15, 10_000)));
+        let last = anchor(31, 16_000);
+        assert!(reads.due(key, last));
+
+        let frozen = anchor(37, 18_000);
+        let asked_at = last.ts;
+        let reach = asked_at.plus(MAX_FINALIZATION_DELAY);
+        let short = reach.minus(Duration::from_millis(1));
+        assert!(!reads.due_at(key, frozen, short), "a millisecond short");
+        reads.arm(&want, HOLDER, reach, Some(frozen));
+        assert!(
+            !reads.due_at(key, last, reach),
+            "nothing new at that anchor"
+        );
+        assert!(reads.due_at(key, frozen, reach), "the clock's reach asks");
+
+        let much_later = reach.plus(MAX_FINALIZATION_DELAY * 4);
+        assert!(!reads.due_at(key, frozen, much_later), "and only once");
     }
 
     /// `spans`, one height each, from `HOLDER`'s height `from`.

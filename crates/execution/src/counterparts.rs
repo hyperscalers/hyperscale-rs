@@ -2803,7 +2803,7 @@ impl Counterparts {
             if self.records.out(record.key).is_none() && *live >= MAX_RECORD_ASKS_PER_HOLDER {
                 continue;
             }
-            if !self.records.due(record.key, anchor) {
+            if !self.records.due_at(record.key, anchor, now) {
                 continue;
             }
             let ask = (record.filed_at, anchor, record.key);
