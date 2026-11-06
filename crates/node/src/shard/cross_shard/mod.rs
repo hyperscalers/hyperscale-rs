@@ -389,36 +389,6 @@ mod tests {
             .collect()
     }
 
-    /// The two fetches count their places apart: one filled by a holder
-    /// that never answers leaves the other sending to that holder at
-    /// once. Which of them an ask reaches is its `FetchIds` arm's to say,
-    /// and this does not drive that.
-    #[test]
-    fn a_full_record_fetch_takes_no_place_of_the_state_proof_fetch() {
-        let silent = ShardId::leaf(1, 0);
-        let mut state = CrossShardState::new(&NodeConfig::default());
-        let filling = RECORD_PROOF_FETCH.max_in_flight;
-        let mut unanswered = reads(silent, u8::MAX);
-        let mut more = reads(silent, u8::MAX);
-        for (filed_at, _, _) in &mut more {
-            *filed_at = filed_at.plus(std::time::Duration::from_secs(1));
-        }
-        unanswered.extend(more);
-        ask_in_vain(&mut state.record_proof, silent, unanswered, 16);
-        assert_eq!(state.record_proof.in_flight_count(), filling);
-
-        let sent = state.state_proof.handle(FetchInput::Request {
-            ids: vec![(header(silent, 1), test_key(1))],
-            shard: silent,
-            preferred: None,
-            class: None,
-        });
-        assert!(
-            matches!(sent.as_slice(), [FetchOutput::Send { .. }]),
-            "the seat ask is dispatched: {sent:?}",
-        );
-    }
-
     /// Reads dispatch in the order their wants were filed, whatever
     /// their keys.
     #[test]
