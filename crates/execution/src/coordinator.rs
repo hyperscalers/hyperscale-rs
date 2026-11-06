@@ -1172,7 +1172,10 @@ impl ExecutionCoordinator {
     }
 
     /// The anchor of the last block this coordinator folded, which every
-    /// tick not yet seated is anchored at or past.
+    /// tick not yet seated is anchored at or past: a bound resting on the
+    /// vote floor f+1 honest signers ran on every certified block, as do
+    /// the retention of a served height and the dispatch panic in
+    /// `own_parts`.
     #[must_use]
     pub const fn committed_ts(&self) -> WeightedTimestamp {
         self.committed_ts

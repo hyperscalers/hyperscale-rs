@@ -44,6 +44,10 @@ use hyperscale_hbor::Hbor;
 /// deterministic deadlines on `header.parent_qc().weighted_timestamp()`,
 /// never on a received block's own `qc().weighted_timestamp()`.
 ///
+/// A certified block's anchor stands at or past its parent's only because the
+/// f+1 honest signers of its QC ran the vote floor in the shard coordinator's
+/// `trigger_qc_verification_or_vote`.
+///
 /// This is the only timestamp type safe to anchor consensus deadlines on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Hbor, Default)]
 #[hbor(transparent)]
@@ -75,14 +79,18 @@ impl WeightedTimestamp {
     /// where `block_anchor` is that block's `parent_qc` weighted timestamp.
     ///
     /// The anchor is hash-pinned, so every validator reads the same value
-    /// for a given block — but it is not monotone along the committed
-    /// chain. The per-block floor the vote path enforces is never asked of
-    /// a sync-admitted block, which commits on QC attestation with no
-    /// local vote. Anything keyed off a clock that runs backwards comes
-    /// back to life: a dedup tombstone prunes early and its artifact is
+    /// for a given block — but this node does not recheck the vote floor
+    /// on a sync-admitted block, which commits on QC attestation with no
+    /// local vote, so it takes the anchor's monotonicity on the signers'
+    /// word. Anything keyed off a clock that runs backwards comes back to
+    /// life: a dedup tombstone prunes early and its artifact is
     /// re-includable, a validity window reopens, a retention deadline
     /// fires twice. So what a commit advances is the running maximum, and
     /// that is what this says.
+    ///
+    /// Retention of a served height and the dispatch panic on a retired
+    /// one read the raw anchor instead, where a higher clock would raise
+    /// the cutoff, and rest on that vote floor rather than on this maximum.
     ///
     /// **Only for readings that are this node's own.** The maximum is over
     /// the blocks *this* node has seen commit, so a node with less history
