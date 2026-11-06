@@ -389,10 +389,12 @@ mod tests {
             .collect()
     }
 
-    /// A record fetch filled by a holder that never answers takes no
-    /// place of the state-proof fetch's: a seat ask goes out at once.
+    /// The two fetches count their places apart: one filled by a holder
+    /// that never answers leaves the other sending to that holder at
+    /// once. Which of them an ask reaches is its `FetchIds` arm's to say,
+    /// and this does not drive that.
     #[test]
-    fn a_full_record_fetch_leaves_a_seat_ask_dispatchable() {
+    fn a_full_record_fetch_takes_no_place_of_the_state_proof_fetch() {
         let silent = ShardId::leaf(1, 0);
         let mut state = CrossShardState::new(&NodeConfig::default());
         let filling = RECORD_PROOF_FETCH.max_in_flight;

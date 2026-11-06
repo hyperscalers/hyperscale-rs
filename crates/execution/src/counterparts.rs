@@ -4341,10 +4341,8 @@ impl Counterparts {
         let unresolved = &self.ledger;
         // A claim is worth carrying while something still wants what it
         // answers: a transaction the ledger owes an outcome for, or a
-        // leaf-driven question of this shard's, by [`wants_reading`] —
-        // the same predicate that decided the reading was worth keeping
-        // when the fetch landed — or a record this shard's fold credits
-        // or declines unasked.
+        // leaf-driven question of this shard's, by [`wants_reading`], or
+        // a record this shard's fold credits or declines unasked.
         // A claim stands only at an anchor this validator still holds
         // commit-proven, since a retired or fenced anchor is one no
         // voter could stand it at, so one whose anchor is gone is let go
