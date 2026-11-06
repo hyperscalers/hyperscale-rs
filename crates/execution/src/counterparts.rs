@@ -1740,26 +1740,81 @@ struct Probe {
 /// into another asker's fetch of the same key. The question closes on
 /// the last of them, and the readings are offered only then, and only
 /// where together they read the cycle or the victim's leaving.
+///
+/// Its question's keys are held here: a hot queue stands hundreds of
+/// probes at one anchor, and each proof and each turnover of the head
+/// consults every one of them on the driver thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SeatProbe {
     anchor: Anchor,
     returned: bool,
-    parts: Vec<StateClaim>,
+    keys: Vec<SubstateKey>,
+    parts: Vec<SeatPart>,
 }
 
 impl SeatProbe {
-    /// What the readings come back so far say of `key`.
-    fn read(&self, key: SubstateKey) -> Option<Inclusion> {
-        self.parts.iter().find_map(|part| part.reading(key))
+    /// The keys `question` reads, derived once for as long as it stands.
+    fn keys_of(question: &SeatQuestion) -> Vec<SubstateKey> {
+        #[cfg(test)]
+        SEAT_KEY_DERIVATIONS.with(|count| count.set(count.get() + 1));
+        question.keys()
     }
 
-    /// Whether this probe still waits on a fetch of `key` at `anchor`.
-    fn awaits(&self, question: &SeatQuestion, anchor: Anchor, key: SubstateKey) -> bool {
-        !self.returned
-            && self.anchor == anchor
-            && question.keys().contains(&key)
-            && self.read(key).is_none()
+    /// What the readings come back so far say of `key`.
+    fn read(&self, key: SubstateKey) -> Option<Inclusion> {
+        self.parts.iter().find_map(|part| part.read(key))
     }
+
+    /// The fetches this probe still waits on.
+    fn awaited(&self) -> impl Iterator<Item = (Anchor, SubstateKey)> + '_ {
+        self.keys
+            .iter()
+            .filter(|key| !self.returned && self.read(**key).is_none())
+            .map(|key| (self.anchor, *key))
+    }
+}
+
+/// What one answer gave a seat probe: its readings, beside the whole
+/// proof of that answer, which every probe it speaks to shares. Plain
+/// contention closes on nothing it would carry, so the proof is cut only
+/// for a question the readings prove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeatPart {
+    cells: Vec<(SubstateKey, Inclusion)>,
+    proof: Arc<MerkleInclusionProof>,
+}
+
+impl SeatPart {
+    /// What these readings say of `key`.
+    fn read(&self, key: SubstateKey) -> Option<Inclusion> {
+        self.cells
+            .iter()
+            .find_map(|&(cell, inclusion)| (cell == key).then_some(inclusion))
+    }
+
+    /// The readings as a claim at `anchor`, the proof cut down to them.
+    fn claim(&self, anchor: Anchor) -> Option<StateClaim> {
+        #[cfg(test)]
+        SEAT_PROOF_CUTS.with(|count| count.set(count.get() + 1));
+        let keys: Vec<SubstateKey> = self.cells.iter().map(|(key, _)| *key).collect();
+        let cut = self.proof.restrict(&keys).ok()?;
+        Some(StateClaim::new(anchor, stated(&self.cells), cut))
+    }
+}
+
+/// `cells` as a claim states them.
+fn stated(cells: &[(SubstateKey, Inclusion)]) -> impl Iterator<Item = (SubstateKey, Stated)> + '_ {
+    cells
+        .iter()
+        .map(|&(key, inclusion)| (key, Stated::Inclusion(inclusion)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has derived a seat question's keys.
+    static SEAT_KEY_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times this thread has cut a proof for a seat probe.
+    static SEAT_PROOF_CUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What a commit folded, and what it could not answer for.
@@ -2290,22 +2345,13 @@ impl Counterparts {
             .seats
             .extract_if(.., |question, _| !standing.contains(question))
             .collect();
-        let mut released: Vec<(Anchor, SubstateKey)> = dropped
+        let released: BTreeSet<(Anchor, SubstateKey)> = dropped
             .iter()
-            .flat_map(|(question, probe)| {
-                question
-                    .keys()
-                    .into_iter()
-                    .filter(|key| probe.awaits(question, probe.anchor, *key))
-                    .map(|key| (probe.anchor, key))
-            })
+            .flat_map(|(_, probe)| probe.awaited())
             .collect();
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         let mut aligned: BTreeMap<ShardId, Option<Anchor>> = BTreeMap::new();
         for question in standing {
-            if question.proven_by(self.fetched.claims()) {
-                continue;
-            }
             let Some(anchor) = *aligned.entry(question.shard).or_insert_with(|| {
                 let newest = self
                     .proven_anchors
@@ -2323,25 +2369,31 @@ impl Counterparts {
             }) {
                 continue;
             }
+            if question.proven_by(self.fetched.claims()) {
+                continue;
+            }
+            let keys = self
+                .seats
+                .remove(&question)
+                .map_or_else(|| SeatProbe::keys_of(&question), |probe| probe.keys);
+            wanted
+                .entry(anchor)
+                .or_default()
+                .extend(keys.iter().copied());
             self.seats.insert(
                 question,
                 SeatProbe {
                     anchor,
                     returned: false,
+                    keys,
                     parts: Vec::new(),
                 },
             );
-            let asking = wanted.entry(anchor).or_default();
-            for key in question.keys() {
-                if !asking.contains(&key) {
-                    asking.push(key);
-                }
-            }
         }
         // Judged once this call's own questions are in: a key one of them
         // has just asked for is theirs to wait on, however the fetch layer
         // folds the two asks into one.
-        released.retain(|(anchor, key)| !self.fetch_awaited(*anchor, *key));
+        let released = self.unawaited(released.into_iter().collect());
         let mut actions = fetches(wanted);
         if !released.is_empty() {
             actions.push(Action::AbandonFetch(FetchIds::StateProofs(released)));
@@ -2349,16 +2401,22 @@ impl Counterparts {
         actions
     }
 
-    /// Whether a probe of either kind still waits on a fetch of `key` at
-    /// `anchor`, so letting it go would strand that probe.
-    fn fetch_awaited(&self, anchor: Anchor, key: SubstateKey) -> bool {
-        self.probes
+    /// What is left of `released` once the fetches a probe of either kind
+    /// still waits on are taken out, since letting those go would strand
+    /// their probes.
+    fn unawaited(&self, mut released: Vec<(Anchor, SubstateKey)>) -> Vec<(Anchor, SubstateKey)> {
+        if released.is_empty() {
+            return released;
+        }
+        let awaited: BTreeSet<(Anchor, SubstateKey)> = self
+            .probes
             .values()
-            .any(|probe| !probe.returned && probe.anchor == anchor && probe.question.key == key)
-            || self
-                .seats
-                .iter()
-                .any(|(question, probe)| probe.awaits(question, anchor, key))
+            .filter(|probe| !probe.returned)
+            .map(|probe| (probe.anchor, probe.question.key))
+            .chain(self.seats.values().flat_map(SeatProbe::awaited))
+            .collect();
+        released.retain(|fetch| !awaited.contains(fetch));
+        released
     }
 
     /// The questions this shard's entries open, each at the newest
@@ -3460,7 +3518,7 @@ impl Counterparts {
                 .filter(|key| !at_boundary.contains(key))
                 .filter(|key| wants_reading(&self.rows.awaited, &self.wanted, *key)),
         );
-        for (reading, victim) in self.answer_seats(anchor, keys, proof, inclusions) {
+        for (reading, victim) in self.answer_seats(anchor, proof, inclusions) {
             self.hold_seat_reading(&reading, victim);
         }
         if answering.is_empty() {
@@ -3533,35 +3591,52 @@ impl Counterparts {
     fn answer_seats(
         &mut self,
         anchor: Anchor,
-        keys: &[SubstateKey],
         proof: &MerkleInclusionProof,
         inclusions: &[(SubstateKey, Inclusion)],
     ) -> Vec<(StateClaim, TxHash)> {
         let mut held = Vec::new();
+        let out = |probe: &SeatProbe| !probe.returned && probe.anchor == anchor;
+        if !self.seats.values().any(out) {
+            return held;
+        }
+        let answered: BTreeMap<SubstateKey, Inclusion> = inclusions.iter().copied().collect();
+        let proof = Arc::new(proof.clone());
         for (question, probe) in &mut self.seats {
-            let arrived: Vec<SubstateKey> = question
-                .keys()
-                .into_iter()
-                .filter(|key| keys.contains(key) && probe.awaits(question, anchor, *key))
-                .collect();
-            if arrived.is_empty() {
+            if !out(probe) {
                 continue;
             }
-            let Ok(cut) = proof.restrict(&arrived) else {
-                continue;
-            };
-            let cells = inclusions
+            let cells: Vec<(SubstateKey, Inclusion)> = probe
+                .keys
                 .iter()
-                .filter(|(key, _)| arrived.contains(key))
-                .map(|&(key, inclusion)| (key, Stated::Inclusion(inclusion)));
-            probe.parts.push(StateClaim::new(anchor, cells, cut));
-            if question.keys().iter().any(|key| probe.read(*key).is_none()) {
+                .filter(|key| probe.read(**key).is_none())
+                .filter_map(|key| answered.get(key).map(|inclusion| (*key, *inclusion)))
+                .collect();
+            if cells.is_empty() {
+                continue;
+            }
+            probe.parts.push(SeatPart {
+                cells,
+                proof: Arc::clone(&proof),
+            });
+            if probe.keys.iter().any(|key| probe.read(*key).is_none()) {
                 continue;
             }
             probe.returned = true;
             let parts = std::mem::take(&mut probe.parts);
-            if question.proven_by(&parts) {
-                held.extend(parts.into_iter().map(|part| (part, question.victim())));
+            // Read here and never carried, so it goes without a proof.
+            let readings = StateClaim::new(
+                anchor,
+                parts.iter().flat_map(|part| stated(&part.cells)),
+                MerkleInclusionProof::new(Vec::new()),
+            );
+            if question.proven_by([&readings]) {
+                let victim = question.victim();
+                held.extend(
+                    parts
+                        .iter()
+                        .filter_map(|part| part.claim(anchor))
+                        .map(|claim| (claim, victim)),
+                );
             }
         }
         held
@@ -4144,7 +4219,7 @@ impl Counterparts {
             }
             false
         });
-        released.retain(|(anchor, key)| !self.fetch_awaited(*anchor, *key));
+        let released = self.unawaited(released);
         if released.is_empty() {
             Vec::new()
         } else {
@@ -8414,6 +8489,15 @@ mod tests {
             question.proven_by(counterparts.fetched.claims()),
             "the last readings close the question, and the cycle is held to offer",
         );
+        for claim in counterparts.fetched.claims() {
+            assert!(
+                claim
+                    .proof
+                    .inclusions(state_root, PRODUCER, &claim.keys())
+                    .is_ok(),
+                "a held reading carries the proof cut down to its own cells",
+            );
+        }
         assert!(
             counterparts.ask_seats(&[question], now).is_empty(),
             "a question the held claims prove is not asked again",
@@ -8490,12 +8574,13 @@ mod tests {
             })
             .flatten()
             .collect();
-        let alone: Vec<(Anchor, SubstateKey)> = first
+        let mut alone: Vec<(Anchor, SubstateKey)> = first
             .keys()
             .into_iter()
             .filter(|key| !next.keys().contains(key))
             .map(|key| (anchor, key))
             .collect();
+        alone.sort_unstable();
         assert!(alone.contains(&(anchor, first.keys()[0])));
         assert!(!alone.contains(&(anchor, first.keys()[1])));
         assert_eq!(
@@ -10340,6 +10425,129 @@ mod tests {
             recorder.counter("records_repushed", Some("escrowed")),
             u64::try_from(MAX_UNSOLICITED_RECORDS_PER_PRODUCER * 2).expect("small"),
             "and each push is counted",
+        );
+    }
+
+    /// The seat questions of the routes `head + 1` through `last` waiting
+    /// behind route `head`.
+    fn queue_behind(head: u16, last: u16) -> Vec<SeatQuestion> {
+        let tx = |seed: u16| {
+            let mut bytes = [0u8; 32];
+            bytes[..2].copy_from_slice(&seed.to_be_bytes());
+            TxHash::from(Hash::from_bytes(&bytes))
+        };
+        (head + 1..=last)
+            .map(|waiting| SeatQuestion {
+                shard: PRODUCER,
+                waiting: tx(waiting),
+                holder: tx(head),
+                validity_end: WeightedTimestamp::from_millis(36_000),
+            })
+            .collect()
+    }
+
+    /// Every cell `questions` read, once and in key order.
+    fn cells_of<'q>(questions: impl IntoIterator<Item = &'q SeatQuestion>) -> Vec<SubstateKey> {
+        let cells: BTreeSet<SubstateKey> =
+            questions.into_iter().flat_map(SeatQuestion::keys).collect();
+        cells.into_iter().collect()
+    }
+
+    /// A hot queue of five hundred routes behind one head, the head
+    /// turning over with every probe out: the whole line's questions drop
+    /// and stand again at one anchor, then the answers come back to plain
+    /// contention. Each question derives its keys once, and no proof is
+    /// cut for a reading nothing will carry.
+    #[test]
+    fn a_hot_queue_derives_each_seat_question_once_and_cuts_no_proof() {
+        const WAITING: u16 = 500;
+        let spent = || {
+            (
+                SEAT_KEY_DERIVATIONS.with(std::cell::Cell::get),
+                SEAT_PROOF_CUTS.with(std::cell::Cell::get),
+            )
+        };
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            Arc::new(TestRows::default()) as _,
+            ReadFrontier::default(),
+        );
+        let first = queue_behind(1, WAITING + 1);
+        let second = queue_behind(2, WAITING + 1);
+        let every = cells_of(first.iter().chain(&second));
+        let (state_root, _) = state_and_proof(PRODUCER, &every, &[]);
+        let now = WeightedTimestamp::from_millis(10_000);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(8),
+            state_root,
+            ts: now,
+        };
+        anchors.record(anchor);
+
+        let before = spent();
+        assert_eq!(counterparts.ask_seats(&first, now).len(), 1);
+        let turned_over = counterparts.ask_seats(&second, now);
+        assert_eq!(
+            spent().0 - before.0,
+            first.len() + second.len(),
+            "a turnover derives only the keys of the questions it stands",
+        );
+        let released: Vec<&(Anchor, SubstateKey)> = turned_over
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::StateProofs(ids)) => Some(ids),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !released.is_empty() && released.windows(2).all(|pair| pair[0] < pair[1]),
+            "each cell the dropped questions held is let go of once",
+        );
+
+        let answers: Vec<(Vec<SubstateKey>, MerkleInclusionProof)> = cells_of(&second)
+            .chunks(MAX_PROOFS_PER_QUERY)
+            .map(|chunk| {
+                let (_, proof) = state_and_proof(PRODUCER, &every, chunk);
+                (chunk.to_vec(), proof)
+            })
+            .collect();
+        let before = spent();
+        for (keys, proof) in &answers {
+            counterparts.on_proof_fetched(anchor, keys, proof, &[]);
+        }
+        assert_eq!(
+            spent(),
+            before,
+            "answers read the keys held and cut no proof for plain contention",
+        );
+        assert!(
+            second
+                .iter()
+                .all(|question| counterparts.seats[question].returned),
+            "every question closes on its answers",
+        );
+        assert!(
+            counterparts.fetched.is_empty(),
+            "plain contention holds nothing to offer",
+        );
+
+        let later = Anchor {
+            height: BlockHeight::new(12),
+            ts: now.plus(Duration::from_secs(2)),
+            ..anchor
+        };
+        anchors.record(later);
+        let before = spent();
+        assert_eq!(counterparts.ask_seats(&second, later.ts).len(), 1);
+        assert_eq!(
+            spent(),
+            before,
+            "a question asked again reads the keys it holds",
         );
     }
 }
