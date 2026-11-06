@@ -538,8 +538,9 @@ impl MetricsRecorder for MemoryRecorder {
         self.observe("record_push_span", None, millis as f64);
     }
 
-    fn set_record_push_grace(&self, millis: u64) {
-        self.set("record_push_grace", None, millis as f64);
+    fn set_record_push_grace(&self, holder: u64, millis: u64) {
+        let holder = holder.to_string();
+        self.set("record_push_grace", Some(&holder), millis as f64);
         self.observe("record_push_grace", None, millis as f64);
     }
 

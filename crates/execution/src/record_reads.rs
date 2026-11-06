@@ -108,7 +108,13 @@ impl Spans {
     /// the lowest height held is dropped and counts as nothing heard, so
     /// a holder whose heights rewound below its window goes quiet and
     /// sweeps.
-    fn sample(&mut self, height: BlockHeight, span: Duration, now: WeightedTimestamp) {
+    fn sample(
+        &mut self,
+        holder: ShardId,
+        height: BlockHeight,
+        span: Duration,
+        now: WeightedTimestamp,
+    ) {
         let full = self.heights.len() >= PUSH_SPAN_HEIGHTS;
         if let Some(spans) = self.heights.get_mut(&height) {
             self.heard = now;
@@ -130,12 +136,17 @@ impl Spans {
             .filter_map(|spans| median_of(spans))
             .collect();
         self.grace = grace_over(&samples);
-        set_record_push_grace(u64::try_from(self.grace.as_millis()).unwrap_or(u64::MAX));
+        report_grace(holder, self.grace);
         self.heights.insert(height, vec![span]);
         if self.heights.len() > PUSH_SPAN_HEIGHTS {
             self.heights.pop_first();
         }
     }
+}
+
+fn report_grace(holder: ShardId, grace: Duration) {
+    let millis = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+    set_record_push_grace(holder.inner(), millis);
 }
 
 /// One read as the fetch holds it: the clock its want was filed at, the
@@ -236,7 +247,13 @@ impl RecordReads {
             .collect();
         let floor = now.minus(RETENTION_HORIZON);
         self.certified.retain(|_, (_, heard)| *heard >= floor);
-        self.spans.retain(|_, spans| spans.heard >= floor);
+        self.spans.retain(|holder, spans| {
+            let heard = spans.heard >= floor;
+            if !heard {
+                report_grace(*holder, RECORD_PUSH_GRACE_FLOOR);
+            }
+            heard
+        });
         ended
     }
 
@@ -319,7 +336,7 @@ impl RecordReads {
         self.spans
             .entry(anchor.shard)
             .or_insert_with(|| Spans::new(now))
-            .sample(anchor.height, span, now);
+            .sample(anchor.shard, anchor.height, span, now);
     }
 
     /// Whether `key` is asked at `anchor`, a proven anchor of its holder,
@@ -435,6 +452,10 @@ impl RecordReads {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
+    use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{BlockHeight, Hash, StateRoot};
 
@@ -750,6 +771,39 @@ mod tests {
         let past_it = at_the_horizon.plus(Duration::from_millis(1));
         let _ = reads.sweep(past_it, &BTreeSet::new());
         assert_eq!(reads.grace(HOLDER), RECORD_PUSH_GRACE_FLOOR);
+    }
+
+    /// Each holder's grace reads under its own label, so one holder's
+    /// samples never stand for another's, and a holder swept reads the
+    /// floor it is back at.
+    #[test]
+    fn each_holders_grace_reads_apart() {
+        let secs = Duration::from_secs;
+        let other = ShardId::leaf(1, 1);
+        let at = |shard, height| Anchor {
+            shard,
+            ..anchor(height, 0)
+        };
+        let recorder = MemoryRecorder::new();
+        let scoped: Arc<dyn MetricsRecorder> = Arc::new(recorder.clone());
+        let label = |shard: ShardId| shard.inner().to_string();
+        let gauge = |shard| recorder.gauge("record_push_grace", Some(&label(shard)));
+        with_scoped_recorder(scoped, || {
+            let mut reads = RecordReads::new();
+            let now = WeightedTimestamp::ZERO;
+            for height in 1..=4 {
+                reads.pushed(test_key(1), at(HOLDER, height), secs(8), now);
+            }
+            for height in 1..=4 {
+                reads.pushed(test_key(2), at(other, height), secs(6), now);
+            }
+            assert!((gauge(HOLDER) - 12_000.0).abs() < f64::EPSILON);
+            assert!((gauge(other) - 9_000.0).abs() < f64::EPSILON);
+
+            let past = now.plus(RETENTION_HORIZON).plus(Duration::from_millis(1));
+            let _ = reads.sweep(past, &BTreeSet::new());
+            assert!((gauge(HOLDER) - 5_000.0).abs() < f64::EPSILON);
+        });
     }
 
     /// A sample dropped below the window keeps nothing alive: a holder

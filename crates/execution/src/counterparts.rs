@@ -2784,12 +2784,15 @@ impl Counterparts {
         }
         let local = self.ledger.local();
         let mut live: BTreeMap<ShardId, usize> = BTreeMap::new();
+        let mut newest_of: BTreeMap<ShardId, Option<Anchor>> = BTreeMap::new();
         let mut asks: BTreeMap<ShardId, Vec<RecordAsk>> = BTreeMap::new();
         for (record, holder) in filed {
             if holder == local {
                 continue;
             }
-            let newest = self.newest_above_floor(holder, now, windows);
+            let newest = *newest_of
+                .entry(holder)
+                .or_insert_with(|| self.newest_above_floor(holder, now, windows));
             self.records.arm(record, holder, now, newest);
             if self.fetched.reads_arrival(holder, record.key, record.tx) {
                 continue;

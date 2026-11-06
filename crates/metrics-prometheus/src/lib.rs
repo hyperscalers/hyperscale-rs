@@ -231,7 +231,7 @@ pub struct Metrics {
     /// Records consumers here wait on with no arrival for, at a commit.
     pub wanted_records: Gauge,
     pub record_push_span: Histogram,
-    pub record_push_grace: Gauge,
+    pub record_push_grace: GaugeVec,
     /// Proposals a leader made at once rather than holding an empty
     /// block, by the condition that forced it.
     pub eager_proposals: CounterVec,
@@ -1039,9 +1039,10 @@ impl Metrics {
             )
             .unwrap(),
 
-            record_push_grace: register_gauge!(
+            record_push_grace: register_gauge_vec!(
                 "hyperscale_record_push_grace_seconds",
-                "Seconds past a want's filing a holder's record is read, as last derived"
+                "Seconds past a want's filing a holder's record is read, as last derived",
+                &["holder"]
             )
             .unwrap(),
 
@@ -1567,8 +1568,11 @@ impl MetricsRecorder for PrometheusRecorder {
             .observe(millis as f64 / 1_000.0);
     }
 
-    fn set_record_push_grace(&self, millis: u64) {
-        self.metrics.record_push_grace.set(millis as f64 / 1_000.0);
+    fn set_record_push_grace(&self, holder: u64, millis: u64) {
+        self.metrics
+            .record_push_grace
+            .with_label_values(&[&holder.to_string()])
+            .set(millis as f64 / 1_000.0);
     }
 
     fn record_fenced_claim(&self, reading: &str, carried: bool) {

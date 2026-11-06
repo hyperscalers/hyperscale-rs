@@ -383,10 +383,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
         let _ = millis;
     }
 
-    /// The grace a holder's records are read past, in milliseconds, as
+    /// The grace `holder`'s records are read past, in milliseconds, as
     /// a new height's sample moves it.
-    fn set_record_push_grace(&self, millis: u64) {
-        let _ = millis;
+    fn set_record_push_grace(&self, holder: u64, millis: u64) {
+        let _ = (holder, millis);
     }
 
     /// A claim the commit fold acts on by its anchor: one carrying a
@@ -1060,10 +1060,10 @@ pub fn record_record_push_span(millis: u64) {
     recorder().record_record_push_span(millis);
 }
 
-/// Set the grace a holder's records are read past.
+/// Set the grace `holder`'s records are read past.
 #[inline]
-pub fn set_record_push_grace(millis: u64) {
-    recorder().set_record_push_grace(millis);
+pub fn set_record_push_grace(holder: u64, millis: u64) {
+    recorder().set_record_push_grace(holder, millis);
 }
 
 /// Record a fenced claim carried by a block or refused by the read
