@@ -1890,7 +1890,7 @@ impl Executor {
                         .is_none_or(|input| input.member.abortable()),
                 );
                 match own_reads.get(vm_tx) {
-                    Some(own) => batched.with_own_reads(Arc::clone(own)),
+                    Some(own) => batched.with_served_reads(Arc::clone(own), Arc::default()),
                     None => batched,
                 }
             })
