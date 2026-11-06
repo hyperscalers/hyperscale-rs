@@ -650,12 +650,15 @@ where
     read
 }
 
-/// More wanted keys than the record fetch has places.
-const DEAD_HOLDER_ROUTES: usize = 260;
+/// Well over the record fetch's 256 places, with room for the pushes that
+/// land before the holder dies.
+const DEAD_HOLDER_ROUTES: usize = 300;
 
 /// A holder nobody can reach pins no more of the record fetch than its
-/// share: with more keys wanted of it than the fetch has places, a lost
-/// record at a healthy holder is still read in time.
+/// share, so a lost record at a healthy holder is still read in time.
+///
+/// More keys are wanted of it than the fetch has places, and a validator
+/// keeps `asks_per_holder` reads open toward it and no more.
 ///
 /// Requires a grown four-shard cluster over
 /// [`contended_load_genesis_accounts`] of `traders`.
@@ -663,10 +666,15 @@ const DEAD_HOLDER_ROUTES: usize = 260;
 /// # Panics
 ///
 /// Panics if a venue misses its budget standing up, if the dead holder
-/// never reaches more wanted keys than the fetch has places, if the cut
-/// never fires, or if the record takes longer than
+/// never reaches more wanted keys than the fetch has places, if the reads
+/// open toward it are over `asks_per_holder` a validator or under half
+/// that, if the cut never fires, or if the record takes longer than
 /// [`LOST_RECORD_BOUND`].
-pub fn a_dead_holder_leaves_room_for_a_lost_record<C: FaultableCluster>(c: &mut C, traders: usize) {
+pub fn a_dead_holder_leaves_room_for_a_lost_record<C: FaultableCluster>(
+    c: &mut C,
+    traders: usize,
+    asks_per_holder: usize,
+) {
     let cast = LoadCast::stand_up(c, DEAD_HOLDER_ROUTES + 1, &traders_on_both_shards(traders));
     let walked = [BlockHeight::GENESIS, BlockHeight::GENESIS];
     let mut flight = Flight::over(DEAD_HOLDER_ROUTES + 1, walked);
@@ -703,8 +711,16 @@ pub fn a_dead_holder_leaves_room_for_a_lost_record<C: FaultableCluster>(c: &mut 
         "the cluster's clock must pass the finalization delay",
     );
     let open = record_reads_open(c);
-    assert!(open > 0, "the dead holder must have been asked");
-    println!("record read: {open} reads stand open toward a dead holder");
+    let cap = wide(asks_per_holder) * venue_validators(c);
+    println!("record read: {open} reads stand open toward a dead holder, of {cap} places");
+    assert!(
+        open <= cap,
+        "a dead holder holds {open} reads, past its {cap} places",
+    );
+    assert!(
+        open >= cap / 2,
+        "the dead holder must fill its places, and holds {open} of {cap}",
+    );
 
     let lost = isolate_pushed_readings(c, FIRST_VENUE_SHARD, SECOND_TRADER_SHARD);
     let hash = cast.send(

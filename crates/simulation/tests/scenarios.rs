@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
-use hyperscale_execution::RECORD_PUSH_GRACE_FLOOR;
+use hyperscale_execution::{MAX_RECORD_ASKS_PER_HOLDER, RECORD_PUSH_GRACE_FLOOR};
 use hyperscale_node::event::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
@@ -1770,7 +1770,11 @@ fn a_killed_proposer_costs_a_route_no_more_than_a_read_sim() {
 fn a_dead_holder_leaves_room_for_a_lost_record_sim() {
     dedicated_route_cluster(&contended_load_genesis_accounts(CONTENDED_LOAD_TRADERS))
         .run_faultable(|cluster| {
-            a_dead_holder_leaves_room_for_a_lost_record(cluster, CONTENDED_LOAD_TRADERS);
+            a_dead_holder_leaves_room_for_a_lost_record(
+                cluster,
+                CONTENDED_LOAD_TRADERS,
+                MAX_RECORD_ASKS_PER_HOLDER,
+            );
         });
 }
 
