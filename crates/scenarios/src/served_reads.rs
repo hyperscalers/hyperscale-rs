@@ -239,7 +239,12 @@ fn ends_as<C: Cluster>(c: &mut C, tx: TxHash, decision: TransactionDecision, con
 
 /// What a run past a refusal takes to bring a boundary above it into the
 /// beacon's record, which a reclaim reads it at.
-const ANSWER_BOUNDARY: Budget = epochs(3);
+///
+/// The refusal first stands out a span of seconds, whatever an epoch is,
+/// so that takes two epochs of five minutes and nine of thirty seconds.
+/// A wait short of it leaves the reclaim to land past the route's naming
+/// window.
+const ANSWER_BOUNDARY: Budget = epochs(10);
 
 /// Two members reading what the other reserves both settle, in the
 /// order they were placed.
