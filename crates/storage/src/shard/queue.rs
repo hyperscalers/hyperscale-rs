@@ -243,7 +243,7 @@ pub fn shared_standing(row: &MemberRow) -> bool {
                 .is_some_and(|waiting| waiting.settlement == Settlement::Shared),
             RowState::InFlight { settlement, .. } => settlement == Settlement::Shared,
             RowState::Stated { .. } => true,
-            RowState::Released { .. } | RowState::Accepted => false,
+            RowState::Released { .. } | RowState::Accepted { .. } => false,
         }
 }
 

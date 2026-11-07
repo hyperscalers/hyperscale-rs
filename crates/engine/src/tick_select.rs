@@ -721,7 +721,7 @@ pub fn terminal_fates(rows: &MemberIndex) -> Vec<TickLine> {
     rows.members
         .values()
         .map(|row| match row.state {
-            RowState::Accepted => TickLine::End { tx: row.tx },
+            RowState::Accepted { .. } => TickLine::End { tx: row.tx },
             RowState::Pending
             | RowState::InFlight { .. }
             | RowState::Stated { .. }
@@ -744,12 +744,12 @@ fn accepted_decisions<'r>(
 ) -> impl Iterator<Item = (TxHash, Decision)> + 'r {
     rows.members
         .values()
-        .filter(|row| row.state == RowState::Accepted)
+        .filter(|row| row.state.accepted())
         .filter(|row| {
             parent
                 .members
                 .get(&row.tx)
-                .is_some_and(|stood| stood.state == RowState::Accepted)
+                .is_some_and(|stood| stood.state.accepted())
         })
         .map(|row| (row.tx, decide(Hears::Accepted, &views.values(row))))
 }
@@ -1474,7 +1474,7 @@ impl<'a> Exit<'a> {
                     Settlement::Awaited => aborted(passed),
                 }
             }
-            RowState::Accepted => Self::None,
+            RowState::Accepted { .. } => Self::None,
             RowState::Pending => {
                 let standing = Standing::waiting(row, wounded, anchor);
                 if standing.leg() && lapsed {
@@ -2320,7 +2320,7 @@ mod tests {
         member_writes,
     };
     use hyperscale_types::test_utils::{
-        StubTree, proven_claim, stub_abort_charge, stub_stated_terms,
+        StubTree, proven_claim, stub_abort_charge, stub_effects, stub_stated_terms,
     };
     use hyperscale_types::{
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
@@ -4152,7 +4152,7 @@ mod tests {
                     .is_some_and(|waiting| waiting.settlement == Settlement::Shared),
                 RowState::InFlight { settlement, .. } => settlement != Settlement::Alone,
                 RowState::Stated { .. } => true,
-                RowState::Released { .. } | RowState::Accepted => false,
+                RowState::Released { .. } | RowState::Accepted { .. } => false,
             };
             rows.insert_row(if queued && row.queued.is_none() {
                 placed_head(row)
@@ -4194,6 +4194,7 @@ mod tests {
             state: RowState::Stated {
                 tick: BlockHeight::new(2),
                 receipt: GlobalReceiptHash::ZERO,
+                effects: stub_effects(),
             },
             holds: Capped::from_array([(held_cell, WRITE)]),
             ..held_in(1, far(), 2, Joins::Executes, Settlement::Shared)
@@ -4237,6 +4238,7 @@ mod tests {
             state: RowState::Stated {
                 tick: at(2),
                 receipt: GlobalReceiptHash::ZERO,
+                effects: stub_effects(),
             },
             share: 0,
             holds: Capped::from_array([(held_cell, WRITE)]),
@@ -4647,6 +4649,7 @@ mod tests {
                 state: RowState::Stated {
                     tick,
                     receipt: GlobalReceiptHash::ZERO,
+                    effects: stub_effects(),
                 },
                 ..standing(0, far(), RowState::Pending, false)
             };
@@ -4988,6 +4991,7 @@ mod tests {
                 RowState::Stated {
                     tick: at(2),
                     receipt: GlobalReceiptHash::ZERO,
+                    effects: stub_effects(),
                 },
             ),
             ran(
@@ -4996,6 +5000,7 @@ mod tests {
                 RowState::Stated {
                     tick: at(3),
                     receipt: GlobalReceiptHash::ZERO,
+                    effects: stub_effects(),
                 },
             ),
             ran(
@@ -5398,6 +5403,7 @@ mod tests {
                 RowState::Stated {
                     tick: BlockHeight::new(5),
                     receipt: GlobalReceiptHash::ZERO,
+                    effects: stub_effects(),
                 },
                 false,
             ),
@@ -6540,6 +6546,7 @@ mod tests {
             holder.state = RowState::Stated {
                 tick: BlockHeight::new(2),
                 receipt: GlobalReceiptHash::ZERO,
+                effects: stub_effects(),
             };
         }
         for rows in [&in_flight, &stated] {
@@ -6991,7 +6998,14 @@ mod tests {
                     .collect(),
             )
             .expect("one entry"),
-            ..standing(seed, far(), RowState::Accepted, false)
+            ..standing(
+                seed,
+                far(),
+                RowState::Accepted {
+                    effects: stub_effects(),
+                },
+                false,
+            )
         }
     }
 
@@ -7026,6 +7040,7 @@ mod tests {
             state: RowState::Stated {
                 tick: BlockHeight::new(2),
                 receipt: GlobalReceiptHash::ZERO,
+                effects: stub_effects(),
             },
             crossings: consuming().crossings,
             ..accepted(seed, heard)
@@ -7368,6 +7383,7 @@ mod tests {
         let stated = RowState::Stated {
             tick: BlockHeight::new(2),
             receipt: GlobalReceiptHash::ZERO,
+            effects: stub_effects(),
         };
         let mut rows = rows_of([
             accepted(1, None),
@@ -7517,6 +7533,7 @@ mod tests {
         let stated = RowState::Stated {
             tick: BlockHeight::new(2),
             receipt: GlobalReceiptHash::ZERO,
+            effects: stub_effects(),
         };
         let released = RowState::Released {
             settlement: Settlement::Shared,
@@ -7622,6 +7639,7 @@ mod tests {
                 RowState::Stated {
                     tick: BlockHeight::new(2),
                     receipt: GlobalReceiptHash::ZERO,
+                    effects: stub_effects(),
                 },
                 false,
             ),
@@ -7676,6 +7694,7 @@ mod tests {
                 RowState::Stated {
                     tick: BlockHeight::new(2),
                     receipt: GlobalReceiptHash::ZERO,
+                    effects: stub_effects(),
                 },
                 false,
             ),
@@ -7887,7 +7906,7 @@ mod tests {
             }
             peers.advance(block);
         }
-        assert_eq!(peers.members[&tx(1)].state, RowState::Accepted);
+        assert!(peers.members[&tx(1)].state.accepted());
         let (row, unseated, leaf) = (
             member_row_leaf(PEER, tx(1)),
             seat_leaf(PEER, tx(1)),

@@ -179,6 +179,9 @@ pub struct Metrics {
     pub verdict_cells_carried: Counter,
     /// The ones of those in a reading that changed a row's entry.
     pub verdict_cells_changed: Counter,
+    /// Rows that read a verdict leaf holding neither value they would
+    /// hash, and so refuse.
+    pub verdict_differed: Counter,
     /// Bytes the heard verdict cells weigh in their blocks' claims.
     pub verdict_claims_weight: Counter,
     /// The bytes of the ones that changed a row's entry.
@@ -872,6 +875,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            verdict_differed: register_counter!(
+                "hyperscale_verdict_differed_total",
+                "Rows that read a sibling's verdict leaf as neither value they would hash"
+            )
+            .unwrap(),
+
             verdict_claims_weight: register_counter!(
                 "hyperscale_verdict_claims_weight_bytes_total",
                 "Bytes the heard verdict cells weigh in their blocks' claims"
@@ -1452,6 +1461,10 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.verdict_cells_named.inc_by(named as f64);
         self.metrics.verdict_cells_carried.inc_by(carried as f64);
         self.metrics.verdict_cells_changed.inc_by(changed as f64);
+    }
+
+    fn record_verdict_differed(&self, rows: usize) {
+        self.metrics.verdict_differed.inc_by(rows as f64);
     }
 
     fn record_verdict_claims_weight(&self, named: usize, carried: usize, changed: usize) {

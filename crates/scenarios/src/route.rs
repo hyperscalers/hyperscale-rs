@@ -4425,7 +4425,7 @@ impl RowCounts {
                 RowState::InFlight { .. } => counts.in_flight += 1,
                 RowState::Stated { .. } => counts.stated += 1,
                 RowState::Released { .. } => counts.released += 1,
-                RowState::Accepted => counts.accepted += 1,
+                RowState::Accepted { .. } => counts.accepted += 1,
             }
             let aborted = matches!(
                 row,

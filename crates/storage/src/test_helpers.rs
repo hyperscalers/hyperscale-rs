@@ -6749,7 +6749,7 @@ pub fn yes_receipt(tx: TxHash, hash: GlobalReceiptHash) -> StoredReceipt {
             receipt_hash: hash,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
-            effects: None,
+            effects: Some(stub_effects()),
             events: Capped::empty(),
         }),
     )
@@ -6901,7 +6901,8 @@ pub fn test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives<S: TestStore 
     };
 
     let stated = claim_at(2, stated_root);
-    let as_the_reader_derives_it = VerdictLeaf::yes(tx, &Capped::from_array([writer]), reader);
+    let as_the_reader_derives_it =
+        VerdictLeaf::yes(tx, &Capped::from_array([writer]), reader, stub_effects());
     assert_eq!(
         stated.reading(leaf),
         Some(Inclusion::Present(verdict_hash(

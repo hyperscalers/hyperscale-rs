@@ -153,7 +153,7 @@ use hyperscale_metrics::{
     record_accepted_rows_toward_a_sibling, record_blocks_from_stated_to_heard,
     record_claims_recarried, record_core_members_settled, record_eager_proposal,
     record_halt_recovery_offer_refused, record_state_claims_weight, record_verdict_cells,
-    record_verdict_claims_weight, set_standing_answers_by_lineage,
+    record_verdict_claims_weight, record_verdict_differed, set_standing_answers_by_lineage,
 };
 use hyperscale_storage::{
     CommittedProvisions, MemberIndex, MemberInputs, MemberSections, RecoveredState, RowState,
@@ -174,7 +174,7 @@ use hyperscale_types::{
     missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
-use tracing::{debug, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::admission::{
     Committed, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, StateClaimsFold,
@@ -7994,6 +7994,14 @@ impl ShardCoordinator {
             let [named, carried, changed] = spent.bytes;
             record_verdict_claims_weight(named, carried, changed);
         }
+        for tx in &heard.differed {
+            error!(
+                ?tx,
+                height = block.height().inner(),
+                "a sibling's yes differs from this shard's: the member refuses",
+            );
+        }
+        record_verdict_differed(heard.differed.len());
         for blocks in self.verdict_asks.heard(&heard.complete, block.height()) {
             record_blocks_from_stated_to_heard(blocks);
         }
@@ -8001,7 +8009,7 @@ impl ShardCoordinator {
             self.member_rows
                 .members
                 .values()
-                .filter(|row| row.state == RowState::Accepted)
+                .filter(|row| row.state.accepted())
                 .map(|row| (row.awaits.as_slice(), row.owes.total())),
         );
         record_accepted_rows_toward_a_sibling(accepted.most());
@@ -12671,7 +12679,7 @@ mod tests {
             .rows_voted_over(&departed, &committee, &block)
             .expect("the departed sibling's accept accepts the row")
             .expect("a block of member lines");
-        assert_eq!(rows.members[&tx.hash()].state, RowState::Accepted);
+        assert!(rows.members[&tx.hash()].state.accepted());
     }
 
     /// A voter that cannot judge a legs half's name, lacking the window
@@ -12846,10 +12854,7 @@ mod tests {
         ));
         let (state, schedule) = committed_through(from, chain.clone());
         for tx in txs {
-            assert_eq!(
-                state.member_rows().members[&tx.hash()].state,
-                RowState::Accepted
-            );
+            assert!(state.member_rows().members[&tx.hash()].state.accepted());
         }
         assert_eq!(
             state.member_rows(),

@@ -3630,6 +3630,15 @@
           "expr": "sum(rate(hyperscale_transactions_aborted_total[1m])) / count(count by (shard) (hyperscale_block_height))",
           "legendFormat": "Aborts/sec",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(hyperscale_verdict_differed_total[1m]))",
+          "legendFormat": "Verdicts differed/sec",
+          "refId": "B"
         }
       ],
       "title": "Aborted Transactions",

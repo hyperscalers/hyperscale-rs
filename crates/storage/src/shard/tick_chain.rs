@@ -1264,6 +1264,7 @@ mod tests {
     use std::sync::Mutex;
 
     use hyperscale_hbor::{Capped, to_vec};
+    use hyperscale_types::test_utils::stub_effects;
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, Deadline, DeclaredRange, EntryKey, GlobalReceiptHash,
         Hash, Joins, LocalKey, MemberCollection, Movement, Owes, ResourceAddr, Settlement,
@@ -3522,6 +3523,7 @@ mod tests {
         RowState::Stated {
             tick: BlockHeight::new(tick),
             receipt: GlobalReceiptHash::ZERO,
+            effects: stub_effects(),
         }
     }
 
@@ -3654,7 +3656,14 @@ mod tests {
     #[test]
     fn a_stated_hold_is_not_read_at_or_above_its_release() {
         let mut store = stated_at_three(tx(1));
-        writing(&mut store, 6, tx(1), Some(RowState::Accepted));
+        writing(
+            &mut store,
+            6,
+            tx(1),
+            Some(RowState::Accepted {
+                effects: stub_effects(),
+            }),
+        );
         let chain = TickChain::new(Arc::new(store));
         chain.seed_stated(&rows_stating(tx(1)));
         for tick in [3, 5] {
@@ -3710,7 +3719,14 @@ mod tests {
             BlockHeight::new(6),
             HashMap::from([(key(1), encode_amount(100 - RESERVED).to_vec())]),
         );
-        writing(&mut store, 6, tx(1), Some(RowState::Accepted));
+        writing(
+            &mut store,
+            6,
+            tx(1),
+            Some(RowState::Accepted {
+                effects: stub_effects(),
+            }),
+        );
         let chain = TickChain::new(Arc::new(store));
         chain.append(BlockHeight::new(2), leg(tx(1)), &[]);
         chain.raise_floor(BlockHeight::new(4), SHARD);

@@ -36,7 +36,7 @@ use hyperscale_types::{
 };
 
 use super::chain_reader::ShardChainReader;
-use super::members::{MemberIndex, RowState};
+use super::members::MemberIndex;
 use super::unresolved::REPLAY_REACH;
 use crate::Substates;
 
@@ -79,7 +79,7 @@ impl ChainHold {
     pub fn of(members: &MemberIndex) -> Self {
         let mut hold = Self::default();
         for row in members.members.values() {
-            if row.state == RowState::Accepted {
+            if row.state.accepted() {
                 continue;
             }
             hold.bodies.insert(row.tx);
@@ -227,11 +227,12 @@ fn first_dated_from<R: ShardChainReader + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::test_utils::stub_stated_terms;
+    use hyperscale_types::test_utils::{stub_effects, stub_stated_terms};
     use hyperscale_types::{Deadline, GlobalReceiptHash, Hash};
 
     use super::*;
     use crate::MemberInputs;
+    use crate::shard::members::RowState;
 
     /// A standing row holds its body and the rows at its height and the
     /// one above, whose header pins the QC certifying it; and an index
@@ -279,13 +280,15 @@ mod tests {
         let standing = |members: &mut MemberIndex, seed: u8, state: RowState| {
             members.members.get_mut(&tx(seed)).expect("a row").state = state;
         };
-        standing(&mut members, 1, RowState::Accepted);
+        let effects = stub_effects();
+        standing(&mut members, 1, RowState::Accepted { effects });
         standing(
             &mut members,
             2,
             RowState::Stated {
                 tick: BlockHeight::new(8),
                 receipt: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
+                effects,
             },
         );
 

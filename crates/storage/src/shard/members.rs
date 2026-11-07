@@ -64,8 +64,8 @@ use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Anchor, Block, BlockHeight, CollectionId,
-    ConsensusReceipt, Crossings, Deadline, DiscardCause, EntryKey, EntryLeaf, EpochWindows,
-    Finalization, GlobalReceiptHash, Hash, Heard, Hearing, Holds, Inclusion, Joins,
+    ConsensusReceipt, Crossings, Deadline, DiscardCause, EffectsDigest, EntryKey, EntryLeaf,
+    EpochWindows, Finalization, GlobalReceiptHash, Hash, Heard, Hearing, Holds, Inclusion, Joins,
     MAX_PREFIXES_PER_TX, MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection,
     MemberFamily, MemberTerms, Modes, Movement, Owes, Pin, PinClass, PinKey, Pins, Reach, ReadMark,
     RecoveryBand, RecoveryBands, Reserves, Said, SettledEntries, Settlement, ShardId, ShardTrie,
@@ -109,6 +109,9 @@ pub enum RowState {
         tick: BlockHeight,
         /// The receipt hash the tick's certificate attests for it.
         receipt: GlobalReceiptHash,
+        /// The digest its yes states: what a sibling's yes is read
+        /// against, and what the row's own yes says.
+        effects: EffectsDigest,
     },
     /// Let go and not yet ended: by a discard of the tick that held it,
     /// or by a finalization naming it beside no place of its own while
@@ -121,7 +124,11 @@ pub enum RowState {
     /// Settled by a legs half that applied its effects, and standing so
     /// that a sibling still deciding can read the accept. In no tick,
     /// holding and reserving nothing; a [`TickLine::End`] deletes it.
-    Accepted,
+    Accepted {
+        /// The digest it stated. It still reads a sibling's yes, and the
+        /// accept deleted the staged receipt.
+        effects: EffectsDigest,
+    },
 }
 
 impl RowState {
@@ -150,7 +157,7 @@ impl RowState {
                 settlement,
             } => Some((tick, joins, settlement)),
             Self::Stated { tick, .. } => Some((tick, Joins::Executes, Settlement::Shared)),
-            Self::Pending | Self::Released { .. } | Self::Accepted => None,
+            Self::Pending | Self::Released { .. } | Self::Accepted { .. } => None,
         }
     }
 
@@ -158,19 +165,29 @@ impl RowState {
     /// accepted, and what they say decides what ends it.
     #[must_use]
     pub const fn hears(self) -> bool {
-        matches!(self, Self::Stated { .. } | Self::Accepted)
+        self.effects().is_some()
+    }
+
+    /// The digest a row that hears reads its siblings' yeses against.
+    #[must_use]
+    pub const fn effects(self) -> Option<EffectsDigest> {
+        match self {
+            Self::Stated { effects, .. } | Self::Accepted { effects } => Some(effects),
+            Self::Pending | Self::InFlight { .. } | Self::Released { .. } => None,
+        }
+    }
+
+    /// Whether a legs half has settled it accepted.
+    #[must_use]
+    pub const fn accepted(self) -> bool {
+        matches!(self, Self::Accepted { .. })
     }
 
     /// Whether a [`TickLine::End`] deletes a row standing so: an accepted
     /// row and no other. A row waiting, held, stated or let go leaves by
     /// a finalization or a fate, whatever line names it.
     const fn ended_by_a_line(self) -> bool {
-        match self {
-            Self::Accepted => true,
-            Self::Pending | Self::InFlight { .. } | Self::Stated { .. } | Self::Released { .. } => {
-                false
-            }
-        }
+        self.accepted()
     }
 }
 
@@ -194,7 +211,11 @@ fn shared_among(awaits: &Reach, shard: ShardId) -> Awaited {
 ///
 /// It names the transaction and every shard the verdict is shared among,
 /// the writer included, so two siblings that await each other encode one
-/// value for one transaction and a reader hashes it from its own row.
+/// value for one transaction and a reader hashes it from its own row. A
+/// yes names the writer's digest too, so a reader hashes it from its own
+/// and finds any other run's yes a leaving. An accept does not: within a
+/// chain it implies every sibling stated the acceptor's digest, so a
+/// digest there would tell a reader nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub(crate) enum VerdictLeaf {
     /// This shard's certificate succeeded for the member, and its
@@ -204,6 +225,8 @@ pub(crate) enum VerdictLeaf {
         tx: TxHash,
         /// The shards the verdict is shared among.
         awaited: Awaited,
+        /// The digest of the run this shard certified.
+        effects: EffectsDigest,
     },
     /// This shard applied the member's effects, and a sibling may still
     /// ask whether it did.
@@ -216,11 +239,13 @@ pub(crate) enum VerdictLeaf {
 }
 
 impl VerdictLeaf {
-    /// The yes of `shard` for `tx`, shared among `shard` and `awaits`.
-    pub(crate) fn yes(tx: TxHash, awaits: &Reach, shard: ShardId) -> Self {
+    /// The yes of `shard` for `tx`, shared among `shard` and `awaits`,
+    /// stating `effects`.
+    pub(crate) fn yes(tx: TxHash, awaits: &Reach, shard: ShardId, effects: EffectsDigest) -> Self {
         Self::Yes {
             tx,
             awaited: shared_among(awaits, shard),
+            effects,
         }
     }
 
@@ -341,6 +366,12 @@ pub struct HeardCells {
     /// The rows a reading of the block changed that then hold a reading
     /// of every sibling they await.
     pub complete: BTreeSet<TxHash>,
+    /// The rows that took a reading of a verdict leaf holding neither of
+    /// the values the row would hash: a sibling's yes over other effects
+    /// or among other shards. A reader sees only a hash, so this names
+    /// what is known and no more. A row the block's own lines take out
+    /// of hearing is among them, on the terms it stood under.
+    pub differed: BTreeSet<TxHash>,
 }
 
 impl HeardCells {
@@ -431,6 +462,7 @@ fn sibling_said(
     tx: TxHash,
     validity_end: WeightedTimestamp,
     awaited: &Awaited,
+    effects: EffectsDigest,
 ) -> Option<(ReadMark, Option<Said>)> {
     let sibling = at.anchor.shard;
     let leaf = *at.cells.get(&verdict_leaf(sibling, tx))?;
@@ -442,19 +474,26 @@ fn sibling_said(
                 .get(&committed_tx_cell_key(sibling, tx, validity_end)),
         )
         .map(|(row, marker)| (*row, *marker));
-    let (yes, accepted) = sibling_hashes(sibling, tx, awaited);
+    let (yes, accepted) = sibling_hashes(sibling, tx, awaited, effects);
     let said = said_at(leaf, beside, at.anchor.ts, validity_end, yes, accepted)?;
     Some((at.mark, said))
 }
 
 /// The value hashes `sibling`'s verdict cell for `tx` holds where it
-/// says yes and where it says accepted, among the shards `awaited`.
-fn sibling_hashes(sibling: ShardId, tx: TxHash, awaited: &Awaited) -> (Hash, Hash) {
+/// says yes over `effects` and where it says accepted, among the shards
+/// `awaited`.
+fn sibling_hashes(
+    sibling: ShardId,
+    tx: TxHash,
+    awaited: &Awaited,
+    effects: EffectsDigest,
+) -> (Hash, Hash) {
     let hash = |leaf: VerdictLeaf| Hash::from_hash_bytes(&verdict_hash(sibling, tx, &leaf));
     (
         hash(VerdictLeaf::Yes {
             tx,
             awaited: awaited.clone(),
+            effects,
         }),
         hash(VerdictLeaf::Accepted {
             tx,
@@ -466,10 +505,10 @@ fn sibling_hashes(sibling: ShardId, tx: TxHash, awaited: &Awaited) -> (Hash, Has
 /// The questions a shard's hearing rows put to their siblings, with the
 /// two hashes each is read by kept from one derivation to the next.
 ///
-/// A question's hashes turn only on the transaction, the sibling and the
-/// shards the row shares its verdict with, so they are derived when the
-/// question first stands and reused while the row awaits the same
-/// shards. The kept hashes are replaced whole at every derivation, so
+/// A question's hashes turn only on the transaction, the sibling, the
+/// shards the row shares its verdict with and the digest it stated, so
+/// they are derived when the question first stands and reused while the
+/// row awaits the same shards under the same digest. The kept hashes are replaced whole at every derivation, so
 /// they number the questions the last one found: at most one per sibling
 /// a hearing row awaits.
 ///
@@ -480,7 +519,7 @@ fn sibling_hashes(sibling: ShardId, tx: TxHash, awaited: &Awaited) -> (Hash, Has
 /// Observability only.
 #[derive(Debug, Default)]
 pub struct VerdictAsks {
-    kept: BTreeMap<(TxHash, ShardId), (Reach, Hash, Hash)>,
+    kept: BTreeMap<(TxHash, ShardId), (Reach, EffectsDigest, Hash, Hash)>,
     seen: BTreeMap<TxHash, (BlockHeight, bool)>,
 }
 
@@ -513,7 +552,10 @@ impl VerdictAsks {
         let mut seen = BTreeMap::new();
         let mut questions = Vec::new();
         let mut waited = Vec::new();
-        for row in rows.members.values().filter(|row| row.state.hears()) {
+        for row in rows.members.values() {
+            let Some(effects) = row.state.effects() else {
+                continue;
+            };
             let (since, mut reported) = self.seen.get(&row.tx).copied().unwrap_or((tip, false));
             let heard_all = row
                 .awaits
@@ -535,10 +577,17 @@ impl VerdictAsks {
                 };
                 let key = (row.tx, sibling);
                 let (yes, accepted) = match self.kept.get(&key) {
-                    Some((awaits, yes, accepted)) if *awaits == row.awaits => (*yes, *accepted),
-                    _ => sibling_hashes(sibling, row.tx, &shared_among(&row.awaits, shard)),
+                    Some((awaits, held, yes, accepted))
+                        if *awaits == row.awaits && *held == effects =>
+                    {
+                        (*yes, *accepted)
+                    }
+                    _ => {
+                        let awaited = shared_among(&row.awaits, shard);
+                        sibling_hashes(sibling, row.tx, &awaited, effects)
+                    }
                 };
-                kept.insert(key, (row.awaits.clone(), yes, accepted));
+                kept.insert(key, (row.awaits.clone(), effects, yes, accepted));
                 questions.push(VerdictQuestion {
                     sibling,
                     tx: row.tx,
@@ -784,8 +833,10 @@ impl MemberRow {
     /// and none in any other state.
     fn verdict(&self, shard: ShardId) -> Option<VerdictLeaf> {
         match self.state {
-            RowState::Stated { .. } => Some(VerdictLeaf::yes(self.tx, &self.awaits, shard)),
-            RowState::Accepted => Some(VerdictLeaf::accepted(self.tx, &self.awaits, shard)),
+            RowState::Stated { effects, .. } => {
+                Some(VerdictLeaf::yes(self.tx, &self.awaits, shard, effects))
+            }
+            RowState::Accepted { .. } => Some(VerdictLeaf::accepted(self.tx, &self.awaits, shard)),
             RowState::Pending | RowState::InFlight { .. } | RowState::Released { .. } => None,
         }
     }
@@ -1225,6 +1276,15 @@ struct WaiterModes {
 
 /// The family as the fold changes it: each row read at most once, and
 /// written back only where it changed.
+/// What a sibling's cells said to a row, and the row's terms it was
+/// hashed under.
+struct Reading {
+    effects: EffectsDigest,
+    awaited: Awaited,
+    mark: ReadMark,
+    said: Option<Said>,
+}
+
 struct Working<'s, S: ?Sized> {
     state: &'s S,
     shard: ShardId,
@@ -1233,6 +1293,10 @@ struct Working<'s, S: ?Sized> {
     /// Each row read, as the state held it: what a changed row's seat
     /// and reservations are written against.
     read: BTreeMap<u128, Option<MemberRow>>,
+    /// What each reading of the block said to the row it names, by the
+    /// reading's anchor and transaction, as [`Self::differing`] judged it
+    /// over the rows the block found.
+    readings: BTreeMap<(usize, TxHash), Reading>,
     ticks: BTreeMap<BlockHeight, Option<TickRow>>,
     changed_members: BTreeSet<u128>,
     changed_ticks: BTreeSet<BlockHeight>,
@@ -1267,6 +1331,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             family,
             members: BTreeMap::new(),
             read: BTreeMap::new(),
+            readings: BTreeMap::new(),
             ticks: BTreeMap::new(),
             changed_members: BTreeSet::new(),
             changed_ticks: BTreeSet::new(),
@@ -1956,9 +2021,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// only at a strictly higher mark, so the anchors of one block may
     /// be taken in any order, and a second fold of the block finds
     /// every reading already held.
+    ///
+    /// A reading [`Self::differing`] already judged under the row's own
+    /// terms is taken as it stands, so nothing is hashed twice.
     fn hear(&mut self, heard: &[AnchorReadings]) -> HeardCells {
         let mut cells = HeardCells::default();
-        for at in heard {
+        for (index, at) in heard.iter().enumerate() {
             let sibling = at.anchor.shard;
             if sibling == self.shard {
                 continue;
@@ -1967,12 +2035,21 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 let Some(mut row) = self.member(tx) else {
                     continue;
                 };
-                if !row.state.hears() || !row.awaits.contains(&sibling) {
+                let Some(effects) = row.state.effects() else {
+                    continue;
+                };
+                if !row.awaits.contains(&sibling) {
                     continue;
                 }
                 let validity_end = row.deadline.validity_end();
+                let awaited = shared_among(&row.awaits, self.shard);
+                let judged = self
+                    .readings
+                    .get(&(index, tx))
+                    .filter(|reading| reading.effects == effects && reading.awaited == awaited)
+                    .map(|reading| (reading.mark, reading.said));
                 let Some((mark, said)) =
-                    sibling_said(at, tx, validity_end, &shared_among(&row.awaits, self.shard))
+                    judged.or_else(|| sibling_said(at, tx, validity_end, &awaited, effects))
                 else {
                     continue;
                 };
@@ -1997,6 +2074,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     said,
                 }) {
                     cells.changed.entry(at.anchor).or_default().extend(read);
+                    if said == Some(Said::Left)
+                        && matches!(at.cells.get(&leaf), Some(Inclusion::Present(_)))
+                    {
+                        cells.differed.insert(tx);
+                    }
                     let every = row
                         .awaits
                         .iter()
@@ -2009,6 +2091,66 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             }
         }
         cells
+    }
+
+    /// The rows the block's readings tell of a sibling holding neither
+    /// value the row would hash, judged on each row as the block found
+    /// it. A line of the block can take a row out of hearing on the very
+    /// reading that licenses it, and [`Self::hear`] runs after the lines,
+    /// so a row is counted here or the alarm misses the commonest
+    /// refusal. Moves no row: what it keeps is what `hear` would derive.
+    ///
+    /// A reading counts where the row would take it, so a copy of one an
+    /// earlier block committed repeats nothing.
+    fn differing(&mut self, heard: &[AnchorReadings]) -> BTreeSet<TxHash> {
+        let mut differed = BTreeSet::new();
+        for (index, at) in heard.iter().enumerate() {
+            let sibling = at.anchor.shard;
+            if sibling == self.shard {
+                continue;
+            }
+            for &tx in &at.names {
+                let Some(mut row) = self.stored(tx).filter(|row| row.tx == tx) else {
+                    continue;
+                };
+                let Some(effects) = row.state.effects() else {
+                    continue;
+                };
+                if !row.awaits.contains(&sibling) {
+                    continue;
+                }
+                let validity_end = row.deadline.validity_end();
+                let awaited = shared_among(&row.awaits, self.shard);
+                let Some((mark, said)) = sibling_said(at, tx, validity_end, &awaited, effects)
+                else {
+                    continue;
+                };
+                let present = matches!(
+                    at.cells.get(&verdict_leaf(sibling, tx)),
+                    Some(Inclusion::Present(_))
+                );
+                if said == Some(Said::Left)
+                    && present
+                    && row.hear(Heard {
+                        shard: sibling,
+                        mark,
+                        said,
+                    })
+                {
+                    differed.insert(tx);
+                }
+                self.readings.insert(
+                    (index, tx),
+                    Reading {
+                        effects,
+                        awaited,
+                        mark,
+                        said,
+                    },
+                );
+            }
+        }
+        differed
     }
 
     /// A finalization deletes the rows of the members it settles, an
@@ -2063,9 +2205,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             if !shared_here {
                 continue;
             }
+            // A root is checked before a block's sections are, so a half
+            // that carries no digest reaches here and fails validation.
             row.state = RowState::Stated {
                 tick: height,
                 receipt: yes.consensus.receipt_hash(),
+                effects: yes.consensus.effects().unwrap_or(EffectsDigest::ZERO),
             };
             row.share = 0;
             self.staged
@@ -2098,10 +2243,13 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             let Some(mut row) = self.member(tx) else {
                 continue;
             };
-            if !matches!(row.state, RowState::Stated { tick, .. } if tick == height) {
+            let RowState::Stated { tick, effects, .. } = row.state else {
+                continue;
+            };
+            if tick != height {
                 continue;
             }
-            row.state = RowState::Accepted;
+            row.state = RowState::Accepted { effects };
             row.holds = Capped::empty();
             row.reserves = Capped::empty();
             row.crossings = Capped::empty();
@@ -2773,6 +2921,7 @@ fn fold(
             .collect();
         family.every_tick_pins = true;
     }
+    let differed = family.differing(&inputs.heard);
     for line in inputs.manifest.iter() {
         if let TickLine::Recovered { bands } = line {
             family.orphan(bands, inputs.height);
@@ -2830,7 +2979,8 @@ fn fold(
     if pass == Pass::Block {
         family.wait(inputs, &unshared);
     }
-    let heard = family.hear(&inputs.heard);
+    let mut heard = family.hear(&inputs.heard);
+    heard.differed.extend(differed);
 
     let (mut fated, mut ended) = (Vec::new(), Vec::new());
     for line in inputs.manifest.iter() {
@@ -2995,7 +3145,7 @@ fn leaf_changes(
             continue;
         }
         let deleted = now.is_none();
-        let Some(VerdictLeaf::Yes { tx, awaited } | VerdictLeaf::Accepted { tx, awaited }) =
+        let Some(VerdictLeaf::Yes { tx, awaited, .. } | VerdictLeaf::Accepted { tx, awaited }) =
             leaf_entry(now.or(was))
         else {
             continue;
@@ -3177,7 +3327,7 @@ impl MemberIndex {
     pub fn lowest_committed(&self) -> Option<BlockHeight> {
         self.members
             .values()
-            .filter(|row| row.state != RowState::Accepted)
+            .filter(|row| !row.state.accepted())
             .map(|row| row.height)
             .min()
     }
@@ -3496,7 +3646,8 @@ mod tests {
 
     use hyperscale_jmt::{Blake3Hasher, Key as JmtKey, LeafValue, MemoryStore, NodeKey, Tree};
     use hyperscale_types::test_utils::{
-        StubTree, make_live_block, stub_abort_charge, stub_stated_terms, test_key, test_transaction,
+        StubTree, effects_of_seed, make_live_block, stub_abort_charge, stub_effects,
+        stub_stated_terms, test_key, test_transaction,
     };
     use hyperscale_types::{
         AddressClass, ConsensusReceipt, Decision, Declared, Derivation, DerivationError, Derived,
@@ -3753,6 +3904,27 @@ mod tests {
             .cloned()
     }
 
+    /// `row`'s leaf, which names the transaction, both shards and the
+    /// digest, so the sibling encodes the same value from its own row.
+    fn the_leaf_a_sibling_derives(store: &Entries, row: &MemberRow) -> VerdictLeaf {
+        let ours = VerdictLeaf::yes(tx(1), &row.awaits, LOCAL, stub_effects());
+        assert_eq!(
+            ours,
+            VerdictLeaf::Yes {
+                tx: tx(1),
+                awaited: Capped::from_array([LOCAL, PEER]),
+                effects: stub_effects(),
+            },
+        );
+        assert_eq!(leaf_of(store, 1), Some(to_vec(&ours).unwrap()));
+        assert_eq!(
+            VerdictLeaf::yes(tx(1), &Capped::from_array([LOCAL]), PEER, stub_effects()),
+            ours,
+            "the sibling derives the value from what its own row awaits",
+        );
+        ours
+    }
+
     /// A stating half moves the member it states a yes for to `Stated`
     /// under the receipt hash it attests, zeroes its share, keeps its
     /// seat and writes its leaf; the member it refuses is deleted. The
@@ -3779,6 +3951,7 @@ mod tests {
             RowState::Stated {
                 tick: BlockHeight::new(2),
                 receipt: effects(1),
+                effects: stub_effects(),
             },
         );
         assert_eq!(row.share, 0, "the stating half counted it");
@@ -3794,20 +3967,7 @@ mod tests {
             Some(RowState::InFlight { .. })
         ));
 
-        let ours = VerdictLeaf::yes(tx(1), &row.awaits, LOCAL);
-        assert_eq!(
-            ours,
-            VerdictLeaf::Yes {
-                tx: tx(1),
-                awaited: Capped::from_array([LOCAL, PEER]),
-            },
-        );
-        assert_eq!(leaf_of(&store, 1), Some(to_vec(&ours).unwrap()));
-        assert_eq!(
-            VerdictLeaf::yes(tx(1), &Capped::from_array([LOCAL]), PEER),
-            ours,
-            "the sibling derives the value from what its own row awaits",
-        );
+        let ours = the_leaf_a_sibling_derives(&store, &row);
         let tick = &MemberIndex::load(&store, LOCAL).ticks[&BlockHeight::new(2)];
         assert!(
             tick.determined_unsettled && tick.awaiting == 1,
@@ -4042,7 +4202,7 @@ mod tests {
         store.fold(&accepting(4, 2, &[1]));
 
         let row = row_of(&store, 1).expect("an accepted row stands");
-        assert_eq!(row.state, RowState::Accepted);
+        assert!(row.state.accepted());
         assert!(row.holds.is_empty() && row.reserves.is_empty() && row.crossings.is_empty());
         assert_eq!(
             (row.awaits.clone(), row.charge),
@@ -4178,7 +4338,7 @@ mod tests {
         );
 
         store.fold(&accepting(7, 2, &[1]));
-        assert_eq!(state_of(&store, 1), Some(RowState::Accepted));
+        assert!(state_of(&store, 1).is_some_and(RowState::accepted));
         assert!(
             staged_in(&store).is_empty(),
             "the accept deletes the staged yes"
@@ -4212,7 +4372,7 @@ mod tests {
 
         let block = accepting(8, 2, &[1, 2, 3, 4, 5, 6]);
         store.fold(&block);
-        assert_eq!(state_of(&store, 1), Some(RowState::Accepted));
+        assert!(state_of(&store, 1).is_some_and(RowState::accepted));
         let after: Vec<Option<MemberRow>> = (2..=5).map(|seed| row_of(&store, seed)).collect();
         assert_eq!(after, before);
         assert!(member_writes(&store, &block).is_empty());
@@ -4236,7 +4396,7 @@ mod tests {
         store.fold(&naming(2, vec![sharing(1, 7), sharing(2, 9)]));
 
         let awaited = shared_among(&Capped::from_array([LOCAL]), PEER);
-        let (yes, accepted) = sibling_hashes(LOCAL, tx(1), &awaited);
+        let (yes, accepted) = sibling_hashes(LOCAL, tx(1), &awaited, stub_effects());
         let live = SiblingView {
             epoch: Epoch::new(0),
             recovery: Ok(None),
@@ -4335,7 +4495,7 @@ mod tests {
         let early = WeightedTimestamp::from_millis(5_000);
 
         let peers_awaited = shared_among(&Capped::from_array([LOCAL]), PEER);
-        let (yes, accepted) = sibling_hashes(LOCAL, tx(1), &peers_awaited);
+        let (yes, accepted) = sibling_hashes(LOCAL, tx(1), &peers_awaited, stub_effects());
         let held = verdict_hash(
             LOCAL,
             tx(1),
@@ -4416,7 +4576,7 @@ mod tests {
             )
         };
         assert!(member_writes(&store, &running).is_empty());
-        assert_eq!(state_of(&store, 1), Some(RowState::Accepted));
+        assert!(state_of(&store, 1).is_some_and(RowState::accepted));
     }
 
     /// An accepted row is a row standing, so the drain, which is the
@@ -4959,7 +5119,7 @@ mod tests {
             )
         ));
         assert!(matches!(state_of(&store, 4), Some(RowState::Stated { .. })));
-        assert_eq!(state_of(&store, 5), Some(RowState::Accepted));
+        assert!(state_of(&store, 5).is_some_and(RowState::accepted));
         assert!(matches!(
             state_of(&store, 6),
             Some(RowState::Released { .. })
@@ -4970,7 +5130,7 @@ mod tests {
             .members
             .values()
             .map(|row| match row.state {
-                RowState::Accepted => TickLine::End { tx: row.tx },
+                RowState::Accepted { .. } => TickLine::End { tx: row.tx },
                 _ => TickLine::Fate {
                     tx: row.tx,
                     charge: row.charge,
@@ -5093,7 +5253,7 @@ mod tests {
         store.fold(&stating(3, 2, &[], &[2]));
         assert!(matches!(state_of(&store, 2), Some(RowState::Stated { .. })));
         store.fold(&accepting(4, 2, &[2]));
-        assert_eq!(state_of(&store, 2), Some(RowState::Accepted));
+        assert!(state_of(&store, 2).is_some_and(RowState::accepted));
         store.fold(&naming(
             5,
             vec![TickLine::Fate {
@@ -5103,7 +5263,9 @@ mod tests {
         ));
         assert_eq!(
             state_of(&store, 2),
-            Some(RowState::Accepted),
+            Some(RowState::Accepted {
+                effects: stub_effects()
+            }),
             "a fate leaves an accepted row, whose writes have landed, to its end",
         );
         store.fold(&naming(6, vec![TickLine::End { tx: tx(2) }]));
@@ -5508,7 +5670,7 @@ mod tests {
         assert_eq!(stated.owes, owed, "a stated yes lands nothing");
         store.fold(&accepting(4, 2, &[1]));
         let accepted = row_of(&store, 1).expect("accepted");
-        assert_eq!(accepted.state, RowState::Accepted);
+        assert!(accepted.state.accepted());
         assert!(accepted.owes.is_empty(), "its writes landed");
 
         let mut store = stated_beside_peer();
@@ -6141,7 +6303,7 @@ mod tests {
     /// The hash [`PEER`]'s own fold leaves at `seed`'s verdict cell for
     /// a yes shared with [`LOCAL`], derived as the writer derives it.
     fn peers_yes(seed: u8) -> Inclusion {
-        let leaf = VerdictLeaf::yes(tx(seed), &Capped::from_array([LOCAL]), PEER);
+        let leaf = VerdictLeaf::yes(tx(seed), &Capped::from_array([LOCAL]), PEER, stub_effects());
         Inclusion::Present(verdict_hash(PEER, tx(seed), &leaf))
     }
 
@@ -6196,6 +6358,365 @@ mod tests {
         );
     }
 
+    /// A block stating `seed`'s yes over `effects` in the tick at `tick`.
+    fn stating_over(height: u64, tick: u64, seed: u8, effects: EffectsDigest) -> MemberInputs {
+        let hash = self::effects(seed);
+        MemberInputs {
+            height: BlockHeight::new(height),
+            settled: vec![SettledHalf {
+                tick: TickId::new(LOCAL, BlockHeight::new(tick)),
+                half: TickHalf::Stated,
+                deleted: Vec::new(),
+                stated: vec![StoredReceipt::new(
+                    tx(seed),
+                    Arc::new(ConsensusReceipt::Succeeded {
+                        receipt_hash: hash,
+                        writes: StateWrites::default(),
+                        beacon_witness_events: Capped::empty(),
+                        effects: Some(effects),
+                        events: Capped::empty(),
+                    }),
+                )],
+                accepted: Vec::new(),
+            }],
+            ..MemberInputs::still(LOCAL)
+        }
+    }
+
+    /// A store where `1` stands stated beside [`PEER`] over `effects`.
+    fn stated_over(effects: EffectsDigest) -> Entries {
+        let mut store = Entries::default();
+        store.fold(&committing_far(1, &[1]));
+        store.fold(&naming(2, vec![sharing(1, 7)]));
+        store.fold(&stating_over(3, 2, 1, effects));
+        store
+    }
+
+    /// The hash [`PEER`]'s yes for `1` holds where it ran to `effects`.
+    fn peers_yes_over(effects: EffectsDigest) -> Inclusion {
+        let leaf = VerdictLeaf::yes(tx(1), &Capped::from_array([LOCAL]), PEER, effects);
+        Inclusion::Present(verdict_hash(PEER, tx(1), &leaf))
+    }
+
+    /// The block carrying [`PEER`]'s yes for `1` over `effects`.
+    fn hearing_yes_over(height: u64, effects: EffectsDigest) -> MemberInputs {
+        let [leaf, ..] = cells_of(PEER, 1);
+        carrying(
+            height,
+            &[reading(at(7), &[(leaf, peers_yes_over(effects))], &[1])],
+        )
+    }
+
+    /// Two runs of one transaction state two digests: each row reads the
+    /// other's yes as a leaving, each is refused, and each goes by the
+    /// way any refused row does, its abort deleting the row and its leaf.
+    #[test]
+    fn two_rows_under_two_digests_each_refuse_the_other() {
+        use hyperscale_types::Hears;
+
+        let [one, other] = [effects_of_seed(1), effects_of_seed(2)];
+        let live = SiblingView {
+            epoch: Epoch::new(0),
+            recovery: Ok(None),
+            formed: Ok(None),
+        };
+        for (ours, theirs) in [(one, other), (other, one)] {
+            let mut store = stated_over(ours);
+            let row = row_of(&store, 1).expect("a stated row stands");
+            store.fold(&hearing_yes_over(4, theirs));
+            let heard = heard_by(&store, 1);
+            assert_eq!(heard, from_peer(mark(0, 7), Some(Said::Left)));
+            let value = value_of(heard.first(), Some(Source::Live), &live, row.committed);
+            assert_eq!(value, Value::L);
+            assert_eq!(decide(Hears::Stated, &[value]), Decision::Refuse);
+
+            store.fold(&naming(
+                5,
+                vec![
+                    TickLine::Member {
+                        staged: 0,
+                        tx: tx(1),
+                        joins: Joins::Aborted,
+                        settlement: Settlement::Awaited,
+                        holds: Capped::empty(),
+                        pins: Capped::empty(),
+                        reach: Capped::from_array([PEER]),
+                        awaits: Capped::empty(),
+                        charge: stub_abort_charge(1),
+                        share: 7,
+                        reserves: Capped::empty(),
+                        deadline: row.deadline,
+                        crossings: Capped::empty(),
+                        served_at: None,
+                    },
+                    TickLine::Discard {
+                        tick: TickId::new(LOCAL, BlockHeight::new(2)),
+                        cause: DiscardCause::Abandoned(tx(1)),
+                    },
+                ],
+            ));
+            store.fold(&stating(6, 5, &[1], &[]));
+            assert!(row_of(&store, 1).is_none() && leaf_of(&store, 1).is_none());
+        }
+    }
+
+    /// A row hearing a yes over its own digest reads yes, and over any
+    /// other reads a leaving. The hash names the digest, so nothing but
+    /// equality reaches the row.
+    #[test]
+    fn a_yes_reads_yes_over_the_readers_own_digest_alone() {
+        let [ours, theirs] = [effects_of_seed(1), effects_of_seed(2)];
+        let mut same = stated_over(ours);
+        same.fold(&hearing_yes_over(4, ours));
+        assert_eq!(heard_by(&same, 1), from_peer(mark(0, 7), Some(Said::Yes)));
+        let mut differing = stated_over(ours);
+        differing.fold(&hearing_yes_over(4, theirs));
+        assert_eq!(
+            heard_by(&differing, 1),
+            from_peer(mark(0, 7), Some(Said::Left))
+        );
+    }
+
+    /// An accept's leaf names no digest, so a row reads a sibling's
+    /// accept whatever it stated. Within a chain that sibling's accept
+    /// already needed this row's yes under its own digest, and past a
+    /// recovery the branch is the residual's.
+    #[test]
+    fn an_accept_reads_accepted_whatever_the_reader_stated() {
+        let [leaf, ..] = cells_of(PEER, 1);
+        let accepted = VerdictLeaf::accepted(tx(1), &Capped::from_array([LOCAL]), PEER);
+        for effects in [effects_of_seed(1), effects_of_seed(2)] {
+            let mut store = stated_over(effects);
+            let read = Inclusion::Present(verdict_hash(PEER, tx(1), &accepted));
+            store.fold(&carrying(4, &[reading(at(7), &[(leaf, read)], &[1])]));
+            assert_eq!(
+                heard_by(&store, 1),
+                from_peer(mark(0, 7), Some(Said::Accepted))
+            );
+        }
+    }
+
+    /// A row counts a differing leaf once, on the reading it takes. The
+    /// copy every later proposer carries changes nothing, and repeats no
+    /// alarm; a leaving read off an absent leaf is no difference at all.
+    #[test]
+    fn a_differing_leaf_is_counted_by_the_row_that_takes_it() {
+        let [ours, theirs] = [effects_of_seed(1), effects_of_seed(2)];
+        let store = stated_over(ours);
+        let mut index = MemberIndex::load(&store, LOCAL);
+        let heard = index.advance(&hearing_yes_over(4, theirs));
+        assert_eq!(heard.differed, BTreeSet::from([tx(1)]));
+
+        let copy = index.advance(&hearing_yes_over(5, theirs));
+        assert!(!copy.carried.is_empty(), "the copy is read");
+        assert!(copy.changed.is_empty() && copy.differed.is_empty());
+
+        let mut agreeing = MemberIndex::load(&store, LOCAL);
+        assert!(
+            agreeing
+                .advance(&hearing_yes_over(4, ours))
+                .differed
+                .is_empty()
+        );
+
+        let [leaf, row, marker] = cells_of(PEER, 1);
+        let mut left = MemberIndex::load(&store, LOCAL);
+        let gone = [
+            (leaf, Inclusion::Absent),
+            (row, Inclusion::Absent),
+            (marker, PRESENT),
+        ];
+        let heard = left.advance(&carrying(4, &[reading(at(7), &gone, &[1])]));
+        assert_eq!(left.members[&tx(1)].hearing[0].said, Some(Said::Left));
+        assert!(heard.differed.is_empty());
+    }
+
+    /// The block carrying a differing yes for `1` and the abort it
+    /// licenses, which takes the row out of hearing in the same fold.
+    fn refusing_as_it_reads(
+        height: u64,
+        theirs: EffectsDigest,
+        deadline: Deadline,
+    ) -> MemberInputs {
+        let [leaf, ..] = cells_of(PEER, 1);
+        let lines = vec![
+            TickLine::Member {
+                staged: 0,
+                tx: tx(1),
+                joins: Joins::Aborted,
+                settlement: Settlement::Awaited,
+                holds: Capped::empty(),
+                pins: Capped::empty(),
+                reach: Capped::from_array([PEER]),
+                awaits: Capped::empty(),
+                charge: stub_abort_charge(1),
+                share: 7,
+                reserves: Capped::empty(),
+                deadline,
+                crossings: Capped::empty(),
+                served_at: None,
+            },
+            TickLine::Discard {
+                tick: TickId::new(LOCAL, BlockHeight::new(2)),
+                cause: DiscardCause::Abandoned(tx(1)),
+            },
+        ];
+        let carried = [(leaf, peers_yes_over(theirs))];
+        MemberInputs {
+            heard: AnchorReadings::among(&[reading(at(7), &carried, &[1])], GRID),
+            ..naming(height, lines)
+        }
+    }
+
+    /// A block carrying a differing reading beside the abort it licenses
+    /// rings the alarm, though the abort leaves no row hearing by the
+    /// time the block's readings are taken. Every replica counts the row
+    /// once, and a later block carrying the reading again counts nothing.
+    #[test]
+    fn a_differing_reading_rings_in_the_block_that_aborts_on_it() {
+        let [ours, theirs] = [effects_of_seed(1), effects_of_seed(2)];
+        let store = stated_over(ours);
+        let deadline = row_of(&store, 1).expect("a stated row stands").deadline;
+        let block = refusing_as_it_reads(4, theirs, deadline);
+        let mut alarms = 0;
+        for _replica in 0..3 {
+            let mut index = MemberIndex::load(&store, LOCAL);
+            let heard = index.advance(&block);
+            assert_eq!(heard.differed, BTreeSet::from([tx(1)]));
+            assert!(
+                !index.members[&tx(1)].state.hears(),
+                "the abort took the row out of hearing",
+            );
+            alarms += heard.differed.len();
+
+            assert!(
+                index
+                    .advance(&hearing_yes_over(5, theirs))
+                    .differed
+                    .is_empty(),
+                "a later block carrying the reading rings nothing",
+            );
+        }
+        assert_eq!(alarms, 3, "once per row per replica");
+
+        let mut agreeing = MemberIndex::load(&store, LOCAL);
+        assert!(
+            agreeing
+                .advance(&refusing_as_it_reads(4, ours, deadline))
+                .differed
+                .is_empty(),
+            "a yes over the row's own digest rings nothing, whatever else the block does",
+        );
+    }
+
+    /// A row stated again under another digest asks by other hashes, and
+    /// its siblings' accept by the same one: the kept pair stands only
+    /// for the digest it was derived under.
+    #[test]
+    fn a_row_stated_under_another_digest_derives_new_hashes() {
+        let store = stated_over(effects_of_seed(1));
+        let mut rows = MemberIndex::load(&store, LOCAL);
+        let mut asks = VerdictAsks::default();
+        let first = asks
+            .questions(&rows, BlockHeight::new(5), |_, _, _| Some(true))
+            .questions;
+        let RowState::Stated { tick, receipt, .. } = rows.members[&tx(1)].state else {
+            unreachable!("the row stands stated");
+        };
+        rows.members.get_mut(&tx(1)).expect("a row").state = RowState::Stated {
+            tick,
+            receipt,
+            effects: effects_of_seed(2),
+        };
+        let second = asks
+            .questions(&rows, BlockHeight::new(6), |_, _, _| Some(true))
+            .questions;
+        assert_ne!(first[0].yes, second[0].yes);
+        assert_eq!(first[0].accepted, second[0].accepted);
+        let Inclusion::Present(yes) = peers_yes_over(effects_of_seed(2)) else {
+            unreachable!("a yes is a presence");
+        };
+        assert_eq!(second[0].yes, Hash::from_hash_bytes(&yes));
+    }
+
+    /// Where each of `digests.len()` shards states the digest beside it,
+    /// run every row on its siblings' leaves until none moves, and say
+    /// which accepted.
+    fn accepted_among(digests: &[EffectsDigest]) -> Vec<bool> {
+        use hyperscale_types::Hears;
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Standing {
+            Stated,
+            Accepted,
+            Refused,
+        }
+        let shards: Vec<ShardId> = (0..digests.len())
+            .map(|at| ShardId::leaf(3, at as u64))
+            .collect();
+        let awaited: Awaited = Capped::new(shards.clone()).expect("a few shards");
+        let clock = WeightedTimestamp::from_millis(1);
+        let mut standing = vec![Standing::Stated; digests.len()];
+        for _ in 0..=digests.len() {
+            let mut next = standing.clone();
+            for reader in (0..digests.len()).filter(|at| standing[*at] == Standing::Stated) {
+                let values: Vec<Value> = (0..digests.len())
+                    .filter(|sibling| *sibling != reader)
+                    .map(|sibling| {
+                        let shard = shards[sibling];
+                        let leaf = match standing[sibling] {
+                            Standing::Stated => VerdictLeaf::Yes {
+                                tx: tx(1),
+                                awaited: awaited.clone(),
+                                effects: digests[sibling],
+                            },
+                            Standing::Accepted => VerdictLeaf::Accepted {
+                                tx: tx(1),
+                                awaited: awaited.clone(),
+                            },
+                            Standing::Refused => return Value::L,
+                        };
+                        let held = Inclusion::Present(verdict_hash(shard, tx(1), &leaf));
+                        let (yes, accepted) =
+                            sibling_hashes(shard, tx(1), &awaited, digests[reader]);
+                        match said_at(held, None, clock, clock, yes, accepted) {
+                            Some(Some(Said::Yes)) => Value::Y,
+                            Some(Some(Said::Accepted)) => Value::A,
+                            _ => Value::L,
+                        }
+                    })
+                    .collect();
+                match decide(Hears::Stated, &values) {
+                    Decision::Accept => next[reader] = Standing::Accepted,
+                    Decision::Refuse => next[reader] = Standing::Refused,
+                    _ => {}
+                }
+            }
+            standing = next;
+        }
+        standing
+            .into_iter()
+            .map(|stands| stands == Standing::Accepted)
+            .collect()
+    }
+
+    proptest! {
+        /// Over any number of siblings and any digest each states, no row
+        /// accepts unless every digest is one, and where they are all
+        /// one every row does.
+        #[test]
+        fn no_row_accepts_unless_every_digest_is_equal(
+            seeds in vec(0u8..3, 2..7),
+        ) {
+            let digests: Vec<EffectsDigest> =
+                seeds.iter().map(|seed| effects_of_seed(*seed)).collect();
+            let accepted = accepted_among(&digests);
+            let one = digests.iter().all(|digest| *digest == digests[0]);
+            prop_assert_eq!(accepted.iter().any(|row| *row), one);
+            prop_assert_eq!(accepted.iter().all(|row| *row), one);
+        }
+    }
+
     /// The cell holding the accept for those shards reads accepted.
     #[test]
     fn the_accepted_hash_of_the_readers_awaited_set_reads_accepted() {
@@ -6228,6 +6749,7 @@ mod tests {
                 &VerdictLeaf::Yes {
                     tx: tx(1),
                     awaited: wider.clone(),
+                    effects: stub_effects(),
                 },
             ),
             verdict_hash(
@@ -6241,12 +6763,12 @@ mod tests {
             verdict_hash(
                 PEER,
                 tx(1),
-                &VerdictLeaf::yes(tx(9), &Capped::from_array([LOCAL]), PEER),
+                &VerdictLeaf::yes(tx(9), &Capped::from_array([LOCAL]), PEER, stub_effects()),
             ),
             verdict_hash(
                 LOCAL,
                 tx(1),
-                &VerdictLeaf::yes(tx(1), &Capped::from_array([LOCAL]), PEER),
+                &VerdictLeaf::yes(tx(1), &Capped::from_array([LOCAL]), PEER, stub_effects()),
             ),
             [0x5A; 32],
         ];
@@ -6461,7 +6983,12 @@ mod tests {
     fn a_name_with_no_hearing_row_moves_nothing() {
         let store = listening();
         let yes = |shard: ShardId, seed: u8| {
-            let leaf = VerdictLeaf::yes(tx(seed), &Capped::from_array([LOCAL]), shard);
+            let leaf = VerdictLeaf::yes(
+                tx(seed),
+                &Capped::from_array([LOCAL]),
+                shard,
+                stub_effects(),
+            );
             (
                 verdict_leaf(shard, tx(seed)),
                 Inclusion::Present(verdict_hash(shard, tx(seed), &leaf)),
@@ -6541,7 +7068,12 @@ mod tests {
             }],
         ));
         store.fold(&stating(3, 2, &[], &[1]));
-        let leaf = VerdictLeaf::yes(tx(1), &Capped::from_array([LOCAL, PEER]), LOCAL);
+        let leaf = VerdictLeaf::yes(
+            tx(1),
+            &Capped::from_array([LOCAL, PEER]),
+            LOCAL,
+            stub_effects(),
+        );
         let own = carrying(
             6,
             &[reading(
@@ -7765,7 +8297,7 @@ mod tests {
                 let mut ended = Entries(store.0.clone());
                 ended.fold(&ends);
                 let mut expected = rows.clone();
-                expected.members.retain(|_, row| row.state != RowState::Accepted);
+                expected.members.retain(|_, row| !row.state.accepted());
                 prop_assert_eq!(&MemberIndex::load(&ended, LOCAL), &expected, "after {:?}", step);
                 let accepted = rows.members.len() - expected.members.len();
                 prop_assert_eq!(
@@ -9062,12 +9594,12 @@ mod tests {
             store.fold(&carried(&first));
             store.fold(&stating(2, 1, &[], &[1]));
             store.fold(&accepting(3, 1, &[1]));
-            assert_eq!(row(&store, 1).state, RowState::Accepted);
+            assert!(row(&store, 1).state.accepted());
 
             let mut recommit = block(4);
             commit(&mut recommit, 1, terms(&Kind::Determined, &[write(A)]));
             store.fold(&recommit);
-            assert_eq!(row(&store, 1).state, RowState::Accepted);
+            assert!(row(&store, 1).state.accepted());
             assert_eq!(count(&store, MemberCollection::Waiters), 0);
             assert_eq!(row(&store, 2).blocked_at, None);
         }
@@ -9844,7 +10376,7 @@ mod tests {
                 let standing: Vec<&MemberRow> = rows
                     .members
                     .values()
-                    .filter(|row| row.state != RowState::Accepted)
+                    .filter(|row| !row.state.accepted())
                     .collect();
                 for pick in &step.fates {
                     if standing.is_empty() {
@@ -10342,7 +10874,7 @@ mod tests {
                             .map(|row| row.tx)
                             .collect()
                     };
-                    let unended = txs(&|row| row.state != RowState::Accepted);
+                    let unended = txs(&|row| !row.state.accepted());
                     for &at in &plan.fates {
                         if let Some(fated) = pick(&unended, at)
                             && touched.insert(fated)
@@ -10380,7 +10912,7 @@ mod tests {
                             manifest.push(abort_of(&self.terms[&aborted], aborted));
                         }
                     }
-                    let accepted = txs(&|row| row.state == RowState::Accepted);
+                    let accepted = txs(&|row| row.state.accepted());
                     for &at in &plan.ends {
                         if let Some(ended) = pick(&accepted, at)
                             && touched.insert(ended)
@@ -10717,7 +11249,7 @@ mod tests {
                         RowState::Pending => self.terms[&row.tx].settlement == Settlement::Shared,
                         RowState::InFlight { settlement, .. } => settlement != Settlement::Alone,
                         RowState::Stated { .. } => true,
-                        RowState::Released { .. } | RowState::Accepted => false,
+                        RowState::Released { .. } | RowState::Accepted { .. } => false,
                     };
                     standing
                         .then(|| self.places.get(&row.tx).copied())
@@ -11441,12 +11973,12 @@ mod tests {
             writes_within(
                 Shape::Shared,
                 &[
-                    ("Members", 5 * B, 1_355 * B),
+                    ("Members", 5 * B, 1_423 * B),
                     ("Queue", 6 * B, 147 * B),
                     ("Seats", 2 * B, 32 * B),
-                    ("Staged", 2 * B, 38 * B),
+                    ("Staged", 2 * B, 71 * B),
                     ticks[1],
-                    ("Verdicts", 3 * B, 116 * B),
+                    ("Verdicts", 3 * B, 148 * B),
                 ],
             );
             // A leg waits a block in `Waiters`, then holds in `Queue`

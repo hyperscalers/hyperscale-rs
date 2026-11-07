@@ -291,6 +291,12 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// included, in the same three counts.
     fn record_verdict_claims_weight(&self, named: usize, carried: usize, changed: usize) {}
 
+    /// Rows that took a reading of a verdict leaf holding neither value
+    /// they would hash: a sibling that stated another run's effects, or
+    /// a verdict among other shards. Each refuses. Outside a recovery
+    /// this is a defect, and worth a page.
+    fn record_verdict_differed(&self, rows: usize) {}
+
     /// Members a committed block's finalizations settled whose verdict a
     /// counterpart shares: what the verdict figures are read per.
     fn record_core_members_settled(&self, members: usize) {}
@@ -954,6 +960,12 @@ pub fn record_verdict_cells(named: usize, carried: usize, changed: usize) {
 #[inline]
 pub fn record_verdict_claims_weight(named: usize, carried: usize, changed: usize) {
     recorder().record_verdict_claims_weight(named, carried, changed);
+}
+
+/// Record the rows a committed block read a differing yes for.
+#[inline]
+pub fn record_verdict_differed(rows: usize) {
+    recorder().record_verdict_differed(rows);
 }
 
 /// Set the crossing answers standing under a shard's prefix.

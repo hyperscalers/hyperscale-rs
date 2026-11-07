@@ -863,7 +863,7 @@ fn names_its_rows(members: &MemberIndex, fw: &Finalization) -> Result<(), String
                 RowState::Pending
                 | RowState::InFlight { .. }
                 | RowState::Released { .. }
-                | RowState::Accepted => None,
+                | RowState::Accepted { .. } => None,
             });
         if stated != Some(named) {
             return Err(format!(
@@ -1083,7 +1083,7 @@ fn held_for(members: &MemberIndex, fw: &Finalization, tx_hash: TxHash) -> bool {
                 | RowState::InFlight { .. }
                 | RowState::Stated { .. }
                 | RowState::Released { .. }
-                | RowState::Accepted,
+                | RowState::Accepted { .. },
             ) => false,
         })
 }
@@ -1724,7 +1724,7 @@ pub(crate) mod fixtures {
 
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{MemberIndex, MemberRow, RowState, TickRow};
-    use hyperscale_types::test_utils::stub_abort_charge;
+    use hyperscale_types::test_utils::{stub_abort_charge, stub_effects};
     use hyperscale_types::{
         Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Deadline, Epoch, EpochWindows,
         Finalization, GlobalReceiptHash, Hash, Joins, NetworkDefinition, Owes, Settlement,
@@ -1764,6 +1764,7 @@ pub(crate) mod fixtures {
                         RowState::Stated {
                             tick,
                             receipt: GlobalReceiptHash::ZERO,
+                            effects: stub_effects(),
                         }
                     } else {
                         RowState::InFlight {
@@ -1956,7 +1957,8 @@ mod state_claim_tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::{MemberRow, RowState, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::test_utils::{
-        proven_claim, state_and_proof, state_and_proof_holding, stub_abort_charge, test_key,
+        proven_claim, state_and_proof, state_and_proof_holding, stub_abort_charge, stub_effects,
+        test_key,
     };
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, Deadline, Epoch, EpochWindows,
@@ -2692,6 +2694,7 @@ mod state_claim_tests {
             state: RowState::Stated {
                 tick: BlockHeight::new(1),
                 receipt: GlobalReceiptHash::ZERO,
+                effects: stub_effects(),
             },
             holds: Capped::empty(),
             reach: Capped::from_array([sibling]),

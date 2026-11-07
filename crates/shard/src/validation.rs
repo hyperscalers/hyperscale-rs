@@ -826,6 +826,7 @@ pub mod tests {
         RowState::Stated {
             tick: BlockHeight::new(tick),
             receipt: effects_hash(),
+            effects: stub_effects(),
         }
     }
 
@@ -1145,7 +1146,7 @@ pub mod tests {
         let stated = after_committing(holding_in_flight(&[member]), &[&stating]);
         assert_eq!(settles(&stated, &legs), Ok(()));
         let settled = after_committing(stated, &[&legs]);
-        assert_eq!(settled.members.members[&member].state, RowState::Accepted);
+        assert!(settled.members.members[&member].state.accepted());
         assert!(settled.members.ticks.is_empty());
         let err = settles(&settled, &legs).unwrap_err();
         assert!(err.contains("does not hold for its Legs half"), "{err}");
@@ -2621,11 +2622,15 @@ pub mod tests {
                     RowState::Stated {
                         tick: BlockHeight::new(2),
                         receipt: GlobalReceiptHash::from_raw(Hash::from_bytes(b"yes")),
+                        effects: stub_effects(),
                     },
                 ),
             );
             assert!(!rows.quiet(), "{here:?} stated");
-            rows.members.insert(tx, member_row(tx, RowState::Accepted));
+            let accepted = RowState::Accepted {
+                effects: stub_effects(),
+            };
+            rows.members.insert(tx, member_row(tx, accepted));
             assert!(!rows.quiet(), "{here:?} accepted");
             rows.members.remove(&tx);
             assert!(rows.quiet(), "{here:?} ended");
@@ -4387,6 +4392,7 @@ pub mod tests {
                 RowState::Stated {
                     tick: BlockHeight::new(5),
                     receipt,
+                    effects: stub_effects(),
                 },
             ),
         );

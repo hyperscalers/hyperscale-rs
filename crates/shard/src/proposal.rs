@@ -1639,7 +1639,7 @@ mod tests {
     use hyperscale_storage::{MemberRow, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::test_utils::{
         finalization_of, install_stub_protocol_statics, make_finalization, make_finalization_on,
-        make_leg_finalization, proven_claim, stub_abort_charge, stub_transaction,
+        make_leg_finalization, proven_claim, stub_abort_charge, stub_effects, stub_transaction,
         stub_transaction_binding, test_key, test_prefix, test_principal,
     };
     use hyperscale_types::{
@@ -2388,6 +2388,7 @@ mod tests {
             state: RowState::Stated {
                 tick: BlockHeight::new(1),
                 receipt: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
+                effects: stub_effects(),
             },
             holds: Capped::empty(),
             reach: Capped::from_array([SIBLING]),
@@ -4214,12 +4215,16 @@ mod tests {
         let stated = proven_claim(SIBLING, 3, &leaves, &[mid]).hearing([mid_tx]);
         let rows = [
             MemberRow {
-                state: RowState::Accepted,
+                state: RowState::Accepted {
+                    effects: stub_effects(),
+                },
                 ..stated_row(low_tx, None)
             },
             stated_row(mid_tx, None),
             MemberRow {
-                state: RowState::Accepted,
+                state: RowState::Accepted {
+                    effects: stub_effects(),
+                },
                 ..stated_row(high_tx, None)
             },
         ];

@@ -444,6 +444,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("verdict_cells_changed", None, changed as u64);
     }
 
+    fn record_verdict_differed(&self, rows: usize) {
+        self.inc("verdict_differed", None, rows as u64);
+    }
+
     fn set_standing_answers(&self, shard: u64, answers: usize, bytes: usize) {
         let shard = shard.to_string();
         self.set("standing_answers", Some(&shard), answers as f64);

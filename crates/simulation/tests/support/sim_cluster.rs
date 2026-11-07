@@ -192,9 +192,17 @@ struct ServedParts {
 
 impl Drop for SimCluster {
     fn drop(&mut self) {
-        if let Some(tuning) = self.tuning.as_ref().filter(|_| thread::panicking()) {
-            eprintln!("swarm tuning ({SWARM_VAR}=1 replays it): {tuning:?}");
+        if thread::panicking() {
+            if let Some(tuning) = &self.tuning {
+                eprintln!("swarm tuning ({SWARM_VAR}=1 replays it): {tuning:?}");
+            }
+            return;
         }
+        assert_eq!(
+            self.recorder.counter("verdict_differed", None),
+            0,
+            "a row read a sibling's verdict leaf as neither value it would hash",
+        );
     }
 }
 
@@ -714,7 +722,8 @@ impl SimCluster {
         while self.runner.now() < deadline {
             self.topology_step();
             let next = (self.runner.now() + poll).min(deadline);
-            self.runner.run_until(next);
+            let recorder: Arc<dyn MetricsRecorder> = Arc::new(self.recorder.clone());
+            with_scoped_recorder(recorder, || self.runner.run_until(next));
             self.assert_beacon_cadence();
             self.assert_one_identity_per_host();
             self.hold_served_parts();

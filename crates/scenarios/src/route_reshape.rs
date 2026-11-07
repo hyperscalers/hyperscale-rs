@@ -4071,7 +4071,10 @@ fn assert_no_cut_while_unread<C: Cluster>(
     };
     let standing = row(c);
     assert!(
-        matches!(standing, Some(RowState::Stated { .. } | RowState::Accepted)),
+        matches!(
+            standing,
+            Some(RowState::Stated { .. } | RowState::Accepted { .. })
+        ),
         "{departing:?}'s row must hear a sibling when the wait starts; it stands {standing:?}",
     );
     let latched = Cell::new(false);
