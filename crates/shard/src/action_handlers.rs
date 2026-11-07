@@ -2222,12 +2222,12 @@ mod tests {
     use hyperscale_types::{
         Address, AddressClass, AggregateSignature, BeaconBlockHash, BeaconChainConfig, BeaconState,
         BeaconWitnessEvent, BodyRoot, BodyRootVerifyError, CertifiedBeaconBlock, CollectionId,
-        CommittedAt, Deadline, DeclaredKey, DeclaredRange, DerivationError, Derived, EntryKey,
-        ExecutionOutcome, GlobalReceiptHash, GossipMessage, Joins, LocalKey, MessageClass, Mode,
-        NetworkMessage, PriceTable, PrincipalAddr, ProposerTimestamp, ProtocolHasher,
-        ProvisionTxRoot, ProvisionTxRootsMap, ReadFence, Request, Role, RoutingCommittees,
-        SettledWrites, ShardCommittee, ShardTrie, Signer, SignerBitfield, Stake, StateWrites,
-        StatedTerms, TickHalf, TickId, TimestampRange, TransactionEnvelope, TxOutcome,
+        CommittedAt, Deadline, DeclaredKey, DeclaredRange, DerivationError, Derived, EffectsDigest,
+        EntryKey, ExecutionOutcome, GlobalReceiptHash, GossipMessage, Joins, LocalKey,
+        MessageClass, Mode, NetworkMessage, PriceTable, PrincipalAddr, ProposerTimestamp,
+        ProtocolHasher, ProvisionTxRoot, ProvisionTxRootsMap, ReadFence, Request, Role,
+        RoutingCommittees, SettledWrites, ShardCommittee, ShardTrie, Signer, SignerBitfield, Stake,
+        StateWrites, StatedTerms, TickHalf, TickId, TimestampRange, TransactionEnvelope, TxOutcome,
         entry_leaf_key, provision_leaf, receipt_hash_of, served_digest,
     };
 
@@ -2276,6 +2276,7 @@ mod tests {
             writes: writes.clone(),
             beacon_witness_events: Capped::from_array([witness.clone()]),
             events: Capped::empty(),
+            effects: Some(EffectsDigest::ZERO),
         };
         let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
         let tx = TxHash::from(Hash::from_bytes(b"a stated yes"));
@@ -2286,6 +2287,7 @@ mod tests {
                 writes,
                 beacon_witness_events: Capped::from_array([witness]),
                 events: Capped::empty(),
+                effects: Some(EffectsDigest::ZERO),
             }),
         );
         let yes = TxOutcome::new(tx, ExecutionOutcome::Succeeded { receipt_hash })
@@ -3954,6 +3956,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes: writes.into(),
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         );

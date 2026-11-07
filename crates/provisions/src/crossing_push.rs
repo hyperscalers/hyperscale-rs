@@ -664,6 +664,7 @@ mod tests {
                     ..StateWrites::default()
                 },
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         );
@@ -738,6 +739,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes,
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         );

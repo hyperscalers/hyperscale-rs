@@ -685,6 +685,7 @@ fn dedup_window_records_only_what_a_finalization_decided() {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     );

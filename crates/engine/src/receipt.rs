@@ -13,8 +13,8 @@
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    Address, BeaconWitnessEvent, ConsensusReceipt, Event, ExecutionMetadata, GlobalReceiptHash,
-    ShardId, ShardTrie, StateWrites, TxHash,
+    Address, BeaconWitnessEvent, ConsensusReceipt, EffectsDigest, Event, ExecutionMetadata,
+    GlobalReceiptHash, ShardId, ShardTrie, StateWrites, TxHash,
 };
 
 use crate::output::ExecutedTx;
@@ -47,6 +47,9 @@ enum CachedOutputBody {
         /// covers the whole union.
         events: Vec<Event>,
         receipt_hash: GlobalReceiptHash,
+        /// The whole run's digest, where a counterpart shares the
+        /// member's verdict.
+        effects: Option<EffectsDigest>,
         /// Beacon facts lifted from a recognised stake pool's events,
         /// each beside the emitter that produced it.
         ///
@@ -67,6 +70,7 @@ impl CachedOutput {
     pub(crate) const fn succeeded(
         raw_writes: StateWrites,
         receipt_hash: GlobalReceiptHash,
+        effects: Option<EffectsDigest>,
         metadata: ExecutionMetadata,
         events: Vec<Event>,
         witnesses: Vec<(Address, BeaconWitnessEvent)>,
@@ -77,6 +81,7 @@ impl CachedOutput {
                 raw_writes,
                 events,
                 receipt_hash,
+                effects,
                 witnesses,
             },
         }
@@ -119,6 +124,7 @@ pub fn project_to_shard(
             raw_writes,
             events,
             receipt_hash,
+            effects,
             witnesses,
         } => {
             let owned = owned_by(local_shard, shard_trie);
@@ -150,6 +156,7 @@ pub fn project_to_shard(
                 beacon_witness_events: Capped::new(beacon_witness_events)
                     .expect("a list under the cap its source already met"),
                 events: Capped::new(events).expect("a list under the cap its source already met"),
+                effects: *effects,
             };
             ExecutedTx::new(tx_hash, consensus, cached.metadata.clone())
         }

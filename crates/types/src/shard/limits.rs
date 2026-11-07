@@ -459,8 +459,8 @@ const STAGED_EVENT_OVERHEAD: u64 = 8;
 const BEACON_WITNESS_EVENT_BYTES: u64 = 192;
 
 /// What a staged receipt costs around its writes and events: its hash,
-/// its variant and the length of each list it carries.
-const RECEIPT_FRAME_BYTES: u64 = 64;
+/// its variant, the length of each list it carries and its digest.
+const RECEIPT_FRAME_BYTES: u64 = 97;
 
 /// What the leaf holding a staged receipt adds around the receipt: the
 /// collection, the order key and the value's length.
@@ -1040,15 +1040,30 @@ mod tests {
 
     use super::{
         BEACON_WITNESS_EVENT_BYTES, BLOCK_CAPS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_TXS,
-        TX_CAPS, TxsInFlight, budget_admits_block, caps_admit_transaction, drain_admits_block,
-        staged_yes_bound, staged_yes_bytes, sweep_admits_block,
+        RECEIPT_FRAME_BYTES, TX_CAPS, TxsInFlight, budget_admits_block, caps_admit_transaction,
+        drain_admits_block, staged_yes_bound, staged_yes_bytes, sweep_admits_block,
     };
     use crate::test_utils::test_pool;
     use crate::{
         Address, BeaconWitnessEvent, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
-        Epoch, GlobalReceiptHash, Hash, LocalKey, MAX_BEACON_WITNESS_EVENTS_PER_TX, NetworkParams,
-        ParamProposal, ParamVote, ReshapeThresholds, Stake, ValidatorId,
+        EffectsDigest, Epoch, GlobalReceiptHash, Hash, LocalKey, MAX_BEACON_WITNESS_EVENTS_PER_TX,
+        NetworkParams, ParamProposal, ParamVote, ReshapeThresholds, Stake, ValidatorId,
     };
+
+    /// A receipt carrying nothing but its hash and its digest is its
+    /// frame, so the frame holds both. The declared bound's other terms
+    /// have slack enough to hide a frame that does not.
+    #[test]
+    fn a_receipts_frame_holds_its_digest() {
+        let receipt = ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[0xFF; 32])),
+            writes: StateWrites::default(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+            effects: Some(EffectsDigest::from_raw(Hash::from_bytes(&[0xFE; 32]))),
+        };
+        assert!(staged_yes_bytes(&receipt) <= RECEIPT_FRAME_BYTES);
+    }
 
     /// The bound bites on the level a block leaves: one carrying
     /// transactions is refused the moment its own total clears the
@@ -1261,6 +1276,7 @@ mod tests {
                 writes,
                 beacon_witness_events: Capped::new(witnessed).expect("within the witness cap"),
                 events: Capped::new(emitted).expect("within the event cap"),
+                effects: Some(EffectsDigest::from_raw(Hash::from_bytes(&[0xFF; 32]))),
             };
             prop_assert!(
                 staged_yes_bytes(&receipt) <= staged_yes_bound(&work),

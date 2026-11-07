@@ -468,6 +468,12 @@ pub trait Cluster {
         0
     }
 
+    /// How many shards' statements of a transaction this cluster has held
+    /// to another shard's digest. Zero where it does not hold them to it.
+    fn effects_compared(&self) -> usize {
+        0
+    }
+
     /// Whether this cluster has held `tx`'s member on `shard` to the part
     /// a counterpart absorbed. False where it does not hold them to it.
     fn served_part_agreed(&self, shard: ShardId, tx: TxHash) -> bool {

@@ -119,10 +119,10 @@ pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
     AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, BodyRoot, CertificateRoot,
-    EngagementRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
-    GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
-    RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TermsRoot, TickManifestRoot,
-    TransactionRoot, TxHash, WritesRoot,
+    EffectsDigest, EngagementRoot, EventRoot, FinalizationHash, GenesisConfigHash,
+    GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot,
+    ProvisionsRoot, RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TermsRoot,
+    TickManifestRoot, TransactionRoot, TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex,
@@ -153,7 +153,7 @@ pub use receipt::event::{
 };
 pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
-pub use receipt::recompute::{receipt_hash_of, witness_root, writes_root};
+pub use receipt::recompute::{effects_digest, receipt_hash_of, witness_root, writes_root};
 pub use receipt::stored::StoredReceipt;
 pub use shard::abandonment::{
     AbandonmentRecord, AbortCharge, CommitWindow, CommittedAt, Resolutions, UnsettledTx,

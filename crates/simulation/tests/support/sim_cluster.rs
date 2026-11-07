@@ -30,7 +30,8 @@ use hyperscale_scenarios::query::{
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     BlockServingCap, Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster,
-    MemberEdge, ProofMeter, RestartableCluster, ScenarioConfig, grow_and_hold, submission_shards,
+    MemberEdge, ProofMeter, RestartableCluster, ScenarioConfig, epochs, grow_and_hold,
+    submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{
@@ -45,11 +46,11 @@ use hyperscale_types::network::request::GetStateProofRequest;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, Anchor, BeaconChainConfig, BeaconState, Block, BlockHeader, BlockHeight,
-    CertifiedBlock, ChainOrigin, ConsensusReceipt, DeclaredRange, Derivation, Epoch, Event, Heard,
-    LocalKey, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StandingAnswers, StandingToward,
-    StateRoot, SubstateEntry, SubstateKey, TickLine, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
-    shard_prefix_path,
+    CertifiedBlock, ChainOrigin, ConsensusReceipt, DeclaredRange, Derivation, EffectsDigest, Epoch,
+    Event, Heard, LocalKey, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StandingAnswers,
+    StandingToward, StateRoot, SubstateEntry, SubstateKey, TickLine, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, Verified,
+    WeightedTimestamp, shard_prefix_path,
 };
 
 use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
@@ -128,6 +129,41 @@ pub struct SimCluster {
     epoch: Duration,
     /// Every member's own part against the part a counterpart absorbed.
     served_parts: ServedParts,
+    stated_effects: StatedEffects,
+}
+
+/// The effects oracle: every shard that states a transaction states it
+/// under one digest.
+///
+/// It walks with [`ServedParts`] and reads each block's stating halves,
+/// so it holds the chains and no shard's own record of what it ran. A
+/// shard that states a member later is held to what the others stated.
+#[derive(Default)]
+struct StatedEffects {
+    /// What each shard stated of each transaction.
+    stated: BTreeMap<TxHash, BTreeMap<ShardId, EffectsDigest>>,
+    /// The statements held to another shard's so far.
+    compared: usize,
+}
+
+impl StatedEffects {
+    /// Take in `shard`'s statement of `tx`.
+    ///
+    /// # Panics
+    ///
+    /// If another shard stated `tx` under another digest.
+    fn note(&mut self, shard: ShardId, tx: TxHash, digest: EffectsDigest) {
+        let stated = self.stated.entry(tx).or_default();
+        for (sibling, theirs) in stated.iter().filter(|(sibling, _)| **sibling != shard) {
+            assert_eq!(
+                digest, *theirs,
+                "{tx:?} is stated under two digests, by {shard:?} and {sibling:?}",
+            );
+        }
+        if stated.insert(shard, digest).is_none() && stated.len() > 1 {
+            self.compared += 1;
+        }
+    }
 }
 
 /// The served reads oracle: at each shared tick, the entries the source
@@ -435,6 +471,7 @@ impl SimCluster {
             tuning,
             member_rules: Vec::new(),
             served_parts: ServedParts::default(),
+            stated_effects: StatedEffects::default(),
             one_identity_per_host: args.dedicated_pool_hosts && config.vnodes_per_host == 1,
             epoch: beacon_chain_config.epoch_duration(),
         };
@@ -689,13 +726,15 @@ impl SimCluster {
         cond(self)
     }
 
-    /// Walk every chain past where the last walk stopped, and hold each
-    /// member's own part to what its counterpart absorbed.
+    /// Walk every chain past where the last walk stopped, hold each
+    /// member's own part to what its counterpart absorbed, and each
+    /// statement of a transaction to every other shard's.
     ///
     /// # Panics
     ///
-    /// If the two differ, or come from different heights: a shared member
-    /// read other bytes than its counterpart.
+    /// If the two parts differ, or come from different heights: a shared
+    /// member read other bytes than its counterpart. If two shards state
+    /// one transaction under two digests.
     fn hold_served_parts(&mut self) {
         let shards: Vec<ShardId> = self.runner.archive().shards().collect();
         for shard in shards {
@@ -711,6 +750,7 @@ impl SimCluster {
             while height <= tip {
                 if let Some(certified) = self.history(shard).block(height) {
                     self.note_served_parts(shard, certified.block());
+                    self.note_stated_effects(shard, certified.block());
                 }
                 height = height.next();
             }
@@ -730,6 +770,32 @@ impl SimCluster {
             self.served_parts.agreed += 1;
             self.served_parts.compared.insert((member.0, member.2));
         }
+    }
+
+    /// Take in each digest `block` of `shard`'s states.
+    fn note_stated_effects(&mut self, shard: ShardId, block: &Block) {
+        for finalization in block.certificates().iter() {
+            for receipt in finalization.stated_receipts() {
+                let digest = receipt
+                    .consensus
+                    .effects()
+                    .expect("a stated yes carries its digest");
+                self.stated_effects.note(shard, receipt.tx_hash, digest);
+            }
+        }
+    }
+
+    /// Run until the walk has held two shards' statements to each other,
+    /// for a scenario whose member both shards state.
+    ///
+    /// # Panics
+    ///
+    /// If it never does, which leaves the oracle having proved nothing.
+    pub fn assert_effects_compared(&mut self) {
+        assert!(
+            Cluster::run_until(self, epochs(4), |c| c.effects_compared() > 0),
+            "no two shards' statements were held to each other",
+        );
     }
 
     /// Take in what `block` of `shard`'s says of parts: each line running
@@ -1454,6 +1520,10 @@ impl Cluster for SimCluster {
 
     fn served_parts_agreed(&self) -> usize {
         self.served_parts.agreed
+    }
+
+    fn effects_compared(&self) -> usize {
+        self.stated_effects.compared
     }
 
     fn served_part_agreed(&self, shard: ShardId, tx: TxHash) -> bool {

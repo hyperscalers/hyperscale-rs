@@ -1281,8 +1281,8 @@ mod tests {
 
     use hyperscale_engine::legs::Classified;
     use hyperscale_types::{
-        AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, REATTESTATION_STEP,
-        SignerBitfield, StateWrites, receipt_hash_of,
+        AggregateSignature, ConsensusReceipt, EffectsDigest, GlobalReceiptHash, Hash,
+        REATTESTATION_STEP, SignerBitfield, StateWrites, receipt_hash_of,
     };
 
     use super::*;
@@ -1401,6 +1401,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: Some(EffectsDigest::ZERO),
                 events: Capped::empty(),
             },
             true,
@@ -1416,6 +1417,7 @@ mod tests {
                 #[allow(clippy::default_trait_access)]
                 writes: Default::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: Some(EffectsDigest::ZERO),
                 events: Capped::empty(),
             }),
         }

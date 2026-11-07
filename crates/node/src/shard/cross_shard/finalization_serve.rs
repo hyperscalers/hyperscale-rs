@@ -99,6 +99,7 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed])),
                         writes,
                         beacon_witness_events: Capped::empty(),
+                        effects: None,
                         events: Capped::empty(),
                     }),
                 )

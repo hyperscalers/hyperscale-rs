@@ -25,11 +25,11 @@ use hyperscale_types::{
     BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconVote, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
-    CommittedAt, ConsensusReceipt, Deadline, Decision, DiscardCause, EntryKey, EntryLeaf, Epoch,
-    EpochWindows, Event, ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs,
-    GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LocalKey,
-    MAX_SWEEP_PER_BLOCK, MemberCollection, MemberTerms, MerkleInclusionProof, Movement, PcQc2,
-    PcQc3, PcSignerLengths, PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable,
+    CommittedAt, ConsensusReceipt, Deadline, Decision, DiscardCause, EffectsDigest, EntryKey,
+    EntryLeaf, Epoch, EpochWindows, Event, ExecutionCertificate, ExecutionOutcome, Finalization,
+    FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins,
+    LocalKey, MAX_SWEEP_PER_BLOCK, MemberCollection, MemberTerms, MerkleInclusionProof, Movement,
+    PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable,
     ProposerTimestamp, ProtocolHasher, Provision, ProvisionHash, QuorumCertificate,
     RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
     Reading, Role, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement,
@@ -470,6 +470,7 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
         receipt_hash: GlobalReceiptHash::ZERO,
         writes: StateWrites::default(),
         beacon_witness_events: Capped::empty(),
+        effects: None,
         events: Capped::from_array([Event {
             emitter: Address::new([seed; 31], AddressClass::Component),
             event_type: u32::from(seed),
@@ -733,6 +734,7 @@ fn settling(height: BlockHeight, writes: StateWrites) -> Verifiable<Finalization
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     };
@@ -2505,6 +2507,7 @@ where
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     );
@@ -6421,6 +6424,7 @@ pub fn test_a_stating_blocks_yes_receipts_prune_with_it<S: ShardChainReader + Te
         receipt_hash: GlobalReceiptHash::ZERO,
         writes: writes.clone(),
         beacon_witness_events: Capped::empty(),
+        effects: Some(EffectsDigest::ZERO),
         events: Capped::empty(),
     };
     let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -6430,6 +6434,7 @@ pub fn test_a_stating_blocks_yes_receipts_prune_with_it<S: ShardChainReader + Te
             receipt_hash,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: Some(EffectsDigest::ZERO),
             events: Capped::empty(),
         }),
     );
@@ -6744,6 +6749,7 @@ pub fn yes_receipt(tx: TxHash, hash: GlobalReceiptHash) -> StoredReceipt {
             receipt_hash: hash,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     )
@@ -7809,6 +7815,7 @@ fn block_sweeping_to(
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     );

@@ -137,6 +137,14 @@ hash_newtype!(
     "WritesRoot"
 );
 
+hash_newtype!(
+    /// Digest of everything a shared member's run would apply, on any
+    /// shard: its whole delta and every event, owned or not. Every shard
+    /// the member spans derives the same one from the same input.
+    pub EffectsDigest,
+    "EffectsDigest"
+);
+
 // ── State (JMT) ──────────────────────────────────────────────────────────────
 
 hash_newtype!(

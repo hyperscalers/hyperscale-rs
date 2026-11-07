@@ -48,6 +48,7 @@ fn cutoff_cluster(seed: u64) -> SimCluster {
 fn a_divided_core_runs_under_its_earliest_clock() {
     let mut cluster = cutoff_cluster(sim_seed(42));
     cluster.run_faultable(a_divided_core_pays_out_under_one_clock);
+    cluster.assert_effects_compared();
 }
 
 /// Execution votes the book's committee sends that are lost before the
@@ -117,6 +118,7 @@ fn a_core_member_reads_its_own_cells_as_its_bundle_served_them() {
         );
         route.assert_conserved(c, epochs(12));
     });
+    cluster.assert_effects_compared();
 }
 
 /// Provision broadcasts the venue's committee sends that are lost before
@@ -168,4 +170,5 @@ fn a_route_placed_after_a_fill_waits_for_the_fill() {
         );
         route.assert_conserved(c, epochs(12));
     });
+    cluster.assert_effects_compared();
 }

@@ -5453,14 +5453,14 @@ mod tests {
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
         BeaconWitnessLeafCount, BlockHeader, BlockHeaderParts, ChainOrigin, ConsensusPublicKey,
-        ConsensusReceipt, ConsensusSignature, Crossings, Deadline, Epoch, EpochSeed, EpochWindows,
-        ExecutionCertificateContext, ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash,
-        Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
-        MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr,
-        ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryBinding,
-        RecoveryCause, Role, SEED_WINDOW_EPOCHS, SeedRing, SeedSource, SettledTxsRoot, Settlement,
-        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated,
-        StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TimestampRange,
+        ConsensusReceipt, ConsensusSignature, Crossings, Deadline, EffectsDigest, Epoch, EpochSeed,
+        EpochWindows, ExecutionCertificateContext, ExecutionOutcome, ExecutionVoteMessage,
+        GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
+        MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkDefinition,
+        PriceTable, PrincipalAddr, ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON,
+        Randomness, RecoveryBinding, RecoveryCause, Role, SEED_WINDOW_EPOCHS, SeedRing, SeedSource,
+        SettledTxsRoot, Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim,
+        StateRoot, Stated, StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TimestampRange,
         TransactionDecision, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Verify,
         VoteCount, Window, compute_global_receipt_root, receipt_hash_of, signed_bytes,
     };
@@ -9134,6 +9134,7 @@ mod tests {
                     #[allow(clippy::default_trait_access)]
                     writes: Default::default(),
                     beacon_witness_events: Capped::empty(),
+                    effects: None,
                     events: Capped::empty(),
                 }),
             });
@@ -12042,6 +12043,7 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                         writes,
                         beacon_witness_events: Capped::empty(),
+                        effects: None,
                         events: Capped::empty(),
                     }),
                 )
@@ -12472,6 +12474,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
+            effects: Some(EffectsDigest::ZERO),
             events: Capped::empty(),
         };
         StoredReceipt::new(
@@ -12480,6 +12483,7 @@ mod tests {
                 receipt_hash: receipt_hash_of(&unhashed, true).expect("a projected success"),
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: Some(EffectsDigest::ZERO),
                 events: Capped::empty(),
             }),
         )
@@ -17195,6 +17199,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         }

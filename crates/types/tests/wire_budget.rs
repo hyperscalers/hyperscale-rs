@@ -24,10 +24,10 @@ use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass,
     AggregateSignature, Anchor, BLOCK_RESPONSE_INLINE_BYTES, BlockHeader, BlockHeaderParts,
     BlockHeight, CertifiedBlockHeader, CollectionId, CommittedAt, ConsensusReceipt, Crossings,
-    Deadline, DeclaredKey, DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock,
-    Engagement, Epoch, ExecutionCertificate, ExecutionOutcome, Finalization, FinalizationHash,
-    GlobalReceiptHash, Hash, Joins, LeafPath, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK,
-    MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FETCH_RESPONSE_BYTES,
+    Deadline, DeclaredKey, DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, EffectsDigest,
+    ElidedCertifiedBlock, Engagement, Epoch, ExecutionCertificate, ExecutionOutcome, Finalization,
+    FinalizationHash, GlobalReceiptHash, Hash, Joins, LeafPath, LocalKey, MAX_ARTIFACT_BYTES,
+    MAX_CLAIMS_PER_BLOCK, MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FETCH_RESPONSE_BYTES,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_MERKLE_PROOF_LEN,
     MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_PART_BYTES,
     MAX_PROVISION_PATH_DEPTH, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISION_WEIGHT,
@@ -1388,6 +1388,7 @@ fn effects(seed: u32, width: usize) -> StoredReceipt {
         receipt_hash: GlobalReceiptHash::ZERO,
         writes,
         beacon_witness_events: Capped::empty(),
+        effects: Some(EffectsDigest::ZERO),
         events: Capped::empty(),
     };
     let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -1400,6 +1401,7 @@ fn effects(seed: u32, width: usize) -> StoredReceipt {
             receipt_hash,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: Some(EffectsDigest::ZERO),
             events: Capped::empty(),
         }),
     )
@@ -1423,6 +1425,7 @@ fn refused(seed: usize, sibling: ShardId) -> (TxOutcome, StoredReceipt) {
             receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(tx_hash.as_bytes())),
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     );

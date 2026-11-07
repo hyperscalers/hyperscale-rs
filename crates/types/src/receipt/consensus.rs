@@ -20,9 +20,9 @@ use hyperscale_hbor::{
 use crate::receipt::event::EventExt;
 use crate::transaction::vm::Derivation;
 use crate::{
-    BeaconWitnessEvent, BeaconWitnessRoot, Event, EventRoot, GlobalReceipt, GlobalReceiptHash,
-    Hash, MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EVENTS_PER_TX, StateWrites, WritesRoot,
-    compute_merkle_root,
+    BeaconWitnessEvent, BeaconWitnessRoot, EffectsDigest, Event, EventRoot, GlobalReceipt,
+    GlobalReceiptHash, Hash, MAX_BEACON_WITNESS_EVENTS_PER_TX, MAX_EVENTS_PER_TX, StateWrites,
+    WritesRoot, compute_merkle_root,
 };
 
 // Wire variant tag bytes. Explicit rather than relying on declaration
@@ -33,14 +33,15 @@ const RECEIPT_VARIANT_FAILED: u8 = 1;
 /// Canonical receipt hash for any failed transaction.
 ///
 /// All failed transactions hash to the same value — derived from the fixed
-/// `(success=false, EventRoot::ZERO, BeaconWitnessRoot::ZERO, WritesRoot::ZERO)`
-/// tuple. Cached to avoid recomputing per failure.
+/// `(success=false, EventRoot::ZERO, BeaconWitnessRoot::ZERO, WritesRoot::ZERO,
+/// EffectsDigest::ZERO)` tuple. Cached to avoid recomputing per failure.
 pub static FAILED_RECEIPT_HASH: LazyLock<GlobalReceiptHash> = LazyLock::new(|| {
     GlobalReceipt::new(
         false,
         EventRoot::ZERO,
         BeaconWitnessRoot::ZERO,
         WritesRoot::ZERO,
+        EffectsDigest::ZERO,
     )
     .receipt_hash()
 });
@@ -76,6 +77,11 @@ pub enum ConsensusReceipt {
         /// design: an event is stored where its emitter lives, and each
         /// shard attests its own.
         events: Capped<Vec<Event>, MAX_EVENTS_PER_TX>,
+        /// The digest of the whole run, where a counterpart shares this
+        /// member's verdict: what `receipt_hash` binds through
+        /// [`GlobalReceipt::effects`], and `None` for a member nobody
+        /// shares.
+        effects: Option<EffectsDigest>,
     },
     /// All failures collapse to one variant — the canonical
     /// [`FAILED_RECEIPT_HASH`] is derived at hash time, no payload needed.
@@ -118,12 +124,14 @@ impl HborEncode for ConsensusReceipt {
                 writes,
                 beacon_witness_events,
                 events,
+                effects,
             } => {
                 encoder.write_u8(RECEIPT_VARIANT_SUCCEEDED);
                 encoder.nested(receipt_hash)?;
                 encoder.nested(writes)?;
                 encoder.nested(beacon_witness_events)?;
-                encoder.nested(events)
+                encoder.nested(events)?;
+                encoder.nested(effects)
             }
             Self::Failed => {
                 encoder.write_u8(RECEIPT_VARIANT_FAILED);
@@ -144,11 +152,13 @@ impl HborDecode for ConsensusReceipt {
                     MAX_BEACON_WITNESS_EVENTS_PER_TX,
                 > = decoder.nested()?;
                 let events: Capped<Vec<Event>, MAX_EVENTS_PER_TX> = decoder.nested()?;
+                let effects: Option<EffectsDigest> = decoder.nested()?;
                 Ok(Self::Succeeded {
                     receipt_hash,
                     writes,
                     beacon_witness_events,
                     events,
+                    effects,
                 })
             }
             RECEIPT_VARIANT_FAILED => Ok(Self::Failed),
@@ -180,6 +190,16 @@ impl ConsensusReceipt {
     pub const fn writes(&self) -> Option<&StateWrites> {
         match self {
             Self::Succeeded { writes, .. } => Some(writes),
+            Self::Failed => None,
+        }
+    }
+
+    /// The digest of the whole run, where a counterpart shares this
+    /// member's verdict.
+    #[must_use]
+    pub const fn effects(&self) -> Option<EffectsDigest> {
+        match self {
+            Self::Succeeded { effects, .. } => *effects,
             Self::Failed => None,
         }
     }
@@ -224,6 +244,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r")),
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::from_array([Event {
                 emitter: Address::new([7; 31], AddressClass::Component),
                 event_type: 1,

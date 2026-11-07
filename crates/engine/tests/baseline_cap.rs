@@ -26,8 +26,8 @@ use hyperscale_storage::{
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
-    BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange, Ed25519PrivateKey, EntryKey,
-    Epoch, EpochSeed, EpochWindows, FrontierInputs, MAX_INTENT_VALIDITY_RANGE, NetworkId,
+    BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange, Ed25519PrivateKey, EffectsDigest,
+    EntryKey, Epoch, EpochSeed, EpochWindows, FrontierInputs, MAX_INTENT_VALIDITY_RANGE, NetworkId,
     PriceTable, PrincipalAddr, ProtocolHasher, ProvisionalHolds, Randomness, ResourceAddr,
     SeedRing, SeedSource, SettledWrites, ShardId, ShardTrie, StoredReceipt, SubstateEntry,
     SubstateKey, TimestampRange, Transaction, Verified, WeightedTimestamp, absorb_committed_cells,
@@ -390,13 +390,18 @@ fn signed_lottery(build: impl FnOnce(IntentBuilder<'_>) -> IntentTree) -> Transa
 /// clock falls in epoch 4 of a 250 ms grid, whose window holds the
 /// reveal-folded seeds of epochs 1 to 3, the seal's maturity among them.
 fn sealed_env() -> TickEnvironment {
+    env_rolling(0x5E)
+}
+
+/// [`sealed_env`], its window's seeds rolled from `byte`.
+fn env_rolling(byte: u8) -> TickEnvironment {
     let windows = EpochWindows::new(0, 250);
     let mut seeds = SeedRing::default();
     for epoch in 1..=3 {
         seeds.record(
             Epoch::new(epoch),
             EpochSeed {
-                randomness: Randomness::new([0x5E; 32]),
+                randomness: Randomness::new([byte; 32]),
                 source: SeedSource::Reveals,
             },
             windows,
@@ -688,7 +693,13 @@ fn the_fills_range() -> DeclaredRange {
 
 /// The part `state` serves of the fill's interval, one past its cap.
 fn part_over(state: &SimShardStorage) -> ServedPart {
+    part_lacking(state, None)
+}
+
+/// [`part_over`], without the ask at `dropped`.
+fn part_lacking(state: &SimShardStorage, dropped: Option<u64>) -> ServedPart {
     let range = the_fills_range();
+    let dropped = dropped.map(|ticks| ask_at(ticks).order);
     let entries = state
         .entries_in_range(
             range.owner,
@@ -698,6 +709,7 @@ fn part_over(state: &SimShardStorage) -> ServedPart {
             usize::try_from(FILL_CAP).unwrap() + 1,
         )
         .into_iter()
+        .filter(|(order, _)| Some(*order) != dropped)
         .map(|(order, _)| {
             let key = entry_leaf_key(
                 &ProtocolHasher,
@@ -723,6 +735,46 @@ fn run_with_parts(
     txs: &[Transaction],
     parts: &[Option<&ServedPart>],
 ) -> Vec<ExecutedTx> {
+    run_as(
+        executor,
+        baseline,
+        TickEnvironment::unfolded(),
+        &Member::whole(ShardId::ROOT),
+        txs,
+        parts,
+    )
+}
+
+/// A member a sibling shares the verdict on, here where the store holds
+/// all it reaches.
+fn shared_member() -> Member {
+    Member::of(
+        Classified::whole(),
+        ShardId::ROOT,
+        BTreeSet::from([ShardId::ROOT, ShardId::leaf(1, 1)]),
+    )
+}
+
+/// What `run` states, in a run that settled.
+fn stated_digest(run: &ExecutedTx) -> EffectsDigest {
+    assert!(
+        matches!(&run.consensus, ConsensusReceipt::Succeeded { .. }),
+        "the member settles: {:?} {:?}",
+        run.consensus,
+        run.metadata
+    );
+    run.consensus.effects().expect("a shared member digests")
+}
+
+/// [`run_with_parts`] as `member`, under `env`.
+fn run_as(
+    executor: &Executor,
+    baseline: &SimShardStorage,
+    env: TickEnvironment,
+    member: &Member,
+    txs: &[Transaction],
+    parts: &[Option<&ServedPart>],
+) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
     let chain = TickChain::new(Arc::new(baseline.clone()));
     let snapshot = Arc::new(chain.view_at(baseline.jmt_height()).snapshot());
@@ -730,7 +782,7 @@ fn run_with_parts(
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         tick_ts: WeightedTimestamp::from_millis(1_000),
-        env: TickEnvironment::unfolded(),
+        env,
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
         points: Some(Arc::clone(&snapshot) as Arc<dyn PointReads>),
@@ -752,7 +804,7 @@ fn run_with_parts(
             provisions: &[],
             clock: ctx.tick_ts,
             prices: PriceTable::GENESIS,
-            member: Member::whole(ShardId::ROOT),
+            member: member.clone(),
             arrivals: &[],
             served_part: *part,
         })
@@ -770,6 +822,72 @@ fn run_with_parts(
                 .clone()
         })
         .collect()
+}
+
+/// A member's digest is a function of what it was served: one part read
+/// twice digests alike, and a part one ask short digests apart, each run
+/// completing as honest a walk as the other.
+#[test]
+fn a_members_digest_follows_its_part() {
+    let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
+    let baseline = sealed_book(&executor, 1);
+    let (whole, short) = (part_over(&baseline), part_lacking(&baseline, Some(10)));
+    let fill = filling_every_ask();
+    let digest = |part: &ServedPart| {
+        stated_digest(
+            &run_as(
+                &executor,
+                &baseline,
+                TickEnvironment::unfolded(),
+                &shared_member(),
+                std::slice::from_ref(&fill),
+                &[Some(part)],
+            )[0],
+        )
+    };
+
+    assert_eq!(digest(&whole), digest(&whole));
+    assert_ne!(digest(&whole), digest(&short));
+}
+
+/// A draw reads the window of its clock's epoch, so the ring either side
+/// of a beacon fold past that epoch digests alike. A ring that answers
+/// the window with other seeds does not.
+#[test]
+fn a_draw_digests_alike_either_side_of_a_fold() {
+    let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
+    let storage = closed_round(&executor, &[0xA1, 0xA2, 0xA3, 0xA4]);
+    let settle = signed_lottery(|mut root| {
+        lottery::Lottery::at(lottery_addr())
+            .settle(&mut root, 16)
+            .expect("a lottery answers a settlement");
+        root.build().expect("the intent declares no hole")
+    });
+    let digest = |env: TickEnvironment| {
+        stated_digest(
+            &run_as(
+                &executor,
+                &storage,
+                env,
+                &shared_member(),
+                std::slice::from_ref(&settle),
+                &[None],
+            )[0],
+        )
+    };
+
+    let mut folded = sealed_env();
+    folded.seeds.record(
+        Epoch::new(4),
+        EpochSeed {
+            randomness: Randomness::new([0x7F; 32]),
+            source: SeedSource::Reveals,
+        },
+        folded.windows,
+    );
+
+    assert_eq!(digest(sealed_env()), digest(folded));
+    assert_ne!(digest(sealed_env()), digest(env_rolling(0x7F)));
 }
 
 /// What `run` moved out of the book's escrow.
@@ -906,11 +1024,32 @@ fn remote_part(state: &SimShardStorage, tx: &Verified<Transaction>) -> Arc<Vec<S
     )
 }
 
+/// The input of `tx` as `member` at `clock`, over its part.
+fn fill_input<'a>(
+    tx: &'a Verified<Transaction>,
+    part: &'a [Arc<Vec<SubstateEntry>>],
+    clock: WeightedTimestamp,
+    member: Member,
+) -> TickTxInput<'a> {
+    TickTxInput {
+        tx_hash: tx.hash(),
+        transaction: tx,
+        provisions: part,
+        clock,
+        prices: PriceTable::GENESIS,
+        member,
+        arrivals: &[],
+        served_part: None,
+    }
+}
+
 /// On a shard that does not own the book, a group-mate's walk of the
 /// ladder is the outbound record of a verdict the book's shard can still
 /// refuse, and threads to nobody: each of two fills batched here walks the
 /// ladder its own part serves, whichever runs first. The first's removals
-/// reaching the second would leave it two asks past the page.
+/// reaching the second would leave it two asks past the page. Each digests
+/// as it does alone, which is what the book's shard, batching it with
+/// neither, holds it to.
 #[test]
 fn a_group_mates_remote_write_does_not_reach_a_members_part() {
     let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
@@ -941,26 +1080,29 @@ fn a_group_mates_remote_write_does_not_reach_a_members_part() {
         fee_holds: &NoFeeHolds,
         points: Some(Arc::clone(&snapshot) as Arc<dyn PointReads>),
     };
-    let inputs: Vec<TickTxInput<'_>> = [(&first, &parts[0]), (&second, &parts[1])]
-        .into_iter()
-        .map(|(tx, part)| TickTxInput {
-            tx_hash: tx.hash(),
-            transaction: tx,
-            provisions: part,
-            clock: ctx.tick_ts,
-            prices: PriceTable::GENESIS,
-            member: Member::of(
-                Classified::whole(),
-                local,
-                BTreeSet::from([local, book_shard]),
-            ),
-            arrivals: &[],
-            served_part: None,
-        })
-        .collect();
-    let executed = executor
-        .execute_tick_batch(&ctx, &*snapshot, &inputs)
-        .expect("the harness engine holds every package it runs");
+    let member = Member::of(
+        Classified::whole(),
+        local,
+        BTreeSet::from([local, book_shard]),
+    );
+    let input = |tx, part| fill_input(tx, part, ctx.tick_ts, member.clone());
+    let run = |inputs: &[TickTxInput<'_>]| {
+        executor
+            .execute_tick_batch(&ctx, &*snapshot, inputs)
+            .expect("the harness engine holds every package it runs")
+    };
+    let executed = run(&[input(&first, &parts[0]), input(&second, &parts[1])]);
+    for (tx, part) in [(&first, &parts[0]), (&second, &parts[1])] {
+        let beside_its_mate = executed
+            .iter()
+            .find(|run| run.tx_hash == tx.hash())
+            .expect("every input has a result");
+        assert_eq!(
+            stated_digest(beside_its_mate),
+            stated_digest(&run(&[input(tx, part)])[0]),
+            "a mate's remote write reaches no part of this member's run",
+        );
+    }
 
     let bought = vault_key(principal(SETTLER), BOOK_BASE_RESOURCE);
     for run in &executed {

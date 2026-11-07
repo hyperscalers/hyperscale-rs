@@ -43,9 +43,9 @@ mod tests {
     };
 
     use crate::{
-        AggregateSignature, BlockHeight, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome,
-        Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-        RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield, StateWrites,
+        AggregateSignature, BlockHeight, ConsensusReceipt, EffectsDigest, ExecutionCertificate,
+        ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot,
+        Hash, RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield, StateWrites,
         StoredReceipt, TickHalf, TickId, TxHash, TxOutcome, ValidatorId, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, receipt_hash_of,
         tick_leader, tx_outcome_leaf, verify_merkle_inclusion,
@@ -307,6 +307,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: Some(EffectsDigest::ZERO),
                 events: Capped::empty(),
             };
             let receipt_hash = receipt_hash_of(&effects, true).expect("a projected success");
@@ -327,6 +328,7 @@ mod tests {
                         receipt_hash,
                         writes: StateWrites::default(),
                         beacon_witness_events: Capped::empty(),
+                        effects: Some(EffectsDigest::ZERO),
                         events: Capped::empty(),
                     }),
                 )]),
@@ -459,6 +461,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         })
     }
@@ -659,6 +662,7 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                         writes: StateWrites::default(),
                         beacon_witness_events: Capped::empty(),
+                        effects: None,
                         events: Capped::empty(),
                     }),
                 },
@@ -713,6 +717,7 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     writes: StateWrites::default(),
                     beacon_witness_events: Capped::empty(),
+                    effects: None,
                     events: Capped::empty(),
                 }),
             }]),
@@ -746,6 +751,7 @@ mod tests {
                     receipt_hash,
                     writes: StateWrites::default(),
                     beacon_witness_events: Capped::empty(),
+                    effects: None,
                     events: Capped::empty(),
                 }),
             }]),
@@ -794,6 +800,7 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     writes: StateWrites::default(),
                     beacon_witness_events: Capped::empty(),
+                    effects: None,
                     events: Capped::empty(),
                 }),
             }]),
@@ -825,6 +832,7 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     writes: StateWrites::default(),
                     beacon_witness_events: Capped::empty(),
+                    effects: None,
                     events: Capped::empty(),
                 }),
             }]),

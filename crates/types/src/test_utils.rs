@@ -1257,6 +1257,7 @@ pub fn make_finalization_settling(
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     );

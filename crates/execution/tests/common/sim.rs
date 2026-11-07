@@ -48,14 +48,14 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
-    ConsensusReceipt, CounterpartMirror, DeclaredRange, Epoch, EpochSeed, EpochWindows, EventRoot,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt,
-    LocalKey, Movement, ProvenAnchors, Provision, Randomness, RecoveryCause, ResourceAddr,
-    SeedRing, SeedSource, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield,
-    StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, compute_global_receipt_root, encode_amount, read_amount,
-    shard_prefix_path, writes_root,
+    ConsensusReceipt, CounterpartMirror, DeclaredRange, EffectsDigest, Epoch, EpochSeed,
+    EpochWindows, EventRoot, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
+    Finalization, GlobalReceipt, LocalKey, Movement, ProvenAnchors, Provision, Randomness,
+    RecoveryCause, ResourceAddr, SeedRing, SeedSource, SettledWrites, ShardId, ShardRecovery,
+    ShardTrie, SignerBitfield, StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateKey,
+    TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
+    encode_amount, read_amount, shard_prefix_path, writes_root,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -1231,6 +1231,7 @@ fn stub_execute(
         EventRoot::ZERO,
         BeaconWitnessRoot::ZERO,
         writes_root(&writes),
+        EffectsDigest::ZERO,
     )
     .receipt_hash();
     let mut executed = ExecutedTx::new(
@@ -1239,6 +1240,7 @@ fn stub_execute(
             receipt_hash,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         },
         ExecutionMetadata::empty(),
@@ -1274,12 +1276,14 @@ fn stub_charge(owner: Address, hold: Option<SubstateKey>) -> ConsensusReceipt {
         EventRoot::ZERO,
         BeaconWitnessRoot::ZERO,
         writes_root(&writes),
+        EffectsDigest::ZERO,
     )
     .receipt_hash();
     ConsensusReceipt::Succeeded {
         receipt_hash,
         writes,
         beacon_witness_events: Capped::empty(),
+        effects: None,
         events: Capped::empty(),
     }
 }

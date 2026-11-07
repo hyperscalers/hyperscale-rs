@@ -171,6 +171,7 @@ fn succeeded(tx_hash: TxHash) -> ExecutedTx {
             receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         },
         ExecutionMetadata::empty(),

@@ -246,8 +246,8 @@ mod tests {
     use super::*;
     use crate::test_utils::{make_live_block, rebound, stating_half_on};
     use crate::{
-        BlockHeight, ConsensusReceipt, ExecutionOutcome, Finalization, GlobalReceiptHash, Role,
-        ShardId, StateWrites, TxOutcome, ValidatorId, receipt_hash_of,
+        BlockHeight, ConsensusReceipt, EffectsDigest, ExecutionOutcome, Finalization,
+        GlobalReceiptHash, Role, ShardId, StateWrites, TxOutcome, ValidatorId, receipt_hash_of,
     };
 
     /// A body carrying a stating half is bound to its header with the
@@ -262,6 +262,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
+            effects: Some(EffectsDigest::ZERO),
             events: Capped::empty(),
         };
         let effects = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -289,6 +290,7 @@ mod tests {
                 receipt_hash: effects,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: Some(EffectsDigest::ZERO),
                 events: Capped::empty(),
             }),
         );
@@ -298,6 +300,7 @@ mod tests {
                 receipt_hash: refusal,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         );

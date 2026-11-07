@@ -598,6 +598,7 @@ fn finalization_with_writes(height: BlockHeight, writes: StateWrites) -> Verifia
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     };
@@ -1065,6 +1066,7 @@ fn block_settling_receipt(
             receipt_hash,
             writes: make_state_writes(seed, seed, vec![seed]),
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     );

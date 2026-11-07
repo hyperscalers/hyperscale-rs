@@ -170,9 +170,10 @@ fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
 
 /// Whether `receipt` is an effects receipt under `hash` whose content
 /// recomputes to it under the shard's own locality, which a member a
-/// sibling shares the verdict on always runs under.
+/// sibling shares the verdict on always runs under, and which states a
+/// digest because that sibling holds it to one.
 fn effects_under(receipt: &StoredReceipt, hash: GlobalReceiptHash) -> bool {
-    matches!(*receipt.consensus, ConsensusReceipt::Succeeded { .. })
+    receipt.consensus.effects().is_some()
         && receipt.consensus.receipt_hash() == hash
         && receipt_hash_of(&receipt.consensus, true) == Some(hash)
 }
@@ -1200,10 +1201,48 @@ mod tests {
 
     use super::*;
     use crate::{
-        Address, AddressClass, AggregateSignature, BlockHeight, ExecutionVote, Hash, LocalKey,
-        Role, ShardId, SignerBitfield, StateWrites, SubstateKey, ValidatorId, WeightedTimestamp,
-        compute_global_receipt_root,
+        Address, AddressClass, AggregateSignature, BlockHeight, EffectsDigest, ExecutionVote, Hash,
+        LocalKey, Role, ShardId, SignerBitfield, StateWrites, SubstateKey, ValidatorId,
+        WeightedTimestamp, compute_global_receipt_root,
     };
+
+    /// A stated yes without a digest gives a sibling nothing to read it
+    /// against, however well its hash recomputes.
+    #[test]
+    fn a_stating_half_refuses_a_yes_without_a_digest() {
+        let unhashed = ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes: StateWrites::default(),
+            beacon_witness_events: Capped::empty(),
+            effects: None,
+            events: Capped::empty(),
+        };
+        let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
+        let undigested = StoredReceipt {
+            tx_hash: TxHash::from(Hash::from_bytes(b"undigested")),
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                effects: None,
+                events: Capped::empty(),
+            }),
+        };
+        assert!(effects_under(
+            &StoredReceipt {
+                tx_hash: undigested.tx_hash,
+                consensus: Arc::new(ConsensusReceipt::Succeeded {
+                    receipt_hash,
+                    writes: StateWrites::default(),
+                    beacon_witness_events: Capped::empty(),
+                    effects: Some(EffectsDigest::ZERO),
+                    events: Capped::empty(),
+                }),
+            },
+            receipt_hash,
+        ));
+        assert!(!effects_under(&undigested, receipt_hash));
+    }
 
     /// The half is part of what a finalization is, so it is part of its
     /// identity.
@@ -1349,6 +1388,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(hash)),
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         }
@@ -1369,6 +1409,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: Some(EffectsDigest::ZERO),
             events: Capped::empty(),
         };
         let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -1381,6 +1422,7 @@ mod tests {
                 receipt_hash,
                 writes,
                 beacon_witness_events: Capped::empty(),
+                effects: Some(EffectsDigest::ZERO),
                 events: Capped::empty(),
             }),
         }
@@ -1501,6 +1543,7 @@ mod tests {
                 receipt_hash: one.consensus.receipt_hash(),
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         };
@@ -1763,6 +1806,7 @@ mod tests {
                 receipt_hash,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         };

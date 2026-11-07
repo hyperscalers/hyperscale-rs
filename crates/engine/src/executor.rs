@@ -29,11 +29,11 @@ use hyperscale_effects_bridge::{
 use hyperscale_metrics::{record_provision_range_entries_consumed, record_transaction_executed};
 use hyperscale_storage::{Anchored, TickViewSnapshot, entry_from_leaf};
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Epoch, EscrowedValue,
-    Event, EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EffectsDigest, Epoch,
+    EscrowedValue, Event, EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
     MAX_STAGED_RECEIPT_BYTES, MAX_TICK_STAGED_BYTES, Movement, PriceTable, PrincipalAddr,
     ProvisionalHolds, Role, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root, effects_digest,
     install_protocol_statics, staged_yes_bytes, whole_work, witness_root, writes_root,
 };
 use hyperscale_vm_effects::{
@@ -899,6 +899,35 @@ fn release_fee_hold(writes: &mut StateWrites, vault: SubstateKey, tx: TxHash) {
         .insert(fee_hold_key(&ProtocolHasher, vault, tx), None);
 }
 
+/// Lay a run's burn over the writes its delta projected to: the delta is
+/// the one every shard of the member derives, and the burn this shard's
+/// alone.
+fn compose_burn(writes: &mut StateWrites, burn: Option<(SubstateKey, Movement)>) {
+    let Some((vault, burned)) = burn else {
+        return;
+    };
+    let composed = writes.movements.get(&vault).map_or(burned, |standing| {
+        standing
+            .then(burned)
+            .expect("a vault's debits fit under its balance and its credits")
+    });
+    writes.movements.insert(vault, composed);
+}
+
+/// The digest of a run a counterpart can refuse: its whole delta and all
+/// its events, owned and remote, the burn apart. The one thing every
+/// shard it spans derives alike, and what a sibling's yes is held to.
+/// Taken here and not in the kernel, because a member nobody shares has
+/// no reader for it.
+fn whole_effects(receipt: &Receipt) -> EffectsDigest {
+    let whole = receipt
+        .delta
+        .project(&OwnerSet::whole())
+        .expect("the kernel weighed every movement of the run");
+    let events: Vec<Hash> = receipt.events.iter().map(EventExt::hash).collect();
+    effects_digest(&whole, EventRoot::from_raw(compute_merkle_root(&events)))
+}
+
 /// What the charge pass took for a member the kernel burned nothing
 /// for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1132,11 +1161,13 @@ pub fn build_refusal_receipt(
         EventRoot::ZERO,
         BeaconWitnessRoot::ZERO,
         writes_root(&writes),
+        EffectsDigest::ZERO,
     )
     .receipt_hash();
     let cached = CachedOutput::succeeded(
         writes,
         receipt_hash,
+        None,
         vm_metadata(amount, None),
         Vec::new(),
         Vec::new(),
@@ -1192,6 +1223,16 @@ fn never_answers(
         .collect()
 }
 
+/// One publish of the batch.
+#[derive(Clone, Copy)]
+struct Publish<'a> {
+    tx: TxHash,
+    publisher: PrincipalAddr,
+    artifact: &'a [u8],
+    /// Whether a counterpart's verdict can still discard it.
+    abortable: bool,
+}
+
 /// Settle one publish: the artifact lands in the cell its content
 /// address names, and the fee burns from the publisher's vault.
 ///
@@ -1214,14 +1255,17 @@ fn never_answers(
 /// price the vault cannot cover is a publish that did not pay.
 fn assemble_published_tx(
     ctx: &TickBatchContext<'_>,
-    vm_tx: TxHash,
-    publisher: PrincipalAddr,
-    artifact: &[u8],
+    publish: Publish<'_>,
     refusal: Option<&str>,
     charge: Option<(PayerFee, Charge)>,
     locality: &OwnerSet,
 ) -> ExecutedTx {
-    let tx_hash = vm_tx;
+    let Publish {
+        tx: tx_hash,
+        publisher,
+        artifact,
+        abortable,
+    } = publish;
     // The declaration's price at the block's table, like any other
     // transaction: a publish's artifact is bytes written and retained,
     // and its two point writes are writes.
@@ -1232,6 +1276,15 @@ fn assemble_published_tx(
             let mut writes = StateWrites::default();
             let package = package_hash(&ProtocolHasher, artifact);
             let cell = package_key(package);
+            // The artifact alone, whichever shard holds its cell, and
+            // never the burn: that much every shard of the member runs.
+            let effects = abortable.then(|| {
+                let whole = StateWrites {
+                    cells: BTreeMap::from([(cell, Some(artifact.to_vec()))]),
+                    ..StateWrites::default()
+                };
+                effects_digest(&whole, EventRoot::ZERO)
+            });
             if locality.covers(cell.owner) {
                 // Content-addressed, so republishing the same artifact
                 // writes the same bytes to the same cell: idempotent by
@@ -1256,6 +1309,7 @@ fn assemble_published_tx(
                 EventRoot::ZERO,
                 BeaconWitnessRoot::ZERO,
                 writes_root(&writes),
+                effects.unwrap_or(EffectsDigest::ZERO),
             )
             .receipt_hash();
             // The publish raises no beacon fact. Nothing global answers
@@ -1264,6 +1318,7 @@ fn assemble_published_tx(
             CachedOutput::succeeded(
                 writes,
                 receipt_hash,
+                effects,
                 vm_metadata(charged, None),
                 Vec::new(),
                 Vec::new(),
@@ -1486,16 +1541,7 @@ fn assemble_executed_tx(
             .delta
             .project(locality)
             .expect("kernel-produced movements compose");
-        // The delta is the one every shard of the member derives, and the
-        // burn is this shard's alone, so it joins the writes here.
-        if let Some((vault, burned)) = receipt.burn {
-            let composed = writes.movements.get(&vault).map_or(burned, |standing| {
-                standing
-                    .then(burned)
-                    .expect("the kernel weighed the burn beside the vault's movements")
-            });
-            writes.movements.insert(vault, composed);
-        }
+        compose_burn(&mut writes, receipt.burn);
         // The charging member's run burns the price inside these writes,
         // or apart in its refusal receipt; the hold ends in whichever of
         // the two its finalization settles.
@@ -1545,13 +1591,16 @@ fn assemble_executed_tx(
         // — what its receipt stores — and not a union: a participant
         // running only its own legs cannot assemble one, and two
         // participants attesting different unions under one signed root
-        // would contradict each other. Agreement across shards is
-        // outcome-level in the certificates, never hash equality.
+        // would contradict each other. What the shards of a shared member
+        // hold each other to is the digest below, over the whole run.
         let event_hashes: Vec<Hash> = events
             .iter()
             .filter(|event| locality.covers(event.emitter))
             .map(EventExt::hash)
             .collect();
+        let effects = member
+            .is_some_and(Member::abortable)
+            .then(|| whole_effects(receipt));
         // The facts the receipt carries are the ones whose emitters this
         // shard owns, whatever the batch's locality: the projection keeps
         // a fact by its emitter's owner alone, and the root binds what it
@@ -1567,11 +1616,13 @@ fn assemble_executed_tx(
                     .map(|(_, witness)| witness),
             ),
             writes_root(&writes),
+            effects.unwrap_or(EffectsDigest::ZERO),
         )
         .receipt_hash();
         CachedOutput::succeeded(
             writes,
             receipt_hash,
+            effects,
             vm_metadata(charged, None),
             events,
             witnesses,
@@ -2050,9 +2101,14 @@ impl Executor {
                 *vm_tx,
                 assemble_published_tx(
                     ctx,
-                    *vm_tx,
-                    *publisher,
-                    artifact,
+                    Publish {
+                        tx: *vm_tx,
+                        publisher: *publisher,
+                        artifact,
+                        abortable: shapes
+                            .get(vm_tx)
+                            .is_some_and(|input| input.member.abortable()),
+                    },
                     refusal.as_deref(),
                     charge,
                     &locality,
@@ -2288,6 +2344,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed, 1])),
                 writes,
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             },
             vm_metadata(7, None),
@@ -2296,6 +2353,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed, 2])),
             writes: refusal,
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         });
         executed

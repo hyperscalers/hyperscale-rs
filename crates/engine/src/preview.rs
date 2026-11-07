@@ -1358,6 +1358,7 @@ mod point_tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes: writes.into(),
                 beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         };

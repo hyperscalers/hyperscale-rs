@@ -152,6 +152,7 @@ const fn served_reads_config() -> ScenarioConfig {
 fn two_members_reading_what_the_other_reserves_both_settle_sim() {
     let mut cluster = served_reads_cluster(sim_seed(42));
     two_members_reading_what_the_other_reserves_both_settle(&mut cluster);
+    cluster.assert_effects_compared();
 }
 
 /// A reclaim onto a vault a head reads and reserves leaves both shards
@@ -160,6 +161,7 @@ fn two_members_reading_what_the_other_reserves_both_settle_sim() {
 fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards_sim() {
     let mut cluster = served_reads_cluster(sim_seed(42));
     cluster.run_faultable(a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards);
+    cluster.assert_effects_compared();
 }
 
 /// An owed credit onto a vault a head debits composes with the debit.
@@ -167,6 +169,7 @@ fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards_sim() {
 fn an_owed_credit_onto_a_served_vault_composes_sim() {
     let mut cluster = served_reads_cluster(sim_seed(42));
     cluster.run_faultable(an_owed_credit_onto_a_served_vault_composes);
+    cluster.assert_effects_compared();
 }
 
 /// A member named in its head block waits for that block's write, on a
@@ -188,6 +191,7 @@ fn a_member_named_in_its_head_block_reads_one_part_sim() {
         },
     );
     a_member_named_in_its_head_block_reads_one_part(&mut cluster);
+    cluster.assert_effects_compared();
 }
 
 /// A member reading a vault a leg reserves heads once the leg settles,
@@ -230,4 +234,5 @@ fn a_route_is_served_on_a_book_filled_every_block() {
         let _ = route.run_with_fills_every_block(c, epochs(12), "a book filled every block", 6);
         route.assert_conserved(c, epochs(12));
     });
+    cluster.assert_effects_compared();
 }

@@ -30,13 +30,13 @@ use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
-    Ed25519PrivateKey, EnvelopeExt, Epoch, EpochSeed, EpochWindows, EscrowedValue, EventExt,
-    EventRoot, GlobalReceipt, Hash, Inclusion, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
-    MIN_STAKE_FLOOR, MerkleInclusionProof, Movement, NetworkId, PriceTable, PrincipalAddr,
-    ProvisionalHolds, RETENTION_HORIZON, Randomness, SeedRing, SeedSource, SettledWrites, ShardId,
-    ShardTrie, StateClaim, StateRoot, StateWrites, Stated, SubstateEntry, SubstateKey,
-    TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
-    compute_merkle_root, shard_prefix_path, writes_root,
+    Ed25519PrivateKey, EffectsDigest, EnvelopeExt, Epoch, EpochSeed, EpochWindows, EscrowedValue,
+    EventExt, EventRoot, GlobalReceipt, Hash, Inclusion, MAX_DECLARED_RESERVE,
+    MAX_INTENT_VALIDITY_RANGE, MIN_STAKE_FLOOR, MerkleInclusionProof, Movement, NetworkId,
+    PriceTable, PrincipalAddr, ProvisionalHolds, RETENTION_HORIZON, Randomness, SeedRing,
+    SeedSource, SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot, StateWrites, Stated,
+    SubstateEntry, SubstateKey, TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp,
+    absorb_committed_cells, compute_merkle_root, shard_prefix_path, writes_root,
 };
 use hyperscale_vm_effects::{
     AbiParam, Answered, Composed, CrossingCell, CrossingId, CrossingLeaf, Hash32, InstanceMeta,
@@ -2335,6 +2335,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             EventRoot::from_raw(compute_merkle_root(&event_hashes)),
             BeaconWitnessRoot::ZERO,
             writes_root(writes),
+            side.consensus.effects().unwrap_or(EffectsDigest::ZERO),
         )
         .receipt_hash();
         assert_eq!(

@@ -812,6 +812,7 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                     writes: StateWrites::default(),
                     beacon_witness_events: Capped::empty(),
+                    effects: None,
                     events: Capped::empty(),
                 }
             } else {

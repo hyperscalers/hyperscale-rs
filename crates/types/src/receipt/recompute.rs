@@ -5,13 +5,32 @@ use hyperscale_hbor::to_vec as hbor_to_vec;
 
 use crate::receipt::event::EventExt;
 use crate::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, EventRoot, GlobalReceipt,
-    GlobalReceiptHash, Hash, StateWrites, WritesRoot, compute_merkle_root,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, EffectsDigest, EventRoot,
+    GlobalReceipt, GlobalReceiptHash, Hash, StateWrites, WritesRoot, compute_merkle_root,
 };
 
 /// Domain tag separating a receipt's beacon-fact leaf from every other
 /// leaf preimage the codebase hashes.
 const RECEIPT_WITNESS_LEAF_TAG: &[u8] = b"hyperscale.receipt_witness_leaf.v1";
+
+/// Domain tag separating an effects digest from every other preimage
+/// the codebase hashes.
+const EFFECTS_DIGEST_TAG: &[u8] = b"hyperscale.effects_digest.v1";
+
+/// The digest of a whole run: `whole` is its delta projected over every
+/// owner, the fee burn apart, and `events` the root of all its events in
+/// emission order, whoever emitted them.
+///
+/// What a shared member's shards compare, so it reads no term any one
+/// shard's slice of the run would decide.
+#[must_use]
+pub fn effects_digest(whole: &StateWrites, events: EventRoot) -> EffectsDigest {
+    EffectsDigest::from_raw(Hash::from_parts(&[
+        EFFECTS_DIGEST_TAG,
+        writes_root(whole).as_raw().as_bytes(),
+        events.as_raw().as_bytes(),
+    ]))
+}
 
 /// The `writes_root` for a [`GlobalReceipt`] over the writes the
 /// executing shard attests — the shard-projected delta for a batch with
@@ -60,8 +79,9 @@ pub fn witness_root<'a>(
 /// under this shard's own locality, which a batch with a member reaching
 /// beyond the shard does and which the receipt does not record. Its
 /// writes, events and beacon facts are then exactly what the three roots
-/// were taken over, so the answer is the hash a quorum signed for an
-/// honest receipt and some other hash for one altered since.
+/// were taken over, and its digest is the fourth term as it stands, so
+/// the answer is the hash a quorum signed for an honest receipt and some
+/// other hash for one altered since.
 ///
 /// `None` for a success hashed under whole locality: its writes root can
 /// cover more than the slice the receipt holds. Every failure is the one
@@ -72,6 +92,7 @@ pub fn receipt_hash_of(receipt: &ConsensusReceipt, projected: bool) -> Option<Gl
         writes,
         beacon_witness_events,
         events,
+        effects,
         ..
     } = receipt
     else {
@@ -84,6 +105,7 @@ pub fn receipt_hash_of(receipt: &ConsensusReceipt, projected: bool) -> Option<Gl
             EventRoot::from_raw(compute_merkle_root(&event_hashes)),
             witness_root(beacon_witness_events.iter()),
             writes_root(writes),
+            effects.unwrap_or(EffectsDigest::ZERO),
         )
         .receipt_hash()
     })

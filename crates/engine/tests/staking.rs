@@ -30,8 +30,8 @@ use hyperscale_transactions::{Ceilings, Client, Terms, sign_intent};
 use hyperscale_types::test_utils::state_and_proof_holding;
 use hyperscale_types::{
     Anchor, BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusPublicKey,
-    ConsensusReceipt, ConsensusSignature, Deadline, Ed25519PrivateKey, EntryKey, EscrowedValue,
-    EventExt, EventRoot, ExecutionOutcome, GlobalReceipt, Hash, Inclusion, Issuer,
+    ConsensusReceipt, ConsensusSignature, Deadline, Ed25519PrivateKey, EffectsDigest, EntryKey,
+    EscrowedValue, EventExt, EventRoot, ExecutionOutcome, GlobalReceipt, Hash, Inclusion, Issuer,
     MAX_INTENT_VALIDITY_RANGE, MIN_STAKE_FLOOR, MerkleInclusionProof, NetworkId, PriceTable,
     PrincipalAddr, ProvisionalHolds, SettledEntries, SettledWrites, ShardId, ShardTrie, Stake,
     StakePoolId, StakePoolSeat, StateClaim, StateRoot, StateWrites, Stated, SubstateEntry,
@@ -2331,6 +2331,7 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
             EventRoot::from_raw(compute_merkle_root(&event_leaves(receipt))),
             witness_root(beacon_witness_events.iter()),
             writes_root(writes),
+            EffectsDigest::ZERO,
         )
         .receipt_hash()
     };
@@ -2399,6 +2400,7 @@ fn a_projected_receipt_recomputes_the_hash_the_executor_gave_it() {
         receipt_hash,
         writes,
         beacon_witness_events: Capped::empty(),
+        effects: None,
         events,
     };
     assert_ne!(receipt_hash_of(&stripped, true), Some(receipt_hash));
@@ -2538,6 +2540,7 @@ fn a_receipt_without_witness_events_keeps_its_hash() {
             EventRoot::from_raw(compute_merkle_root(&leaves)),
             BeaconWitnessRoot::ZERO,
             writes_root(writes),
+            EffectsDigest::ZERO,
         )
         .receipt_hash(),
     );

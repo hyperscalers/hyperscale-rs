@@ -643,14 +643,14 @@ pub mod tests {
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
         BodyRootContext, ChainOrigin, CommittedAt, ConsensusReceipt, Deadline, Derivation,
-        DerivationError, Derived, DiscardCause, Engagement, EngagementRoot, Epoch, EpochWindows,
-        Evidence, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
-        LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS,
-        MAX_NAMED_MEMBERS_PER_TICK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STAGED_RECEIPT_BYTES,
-        MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_TERMS_BYTES,
-        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MemberTerms,
-        MerkleInclusionProof, NetworkDefinition, Owes, PriceTable, PrincipalAddr,
+        DerivationError, Derived, DiscardCause, EffectsDigest, Engagement, EngagementRoot, Epoch,
+        EpochWindows, Evidence, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion,
+        Joins, LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES, MAX_FINALIZED_TX_PER_BLOCK,
+        MAX_INTENTS, MAX_NAMED_MEMBERS_PER_TICK, MAX_PROPOSAL_EVIDENCE_BYTES,
+        MAX_STAGED_RECEIPT_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
+        MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK,
+        MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES,
+        MemberTerms, MerkleInclusionProof, NetworkDefinition, Owes, PriceTable, PrincipalAddr,
         ProposerTimestamp, Provision, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON,
         Reshaping, Round, RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId, ShardLoad,
         Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites, StatedTerms,
@@ -790,6 +790,7 @@ pub mod tests {
                 receipt_hash: effects_hash(),
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: Some(EffectsDigest::ZERO),
                 events: Capped::empty(),
             }),
         }
@@ -802,6 +803,7 @@ pub mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
+                effects: Some(EffectsDigest::ZERO),
                 events: Capped::empty(),
             },
             true,
@@ -1159,6 +1161,7 @@ pub mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: make_state_writes(1, 1, vec![1]),
             beacon_witness_events: Capped::empty(),
+            effects: Some(EffectsDigest::ZERO),
             events: Capped::empty(),
         };
         let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -1171,6 +1174,7 @@ pub mod tests {
                     receipt_hash,
                     writes: make_state_writes(1, 1, vec![1]),
                     beacon_witness_events: Capped::empty(),
+                    effects: Some(EffectsDigest::ZERO),
                     events: Capped::empty(),
                 }),
             }])
@@ -4151,6 +4155,7 @@ pub mod tests {
                             receipt_hash: GlobalReceiptHash::ZERO,
                             writes: StateWrites::default(),
                             beacon_witness_events: Capped::empty(),
+                            effects: Some(EffectsDigest::ZERO),
                             events: Capped::empty(),
                         }),
                     )
@@ -4309,6 +4314,7 @@ pub mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: Some(EffectsDigest::ZERO),
             events: Capped::empty(),
         };
         let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -4323,6 +4329,7 @@ pub mod tests {
                     receipt_hash,
                     writes,
                     beacon_witness_events: Capped::empty(),
+                    effects: Some(EffectsDigest::ZERO),
                     events: Capped::empty(),
                 }),
             )]),
@@ -4528,6 +4535,7 @@ pub mod tests {
                         receipt_hash: effects_hash(),
                         writes: StateWrites::default(),
                         beacon_witness_events: Capped::empty(),
+                        effects: Some(EffectsDigest::ZERO),
                         events: Capped::empty(),
                     }),
                 )

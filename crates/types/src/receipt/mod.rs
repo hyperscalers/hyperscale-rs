@@ -2,8 +2,8 @@
 //!
 //! | Tier | Type | Contents |
 //! |------|------|----------|
-//! | **Global**    | [`GlobalReceipt`](global::GlobalReceipt)         | success bit + `event_root` + `beacon_witness_root` + `writes_root` |
-//! | **Consensus** | [`ConsensusReceipt`](consensus::ConsensusReceipt) | variant tag + (Succeeded:) shard-filtered writes + events + beacon-witness events + precomputed `receipt_hash` |
+//! | **Global**    | [`GlobalReceipt`](global::GlobalReceipt)         | success bit + `event_root` + `beacon_witness_root` + `writes_root` + `effects` |
+//! | **Consensus** | [`ConsensusReceipt`](consensus::ConsensusReceipt) | variant tag + (Succeeded:) shard-filtered writes + events + beacon-witness events + precomputed `receipt_hash` + `effects` |
 //! | **Metadata**  | [`ExecutionMetadata`](metadata::ExecutionMetadata) | fees, logs, errors (local-only) |
 //! | **Stored**    | [`StoredReceipt`](stored::StoredReceipt)         | `tx_hash` + consensus |
 //!
@@ -34,8 +34,8 @@ mod tests {
 
     use crate::receipt::event::EventExt;
     use crate::{
-        BeaconWitnessRoot, ConsensusReceipt, Event, EventRoot, GlobalReceipt, GlobalReceiptHash,
-        Hash, StateWrites, WritesRoot,
+        BeaconWitnessRoot, ConsensusReceipt, EffectsDigest, Event, EventRoot, GlobalReceipt,
+        GlobalReceiptHash, Hash, StateWrites, WritesRoot, effects_digest, receipt_hash_of,
     };
 
     fn make_event(seed: u8) -> Event {
@@ -51,6 +51,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::new(events).expect("a list written out in a test"),
         }
     }
@@ -62,12 +63,14 @@ mod tests {
             EventRoot::ZERO,
             BeaconWitnessRoot::ZERO,
             WritesRoot::ZERO,
+            EffectsDigest::ZERO,
         );
         let failure = GlobalReceipt::new(
             false,
             EventRoot::ZERO,
             BeaconWitnessRoot::ZERO,
             WritesRoot::ZERO,
+            EffectsDigest::ZERO,
         );
         assert_ne!(success.receipt_hash(), failure.receipt_hash());
     }
@@ -79,12 +82,14 @@ mod tests {
             EventRoot::ZERO,
             BeaconWitnessRoot::ZERO,
             WritesRoot::ZERO,
+            EffectsDigest::ZERO,
         );
         let b = GlobalReceipt::new(
             true,
             EventRoot::ZERO,
             BeaconWitnessRoot::ZERO,
             WritesRoot::from_raw(Hash::from_bytes(b"different")),
+            EffectsDigest::ZERO,
         );
         assert_ne!(a.receipt_hash(), b.receipt_hash());
     }
@@ -96,14 +101,52 @@ mod tests {
             EventRoot::ZERO,
             BeaconWitnessRoot::ZERO,
             WritesRoot::ZERO,
+            EffectsDigest::ZERO,
         );
         let b = GlobalReceipt::new(
             true,
             EventRoot::ZERO,
             BeaconWitnessRoot::from_raw(Hash::from_bytes(b"witness")),
             WritesRoot::ZERO,
+            EffectsDigest::ZERO,
         );
         assert_ne!(a.receipt_hash(), b.receipt_hash());
+    }
+
+    /// A digest sits under the hash, so a receipt carrying another one
+    /// recomputes to another hash: no proposer can stage its own.
+    #[test]
+    fn a_receipt_binds_its_digest() {
+        let stating = |effects| {
+            let ConsensusReceipt::Succeeded {
+                receipt_hash,
+                writes,
+                beacon_witness_events,
+                events,
+                ..
+            } = make_succeeded(vec![make_event(1)])
+            else {
+                unreachable!("make_succeeded succeeds");
+            };
+            let receipt = ConsensusReceipt::Succeeded {
+                receipt_hash,
+                writes,
+                beacon_witness_events,
+                events,
+                effects,
+            };
+            receipt_hash_of(&receipt, true).expect("a projected success")
+        };
+        let (one, other) = (
+            effects_digest(&StateWrites::default(), EventRoot::ZERO),
+            effects_digest(
+                &StateWrites::default(),
+                EventRoot::from_raw(Hash::from_bytes(b"events")),
+            ),
+        );
+        assert_ne!(one, other, "the digest covers the events");
+        assert_ne!(stating(Some(one)), stating(Some(other)));
+        assert_ne!(stating(Some(one)), stating(None));
     }
 
     #[test]

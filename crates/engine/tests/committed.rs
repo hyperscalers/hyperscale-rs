@@ -142,6 +142,7 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: make_state_writes(0xA0, 1, vec![1; 4]),
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     );
@@ -326,6 +327,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: make_state_writes(0xA0, 1, vec![1; 4]),
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     );
@@ -424,6 +426,7 @@ fn funding(vault: SubstateKey) -> StoredReceipt {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
             beacon_witness_events: Capped::empty(),
+            effects: None,
             events: Capped::empty(),
         }),
     )
@@ -583,6 +586,24 @@ fn a_follower_applies_its_half_of_the_terminal() {
     );
 }
 
+/// The receipt settling `writes`.
+fn settling(writes: StateWrites) -> StoredReceipt {
+    use std::sync::Arc;
+
+    use hyperscale_types::GlobalReceiptHash;
+
+    StoredReceipt::new(
+        TxHash::ZERO,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes,
+            beacon_witness_events: Capped::empty(),
+            effects: None,
+            events: Capped::empty(),
+        }),
+    )
+}
+
 /// A split child following its parent's block folds the parent's fee
 /// holds over its own half: a hold and its vault's total sit under the
 /// vault's owner, so a cut puts each on its vault's side, and the halves
@@ -597,8 +618,8 @@ fn a_split_child_recomposes_the_parents_fee_holds() {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::stub_transaction;
     use hyperscale_types::{
-        BlockHeight, ConsensusReceipt, GlobalReceiptHash, PrincipalAddr, SplitChildRoots,
-        StateWrites, TimestampRange, TxHash, Verifiable, WeightedTimestamp, shard_prefix_path,
+        BlockHeight, PrincipalAddr, SplitChildRoots, TimestampRange, Verifiable, WeightedTimestamp,
+        shard_prefix_path,
     };
 
     let parent = ShardId::leaf(2, 2);
@@ -651,17 +672,6 @@ fn a_split_child_recomposes_the_parents_fee_holds() {
     // settles it; a write on each half keeps both subtrees populated.
     let mut release = make_state_writes(0xA0, 1, vec![1; 4]);
     release.cells.insert(t0_hold.hold_key(), None);
-    let settling = |writes: StateWrites| {
-        StoredReceipt::new(
-            TxHash::ZERO,
-            Arc::new(ConsensusReceipt::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-                writes,
-                beacon_witness_events: Capped::empty(),
-                events: Capped::empty(),
-            }),
-        )
-    };
     let first = carrying(
         1,
         &t0,
