@@ -30,8 +30,7 @@ use hyperscale_scenarios::query::{
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     BlockServingCap, Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster,
-    MemberEdge, ProofMeter, RestartableCluster, ScenarioConfig, epochs, grow_and_hold,
-    submission_shards,
+    MemberEdge, ProofMeter, RestartableCluster, ScenarioConfig, grow_and_hold, submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{
@@ -785,15 +784,17 @@ impl SimCluster {
         }
     }
 
-    /// Run until the walk has held two shards' statements to each other,
-    /// for a scenario whose member both shards state.
+    /// Walk to the tip and require that some two shards' statements were
+    /// held to each other, for a load whose every route may lose.
     ///
     /// # Panics
     ///
-    /// If it never does, which leaves the oracle having proved nothing.
+    /// If none were, which leaves the oracle having proved nothing, or
+    /// as [`Self::hold_served_parts`] does.
     pub fn assert_effects_compared(&mut self) {
+        self.hold_served_parts();
         assert!(
-            Cluster::run_until(self, epochs(4), |c| c.effects_compared() > 0),
+            self.effects_compared() > 0,
             "no two shards' statements were held to each other",
         );
     }
@@ -856,6 +857,7 @@ impl SimCluster {
     pub fn run_faultable<R>(&mut self, scenario: impl FnOnce(&mut Self) -> R) -> R {
         let recorder: Arc<dyn MetricsRecorder> = Arc::new(self.recorder.clone());
         let outcome = with_scoped_recorder(recorder, || scenario(self));
+        self.hold_served_parts();
         assert_eq!(
             self.recorder.counter("terminal_fated_hearing_rows", None),
             0,
@@ -1524,6 +1526,13 @@ impl Cluster for SimCluster {
 
     fn effects_compared(&self) -> usize {
         self.stated_effects.compared
+    }
+
+    fn effects_agreed(&self, tx: TxHash) -> bool {
+        self.stated_effects
+            .stated
+            .get(&tx)
+            .is_some_and(|stated| stated.len() > 1)
     }
 
     fn served_part_agreed(&self, shard: ShardId, tx: TxHash) -> bool {

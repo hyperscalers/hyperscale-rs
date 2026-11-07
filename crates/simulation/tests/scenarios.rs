@@ -3474,7 +3474,6 @@ fn a_book_route_reads_its_range_across_a_split_sim() {
         GenesisPackages::with_fixtures(),
     );
     cluster.run_faultable(a_book_route_reads_its_range_across_a_split);
-    cluster.assert_effects_compared();
 }
 
 #[test]

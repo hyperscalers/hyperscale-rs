@@ -2755,7 +2755,8 @@ pub fn a_book_route_reads_its_range_across_a_split<C: FaultableCluster>(c: &mut 
         child, FIRST_VENUE_SHARD,
         "the cut must land the venue on a child"
     );
-    route.run(c, epochs(12), "split");
+    let fill = route.run(c, epochs(12), "split");
+    c.assert_effects_agreed(fill.hash);
 
     for shard in [FIRST_VENUE_SHARD, child] {
         let consumed = c.metric(

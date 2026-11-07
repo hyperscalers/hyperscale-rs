@@ -14,8 +14,8 @@ use hyperscale_types::{
     TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
 };
 
-use super::Budget;
 use super::query::{ChainMentions, ClaimsSection, RanAs, shard_decisions, status_rank};
+use super::{Budget, epochs};
 
 /// The shards a submission of `tx` may enter at, the fee payer's first.
 ///
@@ -472,6 +472,30 @@ pub trait Cluster {
     /// to another shard's digest. Zero where it does not hold them to it.
     fn effects_compared(&self) -> usize {
         0
+    }
+
+    /// Whether this cluster has held two shards' statements of `tx` to
+    /// each other. False where it does not hold them to it.
+    fn effects_agreed(&self, tx: TxHash) -> bool {
+        let _ = tx;
+        false
+    }
+
+    /// Run until two shards' statements of `tx` have been held to each
+    /// other, for a member they both state.
+    ///
+    /// # Panics
+    ///
+    /// If they never are, which leaves the oracle having proved nothing
+    /// of `tx`.
+    fn assert_effects_agreed(&mut self, tx: TxHash)
+    where
+        Self: Sized,
+    {
+        assert!(
+            self.run_until(epochs(4), |c| c.effects_agreed(tx)),
+            "no two shards' statements of {tx:?} were held to each other",
+        );
     }
 
     /// Whether this cluster has held `tx`'s member on `shard` to the part

@@ -333,6 +333,8 @@ pub fn two_members_reading_what_the_other_reserves_both_settle<C: Cluster>(c: &m
         "the second is served from its head, past the block committing it: {second_served:?} \
          against {second_committed:?}",
     );
+    c.assert_effects_agreed(first);
+    c.assert_effects_agreed(second);
     stage.assert_conserved(c, "two members reading what the other reserves");
 }
 
@@ -421,6 +423,7 @@ pub fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards<C: Faultabl
         c.run_until(epochs(4), |c| c.served_part_agreed(HOME, route)),
         "the oracle must have compared the route's part",
     );
+    c.assert_effects_agreed(route);
     stage.assert_conserved(c, "a reclaim onto a served till");
 }
 
@@ -519,6 +522,7 @@ pub fn an_owed_credit_onto_a_served_vault_composes<C: FaultableCluster>(c: &mut 
         c.run_until(epochs(4), |c| c.served_part_agreed(HOME, route)),
         "the oracle must have compared the route's part",
     );
+    c.assert_effects_agreed(route);
     stage.assert_conserved(c, "an owed credit onto a served vault");
 }
 
@@ -562,6 +566,7 @@ pub fn a_member_named_in_its_head_block_reads_one_part<C: Cluster>(c: &mut C) {
         c.run_until(epochs(4), |c| c.served_part_agreed(shard, route)),
         "the oracle must have compared the route's part on {shard:?}",
     );
+    c.assert_effects_agreed(route);
     stage.assert_conserved(c, "a member named in its head block");
 }
 
@@ -606,6 +611,7 @@ pub fn a_restart_between_head_and_tick_reads_the_same_part<C: FaultableCluster>(
         c.run_until(epochs(4), |c| c.served_parts_agreed() > 0),
         "the oracle must have read a part",
     );
+    c.assert_effects_agreed(route);
     stage.assert_conserved(c, "a restart between head and tick");
 }
 

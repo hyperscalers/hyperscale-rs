@@ -177,6 +177,7 @@ pub fn a_divided_core_pays_out_under_one_clock<C: FaultableCluster>(c: &mut C) {
         [PAYMENT, 0],
         "the payment lands in the first cutoff alone, under the early shard's clock",
     );
+    c.assert_effects_agreed(hash);
 }
 
 /// The cell `meta` keeps the protocol resource in.

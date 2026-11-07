@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_scenarios::{
-    BookRoute, ScenarioConfig, a_cycle_through_a_payer_core_aborts_at_the_window,
+    BookRoute, Cluster, ScenarioConfig, a_cycle_through_a_payer_core_aborts_at_the_window,
     a_hot_venue_runs_every_swap_where_it_commits,
     a_leg_reserving_a_read_vault_settles_before_the_read,
     a_member_named_in_its_head_block_reads_one_part,
@@ -151,8 +151,7 @@ const fn served_reads_config() -> ScenarioConfig {
 #[test]
 fn two_members_reading_what_the_other_reserves_both_settle_sim() {
     let mut cluster = served_reads_cluster(sim_seed(42));
-    two_members_reading_what_the_other_reserves_both_settle(&mut cluster);
-    cluster.assert_effects_compared();
+    cluster.run_faultable(two_members_reading_what_the_other_reserves_both_settle);
 }
 
 /// A reclaim onto a vault a head reads and reserves leaves both shards
@@ -161,7 +160,6 @@ fn two_members_reading_what_the_other_reserves_both_settle_sim() {
 fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards_sim() {
     let mut cluster = served_reads_cluster(sim_seed(42));
     cluster.run_faultable(a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards);
-    cluster.assert_effects_compared();
 }
 
 /// An owed credit onto a vault a head debits composes with the debit.
@@ -169,7 +167,6 @@ fn a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards_sim() {
 fn an_owed_credit_onto_a_served_vault_composes_sim() {
     let mut cluster = served_reads_cluster(sim_seed(42));
     cluster.run_faultable(an_owed_credit_onto_a_served_vault_composes);
-    cluster.assert_effects_compared();
 }
 
 /// A member named in its head block waits for that block's write, on a
@@ -190,8 +187,7 @@ fn a_member_named_in_its_head_block_reads_one_part_sim() {
             tail: Duration::ZERO,
         },
     );
-    a_member_named_in_its_head_block_reads_one_part(&mut cluster);
-    cluster.assert_effects_compared();
+    cluster.run_faultable(a_member_named_in_its_head_block_reads_one_part);
 }
 
 /// A member reading a vault a leg reserves heads once the leg settles,
@@ -231,8 +227,8 @@ fn a_route_is_served_on_a_book_filled_every_block() {
     let mut cluster = book_route_cluster(sim_seed(42));
     cluster.run_faultable(|c| {
         let mut route = BookRoute::stand_up(c);
-        let _ = route.run_with_fills_every_block(c, epochs(12), "a book filled every block", 6);
+        let fill = route.run_with_fills_every_block(c, epochs(12), "a book filled every block", 6);
         route.assert_conserved(c, epochs(12));
+        c.assert_effects_agreed(fill.hash);
     });
-    cluster.assert_effects_compared();
 }
