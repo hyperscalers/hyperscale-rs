@@ -1,12 +1,10 @@
 //! [`CertificateRoot`]: the root over a block's finalizations, one leaf
 //! per finalization's receipt hash.
 
-use std::sync::Arc;
-
 use crate::{CertificateRoot, Finalization, Hash, LeafRoot, Verifiable};
 
 impl LeafRoot for CertificateRoot {
-    type Leaf = Arc<Verifiable<Finalization>>;
+    type Leaf = Verifiable<Finalization>;
 
     const ZERO: Self = Self::ZERO;
 

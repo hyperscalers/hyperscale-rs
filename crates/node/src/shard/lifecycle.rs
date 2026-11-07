@@ -1,4 +1,4 @@
-//! Host bring-up: genesis bootstrap and inbound handler registration.
+//! Host bring-up: genesis bootstrap.
 //!
 //! These methods run at well-defined points in the host's life, not
 //! on every event. The run-loop methods live in [`super`].
@@ -8,10 +8,6 @@
 //! - [`network_genesis_block`] commits the network genesis substates into a
 //!   fresh store and builds the genesis block over their state root. Every
 //!   store that installs it builds the same block.
-//! - [`NodeHost::register_inbound_handlers`] wires the request / gossip /
-//!   notification handler closures into the network adapter. Required
-//!   before the host starts processing events; reached by both genesis
-//!   and resume paths.
 
 use std::sync::Arc;
 
@@ -25,8 +21,9 @@ use hyperscale_types::{
     Verified, WeightedTimestamp,
 };
 
+use crate::event::{HostEvent, StepOutput};
 use crate::host::{NodeHost, ShardGenesis};
-use crate::shard::{HostEvent, StepOutput, committed_state_restored};
+use crate::shard::committed_state_restored;
 
 impl<S, N, D> NodeHost<S, N, D>
 where
@@ -77,10 +74,8 @@ where
     /// replica, and drain the resulting setup output.
     ///
     /// Returns the block, its certified form, and the drained
-    /// [`StepOutput`]. The caller commits the
-    /// certified block — production steps `BlockCommitted` inline, simulation
-    /// schedules it after the network is wired — so this stops short of the
-    /// commit, the one step the two runners can't share.
+    /// [`StepOutput`]. The caller commits the certified block, which lets
+    /// the simulation schedule the commit after the network is wired.
     pub fn build_shard_genesis(&mut self, shard: ShardId, config: &GenesisConfig) -> ShardGenesis
     where
         S: GenesisCommit,
@@ -104,17 +99,6 @@ where
             setup_output,
         }
     }
-
-    /// Register inbound network handlers (requests, gossip, notifications).
-    ///
-    /// Must be called once per node before the `NodeHost` starts processing
-    /// events. Both genesis and resume paths reach this — registration is
-    /// not coupled to whether genesis ran.
-    pub fn register_inbound_handlers(&mut self) {
-        self.register_request_handler();
-        self.register_gossip_handlers();
-        self.register_notification_handlers();
-    }
 }
 
 /// The proposer every network genesis block names. A genesis block is
@@ -134,10 +118,6 @@ const GENESIS_PROPOSER: ValidatorId = ValidatorId::new(0);
 /// `topology_snapshot` places the genesis accounts: a store holds only
 /// the ones whose address falls in `shard`'s range, which is the same
 /// under any topology `shard` is a leaf of.
-///
-/// Independent of network-handler registration — runners call
-/// [`NodeHost::register_inbound_handlers`] once their genesis-or-resume
-/// decision is settled.
 ///
 /// # Panics
 ///

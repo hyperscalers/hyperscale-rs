@@ -1,8 +1,6 @@
 //! Candidate beacon-block gossip — the SPC output awaiting
 //! ratification.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 
 use crate::network::{GossipMessage, GossipScope};
@@ -28,7 +26,7 @@ use crate::{CandidateBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct BeaconCandidateGossip {
     /// The candidate block paired with its SPC proposal certificate.
-    pub candidate: Arc<Verifiable<CandidateBeaconBlock>>,
+    pub candidate: Verifiable<CandidateBeaconBlock>,
 }
 
 impl BeaconCandidateGossip {
@@ -36,7 +34,7 @@ impl BeaconCandidateGossip {
     /// raw candidate or a `Verified<CandidateBeaconBlock>` — the
     /// wrapper preserves the marker.
     #[must_use]
-    pub fn new(candidate: impl Into<Arc<Verifiable<CandidateBeaconBlock>>>) -> Self {
+    pub fn new(candidate: impl Into<Verifiable<CandidateBeaconBlock>>) -> Self {
         Self {
             candidate: candidate.into(),
         }
@@ -52,7 +50,7 @@ impl BeaconCandidateGossip {
     /// Consume and return the inner candidate, preserving the
     /// verification marker.
     #[must_use]
-    pub fn into_candidate(self) -> Arc<Verifiable<CandidateBeaconBlock>> {
+    pub fn into_candidate(self) -> Verifiable<CandidateBeaconBlock> {
         self.candidate
     }
 }
@@ -113,7 +111,7 @@ mod tests {
 
     #[test]
     fn hbor_round_trip() {
-        let g = BeaconCandidateGossip::new(Arc::new(Verifiable::from(sample_candidate())));
+        let g = BeaconCandidateGossip::new(sample_candidate());
         let bytes = hbor_to_vec(&g).unwrap();
         let decoded: BeaconCandidateGossip = hbor_from_slice(&bytes).unwrap();
         assert_eq!(g, decoded);

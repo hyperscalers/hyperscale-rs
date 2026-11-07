@@ -9,6 +9,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BlockHeight, DeclaredRange, Hash, StateRoot, SubstateKey, SweepBucket, SweepFrontier,
+    WeightedTimestamp,
 };
 
 use super::core::SimShardStorage;
@@ -70,11 +71,13 @@ fn snapshot_of(state: &SharedState, version: u64) -> SimSnapshot {
 }
 
 impl VersionedStore for SimShardStorage {
+    type Versioned = SimSnapshot;
+
     fn retention_floor(&self) -> u64 {
         Self::retention_floor(self)
     }
 
-    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<SimSnapshot> {
         let state = read_or_recover(&self.state);
         let held = height <= state.current_block_height && height.inner() >= state.retention_floor;
         let snapshot = held.then(|| snapshot_of(&state, height.inner()));
@@ -82,7 +85,7 @@ impl VersionedStore for SimShardStorage {
         snapshot
     }
 
-    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+    fn snapshot_at(&self, height: BlockHeight) -> SimSnapshot {
         let state = read_or_recover(&self.state);
         let (floor, tip) = (state.retention_floor, state.current_block_height);
         let snapshot = snapshot_of(&state, height.inner());
@@ -103,8 +106,10 @@ impl VersionedStore for SimShardStorage {
             .copied()
     }
 
-    fn hold_retention_at(&self, height: BlockHeight) {
-        write_or_recover(&self.state).retention_hold = height.inner();
+    fn hold_retention_at(&self, height: BlockHeight, clock: WeightedTimestamp) {
+        let mut state = write_or_recover(&self.state);
+        state.retention_hold = height.inner();
+        state.retention_clock = clock;
     }
 }
 

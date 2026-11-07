@@ -38,49 +38,18 @@ pub mod vote;
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_hbor::{
         Capped, DecodeError, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
 
-    use crate::test_utils::{test_prefix, test_transaction_with_prefixes};
     use crate::{
-        Address, AggregateSignature, BlockHeight, ConsensusReceipt, ExecutionCertificate,
-        ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, NetworkDefinition, ProvisionTxRoot, ProvisionTxRootsMap, RETENTION_HORIZON,
-        ReceiptValidationError, ShardId, SignerBitfield, StateWrites, StoredReceipt, TickHalf,
-        TickId, TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet,
-        Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
-        compute_global_receipt_root_with_proof, compute_merkle_root, receipt_hash_of, tick_leader,
-        tx_outcome_leaf, verify_merkle_inclusion,
+        AggregateSignature, BlockHeight, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome,
+        Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+        RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield, StateWrites,
+        StoredReceipt, TickHalf, TickId, TxHash, TxOutcome, ValidatorId, WeightedTimestamp,
+        compute_global_receipt_root, compute_global_receipt_root_with_proof, receipt_hash_of,
+        tick_leader, tx_outcome_leaf, verify_merkle_inclusion,
     };
-
-    /// Build a 2-shard topology with validator 0 on shard 0.
-    fn two_shard_topology() -> TopologySnapshot {
-        let validators: Vec<_> = (0..4)
-            .map(|i| ValidatorInfo {
-                validator_id: ValidatorId::new(i),
-                public_key: BlsSigner::generate().public_key(),
-            })
-            .collect();
-        TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            2,
-            ValidatorSet::new(validators),
-        )
-    }
-
-    /// Find a node seed that routes to `target_shard` under 2-way sharding.
-    fn prefix_on_shard(topology_snapshot: &TopologySnapshot, target_shard: ShardId) -> Address {
-        for seed in 0u8..=255 {
-            let prefix = test_prefix(seed);
-            if topology_snapshot.shard_for_prefix(prefix) == target_shard {
-                return prefix;
-            }
-        }
-        panic!("no prefix seed routes to {target_shard:?}");
-    }
 
     fn make_outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -107,72 +76,6 @@ mod tests {
         let w1 = make_tick_id(0, BlockHeight::new(42));
         let w2 = make_tick_id(0, BlockHeight::new(43));
         assert_ne!(w1, w2);
-    }
-
-    #[test]
-    fn test_compute_provision_tx_roots_empty() {
-        let topology_snapshot = two_shard_topology();
-        let map = Verified::<ProvisionTxRootsMap>::compute(
-            ShardId::leaf(1, 0),
-            &topology_snapshot,
-            &[],
-            &|tx| topology_snapshot.all_shards_for_transaction(tx),
-        );
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn test_compute_provision_tx_roots_single_shard_excluded() {
-        let topology_snapshot = two_shard_topology();
-        let local_prefix = prefix_on_shard(&topology_snapshot, ShardId::leaf(1, 0));
-        let tx = Arc::new(Verifiable::from(test_transaction_with_prefixes(
-            &[1, 2, 3],
-            &[local_prefix],
-            &[local_prefix],
-        )));
-        let map = Verified::<ProvisionTxRootsMap>::compute(
-            ShardId::leaf(1, 0),
-            &topology_snapshot,
-            &[tx],
-            &|tx| topology_snapshot.all_shards_for_transaction(tx),
-        );
-        assert!(map.is_empty(), "single-shard tx must not produce an entry");
-    }
-
-    #[test]
-    fn test_compute_provision_tx_roots_covers_all_touched_targets() {
-        let topology_snapshot = two_shard_topology();
-        let local_prefix = prefix_on_shard(&topology_snapshot, ShardId::leaf(1, 0));
-        let remote_prefix = prefix_on_shard(&topology_snapshot, ShardId::leaf(1, 1));
-
-        // Cross-shard tx: writes span local shard 0 and remote shard 1.
-        let tx_a = Arc::new(Verifiable::from(test_transaction_with_prefixes(
-            &[1, 2, 3],
-            &[],
-            &[local_prefix, remote_prefix],
-        )));
-        let tx_b = Arc::new(Verifiable::from(test_transaction_with_prefixes(
-            &[4, 5, 6],
-            &[],
-            &[local_prefix, remote_prefix],
-        )));
-
-        let roots = Verified::<ProvisionTxRootsMap>::compute(
-            ShardId::leaf(1, 0),
-            &topology_snapshot,
-            &[tx_a.clone(), tx_b.clone()],
-            &|tx| topology_snapshot.all_shards_for_transaction(tx),
-        );
-
-        // Local shard excluded; only shard 1 receives provisions.
-        assert_eq!(roots.len(), 1);
-        assert!(roots.contains_key(&ShardId::leaf(1, 1)));
-
-        let expected = ProvisionTxRoot::from_raw(compute_merkle_root(&[
-            Hash::from(tx_a.hash()),
-            Hash::from(tx_b.hash()),
-        ]));
-        assert_eq!(roots[&ShardId::leaf(1, 1)], expected);
     }
 
     #[test]
@@ -272,17 +175,17 @@ mod tests {
         assert_eq!(ec.deadline(), ec.vote_anchor_ts().plus(RETENTION_HORIZON));
     }
 
-    fn make_test_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {
+    fn make_test_ec(shard: u64, seed: u8) -> ExecutionCertificate {
         let outcomes = vec![make_outcome(seed)];
         let global_receipt_root = compute_global_receipt_root(&outcomes);
-        Arc::new(ExecutionCertificate::new(
+        ExecutionCertificate::new(
             make_tick_id(shard, BlockHeight::new(42)),
             WeightedTimestamp::from_millis(43),
             global_receipt_root,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     #[test]
@@ -327,10 +230,9 @@ mod tests {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let outcomes = vec![make_outcome(2), make_outcome(3)];
         let wide = make_local_ec(&tick_id, outcomes);
-        let narrowed = Arc::new(
-            wide.project_to(&std::iter::once(make_outcome(2).tx_hash()).collect())
-                .expect("a copy covering one of the two"),
-        );
+        let narrowed = wide
+            .project_to(&std::iter::once(make_outcome(2).tx_hash()).collect())
+            .expect("a copy covering one of the two");
         assert_eq!(
             narrowed.global_receipt_root(),
             wide.global_receipt_root(),
@@ -541,15 +443,15 @@ mod tests {
         assert_eq!(tick_leader(&tick_id, &committee), leader);
     }
 
-    fn make_local_ec(tick_id: &TickId, outcomes: Vec<TxOutcome>) -> Arc<ExecutionCertificate> {
-        Arc::new(ExecutionCertificate::new(
+    fn make_local_ec(tick_id: &TickId, outcomes: Vec<TxOutcome>) -> ExecutionCertificate {
+        ExecutionCertificate::new(
             *tick_id,
             WeightedTimestamp::from_millis(tick_id.block_height().inner() + 1),
             compute_global_receipt_root(&outcomes),
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     fn make_success_receipt() -> Arc<ConsensusReceipt> {

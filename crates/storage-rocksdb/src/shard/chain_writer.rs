@@ -39,7 +39,7 @@ impl ShardChainWriter for RocksDbShardStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
-        finalizations: &[Arc<Verifiable<Finalization>>],
+        finalizations: &[Verifiable<Finalization>],
         chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
@@ -190,7 +190,7 @@ fn build_prepared_commit(
             let floor = storage.advance_retention_floor(
                 &mut write_batch,
                 block.height().inner(),
-                qc.weighted_timestamp(),
+                block.header().parent_qc().weighted_timestamp(),
             );
             storage.append_block_to_batch(
                 &mut write_batch,

@@ -15,7 +15,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, genesis_world_with_pools, pool_address, stake_unit,
 };
 use hyperscale_engine::legs::{Classified, Member};
-use hyperscale_engine::tick_select::{CommittedSets, member_lines, terms_of_member};
+use hyperscale_engine::tick_select::{self, CommittedSets, member_lines, terms_of_member};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
     TickTxInput, genesis_writes,
@@ -159,7 +159,7 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
     };
     let block = Block::Live {
         header,
-        transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx))])),
+        transactions: Arc::new(Capped::from_array([(Verifiable::from(tx))])),
         certificates,
         provisions,
         abandonment_records,
@@ -347,7 +347,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             shard_id: parent,
             ..header.into_parts()
         }),
-        transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx.clone()))])),
+        transactions: Arc::new(Capped::from_array([(Verifiable::from(tx.clone()))])),
         certificates,
         provisions,
         abandonment_records,
@@ -358,6 +358,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(1),
@@ -365,6 +366,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(&tx),
             crossings: Capped::empty(),
+            served_at: None,
         }])),
         terms,
         witness_sources,
@@ -463,7 +465,7 @@ fn on_chain(
             Capped::new(
                 transactions
                     .iter()
-                    .map(|tx| Arc::new(Verifiable::from(tx.clone())))
+                    .map(|tx| Verifiable::from(tx.clone()))
                     .collect(),
             )
             .expect("a list written out in a test"),
@@ -512,6 +514,7 @@ fn a_follower_applies_its_half_of_the_terminal() {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge,
@@ -519,6 +522,7 @@ fn a_follower_applies_its_half_of_the_terminal() {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(&tx),
             crossings: Capped::empty(),
+            served_at: None,
         }]),
     );
     let terminal = on_chain(
@@ -632,7 +636,7 @@ fn a_split_child_recomposes_the_parents_fee_holds() {
         };
         let block = Block::Live {
             header,
-            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx.clone()))])),
+            transactions: Arc::new(Capped::from_array([(Verifiable::from(tx.clone()))])),
             certificates,
             provisions,
             abandonment_records,
@@ -755,15 +759,17 @@ impl SubstateStore for MapDb {
 }
 
 impl VersionedStore for MapDb {
+    type Versioned = Self;
+
     fn retention_floor(&self) -> u64 {
         0
     }
 
-    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self> {
         (height <= self.jmt_height()).then(|| self.snapshot_at(height))
     }
 
-    fn snapshot_at(&self, _height: BlockHeight) -> Self::Snapshot<'_> {
+    fn snapshot_at(&self, _height: BlockHeight) -> Self {
         Self(self.0.clone())
     }
 
@@ -771,7 +777,7 @@ impl VersionedStore for MapDb {
         None
     }
 
-    fn hold_retention_at(&self, _height: BlockHeight) {}
+    fn hold_retention_at(&self, _height: BlockHeight, _clock: WeightedTimestamp) {}
 }
 
 /// What the window's backing holds, and what each redemption hands in:
@@ -808,7 +814,7 @@ fn a_till_a_pending_member_took_is_not_taken_again_below_its_verdict() {
     let provisions = world.provisioned(&store);
     let base = Arc::new(store);
     let chain = TickChain::new(Arc::clone(&base));
-    let mut naming = Naming::over(&world, [&**first, &**second]);
+    let mut naming = Naming::over(&world, [&*first, &*second]);
     let mut settling = StateWrites::default();
 
     assert_eq!(naming.name(1, &first), vec![first.hash()]);
@@ -924,12 +930,14 @@ impl<'w> Naming<'w> {
         let mut carrying = self.rows.clone();
         carrying.advance(&pending);
         let (lines, missing, _) = member_lines(
-            &carrying,
-            ANCHOR,
-            &self.inputs,
-            &|_, _| Evidence::Readable,
-            false,
-            &BTreeSet::new(),
+            tick_select::Naming {
+                rows: &carrying,
+                anchor: ANCHOR,
+                inputs: &self.inputs,
+                evidence: &|_, _| Evidence::Readable,
+                crossing: &tick_select::Crossing::None,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert!(missing.is_empty(), "no member is held past its evidence");
@@ -1095,10 +1103,10 @@ impl Window {
         let tree = root
             .build_presenting(vec![self.meta.clone()], Vec::new())
             .expect("the intent declares no hole");
-        let seal = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
+        let seal = Verified::<Transaction>::from_persisted(Transaction::new(
             self.client
                 .sign_tree(&tree, &[&Self::key(founder)], Self::terms()),
-        )));
+        ));
         seal.try_derived(self.executor.derivation().as_ref())
             .expect("the seal derives");
         let single = ShardTrie::single();
@@ -1112,6 +1120,7 @@ impl Window {
                     env: TickEnvironment::unfolded(),
                     holds: &ProvisionalHolds::new(),
                     fee_holds: &NoFeeHolds,
+                    points: None,
                 },
                 PriceTable::GENESIS,
                 &store,
@@ -1134,7 +1143,7 @@ impl Window {
 
     /// `redeemer` handing `amount` of the protocol resource to the window
     /// and banking what it pays out, the sponsor paying the fee.
-    fn redeem(&self, redeemer: u8, amount: u128) -> Arc<Verified<Transaction>> {
+    fn redeem(&self, redeemer: u8, amount: u128) -> Verified<Transaction> {
         let chain = self.client.records();
         let composed = Composed::new(&chain, std::slice::from_ref(&self.meta), &ProtocolHasher);
         let from = Self::account(redeemer);
@@ -1150,9 +1159,10 @@ impl Window {
         let sponsor = Self::key(self.sponsor);
         tree.root.attested_by =
             Capped::new(vec![principal_of(&sponsor), from]).expect("two attesters");
-        let tx = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
-            self.client
-                .sign_tree(&tree, &[&sponsor, &Self::key(redeemer)], Self::terms()),
+        let tx = Verified::<Transaction>::from_persisted(Transaction::new(self.client.sign_tree(
+            &tree,
+            &[&sponsor, &Self::key(redeemer)],
+            Self::terms(),
         )));
         tx.try_derived(self.executor.derivation().as_ref())
             .expect("a sponsored redemption derives");
@@ -1208,9 +1218,14 @@ impl Window {
         chain: &TickChain<MapDb>,
         provisions: &[Arc<Vec<SubstateEntry>>],
         below: u64,
-        tx: &Arc<Verified<Transaction>>,
+        tx: &Verified<Transaction>,
     ) -> (ExecutedTx, StateWrites) {
-        chain.prune_persisted(BlockHeight::new(below), BlockHeight::GENESIS);
+        chain.prune_persisted(
+            BlockHeight::new(below),
+            BlockHeight::GENESIS,
+            None,
+            WeightedTimestamp::MAX,
+        );
         let view = chain.view_at(BlockHeight::new(below));
         let holds = view.holds();
         let ctx = TickBatchContext {
@@ -1220,6 +1235,7 @@ impl Window {
             env: TickEnvironment::unfolded(),
             holds: &holds,
             fee_holds: &NoFeeHolds,
+            points: None,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1229,6 +1245,7 @@ impl Window {
             clock: ANCHOR,
             member: self.member(tx),
             arrivals: &[],
+            served_part: None,
         };
         let executed = self
             .executor

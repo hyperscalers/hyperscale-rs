@@ -275,10 +275,11 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
+    let verified = Verified::<Transaction>::from_persisted(tx);
     executor
         .execute_batch(
             &ctx,
@@ -335,6 +336,7 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     // The second pool becomes actual the way the chain makes one actual:
     // a transaction seals it, and the commit path offers its cells to
@@ -342,7 +344,7 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
     let raw = signed_instantiate(OPERATOR, &sealed_here);
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let tx = Verified::<Transaction>::from_persisted(raw);
     let executed = executor
         .execute_batch(&ctx, PriceTable::GENESIS, &store, std::slice::from_ref(&tx))
         .expect("the harness engine holds every package it runs");
@@ -415,12 +417,13 @@ fn a_member_holding_no_record_executes_the_call_alike() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
 
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(holder.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let seal = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let seal = Verified::<Transaction>::from_persisted(raw);
     let sealed = holder
         .execute_batch(
             &ctx,
@@ -447,7 +450,7 @@ fn a_member_holding_no_record_executes_the_call_alike() {
     let raw = signed_stake_composed(&unseated, 500);
     raw.try_derived(holder.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let call = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let call = Verified::<Transaction>::from_persisted(raw);
     let by_holder = holder
         .execute_batch(
             &ctx,
@@ -515,11 +518,12 @@ fn a_kept_record_routes_a_call_on_an_engine_that_never_seated_it() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(holder.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let seal = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let seal = Verified::<Transaction>::from_persisted(raw);
     let sealed = holder
         .execute_batch(
             &ctx,
@@ -647,11 +651,12 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let tx = Verified::<Transaction>::from_persisted(raw);
     let executed_tx = executor
         .execute_batch(&ctx, PriceTable::GENESIS, &store, std::slice::from_ref(&tx))
         .expect("the harness engine holds every package it runs")
@@ -930,7 +935,7 @@ struct DividedStake {
     trie: ShardTrie,
     seats: [u32; 2],
     payer: u8,
-    tx: Arc<Verified<Transaction>>,
+    tx: Verified<Transaction>,
     classified: Classified,
     /// The payer's shard: the legs.
     payer_shard: ShardId,
@@ -970,7 +975,7 @@ fn stake_paid_by(payer: u8) -> DividedStake {
     let raw = signed_double_stake(payer, seats, 500);
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let tx = Verified::<Transaction>::from_persisted(raw);
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     assert!(
         classified
@@ -1043,6 +1048,7 @@ impl DividedStake {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            points: None,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1056,6 +1062,7 @@ impl DividedStake {
                 BTreeSet::from([self.payer_shard, self.core, self.sibling]),
             ),
             arrivals,
+            served_part: None,
         };
         self.executor
             .execute_tick_batch(&ctx, store, &[input])
@@ -1228,6 +1235,285 @@ fn a_consumer_completed_here_and_refused_elsewhere_writes_never() {
         "one Never for the crossing whose decline cell it holds, and no charge: the vault \
          is not here",
     );
+}
+
+/// A core member reads its sibling's pool as its own source shipped it,
+/// whatever a batch-mate carries. Every shard running the transaction
+/// batches it with different neighbours, so a list a neighbour carries —
+/// a predecessor's whose block a successor committed the neighbour again
+/// past — must not reach it.
+///
+/// The sibling ships the core member a state without its pool, so the
+/// stake into it fails. A batch-mate carrying that list and a
+/// predecessor's, which holds the pool, leaves the failure exactly as it
+/// is.
+#[test]
+fn a_core_member_is_unaffected_by_a_batch_mates_lists() {
+    let divided = divided_stake();
+    let store = divided.store(&divided.seats);
+    let handed = divided.handed(&store);
+    let required = divided.provisioned(&divided.store(&divided.seats[..1]), divided.sibling);
+    let predecessor = divided.provisioned(&store, divided.sibling);
+
+    let raw = signed_double_stake(divided.payer, divided.seats, 400);
+    raw.try_derived(divided.executor.derivation().as_ref())
+        .expect("a fixture transaction derives");
+    let mate = Verified::<Transaction>::from_persisted(raw);
+    let mate_classified = Classified::freeze(
+        mate.legs(),
+        mate.fee_payer(),
+        mate.accounts(),
+        &divided.trie,
+    );
+    let reach = BTreeSet::from([divided.payer_shard, divided.core, divided.sibling]);
+    let ctx = TickBatchContext {
+        local_shard: divided.core,
+        shard_trie: &divided.trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
+        points: None,
+    };
+    let run = |mate_carries: &[Arc<Vec<SubstateEntry>>]| {
+        let inputs = [
+            TickTxInput {
+                prices: PriceTable::GENESIS,
+                tx_hash: divided.tx.hash(),
+                transaction: &divided.tx,
+                provisions: &required,
+                clock: WeightedTimestamp::from_millis(1_000),
+                member: Member::of(divided.classified.clone(), divided.core, reach.clone()),
+                arrivals: &handed,
+                served_part: None,
+            },
+            TickTxInput {
+                prices: PriceTable::GENESIS,
+                tx_hash: mate.hash(),
+                transaction: &mate,
+                provisions: mate_carries,
+                clock: WeightedTimestamp::from_millis(1_000),
+                member: Member::of(mate_classified.clone(), divided.core, reach.clone()),
+                arrivals: &[],
+                served_part: None,
+            },
+        ];
+        divided
+            .executor
+            .execute_tick_batch(&ctx, &store, &inputs)
+            .expect("the harness engine holds every package it runs")
+            .into_iter()
+            .find(|ran| ran.tx_hash == divided.tx.hash())
+            .expect("the core member ran")
+    };
+
+    let own = run(&required);
+    assert!(
+        matches!(own.consensus, ConsensusReceipt::Failed),
+        "a stake into a pool its source does not ship fails: {:?}",
+        own.consensus,
+    );
+    let beside = run(&[required.clone(), predecessor].concat());
+    assert_eq!(
+        beside.consensus, own.consensus,
+        "a batch-mate's predecessor list reaches the core member: {:?}",
+        beside.metadata,
+    );
+    assert_eq!(beside.refusal_receipt, own.refusal_receipt);
+    assert_eq!(beside.metadata, own.metadata);
+}
+
+/// A second delegation into the same two pools, paid for by another
+/// account off both core shards.
+fn another_stake(divided: &DividedStake) -> DividedStake {
+    let payer = (1..=u8::MAX)
+        .find(|seed| {
+            *seed != divided.payer
+                && ![divided.core, divided.sibling]
+                    .contains(&divided.trie.shard_for_prefix(account_of(*seed)))
+        })
+        .expect("another key's account sits off both core leaves");
+    stake_paid_by(payer)
+}
+
+impl DividedStake {
+    /// This delegation's member on `self.core`, handed `arrivals` and
+    /// `provisions`.
+    fn core_input<'a>(
+        &'a self,
+        arrivals: &'a [EscrowedValue],
+        provisions: &'a [Arc<Vec<SubstateEntry>>],
+    ) -> TickTxInput<'a> {
+        TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: self.tx.hash(),
+            transaction: &self.tx,
+            provisions,
+            clock: WeightedTimestamp::from_millis(1_000),
+            member: Member::of(
+                self.classified.clone(),
+                self.core,
+                BTreeSet::from([self.payer_shard, self.core, self.sibling]),
+            ),
+            arrivals,
+            served_part: None,
+        }
+    }
+
+    /// Run `inputs` as one tick on `self.core` against `store` under
+    /// `executor`, each member's receipt by its transaction.
+    fn run_core_tick(
+        &self,
+        executor: &Executor,
+        store: &MapDb,
+        inputs: &[TickTxInput<'_>],
+    ) -> BTreeMap<TxHash, ExecutedTx> {
+        let ctx = TickBatchContext {
+            local_shard: self.core,
+            shard_trie: &self.trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
+            points: None,
+        };
+        executor
+            .execute_tick_batch(&ctx, store, inputs)
+            .expect("the harness engine holds every package it runs")
+            .into_iter()
+            .map(|ran| (ran.tx_hash, ran))
+            .collect()
+    }
+}
+
+/// Two core members of one tick hold the sibling's pool at two heights of
+/// the sibling: one list holds the pool, the other predates it. Each
+/// stakes off its own, whichever of the two it holds.
+#[test]
+fn two_core_members_each_read_the_siblings_pool_off_their_own_list() {
+    let first = divided_stake();
+    let second = another_stake(&first);
+    let store = first.store(&first.seats);
+    let handed = [
+        first.handed(&store),
+        second.handed(&second.store(&second.seats)),
+    ];
+    let holding = first.provisioned(&store, first.sibling);
+    let predating = first.provisioned(&first.store(&first.seats[..1]), first.sibling);
+
+    for (lists, completes) in [
+        ([&holding, &predating], [true, false]),
+        ([&predating, &holding], [false, true]),
+    ] {
+        let inputs = [
+            first.core_input(&handed[0], lists[0]),
+            second.core_input(&handed[1], lists[1]),
+        ];
+        let ran = first.run_core_tick(&first.executor, &store, &inputs);
+        for (member, completes) in [&first, &second].into_iter().zip(completes) {
+            let executed = &ran[&member.tx.hash()];
+            assert_eq!(
+                matches!(executed.consensus, ConsensusReceipt::Succeeded { .. }),
+                completes,
+                "a member stakes off its own list alone: {:?}",
+                executed.metadata,
+            );
+        }
+    }
+}
+
+/// A core member resolves the sibling's pool off its own list and the
+/// genesis and committed records alone. Its source ships the pool's cells
+/// without its configuration leaf; a batch-mate's list carries the leaf,
+/// and the member is refused alike beside it and without it.
+#[test]
+fn a_core_member_resolves_targets_off_its_own_list_alone() {
+    let first = divided_stake();
+    let second = another_stake(&first);
+    // Seated with the member's own pool only, and run against a store
+    // holding nothing of the sibling's: the sibling's record reaches it
+    // through provisions or not at all.
+    let executor = seated(&[seat(first.seats[0])], ExecutionMode::Serial);
+    let store = first.store(&first.seats[..1]);
+    let full = first.store(&first.seats);
+    let handed = [
+        first.handed(&full),
+        second.handed(&second.store(&second.seats)),
+    ];
+    let pool = pool_address(
+        package_hash(&ProtocolHasher, staking_artifact()),
+        &seat(first.seats[1]),
+    );
+    let leafless: Vec<Arc<Vec<SubstateEntry>>> = first
+        .provisioned(&full, first.sibling)
+        .iter()
+        .map(|list| {
+            Arc::new(
+                list.iter()
+                    .filter(|entry| entry.key != config_key(pool))
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect();
+    let leafed = first.provisioned(&full, first.sibling);
+
+    let alone = first.run_core_tick(
+        &executor,
+        &store,
+        &[first.core_input(&handed[0], &leafless)],
+    );
+    let alone = &alone[&first.tx.hash()];
+    assert!(
+        matches!(alone.consensus, ConsensusReceipt::Failed),
+        "a pool whose record nothing resolves refuses the stake: {:?}",
+        alone.metadata,
+    );
+    let beside = first.run_core_tick(
+        &executor,
+        &store,
+        &[
+            first.core_input(&handed[0], &leafless),
+            second.core_input(&handed[1], &leafed),
+        ],
+    );
+    let beside = &beside[&first.tx.hash()];
+    assert_eq!(beside.consensus, alone.consensus);
+    assert_eq!(beside.refusal_receipt, alone.refusal_receipt);
+    assert_eq!(
+        beside.metadata, alone.metadata,
+        "a batch-mate's leaf resolves the member's target",
+    );
+}
+
+/// A member running only its own legs reads nothing of the core: its
+/// scope is its own shard. The core's shards ship it their content all
+/// the same, and its receipt is the one it gives with none of it, with
+/// the core's pools or without them.
+#[test]
+fn a_leg_only_member_runs_alike_with_or_without_the_cores_lists() {
+    let divided = divided_stake();
+    assert!(!divided.classified.core().contains(&divided.payer_shard));
+    let store = divided.store(&divided.seats);
+    let core_lists = |shipping: &MapDb| {
+        [
+            divided.provisioned(shipping, divided.core),
+            divided.provisioned(shipping, divided.sibling),
+        ]
+        .concat()
+    };
+
+    let alone = divided.run(&store, divided.payer_shard, &[], &[]);
+    assert!(
+        matches!(alone.consensus, ConsensusReceipt::Succeeded { .. }),
+        "the payer's legs complete: {:?}",
+        alone.metadata,
+    );
+    for shipping in [&store, &divided.store(&[])] {
+        let shipped = divided.run(&store, divided.payer_shard, &[], &core_lists(shipping));
+        assert_eq!(shipped.consensus, alone.consensus);
+        assert_eq!(shipped.refusal_receipt, alone.refusal_receipt);
+    }
 }
 
 /// A core member that aborts names a refusal receipt whose writes are
@@ -1993,11 +2279,12 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     let run = |store: &MapDb, raw: Transaction| {
         raw.try_derived(executor.derivation().as_ref())
             .expect("a fixture transaction derives");
-        let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+        let tx = Verified::<Transaction>::from_persisted(raw);
         executor
             .execute_batch(&ctx, PriceTable::GENESIS, store, std::slice::from_ref(&tx))
             .expect("the harness engine holds every package it runs")
@@ -2277,10 +2564,11 @@ fn run_on(executor: &Executor, store: &MapDb, raw: Transaction) -> ExecutedTx {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        points: None,
     };
     raw.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let tx = Verified::<Transaction>::from_persisted(raw);
     executor
         .execute_batch(&ctx, PriceTable::GENESIS, store, std::slice::from_ref(&tx))
         .expect("the harness engine holds every package it runs")

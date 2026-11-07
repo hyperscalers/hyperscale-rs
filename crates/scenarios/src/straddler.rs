@@ -8,7 +8,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
-use std::sync::Arc;
 
 use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
@@ -500,7 +499,7 @@ pub fn cast_threshold_vote<C: Cluster>(c: &mut C, split_bytes: u64) {
         activate_at,
         validity_around(c.now()),
     );
-    c.submit(Arc::new(vote));
+    c.submit(vote);
     // The wait covers the lead the harness's fold budget sets, which is
     // longer on a wall-clock harness than on the simulator.
     let budget = epochs(u32::try_from(lead + 4).expect("a lead of a few epochs"));

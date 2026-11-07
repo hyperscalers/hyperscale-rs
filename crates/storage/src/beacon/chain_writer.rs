@@ -1,7 +1,5 @@
 //! Write interface for committed beacon blocks.
 
-use std::sync::Arc;
-
 use hyperscale_types::{BeaconState, CertifiedBeaconBlock, Verified};
 
 /// Write access to the process-level beacon chain.
@@ -27,5 +25,5 @@ pub trait BeaconChainWriter: Send + Sync {
     /// activity. Implementations may panic, log, or overwrite — none
     /// of these is safety-critical because the BFT layer's dedup
     /// catches it first.
-    fn commit_beacon_block(&self, block: &Arc<Verified<CertifiedBeaconBlock>>, state: &BeaconState);
+    fn commit_beacon_block(&self, block: &Verified<CertifiedBeaconBlock>, state: &BeaconState);
 }

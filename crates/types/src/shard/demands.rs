@@ -23,8 +23,6 @@ pub enum VerificationKind {
     /// The body root over every section's root, plus the per-tx
     /// validity-window check.
     BodyRoot,
-    /// Per-target-shard provision-tx merkle roots map.
-    ProvisionTxRoots,
     /// Merkle root over the per-shard beacon-witness accumulator after
     /// this block's appended leaves.
     BeaconWitnessRoot,
@@ -46,15 +44,11 @@ impl Demands {
     /// empty one) and appends to the witness accumulator.
     #[must_use]
     pub(crate) fn of(block: &Block) -> Self {
-        let h = block.header();
         let mut demanded = BTreeSet::from([
             VerificationKind::StateRoot,
             VerificationKind::BodyRoot,
             VerificationKind::BeaconWitnessRoot,
         ]);
-        if !h.provision_tx_roots().is_empty() {
-            demanded.insert(VerificationKind::ProvisionTxRoots);
-        }
         if block.resolves_anything() {
             demanded.insert(VerificationKind::Resolutions);
         }

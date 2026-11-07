@@ -20,7 +20,8 @@ use hyperscale_vm_types::{
 
 use crate::provisioning::limits::MAX_MERKLE_PROOF_LEN;
 use crate::{
-    Address, ConsensusReceipt, LocalKey, MAX_BEACON_WITNESS_EVENTS_PER_TX, RoutePrefix, TxsInFlight,
+    Address, ConsensusReceipt, LocalKey, MAX_BEACON_WITNESS_EVENTS_PER_TX, RECOVERY_HISTORY_DEPTH,
+    RoutePrefix, TxsInFlight,
 };
 
 /// The largest message any transport carries, compressed.
@@ -57,9 +58,11 @@ const _: () = assert!(
 /// the `transactions` array inside [`Block`](crate::Block), the
 /// `tx_outcomes` array inside any one
 /// [`ExecutionCertificate`](crate::ExecutionCertificate) for a tick from
-/// this block, and the `transactions` (per-tx state-entry sets) inside
-/// any one [`Provisions`](crate::Provisions) batch sourced from this
-/// block.
+/// this block, and the [`Provision`](crate::Provision) parts this block
+/// owes any one target for the transactions it carries. The parts it
+/// owes for the members it makes head come besides, so the parts one
+/// block roots for one target can pass it: notifications split across
+/// messages, and a fetch caps the indices it asks for.
 pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 
 /// Hard cap on the sweepable cells one block's transactions may create
@@ -235,20 +238,16 @@ pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 /// than this outstanding asks across several requests.
 pub const MAX_PROOFS_PER_QUERY: usize = 256;
 
-/// Hard cap on the number of provision batches any single block can carry.
-///
-/// A [`Provisions`](crate::Provisions) batch is keyed on `(source_shard,
-/// target_shard, source_block_height)`. The count per local block scales
-/// with the number of remote shards we depend on for cross-shard work
-/// and the recent source-block-heights we still need state from. Sized
-/// for small-to-mid-shard topologies; widening the topology may require
-/// revisiting.
-pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
-
 /// Hard cap on the transactions one block's provisions name between
 /// them, and so on the [`Engagements`](crate::Engagements) a sealed block
 /// keeps of them: one entry per named transaction.
 pub const MAX_ENGAGEMENTS_PER_BLOCK: usize = MAX_TXS_PER_BLOCK;
+
+/// Hard cap on the number of provision parts any single block can carry.
+///
+/// A [`Provision`](crate::Provision) names one transaction, so a block
+/// takes as many parts as it names transactions.
+pub const MAX_PROVISIONS_PER_BLOCK: usize = MAX_ENGAGEMENTS_PER_BLOCK;
 /// The most leaves one cells query may be answered over, keys and
 /// range entries together.
 ///
@@ -332,8 +331,27 @@ pub const MAX_TICK_LINES_PER_BLOCK: usize = MAX_UNSETTLED_PER_BLOCK;
 // holds in one manifest, and no later block crosses. A tick row stands
 // only while a member row does, and the drain caps those, so the drain
 // cap may not outgrow a manifest's lines: a tick left out would stand
-// past the crossing for good.
+// past the crossing for good. The block names its recovery marker only
+// where the marker orphans a row, which holds no tick, so the marker and
+// one discard per tick row number at most the rows standing. The aborts
+// the marker licenses drain over later blocks within the member cap.
 const _: () = assert!(MAX_UNSETTLED_TXS <= MAX_TICK_LINES_PER_BLOCK as u64);
+
+/// The decode cap on the bands a recovery marker carries: one per
+/// recovery binding a committee snapshot holds for its shard, the
+/// history the beacon keeps and the pending binding it has yet to stamp.
+pub const MAX_RECOVERY_BANDS: usize = RECOVERY_HISTORY_DEPTH + 1;
+
+/// Bytes one band of a recovery marker costs: a frontier height and a
+/// bridge clock.
+pub const TICK_BAND_BYTES: usize = 16;
+
+// A crossing block's marker with every band, beside a discard for each
+// tick row standing beside the row it orphans, fits the manifest's bytes.
+const _: () = assert!(
+    MAX_RECOVERY_BANDS * TICK_BAND_BYTES + MAX_TICK_LINES_PER_BLOCK * TICK_LINE_BYTES
+        <= MAX_TICK_MANIFEST_BYTES
+);
 
 /// Hard cap on the members a block's tick manifest names.
 ///
@@ -395,13 +413,16 @@ pub const fn tick_manifest_admits_block(weight: usize) -> bool {
 }
 
 /// Bytes one [`TickLine`](crate::TickLine) costs before its holds,
-/// reach, reserves and crossings: a member's transaction,
-/// terms, abort charge, share and deadline.
-pub const TICK_LINE_BYTES: usize = 152;
+/// pins, reach, reserves and crossings: a member's transaction,
+/// terms, abort charge, share, deadline and head height.
+pub const TICK_LINE_BYTES: usize = 161;
 
 /// Bytes one hold of a member line costs: a declared access and its
 /// mode.
 pub const TICK_HOLD_BYTES: usize = 160;
+
+/// Bytes one pin of a member line costs: a pin key and its modes.
+pub const TICK_PIN_BYTES: usize = 17;
 
 /// Bytes one shard of a member line's reach costs.
 pub const TICK_REACH_BYTES: usize = 16;
@@ -411,7 +432,9 @@ pub const TICK_REACH_BYTES: usize = 16;
 const _: () = assert!(MAX_TICK_LINES_PER_BLOCK * TICK_LINE_BYTES <= MAX_TICK_MANIFEST_BYTES);
 
 /// Any single line fits an empty manifest, so no line is ever left
-/// waiting on a budget it can never meet.
+/// waiting on a budget it can never meet. A line carries holds or pins
+/// and never both, and a pin weighs less than a hold.
+const _: () = assert!(TICK_PIN_BYTES <= TICK_HOLD_BYTES);
 const _: () = assert!(
     TICK_LINE_BYTES
         + MAX_HOLDS_PER_MEMBER * TICK_HOLD_BYTES

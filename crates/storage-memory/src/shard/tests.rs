@@ -10,7 +10,7 @@ use hyperscale_storage::test_helpers::{
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
     test_a_recovery_anchor_reads_back, test_a_replayed_sweep_reads_what_its_block_removed,
-    test_a_stored_block_keeps_its_terms,
+    test_a_stored_block_keeps_its_terms, test_a_ticks_probe_outlives_a_raised_floor,
     test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does,
     test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_receipts_reach_state,
@@ -170,6 +170,11 @@ fn historical_reads_respect_retention() {
 }
 
 #[test]
+fn a_ticks_probe_outlives_a_raised_floor() {
+    test_a_ticks_probe_outlives_a_raised_floor(&SimShardStorage::default(), |_| {});
+}
+
+#[test]
 fn witness_window_retention_and_recovery() {
     let storage = SimShardStorage::default();
     test_witness_window_retention_and_recovery(&storage, || {
@@ -246,7 +251,7 @@ fn test_transactions_batch_with_indexed_block() {
     let storage = SimShardStorage::default();
     let block = make_test_block(BlockHeight::new(1));
 
-    let tx = Arc::new(Verifiable::from(test_transaction(42)));
+    let tx = Verifiable::from(test_transaction(42));
     let tx_hash = tx.hash();
     let block = match block {
         Block::Live {
@@ -436,6 +441,12 @@ fn a_replay_keeps_a_leg_its_own_finalization_settled() {
 }
 
 #[test]
+fn a_forged_certificate_clock_moves_no_retirement() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_forged_certificate_clock_moves_no_retirement(&storage);
+}
+
+#[test]
 fn a_leg_entry_holds_the_floor_to_its_horizon() {
     let storage = SimShardStorage::default();
     test_helpers::test_a_leg_entry_holds_the_floor_to_its_horizon(&storage);
@@ -610,7 +621,7 @@ fn a_rebuilt_store_carries_signed_rounds() {
 fn block_with_txs(
     height: BlockHeight,
     anchor_wt_ms: u64,
-    txs: Vec<Arc<Verifiable<Transaction>>>,
+    txs: Vec<Verifiable<Transaction>>,
 ) -> Block {
     match make_test_block_with_anchor_wt(height, anchor_wt_ms) {
         Block::Live {
@@ -638,18 +649,18 @@ fn block_with_txs(
 
 /// A transaction whose signed window ends at `end_ms` — the deadline the
 /// fold has to recover for it.
-fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
+fn dedup_tx(seed: u8, end_ms: u64) -> Verifiable<Transaction> {
     install_stub_protocol_statics();
     let validity = TimestampRange::new(
         WeightedTimestamp::ZERO,
         WeightedTimestamp::from_millis(end_ms),
     );
-    Arc::new(Verifiable::from(stub_transaction(
+    Verifiable::from(stub_transaction(
         test_principal(seed),
         &[test_prefix(seed)],
         1_000,
         validity,
-    )))
+    ))
 }
 
 /// The fold records the names a finalization *decided*, as the live
@@ -677,10 +688,10 @@ fn dedup_window_records_only_what_a_finalization_decided() {
             events: Capped::empty(),
         }),
     );
-    let leg = Arc::new(Verifiable::from(
+    let leg = Verifiable::from(
         make_leg_finalization(BlockHeight::new(1), tx_hash)
             .with_receipts(Capped::from_array([receipt])),
-    ));
+    );
     let block = push_certificate(block_with_txs(BlockHeight::new(1), 1_000, vec![tx]), leg);
     commit_empty(&storage, &block);
 
@@ -852,6 +863,7 @@ fn dedup_window_seeds_engagements_from_block_lists() {
         source: payer,
         tx_hash,
         source_height: BlockHeight::new(1),
+        source_anchor: WeightedTimestamp::ZERO,
     };
     let mut expected = vec![
         (

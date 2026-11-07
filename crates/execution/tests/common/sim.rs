@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
+use hyperscale_core::{Action, CrossShardExecutionRequest, ExecutionAction, TickBatchOutcome};
 use hyperscale_engine::tick_select::terms_of;
 use hyperscale_engine::{AllCodeRuns, ExecutedTx, PROTOCOL_RESOURCE};
 use hyperscale_execution::action_handlers::{
@@ -44,14 +44,14 @@ use hyperscale_storage::{
     with_fee_holds,
 };
 use hyperscale_types::test_utils::{
-    StubVmStatics, TestCommittee, certify, make_live_block, naming,
+    StubVmStatics, TestCommittee, certify_live, make_live_block, naming,
 };
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
-    ConsensusReceipt, CounterpartMirror, DeclaredRange, Epoch, EpochWindows, EventRoot,
+    ConsensusReceipt, CounterpartMirror, DeclaredRange, Epoch, EpochSeed, EpochWindows, EventRoot,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt,
-    LocalKey, MerkleInclusionProof, Movement, ProvenAnchors, ProvisionEntry, Provisions,
-    RecoveryCause, ResourceAddr, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield,
+    LocalKey, Movement, ProvenAnchors, Provision, Randomness, RecoveryCause, ResourceAddr,
+    SeedRing, SeedSource, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield,
     StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
     TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
     Verified, WeightedTimestamp, compute_global_receipt_root, encode_amount, read_amount,
@@ -205,22 +205,24 @@ impl SubstateStore for StubBase {
 }
 
 impl VersionedStore for StubBase {
+    type Versioned = StubSnapshot;
+
     fn retention_floor(&self) -> u64 {
         0
     }
 
-    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<StubSnapshot> {
         (height <= self.jmt_height()).then(|| self.snapshot_at(height))
     }
 
-    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+    fn snapshot_at(&self, height: BlockHeight) -> StubSnapshot {
         StubSnapshot(self.cells_at(height))
     }
     fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
         None
     }
 
-    fn hold_retention_at(&self, _height: BlockHeight) {}
+    fn hold_retention_at(&self, _height: BlockHeight, _clock: WeightedTimestamp) {}
 }
 
 /// A tick dispatched but not yet completed.
@@ -350,8 +352,17 @@ impl ExecutionSim {
     /// `height`, as a host does when it opens a shard: the chain learns
     /// what its base carries, as the coordinator built over it did.
     fn seat_on_store_at(&self, height: BlockHeight) {
-        self.chain
-            .prune_persisted(height, self.coord.baseline_floor());
+        self.hold_baselines(height);
+    }
+
+    /// Publish what the shard loop publishes when a write lands.
+    fn hold_baselines(&self, persisted: BlockHeight) {
+        self.chain.prune_persisted(
+            persisted,
+            self.coord.baseline_floor(),
+            self.coord.served_floor(),
+            self.coord.committed_ts(),
+        );
     }
 
     /// Acknowledge the write of every block committed so far, in the
@@ -359,8 +370,7 @@ impl ExecutionSim {
     /// covers, then the coordinator releases the tick that was waiting
     /// to read it.
     fn acknowledge_writes(&mut self) {
-        self.chain
-            .prune_persisted(self.height, self.coord.baseline_floor());
+        self.hold_baselines(self.height);
         let actions = self.coord.on_block_persisted(&self.topology, self.height);
         self.absorb(actions);
     }
@@ -381,7 +391,9 @@ impl ExecutionSim {
     /// height is the shard's crossing block and every block below it is
     /// anchored below the bridge. The windows from the bridge on carry
     /// the recovery and every window below it the snapshot as it stood,
-    /// as the beacon stamps it.
+    /// as the beacon stamps it. The bridge's window is held at once, as
+    /// the fold that seats the recovery holds the window after its own,
+    /// so the coast blocks below it are signed under it.
     pub fn recover(&mut self, frontier: BlockHeight, bridge: Epoch) {
         let before = Arc::clone(&self.snapshot);
         let recorded = (*self.snapshot)
@@ -406,17 +418,31 @@ impl ExecutionSim {
         for epoch in 0..self.height.inner() {
             self.open_window(Epoch::new(epoch));
         }
+        self.open_window(bridge);
         self.open_windows();
     }
 
     /// Hold the window of `epoch`, stamped or not as [`Self::recover`]
-    /// says.
+    /// says, carrying the seeds the beacon's fold of `epoch` leaves.
     fn open_window(&mut self, epoch: Epoch) {
         let snapshot = match &self.unstamped {
-            Some((from, before)) if epoch < *from => Arc::clone(before),
-            _ => Arc::clone(&self.snapshot),
+            Some((from, before)) if epoch < *from => before,
+            _ => &self.snapshot,
         };
-        self.topology.insert(epoch, snapshot);
+        let windows = self.topology.windows();
+        let mut seeds = SeedRing::default();
+        for rolled in 1..=epoch.inner() {
+            seeds.record(
+                Epoch::new(rolled),
+                EpochSeed {
+                    randomness: Randomness::new([0; 32]),
+                    source: SeedSource::Reveals,
+                },
+                windows,
+            );
+        }
+        let folded = (**snapshot).clone().with_seeds(seeds);
+        self.topology.insert(epoch, Arc::new(folded));
     }
 
     /// The epoch the next block is anchored in, once a recovery has given
@@ -496,14 +522,16 @@ impl ExecutionSim {
             self.height,
             self.height.inner() * BLOCK_INTERVAL_MS,
             ValidatorId::new(0),
-            txs.into_iter().map(Arc::new).collect(),
-            certificates
-                .into_iter()
-                .map(|fw| Arc::new(Verifiable::from(fw)))
-                .collect(),
+            txs,
+            certificates.into_iter().map(Verifiable::from).collect(),
         );
-        let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
         let committee_anchor = self.committee_anchor();
+        let certified = certify_live(
+            &self.topology,
+            block,
+            self.height.inner() * BLOCK_INTERVAL_MS,
+            committee_anchor,
+        );
         let effects = match manifest {
             Some(lines) => self.coord.commit_block(
                 &self.topology,
@@ -545,20 +573,21 @@ impl ExecutionSim {
     /// transaction. A payer's leg waits for this before executing, since
     /// the tick that runs it is the tick that attests it.
     pub fn engage(&mut self, from: ShardId, tx_hashes: &[TxHash]) {
-        let bundle = Provisions::new(
-            from,
-            self.local_shard,
-            self.height,
-            WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS),
-            MerkleInclusionProof::dummy(),
-            Capped::new(
-                tx_hashes
-                    .iter()
-                    .map(|h| ProvisionEntry::new(*h, Capped::from_array([])))
-                    .collect(),
-            )
-            .expect("a list written out in a test"),
-        );
+        let parts = Capped::new(
+            tx_hashes
+                .iter()
+                .map(|h| {
+                    Verifiable::from(Provision::dummy_at(
+                        from,
+                        self.local_shard,
+                        self.height,
+                        WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS),
+                        *h,
+                    ))
+                })
+                .collect(),
+        )
+        .expect("a list written out in a test");
         self.height = self.height.next();
         let block = match make_live_block(
             self.local_shard,
@@ -580,7 +609,7 @@ impl ExecutionSim {
                 header,
                 transactions,
                 certificates,
-                provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
+                provisions: Arc::new(parts),
                 abandonment_records,
                 state_claims,
                 tick_manifest: Arc::new(Capped::empty()),
@@ -589,8 +618,13 @@ impl ExecutionSim {
             },
             sealed @ Block::Sealed { .. } => sealed,
         };
-        let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
         let committee_anchor = self.committee_anchor();
+        let certified = certify_live(
+            &self.topology,
+            block,
+            self.height.inner() * BLOCK_INTERVAL_MS,
+            committee_anchor,
+        );
         let effects =
             self.coord
                 .commit_block_composing(&self.topology, &certified, committee_anchor);
@@ -637,13 +671,13 @@ impl ExecutionSim {
     fn absorb(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::ExecuteTransactions {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
                     tick,
                     fates,
                     requests,
                     included,
                     ..
-                } => {
+                }) => {
                     let release_at = match self.schedule {
                         Schedule::Eager => self.height,
                         Schedule::Lagged(n) => BlockHeight::new(
@@ -667,6 +701,7 @@ impl ExecutionSim {
                 Action::RaiseTickFloor { floor } => {
                     self.chain.raise_floor(floor, self.local_shard);
                     self.chain.seed_stated(&self.member_rows());
+                    self.hold_baselines(self.chain.persisted());
                 }
                 _ => {}
             }
@@ -872,7 +907,7 @@ impl ExecutionSim {
         let verified = Verified::new_unchecked_for_test(finalization);
         self.coord
             .finalization_store()
-            .insert(tick_id, Arc::new(Verifiable::from(verified)));
+            .insert(tick_id, Verifiable::from(verified));
     }
 
     /// The ticks a proposal would carry certificates for, in the order it
@@ -918,13 +953,13 @@ impl ExecutionSim {
     pub fn certify_votable(&mut self) -> Vec<Finalization> {
         let mut certified = Vec::new();
         for action in self.coord.emit_vote_actions(&self.topology) {
-            let Action::SignAndSendExecutionVote {
+            let Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                 vote_anchor_ts,
                 tick_id,
                 global_receipt_root,
                 tx_outcomes,
                 ..
-            } = action
+            }) = action
             else {
                 continue;
             };
@@ -1018,7 +1053,7 @@ impl ExecutionSim {
                     self.local_shard,
                     header.height(),
                     header.parent_qc().weighted_timestamp(),
-                    block.transactions().iter().map(|tx| tx.as_unverified()),
+                    block.transactions().iter().map(Verifiable::as_unverified),
                     MemberSections {
                         certificates: block.certificates(),
                         records: block.abandonment_records(),
@@ -1145,7 +1180,7 @@ fn stub_execute(
     trie: &ShardTrie,
     local_shard: ShardId,
     tx_hash: TxHash,
-    tx: &Arc<Verified<Transaction>>,
+    tx: &Verified<Transaction>,
     abortable: bool,
     spend: Option<(SubstateKey, u128)>,
 ) -> ExecutedTx {
@@ -1277,7 +1312,7 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> Finalization {
     Finalization::new(
         *tick_id,
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::new(receipts.to_vec()).expect("a list written out in a test"),
     )
 }

@@ -23,10 +23,10 @@
 
 use std::collections::HashMap;
 
-use hyperscale_core::Action;
+use hyperscale_core::{Action, ConsensusAction};
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, ConsensusPublicKey, ConsensusSignature, Round,
-    ShardId, ShardVoteEquivocation, TopologySnapshot, ValidatorId, Verified,
+    BlockCommittee, BlockHash, BlockHeader, BlockHeight, BlockVote, ConsensusPublicKey,
+    ConsensusSignature, Epoch, Round, ShardId, ShardVoteEquivocation, ValidatorId, Verified,
 };
 use tracing::{info, trace, warn};
 
@@ -196,21 +196,23 @@ impl VoteKeeper {
     /// the untrusted wire path.
     pub(crate) fn accept_verified_vote(
         &mut self,
-        topology_snapshot: &TopologySnapshot,
+        committee: BlockCommittee<'_>,
         local_shard: ShardId,
         vote: Verified<BlockVote>,
         committed_height: BlockHeight,
         header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
         let block_hash = vote.block_hash();
-        let Some(prep) = Self::preflight(topology_snapshot, local_shard, &vote, committed_height)
-        else {
+        let Some(prep) = Self::preflight(committee, local_shard, &vote, committed_height) else {
             return vec![];
         };
 
         let vote_set = self.bound_vote_set(
             block_hash,
-            topology_snapshot.consensus_committee_for_shard(local_shard),
+            committee
+                .snapshot
+                .consensus_committee_for_shard(local_shard),
+            committee.epoch,
             header_for_vote,
         );
 
@@ -233,15 +235,14 @@ impl VoteKeeper {
     /// [`Self::accept_verified_vote`].
     pub(crate) fn accept_unverified_vote(
         &mut self,
-        topology_snapshot: &TopologySnapshot,
+        committee: BlockCommittee<'_>,
         local_shard: ShardId,
         vote: BlockVote,
         committed_height: BlockHeight,
         header_for_vote: Option<&BlockHeader>,
     ) -> Vec<Action> {
         let block_hash = vote.block_hash();
-        let Some(prep) = Self::preflight(topology_snapshot, local_shard, &vote, committed_height)
-        else {
+        let Some(prep) = Self::preflight(committee, local_shard, &vote, committed_height) else {
             return vec![];
         };
 
@@ -256,7 +257,10 @@ impl VoteKeeper {
 
         let vote_set = self.bound_vote_set(
             block_hash,
-            topology_snapshot.consensus_committee_for_shard(local_shard),
+            committee
+                .snapshot
+                .consensus_committee_for_shard(local_shard),
+            committee.epoch,
             header_for_vote,
         );
 
@@ -277,14 +281,16 @@ impl VoteKeeper {
         self.maybe_trigger_verification(local_shard, block_hash)
     }
 
-    /// The vote set for `block_hash`, bound to `committee`, the committee
-    /// that governs the block now. A set bound to another committee is
-    /// re-bound, so every vote the set holds is indexed against the
-    /// committee the vote it admits next is indexed against.
+    /// The vote set for `block_hash`, bound to `committee` keyed
+    /// `committee_epoch`, the committee that governs the block now. A set
+    /// bound to another committee or epoch is re-bound, so every vote the
+    /// set holds is indexed against the committee the vote it admits next
+    /// is indexed against, and signs the epoch it signs.
     fn bound_vote_set(
         &mut self,
         block_hash: BlockHash,
         committee: &[ValidatorId],
+        committee_epoch: Epoch,
         header_for_vote: Option<&BlockHeader>,
     ) -> &mut VoteSet {
         let next_binding = &mut self.next_binding;
@@ -293,39 +299,61 @@ impl VoteKeeper {
             *next_binding += 1;
             binding
         };
-        let vote_set = self
-            .vote_sets
-            .entry(block_hash)
-            .or_insert_with(|| VoteSet::new(header_for_vote, committee, take_binding()));
-        if !vote_set.tallies_against(committee) {
+        let vote_set = self.vote_sets.entry(block_hash).or_insert_with(|| {
+            VoteSet::new(header_for_vote, committee, committee_epoch, take_binding())
+        });
+        if !vote_set.tallies_against(committee, committee_epoch) {
             info!(
                 ?block_hash,
+                epoch = committee_epoch.inner(),
                 "Block's committee changed; re-binding its vote set"
             );
-            vote_set.rebind(committee, take_binding());
+            vote_set.rebind(committee, committee_epoch, take_binding());
         }
         vote_set
     }
 
-    /// The binding of `header`'s vote set, bound to `committee`: what a
-    /// batch for the block would be taken under.
+    /// The binding of `header`'s vote set, bound to `committee` keyed
+    /// `committee_epoch`: what a batch for the block would be taken under.
     #[cfg(test)]
-    pub(crate) fn bind(&mut self, header: &BlockHeader, committee: &[ValidatorId]) -> u64 {
-        self.bound_vote_set(header.hash(), committee, Some(header))
+    pub(crate) fn bind(
+        &mut self,
+        header: &BlockHeader,
+        committee: &[ValidatorId],
+        committee_epoch: Epoch,
+    ) -> u64 {
+        self.bound_vote_set(header.hash(), committee, committee_epoch, Some(header))
             .binding()
     }
 
     /// Shared committee/power lookup for both vote-ingestion paths.
     /// Returns `None` when the vote should be dropped (committed height,
-    /// non-committee voter, missing public key).
+    /// another committee epoch, non-committee voter, missing public key).
+    ///
+    /// A vote naming another epoch than the block's committee resolves to
+    /// here is dropped before the set sees it: it is the same block and
+    /// round under another view of the schedule, so neither a tally nor
+    /// evidence of equivocation, and buffered it would hold its voter's
+    /// slot against the vote that counts.
     fn preflight(
-        topology_snapshot: &TopologySnapshot,
+        committee: BlockCommittee<'_>,
         local_shard: ShardId,
         vote: &BlockVote,
         committed_height: BlockHeight,
     ) -> Option<VotePreflight> {
         let height = vote.height();
         let voter = vote.voter();
+        let topology_snapshot = committee.snapshot;
+
+        if vote.committee_epoch() != committee.epoch {
+            trace!(
+                voter = ?voter,
+                vote_epoch = vote.committee_epoch().inner(),
+                committee_epoch = committee.epoch.inner(),
+                "Skipping vote signed under another committee epoch"
+            );
+            return None;
+        }
 
         if height <= committed_height {
             trace!(
@@ -407,6 +435,7 @@ impl VoteKeeper {
             return vec![];
         };
 
+        let committee_epoch = vote_set.committee_epoch();
         let verified_votes = vote_set.get_verified_votes();
         let votes_to_verify = vote_set.take_unverified_votes();
 
@@ -418,18 +447,21 @@ impl VoteKeeper {
             "Triggering batch vote verification (quorum possible)"
         );
 
-        vec![Action::VerifyAndBuildQuorumCertificate {
-            block_hash,
-            shard_id: local_shard,
-            height,
-            round,
-            parent_block_hash,
-            parent_weighted_timestamp,
-            votes_to_verify,
-            verified_votes,
-            total_votes: total_power,
-            binding: vote_set.binding(),
-        }]
+        vec![Action::Consensus(
+            ConsensusAction::VerifyAndBuildQuorumCertificate {
+                block_hash,
+                shard_id: local_shard,
+                height,
+                round,
+                committee_epoch,
+                parent_block_hash,
+                parent_weighted_timestamp,
+                votes_to_verify,
+                verified_votes,
+                total_votes: total_power,
+                binding: vote_set.binding(),
+            },
+        )]
     }
 
     /// Whether the QC a batch taken under `binding` formed for
@@ -474,6 +506,7 @@ impl VoteKeeper {
             block_hash,
             parent_block_hash,
             round: vote.round(),
+            committee_epoch: vote.committee_epoch(),
             signature: vote.signature(),
         };
         match self.record_received_vote(vote.height(), vote.voter(), incoming) {
@@ -495,9 +528,11 @@ impl VoteKeeper {
                     round: vote.round(),
                     block_hash_a: existing.block_hash,
                     parent_block_hash_a: parent_a,
+                    committee_epoch_a: existing.committee_epoch,
                     sig_a: existing.signature,
                     block_hash_b: block_hash,
                     parent_block_hash_b: parent_b,
+                    committee_epoch_b: vote.committee_epoch(),
                     sig_b: vote.signature(),
                 })
             }
@@ -590,6 +625,9 @@ pub struct StoredVote {
     pub(crate) parent_block_hash: Option<BlockHash>,
     /// Round the vote was cast in.
     pub(crate) round: Round,
+    /// The committee epoch the vote signed, bound into the signing
+    /// message.
+    pub(crate) committee_epoch: Epoch,
     /// The vote's signature.
     pub(crate) signature: ConsensusSignature,
 }
@@ -614,12 +652,14 @@ pub enum RecordResult {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         BlockHeaderParts, ChainOrigin, Hash, NetworkDefinition, ProposerTimestamp,
-        QuorumCertificate, ShardId, Signer, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
-        WeightedTimestamp, verify_shard_vote_equivocation,
+        QuorumCertificate, ShardId, Signer, TopologySnapshot, ValidatorId, ValidatorInfo,
+        ValidatorSet, VoteCount, WeightedTimestamp, verify_shard_vote_equivocation,
     };
 
     use super::*;
@@ -632,7 +672,17 @@ mod tests {
             block_hash,
             parent_block_hash: Some(BlockHash::from_raw(Hash::from_bytes(b"parent"))),
             round,
+            committee_epoch: Epoch::GENESIS,
             signature: ConsensusSignature::new([0u8; 96]),
+        }
+    }
+
+    /// The committee `snapshot` seats under `epoch`.
+    fn under(snapshot: &Arc<TopologySnapshot>, epoch: Epoch) -> BlockCommittee<'_> {
+        BlockCommittee {
+            snapshot,
+            epoch,
+            past_terminal: false,
         }
     }
 
@@ -663,11 +713,11 @@ mod tests {
         let hdr_h3 = make_header_at_round(BlockHeight::new(3), Round::new(3));
         vk.vote_sets.insert(
             hdr_h1.hash(),
-            VoteSet::new(Some(&hdr_h1), &four_members(), 0),
+            VoteSet::new(Some(&hdr_h1), &four_members(), Epoch::GENESIS, 0),
         );
         vk.vote_sets.insert(
             hdr_h3.hash(),
-            VoteSet::new(Some(&hdr_h3), &four_members(), 0),
+            VoteSet::new(Some(&hdr_h3), &four_members(), Epoch::GENESIS, 0),
         );
         vk.received_votes_by_height.insert(
             (BlockHeight::new(2), ValidatorId::new(7)),
@@ -816,6 +866,7 @@ mod tests {
                 shard,
                 height,
                 round,
+                Epoch::GENESIS,
                 voter,
                 &sk,
                 ProposerTimestamp::ZERO,
@@ -846,7 +897,7 @@ mod tests {
     // Vote-set growth bounds
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn keys_and_topology(n: u64) -> (Vec<BlsSigner>, TopologySnapshot) {
+    fn keys_and_topology(n: u64) -> (Vec<BlsSigner>, Arc<TopologySnapshot>) {
         let keys: Vec<BlsSigner> = (0..n).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -861,7 +912,7 @@ mod tests {
             1,
             ValidatorSet::new(validators),
         );
-        (keys, topo)
+        (keys, Arc::new(topo))
     }
 
     fn wire_vote(keys: &[BlsSigner], voter: usize, height: BlockHeight) -> BlockVote {
@@ -872,6 +923,7 @@ mod tests {
             ShardId::ROOT,
             height,
             Round::INITIAL,
+            Epoch::GENESIS,
             ValidatorId::new(u64::try_from(voter).unwrap_or(u64::MAX)),
             &keys[voter],
             ProposerTimestamp::from_millis(1_000),
@@ -887,7 +939,7 @@ mod tests {
                 &u64::try_from(i).unwrap_or(u64::MAX).to_le_bytes(),
             ));
             vk.vote_sets
-                .insert(hash, VoteSet::new(None, &four_members(), 0));
+                .insert(hash, VoteSet::new(None, &four_members(), Epoch::GENESIS, 0));
         }
         assert_eq!(vk.vote_sets_len(), MAX_VOTE_SETS);
 
@@ -903,7 +955,7 @@ mod tests {
 
     /// A one-shard snapshot seating the validators `ids`, keyed by `keys`
     /// at their own index.
-    fn committee_of(keys: &[BlsSigner], ids: &[u64]) -> TopologySnapshot {
+    fn committee_of(keys: &[BlsSigner], ids: &[u64]) -> Arc<TopologySnapshot> {
         let validators = ids
             .iter()
             .map(|&id| ValidatorInfo {
@@ -911,11 +963,103 @@ mod tests {
                 public_key: keys[usize::try_from(id).expect("fits")].public_key(),
             })
             .collect();
-        TopologySnapshot::new(
+        Arc::new(TopologySnapshot::new(
             NetworkDefinition::simulator(),
             1,
             ValidatorSet::new(validators),
-        )
+        ))
+    }
+
+    /// A redrawn committee can seat the same members at the same indexes
+    /// under another window. The set re-binds on the epoch alone: votes
+    /// signed under the old epoch never reach a batch with those signed
+    /// under the new one, and a vote naming an epoch other than the one
+    /// the block's committee resolves to is dropped without holding its
+    /// voter's slot or being tracked as equivocation.
+    #[test]
+    fn a_vote_set_rebinds_on_an_epoch_change() {
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let members = committee_of(&keys, &[0, 1, 2, 3]);
+        let shard = ShardId::ROOT;
+        let committed = BlockHeight::new(0);
+        let height = BlockHeight::new(1);
+        let header = BlockHeader::new(BlockHeaderParts {
+            height,
+            parent_block_hash: BlockHash::ZERO,
+            round: Round::INITIAL,
+            ..Default::default()
+        });
+        let block_hash = header.hash();
+        let (old, redrawn) = (Epoch::new(2), Epoch::new(21));
+        let vote = |voter: u64, epoch: Epoch| {
+            BlockVote::new(
+                &NetworkDefinition::simulator(),
+                block_hash,
+                BlockHash::ZERO,
+                shard,
+                height,
+                Round::INITIAL,
+                epoch,
+                ValidatorId::new(voter),
+                &keys[usize::try_from(voter).expect("fits")],
+                ProposerTimestamp::from_millis(1_000),
+            )
+            .expect("sign")
+        };
+        let mut vk = VoteKeeper::new();
+        let first = vk.bind(&header, &four_members(), old);
+        for voter in [0, 1] {
+            let actions = vk.accept_unverified_vote(
+                under(&members, old),
+                shard,
+                vote(voter, old),
+                committed,
+                Some(&header),
+            );
+            assert!(actions.is_empty(), "{actions:?}");
+        }
+        // A vote naming the redrawn epoch while the block still resolves
+        // the old one is no vote here.
+        let actions = vk.accept_unverified_vote(
+            under(&members, old),
+            shard,
+            vote(2, redrawn),
+            committed,
+            Some(&header),
+        );
+        assert!(actions.is_empty(), "{actions:?}");
+
+        let rebound = vk.bind(&header, &four_members(), redrawn);
+        assert_ne!(first, rebound, "the epoch alone re-binds the set");
+        let mut batches = Vec::new();
+        for voter in [0, 1, 2] {
+            batches.extend(vk.accept_unverified_vote(
+                under(&members, redrawn),
+                shard,
+                vote(voter, redrawn),
+                committed,
+                Some(&header),
+            ));
+        }
+        let [
+            Action::Consensus(ConsensusAction::VerifyAndBuildQuorumCertificate {
+                votes_to_verify,
+                committee_epoch,
+                binding,
+                ..
+            }),
+        ] = batches.as_slice()
+        else {
+            panic!("one batch at the redrawn quorum, got {batches:?}");
+        };
+        assert_eq!(*committee_epoch, redrawn);
+        assert_eq!(*binding, rebound);
+        assert_eq!(votes_to_verify.len(), 3);
+        assert!(
+            votes_to_verify
+                .iter()
+                .all(|(_, vote, _)| vote.committee_epoch() == redrawn)
+        );
     }
 
     /// Votes indexed against one committee are dropped when the block's
@@ -936,7 +1080,8 @@ mod tests {
             ..Default::default()
         });
         let block_hash = header.hash();
-        let vote = |voter: u64| {
+        let (halted_epoch, fresh_epoch) = (Epoch::GENESIS, Epoch::new(1));
+        let vote = |voter: u64, epoch: Epoch| {
             BlockVote::new(
                 &NetworkDefinition::simulator(),
                 block_hash,
@@ -944,6 +1089,7 @@ mod tests {
                 shard,
                 height,
                 Round::INITIAL,
+                epoch,
                 ValidatorId::new(voter),
                 &keys[usize::try_from(voter).expect("fits")],
                 ProposerTimestamp::from_millis(1_000),
@@ -952,28 +1098,33 @@ mod tests {
         };
         let mut vk = VoteKeeper::new();
         for voter in [0, 1] {
-            let actions =
-                vk.accept_unverified_vote(&halted, shard, vote(voter), committed, Some(&header));
+            let actions = vk.accept_unverified_vote(
+                under(&halted, halted_epoch),
+                shard,
+                vote(voter, halted_epoch),
+                committed,
+                Some(&header),
+            );
             assert!(actions.is_empty(), "{actions:?}");
         }
 
         let mut batches = Vec::new();
         for voter in [4, 5, 6] {
             batches.extend(vk.accept_unverified_vote(
-                &fresh,
+                under(&fresh, fresh_epoch),
                 shard,
-                vote(voter),
+                vote(voter, fresh_epoch),
                 committed,
                 Some(&header),
             ));
         }
         let [
-            Action::VerifyAndBuildQuorumCertificate {
+            Action::Consensus(ConsensusAction::VerifyAndBuildQuorumCertificate {
                 votes_to_verify,
                 verified_votes,
                 total_votes,
                 ..
-            },
+            }),
         ] = batches.as_slice()
         else {
             panic!("one batch at the fresh quorum, got {batches:?}");
@@ -1009,12 +1160,24 @@ mod tests {
 
         // A vote far above committed is dropped before any set is created.
         let far = BlockHeight::new(10 + MAX_VOTE_HEIGHT_LOOKAHEAD + 1);
-        vk.accept_unverified_vote(&topo, shard, wire_vote(&keys, 0, far), committed, None);
+        vk.accept_unverified_vote(
+            under(&topo, Epoch::GENESIS),
+            shard,
+            wire_vote(&keys, 0, far),
+            committed,
+            None,
+        );
         assert_eq!(vk.vote_sets_len(), 0);
 
         // A vote at the lookahead edge is tracked.
         let edge = BlockHeight::new(10 + MAX_VOTE_HEIGHT_LOOKAHEAD);
-        vk.accept_unverified_vote(&topo, shard, wire_vote(&keys, 0, edge), committed, None);
+        vk.accept_unverified_vote(
+            under(&topo, Epoch::GENESIS),
+            shard,
+            wire_vote(&keys, 0, edge),
+            committed,
+            None,
+        );
         assert_eq!(vk.vote_sets_len(), 1);
     }
 
@@ -1099,6 +1262,7 @@ mod properties {
             block_hash,
             parent_block_hash: Some(BlockHash::from_raw(Hash::from_bytes(b"parent"))),
             round,
+            committee_epoch: Epoch::GENESIS,
             signature: ConsensusSignature::new([0u8; 96]),
         }
     }

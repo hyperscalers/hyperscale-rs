@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use hyperscale_simulation::{DeliveryDrain, DeliveryRecord};
 use hyperscale_types::{
-    Anchor, BlockHeight, ExecutionOutcome, Finalization, MessageClass, Provisions, Round, ShardId,
-    TickId, TxHash, TxOutcome,
+    Anchor, BlockHeight, ExecutionOutcome, Finalization, MessageClass, Round, ShardId, TickId,
+    TxHash, TxOutcome,
 };
 use serde::Serialize;
 
@@ -396,7 +396,8 @@ impl TraceEvent {
 
     pub(crate) fn provisions_verified(
         wt: u64,
-        bundle: &Provisions,
+        from: ShardId,
+        from_height: BlockHeight,
         to: ShardId,
         to_height: BlockHeight,
         delivered: Vec<TxHash>,
@@ -404,8 +405,8 @@ impl TraceEvent {
         Self {
             wt,
             kind: TraceKind::ProvisionsVerified {
-                from: bundle.source_shard().into(),
-                from_height: bundle.block_height().inner(),
+                from: from.into(),
+                from_height: from_height.inner(),
                 to: to.into(),
                 to_height: to_height.inner(),
                 txs: delivered.into_iter().map(TxLabel::from).collect(),

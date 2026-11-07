@@ -56,6 +56,8 @@ hyperscale-vm-fixtures.workspace = true
 hyperscale-transactions.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 hyperscale-vm-manifest-builder.workspace = true
+hyperscale-vm-effects = { workspace = true, features = ["testing"] }
+hyperscale-vm-sdk.workspace = true
 proptest.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

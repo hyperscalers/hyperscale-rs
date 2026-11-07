@@ -69,8 +69,8 @@ impl CommitPipeline {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        AggregateSignature, Block, BlockHash, ChainOrigin, QuorumCertificate, Round, ShardId,
-        SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp,
+        AggregateSignature, Block, BlockHash, ChainOrigin, Epoch, QuorumCertificate, Round,
+        ShardId, SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -88,6 +88,7 @@ mod tests {
             BlockHeight::new(height),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -143,8 +144,8 @@ mod tests {
 #[cfg(test)]
 mod properties {
     use hyperscale_types::{
-        AggregateSignature, Block, BlockHash, ChainOrigin, QuorumCertificate, Round, ShardId,
-        SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp,
+        AggregateSignature, Block, BlockHash, ChainOrigin, Epoch, QuorumCertificate, Round,
+        ShardId, SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp,
     };
     use proptest::prelude::*;
 
@@ -163,6 +164,7 @@ mod properties {
             BlockHeight::new(height),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

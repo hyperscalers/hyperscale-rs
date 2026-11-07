@@ -28,9 +28,9 @@ use hyperscale_types::{
     CommittedAt, ConsensusReceipt, Deadline, Decision, DiscardCause, EntryKey, EntryLeaf, Epoch,
     EpochWindows, Event, ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs,
     GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LocalKey,
-    MAX_SWEEP_PER_BLOCK, MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths,
-    PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable, ProposerTimestamp,
-    ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate,
+    MAX_SWEEP_PER_BLOCK, MemberCollection, MemberTerms, MerkleInclusionProof, Movement, PcQc2,
+    PcQc3, PcSignerLengths, PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable,
+    ProposerTimestamp, ProtocolHasher, Provision, ProvisionHash, QuorumCertificate,
     RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
     Reading, Role, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement,
     ShardAnchor, ShardId, ShardTrie, ShardWitnessPayload, SiblingView, SignerBitfield, Source,
@@ -48,21 +48,22 @@ use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
 use crate::shard::chain_floor::{FloorInputs, chain_floor};
 use crate::shard::members::{AnchorReadings, SettledHalf, VerdictLeaf, verdict_hash};
+use crate::shard::serves_order;
 use crate::shard::sweep::{sweep_for_block, sweep_through};
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::shard::vote_registers::carry_signed_rounds;
 use crate::tree::Jmt;
 use crate::tree::proofs::generate_proof;
 use crate::{
-    Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
-    ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit, ImportCursor,
-    ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, MemberRow, PackageArtifactStore,
-    ParentAnchor, PendingChain, RecoveredState, RecoveryAnchor, RowState, SafeVoteRegisterStore,
-    ShardChainReader, ShardChainWriter, SubstateStore, SubstateView, Substates, SweepIndex,
-    TickChain, TickOutput, TickResolution, VerdictChange, VersionedStore, WitnessSeed,
-    colliding_committed_cell, committed_here, committed_tx_cell_key, committed_tx_cells,
-    entry_leaf_value, filter_state_writes_to_prefix, held_total, holds_state, key_under_prefix,
-    member_row_leaf, reserved_total, verdict_changes,
+    AdoptSource, Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore,
+    ChainEntry, ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit, Head,
+    ImportCursor, ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, MemberRow,
+    PackageArtifactStore, ParentAnchor, PendingChain, Place, RecoveredState, RecoveryAnchor,
+    RowState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
+    SubstateView, Substates, SweepIndex, TickChain, TickOutput, TickResolution, VerdictChange,
+    VersionedStore, WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
+    committed_tx_cells, entry_leaf_value, filter_state_writes_to_prefix, held_total, holds_state,
+    key_under_prefix, member_row_leaf, reserved_total, verdict_changes,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -226,15 +227,15 @@ pub const fn state_key(owner_seed: u8, local_seed: u8) -> SubstateKey {
 /// what a stored finalization needs to decode again: one certificate
 /// whose `tick_id` is the tick's own.
 #[must_use]
-pub fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> Arc<ExecutionCertificate> {
-    Arc::new(ExecutionCertificate::new(
+pub fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> ExecutionCertificate {
+    ExecutionCertificate::new(
         TickId::new(shard, height),
         WeightedTimestamp::from_millis(0),
         GlobalReceiptRoot::ZERO,
         Capped::empty(),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
-    ))
+    )
 }
 
 /// Build a test attestation at the given height, carrying a placeholder
@@ -255,15 +256,16 @@ pub fn make_test_block(height: BlockHeight) -> Block {
     make_test_block_with_anchor_wt(height, 0)
 }
 
-/// Build a single-validator test block at `height` stamped `timestamp_ms`.
+/// Build a single-validator test block at `height`, anchored and stamped
+/// at `timestamp_ms`.
 ///
-/// [`make_test_qc`] carries the header's timestamp onto the QC, so this
-/// is how a fixture chain sets the pace its retention floor moves at: a
-/// chain a retention horizon wide per block leaves every prior version
-/// behind, one a fraction of a horizon apart keeps a known number.
+/// A version is dated by its anchor, so this is how a fixture chain sets
+/// the pace its retention floor moves at: a chain a retention horizon wide
+/// per block leaves every prior version behind, one a fraction of a
+/// horizon apart keeps a known number.
 #[must_use]
 pub(crate) fn make_test_block_at(height: BlockHeight, timestamp_ms: u64) -> Block {
-    let mut block = make_test_block_with_anchor_wt(height, 0);
+    let mut block = make_test_block_with_anchor_wt(height, timestamp_ms);
     if let Block::Live { header, .. } = &mut block {
         *header = BlockHeader::new(BlockHeaderParts {
             height,
@@ -319,6 +321,11 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
 /// require the verified marker.
 #[must_use]
 pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
+    make_test_qc_signed(block, Epoch::GENESIS)
+}
+
+/// [`make_test_qc`] signed under `committee_epoch`.
+fn make_test_qc_signed(block: &Block, committee_epoch: Epoch) -> Verified<QuorumCertificate> {
     // SAFETY: synthetic test fixture, no real signature.
     Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
         block.hash(),
@@ -326,6 +333,7 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
         block.height(),
         block.header().parent_block_hash(),
         Round::INITIAL,
+        committee_epoch,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
@@ -342,7 +350,16 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
 /// the helper precludes by construction.
 #[must_use]
 pub fn make_test_certified(block: Block) -> Arc<Verified<CertifiedBlock>> {
-    let qc = make_test_qc(&block);
+    make_test_certified_signed(block, Epoch::GENESIS)
+}
+
+/// [`make_test_certified`] with its QC signed under `committee_epoch`.
+#[must_use]
+pub fn make_test_certified_signed(
+    block: Block,
+    committee_epoch: Epoch,
+) -> Arc<Verified<CertifiedBlock>> {
+    let qc = make_test_qc_signed(&block, committee_epoch);
     let certified = CertifiedBlock::new_unchecked(block, qc);
     // SAFETY: synthetic test fixture; storage round-trip tests don't
     // exercise the `Verified<CertifiedBlock>` predicate.
@@ -387,7 +404,7 @@ fn placeholder_cert() -> SpcCert {
 /// placeholder. Suitable for storage round-trip tests, not for
 /// consensus verification.
 #[must_use]
-pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<Verified<CertifiedBeaconBlock>> {
+pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Verified<CertifiedBeaconBlock> {
     let block = BeaconBlock::new(
         Epoch::new(epoch),
         BeaconBlockHash::from_raw(Hash::from_bytes(tag)),
@@ -401,14 +418,12 @@ pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<Verified<CertifiedB
         SignerBitfield::new(4),
         AggregateSignature::new([0x22; 96]),
     );
-    Arc::new(Verified::new_unchecked_for_test(
-        CertifiedBeaconBlock::new_unchecked(
-            block,
-            BeaconCert::Normal {
-                spc: Box::new(placeholder_cert()),
-                ratify,
-            },
-        ),
+    Verified::new_unchecked_for_test(CertifiedBeaconBlock::new_unchecked(
+        block,
+        BeaconCert::Normal {
+            spc: Box::new(placeholder_cert()),
+            ratify,
+        },
     ))
 }
 
@@ -440,7 +455,7 @@ pub fn make_test_beacon_state(epoch: u64, tag: &[u8]) -> Arc<BeaconState> {
 pub fn make_test_block_and_state(
     epoch: u64,
     tag: &[u8],
-) -> (Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>) {
+) -> (Verified<CertifiedBeaconBlock>, Arc<BeaconState>) {
     let state = make_test_beacon_state(epoch, tag);
     let block = make_test_beacon_block(epoch, tag);
     (block, state)
@@ -507,7 +522,7 @@ pub fn make_test_execution_certificate(
 ///
 /// If `fw` is past the certificate cap the block's field states.
 #[must_use]
-pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
+pub fn push_certificate(block: Block, fw: Verifiable<Finalization>) -> Block {
     match block {
         Block::Live {
             header,
@@ -665,7 +680,9 @@ fn commit_with_members<S: TestStore>(
     )
 }
 
-fn commit_folding<S: TestStore>(
+/// Commit `certified` as [`commit_settled_at`] does, folding `members`
+/// into tick membership.
+pub fn commit_folding<S: TestStore>(
     storage: &S,
     certified: &Arc<Verified<CertifiedBlock>>,
     creations: &[(SubstateKey, Vec<u8>)],
@@ -709,7 +726,7 @@ fn commit_empty_blocks_below(storage: &impl TestStore, target: BlockHeight) {
 
 /// A finalization at `height` whose one receipt carries `writes`, with
 /// the placeholder certificate a stored finalization needs to decode.
-fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finalization>> {
+fn settling(height: BlockHeight, writes: StateWrites) -> Verifiable<Finalization> {
     let receipt = StoredReceipt {
         tx_hash: TxHash::ZERO,
         consensus: Arc::new(ConsensusReceipt::Succeeded {
@@ -719,15 +736,13 @@ fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finaliza
             events: Capped::empty(),
         }),
     };
-    Arc::new(
-        Finalization::new(
-            TickId::new(ShardId::ROOT, height),
-            TickHalf::Determined,
-            Some(placeholder_local_ec(ShardId::ROOT, height)),
-            Capped::from_array([receipt]),
-        )
-        .into(),
+    Finalization::new(
+        TickId::new(ShardId::ROOT, height),
+        TickHalf::Determined,
+        Some(placeholder_local_ec(ShardId::ROOT, height)),
+        Capped::from_array([receipt]),
     )
+    .into()
 }
 
 /// Commit `writes` at `height` through the one commit path.
@@ -819,15 +834,13 @@ pub fn paced(height: u64, blocks: u64) -> WeightedTimestamp {
 /// If a list written out here is past the cap its type states.
 #[must_use]
 pub fn block_settling(height: BlockHeight, receipts: Vec<StoredReceipt>) -> Block {
-    let finalized = Arc::new(
-        Finalization::new(
-            TickId::new(ShardId::ROOT, height),
-            TickHalf::Determined,
-            None,
-            Capped::new(receipts).expect("a list written out in a test"),
-        )
-        .into(),
-    );
+    let finalized = Finalization::new(
+        TickId::new(ShardId::ROOT, height),
+        TickHalf::Determined,
+        None,
+        Capped::new(receipts).expect("a list written out in a test"),
+    )
+    .into();
     push_certificate(make_test_block(height), finalized)
 }
 
@@ -1110,6 +1123,60 @@ pub fn test_boundary_retention_keeps_the_attested_anchor<S: BoundaryStore + Test
 pub fn test_boundary_unpinned_height_not_served<S: BoundaryStore + TestStore>(storage: &S) {
     commit_one(storage, 1);
     assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
+}
+
+/// Shared adoption test: an adopted store keeps no pin beneath its
+/// genesis.
+///
+/// `storage` is an empty store rooted at the trie root's right child,
+/// imported here at its parent's boundary as a split observer's is. A
+/// pin at the genesis outlives a re-run of the adoption.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_an_adoption_evicts_the_pins_beneath_its_genesis<S: BoundaryStore>(storage: &S) {
+    let boundary = BlockHeight::new(3);
+    let root = import_boundary_state(
+        storage,
+        boundary,
+        &[crossing_record_leaf(0x82)],
+        WitnessSeed::default(),
+    )
+    .unwrap();
+    assert_eq!(storage.oldest_pin(), Some(boundary));
+
+    let origin = ChainOrigin {
+        genesis_height: BlockHeight::new(5),
+        anchor_wt: WeightedTimestamp::from_millis(42_000),
+    };
+    let terminal = Block::genesis(
+        ShardId::ROOT,
+        ValidatorId::new(0),
+        StateRoot::ZERO,
+        ChainOrigin {
+            genesis_height: BlockHeight::new(4),
+            anchor_wt: WeightedTimestamp::ZERO,
+        },
+    );
+    let genesis = Block::split_child_genesis(
+        ShardId::ROOT.children().1,
+        root,
+        terminal.header(),
+        origin.anchor_wt,
+    );
+    let adopted = storage
+        .adopt_genesis(origin, &genesis, AdoptSource::FollowedTip)
+        .unwrap();
+    assert_eq!(adopted, root);
+    assert_eq!(storage.oldest_pin(), None);
+    assert!(storage.open_boundary(boundary).is_none());
+
+    storage.pin_boundary(origin.genesis_height).unwrap();
+    storage
+        .adopt_genesis(origin, &genesis, AdoptSource::FollowedTip)
+        .unwrap();
+    assert_eq!(storage.oldest_pin(), Some(origin.genesis_height));
 }
 
 /// The entry pipeline both backends serve identically.
@@ -2013,18 +2080,11 @@ where
     );
 }
 
-/// Attach a provisions bundle for `tx_hash` to a live block, preserving
+/// Attach a provision part for `tx_hash` to a live block, preserving
 /// everything else.
 #[must_use]
 pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block {
-    let bundle = Provisions::new(
-        source,
-        ShardId::ROOT,
-        BlockHeight::new(1),
-        WeightedTimestamp::ZERO,
-        MerkleInclusionProof::dummy(),
-        Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-    );
+    let bundle = Provision::dummy(source, ShardId::ROOT, BlockHeight::new(1), tx_hash);
     match block {
         Block::Live {
             header,
@@ -2038,7 +2098,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             header,
             transactions,
             certificates,
-            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(bundle))])),
+            provisions: Arc::new(Capped::from_array([Verifiable::from(bundle)])),
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
@@ -2050,7 +2110,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
 }
 
 /// Attach `txs` to a live block, preserving everything else.
-fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Block {
+fn with_transactions(block: Block, txs: Vec<Verifiable<Transaction>>) -> Block {
     match block {
         Block::Live {
             header,
@@ -2542,6 +2602,7 @@ fn reserving_chain(first: u64) -> Reserving {
         joins: Joins::Executes,
         settlement: Settlement::Shared,
         holds: Capped::empty(),
+        pins: Capped::empty(),
         reach: stated.terms.reach.clone(),
         awaits: stated.terms.awaits.clone(),
         charge: stated.terms.charge,
@@ -2549,6 +2610,7 @@ fn reserving_chain(first: u64) -> Reserving {
         reserves: stated.terms.reserves.clone(),
         deadline: Deadline::of_transaction(&tx),
         crossings: Capped::empty(),
+        served_at: None,
     };
     let dropped = TickLine::Discard {
         tick: TickId::new(ShardId::ROOT, BlockHeight::new(first + 1)),
@@ -2562,7 +2624,7 @@ fn reserving_chain(first: u64) -> Reserving {
     Reserving {
         blocks: [
             with_member_sections(
-                with_transactions(at(first), vec![Arc::new(Verifiable::from(tx))]),
+                with_transactions(at(first), vec![(Verifiable::from(tx))]),
                 Vec::new(),
                 vec![stated],
             ),
@@ -3977,7 +4039,7 @@ fn commit_finalizing<S: TestStore>(
     let finalization = make_finalization_leaving(BlockHeight::new(tick), tx_hash, writes);
     let block = push_certificate(
         make_test_block(BlockHeight::new(height)),
-        Arc::new(finalization.into()),
+        finalization.into(),
     );
     commit_settled_at(
         storage,
@@ -4048,7 +4110,12 @@ where
     );
     let (block, inputs) = owed_block(2, vec![owed.claim(7, owed.held())], None);
     commit_raising(credited, block, &inputs);
-    chain.prune_persisted(BlockHeight::new(2), BlockHeight::GENESIS);
+    chain.prune_persisted(
+        BlockHeight::new(2),
+        BlockHeight::GENESIS,
+        None,
+        WeightedTimestamp::MAX,
+    );
     assert_eq!(
         baseline_at(&chain, 2, owed.vault()),
         SEED + Owed::AMOUNT,
@@ -4127,7 +4194,12 @@ where
         "block 3 is unwritten, so the tick at height 4 has no baseline yet",
     );
     commit_finalizing(charged, 3, 2, refused, charge);
-    chain.prune_persisted(BlockHeight::new(3), BlockHeight::new(3));
+    chain.prune_persisted(
+        BlockHeight::new(3),
+        BlockHeight::new(3),
+        None,
+        WeightedTimestamp::MAX,
+    );
     assert_eq!(
         baseline_at(&chain, 3, vault),
         CREDIT,
@@ -4209,11 +4281,11 @@ where
     );
     let block = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(tx))],
+        vec![(Verifiable::from(tx))],
     );
     let creations = committed_tx_cells(
         block.header().shard_id(),
-        block.transactions().iter().map(|tx| tx.as_unverified()),
+        block.transactions().iter().map(Verifiable::as_unverified),
     );
 
     let parent_root = storage.state_root();
@@ -4271,7 +4343,7 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
     let tx = test_transaction(1);
     let block = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(tx.clone()))],
+        vec![(Verifiable::from(tx.clone()))],
     );
     let creations = committed_tx_cells(ShardId::ROOT, [&tx]);
     let rows = committed_here(ShardId::ROOT, WeightedTimestamp::ZERO, [&tx]);
@@ -4431,11 +4503,11 @@ where
     let tx = test_transaction(1);
     let block = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(tx))],
+        vec![(Verifiable::from(tx))],
     );
     let creations = committed_tx_cells(
         block.header().shard_id(),
-        block.transactions().iter().map(|tx| tx.as_unverified()),
+        block.transactions().iter().map(Verifiable::as_unverified),
     );
     let (spec_root, _, prepared) = storage.prepare_block_commit(
         ParentAnchor {
@@ -4669,7 +4741,7 @@ pub fn test_committed_bundle_outlives_sealing(
         recovered()
             .retained_provisions
             .iter()
-            .map(|bundle| bundle.hash())
+            .map(Provision::hash)
             .collect::<Vec<_>>(),
         vec![hash],
         "and the body it dropped is recovered from storage",
@@ -4738,8 +4810,8 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + TestStore)) {
     let committing = with_transactions(
         make_test_block(BlockHeight::new(2)),
         vec![
-            Arc::new(Verifiable::from(resolved.clone())),
-            Arc::new(Verifiable::from(open.clone())),
+            (Verifiable::from(resolved.clone())),
+            (Verifiable::from(open.clone())),
         ],
     );
     commit_settled_at(
@@ -4766,11 +4838,11 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + TestStore)) {
     // lets the rebuilt block carry it on every backend.
     let resolving = push_certificate(
         make_test_block(BlockHeight::new(4)),
-        Arc::new(Verifiable::from(make_finalization(
+        Verifiable::from(make_finalization(
             BlockHeight::new(4),
             resolved.hash(),
             TransactionDecision::Aborted,
-        ))),
+        )),
     );
     commit_settled_at(
         storage,
@@ -4913,7 +4985,7 @@ pub fn test_a_settled_tick_pulls_the_replay_down(storage: &(impl ShardChainReade
     // open one commits at 4; the tick's finalization commits at 5.
     let committing = with_transactions(
         make_test_block(BlockHeight::new(2)),
-        vec![Arc::new(Verifiable::from(settled.clone()))],
+        vec![(Verifiable::from(settled.clone()))],
     );
     commit_settled_at(
         storage,
@@ -4926,16 +4998,16 @@ pub fn test_a_settled_tick_pulls_the_replay_down(storage: &(impl ShardChainReade
     commit_settled_at(storage, &seating, &[], &[], &witness);
     let owing = with_transactions(
         make_test_block(BlockHeight::new(4)),
-        vec![Arc::new(Verifiable::from(open))],
+        vec![(Verifiable::from(open))],
     );
     commit_settled_at(storage, &make_test_certified(owing), &[], &[], &witness);
     let settling = push_certificate(
         make_test_block(BlockHeight::new(5)),
-        Arc::new(Verifiable::from(make_finalization(
+        Verifiable::from(make_finalization(
             BlockHeight::new(3),
             settled.hash(),
             TransactionDecision::Aborted,
-        ))),
+        )),
     );
     commit_settled_at(storage, &make_test_certified(settling), &[], &[], &witness);
 
@@ -5006,7 +5078,7 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
             committed: CommittedAt {
                 height: BlockHeight::new(1),
                 anchor: WeightedTimestamp::from_millis(100),
-                committee_anchor: WeightedTimestamp::from_millis(100),
+                committee_epoch: Epoch::GENESIS,
             },
             reach: stranded.routing().all_routes(),
         }],
@@ -5046,11 +5118,11 @@ pub fn test_undischarged_record_holds_the_floor(storage: &(impl ShardChainReader
     // The abort discharges it, and the floor lifts with it.
     let aborting = push_certificate(
         make_test_block(BlockHeight::new(4)),
-        Arc::new(Verifiable::from(make_finalization(
+        Verifiable::from(make_finalization(
             BlockHeight::new(4),
             stranded.hash(),
             TransactionDecision::Aborted,
-        ))),
+        )),
     );
     commit_settled_at(
         storage,
@@ -5093,7 +5165,7 @@ pub fn test_a_leg_entry_holds_the_floor_to_its_horizon(
     commit_empty_blocks_below(storage, BlockHeight::new(1));
     let committing = with_transactions(
         make_test_block_with_anchor_wt(BlockHeight::new(1), committed_ms),
-        vec![Arc::new(Verifiable::from(leg.clone()))],
+        vec![(Verifiable::from(leg.clone()))],
     );
     commit_settled_at(
         storage,
@@ -5104,10 +5176,7 @@ pub fn test_a_leg_entry_holds_the_floor_to_its_horizon(
     );
     let settling = push_certificate(
         make_test_block_with_anchor_wt(BlockHeight::new(2), committed_ms + 1_000),
-        Arc::new(Verifiable::from(make_leg_finalization(
-            BlockHeight::new(2),
-            leg.hash(),
-        ))),
+        Verifiable::from(make_leg_finalization(BlockHeight::new(2), leg.hash())),
     );
     commit_settled_at(
         storage,
@@ -5166,7 +5235,7 @@ pub fn test_the_replay_floor_stops_at_the_chain_origin(
     // certificate resolves, exactly what would hold the floor down.
     let below = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(inherited))],
+        vec![(Verifiable::from(inherited))],
     );
     commit_settled_at(
         storage,
@@ -5177,7 +5246,7 @@ pub fn test_the_replay_floor_stops_at_the_chain_origin(
     );
     let above = with_transactions(
         make_test_block(BlockHeight::new(2)),
-        vec![Arc::new(Verifiable::from(own))],
+        vec![(Verifiable::from(own))],
     );
     commit_settled_at(
         storage,
@@ -5230,7 +5299,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
     commit_empty_blocks_below(storage, BlockHeight::new(1));
     let committing = with_transactions(
         make_test_block(BlockHeight::new(1)),
-        vec![Arc::new(Verifiable::from(leg.clone()))],
+        vec![(Verifiable::from(leg.clone()))],
     );
     commit_settled_at(
         storage,
@@ -5242,10 +5311,7 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
 
     let settling = push_certificate(
         make_test_block(BlockHeight::new(2)),
-        Arc::new(Verifiable::from(make_leg_finalization(
-            BlockHeight::new(2),
-            leg.hash(),
-        ))),
+        Verifiable::from(make_leg_finalization(BlockHeight::new(2), leg.hash())),
     );
     commit_settled_at(
         storage,
@@ -5267,11 +5333,11 @@ pub fn test_a_legs_own_finalization_keeps_the_floor(storage: &(impl ShardChainRe
 
     let deciding = push_certificate(
         make_test_block(BlockHeight::new(3)),
-        Arc::new(Verifiable::from(make_finalization(
+        Verifiable::from(make_finalization(
             BlockHeight::new(3),
             leg.hash(),
             TransactionDecision::Aborted,
-        ))),
+        )),
     );
     commit_settled_at(
         storage,
@@ -5446,13 +5512,11 @@ fn block_with_a_settled_transaction(height: BlockHeight, seed: u8) -> Block {
     let tx_hash = tx.hash();
     let block = with_transactions(
         make_test_block(height),
-        vec![Arc::new(Verifiable::from(
-            Verified::<Transaction>::from_persisted(tx),
-        ))],
+        vec![(Verifiable::from(Verified::<Transaction>::from_persisted(tx)))],
     );
     push_certificate(
         block,
-        Arc::new(make_finalization_leaving(height, tx_hash, StateWrites::default()).into()),
+        make_finalization_leaving(height, tx_hash, StateWrites::default()).into(),
     )
 }
 
@@ -5685,6 +5749,126 @@ pub fn test_snapshot_at_below_the_floor_panics<S: TestStore + VersionedStore>(st
         commit_writes_at(storage, &SettledWrites::default(), paced(height, 2));
     }
     let _snapshot = storage.snapshot_at(BlockHeight::new(1));
+}
+
+/// The clock on a block's certifying QC, which no signer signs and a sync
+/// peer can set, neither dates a version nor moves the cutoff.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_forged_certificate_clock_moves_no_retirement<S: TestStore + VersionedStore>(
+    storage: &S,
+) {
+    let commit = |height: u64, anchor: WeightedTimestamp, clock: WeightedTimestamp| {
+        let block = make_test_block_at(BlockHeight::new(height), anchor.as_millis());
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            block.height(),
+            block.header().parent_block_hash(),
+            Round::INITIAL,
+            Epoch::GENESIS,
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            clock,
+        );
+        let certified = CertifiedBlock::new_unchecked(
+            block,
+            Verified::<QuorumCertificate>::new_unchecked_for_test(qc),
+        );
+        commit_settled_at(
+            storage,
+            &Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+                certified,
+            )),
+            &[],
+            &[],
+            &empty_witness(),
+        );
+    };
+    let far_ahead = paced(1_000, 2);
+
+    // Dated low: three versions a sync peer stamped at zero, under a tip
+    // whose own stamp sits a thousand horizons on. Their anchors are
+    // recent, so all of them stay.
+    for height in 1..=3 {
+        commit(height, paced(height, 100), WeightedTimestamp::ZERO);
+    }
+    commit(4, paced(4, 100), far_ahead);
+    assert!(
+        storage.snapshot_held_at(BlockHeight::new(1)).is_some(),
+        "a low date on the certificate retires nothing",
+    );
+
+    // Dated high: a version stamped far ahead does not stop the floor.
+    // The anchors jump, so two blocks fit the horizon again and the tip
+    // at 10 leaves the floor at 8.
+    for height in 5..=10 {
+        commit(height, paced(height, 2), paced(height, 2));
+    }
+    assert!(
+        storage.snapshot_held_at(BlockHeight::new(7)).is_none(),
+        "a high date on the certificate pins nothing",
+    );
+    assert!(storage.snapshot_held_at(BlockHeight::new(8)).is_some());
+}
+
+/// A tick's snapshot still reads at its anchor once a crossing's floor
+/// raise lets retention pass it.
+///
+/// The raise lifts the hold above the in-flight tick's anchor, the
+/// halt's jump on the tip clock retires history up to it, and `collect`
+/// runs the backend's history collection over what retired.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_ticks_probe_outlives_a_raised_floor<S: TestStore + VersionedStore>(
+    storage: &S,
+    collect: impl Fn(&S),
+) {
+    let key = entry_key(7, 5);
+    commit_writes_at(
+        storage,
+        &make_settled_entries(7, &[(5, Some(vec![1]))]),
+        paced(1, 2),
+    );
+    commit_writes_at(
+        storage,
+        &make_settled_entries(7, &[(5, Some(vec![2]))]),
+        paced(2, 2),
+    );
+    let chain = TickChain::new(Arc::new(storage.clone()));
+    let anchor = BlockHeight::new(1);
+    let snapshot = chain.view_at(anchor).snapshot();
+
+    chain.raise_floor(BlockHeight::new(2), ShardId::leaf(0, 0));
+    chain.prune_persisted(
+        BlockHeight::new(2),
+        BlockHeight::new(2),
+        None,
+        WeightedTimestamp::MAX,
+    );
+    for height in 3..=10u64 {
+        commit_writes_at(storage, &SettledWrites::default(), paced(height, 2));
+    }
+    assert!(
+        storage.retention_floor() > anchor.inner(),
+        "the history under the anchor retired",
+    );
+    collect(storage);
+
+    assert_eq!(
+        snapshot.entry(key.owner, key.collection, key.order),
+        Some(vec![1]),
+        "the probe reads the version the anchor names",
+    );
+    assert_eq!(
+        snapshot.entries_in_range(key.owner, key.collection, 0, u128::MAX, 4),
+        vec![(5, vec![1])],
+        "as does a range over it",
+    );
 }
 
 /// A historical read of a height outside retention answers `None`
@@ -6058,7 +6242,7 @@ fn block_carrying(height: u64, txs: &[&Transaction]) -> Block {
         with_transactions(
             make_test_block(BlockHeight::new(height)),
             txs.iter()
-                .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+                .map(|tx| Verifiable::from((*tx).clone()))
                 .collect(),
         ),
         txs.iter()
@@ -6085,7 +6269,7 @@ fn block_settling_members(height: u64, txs: &[&Transaction]) -> Block {
         .collect();
     push_certificate(
         make_test_block(height),
-        Arc::new(finalization_of(height, outcomes).into()),
+        finalization_of(height, outcomes).into(),
     )
 }
 
@@ -6099,7 +6283,7 @@ fn holds_body(storage: &impl ShardChainReader, tx: &Transaction) -> bool {
 ///
 /// A height no standing row names loses its metadata row and every row
 /// its manifest names; a transaction whose row stands keeps its body and
-/// the metadata rows at its height and the one below, until a
+/// the metadata rows at its height and the one above, until a
 /// finalization settles the row; the floor never moves down; and every
 /// height at or above it still rebuilds.
 ///
@@ -6119,24 +6303,22 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
     };
     // `first` is the one transaction beneath the floor whose row stands.
     // Its sibling in the block and the transaction in the block below
-    // are settled, as is `second`, with a receipt. `late` stands too, in
-    // a block whose own row and the one below sit at or above the floor.
+    // are settled, as is `second` in the block above, with a receipt.
+    // `late` stands too, in a block at or above the floor.
     let settling_second = push_certificate(
         make_test_block(BlockHeight::new(4)),
-        Arc::new(
-            make_finalization_settling(
-                BlockHeight::new(4),
-                TxOutcome::new(
-                    second.hash(),
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-                .charging(0),
-                StateWrites::default(),
+        make_finalization_settling(
+            BlockHeight::new(4),
+            TxOutcome::new(
+                second.hash(),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
             )
-            .into(),
-        ),
+            .charging(0),
+            StateWrites::default(),
+        )
+        .into(),
     );
     let settled = settling_second.certificates()[0].receipt_hash();
     let chain = [
@@ -6164,7 +6346,7 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
     collect(storage);
     assert_eq!(storage.chain_floor(), floor);
     assert!(
-        !rebuilds(3) && !metadata_at(3) && !holds_body(storage, second),
+        !rebuilds(1) && !metadata_at(1) && !holds_body(storage, below),
         "a height no standing row names goes whole",
     );
     assert!(
@@ -6179,17 +6361,17 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
         "a standing row keeps its body and its height's metadata row, and nothing else there",
     );
     assert!(
-        metadata_at(1) && !holds_body(storage, below),
-        "and the metadata row of the height below, without what that height carried",
+        metadata_at(3) && !holds_body(storage, second),
+        "and the metadata row of the height above, without what that height carried",
     );
     assert!(
-        (1..=2).all(|height| storage
+        (2..=3).all(|height| storage
             .get_certified_header(BlockHeight::new(height))
             .is_some()),
         "so the headers a record's check reads off the two heights answer",
     );
     assert!(
-        !rebuilds(1) && !rebuilds(2),
+        !rebuilds(2) && !rebuilds(3),
         "and no partial block rebuilds from what is held",
     );
     assert!(
@@ -6207,7 +6389,7 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
     storage.advance_chain_floor(ShardId::ROOT, floor);
     collect(storage);
     assert!(
-        !metadata_at(2) && !metadata_at(1) && !holds_body(storage, first),
+        !metadata_at(2) && !metadata_at(3) && !holds_body(storage, first),
         "a row a finalization settles releases its rows at the next collection",
     );
     assert!(
@@ -6269,11 +6451,8 @@ pub fn test_a_stating_blocks_yes_receipts_prune_with_it<S: ShardChainReader + Te
     let stated_at = stating.receipt_hash();
     let chain = [
         make_test_block(BlockHeight::new(1)),
-        push_certificate(
-            make_test_block(BlockHeight::new(2)),
-            Arc::new(stating.into()),
-        ),
-        push_certificate(make_test_block(BlockHeight::new(3)), Arc::new(legs.into())),
+        push_certificate(make_test_block(BlockHeight::new(2)), stating.into()),
+        push_certificate(make_test_block(BlockHeight::new(3)), legs.into()),
         make_test_block(BlockHeight::new(4)),
     ];
     for block in chain {
@@ -6345,14 +6524,13 @@ pub fn test_a_standing_member_row_keeps_its_rows<S: ShardChainReader + TestStore
     for block in chain {
         commit_with_members(&storage, &make_test_certified(block));
     }
-    let anchors: Vec<WeightedTimestamp> = (2..=3)
+    let headers: Vec<BlockHash> = (3..=4)
         .map(|height| {
             storage
                 .get_certified_header(BlockHeight::new(height))
                 .expect("a committed height")
                 .header()
-                .parent_qc()
-                .weighted_timestamp()
+                .hash()
         })
         .collect();
 
@@ -6365,19 +6543,16 @@ pub fn test_a_standing_member_row_keeps_its_rows<S: ShardChainReader + TestStore
             holds_body(&storage, standing),
             "a standing row keeps its transaction's body",
         );
-        let held: Vec<WeightedTimestamp> = (2..=3)
+        let held: Vec<BlockHash> = (3..=4)
             .filter_map(|height| storage.get_certified_header(BlockHeight::new(height)))
-            .map(|header| header.header().parent_qc().weighted_timestamp())
+            .map(|header| header.header().hash())
             .collect();
         assert_eq!(
-            held, anchors,
-            "and the headers at its height and the one below, each with its anchor",
+            held, headers,
+            "and the headers at its height and the one above, whose parent QC \
+             states the epoch its commit signed",
         );
-        assert!(
-            !holds_body(&storage, below),
-            "the height below keeps its row alone",
-        );
-        for height in [1, 4, 5] {
+        for height in [1, 2, 5] {
             assert!(
                 storage
                     .get_block_metadata(BlockHeight::new(height))
@@ -6417,8 +6592,9 @@ pub fn test_a_member_row_naming_an_unheld_height_keeps_nothing<S: ShardChainRead
     assert!(!metadata_at(1) && !metadata_at(2));
 
     let unheld = test_transaction(1);
+    // Height 1, so neither its row nor the one above is held.
     let naming = MemberInputs {
-        height: BlockHeight::new(2),
+        height: BlockHeight::new(1),
         transactions: vec![(unheld.hash(), Deadline::of_transaction(&unheld))],
         terms: vec![stub_stated_terms(unheld.hash(), 1)],
         ..MemberInputs::still(ShardId::ROOT)
@@ -6458,6 +6634,7 @@ fn core_run_at_one(
             joins: Joins::Executes,
             settlement: Settlement::Shared,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::from_array([counterpart]),
             awaits: Capped::from_array([counterpart]),
             charge: AbortCharge {
@@ -6468,9 +6645,93 @@ fn core_run_at_one(
             reserves: Capped::empty(),
             deadline,
             crossings: Capped::empty(),
+            served_at: None,
         }])),
         ..MemberInputs::still(shard)
     }
+}
+
+/// `row`, built by hand, placed and head of the queue at the block that
+/// committed it.
+///
+/// The row a fold leaves for a member a counterpart shares the verdict
+/// on that nothing stood ahead of. Its rank is read off its hash, so rows
+/// built from distinct hashes take distinct places.
+#[must_use]
+pub fn placed_head(row: MemberRow) -> MemberRow {
+    let bytes = row.tx.as_bytes();
+    let place = Place {
+        height: row.height,
+        rank: u16::from_be_bytes([bytes[0], bytes[1]]) % (1 << 14),
+    };
+    MemberRow {
+        queued: Some(place),
+        head: Some(Head {
+            height: row.height,
+            rank: place.packed(),
+            clock: row.committed,
+        }),
+        ..row
+    }
+}
+
+/// The row the block at `height` committing `tx` on `terms` at
+/// `committed` writes, standing `Pending` and unplaced, its deadline one
+/// no fixture reaches.
+#[must_use]
+pub fn pending_row(
+    tx: TxHash,
+    height: BlockHeight,
+    committed: WeightedTimestamp,
+    terms: &MemberTerms,
+) -> MemberRow {
+    let far = Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 2));
+    MemberRow::pending(tx, far, committed, height, terms)
+}
+
+/// `row` placed by its committing block and made head by the block at
+/// `height`, whose parent-QC clock is `clock`.
+#[must_use]
+pub fn headed_at(row: MemberRow, height: BlockHeight, clock: WeightedTimestamp) -> MemberRow {
+    let placed = placed_head(row);
+    MemberRow {
+        head: placed.head.map(|head| Head {
+            height,
+            clock,
+            ..head
+        }),
+        ..placed
+    }
+}
+
+/// The entries `rows`, built by hand, stand on in `shard`'s family as
+/// far as a serve reads them: each row, and the `Serves` entry of each
+/// that is head.
+///
+/// # Panics
+///
+/// Never: a row and a hash encode.
+#[must_use]
+pub fn serving_entries(shard: ShardId, rows: &[MemberRow]) -> SettledWrites {
+    let mut entries = BTreeMap::new();
+    for row in rows {
+        entries.insert(
+            MemberCollection::Members.entry(shard, row.tx),
+            Some(to_vec(row).expect("a row encodes")),
+        );
+        if let Some(head) = row.head {
+            let (owner, collection) = MemberCollection::Serves.of(shard);
+            entries.insert(
+                EntryKey {
+                    owner,
+                    collection,
+                    order: serves_order(head),
+                },
+                Some(to_vec(&row.tx).expect("a hash encodes")),
+            );
+        }
+    }
+    SettledWrites::from_parts(BTreeMap::new(), entries)
 }
 
 /// The yes receipt a stating half carries for `tx` under `hash`, writing
@@ -6733,6 +6994,7 @@ fn abort_of_a_released_row(tx: TxHash, counterpart: ShardId, deadline: Deadline)
         joins: Joins::Aborted,
         settlement: Settlement::Awaited,
         holds: Capped::empty(),
+        pins: Capped::empty(),
         reach: Capped::from_array([counterpart]),
         awaits: Capped::empty(),
         charge: AbortCharge {
@@ -6743,6 +7005,7 @@ fn abort_of_a_released_row(tx: TxHash, counterpart: ShardId, deadline: Deadline)
         reserves: Capped::empty(),
         deadline,
         crossings: Capped::empty(),
+        served_at: None,
     }
 }
 

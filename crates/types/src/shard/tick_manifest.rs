@@ -11,10 +11,11 @@ use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Mode};
 
 use crate::{
-    AbortCharge, Deadline, DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX,
-    MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK, RoutePrefix, ShardId, SubstateKey,
-    TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES,
-    TICK_TERMS_BYTES, TickId, TxHash,
+    AbortCharge, BlockHeight, Deadline, DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX,
+    MAX_RECOVERY_BANDS, MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK, Pins, RoutePrefix, ShardId,
+    SubstateKey, TICK_BAND_BYTES, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
+    TICK_PIN_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickId, TxHash,
+    WeightedTimestamp,
 };
 
 /// How a member joins its tick: the terms a
@@ -23,10 +24,6 @@ use crate::{
 pub enum Joins {
     /// In the batch, attested on what execution says.
     Executes,
-    /// In the batch, attested `Aborted` whatever it says: the payer's
-    /// leg whose counterparts never engaged. It still executes, because
-    /// the charge that abort settles is what the execution builds.
-    ExecutesAborted,
     /// Not in the batch. Past the deadline that bounds it, or the
     /// victim of a hold cycle the block proves, so no execution here
     /// reaches an outcome, and the tick attests `Aborted` on nothing but
@@ -39,13 +36,7 @@ impl Joins {
     /// waits for a result before it can vote.
     #[must_use]
     pub const fn dispatched(self) -> bool {
-        matches!(self, Self::Executes | Self::ExecutesAborted)
-    }
-
-    /// Whether the tick attests `Aborted` whatever execution says.
-    #[must_use]
-    pub const fn aborts(self) -> bool {
-        matches!(self, Self::ExecutesAborted | Self::Aborted)
+        matches!(self, Self::Executes)
     }
 }
 
@@ -93,6 +84,29 @@ pub enum DiscardCause {
     /// and the block is the first the fresh committee certified.
     Recovery,
 }
+
+/// One halt recovery of a shard, as a crossing block's marker carries
+/// it: the band of work the recovered chain does not trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Hbor)]
+pub struct RecoveryBand {
+    /// The recovery's beacon-attested frontier.
+    pub attested_frontier: BlockHeight,
+    /// The first clock of the recovery's bridge epoch, the window the
+    /// fresh committee governs from.
+    pub bridge_start: WeightedTimestamp,
+}
+
+impl RecoveryBand {
+    /// Whether work at `height` anchored at `clock` lies in the band:
+    /// anchored below the bridge, at a height above the frontier.
+    #[must_use]
+    pub fn orphans(self, height: BlockHeight, clock: WeightedTimestamp) -> bool {
+        clock < self.bridge_start && height > self.attested_frontier
+    }
+}
+
+/// The bands a recovery marker carries, oldest first.
+pub type RecoveryBands = Capped<Vec<RecoveryBand>, MAX_RECOVERY_BANDS>;
 
 /// What an abortable member holds provisionally while its tick is in
 /// flight: its declared accesses, each under the mode it takes.
@@ -190,6 +204,11 @@ pub enum TickLine {
         settlement: Settlement,
         /// What it holds while the tick is in flight.
         holds: Holds,
+        /// On a line running a member its own certificate settles, the
+        /// keys its declaration takes on this shard, which stand in the
+        /// queue while the tick's determined half is owed. Empty on every
+        /// other line, so a line carries holds or pins and never both.
+        pins: Pins,
         /// The remote shards it reaches.
         reach: Reach,
         /// The remote shards whose certificates its settlement awaits:
@@ -215,6 +234,11 @@ pub enum TickLine {
         /// is shared with a sibling, every escrowed crossing it consumes,
         /// which its row keeps while it stands. Empty on every other line.
         crossings: Crossings,
+        /// On a line running a member a sibling shares the verdict on and
+        /// reading keys of this shard, its row's head height: the block
+        /// whose state serves its part, and from which this shard's own
+        /// tick reads those keys. `None` on every other line.
+        served_at: Option<BlockHeight>,
     },
     /// The chain lets a member go with an abort no certificate attests:
     /// its row leaves the family, and its charge is burned where its
@@ -245,20 +269,35 @@ pub enum TickLine {
         /// The transaction, whose row the chain still holds.
         tx: TxHash,
     },
+    /// A halt recovery's crossing block orphans every member row standing
+    /// unnamed on terms a counterpart shares the verdict on, keyed here,
+    /// that its parent holds without a head or with a head some band
+    /// covers: the lost tail may have made it head and served it there.
+    /// An orphan holds no place and no seat, never heads again, and
+    /// leaves by an abort. Named first, and only where it orphans a row.
+    Recovered {
+        /// Every recovery binding the block's committee holds for the
+        /// shard, oldest first: the bridged snapshot
+        /// `TopologySchedule::live_committee` resolves at the parent's
+        /// anchor.
+        bands: RecoveryBands,
+    },
 }
 
 impl TickLine {
     /// An upper bound on what this line costs the block that carries
     /// it, so a composer spends the section's budget as it fills it and
     /// a voter checks the same figure without re-encoding what it
-    /// decoded. Everything but the holds, the reach, the reserves and
-    /// the crossings answered is fixed width.
+    /// decoded. Everything but the holds, the pins, the reach, the
+    /// reserves, the crossings answered and a marker's bands is fixed
+    /// width.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
         TICK_LINE_BYTES
             + match self {
                 Self::Member {
                     holds,
+                    pins,
                     reach,
                     awaits,
                     reserves,
@@ -266,10 +305,12 @@ impl TickLine {
                     ..
                 } => {
                     holds.len() * TICK_HOLD_BYTES
+                        + pins.len() * TICK_PIN_BYTES
                         + (reach.len() + awaits.len()) * TICK_REACH_BYTES
                         + reserves.len() * TICK_RESERVE_BYTES
                         + crossings.len() * TICK_CROSSING_BYTES
                 }
+                Self::Recovered { bands } => bands.len() * TICK_BAND_BYTES,
                 Self::Fate { .. } | Self::Discard { .. } | Self::End { .. } => 0,
             }
     }
@@ -277,7 +318,7 @@ impl TickLine {
 
 /// A block's tick manifest, in the order its lines are charged.
 ///
-/// The discards of a halt recovery; the fates, in transaction order,
+/// A halt recovery's marker and its discards; the fates, in transaction order,
 /// each after the `Unanswerable` discard it is charged with; the member
 /// lines; the `Abandoned` discards; the ends.
 pub type TickManifest = Capped<Vec<TickLine>, MAX_TICK_LINES_PER_BLOCK>;

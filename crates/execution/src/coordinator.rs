@@ -50,12 +50,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
+    Action, CrossShardExecutionRequest, ExecutionAction, FetchIds, FetchRequest, ProtocolEvent,
+    ProvisionAction, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Member, abandoned_never};
-use hyperscale_engine::tick_select::{
-    ProvisionalCells, Requirement, SeatQuestion, requirements_of,
-};
+use hyperscale_engine::tick_select::{Requirement, SeatQuestion, requirements_of};
 use hyperscale_engine::{
     CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
 };
@@ -65,20 +64,21 @@ use hyperscale_metrics::{
     record_pushes_placed_on_carry, record_unresolvable_tx,
 };
 use hyperscale_storage::{
-    FeeTerms, ProvisionalTx, RecoveredState, TickResolution, declared_reservations,
+    FeeTerms, ProvisionalTx, QueueHolds, RECENT_HEADER_REPLAY, RecoveredState, TickResolution,
+    declared_reservations,
 };
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CarriedClaims, CertifiedBlock,
-    CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
-    EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome,
-    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
-    Hash, Joins, MerkleInclusionProof, Mode, Movement, ProvenAnchors, Provisions,
-    REATTESTATION_STEP, ScheduleLookup, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim,
-    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
-    WeightedTimestamp, derive_block_transactions, tick_leader,
+    Anchor, Attempt, Block, BlockCommittee, BlockHash, BlockHeight, BlockResolution, BloomFilter,
+    CarriedClaims, CertifiedBlock, CheckedStateProof, CommittedAt, ConsensusPublicKey,
+    CounterpartMirror, DeclaredKey, Derivation, DiscardCause, Epoch, EpochWindows,
+    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
+    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Joins, Mode,
+    Movement, ProvenAnchors, Provision, REATTESTATION_STEP, SeedRing, SettledTxSet, Settlement,
+    ShardId, ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId,
+    TickLine, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
+    TxOutcome, TxResolution, UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable,
+    Verified, WeightedTimestamp, derive_block_transactions, pins_of, tick_leader,
 };
 use tracing::instrument;
 
@@ -90,8 +90,8 @@ use crate::finalizations::FinalizationStore;
 use crate::gate::{Attested, Gate, gate_certificate};
 use crate::ledger::{Certified, Ledger, Unanswerable};
 use crate::lookups::{
-    assign_participants, attesting_committee, build_provision_requests, ec_has_shard_quorum_power,
-    peers_excluding_self, record_pushes,
+    assign_participants, attesting_committee, ec_has_shard_quorum_power, peers_excluding_self,
+    record_pushes,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
@@ -110,7 +110,7 @@ use crate::vote_tracker::VoteTracker;
 /// is one more place that answer can drift from the member's.
 #[derive(Clone)]
 struct CommittedMember {
-    tx: Arc<Verifiable<Transaction>>,
+    tx: Verifiable<Transaction>,
     member: Member,
 }
 
@@ -120,7 +120,7 @@ struct CommittedMember {
 fn committed_members(
     classification: &TopologySnapshot,
     local_shard: ShardId,
-    transactions: &[Arc<Verifiable<Transaction>>],
+    transactions: &[Verifiable<Transaction>],
 ) -> Vec<CommittedMember> {
     let trie = classification.shard_trie();
     // A transaction this node could not route takes no part here. Where
@@ -129,10 +129,10 @@ fn committed_members(
     // certified block is committed by every replica alike — including
     // one that has never been where those records are seated. The commit
     // asks for them; nothing is booked on a shape nobody derived.
-    let routed: Vec<Arc<Verifiable<Transaction>>> = transactions
+    let routed: Vec<Verifiable<Transaction>> = transactions
         .iter()
         .filter(|tx| tx.as_unverified().is_routed())
-        .map(Arc::clone)
+        .cloned()
         .collect();
     assign_participants(classification, &routed)
         .into_iter()
@@ -159,6 +159,7 @@ fn receipt_writes(fw: &Finalization) -> Vec<(TxHash, StateWrites)> {
 /// What the lines of a held tick's block say of its members: the block's
 /// own content, never what this node's ledger let it seat, so every
 /// replica holding the tick reads the same set.
+#[derive(Clone)]
 struct HeldTick {
     /// The members the lines name `Aborted`: the ones that reach no
     /// engine, whose refusal receipts are built at seating.
@@ -281,8 +282,136 @@ struct PendingTick {
     /// that judges debits under them.
     included: Vec<FeeTerms>,
     /// Whether this node holds everything the tick's lines name: a body
-    /// for each member and the bundles each one named to run needs.
+    /// for each member, the bundles each one named to run needs, and the
+    /// seed window each draws on or one the beacon has yet to publish.
     in_hand: bool,
+    /// The member windows the beacon had not published when the tick was
+    /// seated. `None` once the tick's ring holds every member's.
+    awaiting: Option<AwaitedSeeds>,
+}
+
+/// The seed windows a seated tick waits on, each newer than every window
+/// the schedule held when it was seated.
+///
+/// The fold that publishes such a window is the newest the schedule
+/// holds, so a tick queued while it folds takes the ring in then. One
+/// that is still waiting when a finalization of it commits is answered
+/// by that finalization instead, as a tick this node cannot run is, and
+/// so is one whose window no ring the schedule holds reaches any longer.
+#[derive(Clone)]
+struct AwaitedSeeds {
+    epochs: BTreeSet<Epoch>,
+    /// What the tick is held as should a finalization of it come first.
+    held: HeldTick,
+}
+
+/// Where a tick's members' seed windows stand once seating has taken in
+/// every one the schedule holds.
+enum SeatedSeeds {
+    /// The tick's ring holds every one.
+    Held,
+    /// The beacon has yet to publish these epochs' windows.
+    Unpublished(BTreeSet<Epoch>),
+    /// The window of this epoch, which no ring this node's schedule holds
+    /// reaches, so the tick is one this node cannot run.
+    Evicted(Epoch),
+}
+
+impl SeatedSeeds {
+    /// Whether the seeds let tick `tick_id`, seated from `lines`, run,
+    /// and the windows it waits on if so.
+    fn awaiting(self, tick_id: TickId, lines: &[TickLine]) -> (bool, Option<AwaitedSeeds>) {
+        match self {
+            Self::Held => (true, None),
+            Self::Unpublished(epochs) => (
+                true,
+                Some(AwaitedSeeds {
+                    epochs,
+                    held: HeldTick::of(lines),
+                }),
+            ),
+            Self::Evicted(epoch) => {
+                tracing::warn!(
+                    tick = %tick_id,
+                    epoch = epoch.inner(),
+                    "Holding a tick whose member's seed window this node has evicted"
+                );
+                (false, None)
+            }
+        }
+    }
+}
+
+/// Where one member window stands once a tick's ring has taken in what
+/// the schedule holds of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowStands {
+    /// The ring holds it.
+    Held,
+    /// The beacon has yet to publish it.
+    Unpublished,
+    /// No ring the schedule holds reaches it.
+    Evicted,
+}
+
+/// Take into `seeds` what `schedule` holds of the window a member
+/// clocked in `epoch` draws on.
+///
+/// Any ring holding every seed of the window answers it alike, so the
+/// ring taken is the one reaching furthest back of those that can hold
+/// its frontier: the lowest window held at or past `epoch`, which is
+/// `epoch`'s own while it is held. Past every window held, the newest
+/// may already have folded the frontier.
+fn take_window(seeds: &mut SeedRing, epoch: Epoch, schedule: &TopologySchedule) -> WindowStands {
+    if seeds.holds_window(epoch) {
+        return WindowStands::Held;
+    }
+    let Some((oldest, newest)) = schedule.retained_epochs() else {
+        return WindowStands::Unpublished;
+    };
+    let ring = (epoch.max(oldest).inner()..=newest.inner())
+        .find_map(|at| schedule.seeds_at(Epoch::new(at)))
+        .or_else(|| schedule.seeds_at(newest));
+    if let Some(ring) = ring {
+        seeds.absorb(ring);
+    }
+    if seeds.holds_window(epoch) {
+        WindowStands::Held
+    } else if epoch > newest {
+        WindowStands::Unpublished
+    } else {
+        WindowStands::Evicted
+    }
+}
+
+/// Take into `env` what `schedule` holds of each member window it lacks.
+///
+/// Read at seating rather than at dispatch: the schedule evicts at every
+/// beacon fold, while a tick may wait behind others far longer than one.
+fn seat_seeds(
+    env: &mut TickEnvironment,
+    requests: &[CrossShardExecutionRequest],
+    schedule: &TopologySchedule,
+) -> SeatedSeeds {
+    let epochs: BTreeSet<Epoch> = requests
+        .iter()
+        .map(|request| env.windows.epoch_for(request.clock))
+        .collect();
+    let mut unpublished = BTreeSet::new();
+    for epoch in epochs {
+        match take_window(&mut env.seeds, epoch, schedule) {
+            WindowStands::Held => {}
+            WindowStands::Unpublished => {
+                unpublished.insert(epoch);
+            }
+            WindowStands::Evicted => return SeatedSeeds::Evicted(epoch),
+        }
+    }
+    if unpublished.is_empty() {
+        SeatedSeeds::Held
+    } else {
+        SeatedSeeds::Unpublished(unpublished)
+    }
 }
 
 /// One seated tick in dispatch order.
@@ -299,6 +428,22 @@ enum Queued {
 }
 
 impl PendingTick {
+    /// The lowest height this tick reads a member's own part at.
+    fn served_floor(&self) -> Option<BlockHeight> {
+        self.requests
+            .iter()
+            .filter_map(|request| request.served_at)
+            .min()
+    }
+
+    /// The highest height this tick reads a member's own part at.
+    fn served_ceiling(&self) -> Option<BlockHeight> {
+        self.requests
+            .iter()
+            .filter_map(|request| request.served_at)
+            .max()
+    }
+
     /// The packages this tick's members run that do not resolve on this
     /// node.
     fn missing_code(&self, code: &dyn CodeAvailability) -> Vec<Hash> {
@@ -310,6 +455,36 @@ impl PendingTick {
             .filter(|package| !code.can_run(*package))
             .collect();
         missing.into_iter().collect()
+    }
+
+    /// Take in what `schedule` now holds of each awaited window, and name
+    /// one no ring it holds reaches any longer, which no wait answers.
+    ///
+    /// A window is awaited only for a member clocked past every window
+    /// held at seating: a whole member whose remote payer committed it
+    /// later than this shard did. Its seeds are a fact the beacon fixes
+    /// and this node has not folded, so the tick waits for them rather
+    /// than answer a draw some other way. A node that installs a newer
+    /// schedule skips the folds between, so a window can be published
+    /// and evicted without this tick ever seeing it the newest held.
+    fn take_published_seeds(&mut self, schedule: &TopologySchedule) -> Option<Epoch> {
+        let awaited = self.awaiting.as_mut()?;
+        let seeds = &mut self.env.seeds;
+        let mut evicted = None;
+        awaited
+            .epochs
+            .retain(|epoch| match take_window(seeds, *epoch, schedule) {
+                WindowStands::Held => false,
+                WindowStands::Unpublished => true,
+                WindowStands::Evicted => {
+                    evicted.get_or_insert(*epoch);
+                    true
+                }
+            });
+        if awaited.epochs.is_empty() {
+            self.awaiting = None;
+        }
+        evicted
     }
 }
 
@@ -363,6 +538,18 @@ impl CommitEffects {
     }
 }
 
+/// How many commits may queue behind one parked on an evicted signed
+/// window before the fold gives up until a restart.
+///
+/// Each one is a whole block held in memory, and nothing but another
+/// chain registering on this host lifts the park, so the bound is
+/// memory's rather than the protocol's: the commits of one leader
+/// rotation of the largest committee, which is what a restart reads back
+/// into its delay estimate. A park that outlasts it is one a restart
+/// lifts, and the restart replays every commit dropped here from the
+/// store.
+const MAX_AWAITING_EVICTED: usize = RECENT_HEADER_REPLAY;
+
 /// Execution memory statistics for monitoring collection sizes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutionMemoryStats {
@@ -400,6 +587,13 @@ pub struct ExecutionMemoryStats {
     /// sustained rise means a source shard certifies without proving
     /// commits — the fork/withholding signature.
     pub unproven_ecs: usize,
+    /// Commits queued behind one whose signed window the schedule does
+    /// not hold, the queued one included.
+    pub awaiting_window: usize,
+    /// One while the fold is parked on an evicted signed window or has
+    /// given up on one, zero otherwise. Either way the replica keeps
+    /// voting with no execution behind it; a restart recovers it.
+    pub parked_fold: usize,
 }
 
 impl ExecutionMemoryStats {
@@ -426,6 +620,8 @@ impl ExecutionMemoryStats {
             outbound_certs,
             proven_remote_blocks,
             unproven_ecs,
+            awaiting_window,
+            parked_fold,
         } = *self;
         vec![
             ("tick_execution_receipts", tick_execution_receipts),
@@ -444,6 +640,8 @@ impl ExecutionMemoryStats {
             ("outbound_certs", outbound_certs),
             ("proven_remote_blocks", proven_remote_blocks),
             ("unproven_ecs", unproven_ecs),
+            ("awaiting_window", awaiting_window),
+            ("parked_fold", parked_fold),
         ]
     }
 }
@@ -474,12 +672,12 @@ pub struct ExecutionCoordinator {
     stalled_for: Duration,
     stall_retry_periods: u32,
 
-    /// Anchor selecting the committee that governs the last locally committed
-    /// block — the anchor its *parent* carried, since a block's committee
-    /// keys on its parent. What tick and provision classification resolves
-    /// against, so every replica groups a block's transactions exactly as the
-    /// proposer built them and the verifier validated them.
-    committed_committee_anchor_wt: WeightedTimestamp,
+    /// The epoch of the window the last locally committed block was
+    /// certified under ([`Self::certified_committee`]): what a probe of
+    /// silent counterparts resolves its trie from. `None` while the tip
+    /// is one no committee signed, a chain's genesis block, whose window
+    /// is its own anchor's.
+    committed_committee_epoch: Option<Epoch>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Tick dispatch
@@ -517,6 +715,11 @@ pub struct ExecutionCoordinator {
     /// Whether a dispatched tick's `ExecutionBatchCompleted` is still
     /// outstanding.
     tick_in_flight: bool,
+
+    /// The lowest height the tick out at dispatch reads a member's own
+    /// part at. Cleared only by its batch coming back, whether it ran or
+    /// goes back to the queue, so a run outliving a terminal keeps it.
+    in_flight_served: Option<BlockHeight>,
 
     /// Whether the committed tip is past this chain's terminal window.
     ///
@@ -572,11 +775,19 @@ pub struct ExecutionCoordinator {
     /// would go out ahead of the later blocks that settle it, and land
     /// an entry the base already carries with nothing to say so.
     replay_through: BlockHeight,
-    /// Commits whose anchored committee sits in a window this node's
-    /// beacon has not committed yet, each with its committee anchor, in
-    /// commit order. Folded as the windows land, and every later commit
-    /// queues behind the first, so the fold never runs out of order.
+    /// Commits whose certified committee sits in a window this schedule
+    /// does not hold, each with its committee anchor, in commit order.
+    /// Folded as the windows land, and every later commit queues behind
+    /// the first, so the fold never runs out of order.
     awaiting_window: VecDeque<(CertifiedBlock, WeightedTimestamp, Naming)>,
+    /// The height of the commit at the front of
+    /// [`awaiting_window`](Self::awaiting_window) whose signed window the
+    /// schedule has evicted, while it parks there; it is reported once.
+    parked_evicted: Option<BlockHeight>,
+    /// Set, never cleared, once a park on an evicted window outgrew
+    /// [`MAX_AWAITING_EVICTED`]: the commits it dropped leave a gap no
+    /// later fold can step over, so every commit after is dropped too.
+    fold_abandoned: bool,
 
     /// The lowest height a tick may be *dispatched* at.
     ///
@@ -718,12 +929,10 @@ impl ExecutionCoordinator {
     ///
     /// Either way the seed keeps the next commit on the exact carry path —
     /// height-contiguous, its committee anchor the previous block's — where
-    /// a zero frontier would take the gap fallback and classify that
-    /// block's ticks under the window it opens: a replica restarted just
-    /// below an epoch cut that a reshape moves would group ticks
-    /// differently from its peers and split execution votes. A seeded
-    /// frontier also gives pre-first-commit bookkeeping a real clock
-    /// instead of a zero one.
+    /// a zero frontier would take the gap fallback and place that block
+    /// against a recovery's bridge by its own anchor. A seeded frontier
+    /// also gives pre-first-commit bookkeeping a real clock instead of a
+    /// zero one.
     ///
     /// `persisted_base` is how far the store under the replica's tick
     /// chain is written: the store's tree version. Each tick waits until
@@ -745,9 +954,9 @@ impl ExecutionCoordinator {
         // Execution resumes below the first block it replays, so the
         // replay carries the frontier up to the tip rather than starting
         // from it. Without the block under the floor there is no clock to
-        // carry, and the first block replayed classifies under its own
-        // anchor — the same fallback a chain with no history takes, which
-        // a genesis frontier is what selects.
+        // carry, and the first block replayed takes its own anchor as its
+        // committee anchor — the same fallback a chain with no history
+        // takes, which a genesis frontier is what selects.
         let resume = recovered
             .replay
             .blocks
@@ -757,13 +966,6 @@ impl ExecutionCoordinator {
             Some((first, Some(anchor))) => (first.saturating_sub(1), anchor),
             Some((_, None)) => (BlockHeight::GENESIS, WeightedTimestamp::ZERO),
             None => (recovered.committed_height, recovered.block_anchor_wt()),
-        };
-        // Whatever seeds the height seeds this too: the block above is
-        // contiguous, so it carries `committed_ts` into the slot before
-        // anything classifies against it.
-        let committed_committee_anchor_wt = match resume {
-            Some(_) => committed_block_anchor_wt,
-            None => recovered.committee_anchor_wt(),
         };
         Self {
             counterparts: Counterparts::new(
@@ -780,12 +982,18 @@ impl ExecutionCoordinator {
             stall_seen_ts: committed_block_anchor_wt,
             stalled_for: Duration::ZERO,
             stall_retry_periods: 0,
-            committed_committee_anchor_wt,
+            // A replay commits from its first block before anything
+            // probes, and each replayed commit reseats this off its own
+            // stored QC. A snap-seated tip's anchor QC is not read: until
+            // the first commit, a probe places its questions under the
+            // live committee at the tip's clock.
+            committed_committee_epoch: recovered.verified_committee_epoch(),
             pending_ticks: VecDeque::new(),
             held: BTreeMap::new(),
             code,
             persisted: persisted_base,
             tick_in_flight: false,
+            in_flight_served: None,
             terminated: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
@@ -796,6 +1004,8 @@ impl ExecutionCoordinator {
                 .last()
                 .map_or(BlockHeight::GENESIS, |certified| certified.block().height()),
             awaiting_window: VecDeque::new(),
+            parked_evicted: None,
+            fold_abandoned: false,
             dispatch_from: recovered.replay.dispatch_from,
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
@@ -845,16 +1055,18 @@ impl ExecutionCoordinator {
             };
             let (recipients, local_recipient) =
                 self.addressed(vec![tick_leader(tick_id, &committee)]);
-            actions.push(Action::SignAndSendExecutionVote {
-                block_hash: tick.block_hash(),
-                vote_anchor_ts,
-                tick_id: *tick_id,
-                global_receipt_root,
-                tx_outcomes,
-                recipients,
-                local_recipient,
-                signer,
-            });
+            actions.push(Action::Execution(
+                ExecutionAction::SignAndSendExecutionVote {
+                    block_hash: tick.block_hash(),
+                    vote_anchor_ts,
+                    tick_id: *tick_id,
+                    global_receipt_root,
+                    tx_outcomes,
+                    recipients,
+                    local_recipient,
+                    signer,
+                },
+            ));
         }
         actions
     }
@@ -943,69 +1155,84 @@ impl ExecutionCoordinator {
             .max(self.dispatch_from.prev().unwrap_or(BlockHeight::GENESIS))
     }
 
+    /// The lowest height a tick this coordinator has still to run reads
+    /// a member's own part at: the queued ticks it can run, and the one
+    /// out at dispatch. A held tick reads nothing, since its certificate
+    /// seats it.
+    #[must_use]
+    pub fn served_floor(&self) -> Option<BlockHeight> {
+        self.pending_ticks
+            .iter()
+            .filter_map(|queued| match queued {
+                Queued::Run(pending) => pending.served_floor(),
+                Queued::Held(_) => None,
+            })
+            .chain(self.in_flight_served)
+            .min()
+    }
+
+    /// The anchor of the last block this coordinator folded, which every
+    /// tick not yet seated is anchored at or past: a bound resting on the
+    /// vote floor f+1 honest signers ran on every certified block, as do
+    /// the retention of a served height and the dispatch panic in
+    /// `own_parts`.
+    #[must_use]
+    pub const fn committed_ts(&self) -> WeightedTimestamp {
+        self.committed_ts
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Tick Assignment
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// The committee a committed block's content is classified under: the
-    /// one at its `committee_anchor`, its parent's anchor, which is the
-    /// snapshot the proposer classified the block against and the verifier
-    /// validated it against. The block's own anchor and its committee
-    /// anchor straddle an epoch cut once per window, and a reshape cut
-    /// there changes the shard set `compute_ticks` routes over.
+    /// window whose committee certified it, keyed by the epoch the QC its
+    /// child pins signed. `certified` carries that copy, which the commit
+    /// stores. Honest voters validated the block's content under exactly
+    /// that window before signing it, so its trie and prices are the ones
+    /// the proposer classified and priced under and admission judged —
+    /// including for a halt recovery's crossing block, whose committee
+    /// anchor lies below the bridge and whose fresh committee signs the
+    /// window it was seated in.
     ///
-    /// `None` while that window is newer than this node's beacon has
-    /// committed: the commit waits for it rather than read the head, so
-    /// every replica groups a block's transactions identically across a
-    /// reshape boundary.
+    /// A chain's genesis block carries no signed QC; its committee anchor
+    /// is its own, the chain origin's.
     ///
-    /// An evicted committee anchor is reached by the first block of a
-    /// chain whose predecessor's anchor lies before its cut, and that
-    /// block classifies under its own anchor's window. Where that is
-    /// evicted too, no window names this shard at all — a split child
-    /// replaying the window it inherited, whose content predates its own
-    /// cut — and the head, its only committee, classifies the content the
-    /// way the child's own keyspace is cut.
-    fn anchored_committee<'t>(
+    /// A miss is either a window newer than this node's beacon has
+    /// committed, which the commit waits for rather than read the head,
+    /// or an evicted one, which parks it.
+    fn certified_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
-        committee_anchor: WeightedTimestamp,
-        own_anchor: WeightedTimestamp,
-    ) -> Option<&'t TopologySnapshot> {
-        let resolve = |wt| match topology_schedule.lookup_for_shard(self.local_shard, wt).0 {
-            ScheduleLookup::Committee(snapshot) => Ok(snapshot.as_ref()),
-            ScheduleLookup::NotYetCommitted => Err(true),
-            ScheduleLookup::Evicted => Err(false),
-        };
-        match resolve(committee_anchor) {
-            Ok(snapshot) => Some(snapshot),
-            Err(true) => None,
-            Err(false) => match resolve(own_anchor) {
-                Ok(snapshot) => Some(snapshot),
-                Err(true) => None,
-                Err(false) => Some(topology_schedule.head().as_ref()),
-            },
+        certified: &CertifiedBlock,
+    ) -> BlockResolution<'t> {
+        let block = certified.block();
+        if block.is_genesis() {
+            let own_anchor = block.header().parent_qc().weighted_timestamp();
+            return topology_schedule.live_committee(self.local_shard, own_anchor);
         }
+        topology_schedule.signed_committee(self.local_shard, certified.qc().committee_epoch())
     }
 
     /// The trie that says who was party to a transaction, off the latest
-    /// committed block's anchored committee; `None` while that window is
-    /// not committed here.
+    /// committed block's certified committee; `None` while that window is
+    /// not held here.
     ///
     /// What a probe of silent counterparts places its questions under. A
     /// window later resolves a departed counterpart's *successor*, a
-    /// shard that was never party, so the anchor is the committed
+    /// shard that was never party, so the window is the committed
     /// block's and never this node's head.
     fn counterpart_trie<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
     ) -> Option<&'t ShardTrie> {
-        self.anchored_committee(
-            topology_schedule,
-            self.committed_committee_anchor_wt,
-            self.committed_ts,
-        )
-        .map(TopologySnapshot::shard_trie)
+        self.committed_committee_epoch
+            .map_or_else(
+                || topology_schedule.live_committee(self.local_shard, self.committed_ts),
+                |epoch| topology_schedule.signed_committee(self.local_shard, epoch),
+            )
+            .committee()
+            .map(|committee| committee.snapshot.shard_trie())
     }
 
     /// Register a new cross-shard tick's transactions: the dependency set
@@ -1024,8 +1251,9 @@ impl ExecutionCoordinator {
             // and on the crossings its legs consume, and on nothing else.
             // Its inbound escrow is its engagement, and the crossing bundle it consumes is
             // its counterpart's commitment, so neither half of the
-            // engagement exchange is filed, and it runs under its own
-            // committing block's clock.
+            // engagement exchange is filed. Its clock is read off its own
+            // commit and the bundles it waits on, as
+            // `ProvisioningTracker::transaction_clock` reads it.
             if classified.decomposed() {
                 self.provisioning
                     .record_required(tx_hash, requirements_of(member, tx.legs()));
@@ -1075,10 +1303,12 @@ impl ExecutionCoordinator {
     /// at this commit is composition's question, asked again at every one.
     fn register_committed_txs(
         &mut self,
-        classification: &TopologySnapshot,
+        classification: BlockCommittee<'_>,
         block: &CommittingBlock,
-        transactions: &[Arc<Verifiable<Transaction>>],
+        transactions: &[Verifiable<Transaction>],
     ) {
+        let committee_epoch = classification.epoch;
+        let classification = classification.snapshot.as_ref();
         let local_shard = self.local_shard;
         let members = committed_members(classification, local_shard, transactions);
         // The ledger takes the transactions themselves, each with the
@@ -1092,7 +1322,7 @@ impl ExecutionCoordinator {
             CommittedAt {
                 height: block.height,
                 anchor: block.ts,
-                committee_anchor: self.committed_committee_anchor_wt,
+                committee_epoch,
             },
             &classification.prices(),
             members
@@ -1114,14 +1344,15 @@ impl ExecutionCoordinator {
             // BFT-transitive trust that gates the containing block. Honest
             // live-consensus blocks already carry `Verified` entries (the
             // `.into_verified()` arm short-circuits without re-validating).
-            let verified: Arc<Verified<Transaction>> = match (*tx).clone().into_verified() {
-                Ok(v) => Arc::new(v),
-                Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
+            let verified: Verified<Transaction> = match tx.into_verified() {
+                Ok(v) => v,
+                Err(raw) => Verified::<Transaction>::from_persisted(raw),
             };
             self.candidates.register(
                 verified,
                 member.reach().clone(),
                 block.ts,
+                classification.shard_trie(),
                 classification.prices(),
                 member.classified().clone(),
             );
@@ -1207,7 +1438,7 @@ impl ExecutionCoordinator {
     /// in for.
     fn composed_lines(
         &self,
-        anchored: &TopologySnapshot,
+        committee: &TopologySnapshot,
         tick_id: TickId,
         unanswerable: &[Unanswerable],
         recovered: &[TickId],
@@ -1245,7 +1476,6 @@ impl ExecutionCoordinator {
             });
         }
         lines.extend(self.candidates.named(
-            anchored.shard_trie(),
             &self.provisioning,
             &mut self.provisional_cells(),
             self.committed_ts,
@@ -1259,7 +1489,7 @@ impl ExecutionCoordinator {
                 None => None,
             };
             let reach: Vec<ShardId> = ledger
-                .counterparts(entry.tx_hash, anchored.shard_trie())
+                .counterparts(entry.tx_hash, committee.shard_trie())
                 .into_iter()
                 .collect();
             let crossings =
@@ -1280,6 +1510,7 @@ impl ExecutionCoordinator {
                     Settlement::Awaited
                 },
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::new(reach).expect("no more counterparts than prefixes"),
                 awaits: Capped::empty(),
                 charge: entry.charge,
@@ -1288,6 +1519,7 @@ impl ExecutionCoordinator {
                 staged: 0,
                 deadline: entry.deadline,
                 crossings: Capped::new(crossings).expect("a star's edges are capped"),
+                served_at: None,
             });
 
             discards.extend(held_by.map(|tick| TickLine::Discard {
@@ -1439,7 +1671,7 @@ impl ExecutionCoordinator {
                 .member
                 .classified()
                 .local_price(&request.transaction, local_shard, &prices),
-            member.joins,
+            Joins::Executes,
         );
         self.ticks.assign_tx(member.request.tx_hash, tick_id);
         self.counterparts
@@ -1459,16 +1691,32 @@ impl ExecutionCoordinator {
         requests.push(request);
     }
 
+    /// Whether this node's store reaches every height `lines` read a
+    /// member's own part at. Outside a replay it does, since retirement
+    /// stops short of them; a replay starts where the store's history
+    /// does, and a height below that is gone.
+    fn reads_its_parts(&self, lines: &[TickLine]) -> bool {
+        let Some(reach) = self.dispatch_from.prev() else {
+            return true;
+        };
+        lines.iter().all(|line| match line {
+            TickLine::Member { served_at, .. } => served_at.is_none_or(|x| x >= reach),
+            _ => true,
+        })
+    }
+
     /// Seat the tick the committing block names: its members, its aborts,
     /// its discards and its fates, as the lines say. Seating reads no
-    /// baseline, so it runs whether or not the tick can be dispatched.
+    /// baseline, so it runs whether or not the tick can be dispatched;
+    /// only a `runnable` one takes in the seeds its members draw on.
     fn seat_tick(
         &mut self,
         topology_schedule: &TopologySchedule,
-        anchored: &TopologySnapshot,
+        committee: &TopologySnapshot,
         block: &CommittingBlock,
         named: Named<'_>,
         seated: &mut Vec<TickLine>,
+        runnable: bool,
     ) -> (
         Option<PendingTick>,
         Vec<Verifiable<ExecutionVote>>,
@@ -1483,7 +1731,7 @@ impl ExecutionCoordinator {
                 unanswerable,
                 recovered,
             } => {
-                composed = self.composed_lines(anchored, tick_id, unanswerable, recovered);
+                composed = self.composed_lines(committee, tick_id, unanswerable, recovered);
                 &composed[..]
             }
         };
@@ -1499,17 +1747,21 @@ impl ExecutionCoordinator {
                     cause: DiscardCause::Recovery,
                 } => self.discard_recovered(*tick),
                 TickLine::Fate { tx, .. } => self.let_go(*tx),
+                // An orphan stands unnamed; the abort that ends it is a
+                // member line of its own.
                 TickLine::Member { .. }
                 | TickLine::Discard {
                     cause: DiscardCause::Abandoned(_),
                     ..
                 }
-                | TickLine::End { .. } => {}
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. } => {}
             }
         }
-        let (admitted, in_hand) =
-            self.candidates
-                .take_named(lines, &self.provisioning, anchored.shard_trie(), block.ts);
+        let (admitted, in_hand) = self.candidates.take_named(lines, &self.provisioning);
+        // A replay's store may not reach a part's height, so the tick goes
+        // the way of one short of a bundle and its certificate seats it.
+        let in_hand = in_hand && self.reads_its_parts(lines);
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
@@ -1521,7 +1773,7 @@ impl ExecutionCoordinator {
             self.admit_member(tick_id, member, &mut state, &mut ticked, &mut requests);
         }
 
-        self.admit_abandoned(anchored.shard_trie(), tick_id, &mut state, lines);
+        self.admit_abandoned(committee.shard_trie(), tick_id, &mut state, lines);
 
         if state.is_empty() {
             return (None, Vec::new(), Vec::new());
@@ -1566,18 +1818,28 @@ impl ExecutionCoordinator {
             }
         }
 
-        let pending = (!requests.is_empty()).then(|| PendingTick {
-            tick: block.height,
-            tick_ts: block.ts,
-            // Off the block's anchored committee, on the same terms the
-            // classification above reads it: what a seal opens onto is
-            // execution output, and a window taken from this node's head
-            // would make the answer depend on how far this node has
-            // folded the beacon rather than on what the block committed.
-            env: TickEnvironment::governing(anchored, topology_schedule.windows()),
-            requests,
-            included: block.fees.clone(),
-            in_hand,
+        let pending = (!requests.is_empty()).then(|| {
+            // Off the block's certified committee, with the ring of each
+            // member's own window the schedule holds where the committee's
+            // ring falls short: a member clocked past the committee's
+            // window.
+            let mut env = TickEnvironment::governing(committee, topology_schedule.windows());
+            // A tick that never runs here draws on nothing, so a window
+            // this node has evicted is no cause to warn of.
+            let (in_hand, awaiting) = if runnable && in_hand {
+                seat_seeds(&mut env, &requests, topology_schedule).awaiting(tick_id, lines)
+            } else {
+                (false, None)
+            };
+            PendingTick {
+                tick: block.height,
+                tick_ts: block.ts,
+                env,
+                requests,
+                included: block.fees.clone(),
+                in_hand,
+                awaiting,
+            }
         });
         (pending, votes_to_replay, members)
     }
@@ -1703,6 +1965,7 @@ impl ExecutionCoordinator {
         );
         record_batch_unavailable();
         self.tick_in_flight = false;
+        self.in_flight_served = None;
         self.pending_ticks.push_front(Queued::Run(PendingTick {
             tick,
             tick_ts,
@@ -1710,6 +1973,7 @@ impl ExecutionCoordinator {
             requests,
             included,
             in_hand: true,
+            awaiting: None,
         }));
         Vec::new()
     }
@@ -1729,6 +1993,7 @@ impl ExecutionCoordinator {
         outcome: TickBatchOutcome,
     ) -> Vec<Action> {
         self.tick_in_flight = false;
+        self.in_flight_served = None;
         self.last_completed_tick = self.last_completed_tick.max(tick);
         let mut actions = Vec::new();
 
@@ -1829,16 +2094,18 @@ impl ExecutionCoordinator {
             );
             let (recipients, local_recipient) = self.addressed(vec![leader]);
             for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
-                actions.push(Action::SignAndSendExecutionVote {
-                    block_hash: completion.block_hash,
-                    vote_anchor_ts: completion.vote_anchor_ts,
-                    tick_id: completion.tick_id,
-                    global_receipt_root: completion.global_receipt_root,
-                    tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: recipients.clone(),
-                    local_recipient,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::SignAndSendExecutionVote {
+                        block_hash: completion.block_hash,
+                        vote_anchor_ts: completion.vote_anchor_ts,
+                        tick_id: completion.tick_id,
+                        global_receipt_root: completion.global_receipt_root,
+                        tx_outcomes: (*tx_outcomes).clone(),
+                        recipients: recipients.clone(),
+                        local_recipient,
+                        signer,
+                    },
+                ));
             }
         }
         actions
@@ -1852,22 +2119,21 @@ impl ExecutionCoordinator {
     ///
     /// Each batch is peeked for its [`Verifiable::verified`] marker before
     /// re-wrapping. Same-process upstream paths leave the marker live, so
-    /// we borrow the existing [`Verified<Provisions>`] without a body
+    /// we borrow the existing [`Verified<Provision>`] without a body
     /// clone. Wire-decoded blocks land at `Unverified`; the
-    /// [`Verified::<Provisions>::from_committed_block`] gate then carries
+    /// [`Verified::<Provision>::from_committed_block`] gate then carries
     /// the BFT-transitive trust source via a re-wrap (one body clone).
-    fn apply_committed_provisions(&mut self, batches: &[Arc<Verifiable<Provisions>>]) {
+    fn apply_committed_provisions(&mut self, parts: &[Verifiable<Provision>]) {
         // Sort for deterministic iteration (logs, action vector order).
-        let mut ordered: Vec<&Arc<Verifiable<Provisions>>> = batches.iter().collect();
+        let mut ordered: Vec<&Verifiable<Provision>> = parts.iter().collect();
         ordered.sort_by_key(|b| b.hash());
 
-        for provisions in &ordered {
-            if let Some(v) = provisions.verified() {
+        for part in &ordered {
+            if let Some(v) = part.verified() {
                 self.provisioning.absorb_provisions(v);
             } else {
-                let verified = Verified::<Provisions>::from_committed_block(
-                    provisions.as_unverified().clone(),
-                );
+                let verified =
+                    Verified::<Provision>::from_committed_block(part.as_unverified().clone());
                 self.provisioning.absorb_provisions(&verified);
             }
         }
@@ -2063,12 +2329,14 @@ impl ExecutionCoordinator {
         Some(
             held.and_then(|certificate| {
                 let signer = self.envelope_signer(topology_schedule, &certificate)?;
-                Some(Action::BroadcastExecutionCertificate {
-                    shard: self.local_shard,
-                    certificate,
-                    recipients: vec![vote.validator()],
-                    signer,
-                })
+                Some(Action::Execution(
+                    ExecutionAction::BroadcastExecutionCertificate {
+                        shard: self.local_shard,
+                        certificate,
+                        recipients: vec![vote.validator()],
+                        signer,
+                    },
+                ))
             })
             .into_iter()
             .collect(),
@@ -2098,11 +2366,13 @@ impl ExecutionCoordinator {
             vote_count = votes.len(),
             "Dispatching execution vote provisions verification"
         );
-        vec![Action::VerifyAndAggregateExecutionVotes {
-            tick_id,
-            block_hash,
-            votes,
-        }]
+        vec![Action::Execution(
+            ExecutionAction::VerifyAndAggregateExecutionVotes {
+                tick_id,
+                block_hash,
+                votes,
+            },
+        )]
     }
 
     /// Handle a verified execution vote (own vote or already-verified).
@@ -2238,12 +2508,14 @@ impl ExecutionCoordinator {
 
         // tx_outcomes are extracted from votes by the aggregation handler
         // (all quorum votes carry identical outcomes).
-        let mut actions = vec![Action::AggregateExecutionCertificate {
-            tick_id,
-            global_receipt_root,
-            votes,
-            committee,
-        }];
+        let mut actions = vec![Action::Execution(
+            ExecutionAction::AggregateExecutionCertificate {
+                tick_id,
+                global_receipt_root,
+                votes,
+                committee,
+            },
+        )];
         if !ec_tx_hashes.is_empty() {
             actions.push(Action::RecordTxEcCreated {
                 tx_hashes: ec_tx_hashes,
@@ -2263,7 +2535,7 @@ impl ExecutionCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
         tick_id: &TickId,
-        certificate: &Arc<Verified<ExecutionCertificate>>,
+        certificate: &Verified<ExecutionCertificate>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         // EC broadcast is routing — who should receive it now — so recipients
@@ -2292,7 +2564,7 @@ impl ExecutionCoordinator {
 
         // Hold the cert until the containing block commits, for late
         // voters.
-        self.exec_certs.insert(Arc::clone(certificate));
+        self.exec_certs.insert(certificate.clone());
         self.ticks.clear_vote_retry(tick_id);
 
         // Broadcast EC to all local peers (they don't aggregate — they need it).
@@ -2301,12 +2573,14 @@ impl ExecutionCoordinator {
         if let Some(signer) = envelope_signer
             && !local_peers.is_empty()
         {
-            actions.push(Action::BroadcastExecutionCertificate {
-                shard: self.local_shard,
-                certificate: Arc::clone(certificate),
-                recipients: local_peers,
-                signer,
-            });
+            actions.push(Action::Execution(
+                ExecutionAction::BroadcastExecutionCertificate {
+                    shard: self.local_shard,
+                    certificate: certificate.clone(),
+                    recipients: local_peers,
+                    signer,
+                },
+            ));
         }
 
         // Broadcast each target shard its own projection. Track the
@@ -2319,20 +2593,21 @@ impl ExecutionCoordinator {
             let Some(projected) = certificate.project_to(txs) else {
                 continue;
             };
-            let projected = Arc::new(projected);
             self.outbound_certs.on_broadcast(
-                Arc::clone(&projected),
+                projected.clone(),
                 *target_shard,
                 recipients.clone(),
                 self.committed_ts,
             );
             if let Some(signer) = envelope_signer {
-                actions.push(Action::BroadcastExecutionCertificate {
-                    shard: *target_shard,
-                    certificate: projected,
-                    recipients,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::BroadcastExecutionCertificate {
+                        shard: *target_shard,
+                        certificate: projected,
+                        recipients,
+                        signer,
+                    },
+                ));
             }
         }
 
@@ -2467,10 +2742,12 @@ impl ExecutionCoordinator {
         }
 
         match self.gate(topology_schedule, &cert) {
-            Ok(keys) => vec![Action::VerifyExecutionCertificateSignature {
-                public_keys: keys.unwrap_or_default(),
-                certificate: cert,
-            }],
+            Ok(keys) => vec![Action::Execution(
+                ExecutionAction::VerifyExecutionCertificateSignature {
+                    public_keys: keys.unwrap_or_default(),
+                    certificate: cert,
+                },
+            )],
             Err(Gate::BeaconBehind) => {
                 self.parked
                     .park(Waiting::Beacon, Parked::Certificate(Box::new(cert)));
@@ -2489,8 +2766,8 @@ impl ExecutionCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
         result: Result<
-            Arc<Verified<ExecutionCertificate>>,
-            (Arc<ExecutionCertificate>, ExecutionCertificateVerifyError),
+            Verified<ExecutionCertificate>,
+            (ExecutionCertificate, ExecutionCertificateVerifyError),
         >,
     ) -> Vec<Action> {
         // Release the in-flight slot regardless of outcome — a failed
@@ -2499,7 +2776,7 @@ impl ExecutionCoordinator {
         // rather than a real signature mismatch). Subsequent arrivals
         // with a different aggregation hash to a different `wire_hash`
         // and aren't gated by this slot.
-        let ec_arc = match result {
+        let ec = match result {
             Ok(verified) => {
                 self.pending_verifications.remove(&verified.wire_hash());
                 verified
@@ -2523,22 +2800,20 @@ impl ExecutionCoordinator {
         // dispatch this verification, so `None` here means that epoch aged
         // out of the schedule in the interim (the beacon advanced past
         // retention) — the EC is stale, so abandon it.
-        let Some(committee) = attesting_committee(
-            topology_schedule,
-            ec_arc.shard_id(),
-            ec_arc.vote_anchor_ts(),
-        ) else {
+        let Some(committee) =
+            attesting_committee(topology_schedule, ec.shard_id(), ec.vote_anchor_ts())
+        else {
             tracing::warn!(
-                shard = ec_arc.shard_id().inner(),
-                tick = %ec_arc.tick_id(),
+                shard = ec.shard_id().inner(),
+                tick = %ec.tick_id(),
                 "Discarding execution certificate — epoch evicted from schedule before verification completed"
             );
             return vec![];
         };
-        if !ec_has_shard_quorum_power(committee, &ec_arc) {
+        if !ec_has_shard_quorum_power(committee, &ec) {
             tracing::warn!(
-                shard = ec_arc.shard_id().inner(),
-                tick = %ec_arc.tick_id(),
+                shard = ec.shard_id().inner(),
+                tick = %ec.tick_id(),
                 "Discarding sub-quorum execution certificate"
             );
             return vec![];
@@ -2549,14 +2824,14 @@ impl ExecutionCoordinator {
         // committee, and if it now sits in the band it names a height the
         // recovered chain commits anew, whose tick it must not stand for.
         if topology_schedule.recovery_orphaned(
-            ec_arc.shard_id(),
-            ec_arc.vote_anchor_ts(),
-            ec_arc.block_height(),
+            ec.shard_id(),
+            ec.vote_anchor_ts(),
+            ec.block_height(),
         ) {
             tracing::warn!(
-                shard = ec_arc.shard_id().inner(),
-                tick = %ec_arc.tick_id(),
-                height = ec_arc.block_height().inner(),
+                shard = ec.shard_id().inner(),
+                tick = %ec.tick_id(),
+                height = ec.block_height().inner(),
                 "Discarding verified EC anchored below a recovery's bridge above its frontier"
             );
             return vec![];
@@ -2564,7 +2839,7 @@ impl ExecutionCoordinator {
 
         let mut actions = vec![Action::Continuation(
             ProtocolEvent::ExecutionCertificateAdmitted {
-                certificate: Arc::clone(&ec_arc),
+                certificate: ec.clone(),
             },
         )];
 
@@ -2576,16 +2851,16 @@ impl ExecutionCoordinator {
         // cannot settle the tick here, so the vote retry that recovers
         // the complete copy keeps running, and the store keeps its slot
         // for the copy that can serve this shard's own peers.
-        if ec_arc.shard_id() == self.local_shard && ec_arc.is_complete() {
-            self.ticks.mark_ec_dispatched(*ec_arc.tick_id());
+        if ec.shard_id() == self.local_shard && ec.is_complete() {
+            self.ticks.mark_ec_dispatched(*ec.tick_id());
             // The certificate ends this voter's retries and its own tally:
             // a later vote for the tick is answered with the certificate.
-            self.ticks.clear_vote_retry(ec_arc.tick_id());
-            self.ticks.remove_tracker(ec_arc.tick_id());
-            self.exec_certs.insert(Arc::clone(&ec_arc));
+            self.ticks.clear_vote_retry(ec.tick_id());
+            self.ticks.remove_tracker(ec.tick_id());
+            self.exec_certs.insert(ec.clone());
         }
 
-        actions.extend(self.handle_attestation(&ec_arc));
+        actions.extend(self.handle_attestation(&ec));
         actions
     }
 
@@ -2622,28 +2897,20 @@ impl ExecutionCoordinator {
     }
 
     /// Keep a fetched proof for a block this validator proposes.
-    pub fn on_proof_fetched(
-        &mut self,
-        anchor: Anchor,
-        keys: &[SubstateKey],
-        proof: &MerkleInclusionProof,
-        values: &[ServedValue],
-    ) {
-        self.counterparts
-            .on_proof_fetched(anchor, keys, proof, values);
+    pub fn on_proof_fetched(&mut self, proof: &CheckedStateProof, values: &[ServedValue]) {
+        self.counterparts.take_fetched_proof(proof, values);
     }
 
-    /// Take a proof fetched for verdict questions at `anchor`, each
-    /// question as its cells, and hold what a hearing row would take.
+    /// Take a proof fetched for verdict questions, each question as its
+    /// cells, and hold what a hearing row would take.
     pub fn on_verdict_proof_fetched(
         &mut self,
-        anchor: Anchor,
         questions: &[VerdictCells],
-        proof: &MerkleInclusionProof,
+        proof: &CheckedStateProof,
         windows: EpochWindows,
     ) {
         self.counterparts
-            .on_verdict_proof_fetched(anchor, questions, proof, windows);
+            .on_verdict_proof_fetched(questions, proof, windows);
     }
 
     /// What this validator holds to offer in a block it proposes,
@@ -2727,8 +2994,9 @@ impl ExecutionCoordinator {
     /// A push naming a record this validator never carries, as one whose
     /// `Whole` read after a sync or a restart finds the record already
     /// gone, or one toward a prefix a reshape moved away, is released by
-    /// nothing here. It stays held until the horizon retires it or a
-    /// later push evicts it, within the bound the early buffer holds.
+    /// nothing here. It stays held until the horizon retires it or
+    /// pushes at higher heights take its place, within the bound the
+    /// early buffer holds.
     fn release_carried(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -2802,8 +3070,8 @@ impl ExecutionCoordinator {
             Some(proven) if proven == anchor => {
                 if claim.verdicts.is_empty() {
                     let wanted = self.wanted_records();
-                    if !self.counterparts.offer_pushed(&claim, &wanted, now)
-                        && let Err(reason) = self.parked_claims.hold_early(claim)
+                    if let Some(early) = self.counterparts.offer_pushed(claim, &wanted, now)
+                        && let Err(reason) = self.parked_claims.hold_early(early)
                     {
                         record_crossing_push_dropped(reason);
                     }
@@ -2956,16 +3224,18 @@ impl ExecutionCoordinator {
             let (recipients, local_recipient) =
                 self.addressed(vec![tick_leader(&tick_id, &committee)]);
             for &signer in self.signers.iter().filter(|s| committee.contains(s)) {
-                actions.push(Action::SignAndSendExecutionVote {
-                    block_hash,
-                    vote_anchor_ts,
-                    tick_id,
-                    global_receipt_root,
-                    tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: recipients.clone(),
-                    local_recipient,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::SignAndSendExecutionVote {
+                        block_hash,
+                        vote_anchor_ts,
+                        tick_id,
+                        global_receipt_root,
+                        tx_outcomes: (*tx_outcomes).clone(),
+                        recipients: recipients.clone(),
+                        local_recipient,
+                        signer,
+                    },
+                ));
             }
         }
         actions
@@ -3021,7 +3291,7 @@ impl ExecutionCoordinator {
         );
     }
 
-    /// Lift fired retries to `Action::SignAndSendExecutionVote`s.
+    /// Lift fired retries to `ExecutionAction::SignAndSendExecutionVote`s.
     fn lift_vote_retries(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -3078,16 +3348,18 @@ impl ExecutionCoordinator {
                 .collect();
             let (recipients, local_recipient) = self.addressed(recipients);
             for signer in signers {
-                actions.push(Action::SignAndSendExecutionVote {
-                    block_hash,
-                    vote_anchor_ts,
-                    tick_id,
-                    global_receipt_root,
-                    tx_outcomes: (*tx_outcomes).clone(),
-                    recipients: recipients.clone(),
-                    local_recipient,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::SignAndSendExecutionVote {
+                        block_hash,
+                        vote_anchor_ts,
+                        tick_id,
+                        global_receipt_root,
+                        tx_outcomes: (*tx_outcomes).clone(),
+                        recipients: recipients.clone(),
+                        local_recipient,
+                        signer,
+                    },
+                ));
             }
         }
         actions
@@ -3100,10 +3372,12 @@ impl ExecutionCoordinator {
     /// Fold a committed block into execution: the one entry live commits,
     /// block sync and the restart's replay all take.
     ///
-    /// The fold waits behind any commit whose anchored committee sits in
+    /// The fold waits behind any commit whose certified committee sits in
     /// a window this node's beacon has not committed, and folds with it
     /// once it lands, so the effects returned may carry earlier blocks'
-    /// ahead of this one's, or nothing. Each block's fold, in order:
+    /// ahead of this one's, or nothing. `committee_anchor`, the parent's
+    /// own anchor, places the block against a recovery's bridge; it
+    /// classifies nothing. Each block's fold, in order:
     ///
     /// 1. **Resolutions** — what its finalizations settle, read off the
     ///    ledger before anything releases the entries.
@@ -3162,32 +3436,80 @@ impl ExecutionCoordinator {
         committee_anchor: WeightedTimestamp,
         naming: Naming,
     ) -> CommitEffects {
+        if self.fold_abandoned {
+            return CommitEffects::default();
+        }
         self.awaiting_window
             .push_back((certified.clone(), committee_anchor, naming));
-        self.drain_awaiting_window(topology_schedule)
+        let effects = self.drain_awaiting_window(topology_schedule);
+        if self.parked_evicted.is_some() && self.awaiting_window.len() > MAX_AWAITING_EVICTED {
+            let (front, _, _) = self
+                .awaiting_window
+                .front()
+                .expect("a parked fold holds the commit it parks on");
+            tracing::error!(
+                shard = %self.local_shard,
+                height = front.block().height().inner(),
+                epoch = %front.qc().committee_epoch(),
+                retained = ?topology_schedule.retained_epochs(),
+                queued = self.awaiting_window.len(),
+                "The execution fold gives up on an evicted signed window and drops every \
+                 commit until a restart, which widens the schedule back to this window \
+                 and replays them from the store",
+            );
+            self.awaiting_window.clear();
+            self.fold_abandoned = true;
+        }
+        effects
     }
 
     /// Fold the commits waiting on their windows, oldest first, for as
-    /// long as each one's anchored committee resolves. A commit whose
+    /// long as each one's certified committee resolves. A commit whose
     /// window this node's beacon has not committed stays at the front,
     /// and every later one queues behind it, so the fold still runs in
     /// commit order.
+    ///
+    /// A commit whose window the schedule has evicted stays at the front
+    /// too: retention keeps every window a live commit or a restart's
+    /// replay is signed in, so the miss is this node's own fault, and
+    /// folding under any other window would classify and price the block
+    /// unlike every replica that held it. Consensus carries on. Another
+    /// chain registering on this host can widen the shared schedule back
+    /// over the window, so the park waits, but behind at most
+    /// [`MAX_AWAITING_EVICTED`] commits; past that the fold gives up
+    /// until a restart, whose registration widens the schedule to every
+    /// window its replay reads.
     fn drain_awaiting_window(&mut self, topology_schedule: &TopologySchedule) -> CommitEffects {
         let mut effects = CommitEffects::default();
-        while let Some((certified, committee_anchor, _)) = self.awaiting_window.front() {
-            let own_anchor = certified.block().header().parent_qc().weighted_timestamp();
-            let Some(anchored) =
-                self.anchored_committee(topology_schedule, *committee_anchor, own_anchor)
-            else {
-                break;
+        while let Some((certified, _, _)) = self.awaiting_window.front() {
+            let committee = match self.certified_committee(topology_schedule, certified) {
+                BlockResolution::Committee(committee) => committee,
+                BlockResolution::NotYetCommitted => break,
+                BlockResolution::Evicted => {
+                    let height = certified.block().height();
+                    if self.parked_evicted != Some(height) {
+                        tracing::error!(
+                            shard = %self.local_shard,
+                            height = height.inner(),
+                            epoch = %certified.qc().committee_epoch(),
+                            retained = ?topology_schedule.retained_epochs(),
+                            "A commit's signed window is evicted; the execution fold parks on \
+                             it until the schedule holds the window again, which a restart \
+                             brings about",
+                        );
+                        self.parked_evicted = Some(height);
+                    }
+                    break;
+                }
             };
+            self.parked_evicted = None;
             let (certified, committee_anchor, naming) = self
                 .awaiting_window
                 .pop_front()
                 .expect("the front was just read");
-            effects.absorb(self.commit_anchored(
+            effects.absorb(self.commit_certified(
                 topology_schedule,
-                anchored,
+                committee,
                 &certified,
                 committee_anchor,
                 naming,
@@ -3222,19 +3544,20 @@ impl ExecutionCoordinator {
         self.commit_named(topology_schedule, certified, committee_anchor, naming)
     }
 
-    /// One commit's fold, under the committee its anchor resolved.
+    /// One commit's fold, under the committee its QC signed.
     #[allow(clippy::too_many_lines)] // sequential orchestration of one commit's fold
-    fn commit_anchored(
+    fn commit_certified(
         &mut self,
         topology_schedule: &TopologySchedule,
-        anchored: &TopologySnapshot,
+        window: BlockCommittee<'_>,
         certified: &CertifiedBlock,
         committee_anchor: WeightedTimestamp,
         naming: Naming,
     ) -> CommitEffects {
         let block = certified.block();
         let height = block.height();
-        let (floor, crossed) = self.cross_a_bridge(topology_schedule, committee_anchor, block);
+        let (floor, crossed) =
+            self.cross_a_bridge(topology_schedule, window.snapshot, committee_anchor, block);
 
         // What the block's finalizations settle about the transactions
         // they name, read off their outcomes alone.
@@ -3252,7 +3575,9 @@ impl ExecutionCoordinator {
         // for timeout calculations and pruning even when there are no new
         // transactions.
         if height > self.committed_height {
-            self.committed_committee_anchor_wt = committee_anchor;
+            // A genesis block carries no signed QC, so its window is no
+            // epoch a quorum signed: the shard and a restart say the same.
+            self.committed_committee_epoch = (!block.is_genesis()).then_some(window.epoch);
             self.committed_height = height;
             self.committed_ts = block.header().parent_qc().weighted_timestamp();
         }
@@ -3273,8 +3598,8 @@ impl ExecutionCoordinator {
         // What the block says about counterparts, and what it opens to
         // ask them; the strands no counterpart can answer for any more
         // are let go of below.
-        let trie = anchored.shard_trie();
-        let wanted = self.wanted_records();
+        let trie = window.snapshot.shard_trie();
+        let wanted = self.provisioning.wanted_past(block.state_claims());
         actions.extend(self.release_early_pushes(topology_schedule, &wanted));
         let committed =
             self.counterparts
@@ -3317,12 +3642,14 @@ impl ExecutionCoordinator {
         // deterministic across validators.
         for directive in self.outbound_certs.on_block_committed(self.committed_ts) {
             if let Some(signer) = self.envelope_signer(topology_schedule, &directive.certificate) {
-                actions.push(Action::BroadcastExecutionCertificate {
-                    shard: directive.target_shard,
-                    certificate: directive.certificate,
-                    recipients: directive.recipients,
-                    signer,
-                });
+                actions.push(Action::Execution(
+                    ExecutionAction::BroadcastExecutionCertificate {
+                        shard: directive.target_shard,
+                        certificate: directive.certificate,
+                        recipients: directive.recipients,
+                        signer,
+                    },
+                ));
             }
         }
 
@@ -3345,6 +3672,7 @@ impl ExecutionCoordinator {
                 .filter(|(_, decision)| !matches!(decision, TransactionDecision::Accept))
                 .map(|(tx_hash, _)| tx_hash)
                 .collect();
+            self.hold_awaiting_seeds(*fw.tick_id());
             if let Some(held) = self.held.get(fw.tick_id())
                 && height >= self.dispatch_from
             {
@@ -3392,7 +3720,7 @@ impl ExecutionCoordinator {
         actions.extend(self.on_block_committed(
             &mut named,
             topology_schedule,
-            anchored,
+            window,
             block,
             match naming {
                 Naming::Manifest => Named::Lines(block.tick_manifest()),
@@ -3415,9 +3743,13 @@ impl ExecutionCoordinator {
     /// broadcasts, the crossing readings the parent's commit made go with
     /// it, and the pushes queued for the next. Nothing on a block this
     /// replica cannot run.
+    ///
+    /// Everything routes under `window`, the one the block's QC signed,
+    /// under which the header's roots were computed, so each part walks
+    /// to its target's root.
     fn pushes(
         &mut self,
-        anchored: &TopologySnapshot,
+        window: &TopologySnapshot,
         committed: &Block,
         runnable: bool,
     ) -> Vec<Action> {
@@ -3437,18 +3769,36 @@ impl ExecutionCoordinator {
         let proposer = header.proposer();
         if runnable && self.signers.contains(&proposer) {
             let local_shard = self.local_shard;
-            if let Some((requests, shard_recipients)) =
-                build_provision_requests(anchored, transactions, &self.signers, local_shard)
-            {
-                actions.push(Action::FetchAndBroadcastProvisions {
-                    block_hash,
-                    requests,
-                    source_shard: local_shard,
-                    block_height: height,
-                    source_block_ts: header.parent_qc().weighted_timestamp(),
-                    shard_recipients,
-                    signer: proposer,
-                });
+            // A block owes a part wherever its header roots a target: for
+            // a transaction it commits, or for a member it makes head,
+            // which a block committing no cross-shard transaction can.
+            let claimed = header.provision_tx_roots();
+            if !claimed.is_empty() {
+                let shard_recipients = claimed
+                    .keys()
+                    .map(|&target| {
+                        let recipients = window
+                            .committee_for_shard(target)
+                            .iter()
+                            .copied()
+                            .filter(|v| !self.signers.contains(v))
+                            .collect();
+                        (target, recipients)
+                    })
+                    .collect();
+                actions.push(Action::Provisions(
+                    ProvisionAction::FetchAndBroadcastProvisions {
+                        block_hash,
+                        transactions: Arc::clone(transactions),
+                        trie: window.shard_trie().clone(),
+                        source_shard: local_shard,
+                        block_height: height,
+                        source_block_ts: header.parent_qc().weighted_timestamp(),
+                        claimed: claimed.clone(),
+                        shard_recipients,
+                        signer: proposer,
+                    },
+                ));
             }
             if let Some((parent_hash, anchor, mut targets)) = pending_push {
                 // The records still standing whose consumers have not
@@ -3456,7 +3806,7 @@ impl ExecutionCoordinator {
                 // one past its validity end, pushed again at the
                 // parent's view, where each record still stands.
                 for (target, records) in self.counterparts.record_repushes(
-                    anchored.shard_trie(),
+                    window.shard_trie(),
                     self.committed_ts,
                     anchor.height,
                 ) {
@@ -3467,15 +3817,15 @@ impl ExecutionCoordinator {
                 }
                 let shard_recipients = targets
                     .keys()
-                    .map(|&target| (target, anchored.committee_for_shard(target).to_vec()))
+                    .map(|&target| (target, window.committee_for_shard(target).to_vec()))
                     .collect();
-                actions.push(Action::PushCrossingReadings {
+                actions.push(Action::Provisions(ProvisionAction::PushCrossingReadings {
                     block_hash: parent_hash,
                     anchor,
                     targets,
                     shard_recipients,
                     signer: proposer,
-                });
+                }));
             }
         }
         // Every live block is pushed for, whether or not it wrote a
@@ -3485,7 +3835,7 @@ impl ExecutionCoordinator {
             let ledger = &self.counterparts.ledger;
             let targets = record_pushes(
                 finalizations,
-                anchored.shard_trie(),
+                window.shard_trie(),
                 self.local_shard,
                 |tx_hash, record| ledger.claimants(tx_hash, record),
             );
@@ -3512,7 +3862,7 @@ impl ExecutionCoordinator {
         &mut self,
         seated: &mut Vec<TickLine>,
         topology_schedule: &TopologySchedule,
-        anchored: &TopologySnapshot,
+        window: BlockCommittee<'_>,
         committed: &Block,
         named: Named<'_>,
     ) -> Vec<Action> {
@@ -3531,7 +3881,7 @@ impl ExecutionCoordinator {
         // hold.
         let runnable = committed.is_live() && height >= self.dispatch_from;
 
-        actions.extend(self.pushes(anchored, committed, runnable));
+        actions.extend(self.pushes(window.snapshot, committed, runnable));
 
         let block = CommittingBlock {
             hash: block_hash,
@@ -3544,7 +3894,7 @@ impl ExecutionCoordinator {
         // anything is composed from it: the block's own transactions, and
         // the provisions and engagement echoes its batches carry.
         if !transactions.is_empty() {
-            self.register_committed_txs(anchored, &block, transactions);
+            self.register_committed_txs(window, &block, transactions);
         }
         // After the block's transactions are registered, so a record
         // read in a transaction's own block is its arrival.
@@ -3560,7 +3910,14 @@ impl ExecutionCoordinator {
         let (pending, early_votes, members) = if self.terminated {
             (None, Vec::new(), Vec::new())
         } else {
-            self.seat_tick(topology_schedule, anchored, &block, named, seated)
+            self.seat_tick(
+                topology_schedule,
+                window.snapshot,
+                &block,
+                named,
+                seated,
+                runnable,
+            )
         };
         for vote in early_votes {
             actions.extend(self.on_execution_vote(topology_schedule, vote));
@@ -3648,19 +4005,20 @@ impl ExecutionCoordinator {
         );
     }
 
-    /// The cells unresolved cross-shard legs hold provisionally.
+    /// The keys of this shard unresolved cross-shard legs hold
+    /// provisionally, as the queue holds them.
     ///
     /// Rebuilt per commit from `ticked`, which is small: one entry per
     /// tick whose fate has not committed, and the drain budget bounds how
     /// many that can be.
-    fn provisional_cells(&self) -> ProvisionalCells {
-        let mut cells = ProvisionalCells::default();
+    fn provisional_cells(&self) -> QueueHolds {
+        let mut cells = QueueHolds::default();
         for claims in self
             .ticked
             .values()
             .flat_map(|ticked| ticked.provisional_claims.values())
         {
-            cells.claim(claims);
+            cells.hold(&pins_of(claims, self.local_shard));
         }
         cells
     }
@@ -4005,18 +4363,21 @@ impl ExecutionCoordinator {
     /// the floor, so the chain drops it.
     ///
     /// Asks the shard's own question of the shard's own inputs
-    /// ([`TopologySchedule::crossing_block`] at the block's committee
-    /// anchor, its parent's), so the commit that drops the ticks is the
-    /// one whose lines discard their rows. Answers the floor raise beside
-    /// the ticks dropped.
+    /// ([`TopologySchedule::crossing_block`] over the block's certified
+    /// committee, between its committee anchor, its parent's, and its
+    /// own), so the commit that drops the ticks is the one whose lines
+    /// discard their rows. Answers the floor raise beside the ticks
+    /// dropped.
     fn cross_a_bridge(
         &mut self,
         topology_schedule: &TopologySchedule,
+        committee: &TopologySnapshot,
         committee_anchor: WeightedTimestamp,
         block: &Block,
     ) -> (Vec<Action>, Vec<TickId>) {
         let Some(floor) = block.height().prev().filter(|_| {
             topology_schedule.crossing_block(
+                committee,
                 self.local_shard,
                 committee_anchor,
                 block.header().parent_qc().weighted_timestamp(),
@@ -4119,15 +4480,42 @@ impl ExecutionCoordinator {
             .collect()
     }
 
+    /// Hold the queued tick `tick_id` names if it still awaits a seed
+    /// window, as a finalization of it commits.
+    ///
+    /// Its peers ran it, and what this node's draw would answer the
+    /// finalization already says. Held from here, the tick is seated from
+    /// that finalization as a tick this node cannot run is, rather than
+    /// waiting on a window the schedule may evict before it arrives.
+    fn hold_awaiting_seeds(&mut self, tick_id: TickId) {
+        for queued in &mut self.pending_ticks {
+            if let Queued::Run(pending) = queued
+                && TickId::new(self.local_shard, pending.tick) == tick_id
+            {
+                if let Some(awaited) = pending.awaiting.take() {
+                    tracing::debug!(
+                        tick = %tick_id,
+                        "Holding a tick its finalization settled before its seeds arrived"
+                    );
+                    self.held.insert(tick_id, awaited.held);
+                    *queued = Queued::Held(tick_id);
+                }
+                return;
+            }
+        }
+    }
+
     /// Dispatch the queued tick at the head, unless one is already in
     /// flight. Ticks execute serially: each output is the next tick's
     /// baseline, so the next dispatch waits for the previous
     /// `ExecutionBatchCompleted` — by which point the handler has
     /// appended the output to the tick chain.
     ///
-    /// It waits too for the block below the tick to be written. That
-    /// block's commit is in hand by then, and its write never waits on a
-    /// tick, so the wait ends at the `BlockPersisted` that names it.
+    /// It waits too for the block below the tick to be written, and for
+    /// every height a member of it reads its own part at, which a member
+    /// named in its head block places at the tick's own block. Each of
+    /// those commits is in hand by then, and a block's write never waits
+    /// on a tick, so the wait ends at the `BlockPersisted` that names it.
     ///
     /// The tick goes out with every fate recorded for it so far, which
     /// the chain applies under the acquisition that appends its output.
@@ -4151,6 +4539,7 @@ impl ExecutionCoordinator {
                 !topology_schedule.committee_replaced_for_anchored(local_shard, tick.anchor())
             }),
         });
+        self.take_awaited_seeds(topology_schedule);
         if self.tick_in_flight || self.committed_height < self.replay_through {
             return Vec::new();
         }
@@ -4177,7 +4566,9 @@ impl ExecutionCoordinator {
         let Some(Queued::Run(head)) = self.pending_ticks.front() else {
             return Vec::new();
         };
-        if head.tick.prev().is_some_and(|below| below > self.persisted) {
+        if head.tick.prev().is_some_and(|below| below > self.persisted)
+            || head.served_ceiling().is_some_and(|x| x > self.persisted)
+        {
             return Vec::new();
         }
         // Running a member whose code this node lacks would reach the
@@ -4205,24 +4596,61 @@ impl ExecutionCoordinator {
             );
             return vec![Action::Fetch(FetchRequest::Packages { wanted: missing })];
         }
+        // A draw this node cannot answer from the beacon's own seeds is
+        // one it would answer unlike its peers, so the tick waits for the
+        // fold that publishes them. Every beacon fold dispatches again.
+        if head.awaiting.is_some() {
+            tracing::debug!(
+                shard = %self.local_shard,
+                tick = %head.tick,
+                "Holding a tick whose members draw on seeds this node does not hold"
+            );
+            return Vec::new();
+        }
         let Some(Queued::Run(tick)) = self.pending_ticks.pop_front() else {
             return Vec::new();
         };
         self.tick_in_flight = true;
+        self.in_flight_served = tick.served_floor();
         let fates: Vec<TickResolution> = self
             .pending_tick_resolutions
             .iter()
             .filter(|(_, height, _)| *height == tick.tick)
             .map(|(_, _, resolution)| resolution.clone())
             .collect();
-        vec![Action::ExecuteTransactions {
+        vec![Action::Execution(ExecutionAction::ExecuteTransactions {
             tick: tick.tick,
             fates,
             tick_ts: tick.tick_ts,
             env: tick.env,
             requests: tick.requests,
             included: tick.included,
-        }]
+        })]
+    }
+
+    /// Take into every queued tick awaiting a seed window what `schedule`
+    /// now holds of it, and hold in its place each that awaits one no
+    /// held ring reaches, as seating holds a tick past an evicted window.
+    ///
+    /// Every dispatch runs this before anything that can stop it, so a
+    /// tick behind the head, or behind one in flight, takes a window in
+    /// while the fold that published it is the newest held.
+    fn take_awaited_seeds(&mut self, schedule: &TopologySchedule) {
+        for queued in &mut self.pending_ticks {
+            if let Queued::Run(pending) = queued
+                && let Some(epoch) = pending.take_published_seeds(schedule)
+                && let Some(awaited) = pending.awaiting.take()
+            {
+                let tick_id = TickId::new(self.local_shard, pending.tick);
+                tracing::warn!(
+                    tick = %tick_id,
+                    epoch = epoch.inner(),
+                    "Holding a tick whose awaited seed window this node has evicted"
+                );
+                self.held.insert(tick_id, awaited.held);
+                *queued = Queued::Held(tick_id);
+            }
+        }
     }
 
     /// Replay buffered certificates for transactions that have just
@@ -4266,7 +4694,7 @@ impl ExecutionCoordinator {
     /// buffered (or kept buffered) via `pending_routing` until their
     /// block commits; routed `tx_hashes` are cleared from the pending
     /// set, dropping the EC entirely once fully routed.
-    fn handle_attestation(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> Vec<Action> {
+    fn handle_attestation(&mut self, ec: &Verified<ExecutionCertificate>) -> Vec<Action> {
         let mut actions = Vec::new();
         self.counterparts.on_certificate(ec, self.committed_ts);
         if ec.shard_id() != self.local_shard {
@@ -4291,7 +4719,7 @@ impl ExecutionCoordinator {
             if tick.adopt_later_certificate(ec) {
                 actions.extend(self.reanchor_finalizations(tick_id, ec));
             } else {
-                tick.add_execution_certificate(Arc::clone(ec));
+                tick.add_execution_certificate(ec.clone());
             }
             actions.extend(self.finalize(tick_id));
         }
@@ -4314,7 +4742,7 @@ impl ExecutionCoordinator {
     fn reanchor_finalizations(
         &self,
         tick_id: &TickId,
-        local: &Arc<Verified<ExecutionCertificate>>,
+        local: &Verified<ExecutionCertificate>,
     ) -> Vec<Action> {
         let mut finalizations = Vec::new();
         for held in self.finalized.of_tick(tick_id) {
@@ -4326,10 +4754,10 @@ impl ExecutionCoordinator {
                 anchor = local.vote_anchor_ts().as_millis(),
                 "Re-anchoring a held finalization on a later certificate"
             );
-            let reanchored: Arc<Verifiable<Finalization>> =
-                Arc::new(Verified::<Finalization>::seal(reanchored).into());
+            let reanchored: Verifiable<Finalization> =
+                Verified::<Finalization>::seal(reanchored).into();
             self.finalized.remove(&held.receipt_hash());
-            self.finalized.insert(*tick_id, Arc::clone(&reanchored));
+            self.finalized.insert(*tick_id, reanchored.clone());
             finalizations.push(reanchored);
         }
         if finalizations.is_empty() {
@@ -4394,12 +4822,12 @@ impl ExecutionCoordinator {
                 continue;
             }
             self.legs_asked.insert(*tick, tip);
-            actions.push(Action::BuildLegsHalf {
+            actions.push(Action::Execution(ExecutionAction::BuildLegsHalf {
                 tick: *tick,
                 names: names.clone(),
                 tip,
                 tip_height,
-            });
+            }));
         }
         actions
     }
@@ -4434,9 +4862,8 @@ impl ExecutionCoordinator {
             return Vec::new();
         };
         self.legs_offered.insert(tick, names);
-        let half: Arc<Verifiable<Finalization>> =
-            Arc::new(Verified::<Finalization>::seal(half).into());
-        self.finalized.insert(tick, Arc::clone(&half));
+        let half: Verifiable<Finalization> = Verified::<Finalization>::seal(half).into();
+        self.finalized.insert(tick, half.clone());
         vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
             finalizations: vec![half],
         })]
@@ -4459,13 +4886,12 @@ impl ExecutionCoordinator {
         let stating = tick.take_stating_finalization();
 
         // Local-finalization gate produces `Verified<Finalization>`; lift
-        // into the `Block::Live.certificates` transport shape once so the
-        // store, the admission event, and any downstream `PendingBlock`
-        // entry share the same `Arc` without further per-consumer cloning.
+        // into the `Block::Live.certificates` transport shape, whose
+        // clones the store, the admission event and any downstream
+        // `PendingBlock` entry share.
         let mut actions = Vec::new();
         for half in determined.into_iter().chain(stating) {
-            let finalized_arc = Arc::new(Verified::<Finalization>::seal(half).into());
-            actions.extend(self.emit_finalized(finalized_arc));
+            actions.extend(self.emit_finalized(Verified::<Finalization>::seal(half).into()));
         }
 
         if self
@@ -4487,11 +4913,11 @@ impl ExecutionCoordinator {
     /// Record a freshly built finalization and emit its admission event,
     /// which covers both the shard consensus subscriber and the `io_loop`
     /// serving cache.
-    fn emit_finalized(&self, finalized_arc: Arc<Verifiable<Finalization>>) -> Vec<Action> {
+    fn emit_finalized(&self, finalized: Verifiable<Finalization>) -> Vec<Action> {
         self.finalized
-            .insert(*finalized_arc.tick_id(), Arc::clone(&finalized_arc));
+            .insert(*finalized.tick_id(), finalized.clone());
         vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
-            finalizations: vec![finalized_arc],
+            finalizations: vec![finalized],
         })]
     }
 
@@ -4520,7 +4946,7 @@ impl ExecutionCoordinator {
     ///
     /// Runs [`Self::gate`] over the certificate it carries, if any, and
     /// dispatches signature verification to the crypto pool via
-    /// [`Action::VerifyFinalization`]. The matching
+    /// [`ExecutionAction::VerifyFinalization`]. The matching
     /// [`ProtocolEvent::FinalizationVerified`] feeds
     /// [`Self::on_finalization_verified`], which emits
     /// `Continuation(FinalizationsAdmitted)` only when the certificate
@@ -4537,16 +4963,20 @@ impl ExecutionCoordinator {
     pub fn admit_finalization(
         &mut self,
         topology_schedule: &TopologySchedule,
-        tick: Arc<Verifiable<Finalization>>,
+        tick: Verifiable<Finalization>,
     ) -> Vec<Action> {
         // Already-finalized short-circuit — a second fetch arrival for a
         // finalization we've already admitted is wasted verification work.
+        // The fetch that carried it is still owed a release: its ids stay
+        // in flight until a verdict, and none follows from here.
         if self.finalized.get(&tick.receipt_hash()).is_some() {
             tracing::debug!(
                 tick = %tick.tick_id(),
                 "Finalization already in canonical store — skipping verification"
             );
-            return Vec::new();
+            return vec![Action::AbandonFetch(FetchIds::Finalizations(vec![
+                tick.receipt_hash(),
+            ]))];
         }
         // A legs half carries no certificate to verify: what holds it is
         // the receipts it names, each recomputing to its named hash, which
@@ -4557,10 +4987,10 @@ impl ExecutionCoordinator {
             ]))];
         }
         match self.gate(topology_schedule, &tick) {
-            Ok(public_keys) => vec![Action::VerifyFinalization {
+            Ok(public_keys) => vec![Action::Execution(ExecutionAction::VerifyFinalization {
                 finalization: tick,
                 public_keys,
-            }],
+            })],
             Err(Gate::InFlight) => Vec::new(),
             Err(Gate::BeaconBehind) => {
                 self.parked.park(Waiting::Beacon, Parked::Fetched(tick));
@@ -4588,6 +5018,12 @@ impl ExecutionCoordinator {
         effects
             .actions
             .extend(self.release(topology_schedule, Wake::Beacon));
+        // Every queued tick awaiting a window this fold may have
+        // published takes it in as this dispatch starts, while it is the
+        // newest held.
+        effects
+            .actions
+            .extend(self.dispatch_next_tick(topology_schedule));
         effects
             .actions
             .push(Action::Fetch(FetchRequest::SettledTxs {
@@ -4600,12 +5036,12 @@ impl ExecutionCoordinator {
         effects
     }
 
-    /// Handle the result of [`Action::VerifyFinalization`]. Emits the
+    /// Handle the result of [`ExecutionAction::VerifyFinalization`]. Emits the
     /// admission continuation only when every EC's signature passed.
     #[must_use]
     pub fn on_finalization_verified(
         &mut self,
-        result: Result<Arc<Verified<Finalization>>, (Arc<Finalization>, FinalizationVerifyError)>,
+        result: Result<Verified<Finalization>, (Finalization, FinalizationVerifyError)>,
     ) -> Vec<Action> {
         // Release the in-flight slot regardless of outcome — future
         // arrivals can dispatch again.
@@ -4628,12 +5064,8 @@ impl ExecutionCoordinator {
                 ]))];
             }
         };
-        // Lift the verification result into the `Block::Live.certificates`
-        // transport shape exactly once so the admission event and any
-        // downstream pending-block storage share the same `Arc`.
-        let tick = Arc::new((*tick).clone().into());
         vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
-            finalizations: vec![tick],
+            finalizations: vec![tick.into()],
         })]
     }
 
@@ -4676,16 +5108,13 @@ impl ExecutionCoordinator {
     /// Order is all this offers: which of them a block may carry is
     /// admission's, read off the committed rows.
     #[must_use]
-    pub fn get_finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
+    pub fn get_finalizations(&self) -> Vec<Verifiable<Finalization>> {
         self.finalized.all()
     }
 
-    /// Get a finalization by its identity (returns `Arc` for sharing).
+    /// Get a finalization by its identity.
     #[must_use]
-    pub fn get_finalization(
-        &self,
-        hash: &FinalizationHash,
-    ) -> Option<Arc<Verifiable<Finalization>>> {
+    pub fn get_finalization(&self, hash: &FinalizationHash) -> Option<Verifiable<Finalization>> {
         self.finalized.get(hash)
     }
 
@@ -4704,10 +5133,7 @@ impl ExecutionCoordinator {
     /// committed, ticks are persisted to storage and should be fetched
     /// from there.
     #[must_use]
-    pub fn get_finalization_for_tx(
-        &self,
-        tx_hash: TxHash,
-    ) -> Option<Arc<Verifiable<Finalization>>> {
+    pub fn get_finalization_for_tx(&self, tx_hash: TxHash) -> Option<Verifiable<Finalization>> {
         self.finalized.get_for_tx(tx_hash)
     }
 
@@ -4935,6 +5361,8 @@ impl ExecutionCoordinator {
             outbound_certs: self.outbound_certs.memory_stats().tracked_certificates,
             proven_remote_blocks: self.counterparts.proven_anchors.len(),
             unproven_ecs: self.parked.waiting_on(|w| matches!(w, Waiting::Proof(_))),
+            awaiting_window: self.awaiting_window.len(),
+            parked_fold: usize::from(self.parked_evicted.is_some() || self.fold_abandoned),
         }
     }
 
@@ -4999,7 +5427,7 @@ mod tests {
         CommittedAt {
             height: BlockHeight::new(1),
             anchor: WeightedTimestamp::ZERO,
-            committee_anchor: WeightedTimestamp::ZERO,
+            committee_epoch: Epoch::GENESIS,
         }
     }
 
@@ -5014,24 +5442,27 @@ mod tests {
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
-        StubVmStatics, certify as test_certify, genesis_charge,
+        StubVmStatics, certify as test_certify, certify_live, certify_signed as signed_certify,
+        genesis_charge, install_stub_protocol_statics,
         make_finalization as helpers_make_finalization, make_finalization_leaving,
         make_leg_finalization, make_live_block as helpers_make_live_block, naming, proven_claim,
-        state_and_proof, state_and_proof_holding, stating_half_on, stub_abort_charge, test_prefix,
-        test_transaction, test_transaction_running, test_transaction_with_prefixes,
+        state_and_proof, state_and_proof_holding, stating_half_on, stub_abort_charge,
+        stub_transaction_with_reads, test_prefix, test_transaction, test_transaction_running,
+        test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
-        Crossings, Deadline, Epoch, EpochSeed, EpochWindows, ExecutionCertificateContext,
-        ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash, Hash, Inclusion, LocalKey,
-        MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
-        PriceTable, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryBinding,
-        RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot, Settlement, ShardAnchor,
-        ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt,
-        SubstateKey, TerminalEvidence, TickHalf, TransactionDecision, TxResolution, UnsettledTx,
-        ValidatorInfo, ValidatorSet, Verify, VoteCount, Window, compute_global_receipt_root,
-        receipt_hash_of, signed_bytes,
+        BeaconWitnessLeafCount, BlockHeader, BlockHeaderParts, ChainOrigin, ConsensusPublicKey,
+        ConsensusReceipt, ConsensusSignature, Crossings, Deadline, Epoch, EpochSeed, EpochWindows,
+        ExecutionCertificateContext, ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash,
+        Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
+        MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr,
+        ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryBinding,
+        RecoveryCause, Role, SEED_WINDOW_EPOCHS, SeedRing, SeedSource, SettledTxsRoot, Settlement,
+        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated,
+        StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TimestampRange,
+        TransactionDecision, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Verify,
+        VoteCount, Window, compute_global_receipt_root, receipt_hash_of, signed_bytes,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, CrossingId, Hash32, IntentHash, Kind, ProtocolHasher, Terms,
@@ -5040,6 +5471,7 @@ mod tests {
 
     use super::*;
     use crate::counterparts::TestRows;
+    use crate::record_reads::RECORD_PUSH_GRACE_FLOOR;
 
     impl ExecutionCoordinator {
         /// This coordinator with `signer` attached, before it holds any
@@ -5156,7 +5588,7 @@ mod tests {
     fn tick_holding(
         tick_id: TickId,
         tick_ts: WeightedTimestamp,
-        txs: Vec<(Arc<Verified<Transaction>>, BTreeSet<ShardId>)>,
+        txs: Vec<(Verified<Transaction>, BTreeSet<ShardId>)>,
     ) -> TickState {
         let mut state = TickState::new(
             tick_id,
@@ -5175,8 +5607,8 @@ mod tests {
     }
 
     /// Lift a test transaction into the verified form a tick holds.
-    fn verified_arc(tx: &Arc<Transaction>) -> Arc<Verified<Transaction>> {
-        Arc::new(Verified::new_unchecked_for_test((**tx).clone()))
+    fn verified_tx(tx: &Transaction) -> Verified<Transaction> {
+        Verified::new_unchecked_for_test(tx.clone())
     }
 
     /// Three of four signers: the quorum the admission gate holds a
@@ -5242,7 +5674,7 @@ mod tests {
         height: BlockHeight,
         timestamp_ms: u64,
         proposer: ValidatorId,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<Transaction>,
     ) -> Block {
         helpers_make_live_block(
             ShardId::ROOT,
@@ -5259,13 +5691,19 @@ mod tests {
         height: BlockHeight,
         timestamp_ms: u64,
         proposer: ValidatorId,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<Transaction>,
     ) -> Block {
         helpers_make_live_block(shard, height, timestamp_ms, proposer, transactions, vec![])
     }
 
     fn certify(block: Block) -> CertifiedBlock {
         test_certify(block, 0)
+    }
+
+    /// [`certify_signed`](hyperscale_types::test_utils::certify_signed)
+    /// stating epoch `epoch`.
+    fn certify_signed(block: Block, anchor_ms: u64, epoch: u64) -> CertifiedBlock {
+        signed_certify(block, anchor_ms, Epoch::new(epoch))
     }
 
     #[test]
@@ -5275,12 +5713,7 @@ mod tests {
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
 
         // Block committed with transaction
         let actions = state
@@ -5290,11 +5723,10 @@ mod tests {
         // Should request execution (single-shard path) and set up tick tracking
         assert!(!actions.is_empty());
         // First action should be ExecuteTransactions
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::ExecuteTransactions { .. }))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+        )));
 
         // TickState should be set up for this tick.
         let tick_id = state.ticks.tick_assignment(tx_hash);
@@ -5327,20 +5759,16 @@ mod tests {
 
         let tx = test_transaction_running(1, &[package]);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let actions = state
             .commit_block_carrying(&topology_schedule, &certify(block), Naming::Composed)
             .actions;
 
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::ExecuteTransactions { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "a tick running unfetched code must not dispatch"
         );
         assert!(
@@ -5373,7 +5801,9 @@ mod tests {
         let dispatched: Vec<&TxHash> = released
             .iter()
             .filter_map(|action| match action {
-                Action::ExecuteTransactions { requests, .. } => Some(requests),
+                Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. }) => {
+                    Some(requests)
+                }
                 _ => None,
             })
             .flatten()
@@ -5406,21 +5836,24 @@ mod tests {
                     BlockHeight::new(1),
                     1000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![tx],
                 )),
                 Naming::Composed,
             )
             .actions;
-        let Some(Action::ExecuteTransactions {
+        let Some(Action::Execution(ExecutionAction::ExecuteTransactions {
             tick,
             tick_ts,
             env,
             requests,
             included,
             ..
-        }) = actions
-            .into_iter()
-            .find(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        })) = actions.into_iter().find(|action| {
+            matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )
+        })
         else {
             panic!("a tick running code this node holds must dispatch");
         };
@@ -5449,11 +5882,11 @@ mod tests {
         let dispatched: Vec<TxHash> = again
             .iter()
             .filter_map(|action| match action {
-                Action::ExecuteTransactions {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
                     tick: dispatched_tick,
                     requests,
                     ..
-                } if *dispatched_tick == tick => Some(requests),
+                }) if *dispatched_tick == tick => Some(requests),
                 _ => None,
             })
             .flatten()
@@ -5479,20 +5912,16 @@ mod tests {
         let topology_schedule = make_test_topology();
 
         let tx = test_transaction_running(1, &[Hash::from_bytes(b"code this node holds")]);
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let actions = state
             .commit_block_carrying(&topology_schedule, &certify(block), Naming::Composed)
             .actions;
 
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::ExecuteTransactions { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "only the code a member runs can hold its tick"
         );
     }
@@ -5537,12 +5966,7 @@ mod tests {
         let mut state = make_test_state();
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1_000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]);
         state.commit_block_carrying(&schedule, &test_certify(block, 1_000), Naming::Composed);
 
         let tick_id = state
@@ -5610,12 +6034,7 @@ mod tests {
         let mut state = make_test_state();
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            5_000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 5_000, ValidatorId::new(0), vec![tx]);
         // The commit folds under the window it is classified in; only the
         // vote's routing reads the schedule afterwards.
         state.commit_block_carrying(&resolved, &test_certify(block, 5_000), Naming::Composed);
@@ -5646,9 +6065,10 @@ mod tests {
         // Once the schedule carries its epoch the vote must still be there.
         let recovered = state.emit_vote_actions(&resolved);
         assert!(
-            recovered
-                .iter()
-                .any(|a| matches!(a, Action::SignAndSendExecutionVote { .. })),
+            recovered.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+            )),
             "the tick must still vote once its committee resolves, got {recovered:?}",
         );
     }
@@ -5664,7 +6084,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
 
         // Commit the block as validator 0 to discover the tick_id.
@@ -5685,7 +6105,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
         let mut state_leader = make_test_state_for(leader);
         state_leader.commit_block_carrying(&topo_leader, &certify(block_leader), Naming::Composed);
@@ -5697,12 +6117,7 @@ mod tests {
         // A non-leader should NOT have a VoteTracker.
         let non_leader_id = *committee.iter().find(|&&v| v != leader).unwrap();
         let topo_non = make_topology();
-        let block_non = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block_non = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let mut state_non = make_test_state_for(non_leader_id);
         state_non.commit_block_carrying(&topo_non, &certify(block_non), Naming::Composed);
         assert!(
@@ -5720,7 +6135,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
         let mut state = make_test_state();
         state.commit_block_carrying(&topo, &certify(block), Naming::Composed);
@@ -5736,12 +6151,7 @@ mod tests {
         // If we're the leader, this test doesn't apply — find a non-leader topology.
         let non_leader_id = committee.iter().find(|&&v| v != leader).unwrap();
         let topo_non = make_topology();
-        let block_non = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block_non = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let mut state_non = make_test_state_for(*non_leader_id);
         state_non.commit_block_carrying(&topo_non, &certify(block_non), Naming::Composed);
 
@@ -5841,12 +6251,12 @@ mod tests {
         // Elapsed == VOTE_RETRY_TIMEOUT, so should emit retry.
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::SignAndSendExecutionVote {
+            Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                 recipients,
                 local_recipient,
                 tick_id: wid,
                 ..
-            } => {
+            }) => {
                 assert_eq!(wid, &tick_id);
                 assert_eq!(
                     (recipients, *local_recipient),
@@ -5867,7 +6277,9 @@ mod tests {
         state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
         let next = state.check_vote_retry_timeouts(&topo);
         assert_eq!(next.len(), 1);
-        if let Action::SignAndSendExecutionVote { recipients, .. } = &next[0] {
+        if let Action::Execution(ExecutionAction::SignAndSendExecutionVote { recipients, .. }) =
+            &next[0]
+        {
             assert_eq!(
                 recipients, &others,
                 "the second fire addresses the committee"
@@ -5903,7 +6315,7 @@ mod tests {
         let retries = |actions: &[Action]| {
             actions
                 .iter()
-                .filter(|a| matches!(a, Action::SignAndSendExecutionVote { tick_id: t, .. } if *t == tick_id))
+                .filter(|a| matches!(a, Action::Execution(ExecutionAction::SignAndSendExecutionVote { tick_id: t, .. }) if *t == tick_id))
                 .count()
         };
 
@@ -5957,7 +6369,7 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        state.on_certificate_verified(&topo, Ok(Arc::new(Verified::new_unchecked_for_test(cert))));
+        state.on_certificate_verified(&topo, Ok(Verified::new_unchecked_for_test(cert)));
 
         // Advance time past the retry deadline; if the retry had survived,
         // this would fire a SignAndSendExecutionVote action.
@@ -5989,11 +6401,11 @@ mod tests {
         let tick_id = ready_tick_at(&mut state, &schedule, height, 1_000);
         let sent_to = |actions: &[Action]| {
             actions.iter().find_map(|a| match a {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     recipients,
                     local_recipient,
                     ..
-                } => Some((recipients.clone(), *local_recipient)),
+                }) => Some((recipients.clone(), *local_recipient)),
                 _ => None,
             })
         };
@@ -6029,7 +6441,7 @@ mod tests {
         state.on_certificate_aggregated(
             &schedule,
             &tick_id,
-            &Arc::new(Verified::new_unchecked_for_test(cert)),
+            &Verified::new_unchecked_for_test(cert),
         );
         state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
         assert_eq!(
@@ -6088,15 +6500,18 @@ mod tests {
         }
         assert!(state.ticks.contains_tracker(&tick_id));
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate { .. })
+            )),
             "two of four is short of quorum"
         );
         let own = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, me));
         assert!(
-            own.iter()
-                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            own.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate { .. })
+            )),
             "{own:?}"
         );
     }
@@ -6179,22 +6594,22 @@ mod tests {
         let mut aggregated = 0usize;
         while let Some(action) = pending.pop() {
             match action {
-                Action::VerifyAndAggregateExecutionVotes {
+                Action::Execution(ExecutionAction::VerifyAndAggregateExecutionVotes {
                     tick_id,
                     block_hash,
                     votes,
-                } => {
+                }) => {
                     let verified =
                         Verified::<ExecutionVote>::verify_batch(&BlsVerifier, &net, votes);
                     pending
                         .extend(state.on_votes_verified(schedule, tick_id, block_hash, verified));
                 }
-                Action::AggregateExecutionCertificate {
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate {
                     tick_id,
                     global_receipt_root,
                     votes,
                     committee,
-                } => {
+                }) => {
                     aggregated += 1;
                     let certificate = Verified::<ExecutionCertificate>::aggregate(
                         &BlsVerifier,
@@ -6225,7 +6640,7 @@ mod tests {
         let height = BlockHeight::new(1);
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let block = make_live_block(height, 1_000, ValidatorId::new(0), vec![Arc::new(tx)]);
+        let block = make_live_block(height, 1_000, ValidatorId::new(0), vec![tx]);
         state.commit_block_carrying(schedule, &test_certify(block, 1_000), Naming::Composed);
         let tick_id = state
             .ticks
@@ -6245,11 +6660,11 @@ mod tests {
         let (anchor, outcomes) = cast
             .iter()
             .find_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     vote_anchor_ts,
                     tx_outcomes,
                     ..
-                } => Some((*vote_anchor_ts, tx_outcomes.clone())),
+                }) => Some((*vote_anchor_ts, tx_outcomes.clone())),
                 _ => None,
             })
             .expect("the tick's vote is cast");
@@ -6352,10 +6767,8 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        let _ = state.on_certificate_verified(
-            &schedule,
-            Ok(Arc::new(Verified::new_unchecked_for_test(cert))),
-        );
+        let _ =
+            state.on_certificate_verified(&schedule, Ok(Verified::new_unchecked_for_test(cert)));
         assert!(!state.ticks.contains_tracker(&tick_id));
 
         let late = *committee.iter().find(|v| **v != leader).expect("a peer");
@@ -6363,14 +6776,15 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BroadcastExecutionCertificate { recipients, .. } if recipients == &vec![late]
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate { recipients, .. }) if recipients == &vec![late]
             )),
             "{actions:?}"
         );
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate { .. })
+            )),
             "{actions:?}"
         );
         assert!(!state.ticks.contains_tracker(&tick_id));
@@ -6428,19 +6842,17 @@ mod tests {
         )
         .project_to(&HashSet::from([kept]))
         .expect("the tick carries it");
-        state.on_certificate_verified(
-            &topo,
-            Ok(Arc::new(Verified::new_unchecked_for_test(projection))),
-        );
+        state.on_certificate_verified(&topo, Ok(Verified::new_unchecked_for_test(projection)));
 
         assert!(!state.ticks.is_ec_dispatched(&tick_id));
         assert!(state.exec_certs.get(&tick_id).is_none());
         state.committed_ts = WeightedTimestamp::from_millis(5_000).plus(VOTE_RETRY_TIMEOUT);
         let actions = state.check_vote_retry_timeouts(&topo);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::SignAndSendExecutionVote { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+            )),
             "the retry still fires: {actions:?}"
         );
     }
@@ -6456,7 +6868,7 @@ mod tests {
             BlockHeight::new(1),
             1000,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(5);
@@ -6479,12 +6891,7 @@ mod tests {
         let tx = test_transaction(1);
         let topo = make_topology();
         let committee = topo.head().committee_for_shard(ShardId::ROOT).to_vec();
-        let block = make_live_block(
-            BlockHeight::new(1),
-            1000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-        );
+        let block = make_live_block(BlockHeight::new(1), 1000, ValidatorId::new(0), vec![tx]);
         let mut state = make_test_state();
         state.commit_block_carrying(&topo, &certify(block), Naming::Composed);
         let tick_id = state
@@ -6494,15 +6901,15 @@ mod tests {
             .map(|(id, _)| *id)
             .expect("the block seats a tick");
 
-        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let certificate = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )));
-        state.exec_certs.insert(Arc::clone(&certificate));
+        ));
+        state.exec_certs.insert(certificate);
         state.ticks.mark_ec_dispatched(tick_id);
 
         let voter = committee[1];
@@ -6519,7 +6926,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::BroadcastExecutionCertificate { certificate: sent, recipients, .. }
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate { certificate: sent, recipients, .. })
                     if recipients == &vec![voter] && sent.tick_id() == &tick_id
             )),
             "the late voter is sent the certificate: {actions:?}"
@@ -6540,7 +6947,7 @@ mod tests {
         let mut signers = SignerBitfield::new(4);
         signers.set(0); // single signer — well below 2f+1 = 3
         let covered_tx = TxHash::from(Hash::from_bytes(b"covered by the refused cert"));
-        let cert = Arc::new(ExecutionCertificate::new(
+        let cert = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
@@ -6552,9 +6959,9 @@ mod tests {
             )]),
             AggregateSignature::ZERO,
             signers,
-        ));
+        );
 
-        let verified = Arc::new(Verified::new_unchecked_for_test((*cert).clone()));
+        let verified = Verified::new_unchecked_for_test(cert);
         let actions = state.on_certificate_verified(&topo, Ok(verified));
         assert!(
             !actions.iter().any(|a| matches!(
@@ -6580,7 +6987,7 @@ mod tests {
     #[test]
     fn a_certificate_verified_after_its_shards_recovery_folds_is_refused_in_its_band() {
         let at = |height: u64| {
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            Verified::new_unchecked_for_test(ExecutionCertificate::new(
                 TickId::new(ShardId::ROOT, BlockHeight::new(height)),
                 WeightedTimestamp::ZERO,
                 GlobalReceiptRoot::ZERO,
@@ -6590,7 +6997,7 @@ mod tests {
                 )]),
                 AggregateSignature::ZERO,
                 quorum_signers(),
-            )))
+            ))
         };
         let admitted = |actions: &[Action]| {
             actions.iter().any(|action| {
@@ -6646,24 +7053,24 @@ mod tests {
             .emit_vote_actions(&schedule)
             .into_iter()
             .find_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     vote_anchor_ts,
                     global_receipt_root,
                     tx_outcomes,
                     ..
-                } => Some((vote_anchor_ts, global_receipt_root, tx_outcomes)),
+                }) => Some((vote_anchor_ts, global_receipt_root, tx_outcomes)),
                 _ => None,
             })
             .expect("the new tick is voted");
         let certificate = |anchor, root, outcomes: Vec<TxOutcome>| {
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            Verified::new_unchecked_for_test(ExecutionCertificate::new(
                 tick_id,
                 anchor,
                 root,
                 Capped::new(outcomes).expect("a list written out in a test"),
                 AggregateSignature::ZERO,
                 quorum_signers(),
-            )))
+            ))
         };
 
         let orphan = certificate(
@@ -6700,7 +7107,7 @@ mod tests {
         signers.set(1);
         signers.set(2);
         let covered_tx = TxHash::from(Hash::from_bytes(b"covered by the refused cert"));
-        let cert = Arc::new(ExecutionCertificate::new(
+        let cert = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
@@ -6712,7 +7119,7 @@ mod tests {
             )]),
             AggregateSignature::ZERO,
             signers,
-        ));
+        );
 
         let actions = state.on_certificate_verified(
             &topo,
@@ -6747,8 +7154,8 @@ mod tests {
         );
         assert!(!state.counterparts.heard_certificate(remote, tx_hash));
 
-        let actions = state
-            .on_certificate_verified(&topo, Ok(Arc::new(Verified::new_unchecked_for_test(cert))));
+        let actions =
+            state.on_certificate_verified(&topo, Ok(Verified::new_unchecked_for_test(cert)));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -6787,7 +7194,7 @@ mod tests {
         let topo = make_test_topology();
 
         let mut state = make_test_state();
-        let tx = Arc::new(test_transaction(3));
+        let tx = test_transaction(3);
         let participating: BTreeSet<ShardId> =
             [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
         state.ticks.insert_tick(
@@ -6795,7 +7202,7 @@ mod tests {
             tick_holding(
                 tick_id,
                 WeightedTimestamp::ZERO,
-                vec![(verified_arc(&tx), participating)],
+                vec![(verified_tx(&tx), participating)],
             ),
         );
 
@@ -6812,13 +7219,18 @@ mod tests {
         let actions = state.on_certificate_aggregated(
             &topo,
             &tick_id,
-            &Arc::new(Verified::new_unchecked_for_test(cert)),
+            &Verified::new_unchecked_for_test(cert),
         );
 
         // Should have: BroadcastEC(local) + BroadcastEC(remote shard 1)
         let broadcast_actions: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, Action::BroadcastExecutionCertificate { .. }))
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::Execution(ExecutionAction::BroadcastExecutionCertificate { .. })
+                )
+            })
             .collect();
 
         assert!(
@@ -6829,14 +7241,18 @@ mod tests {
 
         // One should be for the local shard (shard 0).
         let has_local = broadcast_actions.iter().any(|a| match a {
-            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardId::ROOT,
+            Action::Execution(ExecutionAction::BroadcastExecutionCertificate { shard, .. }) => {
+                *shard == ShardId::ROOT
+            }
             _ => false,
         });
         assert!(has_local, "Should include local shard broadcast");
 
         // One should be for the remote shard (shard 1).
         let has_remote = broadcast_actions.iter().any(|a| match a {
-            Action::BroadcastExecutionCertificate { shard, .. } => *shard == ShardId::leaf(1, 1),
+            Action::Execution(ExecutionAction::BroadcastExecutionCertificate { shard, .. }) => {
+                *shard == ShardId::leaf(1, 1)
+            }
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
@@ -6864,16 +7280,16 @@ mod tests {
             validators,
         )));
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let tx = Arc::new(test_transaction(3));
+        let tx = test_transaction(3);
         let outcomes = vec![TxOutcome::new(tx.hash(), ExecutionOutcome::Aborted)];
-        let cert = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let cert = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             compute_global_receipt_root(&outcomes),
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )));
+        ));
         let broadcast_signers = |signers: [u64; 2]| {
             let mut state = signed_by(
                 ExecutionCoordinator::new(ShardId::ROOT, Arc::new(TestCode::default())),
@@ -6886,14 +7302,17 @@ mod tests {
                 tick_holding(
                     tick_id,
                     WeightedTimestamp::ZERO,
-                    vec![(verified_arc(&tx), participating)],
+                    vec![(verified_tx(&tx), participating)],
                 ),
             );
             state
                 .on_certificate_aggregated(&topo, &tick_id, &cert)
                 .into_iter()
                 .filter_map(|a| match a {
-                    Action::BroadcastExecutionCertificate { signer, .. } => Some(signer),
+                    Action::Execution(ExecutionAction::BroadcastExecutionCertificate {
+                        signer,
+                        ..
+                    }) => Some(signer),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -6953,13 +7372,15 @@ mod tests {
         let actions = state.on_certificate_aggregated(
             &topo,
             &tick_id,
-            &Arc::new(Verified::new_unchecked_for_test(cert)),
+            &Verified::new_unchecked_for_test(cert),
         );
 
         let broadcasts: Vec<ShardId> = actions
             .iter()
             .filter_map(|action| match action {
-                Action::BroadcastExecutionCertificate { shard, .. } => Some(*shard),
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate {
+                    shard, ..
+                }) => Some(*shard),
                 _ => None,
             })
             .collect();
@@ -6979,8 +7400,8 @@ mod tests {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
-        let shared = Arc::new(test_transaction(3));
-        let ours = Arc::new(test_transaction(4));
+        let shared = test_transaction(3);
+        let ours = test_transaction(4);
         state.ticks.insert_tick(
             tick_id,
             tick_holding(
@@ -6988,13 +7409,10 @@ mod tests {
                 WeightedTimestamp::ZERO,
                 vec![
                     (
-                        verified_arc(&shared),
+                        verified_tx(&shared),
                         [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect(),
                     ),
-                    (
-                        verified_arc(&ours),
-                        std::iter::once(ShardId::ROOT).collect(),
-                    ),
+                    (verified_tx(&ours), std::iter::once(ShardId::ROOT).collect()),
                 ],
             ),
         );
@@ -7015,16 +7433,18 @@ mod tests {
         let actions = state.on_certificate_aggregated(
             &topo,
             &tick_id,
-            &Arc::new(Verified::new_unchecked_for_test(cert)),
+            &Verified::new_unchecked_for_test(cert),
         );
 
-        let sent = |target: ShardId| -> Arc<Verified<ExecutionCertificate>> {
+        let sent = |target: ShardId| -> Verified<ExecutionCertificate> {
             actions
                 .iter()
                 .find_map(|a| match a {
-                    Action::BroadcastExecutionCertificate {
-                        shard, certificate, ..
-                    } if *shard == target => Some(Arc::clone(certificate)),
+                    Action::Execution(ExecutionAction::BroadcastExecutionCertificate {
+                        shard,
+                        certificate,
+                        ..
+                    }) if *shard == target => Some(certificate.clone()),
                     _ => None,
                 })
                 .expect("a broadcast for the target shard")
@@ -7067,28 +7487,29 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let _fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], Action::VerifyFinalization { .. }));
+        assert!(matches!(
+            actions[0],
+            Action::Execution(ExecutionAction::VerifyFinalization { .. })
+        ));
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
@@ -7107,20 +7528,20 @@ mod tests {
     fn on_finalization_verified_drops_invalid() {
         let mut state = make_test_state();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        ));
-        let tick = Arc::new(Finalization::new(
+        );
+        let tick = Finalization::new(
             tick_id,
             TickHalf::Determined,
             Some(ec),
             Capped::from_array([]),
-        ));
+        );
         let fw_hash = tick.receipt_hash();
         let actions = state.on_finalization_verified(Err((
             tick,
@@ -7158,26 +7579,24 @@ mod tests {
         // (2f+1=3 needed).
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let fw_hash = tick.receipt_hash();
 
-        let actions = state.admit_finalization(&topo, Arc::clone(&tick));
+        let actions = state.admit_finalization(&topo, tick.clone());
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -7213,26 +7632,24 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             TickId::new(ShardId::leaf(8, 99), BlockHeight::new(1)),
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let fw_hash = tick.receipt_hash();
 
-        let actions = state.admit_finalization(&topo, Arc::clone(&tick));
+        let actions = state.admit_finalization(&topo, tick.clone());
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -7257,20 +7674,20 @@ mod tests {
     fn on_finalization_verified_admits_valid() {
         let mut state = make_test_state();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        ));
-        let tick = Arc::new(Verified::new_unchecked_for_test(Finalization::new(
+        );
+        let tick = Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
             TickHalf::Determined,
             Some(ec),
             Capped::from_array([]),
-        )));
+        ));
         let actions = state.on_finalization_verified(Ok(tick));
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -7305,7 +7722,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(matches!(
             first[0],
-            Action::VerifyExecutionCertificateSignature { .. }
+            Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
         ));
 
         // Same bytes mid-flight — must drop without dispatching another
@@ -7352,7 +7769,9 @@ mod tests {
             assert!(
                 matches!(
                     suffix.as_slice(),
-                    [Action::VerifyExecutionCertificateSignature { .. }]
+                    [Action::Execution(
+                        ExecutionAction::VerifyExecutionCertificateSignature { .. }
+                    )]
                 ),
                 "pending {pending}: an EC within the frontier dispatches, got {suffix:?}"
             );
@@ -7459,9 +7878,12 @@ mod tests {
             )
         };
         let dispatched = |actions: &[Action]| {
-            actions
-                .iter()
-                .any(|action| matches!(action, Action::VerifyExecutionCertificateSignature { .. }))
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+                )
+            })
         };
 
         // The proof first, retired as every commit retires the mirror.
@@ -7806,9 +8228,10 @@ mod tests {
         state.proven_anchors().record(proven);
         let actions = state.on_committed_remote_header(&topo, proven);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "the committed event must replay the deferred EC, got {actions:?}"
         );
     }
@@ -7847,9 +8270,10 @@ mod tests {
 
         let actions = state.on_execution_certificate(&topo, make_cert(covered).into());
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "a set-covered EC must dispatch without a commit proof, got {actions:?}"
         );
 
@@ -7895,9 +8319,10 @@ mod tests {
             },
         );
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "the set must replay the parked EC into dispatch, got {actions:?}"
         );
     }
@@ -7971,7 +8396,9 @@ mod tests {
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(matches!(
             actions.as_slice(),
-            [Action::VerifyExecutionCertificateSignature { .. }]
+            [Action::Execution(
+                ExecutionAction::VerifyExecutionCertificateSignature { .. }
+            )]
         ));
     }
 
@@ -8003,7 +8430,7 @@ mod tests {
         let _ = state.on_certificate_verified(
             &topo,
             Err((
-                Arc::new(cert.clone()),
+                cert.clone(),
                 ExecutionCertificateVerifyError::BadAggregatedSignature,
             )),
         );
@@ -8011,7 +8438,7 @@ mod tests {
         assert_eq!(again.len(), 1);
         assert!(matches!(
             again[0],
-            Action::VerifyExecutionCertificateSignature { .. }
+            Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
         ));
     }
 
@@ -8038,7 +8465,7 @@ mod tests {
         );
         state
             .exec_certs
-            .insert(Arc::new(Verified::new_unchecked_for_test(cert.clone())));
+            .insert(Verified::new_unchecked_for_test(cert.clone()));
 
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
@@ -8085,13 +8512,13 @@ mod tests {
         assert_ne!(cached.wire_hash(), incoming.wire_hash());
         state
             .exec_certs
-            .insert(Arc::new(Verified::new_unchecked_for_test(cached)));
+            .insert(Verified::new_unchecked_for_test(cached));
 
         let actions = state.on_execution_certificate(&topo, incoming.into());
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::VerifyExecutionCertificateSignature { .. }
+            Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
         ));
     }
 
@@ -8107,35 +8534,36 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let _fw_hash = tick.receipt_hash();
 
-        let first = state.admit_finalization(&topo, Arc::clone(&tick));
+        let first = state.admit_finalization(&topo, tick.clone());
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0], Action::VerifyFinalization { .. }));
+        assert!(matches!(
+            first[0],
+            Action::Execution(ExecutionAction::VerifyFinalization { .. })
+        ));
 
         let second = state.admit_finalization(&topo, tick);
         assert!(second.is_empty());
     }
 
     /// A `Finalization` already in the canonical store short-circuits
-    /// before any verify dispatch.
+    /// before any verify dispatch, and releases the fetch that carried it.
     #[test]
     fn admit_finalization_skips_when_already_finalized() {
         let topo = make_test_topology();
@@ -8146,14 +8574,14 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
+        );
         let raw_finalization = Finalization::new(
             tick_id,
             TickHalf::Determined,
@@ -8161,13 +8589,20 @@ mod tests {
             Capped::from_array([]),
         );
         let verifiable_finalization =
-            Arc::new(Verified::new_unchecked_for_test(raw_finalization.clone()).into());
+            Verified::new_unchecked_for_test(raw_finalization.clone()).into();
         // Seed the canonical store directly (mirrors what `finalize`
         // does on the local-aggregation path).
         state.finalized.insert(tick_id, verifiable_finalization);
 
-        let actions = state.admit_finalization(&topo, Arc::new(Verifiable::from(raw_finalization)));
-        assert!(actions.is_empty());
+        let receipt_hash = raw_finalization.receipt_hash();
+        let actions = state.admit_finalization(&topo, Verifiable::from(raw_finalization));
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::AbandonFetch(FetchIds::Finalizations(ids))] if ids == &[receipt_hash]
+            ),
+            "only the carrying fetch is released: {actions:?}"
+        );
     }
 
     /// A `Finalization` delivered by `admit_finalization` (the fetch
@@ -8182,23 +8617,21 @@ mod tests {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
 
         let tick_id = TickId::new(ShardId::leaf(1, 0), BlockHeight::new(1));
-        let bogus_ec = Arc::new(ExecutionCertificate::new(
+        let bogus_ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(1_000_000),
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             SignerBitfield::empty(), // no signers — far below 2f+1
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(bogus_ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(bogus_ec),
+            Capped::from_array([]),
+        )
+        .into();
         let fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
@@ -8258,9 +8691,10 @@ mod tests {
         state.on_committed_remote_header(&topo, proven);
         let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "must dispatch signature verification even when no local tracker matches"
         );
         // Nothing lands in the early-arrival buffer until verification passes.
@@ -8399,9 +8833,10 @@ mod tests {
         let public_keys = actions
             .iter()
             .find_map(|a| match a {
-                Action::VerifyExecutionCertificateSignature { public_keys, .. } => {
-                    Some(public_keys)
-                }
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature {
+                    public_keys,
+                    ..
+                }) => Some(public_keys),
                 _ => None,
             })
             .expect("on_execution_certificate dispatches a signature verification");
@@ -8435,7 +8870,7 @@ mod tests {
             BlockHeight::new(1),
             ED,
             ValidatorId::new(4),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         coord.commit_block_carrying(&schedule, &test_certify(block, ED), Naming::Composed);
         let tick_id = coord
@@ -8465,7 +8900,10 @@ mod tests {
         let committee = actions
             .iter()
             .find_map(|a| match a {
-                Action::AggregateExecutionCertificate { committee, .. } => Some(committee),
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate {
+                    committee,
+                    ..
+                }) => Some(committee),
                 _ => None,
             })
             .expect("vote quorum dispatches certificate aggregation");
@@ -8516,7 +8954,7 @@ mod tests {
             BlockHeight::new(1),
             1,
             ValidatorId::new(4),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         coord.commit_block_carrying(&schedule, &test_certify(block, 1), Naming::Composed);
         let tick_id = coord
@@ -8543,7 +8981,10 @@ mod tests {
         let committee = actions
             .iter()
             .find_map(|a| match a {
-                Action::AggregateExecutionCertificate { committee, .. } => Some(committee),
+                Action::Execution(ExecutionAction::AggregateExecutionCertificate {
+                    committee,
+                    ..
+                }) => Some(committee),
                 _ => None,
             })
             .expect("vote quorum dispatches certificate aggregation");
@@ -8577,18 +9018,20 @@ mod tests {
 
         let actions = coord.on_execution_certificate(&behind, Verifiable::from(cert));
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "an EC whose epoch the beacon hasn't reached must buffer, not dispatch",
         );
 
         let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
         let drained = coord.on_beacon_block_persisted(&caught_up).actions;
         assert!(
-            drained
-                .iter()
-                .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
+            drained.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyExecutionCertificateSignature { .. })
+            )),
             "draining on catch-up must dispatch the buffered EC's verification",
         );
     }
@@ -8610,39 +9053,39 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(5 * ED), // epoch 5, past the head
             GlobalReceiptRoot::ZERO,
             Capped::from_array([]),
             AggregateSignature::ZERO,
             signers,
-        ));
-        let tick: Arc<Verifiable<Finalization>> = Arc::new(
-            Finalization::new(
-                tick_id,
-                TickHalf::Determined,
-                Some(ec),
-                Capped::from_array([]),
-            )
-            .into(),
         );
+        let tick: Verifiable<Finalization> = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            Some(ec),
+            Capped::from_array([]),
+        )
+        .into();
         let _fw_hash = tick.receipt_hash();
 
-        let actions = coord.admit_finalization(&behind, Arc::clone(&tick));
+        let actions = coord.admit_finalization(&behind, tick);
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyFinalization { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyFinalization { .. })
+            )),
             "a finalization whose EC epoch the beacon hasn't reached must buffer, not dispatch",
         );
 
         let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
         let drained = coord.on_beacon_block_persisted(&caught_up).actions;
         assert!(
-            drained
-                .iter()
-                .any(|a| matches!(a, Action::VerifyFinalization { .. })),
+            drained.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::VerifyFinalization { .. })
+            )),
             "draining on catch-up must dispatch the buffered tick's verification",
         );
     }
@@ -8662,13 +9105,13 @@ mod tests {
     /// [`make_ready_local_tick`] at a chosen tick height.
     fn make_ready_local_tick_at(height: BlockHeight, tx_seeds: &[u8]) -> (TickId, TickState) {
         let tick_id = TickId::new(ShardId::ROOT, height);
-        let txs: Vec<(Arc<Verified<Transaction>>, BTreeSet<ShardId>)> = tx_seeds
+        let txs: Vec<(Verified<Transaction>, BTreeSet<ShardId>)> = tx_seeds
             .iter()
             .map(|s| {
                 let mut participating = BTreeSet::new();
                 participating.insert(ShardId::ROOT);
                 (
-                    Arc::new(Verified::new_unchecked_for_test(test_transaction(*s))),
+                    (Verified::new_unchecked_for_test(test_transaction(*s))),
                     participating,
                 )
             })
@@ -8699,14 +9142,14 @@ mod tests {
         // The tick votes, and the local EC over that vote lands; same
         // tick_id flips `local_ec_emitted` to true.
         let (anchor, root, tx_outcomes) = tick.build_vote_data().expect("every member came back");
-        let local_ec = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let local_ec = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             anchor,
             root,
             Capped::new(tx_outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )));
+        ));
         tick.add_execution_certificate(local_ec);
         assert!(
             tick.determined_ready(),
@@ -8757,9 +9200,8 @@ mod tests {
         }
         let hold = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
             let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
-            let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(
-                u8::try_from(height).unwrap(),
-            )));
+            let tx =
+                Verified::new_unchecked_for_test(test_transaction(u8::try_from(height).unwrap()));
             state.ticks.insert_tick(
                 tick_id,
                 tick_holding(
@@ -8779,6 +9221,7 @@ mod tests {
             );
             state.cross_a_bridge(
                 &schedule,
+                &head,
                 WeightedTimestamp::from_millis(parent_ms),
                 block.block(),
             )
@@ -8807,6 +9250,197 @@ mod tests {
         let (raised, dropped) = at(&mut state, 6, 21_100, 21_200);
         assert!(raised.is_empty() && dropped.is_empty());
         assert!(state.ticks.get_tick(&fresh).is_some());
+    }
+
+    /// A halt recovery of [`HOME`] across a reshape: [`PEER`] runs beside
+    /// it in epoch 2, where the halted tip anchors, and has split into
+    /// [`UPPER`] and [`LOWER`] by epoch 21, the window the fresh committee
+    /// was seated for (rotated at 20, bridge 21). That window prices at
+    /// `prices`.
+    fn halt_across_a_split(prices: PriceTable) -> TopologySchedule {
+        let recoveries = BTreeMap::from([(
+            HOME,
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
+                rotated_at: Epoch::new(20),
+                retained: Vec::new(),
+                attested_frontier: BlockHeight::new(1),
+            },
+        )]);
+        let bridged = Arc::new(
+            leaves_snap(&[HOME, UPPER, LOWER], &[])
+                .as_ref()
+                .clone()
+                .with_pending_recoveries(recoveries)
+                .with_prices(prices)
+                .with_seeds(seed_ring(EpochWindows::new(0, 1_000), 1..=21)),
+        );
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(2),
+            leaves_snap(&[HOME, PEER], &[]),
+        );
+        schedule.insert(Epoch::new(21), Arc::clone(&bridged));
+        schedule.set_head(Epoch::new(21), bridged);
+        schedule
+    }
+
+    /// Commit X2 of a halt recovery on [`HOME`] under `schedule`: the
+    /// crossing block, its committee anchor (the halted tip's, 2.5 s) in
+    /// epoch 2 below the bridge and its own anchor past it, certified by
+    /// a QC its fresh quorum signed under 21. It carries `tx`, which reads
+    /// a key [`UPPER`] holds, with the bundle [`UPPER`] sent for it, and
+    /// names it in its tick.
+    fn commit_crossing_block(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        tx: &Transaction,
+    ) -> CommitEffects {
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(3),
+            21_100,
+            ValidatorId::new(0),
+            vec![tx.clone()],
+        )
+        else {
+            unreachable!("a live block")
+        };
+        let bundle = Provision::dummy_at(
+            UPPER,
+            HOME,
+            BlockHeight::new(3),
+            WeightedTimestamp::from_millis(21_050),
+            tx.hash(),
+        );
+        let block = Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions: Arc::new(
+                Capped::new(vec![Verifiable::from(bundle)]).expect("one bundle fits"),
+            ),
+            abandonment_records,
+            state_claims,
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources,
+        };
+        let line = TickLine::Member {
+            staged: 0,
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            pins: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: genesis_charge(tx),
+            share: 0,
+            reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(tx),
+            crossings: Capped::empty(),
+            served_at: None,
+        };
+        state.commit_block(
+            schedule,
+            &naming(&certify_signed(block, 21_100, 21), vec![line]),
+            WeightedTimestamp::from_millis(2_500),
+        )
+    }
+
+    /// A transaction on [`HOME`] reading a key [`PEER`] held in epoch 2
+    /// and [`UPPER`] holds in epoch 21.
+    fn reading_across_the_split() -> Transaction {
+        test_transaction_with_prefixes(&[0x11], &[test_prefix(0x91)], &[test_prefix(0x11)])
+    }
+
+    /// The first Members block after a halt recovery runs its tick under
+    /// the committee its QC signed. Its committee anchor lies below the
+    /// bridge, where [`PEER`] still owns the key the member reads; the
+    /// fresh committee validated it under the window it was seated in,
+    /// where [`UPPER`] does, and [`UPPER`]'s bundle is in hand. Classified
+    /// under the raw window the member waits on a shard that no longer
+    /// exists, the tick is held, and serial dispatch wedges behind it on
+    /// every replica.
+    #[test]
+    fn a_members_block_after_a_halt_dispatches_under_the_bridge() {
+        let schedule = halt_across_a_split(PriceTable::GENESIS);
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tx = reading_across_the_split();
+
+        let effects = commit_crossing_block(&mut state, &schedule, &tx);
+
+        let tick = TickId::new(HOME, BlockHeight::new(3));
+        assert_eq!(state.ticks.tick_assignment(tx.hash()), Some(tick));
+        assert!(!state.held.contains_key(&tick), "the tick is not held");
+        assert!(
+            matches!(state.pending_ticks.front(), Some(Queued::Run(_)))
+                || effects.actions.iter().any(|action| matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
+            "the tick runs: {:?}",
+            effects.actions,
+        );
+    }
+
+    /// The figures the ledger owes for a transaction the crossing block
+    /// committed are the ones admission judged: priced under the table of
+    /// the window its QC signed, not under the one its committee anchor
+    /// dates, which prices every epoch differently.
+    #[test]
+    fn a_members_block_after_a_halt_prices_under_the_bridge() {
+        let dear = PriceTable {
+            compute: 1_000 * PriceTable::GENESIS.compute,
+            read_bytes: 1_000 * PriceTable::GENESIS.read_bytes,
+            write_bytes: 1_000 * PriceTable::GENESIS.write_bytes,
+            footprint: 1_000 * PriceTable::GENESIS.footprint,
+            retention: 1_000 * PriceTable::GENESIS.retention,
+        };
+        let schedule = halt_across_a_split(dear);
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tx = reading_across_the_split();
+
+        let _ = commit_crossing_block(&mut state, &schedule, &tx);
+
+        let window = schedule
+            .signed_committee(HOME, Epoch::new(21))
+            .committee()
+            .expect("the fixture holds 21");
+        let classified = Classified::freeze(
+            tx.legs(),
+            tx.fee_payer(),
+            tx.accounts(),
+            window.snapshot.shard_trie(),
+        );
+        let admitted = classified.local_price(&tx, HOME, &dear);
+        let raw = Classified::freeze(
+            tx.legs(),
+            tx.fee_payer(),
+            tx.accounts(),
+            leaves_snap(&[HOME, PEER], &[]).shard_trie(),
+        )
+        .local_price(&tx, HOME, &PriceTable::GENESIS);
+        assert_ne!(admitted, raw, "the two windows price it differently");
+        let owed = state
+            .counterparts
+            .ledger
+            .past_deadline(Deadline::of_transaction(&tx).at());
+        let figures = owed
+            .iter()
+            .find(|entry| entry.tx_hash == tx.hash())
+            .expect("the ledger owes the transaction");
+        assert_eq!(figures.charged, admitted);
+        assert_eq!(figures.committed.committee_epoch, Epoch::new(21));
     }
 
     /// A two-committee schedule for one shard under a halt recovery: the
@@ -8853,7 +9487,7 @@ mod tests {
         let mut schedule =
             TopologySchedule::new(EpochWindows::new(0, 1_000), Epoch::new(2), snap(&old));
         schedule.insert(Epoch::new(21), Arc::clone(&fresh_snap));
-        schedule.set_head(fresh_snap);
+        schedule.set_head(Epoch::new(21), fresh_snap);
         (schedule, old, fresh)
     }
 
@@ -8867,8 +9501,9 @@ mod tests {
     ) -> TickId {
         let tx = test_transaction(u8::try_from(height.inner()).unwrap());
         let tx_hash = tx.hash();
-        let block = make_live_block(height, anchor_ms, ValidatorId::new(0), vec![Arc::new(tx)]);
-        state.commit_block_carrying(schedule, &test_certify(block, anchor_ms), Naming::Composed);
+        let block = make_live_block(height, anchor_ms, ValidatorId::new(0), vec![tx]);
+        let certified = certify_on(state, schedule, block, anchor_ms);
+        state.commit_block_carrying(schedule, &certified, Naming::Composed);
         let tick_id = state
             .ticks
             .tick_assignment(tx_hash)
@@ -8901,9 +9536,10 @@ mod tests {
                 ready_tick_at(&mut state, &schedule, height, anchor_ms);
                 let actions = state.emit_vote_actions(&schedule);
                 assert!(
-                    !actions
-                        .iter()
-                        .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
+                    !actions.iter().any(|action| matches!(
+                        action,
+                        Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+                    )),
                     "{me:?} signs the tick at {height:?}: {actions:?}",
                 );
             }
@@ -8926,21 +9562,24 @@ mod tests {
                     BlockHeight::new(1),
                     1000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![tx],
                 )),
                 Naming::Composed,
             )
             .actions;
-        let Some(Action::ExecuteTransactions {
+        let Some(Action::Execution(ExecutionAction::ExecuteTransactions {
             tick,
             tick_ts,
             env,
             requests,
             included,
             ..
-        }) = actions
-            .into_iter()
-            .find(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        })) = actions.into_iter().find(|action| {
+            matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )
+        })
         else {
             panic!("a tick running code this node holds must dispatch");
         };
@@ -8949,9 +9588,10 @@ mod tests {
             state.on_execution_batch_unavailable(tick, tick_ts, env, requests, included, package);
         let written = state.on_block_persisted(&bridged, BlockHeight::new(1));
         assert!(
-            !written
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !written.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "a write dispatches a tick below the bridge again: {written:?}",
         );
         let again = state
@@ -8969,7 +9609,7 @@ mod tests {
         assert!(
             !again.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { tick: dispatched, .. } if *dispatched == tick
+                Action::Execution(ExecutionAction::ExecuteTransactions { tick: dispatched, .. }) if *dispatched == tick
             )),
             "a tick below the bridge is dispatched again: {again:?}",
         );
@@ -9001,15 +9641,16 @@ mod tests {
                     BlockHeight::new(2),
                     2000,
                     ValidatorId::new(0),
-                    vec![Arc::new(test_transaction_running(1, &[package]))],
+                    vec![(test_transaction_running(1, &[package]))],
                 )),
                 Naming::Composed,
             )
             .actions;
         assert!(
-            !queued
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !queued.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "tick 2 waits for height 1 to be written: {queued:?}",
         );
         let ran = state.on_block_persisted(
@@ -9017,8 +9658,10 @@ mod tests {
             BlockHeight::new(1),
         );
         assert!(
-            !ran.iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !ran.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "a write after the fold dispatches a tick below the bridge: {ran:?}",
         );
     }
@@ -9036,11 +9679,11 @@ mod tests {
             .revote_stalled_ticks(schedule)
             .iter()
             .filter_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     tick_id: voted,
                     vote_anchor_ts,
                     ..
-                } if *voted == tick_id => Some(vote_anchor_ts.as_millis()),
+                }) if *voted == tick_id => Some(vote_anchor_ts.as_millis()),
                 _ => None,
             })
             .collect()
@@ -9123,7 +9766,7 @@ mod tests {
         outcome: ExecutionOutcome,
     ) -> (TickId, GlobalReceiptRoot, Vec<TxOutcome>) {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(7)));
+        let tx = Verified::new_unchecked_for_test(test_transaction(7));
         let tx_hash = tx.hash();
         let mut tick = tick_holding(
             tick_id,
@@ -9148,15 +9791,15 @@ mod tests {
         anchor_ms: u64,
         root: GlobalReceiptRoot,
         outcomes: Vec<TxOutcome>,
-    ) -> Arc<Verified<ExecutionCertificate>> {
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+    ) -> Verified<ExecutionCertificate> {
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(anchor_ms),
             root,
             Capped::new(outcomes).expect("one outcome"),
             AggregateSignature::ZERO,
             quorum_signers(),
-        )))
+        ))
     }
 
     /// A tick owing nothing but its stating half re-signs its vote at
@@ -9252,12 +9895,15 @@ mod tests {
         }
         // The same windows before this replica folded the recovery.
         let mut unfolded = schedule.clone();
-        unfolded.set_head(Arc::new(
-            (**schedule.head())
-                .clone()
-                .with_pending_recoveries(BTreeMap::new())
-                .with_recoveries(BTreeMap::new()),
-        ));
+        unfolded.set_head(
+            Epoch::new(21),
+            Arc::new(
+                (**schedule.head())
+                    .clone()
+                    .with_pending_recoveries(BTreeMap::new())
+                    .with_recoveries(BTreeMap::new()),
+            ),
+        );
         for me in [old[0], fresh[0]] {
             for (height, anchor_ms) in [(frontier.next(), 2_500), (frontier, 2_400)] {
                 let mut seated = make_test_state_for(me);
@@ -9346,11 +9992,11 @@ mod tests {
             .emit_vote_actions(&schedule)
             .into_iter()
             .find_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     global_receipt_root,
                     tx_outcomes,
                     ..
-                } => Some((global_receipt_root, tx_outcomes)),
+                }) => Some((global_receipt_root, tx_outcomes)),
                 _ => None,
             })
             .expect("the tick casts its own vote");
@@ -9366,14 +10012,14 @@ mod tests {
             for signer in 0..3 {
                 signers.set(signer);
             }
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            Verified::new_unchecked_for_test(ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::from_millis(anchor_ms),
                 global_receipt_root,
                 Capped::new(tx_outcomes.clone()).expect("one outcome"),
                 AggregateSignature::ZERO,
                 signers,
-            )))
+            ))
         };
         let local_anchor = |state: &ExecutionCoordinator| {
             let held = state.finalized.of_tick(&tick_id);
@@ -9404,9 +10050,10 @@ mod tests {
         );
         let answered = state.on_execution_vote(&schedule, revote.into());
         assert!(
-            !answered
-                .iter()
-                .any(|a| matches!(a, Action::BroadcastExecutionCertificate { .. })),
+            !answered.iter().any(|a| matches!(
+                a,
+                Action::Execution(ExecutionAction::BroadcastExecutionCertificate { .. })
+            )),
             "a re-attestation is not answered with the lapsing certificate: {answered:?}",
         );
         assert_eq!(
@@ -9445,7 +10092,7 @@ mod tests {
     fn the_fold_offers_every_half_it_holds() {
         let mut state = make_test_state();
         let owed_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let owed_tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(7)));
+        let owed_tx = Verified::new_unchecked_for_test(test_transaction(7));
         // Executed, its certificate still owed.
         state.ticks.insert_tick(
             owed_id,
@@ -9556,20 +10203,45 @@ mod tests {
 
     /// An empty block at `height` whose parent QC carries `anchor_ms` — the
     /// block's own position on the weighted-time grid.
-    /// Commit-time classification resolves against the window the block's
-    /// *parent* anchored in, because that is where a block's committee comes
-    /// from — so it matches the snapshot the proposer built under and the
-    /// verifier validated against. Reading the block's own anchor instead
-    /// straddles an epoch cut once per window, and a reshape cut there
-    /// changes the shard set `compute_ticks` routes over.
-    #[test]
-    fn classification_anchors_on_the_parents_window_across_commits() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
-        let topo = make_test_topology();
+    /// A one-shard window at epoch 0 and a two-shard one at epoch 1, the
+    /// head, over one validator set.
+    fn one_then_two_shards() -> TopologySchedule {
+        windows_of(2)
+    }
 
-        // `certify` stamps the block's parent-QC weighted timestamp, which is
-        // the block's own anchor.
-        let commit = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
+    /// A one-shard window at epoch 0 and a `later`-shard one at epoch 1,
+    /// the head, over one validator set.
+    fn windows_of(later: u64) -> TopologySchedule {
+        let validators: Vec<ValidatorInfo> = (0..4u64)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let snapshot = |shards| {
+            Arc::new(TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                shards,
+                ValidatorSet::new(validators.clone()),
+            ))
+        };
+        let mut sched =
+            TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(0), snapshot(1));
+        sched.insert(Epoch::new(1), snapshot(later));
+        sched.set_head(Epoch::new(1), snapshot(later));
+        sched
+    }
+
+    /// Commit-time classification resolves the window the block's QC
+    /// signed — the window honest voters validated its content under —
+    /// whatever either of the block's anchors dates. A block anchored in
+    /// one window can be certified by a committee seated for another: a
+    /// halt recovery's crossing block, or the first block past a cut.
+    #[test]
+    fn classification_reads_the_window_its_qc_signed() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let sched = windows_of(1);
+        let commit = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64, epoch| {
             let block = make_live_block_on_shard(
                 ShardId::ROOT,
                 BlockHeight::new(height),
@@ -9578,93 +10250,102 @@ mod tests {
                 vec![],
             );
             let _ = state.commit_block_carrying(
-                &topo,
-                &test_certify(block, anchor_ms),
+                &sched,
+                &certify_signed(block, anchor_ms, epoch),
                 Naming::Composed,
             );
         };
+        let probes_under = |state: &ExecutionCoordinator, epoch: u64| {
+            let window = sched
+                .signed_committee(ShardId::ROOT, Epoch::new(epoch))
+                .committee()
+                .expect("both windows are held");
+            state
+                .counterpart_trie(&sched)
+                .is_some_and(|trie| std::ptr::eq(trie, window.snapshot.shard_trie()))
+        };
 
-        commit(&mut state, 1, 500);
-        commit(&mut state, 2, 1_500);
+        commit(&mut state, 1, 500, 1);
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(1)));
+        assert!(probes_under(&state, 1), "anchored in epoch 0, signed in 1");
 
-        assert_eq!(
-            state.committed_committee_anchor_wt,
-            WeightedTimestamp::from_millis(500),
-            "the second block is classified in the window its parent anchored in",
-        );
+        commit(&mut state, 2, 1_700, 0);
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(0)));
+        assert!(probes_under(&state, 0), "anchored in epoch 1, signed in 0");
         assert_eq!(
             state.committed_ts,
-            WeightedTimestamp::from_millis(1_500),
+            WeightedTimestamp::from_millis(1_700),
             "its own anchor still drives the deterministic clock",
         );
     }
 
-    /// A root chain's first blocks genuinely anchor at zero, and that zero
-    /// is a carriable parent anchor, not an uninitialized clock: the second
-    /// commit classifies in the window its parent anchored (epoch 0) even
-    /// when the chain stalled long enough at genesis for the block to date
-    /// itself past a cut.
+    /// A restarted replica probes under the window its recovered tip's
+    /// stored QC signed, and its first commit reseats that from the
+    /// commit's own QC.
     #[test]
-    fn a_zero_anchor_at_genesis_is_carried_not_treated_as_a_gap() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
-        let topo = make_test_topology();
-
-        let commit = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
-            let block = make_live_block_on_shard(
+    fn a_restart_seeds_the_window_its_tips_qc_signed() {
+        let sched = windows_of(1);
+        let tip = certify_signed(
+            make_live_block_on_shard(
                 ShardId::ROOT,
-                BlockHeight::new(height),
-                anchor_ms,
+                BlockHeight::new(5),
+                900,
                 ValidatorId::new(0),
                 vec![],
-            );
-            let _ = state.commit_block_carrying(
-                &topo,
-                &test_certify(block, anchor_ms),
-                Naming::Composed,
-            );
-        };
-
-        // Block 1 anchors at genesis zero; block 2 dates itself far past it.
-        commit(&mut state, 1, 0);
-        commit(&mut state, 2, 1_500);
-
-        assert_eq!(
-            state.committed_committee_anchor_wt,
-            WeightedTimestamp::ZERO,
-            "block 2's committee anchors on block 1, at genesis zero",
+            ),
+            900,
+            0,
         );
-    }
+        let (_, unsigned) = tip.into_parts();
+        let unsigned = unsigned.as_unverified();
+        let mut signers = SignerBitfield::new(4);
+        for index in 0..3 {
+            signers.set(index);
+        }
+        let tip_qc = QuorumCertificate::new(
+            unsigned.block_hash(),
+            unsigned.shard_id(),
+            unsigned.height(),
+            unsigned.parent_block_hash(),
+            unsigned.round(),
+            unsigned.committee_epoch(),
+            signers,
+            unsigned.aggregated_signature(),
+            unsigned.weighted_timestamp(),
+        );
+        let restarted = |recovered: &RecoveredState| {
+            ExecutionCoordinator::with_shared_stores(
+                ShardId::ROOT,
+                Arc::new(TestCode::default()),
+                Arc::new(CrossingIndexSlot::default()),
+                recovered,
+                Arc::new(ExecCertStore::new()),
+                Arc::new(FinalizationStore::new()),
+                Arc::new(ProvenAnchors::new()),
+                Arc::new(CounterpartMirror::new()),
+                BlockHeight::GENESIS,
+            )
+            .signed_by(ValidatorId::new(0))
+        };
+        let snapped = restarted(&RecoveredState {
+            committed_height: BlockHeight::new(5),
+            committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
+            anchor_qc: Some(tip_qc.clone()),
+            ..RecoveredState::default()
+        });
+        assert_eq!(
+            snapped.committed_committee_epoch, None,
+            "a snap-seated tip's anchor QC, unverified, seeds no window",
+        );
+        let mut state = restarted(&RecoveredState {
+            committed_height: BlockHeight::new(5),
+            committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
+            committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(800)),
+            latest_qc: Some(Verified::new_unchecked_for_test(tip_qc)),
+            ..RecoveredState::default()
+        });
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(0)));
 
-    /// A restarted replica's first commit classifies exactly like a
-    /// non-restarted peer's: the frontier seeded from the recovered tip is
-    /// the parent anchor the carry needs, so the commit extending the tip
-    /// resolves the window the tip anchored — not the one the new block
-    /// opens, which a zero frontier's gap fallback would pick and which a
-    /// reshape cut between the two turns into a vote-splitting divergence.
-    #[test]
-    fn a_seeded_frontier_carries_the_recovered_anchor_across_a_restart() {
-        let topo = make_test_topology();
-        // The recovered tip: height 5, its own anchor at 900 ms.
-        let mut state = ExecutionCoordinator::with_shared_stores(
-            ShardId::ROOT,
-            Arc::new(TestCode::default()),
-            Arc::new(CrossingIndexSlot::default()),
-            &RecoveredState {
-                committed_height: BlockHeight::new(5),
-                committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
-                committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(800)),
-                ..RecoveredState::default()
-            },
-            Arc::new(ExecCertStore::new()),
-            Arc::new(FinalizationStore::new()),
-            Arc::new(ProvenAnchors::new()),
-            Arc::new(CounterpartMirror::new()),
-            BlockHeight::GENESIS,
-        )
-        .signed_by(ValidatorId::new(0));
-
-        // The first post-restart commit extends the tip and dates itself
-        // past it.
         let block = make_live_block_on_shard(
             ShardId::ROOT,
             BlockHeight::new(6),
@@ -9672,22 +10353,169 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
-        let _ = state.commit_block_carrying(&topo, &test_certify(block, 1_100), Naming::Composed);
+        let _ =
+            state.commit_block_carrying(&sched, &certify_signed(block, 1_100, 1), Naming::Composed);
 
-        assert_eq!(
-            state.committed_committee_anchor_wt,
-            WeightedTimestamp::from_millis(900),
-            "the commit extending the recovered tip is classified in the tip's window",
-        );
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(1)));
         assert_eq!(state.committed_ts, WeightedTimestamp::from_millis(1_100));
     }
 
-    /// Commit-time tick/provision classification anchors on the block's
-    /// committee — not the `ArcSwap` head, so every replica groups a block's
-    /// transactions identically across a reshape boundary (matching the
-    /// proposer and the verifier).
-    /// A commit whose committee anchor lies in a window this node's
-    /// beacon has not committed is parked, not classified under the head:
+    /// A chain's genesis block, which no quorum signed, folds under the
+    /// window its origin anchors and leaves the tip stating no signed
+    /// epoch, as the shard's genesis and a restart's recovered state do.
+    #[test]
+    fn a_committed_genesis_states_no_signed_epoch() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let sched = windows_of(1);
+        let signed = certify_signed(
+            make_live_block_on_shard(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                1_100,
+                ValidatorId::new(0),
+                vec![],
+            ),
+            1_100,
+            1,
+        );
+        let _ =
+            state.commit_block_composing(&sched, &signed, WeightedTimestamp::from_millis(1_100));
+        assert_eq!(state.committed_committee_epoch, Some(Epoch::new(1)));
+
+        let origin = ChainOrigin {
+            genesis_height: BlockHeight::new(5),
+            anchor_wt: WeightedTimestamp::from_millis(1_500),
+        };
+        let mut genesis = make_live_block_on_shard(
+            ShardId::ROOT,
+            origin.genesis_height,
+            1_500,
+            ValidatorId::new(0),
+            vec![],
+        );
+        if let Block::Live { header, .. } = &mut genesis {
+            *header = BlockHeader::new(BlockHeaderParts {
+                shard_id: ShardId::ROOT,
+                height: origin.genesis_height,
+                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, origin).into(),
+                ..Default::default()
+            });
+        }
+        assert!(genesis.is_genesis());
+        let genesis = Verified::<CertifiedBlock>::genesis_certified(genesis);
+        let _ = state.commit_block_composing(&sched, &genesis, origin.anchor_wt);
+        assert_eq!(state.committed_height, origin.genesis_height);
+        assert_eq!(state.committed_committee_epoch, None);
+    }
+
+    /// A commit whose signed window the schedule has evicted parks the
+    /// fold: it folds under no other window, composes nothing, and
+    /// every later commit queues behind it, though its own anchor's
+    /// window is held.
+    #[test]
+    fn an_evicted_signed_window_parks_the_fold() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let mut sched = windows_of(1);
+        sched.evict_below(Epoch::new(1));
+        let block_at = |height: u64, epoch: u64, seed: u8| {
+            certify_signed(
+                make_live_block_on_shard(
+                    ShardId::ROOT,
+                    BlockHeight::new(height),
+                    1_500,
+                    ValidatorId::new(0),
+                    vec![test_transaction(seed)],
+                ),
+                1_500,
+                epoch,
+            )
+        };
+        let evicted = block_at(1, 0, 1);
+        assert!(
+            sched
+                .resolve_for_shard(ShardId::ROOT, WeightedTimestamp::from_millis(1_500))
+                .committee()
+                .is_some(),
+            "the block's own anchor's window is held",
+        );
+        assert!(matches!(
+            state.certified_committee(&sched, &evicted),
+            BlockResolution::Evicted
+        ));
+
+        let parked =
+            state.commit_block_composing(&sched, &evicted, WeightedTimestamp::from_millis(500));
+        let behind = state.commit_block_composing(
+            &sched,
+            &block_at(2, 1, 2),
+            WeightedTimestamp::from_millis(1_500),
+        );
+        assert!(parked.actions.is_empty() && behind.actions.is_empty());
+        assert_eq!(
+            state.committed_height,
+            BlockHeight::GENESIS,
+            "the fold parks"
+        );
+        assert!(tick_members(&state, 1).is_empty() && tick_members(&state, 2).is_empty());
+        assert_eq!(
+            state.awaiting_window.len(),
+            2,
+            "the later commit queues behind"
+        );
+    }
+
+    /// A park on an evicted window shows on the gauges and holds at most
+    /// [`MAX_AWAITING_EVICTED`] commits. Past that the fold drops them
+    /// and every commit after, even once the schedule holds the window
+    /// again, since a fold resumed over the gap would skip what it
+    /// dropped.
+    #[test]
+    fn a_park_on_an_evicted_window_is_bounded_and_reported() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let mut sched = windows_of(1);
+        sched.evict_below(Epoch::new(1));
+        let block_at = |height: u64, epoch: u64| {
+            certify_signed(
+                make_live_block_on_shard(
+                    ShardId::ROOT,
+                    BlockHeight::new(height),
+                    1_500,
+                    ValidatorId::new(0),
+                    vec![],
+                ),
+                1_500,
+                epoch,
+            )
+        };
+        let anchor = WeightedTimestamp::from_millis(1_500);
+        assert_eq!(state.memory_stats().parked_fold, 0);
+
+        let _ = state.commit_block_composing(&sched, &block_at(1, 0), anchor);
+        assert_eq!(state.memory_stats().parked_fold, 1, "the park is reported");
+        let cap = MAX_AWAITING_EVICTED as u64;
+        for height in 2..=cap {
+            let _ = state.commit_block_composing(&sched, &block_at(height, 1), anchor);
+        }
+        let full = state.memory_stats();
+        assert_eq!(full.awaiting_window, MAX_AWAITING_EVICTED);
+        assert_eq!(full.parked_fold, 1);
+
+        let _ = state.commit_block_composing(&sched, &block_at(cap + 1, 1), anchor);
+        let dropped = state.memory_stats();
+        assert_eq!(
+            dropped.awaiting_window, 0,
+            "the queue is dropped at its cap"
+        );
+        assert_eq!(dropped.parked_fold, 1, "and the fold stays reported");
+
+        let held = windows_of(1);
+        let _ = state.commit_block_composing(&held, &block_at(cap + 2, 1), anchor);
+        assert_eq!(state.committed_height, BlockHeight::GENESIS);
+        assert_eq!(state.memory_stats().awaiting_window, 0);
+    }
+
+    /// A commit whose signed window this node's beacon has not committed
+    /// is parked, not classified under the head:
     /// the frontier holds, and a later commit queues behind it. Once the
     /// beacon commits the window, both fold in order under it, as on a
     /// replica that held the window all along.
@@ -9715,10 +10543,10 @@ mod tests {
             Epoch::new(0),
             Arc::clone(&one_shard),
         );
-        sched.set_head(two_shards);
+        sched.set_head(Epoch::new(0), two_shards);
 
         let block_at = |height: u64, anchor_ms: u64| {
-            test_certify(
+            certify_signed(
                 make_live_block_on_shard(
                     ShardId::ROOT,
                     BlockHeight::new(height),
@@ -9727,6 +10555,7 @@ mod tests {
                     vec![],
                 ),
                 anchor_ms,
+                1,
             )
         };
         let first = block_at(1, 1_500);
@@ -9751,124 +10580,919 @@ mod tests {
     }
 
     #[test]
-    fn classification_committee_anchors_at_the_block_window_not_the_head() {
+    fn classification_resolves_the_signed_window_not_the_head() {
         let state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
-        // Epoch 0 carries ROOT (one shard) — the block's anchor; epoch 1
-        // splits it (two shards) and is installed as the flipped head.
-        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
-        let validators: Vec<ValidatorInfo> = keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| ValidatorInfo {
-                validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
-            })
-            .collect();
-        let pre_split = Arc::new(TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            1,
-            ValidatorSet::new(validators.clone()),
-        ));
-        let post_split = Arc::new(TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            2,
-            ValidatorSet::new(validators),
-        ));
-        let mut sched = TopologySchedule::new(
-            EpochWindows::new(0, 1000),
-            Epoch::new(0),
-            Arc::clone(&pre_split),
+        // Epoch 0 carries ROOT (one shard); epoch 1 splits it (two shards)
+        // and is installed as the flipped head.
+        let sched = one_then_two_shards();
+        let certified = certify_signed(
+            make_live_block_on_shard(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                500,
+                ValidatorId::new(0),
+                vec![],
+            ),
+            500,
+            0,
         );
-        sched.insert(Epoch::new(1), Arc::clone(&post_split));
-        sched.set_head(post_split);
-
-        let at = WeightedTimestamp::from_millis(500);
-        let anchored = state
-            .anchored_committee(&sched, at, at)
+        let committee = state
+            .certified_committee(&sched, &certified)
+            .committee()
             .expect("the fixture holds the window");
         assert_eq!(
-            anchored.num_shards(),
+            committee.snapshot.num_shards(),
             1,
-            "classification anchors at the block's window (ROOT, one shard), not the two-shard head",
+            "classification reads the signed window (ROOT, one shard), not the two-shard head",
         );
     }
 
-    /// The seed window a tick executes under is the one its block's
-    /// committee carried, not the one this node's head has folded to.
-    ///
-    /// A head advances as a node folds the beacon and every node folds
-    /// at its own pace, so a window read off the head would answer
-    /// `Pending` on a laggard where it answers `Ready` on a leader —
-    /// one tick, two receipt roots. The block fixes it, on the same
-    /// terms as the clock beside it.
+    /// Two replicas of one shard commit one block in window `E`: one
+    /// still holds the projection of `E` the fold of `E - 1` published,
+    /// the other the frozen copy the fold of `E` replaced it with. Both
+    /// copies carry the ring as their fold left it, one seed apart at
+    /// either end, and the tick must open every seal alike on both.
     #[test]
-    fn a_tick_executes_under_its_blocks_seed_window_not_the_head() {
+    fn replicas_on_either_copy_of_a_window_open_a_seal_alike() {
+        const ED: u64 = 300_000;
+        const E: u64 = 70;
+
+        let windows = EpochWindows::new(0, ED);
+        let folded_through = |newest: u64| seeded_snapshot(windows, 1..=newest);
+        // Adopted beacon `E - 1`: window `E` is the lookahead copy.
+        let mut lookahead =
+            TopologySchedule::new(windows, Epoch::new(E - 1), folded_through(E - 1));
+        lookahead.insert_lookahead(Epoch::new(E), folded_through(E - 1));
+        // Adopted beacon `E` as well: the fold replaced it.
+        let mut frozen = lookahead.clone();
+        frozen.set_head(Epoch::new(E), folded_through(E));
+        frozen.insert(Epoch::new(E), folded_through(E));
+        let tx = stub_transaction_with_reads(
+            PrincipalAddr::new([1; 31]),
+            &[test_prefix(1)],
+            &[test_prefix(11)],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::from_millis(E * ED - 60_000),
+                WeightedTimestamp::from_millis(E * ED + 60_000),
+            ),
+        );
+
+        let window_on = |sched: &TopologySchedule| {
+            let mut state = make_test_state();
+            let block = make_live_block(
+                BlockHeight::new(1),
+                E * ED + 500,
+                ValidatorId::new(0),
+                vec![tx.clone()],
+            );
+            let (env, requests) = state
+                .commit_block_carrying(sched, &certify_signed(block, E * ED, E), Naming::Composed)
+                .actions
+                .into_iter()
+                .find_map(|action| match action {
+                    Action::Execution(ExecutionAction::ExecuteTransactions {
+                        env,
+                        requests,
+                        ..
+                    }) => Some((env, requests)),
+                    _ => None,
+                })
+                .expect("the commit dispatches its tick");
+            // The grid is the schedule's own window length, which is
+            // what the schedule is indexed by — not a default a snapshot
+            // that nobody projected would have answered with.
+            assert_eq!(env.windows, windows);
+            let clock = requests[0].clock;
+            assert_eq!(windows.epoch_for(clock), Epoch::new(E));
+            let window = env
+                .seed_window_for(clock)
+                .expect("the tick dispatched, so it holds the window");
+            (env.seeds, window)
+        };
+        let ((behind_ring, behind), (ahead_ring, ahead)) =
+            (window_on(&lookahead), window_on(&frozen));
+
+        // The ring's old edge: the copy one fold behind still holds the
+        // seed the newer copy dropped.
+        let edge = E - 1 - SeedRing::retained_epochs(windows);
+        assert!(behind_ring.get(Epoch::new(edge)).is_some());
+        assert_eq!(ahead_ring.get(Epoch::new(edge)), None);
+
+        // A seal written in `E - 2` matures into `E`; one written in
+        // `E - 67` matured into `E - 65`, below the window either ring
+        // gives, and one matured into the ring's old edge reads alike too.
+        for matures in [edge, E - 65, E - SEED_WINDOW_EPOCHS, E - 1, E] {
+            assert_eq!(
+                behind.at(matures),
+                ahead.at(matures),
+                "one tick, two answers for a seal maturing into epoch {matures}",
+            );
+        }
+        assert_eq!(behind.at(E), Drawn::Pending, "its own epoch is ahead");
+        assert_eq!(behind.at(E - 1), Drawn::Ready([69; 32]));
+        assert_eq!(behind.at(E - SEED_WINDOW_EPOCHS), Drawn::Ready([6; 32]));
+        assert_eq!(behind.at(E - 65), Drawn::Expired);
+        assert_eq!(behind.at(edge), Drawn::Expired);
+    }
+
+    /// A whole member whose remote payer committed it in a later window
+    /// than this shard's tick runs in draws on seeds past that window's
+    /// ring. The tick waits for the beacon to fold them, then dispatches
+    /// on the fold, under the window of the member's own clock.
+    #[test]
+    fn a_tick_clocked_past_its_ring_waits_for_the_fold() {
         const ED: u64 = 1_000;
+        const T: u64 = 70;
+
+        let windows = EpochWindows::new(0, ED);
+        let mut sched = TopologySchedule::new(
+            windows,
+            Epoch::new(T - 1),
+            seeded_snapshot(windows, 1..=T - 1),
+        );
+        sched.insert_lookahead(Epoch::new(T), seeded_snapshot(windows, 1..=T - 1));
+        let clock = WeightedTimestamp::from_millis((T + 1) * ED);
+        let tick = queued_tick(&sched, T, 1, &test_transaction(1), clock);
+        assert_eq!(
+            tick.awaiting.as_ref().map(|awaited| awaited.epochs.clone()),
+            Some(BTreeSet::from([Epoch::new(T + 1)])),
+            "window {} is past every window the schedule holds",
+            T + 1
+        );
 
         let mut state = make_test_state();
-        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
-        let validators: Vec<ValidatorInfo> = keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| ValidatorInfo {
-                validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
-            })
-            .collect();
-        let seeded = |byte: u8| {
-            let mut ring = SeedRing::default();
-            ring.record(
-                Epoch::GENESIS,
-                EpochSeed {
-                    randomness: Randomness::new([byte; 32]),
-                    source: SeedSource::Reveals,
-                },
-            );
-            Arc::new(
-                TopologySnapshot::new(
-                    NetworkDefinition::simulator(),
-                    1,
-                    ValidatorSet::new(validators.clone()),
-                )
-                .with_seeds(ring),
-            )
-        };
-        // One window, two snapshots of it: what the block's committee
-        // carried, and what a node further along the fold holds.
-        let mut sched =
-            TopologySchedule::new(EpochWindows::new(0, ED), Epoch::GENESIS, seeded(0xA1));
-        sched.set_head(seeded(0xB2));
-
-        let block = make_live_block(
-            BlockHeight::new(1),
-            500,
-            ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+        state.pending_ticks.push_back(Queued::Run(tick));
+        assert!(
+            state.dispatch_next_tick(&sched).is_empty(),
+            "seed {T} is the clock's frontier and nothing here has folded it"
         );
-        let actions = state
-            .commit_block_carrying(&sched, &certify(block), Naming::Composed)
-            .actions;
-        let env = actions
+
+        // The beacon folds `T`, publishing `T + 1`'s projection.
+        sched.insert(Epoch::new(T), seeded_snapshot(windows, 1..=T));
+        sched.insert_lookahead(Epoch::new(T + 1), seeded_snapshot(windows, 1..=T));
+        let dispatched = state.on_beacon_block_persisted(&sched).actions;
+        let env = dispatched
             .iter()
             .find_map(|action| match action {
-                Action::ExecuteTransactions { env, .. } => Some(env),
+                Action::Execution(ExecutionAction::ExecuteTransactions { env, .. }) => Some(env),
                 _ => None,
             })
-            .expect("the commit dispatches its tick");
+            .expect("the fold dispatches the tick");
+        assert_eq!(
+            env.seed_window_for(clock),
+            seeded_snapshot(windows, 1..=T + 1)
+                .seeds()
+                .window_for(Epoch::new(T + 1)),
+        );
+    }
 
-        assert_eq!(
-            env.seeds.at(Epoch::GENESIS.inner()),
-            Drawn::Ready([0xA1; 32]),
-            "the tick reads the seed its block's committee carried",
+    /// A schedule holding window `A` with the ring folded through it,
+    /// and window `C` whose ring keeps only its last few epochs, for a
+    /// block anchored in `A` whose QC `C`'s committee signs. A unit shape
+    /// production does not reach: a block's committee is never past its
+    /// anchor but on a halt recovery's coast, whose ticks never dispatch.
+    /// It stands in for any member whose window the committee's ring
+    /// cannot reach.
+    fn bridged_seed_schedule(windows: EpochWindows, a: u64, c: u64) -> TopologySchedule {
+        let mut sched =
+            TopologySchedule::new(windows, Epoch::new(a), seeded_snapshot(windows, 1..=a - 1));
+        sched.insert(Epoch::new(a), seeded_snapshot(windows, 1..=a));
+        sched.insert(Epoch::new(c), seeded_snapshot(windows, c - 4..=c));
+        sched.set_head(Epoch::new(c), seeded_snapshot(windows, c - 4..=c));
+        sched
+    }
+
+    /// A tick whose member's window the ring its committee carries cannot
+    /// reach draws on that window, which the schedule may evict before
+    /// the tick reaches the dispatch head. Seating takes it while it is
+    /// held, so the tick runs after the eviction. The window here is
+    /// older than the committee's, in the unit shape of
+    /// [`bridged_seed_schedule`].
+    #[test]
+    fn a_tick_seated_while_its_members_window_is_held_runs_after_the_eviction() {
+        const ED: u64 = 1_000;
+        const A: u64 = 70;
+        const C: u64 = 80;
+
+        let windows = EpochWindows::new(0, ED);
+        let mut sched = bridged_seed_schedule(windows, A, C);
+        let mut state = make_test_state();
+        // A tick ahead of it is in flight, so this one waits in the queue.
+        state.tick_in_flight = true;
+        let block = make_live_block(
+            BlockHeight::new(1),
+            A * ED + 500,
+            ValidatorId::new(0),
+            vec![(test_transaction(1))],
         );
-        // And the grid is the schedule's own window length, which is
-        // what the schedule is indexed by — not a default a snapshot
-        // that nobody projected would have answered with.
-        assert_eq!(
-            env.windows,
-            EpochWindows::new(0, ED),
-            "the tick resolves its clock on the chain's epoch grid",
+        let _ = state.commit_block_carrying(
+            &sched,
+            &certify_signed(block, A * ED, C),
+            Naming::Composed,
         );
+        assert!(
+            matches!(state.pending_ticks.front(), Some(Queued::Run(_))),
+            "the tick is seated to run and waits behind the one in flight"
+        );
+
+        sched.evict_below(Epoch::new(C));
+        state.tick_in_flight = false;
+        let dispatched = state.dispatch_next_tick(&sched);
+        let (env, requests) = dispatched
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
+                    env, requests, ..
+                }) => Some((env, requests)),
+                _ => None,
+            })
+            .expect("the tick dispatches over the window it took at seating");
+        let clock = requests[0].clock;
+        assert_eq!(windows.epoch_for(clock), Epoch::new(A));
+        assert_eq!(
+            env.seed_window_for(clock),
+            seeded_snapshot(windows, 1..=A)
+                .seeds()
+                .window_for(Epoch::new(A)),
+        );
+    }
+
+    /// The same unit shape seated on a replica whose schedule has already
+    /// evicted its member's window: nothing brings the window back, so
+    /// the tick is held for its finalization rather than run.
+    #[test]
+    fn a_tick_seated_past_its_members_evicted_window_is_held() {
+        const ED: u64 = 1_000;
+        const A: u64 = 70;
+        const C: u64 = 80;
+
+        let windows = EpochWindows::new(0, ED);
+        let mut sched = bridged_seed_schedule(windows, A, C);
+        sched.evict_below(Epoch::new(C));
+        let mut state = make_test_state();
+        let block = make_live_block(
+            BlockHeight::new(1),
+            A * ED + 500,
+            ValidatorId::new(0),
+            vec![(test_transaction(1))],
+        );
+        let effects = state.commit_block_carrying(
+            &sched,
+            &certify_signed(block, A * ED, C),
+            Naming::Composed,
+        );
+        assert!(!effects.actions.iter().any(|action| matches!(
+            action,
+            Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+        )));
+        let tick = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        assert!(
+            matches!(state.pending_ticks.front(), Some(Queued::Held(held)) if *held == tick),
+            "the tick holds dispatch for its finalization"
+        );
+        assert!(state.held.contains_key(&tick));
+    }
+
+    /// A tick whose member is clocked past every window held at seating
+    /// waits for the fold that publishes it. A finalization of it that
+    /// commits first answers the draw instead: the tick is held from
+    /// there and seated from what the finalization says it left.
+    #[test]
+    fn a_tick_awaiting_seeds_is_seated_from_a_finalization_that_comes_first() {
+        const ED: u64 = 1_000;
+        const T: u64 = 70;
+
+        let windows = EpochWindows::new(0, ED);
+        let mut sched = TopologySchedule::new(
+            windows,
+            Epoch::new(T - 1),
+            seeded_snapshot(windows, 1..=T - 1),
+        );
+        sched.insert_lookahead(Epoch::new(T), seeded_snapshot(windows, 1..=T - 1));
+        let tx = test_transaction(1);
+        let mut state = make_test_state();
+        // Signed by window `T`'s committee and anchored in `T + 1`,
+        // which the beacon has not published here.
+        let block = make_live_block(
+            BlockHeight::new(1),
+            (T + 1) * ED + 500,
+            ValidatorId::new(0),
+            vec![tx.clone()],
+        );
+        let effects = state.commit_block_carrying(
+            &sched,
+            &certify_signed(block, (T + 1) * ED, T),
+            Naming::Composed,
+        );
+        assert!(!effects.actions.iter().any(|action| matches!(
+            action,
+            Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+        )));
+        assert!(
+            matches!(
+                state.pending_ticks.front(),
+                Some(Queued::Run(pending)) if pending.awaiting.is_some()
+            ),
+            "the tick waits on window {}",
+            T + 1
+        );
+
+        let mut writes = StateWrites::default();
+        writes.cells.insert(
+            SubstateKey {
+                owner: Address::new([7; 31], AddressClass::Component),
+                local: LocalKey([1; 16]),
+            },
+            Some(vec![1]),
+        );
+        let finalization: Verifiable<Finalization> =
+            make_finalization_leaving(BlockHeight::new(1), tx.hash(), writes).into();
+        let settling = helpers_make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(2),
+            (T + 1) * ED + 700,
+            ValidatorId::new(0),
+            vec![],
+            vec![finalization],
+        );
+        let effects = state.commit_block_carrying(
+            &sched,
+            &certify_signed(settling, (T + 1) * ED + 200, T),
+            Naming::Composed,
+        );
+        assert!(
+            effects.actions.iter().any(|action| matches!(
+                action,
+                Action::ResolveTicks { resolutions }
+                    if resolutions.iter().any(|(tick, resolution)| {
+                        tick.block_height() == BlockHeight::new(1)
+                            && matches!(resolution, TickResolution::Restored { .. })
+                    })
+            )),
+            "the finalization's writes are seated for the tick"
+        );
+        assert!(
+            !state.pending_ticks.iter().any(|queued| matches!(
+                queued,
+                Queued::Run(pending) if pending.tick == BlockHeight::new(1)
+            )),
+            "and the tick never runs here"
+        );
+    }
+
+    /// The tick at `height` a commit in window `t` seats over `sched`,
+    /// its one member `tx` re-clocked to `clock`, under the ring the
+    /// beacon folded through `t - 1`.
+    fn queued_tick(
+        sched: &TopologySchedule,
+        t: u64,
+        height: u64,
+        tx: &Transaction,
+        clock: WeightedTimestamp,
+    ) -> PendingTick {
+        let windows = sched.windows();
+        let start = windows.window_of(Epoch::new(t)).start.as_millis();
+        let mut request = {
+            let mut state = make_test_state();
+            let block = make_live_block(
+                BlockHeight::new(1),
+                start + 500,
+                ValidatorId::new(0),
+                vec![tx.clone()],
+            );
+            state
+                .commit_block_carrying(sched, &certify_signed(block, start, t), Naming::Composed)
+                .actions
+                .into_iter()
+                .find_map(|action| match action {
+                    Action::Execution(ExecutionAction::ExecuteTransactions {
+                        requests, ..
+                    }) => requests.into_iter().next(),
+                    _ => None,
+                })
+                .expect("the commit dispatches its tick")
+        };
+        request.clock = clock;
+        let mut env = TickEnvironment::governing(&seeded_snapshot(windows, 1..=t - 1), windows);
+        let requests = vec![request];
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
+        let (runs, awaiting) = seat_seeds(&mut env, &requests, sched).awaiting(tick_id, &[]);
+        assert!(runs, "seated with every window it draws on reachable");
+        PendingTick {
+            tick: BlockHeight::new(height),
+            tick_ts: WeightedTimestamp::from_millis(start),
+            env,
+            requests,
+            included: Vec::new(),
+            in_hand: true,
+            awaiting,
+        }
+    }
+
+    /// The schedule of a node that installs a newer schedule while a tick
+    /// awaits window `T + 1`: the windows between are published and
+    /// evicted in one jump, past `newest`, and no fold reaches the tick
+    /// while `T + 1`'s own ring is held.
+    fn jumped_past_an_awaited_window(newest: u64) -> (TopologySchedule, PendingTick) {
+        const T: u64 = 70;
+        let mut sched = folded_before(T);
+        let windows = sched.windows();
+        let clock = windows.window_of(Epoch::new(T + 1)).start;
+        let tick = queued_tick(&sched, T, 1, &test_transaction(1), clock);
+        assert!(tick.awaiting.is_some(), "the tick awaits window {}", T + 1);
+        for epoch in [T, T + 1, newest] {
+            sched.insert(Epoch::new(epoch), seeded_snapshot(windows, 1..=epoch));
+        }
+        sched.evict_below(Epoch::new(newest));
+        (sched, tick)
+    }
+
+    /// A tick awaiting a window the jump evicted takes it off the oldest
+    /// ring the schedule still holds, which reaches back over it, and
+    /// runs on it.
+    #[test]
+    fn a_tick_awaiting_a_window_evicted_in_a_jump_takes_it_off_a_later_ring() {
+        let (sched, tick) = jumped_past_an_awaited_window(73);
+        let clock = tick.requests[0].clock;
+        let mut state = make_test_state();
+        state.pending_ticks.push_back(Queued::Run(tick));
+        let dispatched = state.on_beacon_block_persisted(&sched).actions;
+        let env = dispatched
+            .iter()
+            .find_map(|action| match action {
+                Action::Execution(ExecutionAction::ExecuteTransactions { env, .. }) => Some(env),
+                _ => None,
+            })
+            .expect("the fold dispatches the tick");
+        assert_eq!(
+            env.seed_window_for(clock),
+            seeded_snapshot(sched.windows(), 1..=71)
+                .seeds()
+                .window_for(Epoch::new(71)),
+        );
+    }
+
+    /// A tick awaiting a window no ring the schedule holds reaches any
+    /// longer is held, as one seated past an evicted window is, rather
+    /// than left waiting on a window that is not coming.
+    #[test]
+    fn a_tick_awaiting_a_window_past_every_held_ring_is_held() {
+        let (sched, tick) = jumped_past_an_awaited_window(300);
+        let mut state = make_test_state();
+        state.pending_ticks.push_back(Queued::Run(tick));
+        let actions = state.on_beacon_block_persisted(&sched).actions;
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+        )));
+        let tick = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        assert!(
+            state.held.contains_key(&tick),
+            "the tick is held for its finalization"
+        );
+        assert!(
+            !state
+                .pending_ticks
+                .iter()
+                .any(|queued| matches!(queued, Queued::Run(_))),
+            "and never runs here"
+        );
+    }
+
+    /// A schedule that holds window `T` and has folded through `T - 1`.
+    fn folded_before(t: u64) -> TopologySchedule {
+        let windows = EpochWindows::new(0, 1_000);
+        let mut sched = TopologySchedule::new(
+            windows,
+            Epoch::new(t - 1),
+            seeded_snapshot(windows, 1..=t - 1),
+        );
+        sched.insert_lookahead(Epoch::new(t), seeded_snapshot(windows, 1..=t - 1));
+        sched
+    }
+
+    /// The tick at `height` over `sched`, its one member `tx` served from
+    /// `served_at`.
+    fn served_tick(sched: &TopologySchedule, height: u64, served_at: u64, tx: u8) -> PendingTick {
+        let mut tick = queued_tick(
+            sched,
+            SERVED_WINDOW,
+            height,
+            &test_transaction(tx),
+            sched.windows().window_of(Epoch::new(SERVED_WINDOW)).start,
+        );
+        tick.requests[0].served_at = Some(BlockHeight::new(served_at));
+        tick
+    }
+
+    /// What a batch that ran nothing reports for the tick at `height`.
+    fn empty_outcome(height: u64) -> TickBatchOutcome {
+        TickBatchOutcome {
+            tick_id: TickId::new(ShardId::ROOT, BlockHeight::new(height)),
+            results: Vec::new(),
+            tx_outcomes: Vec::new(),
+            refusal_receipts: Vec::new(),
+        }
+    }
+
+    /// The window [`served_tick`] seats in.
+    const SERVED_WINDOW: u64 = 70;
+
+    /// A queued tick holds the lowest height any of its members reads a
+    /// part at, and the lowest over every queued tick stands until that
+    /// tick leaves the queue.
+    #[test]
+    fn the_served_floor_holds_an_unrun_ticks_head_height() {
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        assert_eq!(state.served_floor(), None, "nothing queued holds nothing");
+
+        let mut lower = served_tick(&sched, 8, 6, 1);
+        let mut second = lower.requests[0].clone();
+        second.served_at = Some(BlockHeight::new(3));
+        lower.requests.push(second);
+        let plain = {
+            let mut tick = served_tick(&sched, 9, 9, 3);
+            tick.requests[0].served_at = None;
+            tick
+        };
+        state.pending_ticks.extend([
+            Queued::Run(lower),
+            Queued::Run(served_tick(&sched, 9, 5, 2)),
+            Queued::Run(plain),
+        ]);
+        assert_eq!(state.served_floor(), Some(BlockHeight::new(3)));
+
+        state.pending_ticks.pop_front();
+        assert_eq!(state.served_floor(), Some(BlockHeight::new(5)));
+    }
+
+    /// A tick this node cannot run is seated from its certificate and
+    /// reads no part, so it holds nothing.
+    #[test]
+    fn the_served_floor_ignores_a_tick_that_cannot_run() {
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        state.pending_ticks.extend([
+            Queued::Held(TickId::new(ShardId::ROOT, BlockHeight::new(7))),
+            Queued::Run(served_tick(&sched, 8, 5, 1)),
+        ]);
+        assert_eq!(state.served_floor(), Some(BlockHeight::new(5)));
+        state.pending_ticks.pop_back();
+        assert_eq!(state.served_floor(), None);
+    }
+
+    /// A member named in the block that makes it head reads the state
+    /// that block leaves, so its tick waits for the block's own write,
+    /// where any other tick waits for the block below. The write's own
+    /// event releases it.
+    #[test]
+    fn a_tick_named_in_its_head_block_waits_for_that_block_to_persist() {
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        state.persisted = BlockHeight::new(4);
+        state
+            .pending_ticks
+            .push_back(Queued::Run(served_tick(&sched, 5, 5, 1)));
+        assert_eq!(
+            dispatched_ticks(&state.on_beacon_block_persisted(&sched).actions),
+            Vec::new(),
+            "block 5 is unwritten",
+        );
+        assert_eq!(
+            dispatched_ticks(&state.on_block_persisted(&sched, BlockHeight::new(5))),
+            vec![BlockHeight::new(5)],
+        );
+
+        let mut state = make_test_state();
+        state.persisted = BlockHeight::new(4);
+        state
+            .pending_ticks
+            .push_back(Queued::Run(served_tick(&sched, 5, 4, 1)));
+        assert_eq!(
+            dispatched_ticks(&state.on_beacon_block_persisted(&sched).actions),
+            vec![BlockHeight::new(5)],
+            "an earlier head needs nothing past the block below",
+        );
+    }
+
+    /// A dispatched tick keeps its term until its batch comes back, a
+    /// terminal in between included, and a tick sent back to the queue
+    /// takes the term with it.
+    #[test]
+    fn the_in_flight_tick_keeps_its_served_term() {
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        state.persisted = BlockHeight::new(1);
+        state
+            .pending_ticks
+            .push_back(Queued::Run(served_tick(&sched, 2, 1, 1)));
+        let held = Some(BlockHeight::new(1));
+
+        let actions = state.on_beacon_block_persisted(&sched).actions;
+        let requests = actions
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Execution(ExecutionAction::ExecuteTransactions {
+                    env, requests, ..
+                }) => Some((env, requests)),
+                _ => None,
+            })
+            .expect("the fold dispatches the tick");
+        assert!(state.pending_ticks.is_empty());
+        assert_eq!(state.served_floor(), held, "out at dispatch");
+
+        let (env, requests) = requests;
+        state.on_execution_batch_unavailable(
+            BlockHeight::new(2),
+            WeightedTimestamp::ZERO,
+            env,
+            requests,
+            Vec::new(),
+            Hash::ZERO,
+        );
+        assert_eq!(state.in_flight_served, None, "the queue has it back");
+        assert_eq!(state.served_floor(), held);
+
+        state.on_beacon_block_persisted(&sched);
+        assert_eq!(state.served_floor(), held, "out at dispatch again");
+
+        state.terminate();
+        assert_eq!(state.served_floor(), held, "a run outlives a terminal");
+
+        state.on_execution_batch_completed(&sched, BlockHeight::new(2), empty_outcome(2));
+        assert_eq!(state.served_floor(), None, "its batch came back");
+    }
+
+    /// A stall carries the store's tip clock far past a block naming a
+    /// member, and the block's successor lands before anything has
+    /// published the block's term: the stale hold sits above the head
+    /// height, whose date stands a whisker inside the horizon of the
+    /// naming block's anchor. The seating clock keeps it through both
+    /// writes, the publication then holds it through the rest of the
+    /// stall, and it goes once the tick has run.
+    #[test]
+    fn a_stall_before_a_naming_blocks_certificate_retires_nothing() {
+        use hyperscale_storage::test_helpers::commit_writes_at;
+        use hyperscale_storage::{TickChain, VersionedStore};
+        use hyperscale_storage_memory::SimShardStorage;
+        use hyperscale_types::SettledWrites;
+
+        const HEAD: u64 = 2;
+        const NAMING: u64 = 10;
+        let horizon = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
+        let step = (horizon - 1) / (NAMING - HEAD);
+        let anchor = |height: u64| WeightedTimestamp::from_millis(height * step);
+        let stalled = anchor(NAMING).plus(Duration::from_secs(200));
+        let empty = SettledWrites::default();
+
+        let store = SimShardStorage::default();
+        let chain = TickChain::new(Arc::new(store.clone()));
+        let sched = folded_before(SERVED_WINDOW);
+        let mut state = make_test_state();
+        for height in 1..NAMING {
+            commit_writes_at(&store, &empty, anchor(height));
+        }
+
+        // Tick 9 is out, tick 8 the last back. The last publication saw
+        // block 9 written and held nothing of the head height.
+        let tip = BlockHeight::new(NAMING - 1);
+        state.persisted = tip;
+        state.last_completed_tick = BlockHeight::new(8);
+        state.tick_in_flight = true;
+        state.committed_ts = anchor(NAMING - 1);
+        let publish = |state: &ExecutionCoordinator, persisted: BlockHeight| {
+            chain.prune_persisted(
+                persisted,
+                state.baseline_floor(),
+                state.served_floor(),
+                state.committed_ts(),
+            );
+        };
+        publish(&state, tip);
+        assert_eq!(state.served_floor(), None);
+        assert_eq!(state.baseline_floor(), BlockHeight::new(8));
+
+        // The naming block seats behind the tick out, and its own write
+        // and its child's land before any publication.
+        state.committed_ts = anchor(NAMING);
+        state
+            .pending_ticks
+            .push_back(Queued::Run(served_tick(&sched, NAMING, HEAD, 1)));
+        commit_writes_at(&store, &empty, anchor(NAMING));
+        commit_writes_at(&store, &empty, stalled);
+        let head = BlockHeight::new(HEAD);
+        assert!(
+            store.snapshot_held_at(head).is_some(),
+            "the seating clock keeps a height a block not yet published names",
+        );
+
+        // The fold reaches the stall's far side and the flush publishes the
+        // term, which is all that holds the height from here.
+        state.committed_ts = stalled;
+        publish(&state, BlockHeight::new(NAMING + 1));
+        commit_writes_at(&store, &empty, stalled.plus(Duration::from_secs(200)));
+        assert!(store.snapshot_held_at(head).is_some());
+
+        // Tick 9 comes back, the naming tick goes out and comes back, and
+        // with its term gone the next write retires the height.
+        state.on_execution_batch_completed(&sched, tip, empty_outcome(NAMING - 1));
+        state.on_block_persisted(&sched, BlockHeight::new(NAMING + 1));
+        assert!(state.pending_ticks.is_empty(), "the naming tick went out");
+        assert_eq!(state.served_floor(), Some(head));
+        state.on_execution_batch_completed(&sched, BlockHeight::new(NAMING), empty_outcome(NAMING));
+        assert_eq!(state.served_floor(), None);
+        publish(&state, BlockHeight::new(NAMING + 1));
+        commit_writes_at(&store, &empty, stalled.plus(Duration::from_secs(400)));
+        assert!(
+            store.snapshot_held_at(head).is_none(),
+            "once the tick has run the height ages out as any other",
+        );
+    }
+
+    /// The block height each dispatch in `actions` runs a tick at.
+    fn dispatched_ticks(actions: &[Action]) -> Vec<BlockHeight> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) => Some(*tick),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tick behind the head, queued while another runs, takes in the
+    /// window it awaits on the fold that publishes it, and runs on it once
+    /// the ticks ahead have, though the schedule has evicted it by then.
+    #[test]
+    fn a_tick_behind_the_head_takes_in_its_window_on_the_fold() {
+        const T: u64 = 70;
+        let mut sched = folded_before(T);
+        let windows = sched.windows();
+        let ahead = queued_tick(
+            &sched,
+            T,
+            1,
+            &test_transaction(1),
+            windows.window_of(Epoch::new(T)).start,
+        );
+        assert!(ahead.awaiting.is_none());
+        let clock = windows.window_of(Epoch::new(T + 1)).start;
+        let behind = queued_tick(&sched, T, 2, &test_transaction(2), clock);
+        assert!(behind.awaiting.is_some());
+        let mut state = make_test_state();
+        state.persisted = BlockHeight::new(1);
+        state.tick_in_flight = true;
+        state
+            .pending_ticks
+            .extend([Queued::Run(ahead), Queued::Run(behind)]);
+
+        sched.insert(Epoch::new(T), seeded_snapshot(windows, 1..=T));
+        sched.insert_lookahead(Epoch::new(T + 1), seeded_snapshot(windows, 1..=T));
+        assert!(
+            dispatched_ticks(&state.on_beacon_block_persisted(&sched).actions).is_empty(),
+            "a tick is in flight"
+        );
+        sched.insert(Epoch::new(300), seeded_snapshot(windows, 1..=300));
+        sched.evict_below(Epoch::new(300));
+
+        state.tick_in_flight = false;
+        assert_eq!(
+            dispatched_ticks(&state.dispatch_next_tick(&sched)),
+            vec![BlockHeight::new(1)]
+        );
+        state.tick_in_flight = false;
+        let dispatched = state.dispatch_next_tick(&sched);
+        let env =
+            dispatched
+                .iter()
+                .find_map(|action| match action {
+                    Action::Execution(ExecutionAction::ExecuteTransactions {
+                        tick, env, ..
+                    }) if *tick == BlockHeight::new(2) => Some(env),
+                    _ => None,
+                })
+                .expect("the tick behind runs on the window it took in");
+        assert_eq!(
+            env.seed_window_for(clock),
+            seeded_snapshot(windows, 1..=T + 1)
+                .seeds()
+                .window_for(Epoch::new(T + 1)),
+        );
+    }
+
+    /// A tick held in place of one awaiting its seeds holds every tick
+    /// behind it until its determined half settles, and never runs here,
+    /// even once a fold publishes the window it awaited. Checked for both
+    /// ways an awaiting tick comes to be held: a finalization of it
+    /// committing first, and its window evicted unseen.
+    #[test]
+    fn a_tick_held_for_its_seeds_holds_the_ticks_behind_it() {
+        const T: u64 = 70;
+        for evicted in [false, true] {
+            let mut sched = folded_before(T);
+            let windows = sched.windows();
+            let held_tx = test_transaction(1);
+            let awaiting = queued_tick(
+                &sched,
+                T,
+                1,
+                &held_tx,
+                windows.window_of(Epoch::new(T + 1)).start,
+            );
+            let later = queued_tick(
+                &sched,
+                T,
+                2,
+                &test_transaction(2),
+                windows.window_of(Epoch::new(T)).start,
+            );
+            let mut state = make_test_state();
+            state.persisted = BlockHeight::new(1);
+            let tick = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+            state.ticks.insert_tick(
+                tick,
+                tick_holding(
+                    tick,
+                    WeightedTimestamp::from_millis(T * 1_000),
+                    vec![(verified_tx(&held_tx), BTreeSet::from([ShardId::ROOT]))],
+                ),
+            );
+            state
+                .pending_ticks
+                .extend([Queued::Run(awaiting), Queued::Run(later)]);
+            if evicted {
+                sched.insert(Epoch::new(300), seeded_snapshot(windows, 1..=300));
+                sched.evict_below(Epoch::new(300));
+            } else {
+                state.hold_awaiting_seeds(tick);
+            }
+
+            assert!(
+                dispatched_ticks(&state.dispatch_next_tick(&sched)).is_empty(),
+                "the held tick holds tick 2 back (evicted: {evicted})"
+            );
+            assert!(
+                matches!(state.pending_ticks.front(), Some(Queued::Held(held)) if *held == tick)
+            );
+            sched.insert(Epoch::new(T + 1), seeded_snapshot(windows, 1..=T + 1));
+            assert!(
+                dispatched_ticks(&state.on_beacon_block_persisted(&sched).actions).is_empty(),
+                "and still does once its window is published (evicted: {evicted})"
+            );
+
+            state
+                .ticks
+                .get_tick_mut(&tick)
+                .expect("seated")
+                .record_settled([held_tx.hash()]);
+            assert_eq!(
+                dispatched_ticks(&state.dispatch_next_tick(&sched)),
+                vec![BlockHeight::new(2)],
+                "once it settles, the tick behind runs and it never does (evicted: {evicted})"
+            );
+        }
+    }
+
+    /// A snapshot whose ring the beacon folded over `epochs`, each seed a
+    /// byte of its own epoch.
+    fn seeded_snapshot(
+        windows: EpochWindows,
+        epochs: std::ops::RangeInclusive<u64>,
+    ) -> Arc<TopologySnapshot> {
+        let ring = seed_ring(windows, epochs);
+        let validators: Vec<ValidatorInfo> = (0..4)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(validators),
+            )
+            .with_seeds(ring),
+        )
+    }
+
+    /// The ring the beacon folded over `epochs`, each seed a byte of its
+    /// own epoch.
+    fn seed_ring(windows: EpochWindows, epochs: std::ops::RangeInclusive<u64>) -> SeedRing {
+        let mut ring = SeedRing::default();
+        for epoch in epochs {
+            ring.record(
+                Epoch::new(epoch),
+                EpochSeed {
+                    randomness: Randomness::new([u8::try_from(epoch % 251).unwrap(); 32]),
+                    source: SeedSource::Reveals,
+                },
+                windows,
+            );
+        }
+        ring
     }
 
     /// The transactions the ledger names past their deadline, and what
@@ -9909,12 +11533,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -9977,12 +11596,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -10028,7 +11642,7 @@ mod tests {
                     BlockHeight::new(1),
                     1_000,
                     ValidatorId::new(0),
-                    vec![Arc::new(tx)],
+                    vec![tx],
                 ),
                 1_000,
             ),
@@ -10091,16 +11705,11 @@ mod tests {
         let schedule = make_test_topology();
         let held = test_transaction(2);
         let held_hash = held.hash();
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
+        let finalization: Verifiable<Finalization> =
             helpers_make_finalization(BlockHeight::new(2), held_hash, TransactionDecision::Accept)
-                .into(),
-        );
+                .into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(3),
@@ -10154,7 +11763,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(named_tx.clone()), Arc::new(unnamed_tx.clone())],
+            vec![named_tx.clone(), unnamed_tx.clone()],
         );
         let lines = vec![TickLine::Member {
             staged: 0,
@@ -10162,6 +11771,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(&named_tx),
@@ -10169,6 +11779,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(&named_tx),
             crossings: Capped::empty(),
+            served_at: None,
         }];
         let live = naming(&test_certify(committing.clone(), 2_000), lines.clone());
         let sealed = naming(&test_certify(committing.into_sealed(), 2_000), lines);
@@ -10218,7 +11829,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         )
         .into_sealed();
         let effects = state.commit_block_carrying(
@@ -10231,6 +11842,7 @@ mod tests {
                     joins: Joins::Executes,
                     settlement: Settlement::Alone,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: Capped::empty(),
                     awaits: Capped::empty(),
                     charge: genesis_charge(&tx),
@@ -10238,6 +11850,7 @@ mod tests {
                     reserves: Capped::empty(),
                     deadline: Deadline::of_transaction(&tx),
                     crossings: Capped::empty(),
+                    served_at: None,
                 }],
             ),
             Naming::Manifest,
@@ -10249,10 +11862,10 @@ mod tests {
         );
         assert!(
             state.pending_ticks.is_empty()
-                && !effects
-                    .actions
-                    .iter()
-                    .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+                && !effects.actions.iter().any(|action| matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
             "the dispatch drops the replaced tick from the queue",
         );
         let crossing = test_certify(
@@ -10261,10 +11874,32 @@ mod tests {
         );
         let _ = state.cross_a_bridge(
             &schedule,
+            schedule.head(),
             WeightedTimestamp::from_millis(2_000),
             crossing.block(),
         );
         assert!(state.held.is_empty(), "the crossing lets go of it");
+    }
+
+    /// The line running `tx` on terms its own certificate settles,
+    /// holding and pinning nothing.
+    fn running_alone(tx: &Transaction) -> TickLine {
+        TickLine::Member {
+            staged: 0,
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            pins: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: genesis_charge(tx),
+            share: 0,
+            reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(tx),
+            crossings: Capped::empty(),
+            served_at: None,
+        }
     }
 
     /// A tick this node cannot run holds every later tick until its
@@ -10274,20 +11909,7 @@ mod tests {
     fn a_held_tick_holds_dispatch_until_it_settles() {
         let schedule = make_test_topology();
         let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
-        let member = |tx: &Transaction| TickLine::Member {
-            staged: 0,
-            tx: tx.hash(),
-            joins: Joins::Executes,
-            settlement: Settlement::Alone,
-            holds: Capped::empty(),
-            reach: Capped::empty(),
-            awaits: Capped::empty(),
-            charge: genesis_charge(tx),
-            share: 0,
-            reserves: Capped::empty(),
-            deadline: Deadline::of_transaction(tx),
-            crossings: Capped::empty(),
-        };
+        let member = running_alone;
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
         state.commit_block_carrying(&schedule, &test_certify(seed, 1_000), Naming::Manifest);
@@ -10295,7 +11917,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(held_tx.clone())],
+            vec![held_tx.clone()],
         )
         .into_sealed();
         state.commit_block_carrying(
@@ -10307,7 +11929,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -10315,9 +11937,12 @@ mod tests {
             Naming::Manifest,
         );
         let executes = |actions: &[Action]| {
-            actions
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. }))
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )
+            })
         };
         assert!(
             !executes(&effects.actions),
@@ -10338,8 +11963,8 @@ mod tests {
             },
             Some(vec![1]),
         );
-        let finalization: Arc<Verifiable<Finalization>> =
-            Arc::new(make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), writes).into());
+        let finalization: Verifiable<Finalization> =
+            make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), writes).into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(4),
@@ -10363,7 +11988,7 @@ mod tests {
         let dispatched = effects
             .actions
             .iter()
-            .position(|action| matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3)));
+            .position(|action| matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3)));
         assert!(restored.is_some(), "the settled half's writes are seated");
         assert!(dispatched.is_some(), "and tick 3 then runs");
         assert!(
@@ -10378,7 +12003,7 @@ mod tests {
         leg: TxHash,
         outcome: ExecutionOutcome,
         writes: StateWrites,
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         half_leaving(TickHalf::Legs, vec![(leg, outcome, writes)])
     }
 
@@ -10388,7 +12013,7 @@ mod tests {
     fn half_leaving(
         half: TickHalf,
         members: Vec<(TxHash, ExecutionOutcome, StateWrites)>,
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
         let outcomes = members
             .iter()
@@ -10427,9 +12052,9 @@ mod tests {
         let half = if half == TickHalf::Legs {
             Finalization::accepting(tick_id, receipts)
         } else {
-            Finalization::new(tick_id, half, Some(Arc::new(certificate)), receipts)
+            Finalization::new(tick_id, half, Some(certificate), receipts)
         };
-        Arc::new(half.into())
+        half.into()
     }
 
     /// The legs half of tick 2 at `ROOT` over a certificate attesting
@@ -10438,7 +12063,7 @@ mod tests {
     fn legs_naming(
         members: Vec<(TxHash, ExecutionOutcome, StateWrites)>,
         named: &[TxHash],
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         let whole = half_leaving(TickHalf::Legs, members);
         let receipts: Vec<StoredReceipt> = whole
             .receipts()
@@ -10446,14 +12071,12 @@ mod tests {
             .filter(|receipt| named.contains(&receipt.tx_hash))
             .cloned()
             .collect();
-        Arc::new(
-            whole
-                .as_unverified()
-                .clone()
-                .naming(&named.iter().copied().collect())
-                .with_receipts(Capped::new(receipts).expect("a list written out in a test"))
-                .into(),
-        )
+        whole
+            .as_unverified()
+            .clone()
+            .naming(&named.iter().copied().collect())
+            .with_receipts(Capped::new(receipts).expect("a list written out in a test"))
+            .into()
     }
 
     /// The line naming `tx` a member settling on its own tick's
@@ -10465,6 +12088,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -10472,6 +12096,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -10487,6 +12112,7 @@ mod tests {
                 Settlement::Awaited
             },
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::new(reach.to_vec()).expect("a list written out in a test"),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -10494,6 +12120,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -10523,7 +12150,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            txs.iter().map(|&tx| Arc::new(tx.clone())).collect(),
+            txs.iter().map(|&tx| tx.clone()).collect(),
         )
         .into_sealed();
         state.commit_block_carrying(
@@ -10598,7 +12225,7 @@ mod tests {
     }
 
     /// A block at `height` on `ROOT` carrying `finalization`.
-    fn settling(height: u64, finalization: Arc<Verifiable<Finalization>>) -> CertifiedBlock {
+    fn settling(height: u64, finalization: Verifiable<Finalization>) -> CertifiedBlock {
         let now_ms = height * 1_000;
         test_certify(
             helpers_make_live_block(
@@ -10643,7 +12270,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         state.commit_block_carrying(
             &schedule,
@@ -10652,7 +12279,7 @@ mod tests {
         );
         let runs_tick_3 = |actions: &[Action]| {
             actions.iter().position(|action| {
-                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+                matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3))
             })
         };
         assert_eq!(
@@ -10661,10 +12288,9 @@ mod tests {
             "the block below tick 3 being written does not release it",
         );
 
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         let effects =
             state.commit_block_carrying(&schedule, &settling(4, determined), Naming::Manifest);
         assert_eq!(
@@ -10730,7 +12356,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         state.commit_block_carrying(
             &schedule,
@@ -10738,14 +12364,13 @@ mod tests {
             Naming::Manifest,
         );
         let _ = state.on_block_persisted(&schedule, BlockHeight::new(3));
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         state.commit_block_carrying(&schedule, &settling(4, determined), Naming::Manifest);
         let runs_tick_3 = |actions: &[Action]| {
             actions.iter().any(|action| {
-                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+                matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3))
             })
         };
         let members = || {
@@ -10809,7 +12434,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         state.commit_block_carrying(
             schedule,
@@ -10817,10 +12442,9 @@ mod tests {
             Naming::Manifest,
         );
         let _ = state.on_block_persisted(schedule, BlockHeight::new(3));
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         state.commit_block_carrying(schedule, &settling(4, determined), Naming::Manifest);
         state
     }
@@ -10866,10 +12490,9 @@ mod tests {
     fn stating_of(
         outcomes: Vec<TxOutcome>,
         receipts: Vec<StoredReceipt>,
-    ) -> Arc<Verifiable<Finalization>> {
-        let half: Arc<Verifiable<Finalization>> = Arc::new(
-            stating_half_on(ShardId::ROOT, BlockHeight::new(2), outcomes, receipts).into(),
-        );
+    ) -> Verifiable<Finalization> {
+        let half: Verifiable<Finalization> =
+            stating_half_on(ShardId::ROOT, BlockHeight::new(2), outcomes, receipts).into();
         assert_eq!(half.validate_against_certificates(), Ok(()));
         half
     }
@@ -10877,7 +12500,7 @@ mod tests {
     /// Whether `actions` dispatch tick 3.
     fn runs_tick_3(actions: &[Action]) -> bool {
         actions.iter().any(|action| {
-            matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+            matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(3))
         })
     }
 
@@ -11076,7 +12699,9 @@ mod tests {
             actions
                 .iter()
                 .filter_map(|action| match action {
-                    Action::ExecuteTransactions { tick, .. } => Some(tick.inner()),
+                    Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) => {
+                        Some(tick.inner())
+                    }
                     _ => None,
                 })
                 .collect()
@@ -11087,7 +12712,7 @@ mod tests {
                 BlockHeight::new(height),
                 height * 1_000,
                 ValidatorId::new(0),
-                vec![Arc::new(tx.clone())],
+                vec![tx.clone()],
             );
             let block = naming(&test_certify(block, height * 1_000), vec![alone(&tx)]);
             state
@@ -11152,17 +12777,16 @@ mod tests {
         let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
         let leg = test_transaction(3).hash();
         let mut state = holding_a_leg(&schedule, &held_tx, leg, BTreeMap::new());
-        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+        let determined: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
-                .into(),
-        );
+                .into();
         state.commit_block_carrying(&schedule, &settling(3, determined), Naming::Manifest);
         state.on_block_persisted(&schedule, BlockHeight::new(3));
         let later = make_live_block(
             BlockHeight::new(4),
             4_000,
             ValidatorId::new(0),
-            vec![Arc::new(later_tx.clone())],
+            vec![later_tx.clone()],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -11172,7 +12796,7 @@ mod tests {
         assert!(
             effects.actions.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(4)
+                Action::Execution(ExecutionAction::ExecuteTransactions { tick, .. }) if *tick == BlockHeight::new(4)
             )),
             "tick 4 runs with the leg still owed",
         );
@@ -11225,6 +12849,7 @@ mod tests {
             joins,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -11232,6 +12857,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -11240,7 +12866,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(abandoned.clone()), Arc::new(mate.clone())],
+            vec![abandoned.clone(), mate.clone()],
         );
         state.commit_block_carrying(
             &schedule,
@@ -11322,7 +12948,7 @@ mod tests {
             BlockHeight::new(2),
             2_000,
             ValidatorId::new(0),
-            vec![Arc::new(tx.clone())],
+            vec![tx.clone()],
         );
         let resumed = make_live_block(BlockHeight::new(3), resumed_ms, ValidatorId::new(0), vec![]);
         let aborting = TickLine::Member {
@@ -11331,6 +12957,7 @@ mod tests {
             joins: Joins::Aborted,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
@@ -11338,6 +12965,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
             crossings: Capped::empty(),
+            served_at: None,
         };
         (
             [
@@ -11391,10 +13019,9 @@ mod tests {
             "the tick seated from the line carries the abort until it settles",
         );
 
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+        let finalization: Verifiable<Finalization> =
             helpers_make_finalization(BlockHeight::new(3), tx.hash(), TransactionDecision::Aborted)
-                .into(),
-        );
+                .into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(5),
@@ -11486,12 +13113,8 @@ mod tests {
         let held = test_transaction(1);
         let held_hash = held.hash();
         let held_deadline = Deadline::of_transaction(&held);
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
         let above = make_live_block(BlockHeight::new(3), 3_000, ValidatorId::new(0), vec![]);
         // The committing block names its own transaction, ready at once.
         let committing = Verified::<CertifiedBlock>::from_persisted(naming(
@@ -11502,6 +13125,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(1),
@@ -11509,6 +13133,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: held_deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             }],
         ));
 
@@ -11545,9 +13170,10 @@ mod tests {
             .on_committed_state_restored(&schedule, &StubVmStatics)
             .actions;
         assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "nothing is dispatched at a height whose baseline the store has retired",
         );
         assert_eq!(
@@ -11560,6 +13186,82 @@ mod tests {
             Some(TickId::new(ShardId::ROOT, BlockHeight::new(2))),
             "and holds it in the tick a replica that never went down holds it in",
         );
+    }
+
+    /// A replay past its own floor that reaches a tick whose member reads
+    /// a part below that floor holds the tick for its certificate: the
+    /// store no longer has the height, and running on anything else would
+    /// split the member from its counterparts. A part at the floor runs.
+    #[test]
+    fn a_replica_without_the_head_height_seats_the_tick_from_its_certificate() {
+        let schedule = make_test_topology();
+        let replayed = |served_at: u64| {
+            let member = test_transaction(1);
+            let tx = member.hash();
+            let deadline = Deadline::of_transaction(&member);
+            let below = make_live_block(BlockHeight::new(3), 3_000, ValidatorId::new(0), vec![]);
+            let naming_block = make_live_block(
+                BlockHeight::new(4),
+                4_000,
+                ValidatorId::new(0),
+                vec![member],
+            );
+            let naming_block = Verified::<CertifiedBlock>::from_persisted(naming(
+                &test_certify(naming_block, 4_000),
+                vec![TickLine::Member {
+                    staged: 0,
+                    tx,
+                    joins: Joins::Executes,
+                    settlement: Settlement::Alone,
+                    holds: Capped::empty(),
+                    pins: Capped::empty(),
+                    reach: Capped::empty(),
+                    awaits: Capped::empty(),
+                    charge: stub_abort_charge(1),
+                    share: 0,
+                    reserves: Capped::empty(),
+                    deadline,
+                    crossings: Capped::empty(),
+                    served_at: Some(BlockHeight::new(served_at)),
+                }],
+            ));
+            let recovered = RecoveredState {
+                committed_height: BlockHeight::new(4),
+                replay: ReplayWindow {
+                    blocks: vec![replayable(below, 3_000), naming_block],
+                    dispatch_from: BlockHeight::new(3),
+                    anchor_wt: Some(WeightedTimestamp::from_millis(2_000)),
+                },
+                ..RecoveredState::default()
+            };
+            let mut restarted = ExecutionCoordinator::with_shared_stores(
+                ShardId::ROOT,
+                Arc::new(TestCode::default()),
+                Arc::new(CrossingIndexSlot::default()),
+                &recovered,
+                Arc::new(ExecCertStore::new()),
+                Arc::new(FinalizationStore::new()),
+                Arc::new(ProvenAnchors::new()),
+                Arc::new(CounterpartMirror::new()),
+                BlockHeight::GENESIS,
+            )
+            .signed_by(ValidatorId::new(0));
+            restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+            restarted
+        };
+
+        let held = TickId::new(ShardId::ROOT, BlockHeight::new(4));
+        let short = replayed(1);
+        assert!(short.held.contains_key(&held), "held for its certificate");
+        assert!(matches!(
+            short.pending_ticks.front(),
+            Some(Queued::Held(tick)) if *tick == held,
+        ));
+        assert_eq!(short.served_floor(), None, "it reads no part");
+
+        let reached = replayed(2);
+        assert!(!reached.held.contains_key(&held), "the store has it");
+        assert_eq!(reached.served_floor(), Some(BlockHeight::new(2)));
     }
 
     /// A settled tick the replay seats below where it dispatches is
@@ -11582,7 +13284,7 @@ mod tests {
                     BlockHeight::new(2),
                     2_000,
                     ValidatorId::new(0),
-                    vec![Arc::new(settled.clone())],
+                    vec![settled.clone()],
                 ),
                 2_000,
             ),
@@ -11590,10 +13292,9 @@ mod tests {
         ));
         // The tick at height 2 settles at height 4, one block above where
         // composition resumes.
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+        let finalization: Verifiable<Finalization> =
             make_finalization_leaving(BlockHeight::new(2), settled_hash, StateWrites::default())
-                .into(),
-        );
+                .into();
         let settling = helpers_make_live_block(
             ShardId::ROOT,
             BlockHeight::new(4),
@@ -11646,7 +13347,10 @@ mod tests {
         assert!(
             actions[..restored.expect("seated")]
                 .iter()
-                .all(|action| !matches!(action, Action::ExecuteTransactions { .. })),
+                .all(|action| !matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
             "and seated before anything the replay composes reads a baseline",
         );
     }
@@ -11668,12 +13372,8 @@ mod tests {
         let held = test_transaction(1);
         let held_hash = held.hash();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
 
         // The replica that was seated when the block committed.
         let mut seated = make_test_state();
@@ -11929,12 +13629,8 @@ mod tests {
         let held = test_transaction(1);
         let held_hash = held.hash();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(held)],
-        );
+        let committing =
+            make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![held]);
 
         // A replica that never went down: its tick at height 2 takes the
         // transaction and holds it until a finalization resolves it.
@@ -11994,7 +13690,7 @@ mod tests {
         );
         assert!(
             actions.iter().any(
-                |action| matches!(action, Action::ExecuteTransactions { requests, .. }
+                |action| matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. })
                     if requests.iter().any(|r| r.tx_hash == held_hash))
             ),
             "and runs it, because the tick that holds it is the tick that ran it",
@@ -12013,7 +13709,7 @@ mod tests {
             BlockHeight::new(3),
             3_000,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(2))],
+            vec![(test_transaction(2))],
         );
         live.commit_block_carrying(
             &schedule,
@@ -12045,12 +13741,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -12080,7 +13771,7 @@ mod tests {
             .ticks
             .get_tick_mut(&tick_id)
             .expect("the tick is still tracked")
-            .add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            .add_execution_certificate(Verified::new_unchecked_for_test(
                 ExecutionCertificate::new(
                     tick_id,
                     WeightedTimestamp::from_millis(1_000),
@@ -12094,7 +13785,7 @@ mod tests {
                     AggregateSignature::ZERO,
                     SignerBitfield::new(4),
                 ),
-            )));
+            ));
         state.scan_votable_ticks(&schedule);
     }
 
@@ -12110,6 +13801,7 @@ mod tests {
             qc.height(),
             qc.parent_block_hash(),
             qc.round(),
+            qc.committee_epoch(),
             qc.signers().clone(),
             qc.aggregated_signature(),
             WeightedTimestamp::from_millis(qc_ms),
@@ -12139,7 +13831,7 @@ mod tests {
             BlockHeight::new(1),
             500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -12161,7 +13853,7 @@ mod tests {
             BlockHeight::new(2),
             1_500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(2))],
+            vec![(test_transaction(2))],
         );
         let effects = state.commit_block_carrying(
             &schedule,
@@ -12197,7 +13889,7 @@ mod tests {
         for epoch in 1..=12u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&post));
         }
-        sched.set_head(post);
+        sched.set_head(Epoch::new(12), post);
         sched
     }
 
@@ -12210,9 +13902,8 @@ mod tests {
     /// terminal leaves — and it is what the drain alone does not cover.
     #[test]
     fn a_terminated_chain_composes_no_further_tick() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
         // BASELINE: the same commit on a live chain composes a tick.
@@ -12314,7 +14005,7 @@ mod tests {
             BlockHeight::new(2),
             50_500,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         assert!(!schedule.past_terminal(ShardId::ROOT, WeightedTimestamp::from_millis(50_500)));
         let effects = state.commit_block_carrying(
@@ -12373,7 +14064,7 @@ mod tests {
                     BlockHeight::new(height),
                     ms,
                     ValidatorId::new(0),
-                    vec![Arc::new(test_transaction(seed))],
+                    vec![(test_transaction(seed))],
                 ),
                 ms,
             )
@@ -12405,7 +14096,7 @@ mod tests {
             BlockHeight::new(4),
             1_800,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let mut restarted = restarted_over(vec![replayable(past, 1_800)], 4, 1_500);
 
@@ -12434,7 +14125,7 @@ mod tests {
             BlockHeight::new(5),
             1_800,
             ValidatorId::new(0),
-            vec![Arc::new(test_transaction(1))],
+            vec![(test_transaction(1))],
         );
         let effects =
             seated.commit_block_carrying(&schedule, &test_certify(first, 1_800), Naming::Composed);
@@ -12451,9 +14142,8 @@ mod tests {
     fn commit_block_reports_a_reclaim_as_the_abort_and_releases_it() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         state.counterparts.ledger.register_committed(
             test_committed(),
@@ -12496,9 +14186,8 @@ mod tests {
     fn an_undispatched_member_joins_on_the_shards_holding_its_keyspace() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
@@ -12552,9 +14241,8 @@ mod tests {
     fn a_record_covering_a_leg_seats_nothing() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let past_deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
@@ -12570,7 +14258,7 @@ mod tests {
         state
             .counterparts
             .ledger
-            .release_resolved(&[Arc::new(Verifiable::from(make_leg_finalization(
+            .release_resolved(&[(Verifiable::from(make_leg_finalization(
                 BlockHeight::new(1),
                 tx_hash,
             )))]);
@@ -12627,9 +14315,8 @@ mod tests {
     /// certificates never combined is abandoned all the same.
     #[test]
     fn a_cores_certificate_is_no_verdict_of_a_leg() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         for outcome in [
             ExecutionOutcome::Failed,
@@ -12682,7 +14369,7 @@ mod tests {
     /// fixes how many shards the core spans, and so whether its
     /// committed cell is ever asked about.
     fn leg_state(
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
         classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
@@ -12880,9 +14567,8 @@ mod tests {
     #[test]
     fn a_core_member_asks_the_siblings_it_waits_on() {
         let schedule = two_shard_core_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let figures = UnsettledTx::for_transaction(
             &transaction,
@@ -12957,7 +14643,7 @@ mod tests {
 
     /// A leg entry on `HOME` whose core consumer's claim sits on `PEER`,
     /// with the committed clock at the deadline.
-    fn claimed_leg_state(transaction: &Arc<Verifiable<Transaction>>) -> ExecutionCoordinator {
+    fn claimed_leg_state(transaction: &Verifiable<Transaction>) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state.counterparts.ledger.register_committed(
             test_committed(),
@@ -13037,9 +14723,8 @@ mod tests {
         producer: ShardId,
         consumer: ShardId,
     ) -> (SubstateKey, SubstateKey, CrossingCell) {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let validity_end = transaction.validity_range().end_timestamp_exclusive;
         let id = CrossingId {
             producer: committed_tx_cell_key(producer, transaction.hash(), validity_end).owner,
@@ -13085,7 +14770,7 @@ mod tests {
     /// Whether a commit dispatched any member.
     fn dispatched(actions: &[Action]) -> bool {
         actions.iter().any(|action| {
-            matches!(action, Action::ExecuteTransactions { requests, .. } if !requests.is_empty())
+            matches!(action, Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. }) if !requests.is_empty())
         })
     }
 
@@ -13112,9 +14797,8 @@ mod tests {
         let validity_end_ms = 400_000;
         let (record_key, claim, cell) = owned_record();
         if owed_here {
-            let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-                Verified::new_unchecked_for_test(straddling_transaction(1)),
-            ));
+            let transaction: Verifiable<Transaction> =
+                Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
             state.counterparts.ledger.register_committed(
                 test_committed(),
                 &PriceTable::GENESIS,
@@ -13159,7 +14843,7 @@ mod tests {
             vec![bundle.naming([(claim, id), (decline, id)])],
         );
         actions.iter().find_map(|action| match action {
-            Action::ExecuteTransactions { requests, .. } => {
+            Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. }) => {
                 requests.first().map(|request| request.member.clone())
             }
             _ => None,
@@ -13238,9 +14922,8 @@ mod tests {
     fn a_record_beside_another_transactions_entry_is_still_asked_about() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let second: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let second: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let (record_key, claim, issued) = owned_record();
         let first = CrossingCell {
             tx: TxHash::from(Hash::from_bytes(b"the first transaction")),
@@ -13296,7 +14979,9 @@ mod tests {
             "and asks a fresh header of neither answer: {opened:?}",
         );
 
-        state.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
+        let checked = CheckedStateProof::check(anchor, vec![claim, decline], proof)
+            .expect("the proof reads under its anchor");
+        state.on_proof_fetched(&checked, &[]);
         assert!(
             state
                 .offers(&CarriedClaims::default())
@@ -13353,7 +15038,7 @@ mod tests {
         shard: ShardId,
         height: u64,
         ts_ms: u64,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<Transaction>,
         claims: Vec<StateClaim>,
     ) -> CertifiedBlock {
         let Block::Live {
@@ -13412,9 +15097,8 @@ mod tests {
     #[test]
     fn a_never_in_a_discarded_suffix_takes_nothing_back() {
         let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let mut state = leg_state(&transaction, &leg_classified());
         let (record_key, _, cell) = owned_record();
@@ -13456,19 +15140,18 @@ mod tests {
     #[test]
     fn a_reclaim_is_untouched_by_a_discard_of_the_tick_at_its_height() {
         let schedule = two_shard_topology();
-        let leg: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let leg: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let mut state = leg_state(&leg, &leg_classified());
         let (record_key, _, cell) = owned_record();
         hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
 
-        let beside = Arc::new(straddling_transaction(2));
+        let beside = straddling_transaction(2);
         let returning = block_reading(
             HOME,
             2,
             past_the_horizon(),
-            vec![Arc::clone(&beside)],
+            vec![beside],
             taking_back(record_key, &cell, 2),
         );
         let actions = state
@@ -13503,6 +15186,7 @@ mod tests {
                 cause: DiscardCause::Recovery,
             }]),
             &mut Vec::new(),
+            true,
         );
         let after = commit_carrying(&mut state, &schedule, 4, past_the_horizon() + 2_000, vec![]);
         assert!(!resolved_aborted(&after, leg.hash()), "resolved once");
@@ -13567,7 +15251,7 @@ mod tests {
             vec![returned_at_the_root(1)],
         );
         let tx = test_transaction(1);
-        let next = block_reading(ShardId::ROOT, 2, 2_000, vec![Arc::new(tx.clone())], vec![]);
+        let next = block_reading(ShardId::ROOT, 2, 2_000, vec![tx.clone()], vec![]);
         let restored = |dispatch_from: u64| {
             let recovered = RecoveredState {
                 committed_height: BlockHeight::new(1),
@@ -13607,7 +15291,12 @@ mod tests {
                 state.on_block_persisted(&schedule, BlockHeight::new(1)),
             ]
             .concat();
-            actions.retain(|action| matches!(action, Action::ExecuteTransactions { .. }));
+            actions.retain(|action| {
+                matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )
+            });
             (state, actions)
         };
         for (replica, (mut state, before)) in [
@@ -13616,9 +15305,10 @@ mod tests {
             ("restored the reclaiming block unrun", restored(2)),
         ] {
             assert!(
-                !before
-                    .iter()
-                    .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+                !before.iter().any(|action| matches!(
+                    action,
+                    Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+                )),
                 "{replica}: the reclaiming block dispatches nothing: {before:?}",
             );
             assert!(
@@ -13630,16 +15320,14 @@ mod tests {
                 .actions;
             actions.extend(state.on_block_persisted(&schedule, BlockHeight::new(2)));
             let dispatched = actions.iter().find_map(|action| match action {
-                Action::ExecuteTransactions { tick, requests, .. }
-                    if *tick == BlockHeight::new(2) =>
-                {
-                    Some(
-                        requests
-                            .iter()
-                            .map(|request| request.tx_hash)
-                            .collect::<Vec<_>>(),
-                    )
-                }
+                Action::Execution(ExecutionAction::ExecuteTransactions {
+                    tick, requests, ..
+                }) if *tick == BlockHeight::new(2) => Some(
+                    requests
+                        .iter()
+                        .map(|request| request.tx_hash)
+                        .collect::<Vec<_>>(),
+                ),
                 _ => None,
             });
             assert_eq!(
@@ -13658,15 +15346,15 @@ mod tests {
     #[test]
     fn a_pending_leg_past_its_dead_core_runs_and_is_taken_back() {
         let schedule = two_shard_topology();
-        let leg: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let leg: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = leg.hash();
         let mut state = leg_state(&leg, &leg_classified());
         state.candidates.register(
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
             BTreeSet::from([HOME, PEER]),
             WeightedTimestamp::ZERO,
+            &ShardTrie::uniform(1),
             PriceTable::GENESIS,
             leg_classified(),
         );
@@ -13691,7 +15379,7 @@ mod tests {
         assert!(
             actions.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { requests, .. }
+                Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. })
                     if requests.iter().any(|request| request.tx_hash == tx_hash)
             )),
             "the next block naming it runs it: {actions:?}",
@@ -13746,13 +15434,13 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::StateProofs(ids),
+                    ids: FetchIds::RecordProofs(ids),
                     shard,
                     ..
                 }) if *shard == PEER => Some(
                     ids.iter()
-                        .filter(|(_, key)| *key == record)
-                        .map(|(anchor, _)| *anchor)
+                        .filter(|(_, _, key)| *key == record)
+                        .map(|(_, anchor, _)| *anchor)
                         .collect::<Vec<_>>(),
                 ),
                 _ => None,
@@ -13762,13 +15450,14 @@ mod tests {
     }
 
     /// A record a delivery here waits on is read from the record's
-    /// holder one finalization delay past the commit that filed the
-    /// want, at the holder's newest proven anchor, and not again until
-    /// the holder has moved on; a committed arrival ends the read.
+    /// holder once the holder's clock stands a grace past the commit
+    /// that filed the want, at the holder's newest proven anchor, and
+    /// not again until the holder has moved on; a committed arrival ends
+    /// the read.
     #[test]
-    fn a_record_read_arms_a_finalization_delay_past_the_commit_and_ends_with_the_arrival() {
+    fn a_record_read_arms_a_grace_past_the_commit_and_ends_with_the_arrival() {
         let (mut state, trie, record_key, cell, filed_at) = a_delivery_waiting_on_a_crossing();
-        let armed = filed_at.plus(MAX_FINALIZATION_DELAY);
+        let armed = filed_at.plus(RECORD_PUSH_GRACE_FLOOR);
         let before = armed.minus(Duration::from_millis(1));
         state
             .counterparts
@@ -13784,7 +15473,7 @@ mod tests {
                 record_key
             )
             .is_empty(),
-            "nothing is asked inside one finalization delay of the commit that filed the want",
+            "nothing is asked inside the grace of the commit that filed the want",
         );
 
         let first = proven_anchor_of(PEER, 10, armed);
@@ -13853,6 +15542,74 @@ mod tests {
         );
     }
 
+    /// An arrival a block carried ends the want, and the commit after it
+    /// lets go of the read still out.
+    #[test]
+    fn a_carried_arrival_abandons_its_read_in_its_commit() {
+        for carries in [false, true] {
+            let (mut state, schedule, trie, record_key, _, carrying_at, carried) =
+                a_body_awaiting_a_push();
+            let armed = carrying_at.ts;
+            let anchor = proven_anchor_of(PEER, 10, armed);
+            state.counterparts.proven_anchors.record(anchor);
+            let wanted = state.wanted_records();
+            assert_eq!(
+                record_asks(
+                    &state
+                        .counterparts
+                        .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
+                    record_key
+                ),
+                vec![anchor],
+            );
+
+            let claims = if carries { vec![carried] } else { vec![] };
+            let abandoned: Vec<Anchor> =
+                commit_carrying(&mut state, &schedule, 1, armed.as_millis(), claims)
+                    .iter()
+                    .filter_map(|action| match action {
+                        Action::AbandonFetch(FetchIds::RecordProofs(ids)) => Some(ids.iter()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter(|(_, _, key)| *key == record_key)
+                    .map(|(_, anchor, _)| *anchor)
+                    .collect();
+            let let_go = if carries { vec![anchor] } else { vec![] };
+            assert_eq!(abandoned, let_go, "carries: {carries}");
+        }
+    }
+
+    /// The commit of the block carrying a held push cuts the reading
+    /// from what is held before its arrival folds, and the want it is
+    /// about to end asks nothing in between.
+    #[test]
+    fn a_block_carrying_an_arrival_draws_no_ask_in_its_commit() {
+        let (mut state, schedule, _, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.counterparts.proven_anchors.record(anchor);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim.clone()])
+                .is_empty()
+        );
+        assert!(holds_record(&state, record_key, cell.tx));
+        assert_eq!(
+            state.wanted_records().len(),
+            1,
+            "a held push leaves the want standing",
+        );
+        let due = proven_anchor_of(PEER, 12, anchor.ts);
+        state.counterparts.proven_anchors.record(due);
+
+        let actions = commit_carrying(&mut state, &schedule, 1, anchor.ts.as_millis(), vec![claim]);
+        assert_eq!(record_asks(&actions, record_key), Vec::<Anchor>::new());
+        assert!(
+            !holds_record(&state, record_key, cell.tx),
+            "the block cut it"
+        );
+        assert!(state.wanted_records().is_empty(), "and its fold ended it");
+    }
+
     /// Whether `state` holds, to offer, a live reading of the record at
     /// `key` naming `tx` as its issuer.
     fn holds_record(state: &ExecutionCoordinator, key: SubstateKey, tx: TxHash) -> bool {
@@ -13897,19 +15654,20 @@ mod tests {
         );
         // The candidate the want is filed for, which is what keeps the
         // want standing across the commits the tests make.
-        state.candidates.register_member(
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
-            Member::whole(HOME),
-            now,
-            PriceTable::GENESIS,
-        );
-        state.provisioning.advance_clock(now);
-        state.committed_ts = now;
         let trie = schedule
             .at(now)
             .expect("the window is seated")
             .shard_trie()
             .clone();
+        state.candidates.register_member(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+            Member::whole(HOME),
+            now,
+            &trie,
+            PriceTable::GENESIS,
+        );
+        state.provisioning.advance_clock(now);
+        state.committed_ts = now;
         let (state_root, proof) = state_and_proof(PEER, &[record_key], &[record_key]);
         let anchor = Anchor {
             shard: PEER,
@@ -14082,6 +15840,54 @@ mod tests {
         let wanted = state.wanted_records();
         assert!(state.release_early_pushes(&schedule, &wanted).is_empty());
         assert!(state.parked_claims.is_empty());
+        assert!(holds_record(&state, record_key, cell.tx));
+    }
+
+    /// Eight heights of pushes nothing comes to want leave a newer push
+    /// its place, and its record arrives when the want is filed. Any
+    /// member of a committee can send those eight, so they must not turn
+    /// away what follows them.
+    #[test]
+    fn a_newer_push_parks_past_eight_stale_heights() {
+        let (mut state, schedule, _, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.provisioning.record_required(cell.tx, BTreeSet::new());
+        state.committed_ts = WeightedTimestamp::from_millis(REFUSED_VALIDITY_END_MS - 1);
+        for height in 1..=8u8 {
+            let (stale_key, _, stale_cell) = arrived_record(0x80 + height, REFUSED_VALIDITY_END_MS);
+            let (state_root, proof) = state_and_proof(PEER, &[stale_key], &[stale_key]);
+            let stale_anchor = Anchor {
+                state_root,
+                ..proven_anchor_of(PEER, u64::from(height), anchor.ts)
+            };
+            state.counterparts.proven_anchors.record(stale_anchor);
+            let pushed = StateClaim::new(
+                stale_anchor,
+                [(
+                    stale_key,
+                    Stated::Held(Bytes::new(stale_cell.to_bytes()).unwrap()),
+                )],
+                proof,
+            );
+            assert!(
+                state
+                    .on_crossing_readings(&schedule, vec![pushed])
+                    .is_empty()
+            );
+        }
+        assert_eq!(state.parked_claims.len(), 8, "the stale heights are parked");
+
+        state.counterparts.proven_anchors.record(anchor);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
+        state.provisioning.record_required(
+            cell.tx,
+            BTreeSet::from([Requirement::Crossing { key: record_key }]),
+        );
+        let wanted = state.wanted_records();
+        assert!(state.release_early_pushes(&schedule, &wanted).is_empty());
         assert!(holds_record(&state, record_key, cell.tx));
     }
 
@@ -14350,9 +16156,10 @@ mod tests {
             "the reading is the one the fold judges the answer's deletion on",
         );
         assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, Action::ExecuteTransactions { .. })),
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::ExecuteTransactions { .. })
+            )),
             "and no member is composed for it",
         );
     }
@@ -14360,14 +16167,13 @@ mod tests {
     /// A leg entry on `HOME` whose core consumer's claim sits on `PEER`,
     /// with the transaction, its figures and the claim key beside it.
     fn consumer_claim_fixture() -> (
-        Arc<Verifiable<Transaction>>,
+        Verifiable<Transaction>,
         UnsettledTx,
         SubstateKey,
         ExecutionCoordinator,
     ) {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let figures = UnsettledTx::for_transaction(
             &transaction,
             test_committed(),
@@ -14446,7 +16252,7 @@ mod tests {
         assert!(
             !folded.iter().any(|action| matches!(
                 action,
-                Action::ExecuteTransactions { requests, .. }
+                Action::Execution(ExecutionAction::ExecuteTransactions { requests, .. })
                     if requests.iter().any(|request| request.tx_hash == tx_hash)
             )),
             "no member is composed for it",
@@ -14477,12 +16283,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -14520,12 +16321,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -14559,12 +16355,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -14806,7 +16597,7 @@ mod tests {
         for epoch in 1..=12u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&post));
         }
-        sched.set_head(post);
+        sched.set_head(Epoch::new(12), post);
         sched
     }
 
@@ -14832,7 +16623,7 @@ mod tests {
         for epoch in 1..=12u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&post));
         }
-        sched.set_head(post);
+        sched.set_head(Epoch::new(12), post);
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         state.committed_ts = WeightedTimestamp::from_millis(1_500);
         (state, sched)
@@ -14997,21 +16788,19 @@ mod tests {
         let (local, partner) = (HOME, PEER);
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         let tick_id = TickId::new(local, BlockHeight::new(1));
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(seed)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![(
-                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                    seed,
-                ))),
+                (Verified::new_unchecked_for_test(straddling_transaction(seed))),
                 [local, partner].into_iter().collect(),
             )],
         );
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
@@ -15020,7 +16809,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
         state.counterparts.ledger.register_committed(
@@ -15071,7 +16860,7 @@ mod tests {
         for epoch in 2..=12u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&post));
         }
-        sched.set_head(post);
+        sched.set_head(Epoch::new(12), post);
         sched
     }
 
@@ -15093,21 +16882,19 @@ mod tests {
     ) -> (ExecutionCoordinator, TickId, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(two_sided_transaction(seed)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![(
-                Arc::new(Verified::new_unchecked_for_test(two_sided_transaction(
-                    seed,
-                ))),
+                (Verified::new_unchecked_for_test(two_sided_transaction(seed))),
                 [HOME, UPPER, LOWER].into_iter().collect(),
             )],
         );
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
@@ -15116,7 +16903,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
         state.counterparts.ledger.register_committed(
@@ -15376,15 +17163,13 @@ mod tests {
         let (mut state, tick_id, tx_hash) = state_stranded_on(&sched, 1);
         state
             .exec_certs
-            .insert(Arc::new(Verified::new_unchecked_for_test(
-                ExecutionCertificate::new(
-                    tick_id,
-                    WeightedTimestamp::ZERO,
-                    GlobalReceiptRoot::ZERO,
-                    Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
-                    AggregateSignature::ZERO,
-                    quorum_signers(),
-                ),
+            .insert(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::ZERO,
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)]),
+                AggregateSignature::ZERO,
+                quorum_signers(),
             )));
 
         state.release_tick(tick_id, Some(tx_hash));
@@ -15417,15 +17202,15 @@ mod tests {
 
     /// [`PEER`]'s certificate settling `tx_hash` against this shard's:
     /// a success that awaited [`HOME`] for it.
-    fn peer_settles(tx_hash: TxHash) -> Arc<Verified<ExecutionCertificate>> {
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+    fn peer_settles(tx_hash: TxHash) -> Verified<ExecutionCertificate> {
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             TickId::new(PEER, BlockHeight::new(1)),
             WeightedTimestamp::from_millis(1_000),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"peer")),
             Capped::from_array([TxOutcome::new(tx_hash, succeeded()).awaiting([HOME])]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )))
+        ))
     }
 
     /// A state whose tick at height 1 holds `T`, a transaction whose
@@ -15436,25 +17221,22 @@ mod tests {
     fn state_holding_a_shared_verdict(seed: u8) -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let shared: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(seed)),
+        let shared: Verifiable<Transaction> = Verifiable::from(Verified::new_unchecked_for_test(
+            straddling_transaction(seed),
         ));
-        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(seed + 1)),
-        ));
+        let alone: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(test_transaction(seed + 1)));
         let (t, x) = (shared.hash(), alone.hash());
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![
                 (
-                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                        seed,
-                    ))),
+                    (Verified::new_unchecked_for_test(straddling_transaction(seed))),
                     BTreeSet::from([HOME, PEER]),
                 ),
                 (
-                    Arc::new(Verified::new_unchecked_for_test(test_transaction(seed + 1))),
+                    (Verified::new_unchecked_for_test(test_transaction(seed + 1))),
                     BTreeSet::from([HOME]),
                 ),
             ],
@@ -15502,7 +17284,7 @@ mod tests {
         anchor_ms: u64,
         near: TxHash,
         far: TxHash,
-    ) -> Arc<Verified<ExecutionCertificate>> {
+    ) -> Verified<ExecutionCertificate> {
         use hyperscale_types::compute_global_receipt_root;
         let outcomes = [(near, 1), (far, 2)].map(|(tx_hash, seed)| {
             TxOutcome::new(tx_hash, succeeded())
@@ -15510,14 +17292,14 @@ mod tests {
                 .awaiting([PEER])
                 .as_role(Role::Whole)
         });
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(anchor_ms),
             compute_global_receipt_root(&outcomes),
             Capped::from_array(outcomes),
             AggregateSignature::ZERO,
             quorum_signers(),
-        )))
+        ))
     }
 
     /// Cast `tick`'s own vote and feed it the certificate of that vote,
@@ -15527,7 +17309,7 @@ mod tests {
         let (anchor, root, outcomes) = tick
             .build_vote_data()
             .expect("every member of the fixture's tick came back");
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
                 anchor,
@@ -15536,7 +17318,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
     }
 
     /// [`state_holding_two_legs`] before this shard's own certificate
@@ -15544,11 +17326,7 @@ mod tests {
     fn state_running_two_legs() -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let shared = |seed: u8| {
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                seed,
-            )))
-        };
+        let shared = |seed: u8| Verified::new_unchecked_for_test(straddling_transaction(seed));
         let (near, far) = (shared(1).hash(), shared(2).hash());
         let mut tick = tick_holding(
             tick_id,
@@ -15573,7 +17351,7 @@ mod tests {
     fn commit_stating(
         state: &mut ExecutionCoordinator,
         tick_id: TickId,
-    ) -> Arc<Verifiable<Finalization>> {
+    ) -> Verifiable<Finalization> {
         let stating = announced(&state.finalize(&tick_id))
             .into_iter()
             .find(|fw| fw.half() == TickHalf::Stated)
@@ -15583,7 +17361,7 @@ mod tests {
     }
 
     /// The transactions each finalization states a yes for.
-    fn stated_by(finalizations: &[Arc<Verifiable<Finalization>>]) -> Vec<Vec<TxHash>> {
+    fn stated_by(finalizations: &[Verifiable<Finalization>]) -> Vec<Vec<TxHash>> {
         finalizations
             .iter()
             .map(|fw| fw.stated_outcomes().map(TxOutcome::tx_hash).collect())
@@ -15591,7 +17369,7 @@ mod tests {
     }
 
     /// The stating halves the store holds for a proposer.
-    fn held_stating(state: &ExecutionCoordinator) -> Vec<Arc<Verifiable<Finalization>>> {
+    fn held_stating(state: &ExecutionCoordinator) -> Vec<Verifiable<Finalization>> {
         state
             .get_finalizations()
             .into_iter()
@@ -15717,11 +17495,7 @@ mod tests {
     fn seated_awaiting_its_batch(seeds: &[u8]) -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let shared = |seed: u8| {
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                seed,
-            )))
-        };
+        let shared = |seed: u8| Verified::new_unchecked_for_test(straddling_transaction(seed));
         let tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
@@ -15785,7 +17559,7 @@ mod tests {
     fn stating_announced_at_the_next_commit(
         state: &mut ExecutionCoordinator,
         schedule: &TopologySchedule,
-    ) -> Vec<Arc<Verifiable<Finalization>>> {
+    ) -> Vec<Verifiable<Finalization>> {
         let block = make_live_block_on_shard(
             HOME,
             BlockHeight::new(2),
@@ -15818,9 +17592,10 @@ mod tests {
             &[(near, succeeded()), (far, succeeded())],
         );
         assert!(
-            !scanned
-                .iter()
-                .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
+            !scanned.iter().any(|action| matches!(
+                action,
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+            )),
             "a certified tick is sent no vote: {scanned:?}",
         );
         assert_eq!(
@@ -15849,11 +17624,7 @@ mod tests {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let tick_id = TickId::new(HOME, BlockHeight::new(1));
-        let local = |seed: u8| {
-            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
-                seed,
-            )))
-        };
+        let local = |seed: u8| Verified::new_unchecked_for_test(straddling_transaction(seed));
         let tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
@@ -15872,14 +17643,14 @@ mod tests {
                 .as_role(Role::Whole)
         });
         let root = compute_global_receipt_root(&outcomes);
-        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let certificate = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             root,
             Capped::from_array(outcomes),
             AggregateSignature::ZERO,
             quorum_signers(),
-        )));
+        ));
         let _ = state.on_certificate_verified(&schedule, Ok(certificate));
 
         assert!(state.finalized.is_empty(), "no receipt is held yet");
@@ -15898,7 +17669,7 @@ mod tests {
             },
         );
         assert_eq!(state.voted_receipt_root(&tick_id), Some(root));
-        let determined: Vec<Arc<Verifiable<Finalization>>> = announced(&actions)
+        let determined: Vec<Verifiable<Finalization>> = announced(&actions)
             .into_iter()
             .filter(|fw| fw.is_determined())
             .collect();
@@ -15935,11 +17706,10 @@ mod tests {
         let (mut state, tick_id, near, far) = seated_awaiting_its_batch(&[1]);
         certified_by_its_shard(&mut state, &schedule, tick_id, (near, far));
         let scanned = batch_returned(&mut state, &schedule, tick_id, &[(near, succeeded())]);
-        assert!(
-            !scanned
-                .iter()
-                .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
-        );
+        assert!(!scanned.iter().any(|action| matches!(
+            action,
+            Action::Execution(ExecutionAction::SignAndSendExecutionVote { .. })
+        )),);
         assert_eq!(
             state.voted_receipt_root(&tick_id),
             None,
@@ -16013,13 +17783,13 @@ mod tests {
         tick_id: TickId,
         names: &[TxHash],
         (hash, height): (BlockHash, BlockHeight),
-    ) -> Vec<Arc<Verifiable<Finalization>>> {
+    ) -> Vec<Verifiable<Finalization>> {
         let accepting = BTreeMap::from([(tick_id, names.iter().copied().collect())]);
         let mut built = Vec::new();
         for action in state.offer_accepting(hash, height, &accepting) {
-            let Action::BuildLegsHalf {
+            let Action::Execution(ExecutionAction::BuildLegsHalf {
                 tick, names, tip, ..
-            } = action
+            }) = action
             else {
                 continue;
             };
@@ -16034,7 +17804,7 @@ mod tests {
     }
 
     /// The members each finalization `actions` announce names, in order.
-    fn announced(actions: &[Action]) -> Vec<Arc<Verifiable<Finalization>>> {
+    fn announced(actions: &[Action]) -> Vec<Verifiable<Finalization>> {
         actions
             .iter()
             .filter_map(|action| match action {
@@ -16047,7 +17817,7 @@ mod tests {
             .collect()
     }
 
-    fn names_of(finalizations: &[Arc<Verifiable<Finalization>>]) -> Vec<Vec<TxHash>> {
+    fn names_of(finalizations: &[Verifiable<Finalization>]) -> Vec<Vec<TxHash>> {
         finalizations
             .iter()
             .map(|fw| fw.tx_hashes().collect())
@@ -16106,7 +17876,9 @@ mod tests {
             actions
                 .iter()
                 .filter_map(|action| match action {
-                    Action::BuildLegsHalf { tick, tip, .. } => Some((*tick, *tip)),
+                    Action::Execution(ExecutionAction::BuildLegsHalf { tick, tip, .. }) => {
+                        Some((*tick, *tip))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -16254,9 +18026,8 @@ mod tests {
     #[test]
     fn a_release_through_an_abandoned_sibling_keeps_the_member_a_counterpart_can_settle() {
         let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(1);
-        let alone: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(2)),
-        ));
+        let alone: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(test_transaction(2)));
         assert_eq!(alone.hash(), x);
         state
             .counterparts
@@ -16291,6 +18062,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(2),
@@ -16298,6 +18070,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of_transaction(&alone),
                 crossings: Capped::empty(),
+                served_at: None,
             },
             TickLine::Discard {
                 tick: tick_id,
@@ -16323,7 +18096,7 @@ mod tests {
     /// the block that commits it at [`test_committed`] states it:
     /// reaching `reach`, at the genesis prices, answering `crossings`.
     fn aborting(
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
         classified: &Classified,
         reach: &[ShardId],
         crossings: Crossings,
@@ -16338,6 +18111,7 @@ mod tests {
                 Settlement::Awaited
             },
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::new(reach.to_vec()).expect("a short reach"),
             awaits: Capped::empty(),
             charge: genesis_charge(transaction),
@@ -16345,6 +18119,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(transaction),
             crossings,
+            served_at: None,
         }
     }
 
@@ -16395,9 +18170,8 @@ mod tests {
     /// build.
     #[test]
     fn an_abort_named_past_the_abandon_window_is_seated() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let x = transaction.hash();
         let sched = two_shard_topology();
         let trie = sched.head().shard_trie().clone();
@@ -16496,9 +18270,8 @@ mod tests {
     /// successors.
     #[test]
     fn an_abort_after_its_reach_reshaped_names_the_committing_placement() {
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let x = transaction.hash();
         let (left, right) = PEER.children();
         let reshaped = ShardTrie::from_leaves([HOME, left, right]);
@@ -16528,9 +18301,9 @@ mod tests {
     fn a_record_before_the_commit_leaves_the_abort_its_nevers() {
         let schedule = two_shard_topology();
         let trie = schedule.head().shard_trie().clone();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
-        ));
+        );
         let x = transaction.hash();
         let classified = peer_fed_core_classified();
         let never = never_of(&transaction);
@@ -16588,13 +18361,27 @@ mod tests {
             ValidatorId::new(0),
             vec![],
         );
+        let certified = certify_on(state, schedule, block, ts.as_millis());
         state
-            .commit_block_carrying(
-                schedule,
-                &test_certify(block, ts.as_millis()),
-                Naming::Composed,
-            )
+            .commit_block_carrying(schedule, &certified, Naming::Composed)
             .actions
+    }
+
+    /// `block`, anchored at `anchor_ms`, certified by the quorum honest
+    /// voters form for it on `state`'s chain: stating the epoch its live
+    /// committee resolves at its parent's anchor.
+    fn certify_on(
+        state: &ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        block: Block,
+        anchor_ms: u64,
+    ) -> CertifiedBlock {
+        let committee_anchor = if block.height() == state.committed_height.next() {
+            state.committed_ts
+        } else {
+            WeightedTimestamp::from_millis(anchor_ms)
+        };
+        certify_live(schedule, block, anchor_ms, committee_anchor)
     }
 
     /// The outcomes every tick that can vote now attests.
@@ -16641,7 +18428,7 @@ mod tests {
     /// has taken, frozen as `classified`.
     fn core_state(
         shard: ShardId,
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
         classified: &Classified,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), shard);
@@ -16656,7 +18443,7 @@ mod tests {
     /// The one `Never` [`HOME`] writes for `transaction` under
     /// [`peer_fed_core_classified`]: the crossing the leg on [`PEER`]
     /// hands the core.
-    fn never_of(transaction: &Arc<Verifiable<Transaction>>) -> (SubstateKey, Vec<u8>) {
+    fn never_of(transaction: &Verifiable<Transaction>) -> (SubstateKey, Vec<u8>) {
         let classified = peer_fed_core_classified();
         let edges: Vec<_> = classified.refusable_consumed(HOME).collect();
         assert_eq!(edges.len(), 1, "the fixture hands the core one crossing");
@@ -16671,7 +18458,7 @@ mod tests {
     }
 
     /// The deadline of `transaction` as committed at [`test_committed`].
-    fn deadline_of(transaction: &Arc<Verifiable<Transaction>>) -> WeightedTimestamp {
+    fn deadline_of(transaction: &Verifiable<Transaction>) -> WeightedTimestamp {
         UnsettledTx::for_transaction(
             transaction,
             test_committed(),
@@ -16691,9 +18478,9 @@ mod tests {
     #[test]
     fn an_uncertified_abandonment_answers_on_the_shard_holding_the_decline() {
         let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let deadline = deadline_of(&transaction);
         let never = never_of(&transaction);
@@ -16740,9 +18527,9 @@ mod tests {
     #[test]
     fn a_discarded_abandonment_is_composed_again() {
         let schedule = two_shard_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+        let transaction: Verifiable<Transaction> = Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
-        ));
+        );
         let tx_hash = transaction.hash();
         let deadline = deadline_of(&transaction);
         let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
@@ -16808,9 +18595,8 @@ mod tests {
         // Paying from this shard, so the charge is settled here and a
         // receipt carrying the charge alone is told from one carrying a
         // `Never` beside it.
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(1)));
         let tx_hash = transaction.hash();
         let deadline = deadline_of(&transaction);
         let mut state = core_state(HOME, &transaction, &peer_fed_core_classified());
@@ -16827,7 +18613,7 @@ mod tests {
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
                 vec![(
-                    Arc::new(Verified::new_unchecked_for_test(straddling_transaction(1))),
+                    (Verified::new_unchecked_for_test(straddling_transaction(1))),
                     BTreeSet::from([HOME, PEER]),
                 )],
             ),
@@ -16941,6 +18727,7 @@ mod tests {
             &block,
             Named::Lines(lines),
             &mut Vec::new(),
+            true,
         );
     }
 
@@ -16988,8 +18775,14 @@ mod tests {
             ts: state.committed_ts,
             fees: Vec::new(),
         };
-        let (pending, votes, _) =
-            state.seat_tick(&sched, &anchored, &block, Named::Lines(&lines), &mut seated);
+        let (pending, votes, _) = state.seat_tick(
+            &sched,
+            &anchored,
+            &block,
+            Named::Lines(&lines),
+            &mut seated,
+            true,
+        );
         assert!(pending.is_none());
         assert!(votes.is_empty());
         assert_eq!(seated, lines, "the lines seated are the block's");
@@ -17095,19 +18888,15 @@ mod tests {
         );
         state
             .exec_certs
-            .insert(Arc::new(Verified::new_unchecked_for_test(
-                certificate.clone(),
-            )));
+            .insert(Verified::new_unchecked_for_test(certificate.clone()));
         for half in [TickHalf::Determined, TickHalf::Legs] {
             state.finalized.insert(
                 tick_id,
-                Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                    Finalization::new(
-                        tick_id,
-                        half,
-                        Some(Arc::new(certificate.clone())),
-                        Capped::from_array([]),
-                    ),
+                Verifiable::from(Verified::new_unchecked_for_test(Finalization::new(
+                    tick_id,
+                    half,
+                    Some(certificate.clone()),
+                    Capped::from_array([]),
                 ))),
             );
         }
@@ -17156,13 +18945,11 @@ mod tests {
         );
         state.finalized.insert(
             tick_id,
-            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                Finalization::new(
-                    tick_id,
-                    TickHalf::Legs,
-                    Some(Arc::new(taken_before)),
-                    Capped::from_array([]),
-                ),
+            Verifiable::from(Verified::new_unchecked_for_test(Finalization::new(
+                tick_id,
+                TickHalf::Legs,
+                Some(taken_before),
+                Capped::from_array([]),
             ))),
         );
         assert_eq!(
@@ -17272,9 +19059,8 @@ mod tests {
 
         // A second member of the same tick, reaching only into keyspace
         // nobody has left — so its own counterpart is still live.
-        let sibling: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(2)),
-        ));
+        let sibling: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(test_transaction(2)));
         let sibling_hash = sibling.hash();
         state.ticks.assign_tx(sibling_hash, tick_id);
         state.counterparts.ledger.register_committed(
@@ -17384,7 +19170,7 @@ mod tests {
     fn state_abandoning(
         topology_schedule: &TopologySchedule,
         local: ShardId,
-        transaction: &Arc<Verifiable<Transaction>>,
+        transaction: &Verifiable<Transaction>,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         state.committed_ts = WeightedTimestamp::from_millis(1500);
@@ -17412,9 +19198,8 @@ mod tests {
             &[],
             &[(PEER, Some(Epoch::new(0)))],
         ));
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(7)),
-        ));
+        let transaction: Verifiable<Transaction> =
+            Verifiable::from(Verified::new_unchecked_for_test(straddling_transaction(7)));
         let tx_hash = transaction.hash();
         let mut state = state_abandoning(&stamped, HOME, &transaction);
         state
@@ -17481,12 +19266,7 @@ mod tests {
         state.commit_block_carrying(
             &schedule,
             &test_certify(
-                make_live_block(
-                    BlockHeight::new(1),
-                    1_000,
-                    ValidatorId::new(0),
-                    vec![Arc::new(tx)],
-                ),
+                make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![tx]),
                 1_000,
             ),
             Naming::Composed,
@@ -17592,12 +19372,12 @@ mod tests {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     signer,
                     recipients,
                     local_recipient,
                     ..
-                } => Some((*signer, recipients.clone(), *local_recipient)),
+                }) => Some((*signer, recipients.clone(), *local_recipient)),
                 _ => None,
             })
             .collect()
@@ -17712,7 +19492,9 @@ mod tests {
                 .actions
                 .iter()
                 .filter_map(|a| match a {
-                    Action::PushCrossingReadings { signer, .. } => Some(*signer),
+                    Action::Provisions(ProvisionAction::PushCrossingReadings {
+                        signer, ..
+                    }) => Some(*signer),
                     _ => None,
                 })
                 .collect();
@@ -17724,19 +19506,245 @@ mod tests {
         }
     }
 
+    /// The targets and the trie of each provision broadcast `actions`
+    /// carry.
+    fn broadcasts_of(actions: Vec<Action>) -> Vec<(Vec<ShardId>, ShardTrie)> {
+        actions
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Provisions(ProvisionAction::FetchAndBroadcastProvisions {
+                    shard_recipients,
+                    trie,
+                    ..
+                }) => Some((shard_recipients.into_keys().collect(), trie)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `block` with its header rooting a part for each of `targets`.
+    fn rooting(block: Block, targets: &[ShardId]) -> Block {
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+        } = block
+        else {
+            unreachable!("a live block")
+        };
+        let leaf = Hash::from_bytes(b"leaf");
+        let roots = targets
+            .iter()
+            .map(|&target| (target, ProvisionTxRoot::over(&[leaf])))
+            .collect::<BTreeMap<_, _>>();
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                provision_tx_roots: Capped::new(roots).expect("a few targets"),
+                ..header.into_parts()
+            }),
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+        }
+    }
+
+    /// The first block past a halt recovery extends the halted tip, so
+    /// its committee anchor sits below the bridge, and its proposer
+    /// classified it under the window the fresh committee was seated in,
+    /// where the payer's shard has grown. The proposer's commit sends its
+    /// provisions to the targets the header's roots name, routed under the
+    /// window its committee signed, not the one the committee anchor's own
+    /// window routes the payer by.
+    #[test]
+    fn a_block_past_a_recovery_bridge_gossips_under_the_bridged_committee() {
+        install_stub_protocol_statics();
+        let local = ShardId::leaf(1, 0);
+        let grown = ShardTrie::from_leaves([local, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
+        let window = |trie: &ShardTrie| {
+            Arc::new(
+                TopologySnapshot::from_explicit_committees(
+                    NetworkDefinition::simulator(),
+                    &ValidatorSet::new(Vec::new()),
+                    trie.leaves().map(|shard| (shard, Vec::new())).collect(),
+                    HashMap::new(),
+                    BTreeMap::new(),
+                    HashMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeSet::new(),
+                )
+                .with_pending_recoveries(BTreeMap::from([(
+                    local,
+                    ShardRecovery {
+                        cause: RecoveryCause::Halt,
+                        rotated_at: Epoch::new(20),
+                        retained: Vec::new(),
+                        attested_frontier: BlockHeight::GENESIS,
+                    },
+                )])),
+            )
+        };
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, 1_000),
+            Epoch::new(2),
+            window(&ShardTrie::uniform(1)),
+        );
+        schedule.insert(Epoch::new(21), window(&grown));
+        let head = window(&ShardTrie::uniform(1));
+        schedule.insert(Epoch::new(22), Arc::clone(&head));
+        schedule.set_head(Epoch::new(22), head);
+
+        let payer = PrincipalAddr::new([0x80; 31]);
+        let target = ShardId::leaf(2, 2);
+        assert_eq!(grown.shard_for_prefix(payer.address()), target);
+        let tx = stub_transaction_with_reads(
+            payer,
+            &[PrincipalAddr::new([0x10; 31]).address()],
+            &[payer.address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let proposer = ValidatorId::new(0);
+        // A block of the halted suffix, certified below the bridge by the
+        // committee that halted, routes under its own window.
+        for (certified_ms, signed, routed, trie) in [
+            (22_500, Epoch::new(21), target, grown),
+            (
+                3_500,
+                Epoch::new(2),
+                ShardId::leaf(1, 1),
+                ShardTrie::uniform(1),
+            ),
+        ] {
+            let mut state = make_test_state_for_shard(proposer, local);
+            let block = rooting(
+                make_live_block_on_shard(
+                    local,
+                    BlockHeight::new(1),
+                    certified_ms,
+                    proposer,
+                    vec![tx.clone()],
+                ),
+                &[routed],
+            );
+            let certified = test_certify(block, certified_ms);
+            let qc = certified.qc();
+            let qc = QuorumCertificate::new(
+                qc.block_hash(),
+                qc.shard_id(),
+                qc.height(),
+                qc.parent_block_hash(),
+                qc.round(),
+                signed,
+                qc.signers().clone(),
+                qc.aggregated_signature(),
+                qc.weighted_timestamp(),
+            );
+            let certified = CertifiedBlock::new_unchecked(
+                certified.block().clone(),
+                Verified::new_unchecked_for_test(qc),
+            );
+            let effects = state.commit_block_composing(
+                &schedule,
+                &certified,
+                WeightedTimestamp::from_millis(2_500),
+            );
+            assert_eq!(
+                broadcasts_of(effects.actions),
+                vec![(vec![routed], trie)],
+                "certified at {certified_ms}ms"
+            );
+        }
+    }
+
+    /// The proposer broadcasts wherever its block's header roots a
+    /// target, to every target it roots: a block committing no
+    /// transaction roots the parts of the members it makes head. A block
+    /// rooting nothing broadcasts nothing, whatever it commits.
+    #[test]
+    fn a_block_of_late_heads_alone_broadcasts_their_parts() {
+        install_stub_protocol_statics();
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let schedule =
+            TopologySchedule::single(Arc::new(TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &ValidatorSet::new(Vec::new()),
+                ShardTrie::uniform(1)
+                    .leaves()
+                    .map(|shard| (shard, Vec::new()))
+                    .collect(),
+                HashMap::new(),
+                BTreeMap::new(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+            )));
+        let proposer = ValidatorId::new(0);
+        let payer = PrincipalAddr::new([0x80; 31]);
+        let crossing = stub_transaction_with_reads(
+            payer,
+            &[PrincipalAddr::new([0x10; 31]).address()],
+            &[payer.address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let broadcasts = |transactions: Vec<Transaction>, targets: &[ShardId]| {
+            let mut state = make_test_state_for_shard(proposer, local);
+            let block = rooting(
+                make_live_block_on_shard(local, BlockHeight::new(1), 1_000, proposer, transactions),
+                targets,
+            );
+            broadcasts_of(
+                state
+                    .commit_block_composing(
+                        &schedule,
+                        &test_certify(block, 1_000),
+                        WeightedTimestamp::from_millis(1_000),
+                    )
+                    .actions,
+            )
+        };
+        assert_eq!(
+            broadcasts(Vec::new(), &[remote]),
+            vec![(vec![remote], ShardTrie::uniform(1))],
+        );
+        assert!(broadcasts(vec![crossing], &[]).is_empty());
+    }
+
     /// The signers and anchors `actions` sign `tick_id`'s vote under,
     /// each sent to one recipient, the leader at its anchor.
     fn signed_at(actions: &[Action], tick_id: TickId) -> Vec<(ValidatorId, u64)> {
         actions
             .iter()
             .filter_map(|action| match action {
-                Action::SignAndSendExecutionVote {
+                Action::Execution(ExecutionAction::SignAndSendExecutionVote {
                     tick_id: voted,
                     vote_anchor_ts,
                     recipients,
                     signer,
                     ..
-                } if *voted == tick_id => {
+                }) if *voted == tick_id => {
                     assert_eq!(recipients.len(), 1, "the first send goes to the leader");
                     Some((*signer, vote_anchor_ts.as_millis()))
                 }
@@ -17789,16 +19797,14 @@ mod tests {
             state.detach_signer(ValidatorId::new(0));
             let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
             let shared = BTreeSet::from([ShardId::ROOT, ShardId::leaf(1, 1)]);
-            let txs: Vec<Arc<Verified<Transaction>>> = [7, 8]
+            let txs: Vec<Verified<Transaction>> = [7, 8]
                 .into_iter()
-                .map(|seed| Arc::new(Verified::new_unchecked_for_test(test_transaction(seed))))
+                .map(|seed| Verified::new_unchecked_for_test(test_transaction(seed)))
                 .collect();
             let mut tick = tick_holding(
                 tick_id,
                 WeightedTimestamp::from_millis(1_000),
-                txs.iter()
-                    .map(|tx| (Arc::clone(tx), shared.clone()))
-                    .collect(),
+                txs.iter().map(|tx| (tx.clone(), shared.clone())).collect(),
             );
             for tx in &txs {
                 tick.record_execution_result(tx.hash(), ExecutionOutcome::Failed);

@@ -51,6 +51,7 @@ rand_chacha.workspace = true
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 hyperscale-crypto-bls.workspace = true
 hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }
+hyperscale-node.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 serde_json.workspace = true
 tempfile.workspace = true

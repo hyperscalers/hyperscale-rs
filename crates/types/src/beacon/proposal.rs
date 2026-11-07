@@ -8,6 +8,7 @@
 //! [`BeaconBlock::committed_proposals`](crate::BeaconBlock).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use blake3::Hasher;
 use hyperscale_crypto::{SignError, Signer, Verifier};
@@ -30,8 +31,17 @@ use crate::{
 /// validation (witnesses dedup against the per-shard high-water marks,
 /// evidence verifies against the accused, etc.) is the beacon crate's
 /// job — [`Verify`] here checks only who authored the proposal.
+///
+/// Every clone shares one allocation, so moving a proposal between its
+/// raw, verifiable and verified forms, or into the cache, a candidate
+/// and a served block, copies a pointer rather than its evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-pub struct BeaconProposal {
+#[hbor(transparent)]
+pub struct BeaconProposal(Arc<Carried>);
+
+/// What every clone of one [`BeaconProposal`] shares.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Carried {
     body: ProposalBody,
     /// The proposer's signature over the body, under
     /// [`BeaconProposalMessage`]. Without it the reveal, which any
@@ -96,7 +106,7 @@ impl BeaconProposal {
         vrf_proof: VrfProof,
     ) -> Self {
         let mut proposal = Self::vrf_only(vrf_proof);
-        let body = &mut proposal.body;
+        let body = &mut Arc::make_mut(&mut proposal.0).body;
         for (shard, qc) in boundary_qcs {
             if body
                 .boundary_qcs
@@ -136,7 +146,7 @@ impl BeaconProposal {
     /// given VRF reveal.
     #[must_use]
     pub fn vrf_only(vrf_proof: VrfProof) -> Self {
-        Self {
+        Self(Arc::new(Carried {
             body: ProposalBody {
                 boundary_qcs: Capped::default(),
                 equivocations: Capped::empty(),
@@ -145,7 +155,7 @@ impl BeaconProposal {
                 vrf_proof,
             },
             body_sig: ConsensusSignature::ZERO,
-        }
+        }))
     }
 
     /// Attach `signer`'s body signature for `epoch`, replacing any the
@@ -155,16 +165,14 @@ impl BeaconProposal {
     ///
     /// Propagates [`SignError`] when the signer cannot sign.
     pub fn signed(
-        self,
+        mut self,
         signer: &dyn Signer,
         network: &NetworkDefinition,
         epoch: Epoch,
     ) -> Result<Self, SignError> {
-        let body_sig = signer.sign(&signed_bytes(&self.body.signing_message(epoch), network))?;
-        Ok(Self {
-            body: self.body,
-            body_sig,
-        })
+        let body_sig = signer.sign(&signed_bytes(&self.0.body.signing_message(epoch), network))?;
+        Arc::make_mut(&mut self.0).body_sig = body_sig;
+        Ok(self)
     }
 
     /// Per-shard canonical boundary QCs this proposer observed (or `None`
@@ -172,20 +180,20 @@ impl BeaconProposal {
     /// `Verifiable<QuorumCertificate>`: wire-decoded proposals land
     /// `Unverified`; the fold verifies them against the shard committee.
     #[must_use]
-    pub const fn boundary_qcs(
+    pub fn boundary_qcs(
         &self,
     ) -> &Capped<BTreeMap<ShardId, Option<Verifiable<QuorumCertificate>>>, MAX_SHARDS> {
-        &self.body.boundary_qcs
+        &self.0.body.boundary_qcs
     }
 
     /// Equivocation evidence observed this slot. Each entry carries a
     /// `Verifiable` marker upgraded at the admission gate; admission jails
     /// the named validator once the block commits.
     #[must_use]
-    pub const fn equivocations(
+    pub fn equivocations(
         &self,
     ) -> &Capped<Vec<Verifiable<PcVoteEquivocation>>, MAX_EQUIVOCATIONS_PER_PROPOSER> {
-        &self.body.equivocations
+        &self.0.body.equivocations
     }
 
     /// Fork proofs observed this slot, keyed by forked shard. Each carries
@@ -194,11 +202,11 @@ impl BeaconProposal {
     /// the committed proof (≥ f+1 honest verifiers stood behind it) to
     /// stamp a fork-caused `ShardRecovery`.
     #[must_use]
-    pub const fn fork_proofs(
+    pub fn fork_proofs(
         &self,
     ) -> &Capped<BTreeMap<ShardId, Verifiable<Box<ShardForkProof>>>, MAX_FORK_PROOFS_PER_PROPOSER>
     {
-        &self.body.fork_proofs
+        &self.0.body.fork_proofs
     }
 
     /// Shard double-vote pairs observed via gossip this slot. Each
@@ -206,10 +214,10 @@ impl BeaconProposal {
     /// the fold convicts each named validator's pool once the block
     /// commits.
     #[must_use]
-    pub const fn vote_equivocations(
+    pub fn vote_equivocations(
         &self,
     ) -> &Capped<Vec<Verifiable<Box<ShardVoteEquivocation>>>, MAX_EQUIVOCATIONS_PER_PROPOSER> {
-        &self.body.vote_equivocations
+        &self.0.body.vote_equivocations
     }
 
     /// VRF output for this slot — `BLAKE3` of the proof, mixed into
@@ -218,14 +226,14 @@ impl BeaconProposal {
     /// can never disagree with the proof.
     #[must_use]
     pub fn vrf_output(&self) -> VrfOutput {
-        vrf_output_from_proof(&self.body.vrf_proof)
+        vrf_output_from_proof(&self.0.body.vrf_proof)
     }
 
     /// VRF proof — verifiable under the proposer's pubkey against the
     /// `(network.id, slot)` message.
     #[must_use]
-    pub const fn vrf_proof(&self) -> VrfProof {
-        self.body.vrf_proof
+    pub fn vrf_proof(&self) -> VrfProof {
+        self.0.body.vrf_proof
     }
 
     /// Hash this proposal into the `PcValueElement` that represents it
@@ -318,12 +326,12 @@ impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
             &ctx.sender_pk,
             ctx.network,
             ctx.epoch,
-            &self.body.vrf_proof,
+            &self.0.body.vrf_proof,
         ) {
             return Err(BeaconProposalVerifyError::BadVrfReveal);
         }
-        let msg = signed_bytes(&self.body.signing_message(ctx.epoch), ctx.network);
-        if !ctx.verifier.verify(&ctx.sender_pk, &msg, &self.body_sig) {
+        let msg = signed_bytes(&self.0.body.signing_message(ctx.epoch), ctx.network);
+        if !ctx.verifier.verify(&ctx.sender_pk, &msg, &self.0.body_sig) {
             return Err(BeaconProposalVerifyError::BadBodySignature);
         }
         Ok(Verified::new_unchecked(self.clone()))
@@ -376,7 +384,7 @@ impl<'a> BeaconProposalDraft<'a> {
     /// The digest the body signature will cover.
     #[must_use]
     pub fn body_digest(&self) -> Hash {
-        self.proposal.body.signing_message(self.epoch).body
+        self.proposal.0.body.signing_message(self.epoch).body
     }
 
     /// Sign the body, producing a `Verified<BeaconProposal>` whose
@@ -419,14 +427,9 @@ impl Verified<BeaconProposal> {
         if self.equivocations() != &equivocations {
             return Err(BeaconProposalEquivocationMismatch);
         }
-        let proposal = self.into_inner();
-        Ok(Self::new_unchecked(BeaconProposal {
-            body: ProposalBody {
-                equivocations,
-                ..proposal.body
-            },
-            body_sig: proposal.body_sig,
-        }))
+        let mut proposal = self.into_inner();
+        Arc::make_mut(&mut proposal.0).body.equivocations = equivocations;
+        Ok(Self::new_unchecked(proposal))
     }
 
     /// Rebind the proposal's vote-equivocation list to its
@@ -447,14 +450,9 @@ impl Verified<BeaconProposal> {
         if self.vote_equivocations() != &vote_equivocations {
             return Err(BeaconProposalEquivocationMismatch);
         }
-        let proposal = self.into_inner();
-        Ok(Self::new_unchecked(BeaconProposal {
-            body: ProposalBody {
-                vote_equivocations,
-                ..proposal.body
-            },
-            body_sig: proposal.body_sig,
-        }))
+        let mut proposal = self.into_inner();
+        Arc::make_mut(&mut proposal.0).body.vote_equivocations = vote_equivocations;
+        Ok(Self::new_unchecked(proposal))
     }
 }
 
@@ -600,6 +598,32 @@ mod tests {
             verify_under(&proposal, &signer, Epoch::new(4)).err(),
             Some(BeaconProposalVerifyError::BadVrfReveal),
         );
+    }
+
+    /// The cache holds the verified form and a block carries the raw
+    /// one; verifying a proposal, and moving between its forms, must
+    /// hand over the one body rather than copy its evidence.
+    #[test]
+    fn every_form_of_a_proposal_shares_one_body() {
+        let signer = signer_from_u64_seed(7);
+        let network = NetworkDefinition::simulator();
+        let epoch = Epoch::new(3);
+        let proposal = BeaconProposalDraft::new(
+            &signer,
+            &network,
+            epoch,
+            sample_boundary_qcs(),
+            vec![sample_equivocation()],
+            BTreeMap::new(),
+            Vec::new(),
+        )
+        .and_then(BeaconProposalDraft::sign)
+        .expect("sign")
+        .into_inner();
+        let verified = verify_under(&proposal, &signer, epoch).expect("its author's proposal");
+        let wire: Verifiable<BeaconProposal> = verified.clone().into();
+        assert!(Arc::ptr_eq(&proposal.0, &verified.0));
+        assert!(Arc::ptr_eq(&proposal.0, &wire.as_unverified().0));
     }
 
     /// A peer holding the author's reveal can pair it with a body of its

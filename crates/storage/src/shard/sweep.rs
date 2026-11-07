@@ -716,15 +716,22 @@ pub struct CommittedHere {
     pub key: SubstateKey,
     /// The marker's bytes.
     pub value: Vec<u8>,
-    /// For a transaction whose range opened before the chain's origin,
-    /// the marker key under the owner of the shard's right half.
+    /// For a transaction whose range opened no later than the chain's
+    /// origin, the marker key under the owner of the shard's right half.
+    ///
+    /// No later, not before: a merged parent's origin is the cut itself,
+    /// and a predecessor's block anchored on the cut still carries
+    /// content, so a transaction opening on the cut may already be
+    /// committed there.
     ///
     /// A shard's owner is its path padded with zeros, so a left
     /// predecessor wrote under this chain's own owner and `key` already
     /// answers for it. A merged parent's right predecessor wrote here, in
-    /// the parent's own state. On a chain not born by a merge nothing
-    /// sits at it, so reading it needs no knowledge of how the chain was
-    /// born.
+    /// the parent's own state. On any other chain nothing sits at it that
+    /// this lineage did not commit: an earlier merge's right half may
+    /// have left markers there not yet swept, and a hit on one is still a
+    /// transaction committed here. So reading it needs no knowledge of
+    /// how the chain was born.
     pub inherited: Option<SubstateKey>,
 }
 
@@ -737,7 +744,16 @@ impl CommittedHere {
 }
 
 /// [`committed_tx_cells`], with each row carrying the inherited key a
-/// transaction older than `origin` is also judged by.
+/// transaction opening no later than `origin` is also judged by.
+///
+/// The chain's own owner and its right half's are the only keys read, so
+/// the immediate predecessors are the only chains that answer. That holds
+/// because a transaction predates at most one cut on its lineage: the
+/// beacon schedules no cut that ends a chain sooner than
+/// [`MAX_VALIDITY_RANGE`](hyperscale_types::MAX_VALIDITY_RANGE) after the
+/// cut that formed it (`outlives_its_predecessors`), so whatever a
+/// generation before them committed has expired by the first anchor of
+/// this chain.
 #[must_use]
 pub fn committed_here<'a>(
     local_shard: ShardId,
@@ -749,7 +765,7 @@ pub fn committed_here<'a>(
         .map(|tx| {
             let (key, value) = committed_tx_cell(local_shard, tx);
             let range = tx.validity_range();
-            let inherited = (range.start_timestamp_inclusive < origin).then(|| {
+            let inherited = (range.start_timestamp_inclusive <= origin).then(|| {
                 committed_tx_cell_key(
                     local_shard.children().1,
                     tx.hash(),
@@ -828,12 +844,12 @@ pub fn colliding_committed_cell(
 pub fn without_colliding_committed_cells<const N: usize>(
     local_shard: ShardId,
     origin: WeightedTimestamp,
-    transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, N>,
+    transactions: &mut Capped<Vec<Verified<Transaction>>, N>,
     state: &(impl Substates + ?Sized),
 ) {
     let mut named: BTreeSet<SubstateKey> = BTreeSet::new();
     transactions.retain(|tx| {
-        let row = committed_here(local_shard, origin, [&***tx]);
+        let row = committed_here(local_shard, origin, [&**tx]);
         !committed_already(&row[0], &mut named, state)
     });
 }
@@ -1177,6 +1193,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([peer]),
                 awaits: Capped::from_array([peer]),
                 charge: stub_abort_charge(1),
@@ -1184,6 +1201,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             }])),
             ..MemberInputs::still(shard)
         });
@@ -1210,7 +1228,7 @@ mod tests {
             0,
             ValidatorId::new(0),
             Vec::new(),
-            vec![Arc::new(Verifiable::from(half))],
+            vec![Verifiable::from(half)],
         );
         let leaves = |prior: &Rows, half: ShardId| -> Vec<Option<Vec<u8>>> {
             followed_block_writes(
@@ -1432,18 +1450,18 @@ mod tests {
         let (state, parent, record, credit) = returning_at_the_parent();
         let (left, right) = ShardId::ROOT.children();
         let determined = || {
-            Arc::new(Verifiable::from(make_finalization_on(
+            Verifiable::from(make_finalization_on(
                 ShardId::ROOT,
                 BlockHeight::new(1),
                 TxHash::from(Hash::from_bytes(b"a member")),
                 TransactionDecision::Accept,
-            )))
+            ))
         };
         let legs = || {
-            Arc::new(Verifiable::from(make_leg_finalization(
+            Verifiable::from(make_leg_finalization(
                 BlockHeight::new(1),
                 TxHash::from(Hash::from_bytes(b"a leg")),
-            )))
+            ))
         };
         for halves in [
             vec![],
@@ -2243,7 +2261,7 @@ mod tests {
 
         install_stub_protocol_statics();
         let shard = ShardId::leaf(1, 1);
-        let verified = |n: u8| Arc::new(Verified::new_unchecked_for_test(test_transaction(n)));
+        let verified = |n: u8| Verified::new_unchecked_for_test(test_transaction(n));
         let (first, second) = (verified(1), verified(2));
         let key_of = |tx: &Transaction| {
             committed_tx_cell_key(
@@ -2290,18 +2308,20 @@ mod tests {
     /// own marker alone. The proposer drops what the voter refuses.
     #[test]
     fn an_inherited_marker_refuses_a_transaction_older_than_the_chain() {
-        use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+        use hyperscale_types::TimestampRange;
+        use hyperscale_types::test_utils::{
+            install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
+        };
 
         install_stub_protocol_statics();
         let shard = ShardId::leaf(1, 0);
-        let tx = test_transaction(1);
-        let validity_end = tx.validity_range().end_timestamp_exclusive;
-        let right = committed_tx_cell_key(shard.children().1, tx.hash(), validity_end);
+        let opens = WeightedTimestamp::from_millis(60_000);
+        let range = TimestampRange::new(opens, opens.plus(std::time::Duration::from_mins(1)));
+        let tx = stub_transaction(test_principal(1), &[test_prefix(1)], 1_000, range);
+        let right =
+            committed_tx_cell_key(shard.children().1, tx.hash(), range.end_timestamp_exclusive);
         let holding = Holding(BTreeSet::from([right]));
-        let origin = tx
-            .validity_range()
-            .start_timestamp_inclusive
-            .plus(std::time::Duration::from_millis(1));
+        let origin = opens.plus(std::time::Duration::from_millis(1));
 
         let older = committed_here(shard, origin, [&tx]);
         assert_eq!(older[0].inherited, Some(right));
@@ -2310,13 +2330,56 @@ mod tests {
             Some(older[0].key),
             "the right predecessor committed it",
         );
-        let newer = committed_here(shard, WeightedTimestamp::ZERO, [&tx]);
+        let before_it_opens = WeightedTimestamp::from_millis(opens.as_millis() - 1);
+        let newer = committed_here(shard, before_it_opens, [&tx]);
         assert_eq!(newer[0].inherited, None);
         assert_eq!(colliding_committed_cell(&newer, &holding), None);
 
-        let verified = Arc::new(Verified::new_unchecked_for_test(tx));
+        let verified = Verified::new_unchecked_for_test(tx);
         let mut listed: Capped<Vec<_>, 1> = Capped::new(vec![verified]).expect("one");
         without_colliding_committed_cells(shard, origin, &mut listed, &holding);
+        assert!(listed.is_empty(), "the proposer drops it too");
+    }
+
+    /// A merged parent's origin is the cut itself, and a child block
+    /// anchored exactly on the cut still carries content: the boundary
+    /// instant belongs to the window it closes. So the right child can
+    /// commit a transaction opening on the cut, and the merged parent
+    /// must judge it by the right half's marker too.
+    #[test]
+    fn a_merged_parent_refuses_what_its_right_child_committed_on_the_cut() {
+        use hyperscale_types::TimestampRange;
+        use hyperscale_types::test_utils::{
+            install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
+        };
+
+        install_stub_protocol_statics();
+        let parent = ShardId::leaf(1, 0);
+        let cut = WeightedTimestamp::from_millis(60_000);
+        let range = TimestampRange::new(cut, cut.plus(std::time::Duration::from_mins(1)));
+        assert!(
+            range.is_well_formed(cut) && range.contains(cut),
+            "a right child block anchored on the cut can carry it"
+        );
+        let tx = stub_transaction(test_principal(3), &[test_prefix(3)], 1_000, range);
+        let right = committed_tx_cell_key(
+            parent.children().1,
+            tx.hash(),
+            range.end_timestamp_exclusive,
+        );
+        let holding = Holding(BTreeSet::from([right]));
+
+        let rows = committed_here(parent, cut, [&tx]);
+        assert_eq!(rows[0].inherited, Some(right));
+        assert_eq!(
+            colliding_committed_cell(&rows, &holding),
+            Some(rows[0].key),
+            "the right child committed it on the cut",
+        );
+
+        let verified = Verified::new_unchecked_for_test(tx);
+        let mut listed: Capped<Vec<_>, 1> = Capped::new(vec![verified]).expect("one");
+        without_colliding_committed_cells(parent, cut, &mut listed, &holding);
         assert!(listed.is_empty(), "the proposer drops it too");
     }
 
@@ -2360,28 +2423,35 @@ mod tests {
         /// The builder and the voter read one rule: whatever the builder
         /// keeps, the voter admits, and whatever it drops, the voter
         /// refuses — alone, or beside a kept twin.
+        ///
+        /// Every transaction opens at one instant, and the origin lands
+        /// just before it, on it, or just after it. Before it, an inherited
+        /// marker the state holds is not read, so a transaction marked
+        /// only there is kept; on it or after, that marker refuses.
         #[test]
         fn the_builder_keeps_exactly_what_the_voter_admits(
             picks in prop::collection::vec(0u8..6, 0..10),
             marked in prop::collection::vec((0u8..6, any::<bool>()), 0..6),
-            older_than_the_chain in any::<bool>(),
+            origin_offset in prop::sample::select(vec![-1i64, 0, 1]),
         ) {
-            use hyperscale_types::test_utils::{install_stub_protocol_statics, test_transaction};
+            use hyperscale_types::TimestampRange;
+            use hyperscale_types::test_utils::{
+                install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
+            };
 
             install_stub_protocol_statics();
             let shard = ShardId::leaf(1, 0);
-            let origin = if older_than_the_chain {
-                WeightedTimestamp::from_millis(1)
-            } else {
-                WeightedTimestamp::ZERO
-            };
+            let opens = WeightedTimestamp::from_millis(60_000);
+            let range = TimestampRange::new(opens, opens.plus(std::time::Duration::from_mins(1)));
+            let tx_of = |seed: u8| stub_transaction(test_principal(seed), &[test_prefix(seed)], 1_000, range);
+            let origin = WeightedTimestamp::from_millis(opens.as_millis().saturating_add_signed(origin_offset));
             let state = holding_keys(marked.iter().filter_map(|(seed, inherited)| {
-                let row = committed_here(shard, WeightedTimestamp::from_millis(1), [&test_transaction(*seed)]).remove(0);
+                let row = committed_here(shard, opens, [&tx_of(*seed)]).remove(0);
                 if *inherited { row.inherited } else { Some(row.key) }
             }));
             let listed: Vec<_> = picks
                 .iter()
-                .map(|seed| Arc::new(Verified::new_unchecked_for_test(test_transaction(*seed))))
+                .map(|seed| Verified::new_unchecked_for_test(tx_of(*seed)))
                 .collect();
             let mut kept: Capped<Vec<_>, 16> = Capped::new(listed.clone()).expect("under the cap");
             without_colliding_committed_cells(shard, origin, &mut kept, &state);
@@ -2393,6 +2463,15 @@ mod tests {
                 let twin_kept = kept.iter().any(|k| k.hash() == tx.hash());
                 let alone = colliding_committed_cell(&[rows_of_tx(shard, origin, tx)], &state);
                 prop_assert!(twin_kept || alone.is_some(), "a dropped transaction the voter admits alone");
+                let marked_by = |by_inherited: bool| marked.iter().any(|(seed, inherited)| {
+                    *inherited == by_inherited && tx_of(*seed).hash() == tx.hash()
+                });
+                if origin < opens && !marked_by(false) {
+                    prop_assert!(twin_kept, "an inherited marker refused a transaction opening after the origin");
+                }
+                if origin >= opens && marked_by(true) {
+                    prop_assert!(alone.is_some(), "an inherited marker went unread on or after the origin");
+                }
             }
         }
 

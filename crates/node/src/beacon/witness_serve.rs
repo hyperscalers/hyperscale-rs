@@ -158,8 +158,8 @@ mod tests {
     use hyperscale_types::test_utils::test_pool;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
-        BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, ChainOrigin, Hash,
-        LeafIndex, ProposerTimestamp, QuorumCertificate, Round, ShardId, ShardWitnessPayload,
+        BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, ChainOrigin, Epoch,
+        Hash, LeafIndex, ProposerTimestamp, QuorumCertificate, Round, ShardId, ShardWitnessPayload,
         SignerBitfield, Stake, Verified, WeightedTimestamp, WitnessSources, compute_merkle_root,
         verify_range_inclusion,
     };
@@ -203,6 +203,7 @@ mod tests {
             block.height(),
             block.header().parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
@@ -242,9 +243,9 @@ mod tests {
             leaf_count_at_block_end,
             prune_persisted_below: None,
         };
-        // SAFETY: synthetic test fixture, no real signature.
+        // Synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(qc);
-        // SAFETY: synthetic test fixture; round-trip tests don't
+        // Synthetic test fixture; round-trip tests don't
         // exercise the `Verified<CertifiedBlock>` predicate.
         let certified = Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
             CertifiedBlock::new_unchecked(block, qc),

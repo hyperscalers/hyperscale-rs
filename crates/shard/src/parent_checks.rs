@@ -13,7 +13,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
 
 use hyperscale_engine::tick_select::{crossings_consumed, member_of};
 use hyperscale_hbor::Capped;
@@ -50,7 +49,7 @@ pub struct AtParent<'a> {
     pub transactions: &'a SharedTransactions,
     /// The block's finalizations, whose settling receipts a record it
     /// takes back is returned beside.
-    pub finalizations: &'a [Arc<Verifiable<Finalization>>],
+    pub finalizations: &'a [Verifiable<Finalization>],
 }
 
 /// Why the parent state refuses a block.
@@ -216,7 +215,7 @@ pub(crate) fn within_the_cap(
     anchor: WeightedTimestamp,
     parent: &(impl Substates + ?Sized),
     claims: Vec<StateClaim>,
-    transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+    transactions: &mut Capped<Vec<Verified<Transaction>>, MAX_TXS_PER_BLOCK>,
 ) -> (Vec<StateClaim>, usize, usize) {
     let under = shard_prefix_path(local);
     let owed = owed_credits(&claims, &StateWrites::default(), parent);
@@ -320,19 +319,37 @@ pub(crate) fn within_the_cap(
 /// reading goes with the `Never`; one whose ends this chain both holds
 /// is read there for its other settlements too, and stays. A parent
 /// claim left reading nothing goes, and the read mark it raised with it.
-#[must_use]
+///
+/// The cut holds apart from every input naming reads. A remote claim
+/// loses only `Never` cells; a local one also loses the record keys of
+/// crossings whose remote `Never` it cut, and the `Never` cells of
+/// crossings with both ends here. An answer cell names no record, so it
+/// is no arrival, and hearing and the wound read only verdict, member
+/// row, committed marker and seat cells. A record key is an arrival, but
+/// no `Pending` row waits on a crossing its consumer answered `Never`:
+/// the consumer's row was fated before the answer was written, and a
+/// recommit within retention is refused, whichever shard the consumer's
+/// row now stands on.
+///
+/// # Errors
+///
+/// [`Unrestricted`] where a remote claim keeps some cells and its proof
+/// cannot be cut down to them. Every ingress refuses a claim whose proof
+/// its own keys do not restrict it to, so an admitted claim never does;
+/// the proposal is abandoned rather than carry a claim the cut left
+/// whole.
 pub fn without_refused_reclaims(
     claims: Vec<StateClaim>,
     members: &MemberInputs,
     merged: &StateWrites,
     parent: &(impl Substates + ?Sized),
-) -> Vec<StateClaim> {
+) -> Result<Vec<StateClaim>, Unrestricted> {
     let local = members.shard;
     let standing: BTreeSet<SubstateKey> = reclaim_stands(&claims, members, merged, parent)
         .into_iter()
         .collect();
     if standing.is_empty() {
-        return claims;
+        return Ok(claims);
     }
     let refused = |claim: &StateClaim, key: SubstateKey| {
         claim.crossing_of(key).is_some_and(|id| {
@@ -355,33 +372,50 @@ pub fn without_refused_reclaims(
     let cut = |claim: &StateClaim, key: SubstateKey| {
         refused(claim, key) || (claim.anchor.shard == local && returned_alone.contains(&key))
     };
-    claims
-        .into_iter()
-        .filter_map(|claim| {
-            if !claim.keys().into_iter().any(|key| cut(&claim, key)) {
-                return Some(claim);
-            }
-            if claim.anchor.shard != local {
-                return claim.restrict(|key| !cut(&claim, key));
-            }
-            // Read at the parent under the empty proof, so the reading is
-            // dropped from the claim rather than cut from a proof.
-            let cells: Vec<(SubstateKey, Stated)> = claim
-                .cells
-                .iter()
-                .filter(|(key, _)| !cut(&claim, *key))
-                .cloned()
-                .collect();
-            let named: Vec<(SubstateKey, CrossingId)> = claim
-                .crossings
-                .iter()
-                .filter(|(key, _)| !cut(&claim, *key))
-                .copied()
-                .collect();
-            (!cells.is_empty())
-                .then(|| StateClaim::new(claim.anchor, cells, claim.proof.clone()).naming(named))
-        })
-        .collect()
+    let mut kept = Vec::with_capacity(claims.len());
+    for claim in claims {
+        let keys = claim.keys();
+        if !keys.iter().any(|key| cut(&claim, *key)) {
+            kept.push(claim);
+            continue;
+        }
+        if keys.iter().all(|key| cut(&claim, *key)) {
+            continue;
+        }
+        if claim.anchor.shard != local {
+            let piece = claim
+                .restrict(|key| !cut(&claim, key))
+                .ok_or(Unrestricted {
+                    anchor: claim.anchor,
+                })?;
+            kept.push(piece);
+            continue;
+        }
+        // Read at the parent under the empty proof, so the reading is
+        // dropped from the claim rather than cut from a proof.
+        let cells: Vec<(SubstateKey, Stated)> = claim
+            .cells
+            .iter()
+            .filter(|(key, _)| !cut(&claim, *key))
+            .cloned()
+            .collect();
+        let named: Vec<(SubstateKey, CrossingId)> = claim
+            .crossings
+            .iter()
+            .filter(|(key, _)| !cut(&claim, *key))
+            .copied()
+            .collect();
+        kept.push(StateClaim::new(claim.anchor, cells, claim.proof).naming(named));
+    }
+    Ok(kept)
+}
+
+/// A remote claim [`without_refused_reclaims`] keeps some cells of and
+/// cannot cut its proof down to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unrestricted {
+    /// The claim's anchor.
+    pub anchor: Anchor,
 }
 
 /// What each fee vault this shard holds is charged, judged against one
@@ -714,7 +748,7 @@ mod tests {
         fence: ReadFence,
         state_claims: Vec<StateClaim>,
         transactions: SharedTransactions,
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        finalizations: Vec<Verifiable<Finalization>>,
     }
 
     impl Block {
@@ -1597,7 +1631,7 @@ mod tests {
         );
 
         let mut block = Block::empty(ShardId::ROOT);
-        block.transactions = Arc::new(Capped::from_array([Arc::new(Verifiable::from(over))]));
+        block.transactions = Arc::new(Capped::from_array([Verifiable::from(over)]));
         assert_eq!(
             block.judged(&parent),
             Err(ParentRefusal::UncoveredPayer(vault))
@@ -1683,13 +1717,8 @@ mod tests {
         let carrying = |txs: &[Transaction]| {
             let mut block = Block::empty(ShardId::ROOT);
             block.transactions = Arc::new(
-                Capped::new(
-                    txs.iter()
-                        .cloned()
-                        .map(|tx| Arc::new(Verifiable::from(tx)))
-                        .collect(),
-                )
-                .expect("a few transactions"),
+                Capped::new(txs.iter().cloned().map(Verifiable::from).collect())
+                    .expect("a few transactions"),
             );
             block
         };
@@ -1706,7 +1735,7 @@ mod tests {
     fn a_block_its_payer_cannot_cover_is_refused() {
         let (tx, vault) = paid(301);
         let mut block = Block::empty(ShardId::ROOT);
-        block.transactions = Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx))]));
+        block.transactions = Arc::new(Capped::from_array([Verifiable::from(tx)]));
         assert_eq!(
             block.judged(&funded(vault, 1_000, 700)),
             Err(ParentRefusal::UncoveredPayer(vault))
@@ -1925,7 +1954,8 @@ mod tests {
                 &block.members,
                 &merged,
                 parent,
-            );
+            )
+            .expect("the fixture's claims restrict");
             assert!(
                 reclaimed(&cut, PRODUCER, block.members.committed).is_empty()
                     && !reads(&cut, record),
@@ -2070,13 +2100,211 @@ mod tests {
             &block.members,
             &outright,
             &parent,
-        );
+        )
+        .expect("the fixture's claims restrict");
         assert!(reclaimed(&cut, PRODUCER, block.members.committed).is_empty());
         assert!(!reads(
             &cut,
             id.answer_key(&ProtocolHasher, Answered::Never)
         ));
         assert!(reads(&cut, record));
+    }
+
+    /// A proposal names its lines over the claims it gathered, and a
+    /// voter over the claims the reclaim cut leaves. The cut takes only
+    /// the consumer's `Never` and the record read for its return alone,
+    /// and no row waits on a crossing its consumer answered `Never`, so
+    /// the two namings agree: a shared row waiting on another record the
+    /// same parent claim reads arrives, heads and runs over either.
+    #[test]
+    fn a_proposal_with_a_refused_reclaim_names_what_its_voter_checks() {
+        use hyperscale_engine::tick_select::ManifestInputs;
+        use hyperscale_storage::{MemberIndex, record_arrivals};
+        use hyperscale_types::test_utils::{TestCommittee, stub_abort_charge};
+        use hyperscale_types::{Joins, MemberTerms, Settlement, StatedTerms, TickLine};
+
+        use crate::action_handlers::Naming;
+        use crate::tick_members::BlockContent;
+
+        let (refused, waited) = (returnable(0), returnable(1));
+        let lands = producing(
+            &[refused, waited],
+            credit_cell(),
+            encode_amount(40).to_vec(),
+        );
+        let mut state_claims = parent_claims(&[refused, waited], &[], anchor(PRODUCER, 4), &lands);
+        state_claims.push(declined_at_a_boundary(&[refused]));
+        let members = MemberInputs {
+            committed: past(&declined_at_a_boundary(&[refused])),
+            ..MemberInputs::still(PRODUCER)
+        };
+        let mut outright = StateWrites::default();
+        outright
+            .cells
+            .insert(credit_cell(), Some(encode_amount(7).to_vec()));
+        let cut = without_refused_reclaims(state_claims.clone(), &members, &outright, &lands)
+            .expect("the fixture's claims restrict");
+        assert!(
+            !reads(&cut, refused.record_key(&ProtocolHasher)),
+            "the cut takes the refused record's reading",
+        );
+        assert!(reads(&cut, waited.record_key(&ProtocolHasher)));
+
+        // A shared row of the issuing transaction, paying elsewhere and
+        // waiting on the record the cut leaves.
+        let mut charge = stub_abort_charge(1);
+        charge.vault.owner = Address::new([0xC1; 31], AddressClass::Principal);
+        let terms = MemberTerms {
+            leg: false,
+            settlement: Settlement::Shared,
+            declared: Capped::empty(),
+            reach: Capped::from_array([CONSUMER]),
+            awaits: Capped::from_array([CONSUMER]),
+            engages: Capped::empty(),
+            crossings: Capped::from_array([waited]),
+            waits: false,
+            charge,
+            share: 0,
+            reserves: Capped::empty(),
+            staged: 0,
+        };
+        let deadline = Deadline::of(members.committed.plus(Duration::from_secs(60)));
+        let mut rows = MemberIndex::empty(PRODUCER);
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(issuing(), deadline)],
+            terms: vec![StatedTerms {
+                tx: issuing(),
+                terms,
+            }],
+            ..MemberInputs::still(PRODUCER)
+        });
+        assert_eq!(rows.members[&issuing()].queued, None, "its record is owed");
+
+        let snapshot = TestCommittee::new(4, 7).topology_snapshot(2);
+        let manifest = ManifestInputs::default();
+        let named = |claims: &[StateClaim]| -> Vec<TickLine> {
+            let mut committed = manifest.committed.clone();
+            committed.arrived.extend(record_arrivals(claims));
+            Naming {
+                parent: &rows,
+                content: BlockContent {
+                    shard: PRODUCER,
+                    height: BlockHeight::new(2),
+                    anchor: members.committed,
+                    windows: windows(),
+                    committee: &snapshot,
+                    crossing: &manifest.crossing,
+                },
+                certificates: &[],
+                records: &[],
+                claims,
+                manifest: &manifest,
+                committed: &committed,
+            }
+            .over(&[])
+            .lines
+        };
+        let proposed = named(&state_claims);
+        assert!(
+            proposed.iter().any(|line| matches!(
+                line,
+                TickLine::Member { tx, joins: Joins::Executes, .. } if *tx == issuing()
+            )),
+            "the waiting row arrives, heads and runs: {proposed:?}",
+        );
+        assert_eq!(named(&cut), proposed);
+    }
+
+    /// On a merged shard holding both ends of two crossings, whose
+    /// consumer's `Never` of one was read at a predecessor's boundary, the
+    /// cut takes that `Never` and the record read for its return alone,
+    /// which is an arrival; but no row waits on that crossing, so the cut
+    /// and the uncut claims leave every row's unarrived crossings alike,
+    /// and the row waiting on the other record arrives over either.
+    #[test]
+    fn a_merged_shards_cut_leaves_every_rows_arrivals_unchanged() {
+        use hyperscale_storage::{MemberIndex, record_arrivals};
+        use hyperscale_types::test_utils::stub_abort_charge;
+        use hyperscale_types::{MemberTerms, Settlement, StatedTerms};
+
+        const MERGED: ShardId = ShardId::ROOT;
+        let (refused, waited) = (returnable(0), returnable(1));
+        let lands = producing(
+            &[refused, waited],
+            credit_cell(),
+            encode_amount(40).to_vec(),
+        );
+        let mut state_claims = parent_claims(&[refused, waited], &[], anchor(MERGED, 4), &lands);
+        let declined = declined_at_a_boundary(&[refused]);
+        assert_ne!(declined.anchor.shard, MERGED, "read at a predecessor");
+        state_claims.push(declined.clone());
+        let members = MemberInputs {
+            committed: past(&declined),
+            ..MemberInputs::still(MERGED)
+        };
+        let mut outright = StateWrites::default();
+        outright
+            .cells
+            .insert(credit_cell(), Some(encode_amount(7).to_vec()));
+        let cut = without_refused_reclaims(state_claims.clone(), &members, &outright, &lands)
+            .expect("the fixture's claims restrict");
+        let (uncut_arrivals, cut_arrivals) =
+            (record_arrivals(&state_claims), record_arrivals(&cut));
+        assert!(
+            uncut_arrivals.contains(&(refused.record_key(&ProtocolHasher), issuing()))
+                && !cut_arrivals.contains(&(refused.record_key(&ProtocolHasher), issuing())),
+            "the cut takes the refused record's arrival",
+        );
+        assert!(cut_arrivals.contains(&(waited.record_key(&ProtocolHasher), issuing())));
+
+        // The issuing transaction's row, waiting on the record the cut
+        // leaves, on the merged shard; none waits on the refused one.
+        let terms = MemberTerms {
+            leg: false,
+            settlement: Settlement::Shared,
+            declared: Capped::empty(),
+            reach: Capped::from_array([CONSUMER]),
+            awaits: Capped::from_array([CONSUMER]),
+            engages: Capped::empty(),
+            crossings: Capped::from_array([waited]),
+            waits: false,
+            charge: stub_abort_charge(1),
+            share: 0,
+            reserves: Capped::empty(),
+            staged: 0,
+        };
+        let deadline = Deadline::of(members.committed.plus(Duration::from_secs(60)));
+        let mut rows = MemberIndex::empty(MERGED);
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(issuing(), deadline)],
+            terms: vec![StatedTerms {
+                tx: issuing(),
+                terms,
+            }],
+            ..MemberInputs::still(MERGED)
+        });
+        let unarrived = |arrivals| {
+            let mut after = rows.clone();
+            after.advance(&MemberInputs {
+                height: BlockHeight::new(2),
+                arrivals,
+                ..MemberInputs::still(MERGED)
+            });
+            after
+                .members
+                .into_values()
+                .map(|row| (row.tx, row.waiting.map(|waiting| waiting.unarrived)))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let (uncut, cut) = (unarrived(uncut_arrivals), unarrived(cut_arrivals));
+        assert_eq!(uncut, cut);
+        assert_eq!(
+            uncut[&issuing()].as_ref().map(|left| left.len()),
+            Some(0),
+            "the waiting row arrives over either"
+        );
     }
 
     /// A proposer cuts from its claims every owed record whose `Taken`

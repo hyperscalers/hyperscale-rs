@@ -23,7 +23,6 @@
 //! validator decides identically when to re-broadcast or evict.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
@@ -44,7 +43,7 @@ pub struct OutboundCertMemoryStats {
 
 /// A single tracked outbound EC for one (tick, `target_shard`) destination.
 struct OutboundCertEntry {
-    certificate: Arc<Verified<ExecutionCertificate>>,
+    certificate: Verified<ExecutionCertificate>,
     target_shard: ShardId,
     recipients: Vec<ValidatorId>,
     /// Hard deadline past which the EC is provably useless: every tx in the
@@ -62,7 +61,7 @@ pub struct RebroadcastDirective {
     /// Shard the EC should be re-broadcast to.
     pub(crate) target_shard: ShardId,
     /// The verified execution certificate to re-broadcast.
-    pub(crate) certificate: Arc<Verified<ExecutionCertificate>>,
+    pub(crate) certificate: Verified<ExecutionCertificate>,
     /// Per-shard recipients (peer pool) for the broadcast.
     pub(crate) recipients: Vec<ValidatorId>,
 }
@@ -104,7 +103,7 @@ impl OutboundExecutionCertificateTracker {
     /// and pace the first re-broadcast off that.
     pub(crate) fn on_broadcast(
         &mut self,
-        certificate: Arc<Verified<ExecutionCertificate>>,
+        certificate: Verified<ExecutionCertificate>,
         target_shard: ShardId,
         recipients: Vec<ValidatorId>,
         now: WeightedTimestamp,
@@ -184,7 +183,7 @@ impl OutboundExecutionCertificateTracker {
                 entry.rebroadcast_count += 1;
                 directives.push(RebroadcastDirective {
                     target_shard: entry.target_shard,
-                    certificate: Arc::clone(&entry.certificate),
+                    certificate: entry.certificate.clone(),
                     recipients: entry.recipients.clone(),
                 });
             }
@@ -224,22 +223,22 @@ mod tests {
         TickId::new(ShardId::leaf(2, local), BlockHeight::new(h))
     }
 
-    fn cert(tick_id: TickId) -> Arc<Verified<ExecutionCertificate>> {
+    fn cert(tick_id: TickId) -> Verified<ExecutionCertificate> {
         cert_at(tick_id, WeightedTimestamp::ZERO)
     }
 
     fn cert_at(
         tick_id: TickId,
         vote_anchor_ts: WeightedTimestamp,
-    ) -> Arc<Verified<ExecutionCertificate>> {
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+    ) -> Verified<ExecutionCertificate> {
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             vote_anchor_ts,
             GlobalReceiptRoot::from_raw(Hash::ZERO),
             Capped::empty(),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        )))
+        ))
     }
 
     fn vids(ids: &[u64]) -> Vec<ValidatorId> {

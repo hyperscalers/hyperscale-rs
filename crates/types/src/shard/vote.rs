@@ -9,7 +9,7 @@ use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeight, BlockVoteMessage, ConsensusPublicKey, ConsensusSignature,
+    BlockHash, BlockHeight, BlockVoteMessage, ConsensusPublicKey, ConsensusSignature, Epoch,
     NetworkDefinition, ProposerTimestamp, Round, ShardId, ValidatorId, Verified, Verify,
     signed_bytes,
 };
@@ -21,6 +21,7 @@ pub struct BlockVote {
     shard_id: ShardId,
     height: BlockHeight,
     round: Round,
+    committee_epoch: Epoch,
     voter: ValidatorId,
     signature: ConsensusSignature,
     timestamp: ProposerTimestamp,
@@ -32,7 +33,7 @@ impl BlockVote {
     /// # Errors
     ///
     /// Propagates [`SignError`] when the signer cannot sign.
-    #[allow(clippy::too_many_arguments)] // mirrors the 7 stored fields plus the network identity
+    #[allow(clippy::too_many_arguments)] // mirrors the 8 stored fields plus the network identity
     pub fn new(
         network: &NetworkDefinition,
         block_hash: BlockHash,
@@ -40,6 +41,7 @@ impl BlockVote {
         shard_id: ShardId,
         height: BlockHeight,
         round: Round,
+        committee_epoch: Epoch,
         voter: ValidatorId,
         signer: &dyn Signer,
         timestamp: ProposerTimestamp,
@@ -51,6 +53,7 @@ impl BlockVote {
                 round,
                 block_hash,
                 parent_block_hash,
+                committee_epoch,
             },
             network,
         );
@@ -60,6 +63,7 @@ impl BlockVote {
             shard_id,
             height,
             round,
+            committee_epoch,
             voter,
             signature,
             timestamp,
@@ -68,12 +72,14 @@ impl BlockVote {
 
     /// Build a `BlockVote` from its parts without re-signing. Caller is
     /// responsible for the signature being valid for the other fields.
+    #[allow(clippy::too_many_arguments)] // mirrors the 8 stored fields
     #[must_use]
     pub const fn from_parts(
         block_hash: BlockHash,
         shard_id: ShardId,
         height: BlockHeight,
         round: Round,
+        committee_epoch: Epoch,
         voter: ValidatorId,
         signature: ConsensusSignature,
         timestamp: ProposerTimestamp,
@@ -83,6 +89,7 @@ impl BlockVote {
             shard_id,
             height,
             round,
+            committee_epoch,
             voter,
             signature,
             timestamp,
@@ -113,6 +120,14 @@ impl BlockVote {
         self.round
     }
 
+    /// The epoch keying the window whose committee the voter belongs to
+    /// for this block. Signed: a collector tallies only votes naming the
+    /// epoch it latched.
+    #[must_use]
+    pub const fn committee_epoch(&self) -> Epoch {
+        self.committee_epoch
+    }
+
     /// Validator who cast this vote.
     #[must_use]
     pub const fn voter(&self) -> ValidatorId {
@@ -141,6 +156,7 @@ impl BlockVote {
         ShardId,
         BlockHeight,
         Round,
+        Epoch,
         ValidatorId,
         ConsensusSignature,
         ProposerTimestamp,
@@ -150,6 +166,7 @@ impl BlockVote {
             self.shard_id,
             self.height,
             self.round,
+            self.committee_epoch,
             self.voter,
             self.signature,
             self.timestamp,
@@ -176,6 +193,7 @@ impl BlockVote {
                 round: self.round,
                 block_hash: self.block_hash,
                 parent_block_hash: *parent_block_hash,
+                committee_epoch: self.committee_epoch,
             },
             network,
         )
@@ -257,7 +275,7 @@ impl Verified<BlockVote> {
     /// # Errors
     ///
     /// Propagates [`SignError`] when the signer cannot sign.
-    #[allow(clippy::too_many_arguments)] // mirrors the 7 stored fields plus the network identity
+    #[allow(clippy::too_many_arguments)] // mirrors the 8 stored fields plus the network identity
     pub fn sign_local(
         network: &NetworkDefinition,
         block_hash: BlockHash,
@@ -265,6 +283,7 @@ impl Verified<BlockVote> {
         shard_id: ShardId,
         height: BlockHeight,
         round: Round,
+        committee_epoch: Epoch,
         voter: ValidatorId,
         signer: &dyn Signer,
         timestamp: ProposerTimestamp,
@@ -280,6 +299,7 @@ impl Verified<BlockVote> {
             shard_id,
             height,
             round,
+            committee_epoch,
             voter,
             signer,
             timestamp,
@@ -348,6 +368,7 @@ mod tests {
                 round: Round::INITIAL,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                committee_epoch: Epoch::GENESIS,
             },
             &net,
         );
@@ -361,6 +382,7 @@ mod tests {
                     ShardId::ROOT,
                     BlockHeight::new(1),
                     Round::INITIAL,
+                    Epoch::GENESIS,
                     ValidatorId::new(i),
                     signature,
                     ProposerTimestamp::ZERO,
@@ -387,6 +409,7 @@ mod tests {
                 round: Round::INITIAL,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                committee_epoch: Epoch::GENESIS,
             },
             &net,
         );
@@ -399,6 +422,7 @@ mod tests {
                 ShardId::ROOT,
                 BlockHeight::new(1),
                 Round::INITIAL,
+                Epoch::GENESIS,
                 ValidatorId::new(i),
                 signature,
                 ProposerTimestamp::ZERO,

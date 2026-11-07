@@ -19,14 +19,12 @@
 //! certificate is refuted too while this replica's beacon lacks its
 //! signer's window, and this replica's view does not move while it cannot
 //! verify the network's certificates, so the latch has to lapse on the
-//! clock and on the schedule as well as on the view. A slot whose results
-//! never return is reclaimed after [`CLAIM_STALE_AFTER`].
+//! clock and on the schedule as well as on the view. A slot whose result
+//! never returns is reclaimed after [`CLAIM_STALE_AFTER`].
 //!
-//! A refuted claim costs at most two pairings and one per window its walk
-//! tries, which the coordinator bounds by `SYNC_CLAIM_WALK_DEPTH`; every
-//! pairing is dispatched one at a time per carrier. So each carrier costs
-//! this replica at most `2 + SYNC_CLAIM_WALK_DEPTH` pairings per interval,
-//! and the carriers are bounded by twice the validator set.
+//! A claim is checked under the one committee its certificate names, so
+//! each carrier costs this replica one pairing per interval, and the
+//! carriers are bounded by twice the validator set.
 //!
 //! A timeout's or an announcement's signature does not cover the whole
 //! certificate it carries, so a relay can swap a forgery into a
@@ -41,13 +39,13 @@ use std::time::Duration;
 
 use hyperscale_core::SyncClaimId;
 use hyperscale_types::{
-    Epoch, Hash, LocalTimestamp, QuorumCertificate, Round, VIEW_CHANGE_TIMEOUT_DEFAULT,
+    Epoch, LocalTimestamp, QuorumCertificate, Round, VIEW_CHANGE_TIMEOUT_DEFAULT,
     VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, Verified,
 };
 
 /// How long a claim holds its carrier's slot without an answer. A claim
-/// waits one crypto pool round trip per committee tried; one the longest
-/// round timer has not seen answered lost its results.
+/// waits one crypto pool round trip; one the longest round timer has not
+/// seen answered lost its result.
 const CLAIM_STALE_AFTER: Duration = VIEW_CHANGE_TIMEOUT_MAX;
 
 /// How long a carrier whose claim was refuted waits before its next one is
@@ -69,43 +67,11 @@ pub enum Carrier {
     Relayer(ValidatorId),
 }
 
-/// The windows still to try for a claim, from `next` down to `floor`, once
-/// every committee tried so far refutes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EpochWalk {
-    pub next: Epoch,
-    pub floor: Epoch,
-}
-
-impl EpochWalk {
-    /// The walk from `top` down to `floor`, or `None` when that is empty.
-    pub fn down(top: Epoch, floor: Epoch) -> Option<Self> {
-        (top >= floor).then_some(Self { next: top, floor })
-    }
-
-    /// The window to try next, and the walk that remains after it.
-    pub fn step(self) -> (Epoch, Option<Self>) {
-        let rest = (self.next > self.floor).then(|| Self {
-            next: self.next.saturating_sub(1),
-            floor: self.floor,
-        });
-        (self.next, rest)
-    }
-}
-
-/// A claim whose verifications are in flight.
+/// A claim whose verification is in flight.
 struct InFlightClaim {
     id: SyncClaimId,
     qc: QuorumCertificate,
-    /// Verifications still to answer.
-    outstanding: usize,
-    /// Whether one of them has already verified.
-    verified: bool,
-    /// The committees tried, as digests of what a verification reads, so a
-    /// window that seats one of them again is not tried twice.
-    tried: Vec<Hash>,
-    walk: Option<EpochWalk>,
-    /// When the last verification was dispatched, on the local clock.
+    /// When the verification was dispatched, on the local clock.
     since: LocalTimestamp,
 }
 
@@ -119,18 +85,14 @@ struct Refutation {
 /// What a verification result means for its claim.
 #[derive(Debug)]
 pub enum ClaimOutcome {
-    /// The first committee to verify the claim: sync toward it.
+    /// The claim verified: sync toward it.
     Verified(Verified<QuorumCertificate>),
-    /// Every committee tried refuted it and the walk has windows left: try
-    /// the next through [`SyncClaims::walk_of`].
-    Retry(SyncClaimId),
-    /// Every committee refuted it.
+    /// The claim did not verify.
     Refuted {
         carrier: Carrier,
         qc: QuorumCertificate,
     },
-    /// Nothing to act on: other committees are still out, the claim was
-    /// verified already, or it is no longer held.
+    /// Nothing to act on: the claim is no longer held.
     Pending,
 }
 
@@ -201,66 +163,23 @@ impl SyncClaims {
                 .any(|claim| claim.live(now) && &claim.qc == qc)
     }
 
-    /// Hold `qc` from `carrier` while one verification per committee in
-    /// `tried` runs, with `walk` to try once they all refute. Replaces a
+    /// Hold `qc` from `carrier` while its verification runs. Replaces a
     /// stale claim from the same carrier, and drops every other stale one.
     pub fn track(
         &mut self,
         carrier: Carrier,
         qc: QuorumCertificate,
-        tried: Vec<Hash>,
-        walk: Option<EpochWalk>,
         now: LocalTimestamp,
     ) -> SyncClaimId {
         self.in_flight.retain(|_, claim| claim.live(now));
         let id = SyncClaimId(self.next_id);
         self.next_id += 1;
-        self.in_flight.insert(
-            carrier,
-            InFlightClaim {
-                id,
-                qc,
-                outstanding: tried.len(),
-                verified: false,
-                tried,
-                walk,
-                since: now,
-            },
-        );
+        self.in_flight
+            .insert(carrier, InFlightClaim { id, qc, since: now });
         id
     }
 
-    /// Claim `id`'s certificate, the walk left to it and the committees it
-    /// has tried, for the caller to find the next window to try.
-    pub fn walk_of(
-        &self,
-        id: SyncClaimId,
-    ) -> Option<(QuorumCertificate, Option<EpochWalk>, Vec<Hash>)> {
-        let claim = self.in_flight.values().find(|claim| claim.id == id)?;
-        Some((claim.qc.clone(), claim.walk, claim.tried.clone()))
-    }
-
-    /// Record how far claim `id`'s walk got: `walk` is what remains, and
-    /// `dispatched` the digest of the committee now being tried, if any.
-    pub fn resume_walk(
-        &mut self,
-        id: SyncClaimId,
-        walk: Option<EpochWalk>,
-        dispatched: Option<Hash>,
-        now: LocalTimestamp,
-    ) {
-        let Some(claim) = self.in_flight.values_mut().find(|claim| claim.id == id) else {
-            return;
-        };
-        claim.walk = walk;
-        if let Some(digest) = dispatched {
-            claim.tried.push(digest);
-            claim.outstanding = 1;
-            claim.since = now;
-        }
-    }
-
-    /// One committee answered claim `id`, in `view`.
+    /// Claim `id`'s verification answered, in `view`.
     pub fn on_result(
         &mut self,
         id: SyncClaimId,
@@ -268,30 +187,20 @@ impl SyncClaims {
         view: Round,
         now: LocalTimestamp,
     ) -> ClaimOutcome {
-        let Some((&carrier, claim)) = self.in_flight.iter_mut().find(|(_, c)| c.id == id) else {
+        let Some(carrier) = self
+            .in_flight
+            .iter()
+            .find_map(|(carrier, claim)| (claim.id == id).then_some(*carrier))
+        else {
             return ClaimOutcome::Pending;
         };
-        claim.outstanding = claim.outstanding.saturating_sub(1);
-        let first = match result {
-            Some(verified) if !claim.verified => {
-                claim.verified = true;
-                self.last_verified = Some(verified.clone());
-                Some(verified)
-            }
-            _ => None,
-        };
-        if claim.outstanding > 0 {
-            return first.map_or(ClaimOutcome::Pending, ClaimOutcome::Verified);
-        }
-        if !claim.verified && claim.walk.is_some() {
-            return ClaimOutcome::Retry(id);
-        }
         let claim = self
             .in_flight
             .remove(&carrier)
-            .expect("the claim was just read");
-        if claim.verified {
-            return first.map_or(ClaimOutcome::Pending, ClaimOutcome::Verified);
+            .expect("the claim was just found");
+        if let Some(verified) = result {
+            self.last_verified = Some(verified.clone());
+            return ClaimOutcome::Verified(verified);
         }
         self.refuted
             .retain(|_, refutation| refutation.holds(view, now));
@@ -306,7 +215,8 @@ impl SyncClaims {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeight, ShardId, SignerBitfield, WeightedTimestamp,
+        AggregateSignature, BlockHash, BlockHeight, Hash, ShardId, SignerBitfield,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -318,15 +228,11 @@ mod tests {
             BlockHeight::new(7),
             BlockHash::ZERO,
             Round::new(7),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         )
-    }
-
-    /// `n` distinct committee digests.
-    fn tried(n: u8) -> Vec<Hash> {
-        (0..n).map(|i| Hash::from_bytes(&[i])).collect()
     }
 
     const NOW: LocalTimestamp = LocalTimestamp::ZERO;
@@ -334,14 +240,15 @@ mod tests {
     const A: Carrier = Carrier::Proposer(ValidatorId::new(1));
     const B: Carrier = Carrier::Relayer(ValidatorId::new(2));
 
-    /// A claim verified by one committee stays in flight until the other
-    /// answers, and its certificate is not dispatched again meanwhile; the
-    /// late refutation then changes nothing.
+    /// A verified claim frees its slot and is remembered, so a sync toward
+    /// it starts at once when it is cited again.
     #[test]
-    fn a_verified_claim_holds_its_slot_until_every_committee_answers() {
+    fn a_verified_claim_frees_its_slot_and_is_remembered() {
         let mut claims = SyncClaims::default();
         let cited = qc(b"cited");
-        let id = claims.track(A, cited.clone(), tried(2), None, NOW);
+        let id = claims.track(A, cited.clone(), NOW);
+        assert!(!claims.admits(A, &qc(b"other"), VIEW, NOW));
+        assert!(!claims.admits(B, &cited, VIEW, NOW));
 
         let verified = Verified::new_unchecked_for_test(cited.clone());
         assert!(matches!(
@@ -349,14 +256,11 @@ mod tests {
             ClaimOutcome::Verified(_)
         ));
         assert!(claims.is_verified(&cited));
-        assert!(!claims.admits(A, &qc(b"other"), VIEW, NOW));
-        assert!(!claims.admits(B, &cited, VIEW, NOW));
-
+        assert!(claims.admits(A, &qc(b"other"), VIEW, NOW));
         assert!(matches!(
             claims.on_result(id, None, VIEW, NOW),
             ClaimOutcome::Pending
         ));
-        assert!(claims.admits(A, &qc(b"other"), VIEW, NOW));
     }
 
     /// A refutation frees the slot but holds the carrier off for the rest
@@ -366,7 +270,7 @@ mod tests {
     fn a_refuted_carrier_waits_for_the_view_the_interval_or_the_schedule() {
         let mut claims = SyncClaims::default();
         claims.observe_schedule(Some(Epoch::new(1)));
-        let id = claims.track(A, qc(b"forged"), tried(1), None, NOW);
+        let id = claims.track(A, qc(b"forged"), NOW);
         assert!(matches!(
             claims.on_result(id, None, VIEW, NOW),
             ClaimOutcome::Refuted { carrier: A, .. }
@@ -390,7 +294,7 @@ mod tests {
         let mut claims = SyncClaims::default();
         let relayer = Carrier::Relayer(ValidatorId::new(5));
         let proposer = Carrier::Proposer(ValidatorId::new(5));
-        let id = claims.track(relayer, qc(b"swapped"), tried(1), None, NOW);
+        let id = claims.track(relayer, qc(b"swapped"), NOW);
         assert!(matches!(
             claims.on_result(id, None, VIEW, NOW),
             ClaimOutcome::Refuted { .. }
@@ -404,56 +308,24 @@ mod tests {
     fn a_certificate_in_flight_is_not_claimed_twice() {
         let mut claims = SyncClaims::default();
         let cited = qc(b"cited");
-        let _ = claims.track(A, cited.clone(), tried(1), None, NOW);
+        let _ = claims.track(A, cited.clone(), NOW);
         assert!(!claims.admits(B, &cited, VIEW, NOW));
         assert!(claims.admits(B, &qc(b"other"), VIEW, NOW));
     }
 
-    /// Once every committee refutes, the walk is offered before the claim
-    /// is refuted, and each window tried resets the claim's clock.
-    #[test]
-    fn the_walk_is_tried_after_every_other_committee_refutes() {
-        let mut claims = SyncClaims::default();
-        let walk = EpochWalk::down(Epoch::new(3), Epoch::new(2));
-        let id = claims.track(A, qc(b"cited"), tried(2), walk, NOW);
-        assert!(matches!(
-            claims.on_result(id, None, VIEW, NOW),
-            ClaimOutcome::Pending
-        ));
-        assert!(matches!(
-            claims.on_result(id, None, VIEW, NOW),
-            ClaimOutcome::Retry(retry) if retry == id
-        ));
-        let (_, remaining, held) = claims.walk_of(id).expect("held");
-        assert_eq!(remaining, walk);
-        assert_eq!(held.len(), 2);
-
-        let (epoch, rest) = remaining.expect("a window left").step();
-        assert_eq!(epoch, Epoch::new(3));
-        let later = NOW.plus(CLAIM_STALE_AFTER);
-        claims.resume_walk(id, rest, Some(tried(3).remove(2)), later);
-        assert!(!claims.admits(A, &qc(b"next"), VIEW, later));
-
-        claims.resume_walk(id, None, None, later);
-        assert!(matches!(
-            claims.on_result(id, None, VIEW, later),
-            ClaimOutcome::Refuted { .. }
-        ));
-    }
-
-    /// A claim whose results never return gives its slot back, and a
+    /// A claim whose result never returns gives its slot back, and a
     /// result for it that arrives after the slot was retaken reaches
     /// nothing.
     #[test]
     fn a_claim_never_answered_ages_out() {
         let mut claims = SyncClaims::default();
-        let stale = claims.track(A, qc(b"lost"), tried(1), None, NOW);
+        let stale = claims.track(A, qc(b"lost"), NOW);
         assert!(!claims.admits(A, &qc(b"next"), VIEW, NOW));
 
         let later = NOW.plus(CLAIM_STALE_AFTER);
         assert!(claims.admits(A, &qc(b"next"), VIEW, later));
         assert!(claims.admits(B, &qc(b"lost"), VIEW, later));
-        let fresh = claims.track(A, qc(b"next"), tried(1), None, later);
+        let fresh = claims.track(A, qc(b"next"), later);
         assert!(matches!(
             claims.on_result(stale, None, VIEW, later),
             ClaimOutcome::Pending

@@ -1,4 +1,4 @@
-//! Prometheus emission for the I/O loop.
+//! Prometheus emission for the shard loop.
 //!
 //! [`ShardLoop::record_prometheus`] runs on the shard's pinned thread on
 //! the metrics tick and emits every gauge this shard owns: sync and fetch

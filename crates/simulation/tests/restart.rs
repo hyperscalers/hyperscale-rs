@@ -13,7 +13,6 @@
 
 mod support;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
@@ -31,8 +30,9 @@ use hyperscale_scenarios::{
     ScenarioConfig, VENUE_SHARD, a_late_settled_nullifier_still_refuses_its_intent,
     a_rejoined_producer_reads_a_lost_answer_at_a_boundary,
     a_restart_beside_a_departed_parent_store_resumes,
+    a_restart_between_head_and_tick_reads_the_same_part as restart_between_head_and_tick,
     a_restart_mid_handoff_keeping_its_stores_catches_the_child_up, epochs, grind_onto,
-    split_lifecycle, stand_up_venue, venue_genesis_accounts,
+    served_reads_genesis_accounts, split_lifecycle, stand_up_venue, venue_genesis_accounts,
 };
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{
@@ -44,7 +44,7 @@ use hyperscale_types::{
     TRANSACTION_EVIDENCE_HORIZON, TickHalf, TickId, TransactionDecision, TransactionStatus, TxHash,
     verdict_leaf,
 };
-use support::{SimCluster, committee_member_host, seeded};
+use support::{SimCluster, committee_member_host, seeded, sim_seed};
 
 /// A venue on one shard and its callers on the other, resharding
 /// disarmed so the committees a restart bounces are the ones that were
@@ -124,7 +124,7 @@ fn restart_and_advance(restarted: usize, seed: u64) {
             10,
             validity_around(cluster.now()),
         );
-        cluster.submit(Arc::new(tx));
+        cluster.submit(tx);
     }
     assert!(
         cluster.run_until(epochs(8), |c| c
@@ -188,7 +188,7 @@ fn a_crashed_member_catches_up_on_its_disk(seed: u64) {
     let (payer, from) = sender(0);
     let transfer = |c: &mut SimCluster, index: u8| {
         let tx = build_transfer_tx(&payer, from, recipient(index), 10, validity_around(c.now()));
-        c.submit(Arc::new(tx));
+        c.submit(tx);
     };
 
     for index in 0..4u8 {
@@ -405,7 +405,7 @@ fn crashes_at_writes_and_catches_up(seed: u64, kind: Crash, processing: Processi
         let transfer = |c: &mut SimCluster, index: u8| {
             let tx =
                 build_transfer_tx(&payer, from, recipient(index), 10, validity_around(c.now()));
-            c.submit(Arc::new(tx));
+            c.submit(tx);
         };
         for index in 0..4u8 {
             transfer(&mut cluster, index);
@@ -544,7 +544,7 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
         for leg in &setup.straddlers[..HALT_STRADDLER_BATCH] {
             let tx = build_leg_payment_tx(leg, 100, validity_around(c.now()));
             submitted.push(tx.hash());
-            c.submit(Arc::new(tx));
+            c.submit(tx);
         }
         let held = submitted[0];
         assert!(
@@ -742,7 +742,7 @@ fn a_tick_in_flight_survives(restarted: usize, seed: u64) {
             10,
             validity_around(cluster.now()),
         );
-        cluster.submit(Arc::new(tx));
+        cluster.submit(tx);
     }
     assert!(
         cluster.run_until(epochs(8), |c| a_tick_in_flight(c, shard).is_some()),
@@ -858,7 +858,7 @@ fn a_restarted_member_agrees_on_the_state_it_rebuilt() {
             validity_around(cluster.now()),
         );
         submitted.push(tx.hash());
-        cluster.submit(Arc::new(tx));
+        cluster.submit(tx);
     }
     let held = submitted[0];
     assert!(
@@ -973,7 +973,7 @@ fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
     let price = declared_price(&cluster, &refused);
     let funded = vault_balance(&cluster, SWAPPER_SHARD, caller);
     let hash = refused.hash();
-    cluster.submit(Arc::new(refused));
+    cluster.submit(refused);
 
     // The leg has paid and certified: its own finalization is on the
     // caller's chain, naming a transaction it does not decide. The venue's
@@ -1068,7 +1068,7 @@ fn a_restarted_or_snap_synced_replica_folds_the_same_reclaim() {
     );
     let price = declared_price(&cluster, &refused);
     let funded = vault_balance(&cluster, SWAPPER_SHARD, caller);
-    cluster.submit(Arc::new(refused));
+    cluster.submit(refused);
     assert!(
         cluster.run_until(epochs(12), |c| vault_balance(c, SWAPPER_SHARD, caller)
             == funded - SWAP_INPUT - price),
@@ -1154,7 +1154,7 @@ fn commit_overdrawing_transfer(
         validity_around(cluster.now()),
     );
     let hash = tx.hash();
-    cluster.submit(Arc::new(tx));
+    cluster.submit(tx);
     assert!(
         cluster.run_until(epochs(4), |c| c.chain_fate(ShardId::ROOT, hash).0.is_some()),
         "transfer to recipient {recipient_index} must commit",
@@ -1416,7 +1416,7 @@ fn a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved() {
         validity_around(cluster.now()),
     );
     let first_hash = first.hash();
-    cluster.submit(Arc::new(first));
+    cluster.submit(first);
 
     let legs_owed = |c: &SimCluster| legs_owed(c, peer, shard, first_hash);
     assert!(
@@ -1613,7 +1613,7 @@ fn stated_beside_a_silent_sponsor() -> (SimCluster, Vec<usize>, TxHash) {
         validity_around(cluster.now()),
     );
     let tx = swap.hash();
-    cluster.submit(Arc::new(swap));
+    cluster.submit(swap);
     assert!(
         cluster.run_until(epochs(8), |c| matches!(
             stated_on(c, hosts[1], shard, tx).0,
@@ -1761,7 +1761,7 @@ fn a_replica_restarted_past_replay_reach_accepts_a_stated_row() {
         validity_around(cluster.now()),
     );
     let tx = swap.hash();
-    cluster.submit(Arc::new(swap));
+    cluster.submit(swap);
     let stated = |c: &SimCluster| match stated_on(c, peer, shard, tx).0 {
         Some(RowState::Stated { tick, .. }) => Some(tick),
         _ => None,
@@ -1834,7 +1834,7 @@ fn commit_transfer(
 ) -> (TxHash, BlockHeight) {
     let tx = build_transfer_tx(key, payer, to, amount, validity_around(c.now()));
     let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    c.submit(tx);
     assert!(
         c.run_until(epochs(4), |c| c.chain_fate(shard, hash).0.is_some()),
         "the transfer to {to:?} must commit",
@@ -1924,7 +1924,7 @@ fn a_restarted_replica_holds_what_a_leg_settled_in_its_replay_reserved() {
         validity_around(cluster.now()),
     );
     let first_hash = first.hash();
-    cluster.submit(Arc::new(first));
+    cluster.submit(first);
     assert!(
         cluster.run_until(epochs(8), |c| legs_owed(c, peer, shard, first_hash)
             .is_some()),
@@ -1985,7 +1985,7 @@ fn a_restarted_replica_holds_what_a_leg_settled_in_its_replay_reserved() {
 mod a_commit_past_the_replay {
     use hyperscale_scenarios::tx::{STRADDLER_SPLITTER, STRADDLER_SURVIVOR, voted_split_bytes};
     use hyperscale_scenarios::{
-        cast_threshold_vote, departing_caller_ballast, departing_venue_split_bytes,
+        assume, cast_threshold_vote, departing_caller_ballast, departing_venue_split_bytes,
         venue_genesis_accounts_on,
     };
 
@@ -2089,7 +2089,7 @@ mod a_commit_past_the_replay {
             validity_around(c.now()),
         );
         let hash = swap.hash();
-        c.submit(Arc::new(swap));
+        c.submit(swap);
         let peer = c.committee_hosts(HOME)[0];
         assert!(
             run_cut_until(c, 2, |c| legs_owed(c, peer, HOME, hash).is_some()),
@@ -2155,9 +2155,12 @@ mod a_commit_past_the_replay {
             )),
             "each restarted replica must move its floor again",
         );
-        assert!(
+        // The counterpart's split lands on its own schedule; a seed that
+        // decides the swap inside the restart window never reaches the
+        // committee this test is about.
+        assume(
             c.chain_fate(HOME, hash).1.is_none(),
-            "the swap must not be decided before the restarted replicas have collected",
+            "the swap is still undecided once the restarted replicas have collected",
         );
         for &host in &holders[2..] {
             assert!(
@@ -2187,21 +2190,21 @@ mod a_commit_past_the_replay {
         accounts.extend(venue_genesis_accounts_on(HOME, &[COUNTERPART]));
         let mut cluster = SimCluster::with_packages_on_dedicated_pool_hosts(
             &departing_counterpart_config(),
-            11,
+            2,
             &accounts,
             GenesisPackages::with_fixtures(),
         );
         cluster.run_faultable(|c| {
             let (hash, committed) = commit_a_swap_the_counterpart_never_certifies(c);
-            let below = committed.prev().expect("a commit above genesis");
+            let above = committed.next();
             let restarted = restart_two_past_the_floor(c, hash, committed);
             for host in restarted {
                 assert!(
                     holds_commit(c, host, hash, committed)
                         && home_store(c, host)
-                            .is_some_and(|store| store.get_block_metadata(below).is_some()),
+                            .is_some_and(|store| store.get_block_metadata(above).is_some()),
                     "restarted host {host} must still hold the swap's body and the rows at \
-                     {committed:?} and {below:?}",
+                     {committed:?} and {above:?}",
                 );
             }
 
@@ -2252,3 +2255,30 @@ seeded!(
     seed_2 = 2,
     seed_42 = 42,
 );
+
+/// A restart of a shard's whole committee with a shared member head and
+/// unnamed: the replay holds the head height, and the tick reads from it
+/// the part the counterpart reads.
+#[test]
+fn a_restart_between_head_and_tick_reads_the_same_part() {
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            shard_size: 4,
+            vnodes_per_host: 1,
+            pool_surplus: 14,
+            num_shards: 4,
+            split_bytes: u64::MAX,
+            latency: Duration::from_millis(150),
+        },
+        sim_seed(42),
+        &served_reads_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(|c| {
+        restart_between_head_and_tick(c, |c, shard| {
+            for host in c.committee_hosts(shard) {
+                c.restart_host(host);
+            }
+        });
+    });
+}

@@ -215,8 +215,9 @@ fn advance_fullness(state: &mut BeaconState, readings: &BTreeMap<ShardId, FiveWa
 /// ready timeout) and replay witnesses against a watermark that
 /// already accounts for them. Genesis sits at `current_epoch =
 /// GENESIS` and the first apply is `epoch > GENESIS`, so strict `>` is
-/// the right bound. Tests sometimes skip slots, so we don't require
-/// strict-linear `epoch == current_epoch + 1`.
+/// the right bound. Strict-linear `epoch == current_epoch + 1` is not
+/// required here, but the seed ring requires it of every epoch it
+/// records, so a test that skips slots resets `state.seeds` first.
 #[allow(clippy::too_many_lines)] // sequential epoch-fold pipeline; each step is already a helper
 pub fn apply_epoch(
     verifier: &dyn Verifier,
@@ -878,7 +879,6 @@ fn ingest_fork_proofs(
             if !state.pending_recoveries.contains_key(&shard)
                 && proof.on_a_discarded_branch(
                     state.recoveries.get(&shard).into_iter().flatten().copied(),
-                    state.chain_config.epoch_windows(),
                 )
             {
                 continue;
@@ -1570,6 +1570,7 @@ mod tests {
             BlockHeight::new(height.saturating_sub(1)),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
@@ -1698,12 +1699,19 @@ mod tests {
 
     /// A QC naming `header` with weighted timestamp `wt`.
     fn qc_over(header: &BlockHeader, wt: u64) -> QuorumCertificate {
+        qc_signed_under(header, Epoch::GENESIS, wt)
+    }
+
+    /// A QC naming `header`, stating `committee_epoch` as the window its
+    /// signers signed under, with weighted timestamp `wt`.
+    fn qc_signed_under(header: &BlockHeader, committee_epoch: Epoch, wt: u64) -> QuorumCertificate {
         QuorumCertificate::new(
             header.hash(),
             header.shard_id(),
             header.height(),
             BlockHash::ZERO,
             Round::INITIAL,
+            committee_epoch,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(wt),
@@ -1969,6 +1977,18 @@ mod tests {
         block: (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>),
         qc_wt: u64,
     ) -> BTreeMap<ShardId, RevealChain> {
+        fold_alone_signed_under(state, shard, epoch, block, Epoch::GENESIS, qc_wt)
+    }
+
+    /// [`fold_alone`] under a QC whose signers signed `committee_epoch`.
+    fn fold_alone_signed_under(
+        state: &mut BeaconState,
+        shard: ShardId,
+        epoch: u64,
+        block: (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>),
+        committee_epoch: Epoch,
+        qc_wt: u64,
+    ) -> BTreeMap<ShardId, RevealChain> {
         let (header, payloads, _) = block;
         let (prior, chunk_end) = witness_chunk_bounds(state, shard, &header);
         let chunk = if chunk_end == prior {
@@ -1983,7 +2003,8 @@ mod tests {
                 usize::try_from(chunk_end).expect("fits"),
             )
         };
-        let (committed, contributions) = contribution_for(shard, header, chunk, qc_wt);
+        let (committed, contributions) =
+            contribution_signed_under(shard, header, chunk, committee_epoch, qc_wt);
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             state,
@@ -2295,6 +2316,7 @@ mod tests {
             terminal.height(),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(2_400),
@@ -2465,7 +2487,7 @@ mod tests {
         assert_eq!(state.latest_completed_recovery(shard), None);
 
         let fresh = boundary_block_with_witnesses(shard, 10, 2_900, root_of(b"fresh"), 7);
-        fold_alone(&mut state, shard, 4, fresh, 3_500);
+        fold_alone_signed_under(&mut state, shard, 4, fresh, Epoch::new(2), 3_500);
         assert_eq!(state.boundaries[&shard].height, BlockHeight::new(10));
         assert!(!state.pending_recoveries.contains_key(&shard));
         assert!(state.latest_completed_recovery(shard).is_some());
@@ -2666,8 +2688,12 @@ mod tests {
             }],
         );
         let fresh = TestCommittee::new(4, 1);
-        let proof =
-            fork_proof_between(shard, BlockHeight::new(5), (&fresh, 4_500), (&fresh, 4_500));
+        let proof = fork_proof_between(
+            shard,
+            BlockHeight::new(5),
+            (&fresh, 4, 4_500),
+            (&fresh, 4, 4_500),
+        );
         let committed = [(
             ValidatorId::new(0),
             BeaconProposal::new(
@@ -2690,7 +2716,7 @@ mod tests {
     fn a_fork_proof_rearms_from_the_window_before_the_bridge() {
         let shard = ShardId::leaf(1, 0);
         let fresh = TestCommittee::new(4, 1);
-        let flags = |ms| {
+        let flags = |epoch, ms| {
             let mut state = single_pool_state(4);
             state.chain_config.epoch_duration_ms = 1_000;
             state.recoveries.insert(
@@ -2701,7 +2727,12 @@ mod tests {
                     completed: true,
                 }],
             );
-            let proof = fork_proof_between(shard, BlockHeight::new(5), (&fresh, ms), (&fresh, ms));
+            let proof = fork_proof_between(
+                shard,
+                BlockHeight::new(5),
+                (&fresh, epoch, ms),
+                (&fresh, epoch, ms),
+            );
             let committed = [(
                 ValidatorId::new(0),
                 BeaconProposal::new(
@@ -2715,8 +2746,8 @@ mod tests {
             ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(4), &committed);
             state.fork_flagged.contains_key(&shard)
         };
-        assert!(flags(3_500));
-        assert!(!flags(2_500));
+        assert!(flags(4, 3_500));
+        assert!(!flags(2, 2_500));
     }
 
     /// A Skip epoch cannot drop an armed fork: the recovery pass runs on
@@ -3681,25 +3712,28 @@ mod tests {
     }
 
     /// Fold one crossing of `shard` at `height`, anchored at `anchor_ms`
-    /// and certified at `certified_ms`, as a committed proposal carries it
-    /// with no admission ahead of it.
+    /// and certified at `certified_ms` by a committee that signed
+    /// `committee_epoch`, as a committed proposal carries it with no
+    /// admission ahead of it.
     fn fold_crossing(
         state: &mut BeaconState,
         shard: ShardId,
         epoch: u64,
         height: u64,
         anchor_ms: u64,
+        committee_epoch: u64,
         certified_ms: u64,
     ) {
         let (b, payloads, range_proof) =
             boundary_block_with_payloads(shard, height, anchor_ms, StateRoot::ZERO, Vec::new());
-        let (committed, contributions) = contribution_for(
+        let (committed, contributions) = contribution_signed_under(
             shard,
             b,
             (
                 Capped::new(payloads).expect("a list written out in a test"),
                 Capped::new(range_proof).expect("a list written out in a test"),
             ),
+            Epoch::new(committee_epoch),
             certified_ms,
         );
         record_boundaries(
@@ -3739,11 +3773,11 @@ mod tests {
         );
         state.record_recovery(shard, Epoch::new(9), BlockHeight::new(3));
 
-        fold_crossing(&mut state, shard, 9, 5, 900, 9_100);
+        fold_crossing(&mut state, shard, 9, 5, 900, 10, 9_100);
         assert_eq!(state.boundaries[&shard].height, BlockHeight::new(5));
         assert!(!state.pending_recoveries.contains_key(&shard));
 
-        fold_crossing(&mut state, shard, 11, 7, 10_900, 11_100);
+        fold_crossing(&mut state, shard, 11, 7, 10_900, 10, 11_100);
         assert_eq!(state.boundaries[&shard].height, BlockHeight::new(7));
 
         let mut quiet = state.clone();
@@ -3756,7 +3790,7 @@ mod tests {
             &BTreeMap::new(),
             &BTreeSet::new(),
         );
-        fold_crossing(&mut state, shard, 12, 9, 4_900, 5_100);
+        fold_crossing(&mut state, shard, 12, 9, 4_900, 4, 5_100);
         assert_eq!(state.boundaries[&shard].height, BlockHeight::new(7));
         assert_eq!(
             state, quiet,
@@ -3764,26 +3798,28 @@ mod tests {
         );
     }
 
-    /// A fork proof on `shard` at `height`, one side signed by `a` dated
-    /// `a_ms` and the other by `b` dated `b_ms`.
+    /// A fork proof on `shard` at `height`, one side signed by `a` under
+    /// window `a_epoch` dated `a_ms` and the other by `b` under window
+    /// `b_epoch` dated `b_ms`.
     fn fork_proof_between(
         shard: ShardId,
         height: BlockHeight,
-        (a, a_ms): (&TestCommittee, u64),
-        (b, b_ms): (&TestCommittee, u64),
+        (a, a_epoch, a_ms): (&TestCommittee, u64, u64),
+        (b, b_epoch, b_ms): (&TestCommittee, u64, u64),
     ) -> ShardForkProof {
-        let side = |committee: &TestCommittee, ms| {
+        let side = |committee: &TestCommittee, epoch, ms| {
             let keys: Vec<_> = (0..4).map(|i| committee.signer(i)).collect();
             shard_fork_proof_signed_by(
                 &BlsVerifier,
                 &keys,
                 shard,
                 height,
+                Epoch::new(epoch),
                 WeightedTimestamp::from_millis(ms),
             )
         };
-        let ShardForkProof::ConflictingCommits { a, .. } = side(a, a_ms);
-        let ShardForkProof::ConflictingCommits { b, .. } = side(b, b_ms);
+        let ShardForkProof::ConflictingCommits { a, .. } = side(a, a_epoch, a_ms);
+        let ShardForkProof::ConflictingCommits { b, .. } = side(b, b_epoch, b_ms);
         ShardForkProof::ConflictingCommits { a, b }
     }
 
@@ -3866,8 +3902,8 @@ mod tests {
         let proof = fork_proof_between(
             ShardId::ROOT,
             BlockHeight::new(1_000),
-            (&replaced, 5_000),
-            (&replaced, 5_000),
+            (&replaced, 5, 5_000),
+            (&replaced, 5, 5_000),
         );
         assert_eq!(
             proof.verify(&BlsVerifier, &cleared_schedule(&replaced, &fresh)),
@@ -3889,8 +3925,8 @@ mod tests {
         let proof = fork_proof_between(
             ShardId::ROOT,
             BlockHeight::new(14),
-            (&replaced, 5_000),
-            (&fresh, 11_000),
+            (&replaced, 5, 5_000),
+            (&fresh, 11, 11_000),
         );
         assert_eq!(
             proof.verify(&BlsVerifier, &cleared_schedule(&replaced, &fresh)),
@@ -3909,8 +3945,8 @@ mod tests {
         let proof = fork_proof_between(
             ShardId::ROOT,
             BlockHeight::new(14),
-            (&replaced, 5_000),
-            (&replaced, 5_000),
+            (&replaced, 5, 5_000),
+            (&replaced, 5, 5_000),
         );
         let pending = ShardRecovery {
             cause: RecoveryCause::Halt,
@@ -3939,8 +3975,8 @@ mod tests {
         let proof = fork_proof_between(
             ShardId::ROOT,
             BlockHeight::new(14),
-            (&fresh, 11_000),
-            (&fresh, 11_000),
+            (&fresh, 11, 11_000),
+            (&fresh, 11, 11_000),
         );
         let state = folding_fork_proof(vec![completed_binding()], None, proof);
         assert_eq!(
@@ -4356,7 +4392,25 @@ mod tests {
         Vec<(ValidatorId, BeaconProposal)>,
         BTreeMap<ShardId, ShardEpochContribution>,
     ) {
-        let qc = qc_over(&header, qc_wt);
+        contribution_signed_under(shard, header, chunk, Epoch::GENESIS, qc_wt)
+    }
+
+    /// [`contribution_for`] under a QC whose signers signed
+    /// `committee_epoch`.
+    fn contribution_signed_under(
+        shard: ShardId,
+        header: BlockHeader,
+        chunk: (
+            Capped<Vec<ShardWitnessPayload>, MAX_WITNESSES_PER_SHARD>,
+            Capped<Vec<Hash>, MAX_RANGE_PROOF_NODES>,
+        ),
+        committee_epoch: Epoch,
+        qc_wt: u64,
+    ) -> (
+        Vec<(ValidatorId, BeaconProposal)>,
+        BTreeMap<ShardId, ShardEpochContribution>,
+    ) {
+        let qc = qc_signed_under(&header, committee_epoch, qc_wt);
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
             Vec::new(),

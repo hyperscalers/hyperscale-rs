@@ -22,6 +22,11 @@ pub mod genesis;
 pub mod members;
 pub mod packages;
 pub mod pending_chain;
+mod queue;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) use queue::serves_order;
+pub use queue::{Head, Place, QueueHolds, pinned_holds, served_from_head, served_rows};
 pub mod read_frontier;
 pub mod recovered_state;
 pub mod retention;

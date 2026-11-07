@@ -5,21 +5,16 @@
 //! the coordinator so the topology-only parts are unit-testable without a
 //! full driver fixture.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use hyperscale_core::ProvisionsRequest;
-use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    ConsensusPublicKey, ConsensusReceipt, DeclaredKey, DeclaredRange, ExecutionCertificate,
-    Finalization, ShardId, ShardTrie, SubstateKey, TickHalf, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, VoteCount, WeightedTimestamp,
+    ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, Finalization, ShardId, ShardTrie,
+    SubstateKey, TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
+    ValidatorId, Verifiable, VoteCount, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{CrossingCell, CrossingLeaf};
 use hyperscale_vm_types::ProtocolHasher;
-
-/// Per-shard recipient lists for provision broadcasting.
-pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
 
 /// The committee that attests a tick of `shard` anchored at `anchor_wt`
 /// — the one its votes address, its certificate's bitfield indexes, and
@@ -114,8 +109,8 @@ pub fn committee_public_keys_for_shard(
 /// replica pairs them identically. In block order.
 pub fn assign_participants(
     topology_snapshot: &TopologySnapshot,
-    transactions: &[Arc<Verifiable<Transaction>>],
-) -> Vec<(Arc<Verifiable<Transaction>>, BTreeSet<ShardId>)> {
+    transactions: &[Verifiable<Transaction>],
+) -> Vec<(Verifiable<Transaction>, BTreeSet<ShardId>)> {
     transactions
         .iter()
         .map(|tx| {
@@ -123,78 +118,9 @@ pub fn assign_participants(
                 .all_shards_for_transaction(tx)
                 .into_iter()
                 .collect();
-            (Arc::clone(tx), all_shards)
+            (tx.clone(), all_shards)
         })
         .collect()
-}
-
-/// One transaction's provision request: the locally owned read-set keys
-/// (fresh reads and read-modify-write priors) toward every remote
-/// participant.
-///
-/// The payer shard's bundle flows even with nothing to serve — it is
-/// the engagement evidence a counterpart demands before proposing the
-/// transaction — and a counterpart with nothing to serve emits an empty
-/// bundle to the payer alone: the engagement echo the payer's vote
-/// waits for. The gossip emit path broadcasts to every target; the
-/// fetch serve path narrows the same derivation to the requester.
-///
-/// `None` for a transaction this node could not route. A replica commits
-/// a certified block whose transactions name records it has never held,
-/// and their read sets come off a derivation only the nodes holding those
-/// records reach: this node has nothing to say about them, and a
-/// requester asks a peer that does.
-pub fn provision_request(
-    trie: &ShardTrie,
-    tx: &Verifiable<Transaction>,
-    local_shard: ShardId,
-) -> Option<ProvisionsRequest> {
-    if !tx.as_unverified().is_routed() {
-        return None;
-    }
-    let local_keys: Vec<SubstateKey> = tx
-        .routing()
-        .provision_keys
-        .iter()
-        .filter_map(DeclaredKey::cell)
-        .filter(|cell| trie.shard_for_prefix(cell.owner) == local_shard)
-        .collect();
-    let local_ranges: Vec<DeclaredRange> = tx
-        .routing()
-        .provision_keys
-        .iter()
-        .filter_map(DeclaredKey::range)
-        .filter(|range| trie.shard_for_prefix(range.owner) == local_shard)
-        .collect();
-    let payer_shard = trie.shard_for_prefix(tx.fee_payer());
-    // A shard that only takes delivery of the transaction never includes
-    // it, so no bundle goes there.
-    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
-    let targets: Vec<ShardId> =
-        if local_keys.is_empty() && local_ranges.is_empty() && payer_shard != local_shard {
-            // The engagement echo: a counterpart with nothing to serve still
-            // owes the payer its commitment of the transaction — the evidence
-            // the payer's vote waits for — and owes nobody else anything.
-            vec![payer_shard]
-        } else {
-            tx.routing()
-                .all_prefixes()
-                .into_iter()
-                .map(|prefix| trie.shard_for_prefix(prefix))
-                .filter(|&s| s != local_shard && classified.commits_at(s))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect()
-        };
-    if targets.is_empty() {
-        return None;
-    }
-    Some(ProvisionsRequest {
-        tx_hash: tx.hash(),
-        targets,
-        local_keys,
-        local_ranges,
-    })
 }
 
 /// The crossing records a finalization issued: every live record an
@@ -268,7 +194,7 @@ pub fn records_written(finalization: &Finalization) -> Vec<(TxHash, SubstateKey,
 /// trie.
 #[must_use]
 pub fn record_pushes(
-    finalizations: &[Arc<Verifiable<Finalization>>],
+    finalizations: &[Verifiable<Finalization>],
     trie: &ShardTrie,
     local: ShardId,
     claimants: impl Fn(TxHash, SubstateKey) -> BTreeSet<ShardId>,
@@ -288,109 +214,13 @@ pub fn record_pushes(
     pushes
 }
 
-/// Build provision requests and shard recipients for the block's
-/// cross-shard transactions: read sets only.
-///
-/// A transaction this node never routed is skipped: whether it crosses
-/// at all is a derivation only the nodes holding its records reach, and
-/// a proposer replaying its own block after a restart may hold none.
-///
-/// Returns `None` if nothing in the block owes anyone a bundle.
-pub fn build_provision_requests(
-    topology_snapshot: &TopologySnapshot,
-    transactions: &[Arc<Verifiable<Transaction>>],
-    signers: &BTreeSet<ValidatorId>,
-    local_shard: ShardId,
-) -> Option<(Vec<ProvisionsRequest>, ShardRecipients)> {
-    let mut provision_requests = Vec::new();
-    for tx in transactions {
-        if !tx.as_unverified().is_routed() || topology_snapshot.is_single_shard_transaction(tx) {
-            continue;
-        }
-        if let Some(request) = provision_request(topology_snapshot.shard_trie(), tx, local_shard) {
-            provision_requests.push(request);
-        }
-    }
-    if provision_requests.is_empty() {
-        return None;
-    }
-
-    let mut shard_recipients = HashMap::new();
-    for req in &provision_requests {
-        for &target_shard in &req.targets {
-            shard_recipients.entry(target_shard).or_insert_with(|| {
-                topology_snapshot
-                    .committee_for_shard(target_shard)
-                    .iter()
-                    .copied()
-                    .filter(|v| !signers.contains(v))
-                    .collect()
-            });
-        }
-    }
-
-    Some((provision_requests, shard_recipients))
-}
-
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::{self, TestCommittee};
-    use hyperscale_types::{
-        NetworkDefinition, PrincipalAddr, TimestampRange, ValidatorInfo, ValidatorSet,
-    };
+    use hyperscale_types::test_utils::TestCommittee;
+    use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet};
 
     use super::*;
-
-    /// A transaction this node never routed names no provisions: its
-    /// read set is a derivation it does not hold.
-    #[test]
-    fn an_unrouted_transaction_names_no_provisions() {
-        let topology = single_shard_topology(&TestCommittee::new(4, 1));
-        let payer = PrincipalAddr::new([0x42; 31]);
-        let signed = test_utils::stub_transaction(
-            payer,
-            &[payer.address()],
-            1,
-            TimestampRange::new(
-                WeightedTimestamp::ZERO,
-                WeightedTimestamp::from_millis(60_000),
-            ),
-        );
-        let unrouted = Verifiable::from(Transaction::new(signed.body().clone()));
-        assert!(!unrouted.as_unverified().is_routed());
-
-        assert!(provision_request(topology.shard_trie(), &unrouted, ShardId::ROOT).is_none());
-    }
-
-    /// A committed block holding a transaction this node never routed
-    /// owes no bundle for it, rather than reading the routing it lacks.
-    #[test]
-    fn a_block_of_an_unrouted_transaction_owes_no_bundle() {
-        let committee = TestCommittee::new(4, 1);
-        let topology = single_shard_topology(&committee);
-        let payer = PrincipalAddr::new([0x42; 31]);
-        let signed = test_utils::stub_transaction(
-            payer,
-            &[payer.address()],
-            1,
-            TimestampRange::new(
-                WeightedTimestamp::ZERO,
-                WeightedTimestamp::from_millis(60_000),
-            ),
-        );
-        let unrouted = Arc::new(Verifiable::from(Transaction::new(signed.body().clone())));
-
-        assert!(
-            build_provision_requests(
-                &topology,
-                &[unrouted],
-                &BTreeSet::from([committee.validator_id(0)]),
-                ShardId::ROOT,
-            )
-            .is_none()
-        );
-    }
 
     fn single_shard_topology(committee: &TestCommittee) -> TopologySnapshot {
         let validators: Vec<ValidatorInfo> = (0..committee.size())
@@ -450,22 +280,22 @@ mod tests {
     }
 
     /// A certificate of `tick` carrying `outcomes`.
-    fn certificate(tick: TickId, outcomes: Vec<TxOutcome>) -> StdArc<ExecutionCertificate> {
-        StdArc::new(ExecutionCertificate::new(
+    fn certificate(tick: TickId, outcomes: Vec<TxOutcome>) -> ExecutionCertificate {
+        ExecutionCertificate::new(
             tick,
             WeightedTimestamp::from_millis(3),
             GlobalReceiptRoot::ZERO,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     /// A finalization of `local`'s tick at height 3 carrying `certificate`
     /// and `receipts`.
     fn finalization(
         local: ShardId,
-        certificate: StdArc<ExecutionCertificate>,
+        certificate: ExecutionCertificate,
         receipts: Vec<StoredReceipt>,
     ) -> Finalization {
         Finalization::new(
@@ -565,7 +395,7 @@ mod tests {
         assert_eq!(trie.shard_for_prefix(home.consumer), local);
         let cell = |id: CrossingId, tx: TxHash| id.cell(tx, resource, 7, 9_000, Terms::Owed);
         let finalization = |seed: u8, id: CrossingId, key: SubstateKey| {
-            StdArc::new(Verifiable::from(finalization(
+            Verifiable::from(finalization(
                 local,
                 certificate(
                     TickId::new(local, BlockHeight::new(3)),
@@ -575,7 +405,7 @@ mod tests {
                     tx(seed),
                     vec![(key, Some(cell(id, tx(seed)).to_bytes()))],
                 )],
-            )))
+            ))
         };
         let pushes = record_pushes(
             &[
@@ -608,14 +438,14 @@ mod tests {
         assert_eq!(trie.shard_for_prefix(id.consumer), owner);
         let issuer = tx(0xD3);
         let cell = id.cell(issuer, ResourceAddr::new([0xE1; 31]), 7, 9_000, Terms::Owed);
-        let finalization = StdArc::new(Verifiable::from(finalization(
+        let finalization = Verifiable::from(finalization(
             local,
             certificate(
                 TickId::new(local, BlockHeight::new(3)),
                 vec![TxOutcome::new(issuer, SUCCEEDED.clone())],
             ),
             vec![receipt(issuer, vec![(key, Some(cell.to_bytes()))])],
-        )));
+        ));
         let pushes = record_pushes(&[finalization], &trie, local, |tx_hash, record| {
             assert_eq!((tx_hash, record), (issuer, key));
             BTreeSet::from([local, owner, sibling, departed])

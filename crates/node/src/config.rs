@@ -1,11 +1,11 @@
-//! Consolidated configuration for `NodeHost`.
+//! Consolidated configuration for a [`NodeHost`](crate::NodeHost).
 
 use std::time::Duration;
 
 use crate::fetch::FetchConfig;
 use crate::shard::consensus::BlockSyncConfig;
 
-/// Configuration for [`NodeHost`](crate::host::NodeHost).
+/// Configuration for [`NodeHost`](crate::NodeHost).
 ///
 /// Bundles all sub-component configs so runners can pass a single value.
 #[derive(Debug, Default, Clone)]
@@ -30,11 +30,10 @@ pub struct NodeConfig {
     pub batch: BatchConfig,
 }
 
-/// Batching thresholds for the I/O loop.
+/// Batching thresholds for the shard loops.
 ///
 /// Each batch has a maximum item count and a time window. The batch flushes
-/// when either limit is reached. Defaults match the previous hard-coded
-/// constants.
+/// when either limit is reached.
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
     /// Max items in the execution-vote verification batch.

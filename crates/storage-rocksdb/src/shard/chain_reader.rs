@@ -8,7 +8,7 @@ use hyperscale_storage::{BlockForSync, RecoveredState, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash,
-    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
+    Hash, Provision, ProvisionHash, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
     TxHash, Verifiable, Verified,
 };
 
@@ -22,7 +22,7 @@ impl ShardChainReader for RocksDbShardStorage {
         self.get_block_denormalized(height)
     }
 
-    fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+    fn provisions_at(&self, height: BlockHeight) -> Vec<Verifiable<Provision>> {
         let cf = self.cf();
         let provisions_cf = ProvisionsCf::handle(&cf);
         iter_from::<ProvisionsCf>(
@@ -31,7 +31,7 @@ impl ShardChainReader for RocksDbShardStorage {
             &(height, ProvisionHash::from_raw(Hash::ZERO)),
         )
         .take_while(|((at, _), _)| *at == height)
-        .map(|(_, provisions)| Arc::new(Verifiable::from(provisions)))
+        .map(|(_, provisions)| Verifiable::from(provisions))
         .collect()
     }
 

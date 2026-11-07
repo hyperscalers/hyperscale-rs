@@ -210,22 +210,10 @@ impl Verified<CertifiedBlock> {
     /// Panics if `block` is not structurally genesis.
     #[must_use]
     pub fn genesis_certified(block: Block) -> Self {
-        assert!(
-            block.is_genesis(),
-            "genesis pairing for a non-genesis block"
-        );
-        let block_hash = block.hash();
-        let base = block.header().parent_qc().clone();
-        let qc_for_block = QuorumCertificate::new(
-            block_hash,
-            base.shard_id(),
-            base.height(),
-            base.parent_block_hash(),
-            base.round(),
-            base.signers().clone(),
-            base.aggregated_signature(),
-            base.weighted_timestamp(),
-        );
+        let qc_for_block = block
+            .header()
+            .genesis_certifying_qc()
+            .expect("genesis pairing for a non-genesis block");
         // SAFETY: genesis-shape QC paired with a freshly-built local
         // genesis block; both inputs are verified by construction
         // (empty-input root compute + zero-signers QC).
@@ -393,6 +381,40 @@ impl Verified<CertifiedBlock> {
         Verified::<QuorumCertificate>::new_unchecked(self.block().header().parent_qc().clone())
     }
 
+    /// This block with the QC `child` pins over it in place of the copy it
+    /// holds: the canonical copy, which every replica committing the block
+    /// reads alike, since the child's hash binds it. Copies of one QC can
+    /// differ in their stamp and their signer bitfield, and the one a
+    /// replica cached is whichever reached it last.
+    ///
+    /// The pinned copy is trusted through `child`'s certificate, as
+    /// [`Self::parent_qc_attested`] trusts it: the child's signers verified
+    /// it before voting the child's header, its floor included. It is never
+    /// verified again here.
+    ///
+    /// # Errors
+    ///
+    /// [`LinkageError::BlockHashMismatch`] when `child` does not extend
+    /// this block.
+    pub fn pinned_by(&self, child: &Verified<CertifiedBlockHeader>) -> Result<Self, LinkageError> {
+        let pinned = child.header().parent_qc();
+        let block_hash = self.block().hash();
+        if pinned.block_hash() != block_hash || child.header().parent_block_hash() != block_hash {
+            return Err(LinkageError::BlockHashMismatch {
+                block_hash,
+                qc_block_hash: pinned.block_hash(),
+            });
+        }
+        // SAFETY: the child's verified QC attests its header, which binds
+        // `parent_qc` by hash; at least one honest signer verified it
+        // before voting.
+        let qc = Verified::<QuorumCertificate>::new_unchecked(pinned.clone());
+        Ok(Self::new_unchecked(CertifiedBlock {
+            block: self.block().clone(),
+            qc: qc.into(),
+        }))
+    }
+
     /// Project to the verified certified header — the block's header
     /// paired with its verified QC. Infallible: the
     /// [`Verified<CertifiedBlock>`] predicate already guarantees the QC
@@ -413,7 +435,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        AggregateSignature, Round, ShardId, SignerBitfield, StateRoot, ValidatorId,
+        AggregateSignature, Epoch, Round, ShardId, SignerBitfield, StateRoot, ValidatorId,
         WeightedTimestamp,
     };
 
@@ -436,6 +458,7 @@ mod tests {
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -468,6 +491,7 @@ mod tests {
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -498,6 +522,7 @@ mod tests {
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -531,6 +556,7 @@ mod tests {
             raw_qc.height(),
             raw_qc.parent_block_hash(),
             raw_qc.round(),
+            raw_qc.committee_epoch(),
             raw_qc.signers().clone(),
             raw_qc.aggregated_signature(),
             raw_qc.weighted_timestamp(),

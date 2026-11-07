@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use hyperscale_metrics::record_fetch_response_sent;
-use hyperscale_network::Verdict;
 use hyperscale_storage::BeaconChainReader;
 use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
 use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
@@ -26,7 +25,7 @@ use hyperscale_types::{
 /// this host's did.
 const EPOCHS_AHEAD: u64 = 2;
 
-type Proposals = BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>;
+type Proposals = BTreeMap<ValidatorId, Verified<BeaconProposal>>;
 
 /// Per-epoch cache of beacon proposals for inbound fetch serving.
 ///
@@ -60,7 +59,7 @@ impl BeaconProposalCache {
         &self,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     ) {
         let Some(in_flight) = self.beacon.latest_committed_epoch().map(Epoch::next) else {
             return;
@@ -78,33 +77,33 @@ impl BeaconProposalCache {
     }
 
     /// Admit a wire proposal: reuse a surviving `Verified` marker
-    /// (local dispatch), otherwise verify under `sender_pk` and drop on
-    /// failure. A proposal that fails is its sender's fault: it names its
-    /// own epoch and key, so no view of the chain makes an honest one fail.
+    /// (local dispatch), otherwise verify under `sender_pk`. The verified
+    /// proposal comes back for the beacon loop, which checks nothing
+    /// further; `None` is a proposal that failed, and that is its
+    /// sender's fault: it names its own epoch and key, so no view of the
+    /// chain makes an honest one fail.
     pub(crate) fn admit_wire(
         &self,
         verifier: &dyn Verifier,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: &Verifiable<BeaconProposal>,
+        proposal: Verifiable<BeaconProposal>,
         sender_pk: ConsensusPublicKey,
-    ) -> Verdict {
-        let admitted = if let Some(verified) = proposal.verified() {
-            verified.clone()
-        } else {
-            let ctx = BeaconProposalVerifyContext {
-                verifier,
-                network: &self.network,
-                epoch,
-                sender_pk,
-            };
-            match proposal.as_unverified().verify(&ctx) {
-                Ok(fresh) => fresh,
-                Err(_) => return Verdict::Reject,
+    ) -> Option<Verified<BeaconProposal>> {
+        let admitted = match proposal.into_verified() {
+            Ok(sealed) => sealed,
+            Err(raw) => {
+                let ctx = BeaconProposalVerifyContext {
+                    verifier,
+                    network: &self.network,
+                    epoch,
+                    sender_pk,
+                };
+                raw.verify(&ctx).ok()?
             }
         };
-        self.admit(from, epoch, Arc::new(admitted));
-        Verdict::Accept
+        self.admit(from, epoch, admitted.clone());
+        Some(admitted)
     }
 
     /// Serve an inbound fetch from the cache.
@@ -115,9 +114,7 @@ impl BeaconProposalCache {
             .expect("beacon proposal cache lock")
             .get(&req.epoch)
             .and_then(|proposals| proposals.get(&req.validator).cloned());
-        let response = GetBeaconProposalResponse::new(
-            held.map(|verified| Arc::new(Verifiable::from((*verified).clone()))),
-        );
+        let response = GetBeaconProposalResponse::new(held.map(Verifiable::from));
         record_fetch_response_sent("beacon_proposal", usize::from(response.proposal.is_some()));
         response
     }
@@ -138,14 +135,14 @@ mod tests {
         fn get_beacon_block_by_epoch(
             &self,
             _epoch: Epoch,
-        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+        ) -> Option<Verified<CertifiedBeaconBlock>> {
             None
         }
 
         fn get_beacon_block_by_hash(
             &self,
             _hash: BeaconBlockHash,
-        ) -> Option<Arc<Verified<CertifiedBeaconBlock>>> {
+        ) -> Option<Verified<CertifiedBeaconBlock>> {
             None
         }
 
@@ -157,9 +154,7 @@ mod tests {
             Some(Epoch::new(self.0.load(Ordering::Relaxed)))
         }
 
-        fn latest_committed(
-            &self,
-        ) -> Option<(Arc<Verified<CertifiedBeaconBlock>>, Arc<BeaconState>)> {
+        fn latest_committed(&self) -> Option<(Verified<CertifiedBeaconBlock>, Arc<BeaconState>)> {
             None
         }
     }
@@ -173,10 +168,8 @@ mod tests {
         (cache, chain)
     }
 
-    fn proposal() -> Arc<Verified<BeaconProposal>> {
-        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
-            VrfProof::new([0xAB; 96]),
-        )))
+    fn proposal() -> Verified<BeaconProposal> {
+        Verified::new_unchecked_for_test(BeaconProposal::vrf_only(VrfProof::new([0xAB; 96])))
     }
 
     fn served(cache: &BeaconProposalCache, epoch: u64, validator: u64) -> bool {

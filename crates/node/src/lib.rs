@@ -1,65 +1,68 @@
-//! Composite consensus node — state machine plus per-shard drivers.
+//! Composite consensus node — the replica state machine plus the drivers
+//! that run it.
 //!
 //! This crate is the integration point. It owns two concerns:
 //!
-//! - [`NodeStateMachine`] composes the per-domain coordinators (shard consensus,
-//!   execution, mempool, provisions, remote-headers, topology) into a
-//!   single deterministic state machine over `ProtocolEvent` inputs
-//!   and `Action` outputs.
-//! - [`host::NodeHost`] composes process-scoped resources ([`ProcessIo`])
-//!   plus one [`shard::ShardLoop`] per hosted shard, wrapping the
-//!   state machine with transport-dependent plumbing: network I/O,
-//!   thread-pool dispatch, timer scheduling, block-sync and per-payload
-//!   fetch sub-machines.
+//! - [`NodeStateMachine`] is one shard's replica: the shard consensus,
+//!   execution, mempool, provisions and remote-header coordinators, and
+//!   the beacon schedule they read, composed into a single deterministic
+//!   state machine over `ProtocolEvent` inputs and `Action` outputs.
+//! - [`NodeHost`] composes process-scoped resources ([`ProcessIo`]), the
+//!   host's one [`BeaconLoop`], and one [`ShardLoop`] per hosted shard,
+//!   wrapping each replica with transport-dependent plumbing: network I/O,
+//!   thread-pool dispatch, timer scheduling, block sync and per-payload
+//!   fetches.
+//!
+//! The loops take [`event`] inputs; [`bootstrap`], [`reshape`] and
+//! [`seating`] hold the sans-io sequencers and placement rules a runner
+//! drives around them.
 //!
 //! # Topology sharing
 //!
-//! The state machine owns the topology coordinator; per-shard drivers
-//! receive a [`SharedTopologySnapshot`] (an `ArcSwap<TopologyState>`)
-//! for inbound verification only. Cross-shard broadcasts and fetches
-//! encode their recipients in the emitted `Action` itself, so delegated
-//! handlers never need to read topology from the state machine.
+//! The beacon loop is the one writer of the topology the process
+//! publishes; shard loops and network handlers read it through a
+//! [`SharedTopologySnapshot`] (an `ArcSwap<TopologySnapshot>`) for inbound
+//! verification only. Cross-shard broadcasts and fetches encode their
+//! recipients in the emitted `Action` itself, so delegated handlers never
+//! need to read topology from the state machine.
 //!
 //! # Provision DA fallback
 //!
 //! Cross-shard provisions are gossiped optimistically; if a target shard
-//! misses the broadcast, the cross-shard `provision_serve` path answers
-//! `provision.request` from `RocksDB` and the historical JMT. Reads are
-//! bounded by the retention floor — `RETENTION_HORIZON` of weighted
-//! time behind the tip.
-//!
-//! [`ProcessIo`]: crate::process::ProcessIo
+//! misses the broadcast, the cross-shard provision serve answers
+//! `provision.request` from the shard's store and the historical JMT.
+//! Reads are bounded by the retention floor — `RETENTION_HORIZON` of
+//! weighted time behind the tip.
 
 mod batch_accumulator;
 mod beacon;
-pub mod beacon_loop;
 pub mod bootstrap;
 mod config;
 pub mod event;
 mod fetch;
-pub mod host;
-pub mod process;
+mod host;
+mod network_lane;
+mod process;
 mod replica;
 pub mod reshape;
-pub mod shard;
-pub mod startup;
-mod state;
+pub mod seating;
+mod serve;
+mod shard;
 mod sync;
 
+pub use beacon::BeaconLoop;
 pub use bootstrap::state_range_serve::serve_state_range_request;
 pub use bootstrap::witness_history_serve::serve_witness_history_request;
-pub use config::NodeConfig;
-pub use event::{Registration, RegistrationReply};
+pub use config::{BatchConfig, NodeConfig};
 pub use fetch::FetchConfig;
-pub use host::{HostedChain, NodeHost, ShardGenesis};
-pub use process::TxStatusCache;
-pub use replica::ReplicaConfig;
+pub use host::{
+    HostResources, HostedChain, NodeHost, ShardGenesis, attach_shard, chain_anchors, detach_shard,
+};
+pub use process::{ProcessIo, TxStatusCache};
+pub use replica::{NodeStateMachine, ReplicaConfig};
 pub use shard::consensus::{BlockSyncStateKind, BlockSyncStatus, serve_block_request};
-pub use shard::cross_shard::{
-    serve_local_certified_headers, serve_settled_txs_request, serve_state_proof_request,
-};
+pub use shard::cross_shard::serve_local_certified_headers;
 pub use shard::{
-    SharedTopologySnapshot, TimerOp, TimerOwner, installed_network_genesis_block,
-    network_genesis_block, timer_event,
+    ShardLoop, SharedTopologySnapshot, ThreadShardLoop, installed_network_genesis_block,
+    network_genesis_block,
 };
-pub use state::NodeStateMachine;

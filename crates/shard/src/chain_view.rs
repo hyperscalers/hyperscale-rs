@@ -286,13 +286,15 @@ impl<'a> ChainView<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
-        AggregateSignature, Block, BlockHeaderParts, BlockManifest, Hash, LocalTimestamp,
-        ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield, Transaction,
-        Verifiable, WeightedTimestamp, WitnessSources, test_utils,
+        AggregateSignature, Block, BlockHeaderParts, BlockManifest, Engagement, Epoch, Hash,
+        LocalTimestamp, ProposerTimestamp, Provision, QuorumCertificate, Round, ShardId,
+        SignerBitfield, Transaction, TxHash, Verifiable, WeightedTimestamp, WitnessSources,
+        test_utils,
     };
 
     use super::*;
@@ -422,8 +424,7 @@ mod tests {
         // still land in the dedup set even though an unassembled ancestor sits
         // between it and the walk start — otherwise a descendant could
         // re-include a transaction already present above the committed tip.
-        let tx: Arc<Verifiable<Transaction>> =
-            Arc::new(Verifiable::from(test_utils::test_transaction(7)));
+        let tx: Verifiable<Transaction> = Verifiable::from(test_utils::test_transaction(7));
         let tx_hash = tx.hash();
         let low = Block::Live {
             header: make_header(1, BlockHash::ZERO),
@@ -487,8 +488,7 @@ mod tests {
     /// uncommitted prefix.
     #[test]
     fn a_sync_admitted_ancestor_is_walked_for_its_names() {
-        let tx: Arc<Verifiable<Transaction>> =
-            Arc::new(Verifiable::from(test_utils::test_transaction(4)));
+        let tx: Verifiable<Transaction> = Verifiable::from(test_utils::test_transaction(4));
         let tx_hash = tx.hash();
         let low = Block::Live {
             header: make_header(1, BlockHash::ZERO),
@@ -508,6 +508,7 @@ mod tests {
             BlockHeight::new(1),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -548,6 +549,116 @@ mod tests {
                         .txs
                         .contains(&tx_hash),
                     "a sync-admitted ancestor's names must reach the dedup set",
+                );
+            },
+        );
+    }
+
+    /// The walk gathers what an ancestor's provisions engage: off the
+    /// parts a pending ancestor has received, assembled or not, and off
+    /// the kept list of a sealed certified one.
+    #[test]
+    fn the_chain_walk_gathers_every_ancestor_engagement() {
+        let part = |height: u64, seed: &[u8]| -> Verifiable<Provision> {
+            Verified::<Provision>::new_unchecked_for_test(Provision::dummy_at(
+                ShardId::leaf(1, 1),
+                ShardId::ROOT,
+                BlockHeight::new(height),
+                WeightedTimestamp::from_millis(height * 100),
+                TxHash::from(Hash::from_bytes(seed)),
+            ))
+            .into()
+        };
+        let carrying =
+            |height: u8, parent: BlockHash, carried: Verifiable<Provision>| Block::Live {
+                header: make_header(height, parent),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::from_array([carried])),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            };
+
+        let (sealed_part, assembled_part, received_part) = (
+            part(3, b"sealed ancestor"),
+            part(4, b"assembled ancestor"),
+            part(5, b"assembling ancestor"),
+        );
+        let low = carrying(1, BlockHash::ZERO, sealed_part.clone()).into_sealed();
+        let low_hash = low.hash();
+        let qc = QuorumCertificate::new(
+            low_hash,
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            Epoch::GENESIS,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        let certified: HashMap<BlockHash, Arc<Verified<CertifiedBlock>>> = HashMap::from([(
+            low_hash,
+            Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+                CertifiedBlock::new_unchecked(
+                    low,
+                    Verified::<QuorumCertificate>::new_unchecked_for_test(qc),
+                ),
+            )),
+        )]);
+
+        let middle_block = carrying(2, low_hash, assembled_part.clone());
+        let mut middle = PendingBlock::from_complete_block(
+            &middle_block,
+            vec![],
+            vec![assembled_part.clone()],
+            LocalTimestamp::ZERO,
+        );
+        middle.construct_block().expect("construct block");
+        let middle_hash = middle.header().hash();
+
+        let top_block = carrying(3, middle_hash, received_part.clone());
+        let manifest = PendingBlock::from_complete_block(
+            &top_block,
+            vec![],
+            vec![received_part.clone()],
+            LocalTimestamp::ZERO,
+        )
+        .manifest()
+        .clone();
+        let mut top =
+            PendingBlock::from_manifest(top_block.header().clone(), manifest, LocalTimestamp::ZERO);
+        let top_hash = top.header().hash();
+        assert!(top.add_provision(received_part.clone()));
+
+        let mut pending = PendingBlocks::new();
+        pending.insert(middle);
+        pending.insert(top);
+
+        run_view_over(
+            0,
+            BlockHash::ZERO,
+            StateRoot::ZERO,
+            &pending,
+            &certified,
+            None,
+            |view| {
+                assert!(
+                    view.get_pending(top_hash)
+                        .is_some_and(|p| p.block().is_none())
+                );
+                assert_eq!(
+                    QcChainSets::behind(view, top_hash)
+                        .engaged
+                        .into_keys()
+                        .collect::<BTreeSet<_>>(),
+                    [sealed_part, assembled_part, received_part]
+                        .iter()
+                        .map(|part| Engagement::of_part(part))
+                        .collect::<BTreeSet<_>>(),
                 );
             },
         );
@@ -637,6 +748,7 @@ mod tests {
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1000),

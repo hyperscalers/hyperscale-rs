@@ -65,7 +65,7 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHeight,
-        FrontierInputs, ResourceAddr, SweepFrontier, SyncHint,
+        FrontierInputs, ResourceAddr, SweepFrontier, SyncHint, WeightedTimestamp,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher, Terms, TxHash};
 
@@ -267,7 +267,7 @@ mod tests {
         // pass a tip the reader captured within a horizon's worth of
         // commits. A node's tick chain holds retention at or below any
         // tip its readers take; here the hold is genesis, for the run.
-        store.hold_retention_at(BlockHeight::new(0));
+        store.hold_retention_at(BlockHeight::new(0), WeightedTimestamp::MAX);
         let chain = Arc::new(PendingChain::new(
             Arc::new(store.clone()),
             BlockHeight::GENESIS,

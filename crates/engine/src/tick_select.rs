@@ -3,26 +3,39 @@
 //!
 //! A member joins when everything it needs has committed — its
 //! counterparts' bundles and the crossings its legs consume, and its
-//! payer's engagement wait over one way or the other — and no cell an
-//! in-flight leg holds provisionally refuses it. Every input is read off
-//! committed content at the block's parent, so two replicas at different
-//! committed tips name one list.
+//! payer's engagement wait over one way or the other — and the shard's
+//! queue lets it run. A member whose verdict a counterpart shares runs
+//! only once its row stands head: nothing placed before it on a key it
+//! pins conflicts with it, read both ways against a member still
+//! waiting and one way against one in flight or stated. Any other member
+//! runs only where nothing standing in the queue refuses its pins: no
+//! shared member placed and unresolved, and no leg in flight; a leg is
+//! also kept from running ahead of a waiting shared member it would
+//! refuse. A head that refuses someone and stays unnamed
+//! past its naming window is aborted. Every input is read off committed
+//! content at the block's parent, so two replicas at different committed
+//! tips name one list.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_effects_bridge::is_protocol_vault;
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_terminal_fated_hearing_rows;
-use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
-use hyperscale_types::{
-    AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, Decision,
-    DeclaredKey, DiscardCause, Evidence, Formed, Hears, Holds, Inclusion, Joins,
-    MAX_STAGED_RECEIPT_BYTES, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_STAGED_BYTES, MemberTerms, Mode,
-    ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, SiblingView,
-    Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
-    Value, WeightedTimestamp, Window, compatible, decide, staged_yes_bound,
-    tick_manifest_admits_block, tick_manifest_admits_members, value_of, verdict_leaf,
+use hyperscale_storage::{
+    MemberIndex, MemberRow, QueueHolds, RowState, committed_tx_cell_key, member_row_leaf,
+    pinned_holds, seat_leaf, served_from_head,
 };
+use hyperscale_types::{
+    AbortCharge, Anchor, BlockHeight, Crossings, Deadline, Decision, DeclaredKey, DiscardCause,
+    Evidence, Formed, Hash, Hears, Holds, Inclusion, Joins, MAX_STAGED_RECEIPT_BYTES,
+    MAX_TICK_LINES_PER_BLOCK, MAX_TICK_STAGED_BYTES, MemberTerms, Mode, NAMING_WINDOW, Pin, Pins,
+    PriceTable, Reach, RecoveryBands, Reserves, Role, Said, Settlement, ShardId, ShardTrie,
+    SiblingView, Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction,
+    TxHash, Value, WeightedTimestamp, Window, decide, is_protocol_vault, pins_of, said_at,
+    staged_yes_bound, tick_manifest_admits_block, tick_manifest_admits_members, value_of,
+    verdict_leaf,
+};
+#[cfg(test)]
+use hyperscale_types::{Address, CollectionId, ModeKind, compatible};
 use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
 
@@ -93,9 +106,13 @@ pub fn divided_requirements(
     // Every member admits the whole manifest, and admission resolves a
     // component call against the target's own record — a declared read
     // of its leaf, provisioned by the shard holding it. So a member waits
-    // for the commit-time bundle of every remote shard holding a
-    // component the transaction calls, which is where the records it
-    // cannot read itself arrive. A principal has no record to read, so a
+    // for the bundle of every remote shard holding a component the
+    // transaction calls, which is where the records it cannot read itself
+    // arrive. That shard serves a leg, which shares no verdict with its
+    // core, from the block committing the transaction, and a core
+    // sibling from the block making its member there head, so the leg's
+    // bundle never waits on the record the leg writes. A principal has no
+    // record to read, so a
     // transaction reaching only accounts waits on nobody here, and a
     // shard that only takes delivery commits nothing and sends no bundle.
     if let Some(trie) = classified.placement() {
@@ -124,7 +141,9 @@ pub fn divided_requirements(
     requirements
 }
 
-/// How unresolved legs are reaching the cells they claimed.
+/// How unresolved legs are reaching the cells they claimed: the
+/// scheduling relation over declared keys, which `Modes::refuses`
+/// holds over pins and is checked against.
 ///
 /// A cross-shard leg's local writes are provisional until its tick
 /// resolves. Whether that stops a later transaction depends entirely on
@@ -158,8 +177,9 @@ pub fn divided_requirements(
 /// over entries, and no point cell is an entry. Overlap alone decides
 /// nothing; what decides is whether the modes on the two sides can be in
 /// flight together.
+#[cfg(test)]
 #[derive(Debug, Default)]
-pub struct ProvisionalCells {
+pub(crate) struct ProvisionalCells {
     cells: BTreeMap<SubstateKey, BTreeSet<ModeKind>>,
     /// Modes held per collection, interval-insensitive: two intervals of
     /// one collection contend by mode alone, the conservative half of
@@ -170,6 +190,7 @@ pub struct ProvisionalCells {
     debited: BTreeSet<SubstateKey>,
 }
 
+#[cfg(test)]
 impl ProvisionalCells {
     /// Record how one unresolved leg declared it would reach each cell.
     pub fn claim(&mut self, declared: &[(DeclaredKey, Mode)]) {
@@ -192,13 +213,6 @@ impl ProvisionalCells {
                 }
             }
         }
-    }
-
-    /// Whether nothing is claimed — the common case, and worth
-    /// short-circuiting on since it spares every candidate the walk.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.cells.is_empty() && self.collections.is_empty()
     }
 
     /// Whether a candidate's declared access cannot be in flight beside
@@ -259,10 +273,16 @@ pub struct Judged<'a> {
     waits: bool,
     /// What its yes receipt can cost staged.
     staged: u64,
+    /// Whether its row stands head of the queue on every key it pins,
+    /// which a member a counterpart shares the verdict on needs before a
+    /// line runs it.
+    head: bool,
+    /// The height its row stood head at, off a row that carries one.
+    head_height: Option<BlockHeight>,
 }
 
 impl<'a> Judged<'a> {
-    /// What `terms` state.
+    /// What `terms` state, of a member whose row is not head.
     #[must_use]
     pub fn of(terms: &'a MemberTerms) -> Self {
         Self {
@@ -275,7 +295,15 @@ impl<'a> Judged<'a> {
             crossings: &terms.crossings,
             waits: terms.waits,
             staged: terms.staged,
+            head: false,
+            head_height: None,
         }
+    }
+
+    /// These terms, of a member whose row stands head.
+    #[must_use]
+    pub const fn headed(self) -> Self {
+        Self { head: true, ..self }
     }
 
     /// What `row`, standing `Pending`, carries from its committing
@@ -301,6 +329,8 @@ impl<'a> Judged<'a> {
             crossings: &row.crossings,
             waits: waiting.waits,
             staged: waiting.staged,
+            head: row.head.is_some(),
+            head_height: row.head.map(|head| head.height),
         }
     }
 
@@ -386,6 +416,20 @@ pub fn crossings_consumed(member: &Member) -> Crossings {
     .expect("a star's edges are capped")
 }
 
+/// Which half settles `member`: its own where no sibling's verdict can
+/// discard its effects, one it shares with its siblings where it is a
+/// whole or core member, and the one it awaits otherwise.
+#[must_use]
+pub fn settlement_of(member: &Member) -> Settlement {
+    if !member.abortable() {
+        Settlement::Alone
+    } else if matches!(member.role(), Role::Whole | Role::Core) {
+        Settlement::Shared
+    } else {
+        Settlement::Awaited
+    }
+}
+
 /// The terms of `member`, `tx`'s member classified under `trie`, priced
 /// at `prices`.
 ///
@@ -405,13 +449,7 @@ pub fn terms_of_member(
     let local = member.local();
     let classified = member.classified();
     let reach = remote(member.reach().iter().copied(), local);
-    let settlement = if !member.abortable() {
-        Settlement::Alone
-    } else if matches!(member.role(), Role::Whole | Role::Core) {
-        Settlement::Shared
-    } else {
-        Settlement::Awaited
-    };
+    let settlement = settlement_of(member);
     let (engages, crossings, waits) = if !member.reaches_beyond() {
         (Capped::empty(), Capped::empty(), false)
     } else if classified.decomposed() {
@@ -531,39 +569,19 @@ pub trait CommittedInputs {
     fn reshaping(&self, tx: TxHash) -> bool;
 }
 
-/// Whether a member can join a tick at `anchor`, and on what terms.
+/// Whether a member short of its deadline can run: it holds every bundle
+/// and crossing it requires, and a payer's counterparts have engaged.
 ///
-/// `None` while it waits: on a bundle or a crossing it requires, or on
-/// its payer's engagement short of `deadline`, the transaction's own.
-/// Past that deadline with a counterpart silent it joins, attested
-/// aborted.
+/// A member past its deadline never asks: [`select_members`] names it
+/// `Aborted`, running nothing, before its inputs are read.
 #[must_use]
-pub fn readiness(
-    tx: TxHash,
-    judged: &Judged<'_>,
-    deadline: Deadline,
-    anchor: WeightedTimestamp,
-    inputs: &dyn CommittedInputs,
-) -> Option<Joins> {
-    let provisioned = judged
+pub fn ready(tx: TxHash, judged: &Judged<'_>, inputs: &dyn CommittedInputs) -> bool {
+    judged
         .engages
         .iter()
         .all(|&shard| inputs.engaged(shard, tx))
-        && judged.records().all(|key| inputs.arrived(key, tx));
-    if !provisioned {
-        return None;
-    }
-    if !judged.waits {
-        return Some(Joins::Executes);
-    }
-    let silent = judged.reach.iter().any(|&shard| !inputs.engaged(shard, tx));
-    if !silent {
-        Some(Joins::Executes)
-    } else if deadline.passed(anchor) {
-        Some(Joins::ExecutesAborted)
-    } else {
-        None
-    }
+        && judged.records().all(|key| inputs.arrived(key, tx))
+        && (!judged.waits || judged.reach.iter().all(|&shard| inputs.engaged(shard, tx)))
 }
 
 /// Committed inputs as the sets a coordinator gathers for the members
@@ -892,30 +910,26 @@ pub fn legs_stand(
 /// derives the lines from: an exit the budget left out frees room for
 /// lines after it, and the second naming keeps every exit the first did,
 /// since each came before the point the first stopped at.
-#[allow(clippy::too_many_arguments)] // member_lines' inputs and the views its verdicts are read under
 #[must_use]
 pub fn licensed_lines(
-    rows: &MemberIndex,
-    anchor: WeightedTimestamp,
-    inputs: &dyn CommittedInputs,
-    evidence: &dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
-    recovery: bool,
-    wounded: &BTreeSet<TxHash>,
+    naming: Naming<'_>,
     views: &SiblingViews,
 ) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
-    let licensed: BTreeMap<TxHash, Decision> = stated_decisions(rows, views)
+    let licensed: BTreeMap<TxHash, Decision> = stated_decisions(naming.rows, views)
         .into_iter()
         .filter(|(_, decision)| *decision == Decision::Refuse)
         .collect();
+    let holds = QueueHolds::of(naming.rows);
+    let named = |verdicts: &BTreeMap<TxHash, Decision>| lines_over(naming, holds.clone(), verdicts);
     if licensed.is_empty() {
-        return member_lines(rows, anchor, inputs, evidence, recovery, wounded, &licensed);
+        return named(&licensed);
     }
-    let (first, ..) = member_lines(rows, anchor, inputs, evidence, recovery, wounded, &licensed);
+    let (first, ..) = named(&licensed);
     let carried: BTreeMap<TxHash, Decision> = licensed
         .into_iter()
         .filter(|(tx, _)| first.iter().any(|line| exits(line) == Some(*tx)))
         .collect();
-    member_lines(rows, anchor, inputs, evidence, recovery, wounded, &carried)
+    named(&carried)
 }
 
 /// The member a line ends the row of, by an abort or a fate.
@@ -927,7 +941,10 @@ const fn exits(line: &TickLine) -> Option<TxHash> {
             ..
         }
         | TickLine::Fate { tx, .. } => Some(*tx),
-        TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+        TickLine::Member { .. }
+        | TickLine::Discard { .. }
+        | TickLine::End { .. }
+        | TickLine::Recovered { .. } => None,
     }
 }
 
@@ -991,12 +1008,55 @@ pub fn carried_verdicts(
 pub struct ManifestInputs {
     /// What committed content up to the parent says of the members.
     pub committed: CommittedSets,
-    /// Whether the block is its shard's crossing block past a halt
-    /// recovery's bridge, which discards every tick its parent's rows
-    /// hold.
-    pub recovery: bool,
+    /// What the block does across a halt recovery's bridge.
+    pub crossing: Crossing,
     /// What the block's manifest names.
     pub kind: ManifestKind,
+}
+
+/// What a block of member lines does across a halt recovery's bridge,
+/// read once per block off the schedule and its parent's rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Crossing {
+    /// It is not its shard's crossing block.
+    #[default]
+    None,
+    /// It is its shard's crossing block, and orphans no row: it discards
+    /// every tick its parent's rows hold.
+    Discards,
+    /// It is its shard's crossing block, and this recovery marker over
+    /// its parent's rows orphans one: it discards every tick, its content
+    /// is folded with the marker, and the marker is its first line.
+    Marked(Box<TickLine>),
+}
+
+impl Crossing {
+    /// What a block at `height` over `parent`, its parent's rows, does
+    /// where the schedule gives it `bands`: the recovery bands of a
+    /// crossing block, or `None` on any other block.
+    #[must_use]
+    pub fn over(bands: Option<RecoveryBands>, parent: &MemberIndex, height: BlockHeight) -> Self {
+        bands.map_or(Self::None, |bands| {
+            parent
+                .recovery_marker(bands, height)
+                .map_or(Self::Discards, |marker| Self::Marked(Box::new(marker)))
+        })
+    }
+
+    /// Whether the block discards every tick its parent's rows hold.
+    #[must_use]
+    pub const fn discards(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// The block's recovery marker, where it carries one.
+    #[must_use]
+    pub const fn marker(&self) -> Option<&TickLine> {
+        match self {
+            Self::Marked(marker) => Some(&**marker),
+            Self::None | Self::Discards => None,
+        }
+    }
 }
 
 /// Where a candidate stands, as its row says, with what judging it
@@ -1010,6 +1070,16 @@ pub enum Standing<'a> {
     /// the block's own claims prove: aborted on those terms, whatever
     /// its deadline. See [`wounded`].
     Wounded(Judged<'a>),
+    /// Committed and named by no tick yet, head of the queue, and past
+    /// its naming window: it has refused someone on a key it pins for
+    /// [`NAMING_WINDOW`] since the later of its head and its first
+    /// refusal. Aborted on those terms, whatever its deadline.
+    Windowed(Judged<'a>),
+    /// Committed and named by no tick yet, and orphaned by a halt
+    /// recovery's crossing block: the lost tail may have served it, so
+    /// it never heads again. Aborted on those terms, whatever its
+    /// deadline.
+    Orphaned(Judged<'a>),
     /// Held by a tick that lets go of it on its abort: a member a
     /// counterpart's verdict can discard, which a departure covers and
     /// which the tick does not hold as its own abandonment. Judged on
@@ -1029,12 +1099,22 @@ pub enum Standing<'a> {
 }
 
 impl<'a> Standing<'a> {
-    /// How `row`, committed and named by no tick, stands: wounded where
-    /// the block's claims prove it the victim of a hold cycle.
-    fn waiting(row: &'a MemberRow, wounded: &BTreeSet<TxHash>) -> Self {
+    /// How `row`, committed and named by no tick, stands at `anchor`:
+    /// orphaned where a recovery's crossing block orphaned it, wounded
+    /// where the block's claims prove it the victim of a hold cycle, and
+    /// windowed where it stands head and its naming window has closed.
+    fn waiting(row: &'a MemberRow, wounded: &BTreeSet<TxHash>, anchor: WeightedTimestamp) -> Self {
         let judged = Judged::of_row(row);
-        if wounded.contains(&row.tx) {
+        let windowed = row
+            .head
+            .zip(row.blocked_at)
+            .is_some_and(|(head, blocked)| anchor >= head.clock.max(blocked).plus(NAMING_WINDOW));
+        if row.orphaned {
+            Self::Orphaned(judged)
+        } else if wounded.contains(&row.tx) {
             Self::Wounded(judged)
+        } else if windowed {
+            Self::Windowed(judged)
         } else {
             Self::Pending(judged)
         }
@@ -1043,7 +1123,10 @@ impl<'a> Standing<'a> {
     /// The remote shards the transaction reaches.
     const fn reach(&self) -> &'a Reach {
         match self {
-            Self::Pending(judged) | Self::Wounded(judged) => judged.reach,
+            Self::Pending(judged)
+            | Self::Wounded(judged)
+            | Self::Windowed(judged)
+            | Self::Orphaned(judged) => judged.reach,
             Self::Held { reach, .. } | Self::Released { reach, .. } => reach,
         }
     }
@@ -1054,7 +1137,10 @@ impl<'a> Standing<'a> {
     /// abort is its exit.
     const fn leg(&self) -> bool {
         match self {
-            Self::Pending(judged) | Self::Wounded(judged) => judged.leg,
+            Self::Pending(judged)
+            | Self::Wounded(judged)
+            | Self::Windowed(judged)
+            | Self::Orphaned(judged) => judged.leg,
             Self::Held { .. } | Self::Released { .. } => false,
         }
     }
@@ -1064,13 +1150,17 @@ impl<'a> Standing<'a> {
 /// block's own finalizations, discards, records, claims and
 /// transactions.
 ///
-/// Every in-flight row's holds are held, a stated row's as it held them
-/// in flight, and each row takes the exit its standing gives it at
-/// `anchor`, which [`Exit::of`] decides on the row alone, so a replica
-/// that cannot route a member names and expects the lines its peers do.
-/// A pending member of `wounded`, the victims
-/// the block's own state claims prove (see [`wounded`]), is aborted
-/// short of its deadline.
+/// What the queue holds is read once off the rows' `Queue` entries: the
+/// places of the shared rows standing and of the legs in flight, which
+/// is every row holding what it declared, on the keys this shard owns.
+/// Each row takes the exit its standing gives it at `anchor`, which
+/// [`Exit::of`] decides on the row alone, so a replica that cannot
+/// route a member names and expects the lines its peers do. A pending
+/// member of `wounded`, the victims the block's own state claims prove
+/// (see [`wounded`]), is aborted short of its deadline, and so is a
+/// head whose naming window has closed: one with a `blocked_at`, at an
+/// anchor [`NAMING_WINDOW`] or more past the later of its head clock
+/// and its `blocked_at`.
 ///
 /// A stated row takes the exit `verdicts` gives it, the decisions over
 /// its siblings' state the block acts on: an abort where it is refused,
@@ -1090,15 +1180,17 @@ impl<'a> Standing<'a> {
 /// beside the lines, so a voter, which cannot judge a manifest without
 /// it, defers.
 ///
-/// On a recovery's crossing block (`recovery`) every tick the rows hold
-/// is discarded: each was anchored below the bridge, so no committee the
-/// shard keeps can certify it, and no other line names its members in
-/// that block. The discard releases each member in flight and keeps each
-/// stated one, which owes nothing a certificate gives and leaves only on
-/// what its siblings' state says.
+/// On a recovery's crossing block ([`Crossing::discards`]) every tick the
+/// rows hold is discarded: each was anchored below the bridge, so no
+/// committee the shard keeps can certify it, and no other line names its
+/// members in that block. The discard releases each member in flight and
+/// keeps each stated one, which owes nothing a certificate gives and
+/// leaves only on what its siblings' state says. Its marker, where it
+/// carries one, orphans the rows the lost tail may have served, and each
+/// orphan is aborted as the budget lets, in this block or a later one.
 ///
-/// The lines are listed as the budget is charged: a recovery's
-/// discards; the fates in transaction order, each after the
+/// The lines are listed as the budget is charged: a recovery's marker
+/// and discards; the fates in transaction order, each after the
 /// `Unanswerable` discard of the tick holding its member, the two taken
 /// together so both fit or neither is named; the member lines; the
 /// `Abandoned` discards. Nothing is named past the first refusal. The
@@ -1106,27 +1198,61 @@ impl<'a> Standing<'a> {
 /// names after them.
 #[must_use]
 pub fn member_lines(
-    rows: &MemberIndex,
-    anchor: WeightedTimestamp,
-    inputs: &dyn CommittedInputs,
-    evidence: &dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
-    recovery: bool,
-    wounded: &BTreeSet<TxHash>,
+    naming: Naming<'_>,
     verdicts: &BTreeMap<TxHash, Decision>,
 ) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
-    let mut holds = ProvisionalCells::default();
+    lines_over(naming, QueueHolds::of(naming.rows), verdicts)
+}
+
+/// What naming a block's member lines reads, however many times the
+/// block names them. See [`member_lines`].
+#[derive(Clone, Copy)]
+pub struct Naming<'a> {
+    /// The family after the block's own content.
+    pub rows: &'a MemberIndex,
+    /// The block's anchor, whose clock every deadline and window is
+    /// judged at.
+    pub anchor: WeightedTimestamp,
+    /// What committed content says each member has in hand, which
+    /// decides whether it is ready.
+    pub inputs: &'a dyn CommittedInputs,
+    /// Asked of each shard a member reaches, at the clock its row was
+    /// committed at.
+    pub evidence: &'a dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
+    /// What the block does across a recovery's bridge: a crossing block
+    /// discards every tick the rows hold, and its marker, where it
+    /// carries one, is named first and already folded into `rows` with
+    /// the content.
+    pub crossing: &'a Crossing,
+    /// The pending members the block's claims prove the victims of a
+    /// hold cycle. See [`wounded`].
+    pub wounded: &'a BTreeSet<TxHash>,
+}
+
+/// [`member_lines`] over `holds`, the `Queue` collection the rows hold,
+/// which naming the lines takes the walk's lines into.
+fn lines_over(
+    naming: Naming<'_>,
+    mut holds: QueueHolds,
+    verdicts: &BTreeMap<TxHash, Decision>,
+) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
+    let Naming {
+        rows,
+        anchor,
+        inputs,
+        evidence,
+        crossing,
+        wounded,
+    } = naming;
     let mut candidates = Vec::new();
     let mut missing = Vec::new();
     let mut fated: Vec<(Option<TickLine>, TickLine)> = Vec::new();
-    let recovered: Vec<BlockHeight> = if recovery {
+    let recovered: Vec<BlockHeight> = if crossing.discards() {
         rows.ticks.keys().copied().collect()
     } else {
         Vec::new()
     };
     for row in rows.members.values() {
-        if row.state.held().is_some() {
-            holds.claim(&row.holds);
-        }
         match Exit::of(row, rows, anchor, evidence, &recovered, wounded, verdicts) {
             Exit::None => {}
             Exit::Unread => missing.push(row.tx),
@@ -1155,6 +1281,12 @@ pub fn member_lines(
     }
     let mut budget = ManifestBudget::default();
     let mut lines = Vec::new();
+    if let Some(marker) = crossing.marker() {
+        if !budget.take(marker) {
+            return (lines, missing, budget);
+        }
+        lines.push(marker.clone());
+    }
     let recoveries = recovered.into_iter().map(|height| {
         let discard = TickLine::Discard {
             tick: TickId::new(rows.shard(), height),
@@ -1170,6 +1302,7 @@ pub fn member_lines(
         lines.push(line);
     }
     lines.extend(select_members(
+        rows.shard(),
         anchor,
         candidates,
         inputs,
@@ -1204,8 +1337,9 @@ impl<'a> Exit<'a> {
     /// too. A row let go of always has a clock, since no half settles it:
     ///
     /// - one no tick has named is aborted at its deadline, or wounded
-    ///   short of it, having certified nothing; a leg is never aborted,
-    ///   and is fated once its leg entry window has closed, what it
+    ///   short of it, or at its naming window where it stands head and
+    ///   has refused someone, having certified nothing; a leg is never
+    ///   aborted, and is fated once its leg entry window has closed, what it
     ///   issued going back in its producer's fold on its consumer's
     ///   `Never`;
     /// - one a tick holds leaves by its tick, and otherwise only where a
@@ -1342,7 +1476,7 @@ impl<'a> Exit<'a> {
             }
             RowState::Accepted => Self::None,
             RowState::Pending => {
-                let standing = Standing::waiting(row, wounded);
+                let standing = Standing::waiting(row, wounded, anchor);
                 if standing.leg() && lapsed {
                     Self::Fated(None)
                 } else {
@@ -1468,6 +1602,7 @@ impl Nameable<'_> {
                 Settlement::Awaited
             },
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: reach.clone(),
             awaits: Capped::empty(),
             charge: self.charge,
@@ -1480,21 +1615,41 @@ impl Nameable<'_> {
             } else {
                 self.crossings.clone()
             },
+            served_at: None,
         };
         let discard = match self.standing {
             Standing::Held { tick, .. } => Some(TickLine::Discard {
                 tick,
                 cause: DiscardCause::Abandoned(self.tx),
             }),
-            Standing::Pending(_) | Standing::Wounded(_) | Standing::Released { .. } => None,
+            Standing::Pending(_)
+            | Standing::Wounded(_)
+            | Standing::Windowed(_)
+            | Standing::Orphaned(_)
+            | Standing::Released { .. } => None,
         };
         (line, discard)
     }
 }
 
 /// The lines a block names: every ready candidate, in canonical order,
-/// that no provisional hold refuses, up to the budget, then the discards
-/// its aborts imply.
+/// that the queue lets run, up to the budget, then the discards its
+/// aborts imply.
+///
+/// A candidate whose verdict a counterpart shares runs only where its
+/// row stands head of the queue on every key it pins: nothing placed
+/// before it on those keys conflicts with it, both ways against a row
+/// still waiting and one way against a row in flight or stated. Any
+/// other candidate runs only where its pins on `local` are compatible
+/// with every `Queue` entry `holds` carries in, the places of the shared
+/// rows standing and of the legs in flight: a leg both ways against the
+/// shared rows waiting and one way against the rest, since neither of two
+/// abortable members' writes is in a view until it resolves, and a
+/// determined member one way against all of them, since its output
+/// enters the view at its naming. The two-way reading covers `Queue`
+/// entries and not `Waiters`: two waiting legs are judged in this walk's
+/// order, not by place, which is harmless since a leg waits only on
+/// cores, and a core consuming a leg's records is placed only at them.
 ///
 /// A candidate whose settlement awaits a sibling is named to run by no
 /// line while this shard or a sibling it awaits is reshaping: a row it
@@ -1508,29 +1663,40 @@ impl Nameable<'_> {
 /// whenever it then commits. A leg past its deadline is not named at all:
 /// its fate ends it at the close of its leg entry window. A candidate a
 /// tick holds or let go of is one [`Exit::of`] found due an abort, and is
-/// named `Aborted` whatever its deadline. A
-/// [`Standing::Wounded`] candidate is named
+/// named `Aborted` whatever its deadline. A [`Standing::Wounded`],
+/// [`Standing::Windowed`] or [`Standing::Orphaned`] candidate is named
 /// `Aborted` as one past its deadline is. An abort line carries the
 /// candidate's deadline and the crossings it answers `Never` for, so a
 /// replica holding nothing of the transaction seats and settles it, and
 /// a line running a member whose settlement is shared with a sibling
 /// carries the crossings it consumes, which its row keeps. An
 /// abort of a member a tick holds is charged together with that tick's
-/// `Abandoned` discard, so the pair fits or neither does.
+/// `Abandoned` discard, so the pair fits or neither does. A line running
+/// a member its own certificate settles carries the pins its declaration
+/// takes on `local`, and holds nothing.
 ///
 /// Canonical order puts the transactions reaching beyond this shard
 /// first, then hash order: theirs are the provisional writes everything
 /// else has to be compatible with, and a determined member is the
-/// cheaper of the two to defer. `holds` carries in what in-flight legs
-/// claim and leaves with what the named lines add, so a member of this
-/// very tick can be what keeps the next one out. The walk stops at the
-/// first line the budget refuses, and the rest wait a block.
+/// cheaper of the two to defer. A shared row this block places stands
+/// in `holds` already, since a block's content is folded before its
+/// lines are named. A line named to run on terms a counterpart's verdict
+/// can discard leaves its pins held for the rest of the walk: its writes
+/// are in no view until it resolves, and a member of this very tick
+/// reading them would read what that verdict can still discard. Those
+/// holds keep out the determined members named after it; a shared
+/// candidate is tested against them too, though a head is compatible
+/// both ways with every other head, and a leg that conflicts with a
+/// waiting head is refused before it holds. The walk
+/// stops at the first line the budget refuses, and the rest wait a
+/// block.
 #[must_use]
 pub fn select_members<'a>(
+    local: ShardId,
     anchor: WeightedTimestamp,
     candidates: impl IntoIterator<Item = Nameable<'a>>,
     inputs: &dyn CommittedInputs,
-    holds: &mut ProvisionalCells,
+    holds: &mut QueueHolds,
     budget: &mut ManifestBudget,
 ) -> Vec<TickLine> {
     let mut ordered: Vec<Nameable<'a>> = candidates.into_iter().collect();
@@ -1541,7 +1707,11 @@ pub fn select_members<'a>(
         if candidate.deadline.passed(anchor)
             || matches!(
                 candidate.standing,
-                Standing::Wounded(_) | Standing::Held { .. } | Standing::Released { .. }
+                Standing::Wounded(_)
+                    | Standing::Windowed(_)
+                    | Standing::Orphaned(_)
+                    | Standing::Held { .. }
+                    | Standing::Released { .. }
             )
         {
             if candidate.standing.leg() {
@@ -1571,19 +1741,26 @@ pub fn select_members<'a>(
         if judged.settlement == Settlement::Shared && inputs.reshaping(tx) {
             continue;
         }
-        let Some(joins) = readiness(tx, &judged, deadline, anchor, inputs) else {
+        if !ready(tx, &judged, inputs) {
             continue;
-        };
+        }
         let abortable = judged.abortable();
-        if !holds.is_empty() && holds.blocks(judged.declared) {
+        let shared = judged.settlement == Settlement::Shared;
+        let pinned = pins_of(judged.declared, local);
+        if (shared && !judged.head) || holds.refuses(&pinned, judged.settlement) {
             continue;
         }
         let line = TickLine::Member {
             tx,
-            joins,
+            joins: Joins::Executes,
             settlement: judged.settlement,
             holds: if abortable {
                 judged.declared.clone()
+            } else {
+                Capped::empty()
+            },
+            pins: if judged.settlement.alone() {
+                pinned.clone()
             } else {
                 Capped::empty()
             },
@@ -1594,11 +1771,14 @@ pub fn select_members<'a>(
             reserves: reserves.clone(),
             staged: judged.staged,
             deadline,
-            crossings: if judged.settlement == Settlement::Shared {
+            crossings: if shared {
                 crossings.clone()
             } else {
                 Capped::empty()
             },
+            served_at: judged
+                .head_height
+                .filter(|_| served_from_head(judged.settlement, &pinned)),
         };
 
         if !budget.take(&line) {
@@ -1607,7 +1787,7 @@ pub fn select_members<'a>(
         // After the test, never before: a transaction is not what keeps
         // itself out.
         if abortable {
-            holds.claim(judged.declared);
+            holds.hold(&pinned);
         }
         lines.push(line);
     }
@@ -1626,34 +1806,81 @@ pub struct Contention {
     pub holder: TxHash,
 }
 
-/// A core member's holds, as a refusal reads them.
+/// Whether two members pinning `one` and `other` on one shard conflict
+/// there both ways: on some key both pin, either one's modes refuse the
+/// other's. Both are ascending by key, as [`pins_of`] gives them.
+fn pins_conflict(one: &[Pin], other: &[Pin]) -> bool {
+    one.iter().any(|pin| {
+        other
+            .binary_search_by_key(&pin.key, |theirs| theirs.key)
+            .is_ok_and(|at| pin.modes.conflicts(other[at].modes))
+    })
+}
+
+/// Whether a member pinning `held` on one shard refuses one pinning
+/// `candidate` there: on some key both pin, the held modes refuse the
+/// candidate's. Both are ascending by key, as [`pins_of`] gives them.
+fn pins_refuse(held: &[Pin], candidate: &[Pin]) -> bool {
+    held.iter().any(|pin| {
+        candidate
+            .binary_search_by_key(&pin.key, |theirs| theirs.key)
+            .is_ok_and(|at| pin.modes.refuses(candidate[at].modes))
+    })
+}
+
+/// A core member holding a seat, as a refusal reads it.
 struct CoreHolder<'r> {
     tx: TxHash,
+    /// What it pins: what it waits on while a `Pending` head, and what it
+    /// holds after.
     holds: &'r Holds,
-    cells: ProvisionalCells,
+    /// Its pins on the shard asking.
+    pins: Pins,
     awaits: &'r Reach,
+    /// Whether it is a `Pending` head, which the queue reads both ways
+    /// against the rows placed after it. One in flight or stated it reads
+    /// one way.
+    head: bool,
+    /// The end of its signed validity range.
+    validity_end: WeightedTimestamp,
 }
 
 impl<'r> CoreHolder<'r> {
-    /// A holder over `holds`, or `None` where it holds nothing.
-    fn of(tx: TxHash, holds: &'r Holds, awaits: &'r Reach) -> Option<Self> {
+    /// A holder over `holds` on `local`, or `None` where it holds
+    /// nothing.
+    fn of(
+        tx: TxHash,
+        holds: &'r Holds,
+        awaits: &'r Reach,
+        local: ShardId,
+        head: bool,
+        validity_end: WeightedTimestamp,
+    ) -> Option<Self> {
         if holds.is_empty() {
             return None;
         }
-        let mut cells = ProvisionalCells::default();
-        cells.claim(holds);
         Some(Self {
             tx,
             holds,
-            cells,
+            pins: pins_of(holds, local),
             awaits,
+            head,
+            validity_end,
         })
     }
 
-    /// Whether these holds refuse `waiting`, which awaits a shard this
-    /// holder awaits too.
-    fn refuses(&self, waiting: &Judged<'_>) -> bool {
-        self.shared(waiting).next().is_some() && self.cells.blocks(waiting.declared)
+    /// Whether this holder stands ahead of `waiting` here, which pins
+    /// `pinned` here and awaits a shard this holder awaits too: the
+    /// relation the queue reads over the keys this shard owns, both ways
+    /// against a `Pending` head and one way against a row in flight or
+    /// stated.
+    fn refuses(&self, waiting: &Judged<'_>, pinned: &[Pin]) -> bool {
+        self.shared(waiting).next().is_some()
+            && if self.head {
+                pins_conflict(&self.pins, pinned)
+            } else {
+                pins_refuse(&self.pins, pinned)
+            }
     }
 
     /// The shards both this holder and `waiting` await: where each has a
@@ -1666,22 +1893,45 @@ impl<'r> CoreHolder<'r> {
     }
 }
 
-/// Every core member of `rows` in flight, with what it holds.
-fn in_flight_holders<'r>(
+/// Every core member of `rows` holding a seat: a `Pending` Shared head,
+/// or one in flight Shared or stated, with what it pins, its pins read
+/// on `local`.
+fn seated_holders<'r>(
     rows: impl Iterator<Item = &'r MemberRow>,
+    local: ShardId,
 ) -> impl Iterator<Item = CoreHolder<'r>> {
-    rows.filter(|row| row.state.seated())
-        .filter_map(|row| CoreHolder::of(row.tx, &row.holds, &row.awaits))
+    rows.filter(|row| row.seated()).filter_map(move |row| {
+        CoreHolder::of(
+            row.tx,
+            pinned_holds(row),
+            &row.awaits,
+            local,
+            row.state == RowState::Pending,
+            row.deadline.validity_end(),
+        )
+    })
+}
+
+/// Whether `row` is a waiting row a seated holder can stand ahead of: a
+/// Shared member, `Pending`, placed and not head.
+fn waits_placed(row: &MemberRow) -> bool {
+    row.state == RowState::Pending
+        && row.queued.is_some()
+        && row.head.is_none()
+        && row
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.settlement == Settlement::Shared)
 }
 
 /// The contentions a block naming `lines` over `rows` leaves standing.
 ///
-/// Every core member short of its deadline that is ready at `anchor` and
-/// that no line names, paired with each core member whose holds refuse
-/// it and which awaits a shard it awaits too: one in flight on its
-/// row, or named by `lines` themselves. `rows` is the family before the
-/// lines, so a member they name is still `Pending` there and counts
-/// once, as a holder.
+/// Every core member short of its deadline that is ready at `anchor`,
+/// placed and not head, and that no line names, paired with each core
+/// member standing ahead of it on this shard's keys and awaiting a shard
+/// it awaits too: one seated on its row, or named by `lines` themselves.
+/// `rows` is the family before the lines, so a head they name is still
+/// `Pending` there; it counts once, through the lines.
 #[must_use]
 pub fn contentions(
     rows: &MemberIndex,
@@ -1689,11 +1939,15 @@ pub fn contentions(
     anchor: WeightedTimestamp,
     inputs: &dyn CommittedInputs,
 ) -> Vec<Contention> {
+    let local = rows.shard();
     let named: BTreeSet<TxHash> = lines
         .iter()
         .filter_map(|line| match line {
             TickLine::Member { tx, .. } => Some(*tx),
-            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+            TickLine::Fate { .. }
+            | TickLine::Discard { .. }
+            | TickLine::End { .. }
+            | TickLine::Recovered { .. } => None,
         })
         .collect();
     let in_lines = lines.iter().filter_map(|line| match line {
@@ -1702,39 +1956,39 @@ pub fn contentions(
             settlement: Settlement::Shared,
             holds,
             awaits,
+            deadline,
             ..
-        } => CoreHolder::of(*tx, holds, awaits),
+        } => CoreHolder::of(*tx, holds, awaits, local, false, deadline.validity_end()),
         TickLine::Member {
             settlement: Settlement::Alone | Settlement::Awaited,
             ..
         }
         | TickLine::Fate { .. }
         | TickLine::Discard { .. }
-        | TickLine::End { .. } => None,
+        | TickLine::End { .. }
+        | TickLine::Recovered { .. } => None,
     });
-    let holders: Vec<CoreHolder<'_>> = in_flight_holders(rows.members.values())
-        .chain(in_lines)
-        .collect();
+    let holders: Vec<CoreHolder<'_>> = seated_holders(
+        rows.members.values().filter(|row| !named.contains(&row.tx)),
+        local,
+    )
+    .chain(in_lines)
+    .collect();
     if holders.is_empty() {
         return Vec::new();
     }
     let mut contended = Vec::new();
     for row in rows.members.values() {
-        if row.state != RowState::Pending || named.contains(&row.tx) || row.deadline.passed(anchor)
-        {
+        if !waits_placed(row) || named.contains(&row.tx) || row.deadline.passed(anchor) {
             continue;
         }
         let waiting = Judged::of_row(row);
-        if waiting.settlement != Settlement::Shared {
-            continue;
-        }
+        let pinned = pins_of(waiting.declared, local);
         let refusing: Vec<&CoreHolder<'_>> = holders
             .iter()
-            .filter(|holder| holder.refuses(&waiting))
+            .filter(|holder| holder.refuses(&waiting, &pinned))
             .collect();
-        if refusing.is_empty()
-            || readiness(row.tx, &waiting, row.deadline, anchor, inputs).is_none()
-        {
+        if refusing.is_empty() || !ready(row.tx, &waiting, inputs) {
             continue;
         }
         contended.extend(refusing.into_iter().map(|holder| Contention {
@@ -1745,29 +1999,71 @@ pub fn contentions(
     contended
 }
 
+/// How many of `lines`, named over `rows` at `anchor` with `wounded` the
+/// block's proven victims, abort a head at its naming window: those a
+/// [`Standing::Windowed`] row takes, which tells a window from a wound.
+#[must_use]
+pub fn heads_windowed(
+    rows: &MemberIndex,
+    lines: &[TickLine],
+    anchor: WeightedTimestamp,
+    wounded: &BTreeSet<TxHash>,
+) -> usize {
+    lines
+        .iter()
+        .filter(|line| match line {
+            TickLine::Member {
+                tx,
+                joins: Joins::Aborted,
+                ..
+            } => rows.members.get(tx).is_some_and(|row| {
+                row.state == RowState::Pending
+                    && matches!(
+                        Standing::waiting(row, wounded, anchor),
+                        Standing::Windowed(_)
+                    )
+            }),
+            TickLine::Member { .. }
+            | TickLine::Fate { .. }
+            | TickLine::Discard { .. }
+            | TickLine::End { .. }
+            | TickLine::Recovered { .. } => false,
+        })
+        .count()
+}
+
 /// The pending core members of `rows` that `claims`, a block's own state
 /// claims, prove the victims of a hold cycle at `anchor`.
 ///
-/// A cycle is two core members each shard holds in the other's order:
-/// here, `holder` is in flight and its holds refuse `waiting`, which is
-/// pending; on a counterpart both await, the claims at one anchor there
-/// read `waiting` seated and `holder` committed, unseated and with no
-/// verdict leaf. Holds are the whole transaction's declared set, and
-/// `waiting`'s refuses `holder`'s in turn, so the counterpart's seat of
-/// `waiting` refuses `holder` there just as `holder` refuses `waiting`
-/// here, and neither certificate the other awaits can come. Nor can the
-/// reading go stale: the counterpart releases `waiting` only on this
-/// shard's verdict, which a pending member has not given, so `holder`
-/// stays refused there for as long as this shard's own rows stand.
+/// A cycle is two core members each shard holds in the other's order.
+/// Here `holder` holds a seat and stands ahead of `waiting`, which is
+/// placed after it and not head, on this shard's keys: a `Pending` head
+/// stands first on every key it pins, read both ways, and one in flight
+/// was named over `waiting`, read one way. On a counterpart both await,
+/// the two conflict on that shard's keys, and the claims at one anchor
+/// there read `waiting` seated and `holder` committed, unseated and with
+/// no verdict leaf: placed after `waiting` there, not placed yet, or
+/// already leaving. Neither can be served to the other until the other
+/// leaves. Where `waiting` is in flight on the counterpart, which reads
+/// it one way, the counterpart's leg over-reads: a rare spurious unnamed
+/// abort.
 ///
-/// A reading anchored at or past `holder`'s deadline proves nothing: by
-/// then the counterpart may have aborted `holder` where it waits, which
-/// leaves its row standing with no seat while the cycle is already
-/// breaking. The anchor's clock is the one that abort is judged by.
+/// A cycle reading anchored at or past `holder`'s deadline proves
+/// nothing: by then the counterpart may have aborted `holder` where it
+/// waits, which leaves its row standing with no seat while the cycle is
+/// already breaking. The anchor's clock is the one that abort is judged
+/// by.
 ///
-/// The victim is the later of the two in hash order. Both shards order
-/// them alike, and only the shard where the victim is pending names it,
-/// so a cycle the deadline is not already breaking loses one member.
+/// The victim is [`SeatQuestion::victim`], the later of the two in hash
+/// order, and only a victim no tick here has named is ever asked about:
+/// the waiting row, or a `Pending` head holder. Both shards order the
+/// two alike, so a cycle the deadline is not already breaking loses one
+/// member: behind on one shard and at its head on the other, unnamed on
+/// both, or in flight on the shard where it holds, which refuses it on
+/// the leaving. Whichever shard aborts it first deletes its row there,
+/// and with it the cycle reading the other shard needs; that shard reads
+/// the victim's leaving instead, at any anchor, since a leaving is final
+/// on the chain it is read from.
 #[must_use]
 pub fn wounded(
     rows: &MemberIndex,
@@ -1780,16 +2076,16 @@ pub fn wounded(
     seat_questions(rows, anchor)
         .into_iter()
         .filter(|question| {
-            let Some(lapse) = rows
+            let lapse = rows
                 .members
                 .get(&question.holder)
-                .map(|row| row.deadline.at())
-            else {
-                return false;
-            };
-            question.proven_by(claims.iter().filter(|claim| claim.anchor.ts < lapse))
+                .map(|row| row.deadline.at());
+            question.answered_at(claims, |read, anchor| {
+                question.left(read, anchor.ts)
+                    || lapse.is_some_and(|lapse| anchor.ts < lapse && question.crossed(read))
+            })
         })
-        .map(|question| question.waiting)
+        .map(|question| question.victim())
         .collect()
 }
 
@@ -1797,112 +2093,214 @@ pub fn wounded(
 /// as the victim of a hold cycle.
 ///
 /// Whether, at one anchor there, `waiting` is seated and `holder`, which
-/// refuses it here, is committed and unseated with no verdict leaf. See
-/// [`wounded`].
+/// conflicts with it here, is committed and unseated with no verdict
+/// leaf; or whether the victim has left there. See [`wounded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeatQuestion {
     /// The counterpart both members await, where each has a sibling.
     pub shard: ShardId,
-    /// The pending member, the later of the two in hash order.
+    /// The member placed behind `holder` here, waiting.
     pub waiting: TxHash,
-    /// The member in flight here whose holds refuse it.
+    /// The seated member standing ahead of `waiting` here: a `Pending`
+    /// head, or one in flight or stated.
     pub holder: TxHash,
+    /// The end of the victim's signed validity range, which its
+    /// committed marker on the counterpart is keyed by.
+    pub validity_end: WeightedTimestamp,
 }
 
 impl SeatQuestion {
-    /// The cells it reads on its counterpart: the waiting member's seat,
-    /// the holder's row, the holder's seat and the holder's verdict leaf.
+    /// The member a proven answer aborts: the later of the two in hash
+    /// order, a function of the pair alone, so the two shards of a cycle
+    /// name the same one.
     #[must_use]
-    pub fn keys(&self) -> [SubstateKey; 4] {
-        [
+    pub fn victim(&self) -> TxHash {
+        self.waiting.max(self.holder)
+    }
+
+    /// The cells it reads on its counterpart: the waiting member's seat,
+    /// the holder's row, the holder's seat and the holder's verdict leaf,
+    /// then the victim's verdict leaf, row and committed marker, each
+    /// once.
+    #[must_use]
+    pub fn keys(&self) -> Vec<SubstateKey> {
+        let victim = self.victim();
+        let mut keys = vec![
             seat_leaf(self.shard, self.waiting),
             member_row_leaf(self.shard, self.holder),
             seat_leaf(self.shard, self.holder),
             verdict_leaf(self.shard, self.holder),
-        ]
+        ];
+        for key in [
+            verdict_leaf(self.shard, victim),
+            member_row_leaf(self.shard, victim),
+            committed_tx_cell_key(self.shard, victim, self.validity_end),
+        ] {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
     }
 
     /// Whether `read`, one anchor's readings, answers with the cycle: the
     /// waiting member seated, and the holder committed, unseated and
     /// with no verdict leaf. A holder whose verdict leaf stands proves no
     /// cycle, whatever its seat reads.
-    fn answered_by(&self, read: impl Fn(SubstateKey) -> Option<Inclusion>) -> bool {
-        let [seat, row, unseated, unsaid] = self.keys();
-        matches!(read(seat), Some(Inclusion::Present(_)))
-            && matches!(read(row), Some(Inclusion::Present(_)))
-            && read(unseated) == Some(Inclusion::Absent)
-            && read(unsaid) == Some(Inclusion::Absent)
+    fn crossed(&self, read: &dyn Fn(SubstateKey) -> Option<Inclusion>) -> bool {
+        matches!(
+            read(seat_leaf(self.shard, self.waiting)),
+            Some(Inclusion::Present(_))
+        ) && matches!(
+            read(member_row_leaf(self.shard, self.holder)),
+            Some(Inclusion::Present(_))
+        ) && read(seat_leaf(self.shard, self.holder)) == Some(Inclusion::Absent)
+            && read(verdict_leaf(self.shard, self.holder)) == Some(Inclusion::Absent)
     }
 
-    /// Whether `claims` answer it at one anchor. The readings may sit in
-    /// several claims at that anchor: one anchor is one root, however its
-    /// cells were cut.
+    /// Whether `read`, one anchor's readings at `clock`, reads the victim
+    /// left: its verdict leaf absent, and then its row absent and its
+    /// committed marker present or `clock` at or past its validity end,
+    /// as [`said_at`] reads an absent leaf. A present verdict leaf, a
+    /// stated yes included, is never a leaving here, whatever it holds.
+    ///
+    /// Sound only for a victim no tick here has named: a member accepts
+    /// only on every shard's yes, so one that has given none here cannot
+    /// have been accepted anywhere, and having left the counterpart it
+    /// was aborted or fated there. An accepted member that has since
+    /// ended reads exactly the same, which is why every question asked
+    /// names a victim unnamed here.
+    fn left(
+        &self,
+        read: &dyn Fn(SubstateKey) -> Option<Inclusion>,
+        clock: WeightedTimestamp,
+    ) -> bool {
+        let victim = self.victim();
+        if read(verdict_leaf(self.shard, victim)) != Some(Inclusion::Absent) {
+            return false;
+        }
+        let beside = read(member_row_leaf(self.shard, victim)).zip(read(committed_tx_cell_key(
+            self.shard,
+            victim,
+            self.validity_end,
+        )));
+        said_at(
+            Inclusion::Absent,
+            beside,
+            clock,
+            self.validity_end,
+            Hash::ZERO,
+            Hash::ZERO,
+        ) == Some(Some(Said::Left))
+    }
+
+    /// Whether `claims` answer it at one anchor, with the cycle or the
+    /// victim's leaving.
     #[must_use]
     pub fn proven_by<'c>(&self, claims: impl IntoIterator<Item = &'c StateClaim>) -> bool {
+        self.answered_at(claims, |read, anchor| {
+            self.crossed(read) || self.left(read, anchor.ts)
+        })
+    }
+
+    /// Whether `answers` holds of the readings `claims` give at one
+    /// anchor of the counterpart. The readings may sit in several claims
+    /// at that anchor: one anchor is one root, however its cells were
+    /// cut.
+    fn answered_at<'c>(
+        &self,
+        claims: impl IntoIterator<Item = &'c StateClaim>,
+        answers: impl Fn(&dyn Fn(SubstateKey) -> Option<Inclusion>, Anchor) -> bool,
+    ) -> bool {
         let claims: Vec<&StateClaim> = claims
             .into_iter()
             .filter(|claim| claim.anchor.shard == self.shard)
             .collect();
         let anchors: BTreeSet<Anchor> = claims.iter().map(|claim| claim.anchor).collect();
         anchors.into_iter().any(|anchor| {
-            self.answered_by(|key| {
+            let read = |key: SubstateKey| {
                 claims
                     .iter()
                     .filter(|claim| claim.anchor == anchor)
                     .find_map(|claim| claim.reading(key))
-            })
+            };
+            answers(&read, anchor)
         })
     }
 }
 
 /// The seat questions the pending core members of `rows` put.
 ///
-/// One for each pending core member short of its deadline at `anchor`
-/// and each core member in flight that refuses it, is earlier in hash
-/// order, and awaits a counterpart it awaits, per counterpart. The
-/// refusal is asked both ways: the waiting member's seat on the
-/// counterpart must refuse the holder there too, or an unseated holder
-/// would read as a cycle when it was only not yet ready. A holder past
-/// its own deadline asks nothing: the counterpart where it waits aborts
-/// it, which breaks the cycle with no victim here.
+/// One for each waiting core member short of its deadline at `anchor`,
+/// placed and not head, and each seated core member standing ahead of it
+/// on this shard's keys and awaiting a counterpart it awaits, per such
+/// counterpart on whose keys the two conflict too: otherwise an unseated
+/// holder would read as a cycle when it was only not yet ready. Each leg
+/// reads the relation the queue reads there, over the pins each shard
+/// owns: here both ways where the holder is a `Pending` head and one way
+/// where it is in flight or stated, and both ways there, where the
+/// reading cannot tell a waiting member from one in flight.
+///
+/// Only a pair whose victim no tick here has named is asked about: the
+/// victim is the waiting row, or a holder that is a `Pending` head. The
+/// leaving reading is sound for no other, so the filter must never be
+/// widened. A holder past its own deadline asks nothing: the counterpart
+/// where it waits aborts it, which breaks the cycle with no victim here.
 #[must_use]
 pub fn seat_questions(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<SeatQuestion> {
-    let holders: Vec<CoreHolder<'_>> = in_flight_holders(
+    let local = rows.shard();
+    let holders: Vec<CoreHolder<'_>> = seated_holders(
         rows.members
             .values()
             .filter(|row| !row.deadline.passed(anchor)),
+        local,
     )
     .collect();
     if holders.is_empty() {
         return Vec::new();
     }
+    // Each holder's pins on each counterpart, taken once.
+    let mut held_there: BTreeMap<(TxHash, ShardId), Pins> = BTreeMap::new();
     let mut questions = Vec::new();
     for row in rows.members.values() {
-        if row.state != RowState::Pending || row.deadline.passed(anchor) {
+        if !waits_placed(row) || row.deadline.passed(anchor) {
             continue;
         }
         let waiting = Judged::of_row(row);
-        if waiting.settlement != Settlement::Shared {
-            continue;
-        }
-        let mut seat: Option<ProvisionalCells> = None;
+        let pinned = pins_of(waiting.declared, local);
+        // The waiting member's pins on each counterpart, taken once.
+        let mut seats: BTreeMap<ShardId, Pins> = BTreeMap::new();
         for holder in holders
             .iter()
-            .filter(|holder| holder.tx < row.tx && holder.refuses(&waiting))
+            .filter(|holder| holder.refuses(&waiting, &pinned))
         {
-            let seat = seat.get_or_insert_with(|| {
-                let mut cells = ProvisionalCells::default();
-                cells.claim(waiting.declared);
-                cells
-            });
-            if !seat.blocks(holder.holds) {
+            let asked = |shard| {
+                let mut question = SeatQuestion {
+                    shard,
+                    waiting: row.tx,
+                    holder: holder.tx,
+                    validity_end: row.deadline.validity_end(),
+                };
+                if question.victim() == holder.tx {
+                    question.validity_end = holder.validity_end;
+                }
+                question
+            };
+            // The victim unnamed here: the waiting row, or a head holder.
+            if asked(local).victim() == holder.tx && !holder.head {
                 continue;
             }
-            questions.extend(holder.shared(&waiting).map(|shard| SeatQuestion {
-                shard,
-                waiting: row.tx,
-                holder: holder.tx,
-            }));
+            for shard in holder.shared(&waiting) {
+                let seat = seats
+                    .entry(shard)
+                    .or_insert_with(|| pins_of(waiting.declared, shard));
+                let held = held_there
+                    .entry((holder.tx, shard))
+                    .or_insert_with(|| pins_of(holder.holds, shard));
+                if pins_conflict(seat, held) {
+                    questions.push(asked(shard));
+                }
+            }
         }
     }
     questions
@@ -1916,9 +2314,10 @@ mod tests {
 
     use hyperscale_effects_bridge::vault_key;
     use hyperscale_hbor::{Bytes, to_vec};
-    use hyperscale_storage::test_helpers::yes_receipt;
+    use hyperscale_storage::test_helpers::{placed_head, yes_receipt};
     use hyperscale_storage::{
-        MemberInputs, SettledHalf, TickRow, Waiting, fate_writes, member_row_leaf, member_writes,
+        MemberInputs, Place, SettledHalf, TickRow, Waiting, fate_writes, member_row_leaf,
+        member_writes,
     };
     use hyperscale_types::test_utils::{
         StubTree, proven_claim, stub_abort_charge, stub_stated_terms,
@@ -1927,10 +2326,11 @@ mod tests {
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
         Derived, EPOCH_DURATION, EntryKey, Epoch, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash,
         Heard, LocalKey, MAX_FINALIZATION_DELAY, MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK,
-        MAX_TICK_MANIFEST_BYTES, MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkId, Owes,
-        PrincipalAddr, ProtocolHasher, ReadMark, Routing, Said, StatedTerms, TICK_LINE_BYTES,
-        TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange, TransactionEnvelope,
-        Unpublished, entry_leaf_key, said_at, tick_manifest_admits_members,
+        MAX_TICK_MANIFEST_BYTES, MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection,
+        NetworkId, Owes, PrincipalAddr, ProtocolHasher, ReadMark, RecoveryBand, RecoveryBands,
+        Routing, Said, StatedTerms, TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf,
+        TimestampRange, TransactionEnvelope, Unpublished, entry_leaf_key, said_at,
+        tick_manifest_admits_members,
     };
     use hyperscale_vm_effects::{Hash32, IntentHash};
     use hyperscale_vm_types::Moves;
@@ -1948,12 +2348,18 @@ mod tests {
         wounded: &BTreeSet<TxHash>,
     ) -> (Vec<TickLine>, Vec<TxHash>) {
         let (lines, missing, _) = member_lines(
-            rows,
-            anchor,
-            inputs,
-            evidence,
-            recovery,
-            wounded,
+            Naming {
+                rows,
+                anchor,
+                inputs,
+                evidence,
+                crossing: &if recovery {
+                    Crossing::Discards
+                } else {
+                    Crossing::None
+                },
+                wounded,
+            },
             &BTreeMap::new(),
         );
         (lines, missing)
@@ -1981,10 +2387,35 @@ mod tests {
     const DEBIT: Mode = Mode::Delta { moves: Moves::Out };
     const CREDIT: Mode = Mode::Delta { moves: Moves::In };
 
+    /// The queue's pin relation is the hold rule: on one key, a claim's
+    /// pin refuses a candidate's exactly where the claim set holding the
+    /// claim blocks the candidate, debit rule and fee vault included.
+    #[test]
+    fn a_pin_refuses_what_the_hold_rule_blocks() {
+        let fee_vault = DeclaredKey::Cell(vault_key(
+            PrincipalAddr::new([0x52; 31]),
+            *PROTOCOL_RESOURCE,
+        ));
+        let modes = [Mode::Read, WRITE, RESERVE, DEBIT, CREDIT];
+        for key in [cell(1, 1), fee_vault, interval(1, 0, 9)] {
+            for held in modes {
+                for candidate in modes {
+                    let mut claims = ProvisionalCells::default();
+                    claims.claim(&[(key, held)]);
+                    let pin = |mode| pins_of(&[(key, mode)], ShardId::ROOT)[0].modes;
+                    assert_eq!(
+                        pin(held).refuses(pin(candidate)),
+                        claims.blocks(&[(key, candidate)]),
+                        "{held:?} against {candidate:?} on {key:?}",
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn nothing_is_blocked_by_an_empty_claim_set() {
         let claims = ProvisionalCells::default();
-        assert!(claims.is_empty());
         assert!(!claims.blocks(&[(cell(1, 1), WRITE)]));
     }
 
@@ -2134,11 +2565,12 @@ mod tests {
 
     const UNRESERVED: &Reserves = &Capped::empty();
 
+    /// A candidate committed on `terms`, its row head of the queue.
     fn pending(tx: TxHash, terms: &MemberTerms, deadline: Deadline) -> Nameable<'_> {
         Nameable {
             tx,
             deadline,
-            standing: Standing::Pending(Judged::of(terms)),
+            standing: Standing::Pending(Judged::of(terms).headed()),
             charge: CHARGE,
             share: 0,
             reserves: UNRESERVED,
@@ -2147,8 +2579,20 @@ mod tests {
         }
     }
 
-    /// The `Pending` row a block stating `terms` writes for `seed`.
+    /// The `Pending` row a block stating `terms` writes for `seed`, placed
+    /// and head of the queue where a counterpart shares its verdict, as
+    /// an uncontended block leaves it.
     fn stating(seed: u8, deadline: Deadline, terms: &MemberTerms) -> MemberRow {
+        let row = unplaced(seed, deadline, terms);
+        if terms.settlement == Settlement::Shared {
+            placed_head(row)
+        } else {
+            row
+        }
+    }
+
+    /// [`stating`], left unplaced.
+    fn unplaced(seed: u8, deadline: Deadline, terms: &MemberTerms) -> MemberRow {
         MemberRow {
             tx: tx(seed),
             deadline,
@@ -2170,10 +2614,15 @@ mod tests {
                 declared: terms.declared.clone(),
                 engages: terms.engages.clone(),
                 waits: terms.waits,
+                unarrived: terms.crossings.clone(),
             }),
             covered: false,
             executed: false,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
+            orphaned: false,
         }
     }
 
@@ -2369,6 +2818,7 @@ mod tests {
             joins: Joins::Aborted,
             settlement: Settlement::Awaited,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: entry.terms.charge,
@@ -2376,6 +2826,7 @@ mod tests {
             reserves: entry.terms.reserves,
             deadline: far(),
             crossings: Capped::empty(),
+            served_at: None,
         };
         assert!(to_vec(&line).expect("a line encodes").len() <= line.wire_weight());
     }
@@ -2402,6 +2853,7 @@ mod tests {
             joins,
             settlement: terms.settlement,
             holds: terms.declared.clone(),
+            pins: Capped::empty(),
             reach: terms.reach.clone(),
             awaits: terms.awaits.clone(),
             charge: terms.charge,
@@ -2409,6 +2861,7 @@ mod tests {
             reserves: terms.reserves.clone(),
             deadline,
             crossings: Capped::empty(),
+            served_at: None,
         };
         let committing = |stated: Vec<StatedTerms>, lines: Vec<TickLine>| MemberInputs {
             height: at(1),
@@ -2478,6 +2931,7 @@ mod tests {
             joins: Joins::Executes,
             settlement: Settlement::Shared,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::from_array([PEER]),
             awaits: Capped::empty(),
             charge: stub_abort_charge(seed),
@@ -2485,6 +2939,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: far(),
             crossings: Capped::empty(),
+            served_at: None,
         };
         rows.advance(&MemberInputs {
             height: at(2),
@@ -2546,8 +3001,7 @@ mod tests {
     }
 
     /// A member waits on every bundle and crossing it requires, and a
-    /// payer on its counterparts' engagement until the wait's deadline,
-    /// past which it runs attested aborted.
+    /// payer on its counterparts' engagement.
     #[test]
     fn a_member_is_ready_once_its_committed_inputs_are() {
         let crossing = CrossingId {
@@ -2562,51 +3016,64 @@ mod tests {
             crossings: Capped::from_array([crossing]),
             ..leg(vec![], &[PEER])
         };
-        let deadline = Deadline::of(ms(5_000));
-        let ready = |terms: &MemberTerms, at: WeightedTimestamp, held: &Held| {
-            readiness(tx(1), &Judged::of(terms), deadline, at, held)
-        };
+        let is_ready = |terms: &MemberTerms, held: &Held| ready(tx(1), &Judged::of(terms), held);
         let mut held = Held::default();
-        assert_eq!(ready(&terms, ms(0), &held), None);
+        assert!(!is_ready(&terms, &held));
         held.engaged.insert((PEER, tx(1)));
-        assert_eq!(ready(&terms, ms(0), &held), None, "the crossing");
+        assert!(!is_ready(&terms, &held), "the crossing");
         held.arrived.insert((record, tx(2)));
-        assert_eq!(
-            ready(&terms, ms(0), &held),
-            None,
+        assert!(
+            !is_ready(&terms, &held),
             "an arrival naming another transaction answers nothing"
         );
         held.arrived.insert((record, tx(1)));
-        assert_eq!(ready(&terms, ms(0), &held), Some(Joins::Executes));
+        assert!(is_ready(&terms, &held));
 
         let payer = MemberTerms {
             waits: true,
             ..leg(vec![], &[])
         };
         let silent = Held::default();
-        assert_eq!(
-            ready(
-                &payer,
-                deadline.at().minus(Duration::from_millis(1)),
-                &silent
-            ),
-            None
-        );
-        assert_eq!(
-            ready(&payer, deadline.at(), &silent),
-            Some(Joins::ExecutesAborted)
-        );
-        assert_eq!(
-            ready(&payer, ms(0), &held),
-            Some(Joins::Executes),
+        assert!(!is_ready(&payer, &silent));
+        assert!(
+            is_ready(&payer, &held),
             "an engaged counterpart ends the wait"
         );
-        assert_eq!(ready(&alone(vec![]), ms(0), &silent), Some(Joins::Executes));
+        assert!(is_ready(&alone(vec![]), &silent));
+    }
+
+    /// A waiting payer whose counterparts stay silent past its deadline
+    /// is named `Aborted` and never runs.
+    #[test]
+    fn a_silent_payer_past_its_deadline_is_aborted() {
+        let deadline = Deadline::of(ms(5_000));
+        let payer = MemberTerms {
+            waits: true,
+            ..leg(vec![], &[])
+        };
+        for (anchor, expected) in [
+            (deadline.at().minus(Duration::from_millis(1)), None),
+            (deadline.at(), Some(Joins::Aborted)),
+        ] {
+            let lines = select_members(
+                ShardId::ROOT,
+                anchor,
+                [pending(tx(1), &payer, deadline)],
+                &Held::default(),
+                &mut QueueHolds::default(),
+                &mut ManifestBudget::default(),
+            );
+            let joins = lines.iter().find_map(|line| match line {
+                TickLine::Member { joins, .. } => Some(*joins),
+                _ => None,
+            });
+            assert_eq!(joins, expected, "at {anchor:?}");
+        }
     }
 
     /// Members reaching beyond the shard are named first, a member an
     /// earlier abortable one's hold refuses is skipped, one awaiting
-    /// nobody claims nothing, and no terms state a declaration a line
+    /// nobody holds nothing, and no terms state a declaration a line
     /// cannot carry.
     #[test]
     fn members_are_named_in_canonical_order_under_the_hold_rule() {
@@ -2614,8 +3081,9 @@ mod tests {
         let reaching = leg(vec![(shared, WRITE)], &[]);
         let local = alone(vec![(shared, WRITE)]);
         let held = Held::default();
-        let mut holds = ProvisionalCells::default();
+        let mut holds = QueueHolds::default();
         let lines = select_members(
+            ShardId::ROOT,
             ms(0),
             [
                 pending(tx(1), &local, far()),
@@ -2631,7 +3099,8 @@ mod tests {
                 TickLine::Member { tx, .. } => *tx,
                 other @ (TickLine::Discard { .. }
                 | TickLine::Fate { .. }
-                | TickLine::End { .. }) => {
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. }) => {
                     panic!("{other:?}")
                 }
             })
@@ -2641,10 +3110,14 @@ mod tests {
             vec![tx(9)],
             "the reaching member goes first and its write holds the local one out",
         );
-        assert!(holds.blocks(&[(shared, WRITE)]));
+        assert!(holds.refuses(
+            &pins_of(&[(shared, WRITE)], ShardId::ROOT),
+            Settlement::Alone
+        ));
 
-        let mut holds = ProvisionalCells::default();
+        let mut holds = QueueHolds::default();
         let lines = select_members(
+            ShardId::ROOT,
             ms(0),
             [
                 pending(tx(1), &local, far()),
@@ -2681,10 +3154,11 @@ mod tests {
         let members: Vec<TxHash> = (0..40u8).map(tx).collect();
         let named = |members: &[TxHash]| -> Vec<TxHash> {
             select_members(
+                ShardId::ROOT,
                 ms(0),
                 members.iter().map(|&member| pending(member, &small, far())),
                 &Held::default(),
-                &mut ProvisionalCells::default(),
+                &mut QueueHolds::default(),
                 &mut ManifestBudget::default(),
             )
             .iter()
@@ -2695,7 +3169,8 @@ mod tests {
                 }
                 other @ (TickLine::Discard { .. }
                 | TickLine::Fate { .. }
-                | TickLine::End { .. }) => panic!("{other:?}"),
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. }) => panic!("{other:?}"),
             })
             .collect()
         };
@@ -2730,10 +3205,11 @@ mod tests {
             .map(|seed| pending(tx(seed), &wide, far()))
             .collect();
         let lines = select_members(
+            ShardId::ROOT,
             ms(0),
             candidates,
             &Held::default(),
-            &mut ProvisionalCells::default(),
+            &mut QueueHolds::default(),
             &mut ManifestBudget::default(),
         );
         let fits = MAX_TICK_MANIFEST_BYTES / lines[0].wire_weight();
@@ -2753,10 +3229,11 @@ mod tests {
             .collect();
         for (anchor, joins) in [(ms(0), Joins::Executes), (far().at(), Joins::Aborted)] {
             let lines = select_members(
+                ShardId::ROOT,
                 anchor,
                 waiting.iter().map(|&tx| pending(tx, &determined, far())),
                 &Held::default(),
-                &mut ProvisionalCells::default(),
+                &mut QueueHolds::default(),
                 &mut ManifestBudget::default(),
             );
             assert_eq!(lines.len(), MAX_NAMED_MEMBERS_PER_TICK, "{joins:?}");
@@ -2782,10 +3259,11 @@ mod tests {
             .map(|at| TxHash::from(Hash::from_bytes(&at.to_be_bytes())))
             .collect();
         let lines = select_members(
+            ShardId::ROOT,
             ms(0),
             carried.iter().map(|&tx| pending(tx, &determined, far())),
             &Held::default(),
-            &mut ProvisionalCells::default(),
+            &mut QueueHolds::default(),
             &mut ManifestBudget::default(),
         );
         assert_eq!(lines.len(), MAX_TXS_PER_BLOCK);
@@ -2804,11 +3282,12 @@ mod tests {
             leg: true,
             ..alone(vec![])
         };
-        let mut holds = ProvisionalCells::default();
-        holds.claim(&[(shared, WRITE)]);
+        let mut holds = QueueHolds::default();
+        holds.hold(&pins_of(&[(shared, WRITE)], ShardId::ROOT));
         let anchor = ms(60_000);
         assert!(passed.passed(anchor));
         let lines = select_members(
+            ShardId::ROOT,
             anchor,
             [
                 pending(tx(1), &waiting, passed),
@@ -2826,6 +3305,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: CHARGE,
@@ -2833,6 +3313,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: passed,
                 crossings: Capped::empty(),
+                served_at: None,
             }],
         );
     }
@@ -2846,10 +3327,11 @@ mod tests {
         let deadline = Deadline::of(ms(10_000));
         let named = |at: WeightedTimestamp| {
             select_members(
+                ShardId::ROOT,
                 at,
                 [pending(tx(1), &core, deadline)],
                 &Held::default(),
-                &mut ProvisionalCells::default(),
+                &mut QueueHolds::default(),
                 &mut ManifestBudget::default(),
             )
         };
@@ -2865,6 +3347,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: CHARGE,
@@ -2872,6 +3355,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             }],
         );
     }
@@ -2905,6 +3389,10 @@ mod tests {
             waiting: None,
             executed: joins.dispatched(),
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
+            orphaned: false,
         };
         let mut rows = MemberIndex::empty(ShardId::ROOT);
         for held in [
@@ -2935,6 +3423,7 @@ mod tests {
                     joins: Joins::Aborted,
                     settlement: Settlement::Awaited,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: Capped::from_array([PEER]),
                     awaits: Capped::empty(),
                     charge: CHARGE,
@@ -2942,6 +3431,7 @@ mod tests {
                     reserves: Capped::empty(),
                     deadline,
                     crossings: Capped::empty(),
+                    served_at: None,
                 },
                 TickLine::Discard {
                     tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
@@ -2972,12 +3462,16 @@ mod tests {
             waiting: None,
             executed: true,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
+            orphaned: false,
         }
     }
 
     /// The lines named over `row` alone at `anchor`, every shard reading
     /// `evidence`.
-    fn lines_over(
+    fn lines_of_row(
         row: &MemberRow,
         anchor: WeightedTimestamp,
         evidence: Evidence,
@@ -3033,49 +3527,47 @@ mod tests {
             )
         };
         let pair = (vec![unanswerable(2, 1), fate_of(1)], vec![]);
-        for joins in [Joins::Executes, Joins::ExecutesAborted] {
-            for covered in [false, true] {
-                let row = in_flight(joins, covered);
-                for anchor in [before, deadline.at()] {
-                    assert_eq!(
-                        lines_over(&row, anchor, Evidence::Unreadable),
-                        pair,
-                        "{joins:?}, covered {covered}, at {anchor:?}",
-                    );
-                    assert_eq!(
-                        lines_over(&row, anchor, Evidence::Unknown),
-                        (vec![], vec![tx(1)]),
-                    );
-                }
-                for answered in [Evidence::Readable, Evidence::Live { terminating: true }] {
-                    assert_eq!(
-                        lines_over(&row, before, answered),
-                        (vec![], vec![]),
-                        "a shard that can answer keeps it short of its deadline",
-                    );
-                    let (lines, missing) = lines_over(&row, deadline.at(), answered);
-                    assert!(missing.is_empty());
-                    if covered {
-                        assert!(
-                            matches!(
-                                lines[..],
-                                [
-                                    TickLine::Member {
-                                        joins: Joins::Aborted,
-                                        ..
-                                    },
-                                    TickLine::Discard {
-                                        cause: DiscardCause::Abandoned(_),
-                                        ..
-                                    },
-                                ]
-                            ),
-                            "a covered member a shard can still answer for is aborted at its \
+        for covered in [false, true] {
+            let row = in_flight(Joins::Executes, covered);
+            for anchor in [before, deadline.at()] {
+                assert_eq!(
+                    lines_of_row(&row, anchor, Evidence::Unreadable),
+                    pair,
+                    "covered {covered}, at {anchor:?}",
+                );
+                assert_eq!(
+                    lines_of_row(&row, anchor, Evidence::Unknown),
+                    (vec![], vec![tx(1)]),
+                );
+            }
+            for answered in [Evidence::Readable, Evidence::Live { terminating: true }] {
+                assert_eq!(
+                    lines_of_row(&row, before, answered),
+                    (vec![], vec![]),
+                    "a shard that can answer keeps it short of its deadline",
+                );
+                let (lines, missing) = lines_of_row(&row, deadline.at(), answered);
+                assert!(missing.is_empty());
+                if covered {
+                    assert!(
+                        matches!(
+                            lines[..],
+                            [
+                                TickLine::Member {
+                                    joins: Joins::Aborted,
+                                    ..
+                                },
+                                TickLine::Discard {
+                                    cause: DiscardCause::Abandoned(_),
+                                    ..
+                                },
+                            ]
+                        ),
+                        "a covered member a shard can still answer for is aborted at its \
                              deadline: {lines:?}",
-                        );
-                    } else {
-                        assert!(lines.is_empty(), "{lines:?}");
-                    }
+                    );
+                } else {
+                    assert!(lines.is_empty(), "{lines:?}");
                 }
             }
         }
@@ -3105,7 +3597,7 @@ mod tests {
             );
             for evidence in [Evidence::Unreadable, Evidence::Unknown] {
                 assert_eq!(
-                    lines_over(&row, deadline.at(), evidence),
+                    lines_of_row(&row, deadline.at(), evidence),
                     (vec![], vec![]),
                     "{joins:?}, {settlement:?}, {evidence:?}",
                 );
@@ -3124,6 +3616,7 @@ mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(seed),
@@ -3131,6 +3624,7 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline,
                 crossings: Capped::empty(),
+                served_at: None,
             },
             TickLine::Discard {
                 tick: TickId::new(ShardId::ROOT, BlockHeight::new(tick)),
@@ -3141,38 +3635,36 @@ mod tests {
 
     /// A shared member in flight that no record covers is aborted once
     /// its stating window closes, beside the `Abandoned` discard of its
-    /// tick, whether or not it ran: it never stated, so no sibling read a
-    /// yes of it. A shard it reaches that can no longer answer still has
-    /// it fated, and one not yet folded still holds the voter back.
+    /// tick, though it ran: it never stated, so no sibling read a yes of
+    /// it. A shard it reaches that can no longer answer still has it
+    /// fated, and one not yet folded still holds the voter back.
     #[test]
     fn a_shared_member_in_flight_is_aborted_at_its_stating_window_end_without_a_record() {
         let deadline = Deadline::of(ms(10_000));
         let end = Window::Stating.of(deadline).end;
-        for joins in [Joins::Executes, Joins::ExecutesAborted] {
-            let row = held_in(1, deadline, 2, joins, Settlement::Shared);
-            for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
+        let row = held_in(1, deadline, 2, Joins::Executes, Settlement::Shared);
+        for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
+            assert_eq!(
+                lines_of_row(&row, end.minus(Duration::from_millis(1)), answered),
+                (vec![], vec![]),
+                "under {answered:?} it stands inside its stating window",
+            );
+            for anchor in [end, end.plus(Duration::from_hours(1))] {
                 assert_eq!(
-                    lines_over(&row, end.minus(Duration::from_millis(1)), answered),
-                    (vec![], vec![]),
-                    "{joins:?} under {answered:?} stands inside its stating window",
+                    lines_of_row(&row, anchor, answered),
+                    (aborted_in(1, deadline, 2), vec![]),
+                    "under {answered:?} at {anchor:?}",
                 );
-                for anchor in [end, end.plus(Duration::from_hours(1))] {
-                    assert_eq!(
-                        lines_over(&row, anchor, answered),
-                        (aborted_in(1, deadline, 2), vec![]),
-                        "{joins:?} under {answered:?} at {anchor:?}",
-                    );
-                }
             }
-            assert_eq!(
-                lines_over(&row, end, Evidence::Unreadable),
-                (vec![unanswerable(2, 1), fate_of(1)], vec![]),
-            );
-            assert_eq!(
-                lines_over(&row, end, Evidence::Unknown),
-                (vec![], vec![tx(1)])
-            );
         }
+        assert_eq!(
+            lines_of_row(&row, end, Evidence::Unreadable),
+            (vec![unanswerable(2, 1), fate_of(1)], vec![]),
+        );
+        assert_eq!(
+            lines_of_row(&row, end, Evidence::Unknown),
+            (vec![], vec![tx(1)])
+        );
     }
 
     /// Past its deadline and short of its stating window's end, a shared
@@ -3196,12 +3688,12 @@ mod tests {
             last,
         ] {
             assert_eq!(
-                lines_over(&uncovered, anchor, Evidence::Readable),
+                lines_of_row(&uncovered, anchor, Evidence::Readable),
                 (vec![], vec![]),
                 "at {anchor:?}",
             );
             assert_eq!(
-                lines_over(&covered, anchor, Evidence::Readable),
+                lines_of_row(&covered, anchor, Evidence::Readable),
                 (aborted_in(1, deadline, 2), vec![]),
                 "at {anchor:?}",
             );
@@ -3222,12 +3714,12 @@ mod tests {
         let awaiting = held_in(1, deadline, 2, Joins::Executes, Settlement::Awaited);
         for anchor in [deadline.at(), late] {
             assert_eq!(
-                lines_over(&awaiting, anchor, Evidence::Readable),
+                lines_of_row(&awaiting, anchor, Evidence::Readable),
                 (vec![], vec![]),
                 "at {anchor:?}",
             );
             assert_eq!(
-                lines_over(
+                lines_of_row(
                     &MemberRow {
                         covered: true,
                         ..awaiting.clone()
@@ -3244,7 +3736,7 @@ mod tests {
                     ..held_in(1, deadline, 2, Joins::Aborted, Settlement::Awaited)
                 };
                 assert_eq!(
-                    lines_over(&abort, anchor, Evidence::Readable),
+                    lines_of_row(&abort, anchor, Evidence::Readable),
                     (vec![], vec![]),
                     "covered {covered} at {anchor:?}",
                 );
@@ -3277,12 +3769,12 @@ mod tests {
             let row = released(covered);
             for anchor in [before, deadline.at()] {
                 assert_eq!(
-                    lines_over(&row, anchor, Evidence::Unreadable),
+                    lines_of_row(&row, anchor, Evidence::Unreadable),
                     (vec![fate_of(1)], vec![]),
                     "covered {covered}, at {anchor:?}",
                 );
                 assert_eq!(
-                    lines_over(&row, anchor, Evidence::Unknown),
+                    lines_of_row(&row, anchor, Evidence::Unknown),
                     (vec![], vec![tx(1)]),
                 );
             }
@@ -3292,13 +3784,13 @@ mod tests {
             };
             for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
                 assert_eq!(
-                    lines_over(&row, before, answered),
+                    lines_of_row(&row, before, answered),
                     (vec![aborting(&row, Capped::empty())], vec![]),
                     "covered {covered}, {answered:?}",
                 );
-                assert_eq!(lines_over(&unran, before, answered), (vec![], vec![]));
+                assert_eq!(lines_of_row(&unran, before, answered), (vec![], vec![]));
                 assert_eq!(
-                    lines_over(&unran, deadline.at(), answered),
+                    lines_of_row(&unran, deadline.at(), answered),
                     (vec![aborting(&unran, Capped::empty())], vec![]),
                     "covered {covered}, {answered:?}",
                 );
@@ -3314,7 +3806,7 @@ mod tests {
         for settlement in [Settlement::Alone, Settlement::Awaited] {
             let row = standing(1, deadline, RowState::Released { settlement }, false);
             for evidence in [Evidence::Unreadable, Evidence::Unknown] {
-                let (lines, missing) = lines_over(&row, deadline.at(), evidence);
+                let (lines, missing) = lines_of_row(&row, deadline.at(), evidence);
                 assert!(missing.is_empty(), "{settlement:?}, {evidence:?}");
                 assert!(
                     !lines
@@ -3355,6 +3847,7 @@ mod tests {
                 Settlement::Awaited
             },
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: row.reach.clone(),
             awaits: Capped::empty(),
             charge: row.charge,
@@ -3362,6 +3855,7 @@ mod tests {
             reserves: row.reserves.clone(),
             deadline: row.deadline,
             crossings,
+            served_at: None,
         }
     }
 
@@ -3464,7 +3958,7 @@ mod tests {
         let row = stating(1, deadline, &core);
         for said in READINGS {
             assert_eq!(
-                lines_over(&row, deadline.at().minus(MS), said),
+                lines_of_row(&row, deadline.at().minus(MS), said),
                 (vec![], vec![]),
                 "short of its deadline it waits on its bundle",
             );
@@ -3475,7 +3969,7 @@ mod tests {
                 lapse(deadline).plus(TRANSACTION_EVIDENCE_HORIZON),
             ] {
                 assert_eq!(
-                    lines_over(&row, anchor, said),
+                    lines_of_row(&row, anchor, said),
                     (vec![aborting(&row, Capped::empty())], vec![]),
                     "{anchor:?}, {said:?}",
                 );
@@ -3497,13 +3991,13 @@ mod tests {
                 };
                 for said in READINGS {
                     assert_eq!(
-                        lines_over(&row, deadline.at().minus(MS), said),
+                        lines_of_row(&row, deadline.at().minus(MS), said),
                         (vec![], vec![]),
                         "{settlement:?}, covered {covered}, {said:?}",
                     );
                     for anchor in [deadline.at(), lapse(deadline)] {
                         assert_eq!(
-                            lines_over(&row, anchor, said),
+                            lines_of_row(&row, anchor, said),
                             (vec![aborting(&row, Capped::empty())], vec![]),
                             "{settlement:?}, covered {covered}, {said:?} at {anchor:?}",
                         );
@@ -3542,7 +4036,7 @@ mod tests {
                         lapse(deadline).minus(MS),
                     ] {
                         assert_eq!(
-                            lines_over(&row, standing, said),
+                            lines_of_row(&row, standing, said),
                             (vec![], vec![]),
                             "covered {covered}, executed {executed}, {said:?} at {standing:?}",
                         );
@@ -3552,7 +4046,7 @@ mod tests {
                         lapse(deadline).plus(TRANSACTION_EVIDENCE_HORIZON),
                     ] {
                         assert_eq!(
-                            lines_over(&row, closed, said),
+                            lines_of_row(&row, closed, said),
                             (vec![fate_of(1)], vec![]),
                             "covered {covered}, executed {executed}, {said:?} at {closed:?}",
                         );
@@ -3591,13 +4085,13 @@ mod tests {
             ] {
                 let row = released(executed, covered);
                 assert_eq!(
-                    lines_over(&row, deadline.at().minus(MS), said),
+                    lines_of_row(&row, deadline.at().minus(MS), said),
                     (vec![], vec![]),
                     "an abort a wound named and a recovery released waits for its deadline",
                 );
                 for anchor in [deadline.at(), lapse(deadline)] {
                     assert_eq!(
-                        lines_over(&row, anchor, said),
+                        lines_of_row(&row, anchor, said),
                         (vec![aborting(&row, crossings.clone())], vec![]),
                         "executed {executed}, covered {covered}, {said:?} at {anchor:?}",
                     );
@@ -3645,11 +4139,27 @@ mod tests {
         )
     }
 
-    /// `rows` holding `members`, each under its own transaction.
+    /// `rows` holding `members`, each under its own transaction, those a
+    /// counterpart shares the verdict on, or holding what they declared,
+    /// placed head of the queue with their entries standing.
     fn rows_of(members: impl IntoIterator<Item = MemberRow>) -> MemberIndex {
         let mut rows = MemberIndex::empty(ShardId::ROOT);
-        rows.members
-            .extend(members.into_iter().map(|row| (row.tx, row)));
+        for row in members {
+            let queued = match row.state {
+                RowState::Pending => row
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|waiting| waiting.settlement == Settlement::Shared),
+                RowState::InFlight { settlement, .. } => settlement != Settlement::Alone,
+                RowState::Stated { .. } => true,
+                RowState::Released { .. } | RowState::Accepted => false,
+            };
+            rows.insert_row(if queued && row.queued.is_none() {
+                placed_head(row)
+            } else {
+                row
+            });
+        }
         rows
     }
 
@@ -3743,7 +4253,7 @@ mod tests {
 
         let standing = holding(stated(false), false);
         assert_eq!(
-            in_flight_holders(standing.members.values())
+            seated_holders(standing.members.values(), shard)
                 .map(|holder| holder.tx)
                 .collect::<Vec<_>>(),
             vec![tx(1)],
@@ -3963,8 +4473,241 @@ mod tests {
             TickLine::Discard {
                 cause: DiscardCause::Recovery,
                 ..
-            } => false,
+            }
+            | TickLine::Recovered { .. } => false,
         })
+    }
+
+    /// The transaction of the `at`th of many rows.
+    fn many(at: usize) -> TxHash {
+        TxHash::from(Hash::from_bytes(&(at as u64).to_be_bytes()))
+    }
+
+    /// A core member a sibling on `PEER` shares the verdict on, writing a
+    /// cell this shard owns, committed at `height` anchored at `height`
+    /// seconds, and head of the queue there where `headed`.
+    fn keyed_core(tx: TxHash, height: u64, headed: bool) -> MemberRow {
+        let row = MemberRow {
+            tx,
+            committed: ms(height * 1_000),
+            height: BlockHeight::new(height),
+            ..unplaced(0, far(), &leg(vec![(cell(1, 1), WRITE)], &[]))
+        };
+        if headed { placed_head(row) } else { row }
+    }
+
+    /// The band of a recovery whose frontier is `frontier` and whose
+    /// bridge opens at `bridge` seconds.
+    fn band(frontier: u64, bridge: u64) -> RecoveryBand {
+        RecoveryBand {
+            attested_frontier: BlockHeight::new(frontier),
+            bridge_start: ms(bridge * 1_000),
+        }
+    }
+
+    fn bands(of: &[RecoveryBand]) -> RecoveryBands {
+        Capped::new(of.to_vec()).expect("a few bands")
+    }
+
+    /// Every row a recovery orphans is aborted, unnamed: the crossing
+    /// block names its marker first and then as many aborts as the
+    /// member cap lets, and the rest wait for the block after it, which
+    /// aborts them.
+    #[test]
+    fn orphaned_rows_abort_across_blocks_within_the_member_cap() {
+        const LEFT: usize = 3;
+        let count = MAX_NAMED_MEMBERS_PER_TICK + LEFT;
+        let mut rows = rows_of((0..count).map(|at| keyed_core(many(at), 1, false)));
+        let marker = rows
+            .recovery_marker(bands(&[band(0, 5)]), BlockHeight::new(3))
+            .expect("every row is unheaded and keyed");
+        naming(&mut rows, 3, vec![marker.clone()]);
+        assert!(rows.members.values().all(|row| row.orphaned));
+        let aborts = |lines: &[TickLine]| {
+            lines
+                .iter()
+                .filter(|line| {
+                    matches!(
+                        line,
+                        TickLine::Member {
+                            joins: Joins::Aborted,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+
+        let (crossing, missing, _) = member_lines(
+            Naming {
+                rows: &rows,
+                anchor: ms(6_000),
+                inputs: &Held::default(),
+                evidence: &|_, _| Evidence::Live { terminating: false },
+                crossing: &Crossing::Marked(Box::new(marker.clone())),
+                wounded: &BTreeSet::new(),
+            },
+            &BTreeMap::new(),
+        );
+        assert!(missing.is_empty());
+        assert_eq!(crossing[0], marker, "the marker is named first");
+        assert_eq!(aborts(&crossing), MAX_NAMED_MEMBERS_PER_TICK);
+        assert_eq!(crossing.len(), MAX_NAMED_MEMBERS_PER_TICK + 1);
+        naming(&mut rows, 3, crossing);
+
+        let (after, missing) = lines_at(
+            &rows,
+            ms(7_000),
+            Evidence::Live { terminating: false },
+            false,
+        );
+        assert!(missing.is_empty());
+        assert_eq!(aborts(&after), LEFT, "the rest abort a block later");
+        assert_eq!(after.len(), LEFT);
+        naming(&mut rows, 4, after);
+        assert!(
+            rows.members.values().all(|row| matches!(
+                row.state,
+                RowState::InFlight {
+                    joins: Joins::Aborted,
+                    ..
+                }
+            )),
+            "every orphan stands in the tick that aborts it",
+        );
+    }
+
+    /// A row made head at or below the frontier was made head where the
+    /// recovered chain keeps it: no marker orphans it, and the crossing
+    /// block runs it as any head. One made head just above the frontier,
+    /// below the bridge, is orphaned.
+    #[test]
+    fn a_row_head_at_or_below_the_frontier_survives_a_recovery_crossing() {
+        let rows = rows_of([keyed_core(tx(1), 2, true)]);
+        assert_eq!(
+            rows.recovery_marker(bands(&[band(2, 5)]), BlockHeight::new(6)),
+            None
+        );
+        let (lines, missing) = lines_at(
+            &rows,
+            ms(6_000),
+            Evidence::Live { terminating: false },
+            true,
+        );
+        assert!(missing.is_empty());
+        assert!(
+            matches!(
+                &lines[..],
+                [TickLine::Member { tx: ran, joins: Joins::Executes, .. }] if *ran == tx(1)
+            ),
+            "the head at the frontier runs: {lines:?}"
+        );
+
+        let above = rows_of([keyed_core(tx(1), 3, true)]);
+        assert!(
+            above
+                .recovery_marker(bands(&[band(2, 5)]), BlockHeight::new(6))
+                .is_some()
+        );
+    }
+
+    /// A chained recovery's marker carries the band of the recovery it
+    /// superseded: a head above the older frontier and below the older
+    /// bridge, at or below the newer frontier, is orphaned by the older
+    /// band alone.
+    #[test]
+    fn a_superseded_recoverys_band_orphans_a_head_in_it() {
+        let (superseded, newest) = (band(2, 5), band(6, 20));
+        let mut rows = rows_of([keyed_core(tx(1), 4, true)]);
+        assert_eq!(
+            rows.recovery_marker(bands(&[newest]), BlockHeight::new(21)),
+            None,
+            "the newest band alone keeps it"
+        );
+        let marker = rows
+            .recovery_marker(bands(&[superseded, newest]), BlockHeight::new(21))
+            .expect("the superseded band orphans it");
+        naming(&mut rows, 21, vec![marker]);
+        let orphan = &rows.members[&tx(1)];
+        assert!(orphan.orphaned);
+        assert_eq!((orphan.queued, orphan.head), (None, None));
+    }
+
+    /// A crossing block over rows that each hold a tick carries no
+    /// marker: nothing is orphaned, so its discards alone fill the
+    /// manifest's lines, one per tick at the drain's cap. A marker beside
+    /// them would leave a tick standing past the crossing.
+    #[test]
+    fn a_crossing_block_with_every_row_held_carries_no_marker() {
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        for at in 0..MAX_TICK_LINES_PER_BLOCK {
+            let tick = BlockHeight::new(at as u64 + 1);
+            let row = MemberRow {
+                tx: many(at),
+                state: RowState::Stated {
+                    tick,
+                    receipt: GlobalReceiptHash::ZERO,
+                },
+                ..standing(0, far(), RowState::Pending, false)
+            };
+            rows.members.insert(row.tx, row);
+            rows.ticks.insert(
+                tick,
+                TickRow {
+                    members: Capped::from_array([many(at)]),
+                    determined_unsettled: false,
+                    awaiting: 1,
+                },
+            );
+        }
+        let crossing = BlockHeight::new(MAX_TICK_LINES_PER_BLOCK as u64 + 1);
+        let every = bands(&[band(0, u64::MAX / 1_000)]);
+        assert_eq!(rows.recovery_marker(every.clone(), crossing), None);
+
+        let live = Evidence::Live { terminating: false };
+        let (lines, missing) = lines_at(&rows, ms(1), live, true);
+        assert!(missing.is_empty());
+        assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK, "a discard per tick");
+
+        let forced = TickLine::Recovered { bands: every };
+        let (overfull, _, _) = member_lines(
+            Naming {
+                rows: &rows,
+                anchor: ms(1),
+                inputs: &Held::default(),
+                evidence: &|_, _| live,
+                crossing: &Crossing::Marked(Box::new(forced)),
+                wounded: &BTreeSet::new(),
+            },
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            overfull.len() - 1,
+            MAX_TICK_LINES_PER_BLOCK - 1,
+            "a marker beside them leaves a tick's discard out"
+        );
+    }
+
+    /// A terminal fates every row, so no head outlives it: the rows it
+    /// leaves root no `Serves` entry.
+    #[test]
+    fn a_terminal_roots_no_head() {
+        use hyperscale_storage::Substates;
+
+        let mut rows = rows_of([keyed_core(tx(1), 1, true), keyed_core(tx(2), 1, true)]);
+        let (owner, serves) = MemberCollection::Serves.of(ShardId::ROOT);
+        assert!(
+            !rows
+                .entries_in_range(owner, serves, 0, u128::MAX, 8)
+                .is_empty()
+        );
+        let fates = terminal_fates(&rows);
+        naming(&mut rows, 2, fates);
+        assert!(rows.members.is_empty());
+        assert!(
+            rows.entries_in_range(owner, serves, 0, u128::MAX, 8)
+                .is_empty()
+        );
     }
 
     /// The seeds of the rows [`before_a_halt`] stands.
@@ -4326,6 +5069,7 @@ mod tests {
                     joins: Joins::Executes,
                     settlement: Settlement::Shared,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: core.reach.clone(),
                     awaits: core.awaits.clone(),
                     charge: core.charge,
@@ -4333,6 +5077,7 @@ mod tests {
                     reserves: core.reserves.clone(),
                     deadline,
                     crossings: core.crossings.clone(),
+                    served_at: None,
                 }],
             );
             let named = &rows.members[&tx(1)];
@@ -4796,6 +5541,10 @@ mod tests {
                 waiting: None,
                 executed: true,
                 hearing: Capped::empty(),
+                queued: None,
+                head: None,
+                blocked_at: None,
+                orphaned: false,
             },
         );
         rows.ticks.insert(
@@ -4903,64 +5652,157 @@ mod tests {
         }
     }
 
-    /// A ready core member left out pairs with every core holder that
-    /// refuses it and awaits a shard it awaits, in flight or named
-    /// beside it; one that is not ready, that awaits no shard in common,
-    /// or that a line names stands in no contention.
+    /// Where the holder of a wound fixture stands: in flight, read one
+    /// way, or a `Pending` head, read both ways.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Holding {
+        InFlight,
+        Head,
+    }
+
+    const HOLDINGS: [Holding; 2] = [Holding::InFlight, Holding::Head];
+
+    /// `seed`'s core row holding `holds` and awaiting `PEER`, standing as
+    /// `holding` says: in flight Shared, or a `Pending` head placed at
+    /// height 1 and unready, its terms engaging `PEER`.
+    fn holder_row(holding: Holding, seed: u8, holds: &[(DeclaredKey, Mode)]) -> MemberRow {
+        match holding {
+            Holding::InFlight => MemberRow {
+                tx: tx(seed),
+                deadline: far(),
+                committed: ms(0),
+                height: BlockHeight::new(1),
+                state: RowState::InFlight {
+                    tick: BlockHeight::new(2),
+                    joins: Joins::Executes,
+                    settlement: Settlement::Shared,
+                },
+                holds: Capped::new(holds.to_vec()).expect("within the cap"),
+                reach: Capped::from_array([PEER]),
+                awaits: Capped::from_array([PEER]),
+                charge: CHARGE,
+                share: 0,
+                reserves: Capped::empty(),
+                crossings: Capped::empty(),
+                owes: Owes::default(),
+                waiting: None,
+                covered: false,
+                executed: true,
+                hearing: Capped::empty(),
+                queued: None,
+                head: None,
+                blocked_at: None,
+                orphaned: false,
+            },
+            Holding::Head => stating(seed, far(), &leg(holds.to_vec(), &[PEER])),
+        }
+    }
+
+    /// The `Pending` row a block stating `terms` writes for `seed`, placed
+    /// at height 2 behind a holder placed before it, and not head.
+    fn placed_behind(seed: u8, terms: &MemberTerms) -> MemberRow {
+        MemberRow {
+            queued: Some(Place {
+                height: BlockHeight::new(2),
+                rank: 0,
+            }),
+            head: None,
+            ..unplaced(seed, far(), terms)
+        }
+    }
+
+    /// A ready core member placed and left out pairs with every core
+    /// holder standing ahead of it and awaiting a shard it awaits, seated
+    /// or named beside it; one that is not ready, that awaits no shard in
+    /// common, or that a line names stands in no contention. A holder in
+    /// flight and one at its head count alike.
     #[test]
     fn a_ready_core_member_left_out_contends_with_its_core_holders() {
         const OTHER: ShardId = ShardId::leaf(1, 0);
         let shared = cell(1, 1);
-        let mut rows = MemberIndex::empty(ShardId::ROOT);
-        let row = |seed: u8, state, holds: Vec<(DeclaredKey, Mode)>| MemberRow {
-            tx: tx(seed),
-            deadline: far(),
-            committed: ms(0),
-            height: BlockHeight::new(1),
-            state,
-            holds: Capped::new(holds).expect("within the cap"),
-            reach: Capped::from_array([PEER]),
-            awaits: Capped::from_array([PEER]),
-            covered: false,
-            charge: CHARGE,
-            share: 0,
-            reserves: Capped::empty(),
-            crossings: Capped::empty(),
-            owes: Owes::default(),
-            waiting: None,
-            executed: true,
-            hearing: Capped::empty(),
-        };
-        let in_flight = RowState::InFlight {
-            tick: BlockHeight::new(2),
-            joins: Joins::Executes,
-            settlement: Settlement::Shared,
-        };
         let ready = leg(vec![(shared, WRITE)], &[PEER]);
         let elsewhere = MemberTerms {
             reach: Capped::from_array([OTHER]),
             awaits: Capped::from_array([OTHER]),
             ..ready.clone()
         };
-        for member in [
-            row(1, in_flight, vec![(shared, WRITE)]),
-            stating(2, far(), &ready),
-            stating(3, far(), &ready),
-            stating(4, far(), &elsewhere),
-            stating(5, far(), &ready),
-        ] {
+        for holding in HOLDINGS {
+            let mut rows = MemberIndex::empty(ShardId::ROOT);
+            for member in [
+                holder_row(holding, 1, &[(shared, WRITE)]),
+                placed_behind(2, &ready),
+                placed_behind(3, &ready),
+                placed_behind(4, &elsewhere),
+                placed_behind(5, &ready),
+            ] {
+                rows.members.insert(member.tx, member);
+            }
+            let mut held = Held::default();
+            for seed in [2, 4, 5] {
+                held.engaged.insert((PEER, tx(seed)));
+            }
+            let named = TickLine::Member {
+                staged: 0,
+                tx: tx(5),
+                joins: Joins::Executes,
+                settlement: Settlement::Shared,
+                holds: Capped::from_array([(shared, WRITE)]),
+                pins: Capped::empty(),
+                reach: Capped::from_array([PEER]),
+                awaits: Capped::from_array([PEER]),
+                charge: CHARGE,
+                share: 0,
+                reserves: Capped::empty(),
+                deadline: far(),
+                crossings: Capped::empty(),
+                served_at: None,
+            };
+            assert_eq!(
+                contentions(&rows, &[named], ms(0), &held),
+                vec![
+                    Contention {
+                        waiting: tx(2),
+                        holder: tx(1),
+                    },
+                    Contention {
+                        waiting: tx(2),
+                        holder: tx(5),
+                    },
+                ],
+                "{holding:?}: tx 3 is not ready, tx 4 awaits no shard in common, tx 5 is named",
+            );
+        }
+    }
+
+    /// A head the block's lines name stands in `rows` still `Pending` and
+    /// seated, and in the lines in flight: it counts once, through the
+    /// lines.
+    #[test]
+    fn contentions_count_a_named_head_once() {
+        let shared = cell(1, 1);
+        let ready = leg(vec![(shared, WRITE)], &[PEER]);
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        for member in [stating(1, far(), &ready), placed_behind(2, &ready)] {
             rows.members.insert(member.tx, member);
         }
         let mut held = Held::default();
-        for seed in [2, 4, 5] {
-            held.engaged.insert((PEER, tx(seed)));
-        }
+        held.engaged.insert((PEER, tx(2)));
+        let one = [Contention {
+            waiting: tx(2),
+            holder: tx(1),
+        }];
+        assert_eq!(
+            contentions(&rows, &[], ms(0), &held),
+            one,
+            "unnamed, seated"
+        );
         let named = TickLine::Member {
             staged: 0,
-            tx: tx(5),
+            tx: tx(1),
             joins: Joins::Executes,
             settlement: Settlement::Shared,
             holds: Capped::from_array([(shared, WRITE)]),
+            pins: Capped::empty(),
             reach: Capped::from_array([PEER]),
             awaits: Capped::from_array([PEER]),
             charge: CHARGE,
@@ -4968,53 +5810,51 @@ mod tests {
             reserves: Capped::empty(),
             deadline: far(),
             crossings: Capped::empty(),
+            served_at: None,
         };
         assert_eq!(
             contentions(&rows, &[named], ms(0), &held),
-            vec![
-                Contention {
-                    waiting: tx(2),
-                    holder: tx(1),
-                },
-                Contention {
-                    waiting: tx(2),
-                    holder: tx(5),
-                },
-            ],
-            "tx 3 is not ready, tx 4 awaits no shard in common, tx 5 is named",
+            one,
+            "named, it counts once",
         );
     }
 
-    /// A family of one core member in flight holding `declared`, and one
-    /// pending beside it that declares the same and waits on `PEER`'s
-    /// bundle.
-    fn held_beside_pending(held: u8, waiting: u8, declared: &[(DeclaredKey, Mode)]) -> MemberIndex {
-        let mut rows = MemberIndex::empty(ShardId::ROOT);
-        let in_flight = MemberRow {
-            tx: tx(held),
-            deadline: far(),
-            committed: ms(0),
-            height: BlockHeight::new(1),
-            state: RowState::InFlight {
-                tick: BlockHeight::new(2),
-                joins: Joins::Executes,
-                settlement: Settlement::Shared,
-            },
-            holds: Capped::new(declared.to_vec()).expect("within the cap"),
-            reach: Capped::from_array([PEER]),
-            awaits: Capped::from_array([PEER]),
-            charge: CHARGE,
-            share: 0,
-            reserves: Capped::empty(),
-            crossings: Capped::empty(),
-            owes: Owes::default(),
-            waiting: None,
-            covered: false,
-            executed: true,
-            hearing: Capped::empty(),
-        };
-        let pending = stating(waiting, far(), &leg(declared.to_vec(), &[PEER]));
-        for member in [in_flight, pending] {
+    /// A write of a cell under `PEER`'s prefix and of one outside it, so
+    /// two members declaring it contend on the shard asking and on `PEER`
+    /// alike.
+    fn spanning_write() -> Vec<(DeclaredKey, Mode)> {
+        vec![(cell(1, 1), WRITE), (cell(0x91, 1), WRITE)]
+    }
+
+    /// A family of one core member holding `declared`, standing as
+    /// `holding` says, and one pending placed behind it that declares the
+    /// same and waits on `PEER`'s bundle.
+    fn held_beside_pending(
+        holding: Holding,
+        held: u8,
+        waiting: u8,
+        declared: &[(DeclaredKey, Mode)],
+    ) -> MemberIndex {
+        held_beside_pending_on(
+            ShardId::ROOT,
+            holding,
+            (held, declared),
+            (waiting, declared),
+        )
+    }
+
+    /// [`held_beside_pending`] on `local`, each member declaring its own.
+    fn held_beside_pending_on(
+        local: ShardId,
+        holding: Holding,
+        (held, holds): (u8, &[(DeclaredKey, Mode)]),
+        (waiting, declared): (u8, &[(DeclaredKey, Mode)]),
+    ) -> MemberIndex {
+        let mut rows = MemberIndex::empty(local);
+        for member in [
+            holder_row(holding, held, holds),
+            placed_behind(waiting, &leg(declared.to_vec(), &[PEER])),
+        ] {
             rows.members.insert(member.tx, member);
         }
         rows
@@ -5063,15 +5903,35 @@ mod tests {
         )
     }
 
-    /// A pending core member that a held one refuses, and that one claim
-    /// reads seated on their shared counterpart with the holder unseated
-    /// there, is aborted short of its deadline when it is the later of
-    /// the two; the earlier one waits, and so does either one without
+    /// The unnamed abort of `seed` on [`leg`] terms reaching `PEER`.
+    fn unnamed_abort(seed: u8) -> TickLine {
+        TickLine::Member {
+            staged: 0,
+            tx: tx(seed),
+            joins: Joins::Aborted,
+            settlement: Settlement::Awaited,
+            holds: Capped::empty(),
+            pins: Capped::empty(),
+            reach: Capped::from_array([PEER]),
+            awaits: Capped::empty(),
+            charge: CHARGE,
+            share: 0,
+            reserves: Capped::empty(),
+            deadline: far(),
+            crossings: Capped::empty(),
+            served_at: None,
+        }
+    }
+
+    /// A core member placed behind a seated one, and that one claim reads
+    /// seated on their shared counterpart with the holder unseated there,
+    /// is aborted short of its deadline when it is the later of the two.
+    /// Where the holder is the later, a head holder is aborted itself,
+    /// and one in flight is never asked about. Either one waits without
     /// the whole reading.
     #[test]
     fn the_later_member_of_a_proven_hold_cycle_is_aborted() {
-        let declared = vec![(cell(1, 1), WRITE)];
-        let family = |held: u8, waiting: u8| held_beside_pending(held, waiting, &declared);
+        let declared = spanning_write();
         let crossed = crossed_reading;
         let reading = seat_reading;
         let live = |_, _| Evidence::Live { terminating: false };
@@ -5080,68 +5940,76 @@ mod tests {
             lines_and_missing(rows, ms(0), &Held::default(), &live, false, &victims).0
         };
 
-        assert_eq!(
-            lines(&family(1, 2), &[crossed(1, 2)]),
-            vec![TickLine::Member {
-                staged: 0,
-                tx: tx(2),
-                joins: Joins::Aborted,
-                settlement: Settlement::Awaited,
-                holds: Capped::empty(),
-                reach: Capped::from_array([PEER]),
-                awaits: Capped::empty(),
-                charge: CHARGE,
-                share: 0,
-                reserves: Capped::empty(),
-                deadline: far(),
-                crossings: Capped::empty(),
-            }],
-            "the later member is the victim",
-        );
-        assert!(
-            lines(&family(2, 1), &[crossed(2, 1)]).is_empty(),
-            "the earlier member waits for the counterpart to abort the later",
-        );
-        assert!(lines(&family(1, 2), &[]).is_empty(), "no reading, no abort");
-        let whole = crossed(1, 2);
-        let split: Vec<StateClaim> = [
-            |key: SubstateKey| key == seat_leaf(PEER, tx(2)),
-            |key: SubstateKey| key != seat_leaf(PEER, tx(2)),
-        ]
-        .into_iter()
-        .filter_map(|keep| whole.restrict(keep))
-        .collect();
-        assert_eq!(split.len(), 2);
-        assert_eq!(
-            lines(&family(1, 2), &split).len(),
-            1,
-            "a reading cut across claims at one anchor proves as one",
-        );
-        assert!(
-            lines(
-                &family(1, 2),
-                &[reading(
-                    1,
-                    2,
-                    &[
-                        seat_leaf(PEER, tx(2)),
-                        member_row_leaf(PEER, tx(1)),
-                        seat_leaf(PEER, tx(1)),
-                    ],
-                )],
-            )
-            .is_empty(),
-            "a holder seated on the counterpart too is no cycle",
-        );
+        for holding in HOLDINGS {
+            let family =
+                |held: u8, waiting: u8| held_beside_pending(holding, held, waiting, &declared);
+            assert_eq!(
+                lines(&family(1, 2), &[crossed(1, 2)]),
+                vec![unnamed_abort(2)],
+                "{holding:?}: the later member is the victim",
+            );
+            assert_eq!(
+                lines(&family(2, 1), &[crossed(2, 1)]),
+                match holding {
+                    Holding::InFlight => Vec::new(),
+                    Holding::Head => vec![unnamed_abort(2)],
+                },
+                "{holding:?}: the later member is the victim, where no tick here has named it",
+            );
+            assert!(
+                lines(&family(1, 2), &[]).is_empty(),
+                "{holding:?}: no reading, no abort"
+            );
+            let whole = crossed(1, 2);
+            let split: Vec<StateClaim> = [
+                |key: SubstateKey| key == seat_leaf(PEER, tx(2)),
+                |key: SubstateKey| key != seat_leaf(PEER, tx(2)),
+            ]
+            .into_iter()
+            .filter_map(|keep| whole.restrict(keep))
+            .collect();
+            assert_eq!(split.len(), 2);
+            assert_eq!(
+                lines(&family(1, 2), &split).len(),
+                1,
+                "{holding:?}: a reading cut across claims at one anchor proves as one",
+            );
+            assert!(
+                lines(
+                    &family(1, 2),
+                    &[reading(
+                        1,
+                        2,
+                        &[
+                            seat_leaf(PEER, tx(2)),
+                            member_row_leaf(PEER, tx(1)),
+                            seat_leaf(PEER, tx(1)),
+                        ],
+                    )],
+                )
+                .is_empty(),
+                "{holding:?}: a holder seated on the counterpart too is no cycle",
+            );
+        }
     }
 
     /// The reading that proves a cycle wounds nobody where the holder
     /// cannot be part of one: past its own deadline, the counterpart
     /// where it waits aborts it; and reaching the counterpart only by a
-    /// leg, it holds no seat there to read.
+    /// leg, it holds no seat there to read. A holder in flight and one at
+    /// its head read alike.
     #[test]
     fn a_reading_wounds_nobody_through_a_lapsed_or_leg_holder() {
-        let declared = vec![(cell(1, 1), WRITE)];
+        for holding in HOLDINGS {
+            a_reading_wounds_nobody_through_a_lapsed_or_leg_holder_standing(holding);
+        }
+    }
+
+    fn a_reading_wounds_nobody_through_a_lapsed_or_leg_holder_standing(holding: Holding) {
+        let declared = spanning_write();
+        let held_beside_pending = |held, waiting, declared: &[(DeclaredKey, Mode)]| {
+            held_beside_pending(holding, held, waiting, declared)
+        };
         let claims = [crossed_reading(1, 2)];
         let lapse = Deadline::of(ms(0));
 
@@ -5201,11 +6069,18 @@ mod tests {
     /// A holder whose verdict leaf stands on the counterpart proves no
     /// cycle, so the pending member is not wounded. The same reading with
     /// the leaf absent is the cycle, and one that does not read the leaf
-    /// proves nothing either way.
+    /// proves nothing either way. A holder in flight and one at its head
+    /// read alike.
     #[test]
     fn a_holder_standing_beside_a_verdict_leaf_proves_no_cycle() {
-        let declared = vec![(cell(1, 1), WRITE)];
-        let rows = held_beside_pending(1, 2, &declared);
+        for holding in HOLDINGS {
+            a_holder_standing_beside_a_verdict_leaf_proves_no_cycle_standing(holding);
+        }
+    }
+
+    fn a_holder_standing_beside_a_verdict_leaf_proves_no_cycle_standing(holding: Holding) {
+        let declared = spanning_write();
+        let rows = held_beside_pending(holding, 1, 2, &declared);
         let (seat, row, unseated, leaf) = (
             seat_leaf(PEER, tx(2)),
             member_row_leaf(PEER, tx(1)),
@@ -5242,6 +6117,455 @@ mod tests {
             BTreeSet::from([tx(2)]),
             "and the leaf read in another claim at the same anchor completes it",
         );
+    }
+
+    /// A claim on `PEER` at `height` over every cell the one seat question
+    /// `rows` put reads, proven against a tree holding `leaves`.
+    fn seat_answer_at(rows: &MemberIndex, height: u64, leaves: &[SubstateKey]) -> StateClaim {
+        let [question] = seat_questions(rows, ms(0))[..] else {
+            panic!("the family puts one seat question");
+        };
+        proven_claim(PEER, height, leaves, &question.keys())
+    }
+
+    /// A victim whose verdict leaf and row are gone from the counterpart,
+    /// its committed marker standing, has left there, and is wounded
+    /// without the cycle: the reading the shard that looks second takes,
+    /// once the first has deleted the holder's row with its abort. A
+    /// leaving is final, so a reading past the holder's deadline still
+    /// wounds, where the cycle at that anchor proves nothing.
+    #[test]
+    fn a_victim_left_on_the_counterpart_is_wounded() {
+        for holding in HOLDINGS {
+            a_victim_left_on_the_counterpart_is_wounded_standing(holding);
+        }
+    }
+
+    fn a_victim_left_on_the_counterpart_is_wounded_standing(holding: Holding) {
+        let declared = spanning_write();
+        let held_beside_pending = |held, waiting, declared: &[(DeclaredKey, Mode)]| {
+            held_beside_pending(holding, held, waiting, declared)
+        };
+        let rows = held_beside_pending(1, 2, &declared);
+        let marker = committed_tx_cell_key(PEER, tx(2), far().validity_end());
+        assert_eq!(
+            wounded(&rows, ms(0), &[seat_answer_at(&rows, 5, &[marker])]),
+            BTreeSet::from([tx(2)]),
+            "the victim's marker stands with neither its row nor its verdict leaf",
+        );
+
+        let mut lapsing = held_beside_pending(1, 2, &declared);
+        if let Some(holder) = lapsing.members.get_mut(&tx(1)) {
+            holder.deadline = Deadline::of(ms(1_000));
+        }
+        let past = lapsing.members[&tx(1)].deadline.at().as_millis() / 1_000 + 1;
+        let crossed = [seat_leaf(PEER, tx(2)), member_row_leaf(PEER, tx(1))];
+        assert!(
+            wounded(&lapsing, ms(0), &[seat_answer_at(&lapsing, past, &crossed)]).is_empty(),
+            "the cycle read past the holder's deadline proves nothing",
+        );
+        assert_eq!(
+            wounded(
+                &lapsing,
+                ms(0),
+                &[seat_answer_at(&lapsing, past, &[marker])]
+            ),
+            BTreeSet::from([tx(2)]),
+            "the victim's leaving read there still does",
+        );
+    }
+
+    /// The survivor's leaving is no answer: with the holder's row gone
+    /// from the counterpart there is no cycle to read, and the victim,
+    /// whose row stands there or who was never committed there, has not
+    /// left.
+    #[test]
+    fn a_survivor_left_on_the_counterpart_wounds_nobody() {
+        for holding in HOLDINGS {
+            a_survivor_left_on_the_counterpart_wounds_nobody_standing(holding);
+        }
+    }
+
+    fn a_survivor_left_on_the_counterpart_wounds_nobody_standing(holding: Holding) {
+        let declared = spanning_write();
+        let rows = held_beside_pending(holding, 1, 2, &declared);
+        let seat = seat_leaf(PEER, tx(2));
+        let survivor_marker = committed_tx_cell_key(PEER, tx(1), far().validity_end());
+        assert!(
+            wounded(
+                &rows,
+                ms(0),
+                &[seat_answer_at(&rows, 5, &[seat, survivor_marker])],
+            )
+            .is_empty(),
+            "the holder left, and the victim is seated there",
+        );
+        let victim_marker = committed_tx_cell_key(PEER, tx(2), far().validity_end());
+        assert!(
+            wounded(
+                &rows,
+                ms(0),
+                &[seat_answer_at(
+                    &rows,
+                    5,
+                    &[
+                        seat,
+                        member_row_leaf(PEER, tx(2)),
+                        victim_marker,
+                        survivor_marker
+                    ],
+                )],
+            )
+            .is_empty(),
+            "a victim whose row stands there has not left",
+        );
+    }
+
+    /// A victim with no verdict leaf and no row on the counterpart has
+    /// left only where its committed marker stands, or at or past its
+    /// validity end: before that the counterpart may yet commit it. A
+    /// reading that does not say whether the marker stands proves
+    /// nothing.
+    #[test]
+    fn a_leaving_read_without_its_marker_proves_nothing() {
+        for holding in HOLDINGS {
+            a_leaving_read_without_its_marker_proves_nothing_standing(holding);
+        }
+    }
+
+    fn a_leaving_read_without_its_marker_proves_nothing_standing(holding: Holding) {
+        let declared = spanning_write();
+        let held_beside_pending = |held, waiting, declared: &[(DeclaredKey, Mode)]| {
+            held_beside_pending(holding, held, waiting, declared)
+        };
+        let rows = held_beside_pending(1, 2, &declared);
+        assert!(
+            wounded(&rows, ms(0), &[seat_answer_at(&rows, 5, &[])]).is_empty(),
+            "uncommitted there before its validity end",
+        );
+        let marker = committed_tx_cell_key(PEER, tx(2), far().validity_end());
+        let unread = seat_answer_at(&rows, 5, &[marker])
+            .restrict(|key| key != marker)
+            .expect("the other cells are left");
+        assert!(
+            wounded(&rows, ms(0), &[unread]).is_empty(),
+            "a reading that does not read the marker",
+        );
+
+        let mut ending = held_beside_pending(1, 2, &declared);
+        if let Some(victim) = ending.members.get_mut(&tx(2)) {
+            victim.deadline = Deadline::of(ms(2_000));
+        }
+        assert!(
+            wounded(&ending, ms(0), &[seat_answer_at(&ending, 1, &[])]).is_empty(),
+            "a second before its validity end",
+        );
+        assert_eq!(
+            wounded(&ending, ms(0), &[seat_answer_at(&ending, 2, &[])]),
+            BTreeSet::from([tx(2)]),
+            "at its validity end, the counterpart can no longer commit it",
+        );
+    }
+
+    /// A present verdict leaf is never a leaving for a seat question,
+    /// whatever it holds: a victim stated on the counterpart is about to
+    /// collect this shard's yes, not gone. The verdict reading of the
+    /// same cells takes a leaf that matches neither hash it is given as
+    /// a leaving, so the seat question reads the leaf absent first.
+    #[test]
+    fn a_victim_stated_on_the_counterpart_is_no_leaving() {
+        for holding in HOLDINGS {
+            a_victim_stated_on_the_counterpart_is_no_leaving_standing(holding);
+        }
+    }
+
+    fn a_victim_stated_on_the_counterpart_is_no_leaving_standing(holding: Holding) {
+        let declared = spanning_write();
+        let rows = held_beside_pending(holding, 1, 2, &declared);
+        let (leaf, row) = (verdict_leaf(PEER, tx(2)), member_row_leaf(PEER, tx(2)));
+        let marker = committed_tx_cell_key(PEER, tx(2), far().validity_end());
+        for leaves in [vec![leaf, row, marker], vec![leaf, marker]] {
+            let stated = seat_answer_at(&rows, 5, &leaves);
+            let Some(held) = stated.reading(leaf) else {
+                panic!("the leaf is read");
+            };
+            assert!(matches!(held, Inclusion::Present(_)));
+            let beside = stated.reading(row).zip(stated.reading(marker));
+            assert_eq!(
+                said_at(
+                    held,
+                    beside,
+                    stated.anchor.ts,
+                    far().validity_end(),
+                    Hash::ZERO,
+                    Hash::ZERO
+                ),
+                Some(Some(Said::Left)),
+                "a leaf matching neither hash reads as a leaving to a verdict question",
+            );
+            assert!(
+                wounded(&rows, ms(0), &[stated]).is_empty(),
+                "but proves nothing to a seat question",
+            );
+        }
+    }
+
+    /// The crossed pair, asked about on the holder's shard: H1, in flight
+    /// or at its head, writes a key W reads here, and on `PEER` W
+    /// reserves a vault H1 debits, which the queue there reads both ways
+    /// while W waits. The question is put on `PEER`'s pins of each, and
+    /// the reading of W seated there and H1 unseated wounds W.
+    #[test]
+    fn a_crossed_reserve_and_debit_pair_is_wounded() {
+        let here = ShardId::leaf(1, 0);
+        let (key, vault) = (cell(1, 1), cell(0x91, 1));
+        for holding in HOLDINGS {
+            let rows = held_beside_pending_on(
+                here,
+                holding,
+                (1, &[(key, WRITE), (vault, DEBIT)]),
+                (2, &[(key, Mode::Read), (vault, RESERVE)]),
+            );
+            assert_eq!(
+                seat_questions(&rows, ms(0)),
+                vec![SeatQuestion {
+                    shard: PEER,
+                    waiting: tx(2),
+                    holder: tx(1),
+                    validity_end: far().validity_end(),
+                }],
+                "{holding:?}",
+            );
+            assert_eq!(
+                wounded(&rows, ms(0), &[crossed_reading(1, 2)]),
+                BTreeSet::from([tx(2)]),
+                "{holding:?}",
+            );
+
+            // Reading the vault on both sides, the two conflict here
+            // alone, so an unseated H1 on `PEER` is only not yet ready
+            // there.
+            let reading = held_beside_pending_on(
+                here,
+                holding,
+                (1, &[(key, WRITE), (vault, Mode::Read)]),
+                (2, &[(key, Mode::Read), (vault, Mode::Read)]),
+            );
+            assert!(seat_questions(&reading, ms(0)).is_empty(), "{holding:?}");
+        }
+    }
+
+    /// The holder leg reads the queue's relation for an in-flight row: the
+    /// holder refusing the waiting member, one way. H1 in flight reserves
+    /// a vault here that W debits, which the queue here admits, so W is
+    /// not kept out here and conflicting with H1 on `PEER` makes no cycle.
+    /// The contention count skips the pair too. The reverse, H1 debiting
+    /// beside W's reservation, does keep W out and is asked.
+    #[test]
+    fn an_inflight_reservation_beside_a_waiting_debit_asks_nothing() {
+        let here = ShardId::leaf(1, 0);
+        let (vault, there) = (cell(1, 1), cell(0x91, 1));
+        let rows = held_beside_pending_on(
+            here,
+            Holding::InFlight,
+            (1, &[(vault, RESERVE), (there, WRITE)]),
+            (2, &[(vault, DEBIT), (there, WRITE)]),
+        );
+        assert!(seat_questions(&rows, ms(0)).is_empty());
+        assert!(wounded(&rows, ms(0), &[crossed_reading(1, 2)]).is_empty());
+        let mut held = Held::default();
+        held.engaged.insert((PEER, tx(2)));
+        assert!(contentions(&rows, &[], ms(0), &held).is_empty());
+
+        let debiting = held_beside_pending_on(
+            here,
+            Holding::InFlight,
+            (1, &[(vault, DEBIT), (there, WRITE)]),
+            (2, &[(vault, RESERVE), (there, WRITE)]),
+        );
+        assert_eq!(
+            seat_questions(&debiting, ms(0)),
+            vec![SeatQuestion {
+                shard: PEER,
+                waiting: tx(2),
+                holder: tx(1),
+                validity_end: far().validity_end(),
+            }],
+        );
+        assert_eq!(
+            contentions(&debiting, &[], ms(0), &held),
+            vec![Contention {
+                waiting: tx(2),
+                holder: tx(1),
+            }],
+        );
+    }
+
+    /// A head reads both ways against the rows placed after it, so H1
+    /// waiting at its head with a reservation of a vault here keeps W's
+    /// debit of it behind it: the pair is asked about, counted, and the
+    /// reading of W seated on `PEER` and H1 unseated wounds W.
+    #[test]
+    fn a_waiting_reservation_head_keeps_a_debit_behind_it_and_is_asked() {
+        let here = ShardId::leaf(1, 0);
+        let (vault, there) = (cell(1, 1), cell(0x91, 1));
+        let rows = held_beside_pending_on(
+            here,
+            Holding::Head,
+            (1, &[(vault, RESERVE), (there, WRITE)]),
+            (2, &[(vault, DEBIT), (there, WRITE)]),
+        );
+        assert_eq!(
+            seat_questions(&rows, ms(0)),
+            vec![SeatQuestion {
+                shard: PEER,
+                waiting: tx(2),
+                holder: tx(1),
+                validity_end: far().validity_end(),
+            }],
+        );
+        assert_eq!(
+            wounded(&rows, ms(0), &[crossed_reading(1, 2)]),
+            BTreeSet::from([tx(2)]),
+        );
+        let mut held = Held::default();
+        held.engaged.insert((PEER, tx(2)));
+        assert_eq!(
+            contentions(&rows, &[], ms(0), &held),
+            vec![Contention {
+                waiting: tx(2),
+                holder: tx(1),
+            }],
+        );
+    }
+
+    /// A pair that conflicts only on a counterpart's keys asks nothing
+    /// here: the holder, in flight or at its head, stands ahead of the
+    /// waiting member on no key this shard owns, so the waiting member is
+    /// not kept out here, and no reading there makes the two a cycle. The
+    /// contention count skips it too.
+    #[test]
+    fn a_pair_contending_only_on_another_shards_keys_is_not_wounded() {
+        let here = ShardId::leaf(1, 0);
+        let declared = [(cell(1, 1), Mode::Read), (cell(0x91, 1), WRITE)];
+        let local_write = [(cell(1, 1), WRITE), (cell(0x91, 1), WRITE)];
+        let mut held = Held::default();
+        held.engaged.insert((PEER, tx(2)));
+        for holding in HOLDINGS {
+            let rows = held_beside_pending_on(here, holding, (1, &declared), (2, &declared));
+            assert!(seat_questions(&rows, ms(0)).is_empty(), "{holding:?}");
+            assert!(
+                wounded(&rows, ms(0), &[crossed_reading(1, 2)]).is_empty(),
+                "{holding:?}"
+            );
+            assert!(
+                contentions(&rows, &[], ms(0), &held).is_empty(),
+                "{holding:?}"
+            );
+
+            let contending =
+                held_beside_pending_on(here, holding, (1, &local_write), (2, &local_write));
+            assert_eq!(
+                contentions(&contending, &[], ms(0), &held),
+                vec![Contention {
+                    waiting: tx(2),
+                    holder: tx(1),
+                }],
+                "{holding:?}: the same pair contending here is counted",
+            );
+        }
+    }
+
+    /// A waiting row is asked about only beside the holders standing
+    /// ahead of it here. H3, another head that shares only `PEER`'s keys
+    /// with W, keeps nothing of W's out here, so a reading on `PEER` of W
+    /// seated and H3 unseated wounds nobody, whichever of the two is
+    /// later; the head W stands behind is asked about as ever.
+    #[test]
+    fn a_waiting_row_behind_another_member_is_not_wounded_by_an_unrelated_head() {
+        let here = ShardId::leaf(1, 0);
+        let (local, there) = (cell(1, 1), cell(0x91, 1));
+        let mut rows = held_beside_pending_on(
+            here,
+            Holding::Head,
+            (1, &[(local, WRITE), (there, WRITE)]),
+            (2, &[(local, WRITE), (there, WRITE)]),
+        );
+        let unrelated = stating(
+            3,
+            far(),
+            &leg(vec![(cell(1, 2), WRITE), (there, WRITE)], &[PEER]),
+        );
+        rows.members.insert(unrelated.tx, unrelated);
+        assert_eq!(
+            seat_questions(&rows, ms(0))
+                .iter()
+                .map(|question| question.holder)
+                .collect::<Vec<_>>(),
+            vec![tx(1)],
+        );
+        assert!(
+            wounded(&rows, ms(0), &[crossed_reading(3, 2)]).is_empty(),
+            "the unrelated head proves no cycle with W",
+        );
+        assert_eq!(
+            wounded(&rows, ms(0), &[crossed_reading(1, 2)]),
+            BTreeSet::from([tx(2)]),
+        );
+    }
+
+    /// A victim a tick here has named is never asked about: a holder in
+    /// flight or stated that is the later of the pair puts no question,
+    /// so no reading wounds it, the cycle or its own leaving. The same
+    /// pair with the holder at its head is asked about, and the head is
+    /// the victim.
+    #[test]
+    fn a_held_holder_is_never_asked_about_as_victim() {
+        let declared = spanning_write();
+        assert!(tx(1) < tx(2));
+        let left = proven_claim(
+            PEER,
+            5,
+            &[committed_tx_cell_key(PEER, tx(2), far().validity_end())],
+            &[
+                verdict_leaf(PEER, tx(2)),
+                member_row_leaf(PEER, tx(2)),
+                committed_tx_cell_key(PEER, tx(2), far().validity_end()),
+            ],
+        );
+        let readings = [crossed_reading(2, 1), left];
+        let in_flight = held_beside_pending(Holding::InFlight, 2, 1, &declared);
+        let mut stated = held_beside_pending(Holding::InFlight, 2, 1, &declared);
+        if let Some(holder) = stated.members.get_mut(&tx(2)) {
+            holder.state = RowState::Stated {
+                tick: BlockHeight::new(2),
+                receipt: GlobalReceiptHash::ZERO,
+            };
+        }
+        for rows in [&in_flight, &stated] {
+            assert!(seat_questions(rows, ms(0)).is_empty());
+            for reading in &readings {
+                assert!(wounded(rows, ms(0), from_ref(reading)).is_empty());
+            }
+        }
+
+        let head = held_beside_pending(Holding::Head, 2, 1, &declared);
+        assert_eq!(
+            seat_questions(&head, ms(0)),
+            vec![SeatQuestion {
+                shard: PEER,
+                waiting: tx(1),
+                holder: tx(2),
+                validity_end: far().validity_end(),
+            }],
+        );
+        for reading in &readings {
+            assert_eq!(
+                wounded(&head, ms(0), from_ref(reading)),
+                BTreeSet::from([tx(2)]),
+                "a head holder is the victim, by the cycle or its leaving",
+            );
+        }
     }
 
     /// Past its deadline, a held member a record covers is aborted
@@ -5716,12 +7040,14 @@ mod tests {
     /// every shard's evidence live, acting on what `views` licenses.
     fn licensed_over(rows: &MemberIndex, views: &SiblingViews) -> Vec<TickLine> {
         let (lines, missing, _) = licensed_lines(
-            rows,
-            ms(5_500),
-            &Held::default(),
-            &|_, _| Evidence::Live { terminating: false },
-            false,
-            &BTreeSet::new(),
+            Naming {
+                rows,
+                anchor: ms(5_500),
+                inputs: &Held::default(),
+                evidence: &|_, _| Evidence::Live { terminating: false },
+                crossing: &Crossing::None,
+                wounded: &BTreeSet::new(),
+            },
             views,
         );
         assert!(missing.is_empty());
@@ -5846,15 +7172,15 @@ mod tests {
             BTreeMap::from([(tx(1), Decision::Refuse)]),
         );
 
-        let (lines, missing, budget) = licensed_lines(
-            &rows,
+        let naming = Naming {
+            rows: &rows,
             anchor,
-            &Held::default(),
-            &evidence,
-            false,
-            &BTreeSet::new(),
-            &views,
-        );
+            inputs: &Held::default(),
+            evidence: &evidence,
+            crossing: &Crossing::None,
+            wounded: &BTreeSet::new(),
+        };
+        let (lines, missing, budget) = licensed_lines(naming, &views);
         assert!(missing.is_empty());
         assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK);
         assert!(
@@ -5868,18 +7194,7 @@ mod tests {
         );
 
         let carried = carried_verdicts(&lines, &rows, &views).expect("every exit is licensed");
-        assert_eq!(
-            member_lines(
-                &rows,
-                anchor,
-                &Held::default(),
-                &evidence,
-                false,
-                &BTreeSet::new(),
-                &carried,
-            ),
-            (lines, missing, budget),
-        );
+        assert_eq!(member_lines(naming, &carried), (lines, missing, budget),);
     }
 
     /// A stated row's tick owing its determined half ends the row by no
@@ -6118,12 +7433,14 @@ mod tests {
                 ..CommittedSets::default()
             };
             member_lines(
-                &rows,
-                ms(0),
-                &sets,
-                &|shard, committed| sets.evidence(shard, committed),
-                false,
-                &BTreeSet::new(),
+                Naming {
+                    rows: &rows,
+                    anchor: ms(0),
+                    inputs: &sets,
+                    evidence: &|shard, committed| sets.evidence(shard, committed),
+                    crossing: &Crossing::None,
+                    wounded: &BTreeSet::new(),
+                },
                 &BTreeMap::new(),
             )
             .0
@@ -6179,12 +7496,14 @@ mod tests {
             )]),
         };
         let (lines, missing, _) = licensed_lines(
-            rows,
-            IN_A_LATER_LIFE,
-            sets,
-            &|shard, committed| sets.evidence(shard, committed),
-            false,
-            &BTreeSet::new(),
+            Naming {
+                rows,
+                anchor: IN_A_LATER_LIFE,
+                inputs: sets,
+                evidence: &|shard, committed| sets.evidence(shard, committed),
+                crossing: &Crossing::None,
+                wounded: &BTreeSet::new(),
+            },
             &views,
         );
         (lines, missing)
@@ -6536,6 +7855,7 @@ mod tests {
                     joins: Joins::Executes,
                     settlement: Settlement::Shared,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: Capped::from_array([ShardId::ROOT]),
                     awaits: Capped::from_array([ShardId::ROOT]),
                     charge: CHARGE,
@@ -6543,6 +7863,7 @@ mod tests {
                     reserves: Capped::empty(),
                     deadline: far(),
                     crossings: Capped::empty(),
+                    served_at: None,
                 }])),
                 ..MemberInputs::still(PEER)
             },
@@ -6578,21 +7899,26 @@ mod tests {
             .collect();
         assert!(written.contains(&row) && written.contains(&leaf) && !written.contains(&unseated));
 
-        let declared = vec![(cell(1, 1), WRITE)];
-        let rows = held_beside_pending(1, 2, &declared);
+        let declared = spanning_write();
         let leaves: Vec<SubstateKey> = written
             .into_iter()
             .chain([seat_leaf(PEER, tx(2))])
             .collect();
         let reading = seat_reading(1, 2, &leaves);
         assert_eq!(reading.reading(unseated), Some(Inclusion::Absent));
-        assert!(wounded(&rows, ms(0), from_ref(&reading)).is_empty());
         let cycle = seat_reading(1, 2, &[seat_leaf(PEER, tx(2)), row]);
-        assert_eq!(
-            wounded(&rows, ms(0), from_ref(&cycle)),
-            BTreeSet::from([tx(2)]),
-            "without the leaf the same reading is the cycle",
-        );
+        for holding in HOLDINGS {
+            let rows = held_beside_pending(holding, 1, 2, &declared);
+            assert!(
+                wounded(&rows, ms(0), from_ref(&reading)).is_empty(),
+                "{holding:?}"
+            );
+            assert_eq!(
+                wounded(&rows, ms(0), from_ref(&cycle)),
+                BTreeSet::from([tx(2)]),
+                "{holding:?}: without the leaf the same reading is the cycle",
+            );
+        }
     }
 
     /// A crossing block over the most tick rows a chain can hold names
@@ -6618,12 +7944,14 @@ mod tests {
         let live = |_, _| Evidence::Live { terminating: false };
         let at_cap = fill(MAX_TICK_LINES_PER_BLOCK);
         let (lines, missing, _) = member_lines(
-            &at_cap,
-            ms(5_000),
-            &Held::default(),
-            &live,
-            true,
-            &BTreeSet::new(),
+            Naming {
+                rows: &at_cap,
+                anchor: ms(5_000),
+                inputs: &Held::default(),
+                evidence: &live,
+                crossing: &Crossing::Discards,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert!(missing.is_empty());
@@ -6637,12 +7965,14 @@ mod tests {
         )));
         let over = fill(MAX_TICK_LINES_PER_BLOCK + 1);
         let (lines, _, _) = member_lines(
-            &over,
-            ms(5_000),
-            &Held::default(),
-            &live,
-            true,
-            &BTreeSet::new(),
+            Naming {
+                rows: &over,
+                anchor: ms(5_000),
+                inputs: &Held::default(),
+                evidence: &live,
+                crossing: &Crossing::Discards,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert_eq!(
@@ -6650,5 +7980,898 @@ mod tests {
             MAX_TICK_LINES_PER_BLOCK,
             "one past the cap is left out"
         );
+    }
+
+    /// Naming in queue order: rows folded from block content, and the
+    /// lines named over them.
+    mod queue_naming {
+        use super::*;
+
+        const READ: Mode = Mode::Read;
+
+        fn key(seed: u8) -> DeclaredKey {
+            cell(1, seed)
+        }
+
+        /// A member a counterpart shares the verdict on, paying here and
+        /// ready once committed.
+        fn shared(declared: Vec<(DeclaredKey, Mode)>) -> MemberTerms {
+            leg(declared, &[])
+        }
+
+        /// [`shared`], waiting on `PEER`'s bundle, which never comes.
+        fn unready(declared: Vec<(DeclaredKey, Mode)>) -> MemberTerms {
+            leg(declared, &[PEER])
+        }
+
+        /// A leg on awaited terms.
+        fn awaited(declared: Vec<(DeclaredKey, Mode)>) -> MemberTerms {
+            MemberTerms {
+                leg: true,
+                settlement: Settlement::Awaited,
+                ..leg(declared, &[])
+            }
+        }
+
+        fn clock(height: u64) -> WeightedTimestamp {
+            ms(height * 1_000)
+        }
+
+        fn block(height: u64) -> MemberInputs {
+            MemberInputs {
+                height: BlockHeight::new(height),
+                committed: clock(height),
+                ..MemberInputs::still(ShardId::ROOT)
+            }
+        }
+
+        fn commit(block: &mut MemberInputs, seed: u8, terms: &MemberTerms, deadline: Deadline) {
+            block.transactions.push((tx(seed), deadline));
+            block.terms.push(StatedTerms {
+                tx: tx(seed),
+                terms: terms.clone(),
+            });
+        }
+
+        fn with_lines(mut block: MemberInputs, lines: Vec<TickLine>) -> MemberInputs {
+            block.manifest = Arc::new(Capped::new(lines).expect("a few lines"));
+            block
+        }
+
+        /// The line running `seed` on `terms`, as a proposer names it.
+        fn run(seed: u8, terms: &MemberTerms) -> TickLine {
+            let alone = terms.settlement.alone();
+            TickLine::Member {
+                tx: tx(seed),
+                joins: Joins::Executes,
+                settlement: terms.settlement,
+                holds: if alone {
+                    Capped::empty()
+                } else {
+                    terms.declared.clone()
+                },
+                pins: if alone {
+                    pins_of(&terms.declared, ShardId::ROOT)
+                } else {
+                    Capped::empty()
+                },
+                reach: terms.reach.clone(),
+                awaits: terms.awaits.clone(),
+                charge: terms.charge,
+                share: terms.share,
+                reserves: terms.reserves.clone(),
+                staged: terms.staged,
+                deadline: far(),
+                crossings: Capped::empty(),
+                served_at: None,
+            }
+        }
+
+        fn gone(seed: u8) -> TickLine {
+            fate_of(seed)
+        }
+
+        /// How the lines named over `rows` at `anchor` name each member.
+        fn named(rows: &MemberIndex, anchor: WeightedTimestamp) -> BTreeMap<TxHash, Joins> {
+            let live = |_, _| Evidence::Live { terminating: false };
+            let (lines, missing) = lines_and_missing(
+                rows,
+                anchor,
+                &Held::default(),
+                &live,
+                false,
+                &BTreeSet::new(),
+            );
+            assert!(missing.is_empty());
+            lines
+                .iter()
+                .filter_map(|line| match line {
+                    TickLine::Member { tx, joins, .. } => Some((*tx, *joins)),
+                    TickLine::Fate { .. }
+                    | TickLine::Discard { .. }
+                    | TickLine::End { .. }
+                    | TickLine::Recovered { .. } => None,
+                })
+                .collect()
+        }
+
+        /// Rows after blocks committing each of `commits` in turn, one a
+        /// block from height 1.
+        fn committed(commits: &[(u8, &MemberTerms)]) -> MemberIndex {
+            let mut rows = MemberIndex::empty(ShardId::ROOT);
+            for (at, (seed, terms)) in (1u64..).zip(commits) {
+                let mut next = block(at);
+                commit(&mut next, *seed, terms, far());
+                rows.advance(&next);
+            }
+            rows
+        }
+
+        const RUNS: Option<&Joins> = Some(&Joins::Executes);
+
+        /// What the line running each member says serves it.
+        fn served_ats(
+            rows: &MemberIndex,
+            anchor: WeightedTimestamp,
+        ) -> BTreeMap<TxHash, Option<BlockHeight>> {
+            let live = |_, _| Evidence::Live { terminating: false };
+            let (lines, _) = lines_and_missing(
+                rows,
+                anchor,
+                &Held::default(),
+                &live,
+                false,
+                &BTreeSet::new(),
+            );
+            lines
+                .iter()
+                .filter_map(|line| match line {
+                    TickLine::Member { tx, served_at, .. } => Some((*tx, *served_at)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A line running a shared member that reads keys of this shard
+        /// carries the height its row stood head at, which is not the height
+        /// that committed it where the member waited. A member only
+        /// crediting here is served from its commit and carries none, nor
+        /// does a member its own certificate settles.
+        #[test]
+        fn a_shared_line_carries_its_head_height() {
+            let writer = shared(vec![(key(1), WRITE)]);
+            let reader = shared(vec![(key(1), READ)]);
+            let crediting = shared(vec![(key(2), CREDIT)]);
+            let determined = alone(vec![(key(3), WRITE)]);
+            let mut rows = committed(&[
+                (1, &writer),
+                (2, &reader),
+                (3, &crediting),
+                (4, &determined),
+            ]);
+
+            let lines = served_ats(&rows, clock(5));
+            assert_eq!(lines[&tx(1)], Some(BlockHeight::new(1)));
+            assert!(!lines.contains_key(&tx(2)), "behind the write");
+            assert_eq!(lines[&tx(3)], None);
+            assert_eq!(lines[&tx(4)], None);
+
+            rows.advance(&with_lines(block(5), vec![gone(1)]));
+            assert_eq!(
+                served_ats(&rows, clock(6))[&tx(2)],
+                Some(BlockHeight::new(5)),
+                "the block that made it head, past the one that committed it",
+            );
+        }
+
+        /// A shared member is named only once its row stands head: one
+        /// behind an earlier writer waits for it to leave, and one built
+        /// unplaced is never named.
+        #[test]
+        fn a_shared_member_is_named_only_at_its_head() {
+            let writer = shared(vec![(key(1), WRITE)]);
+            let reader = shared(vec![(key(1), READ)]);
+            let mut rows = committed(&[(1, &writer), (2, &reader)]);
+            assert!(rows.members[&tx(1)].head.is_some());
+            assert_eq!(rows.members[&tx(2)].head, None);
+            let lines = named(&rows, clock(3));
+            assert_eq!(lines.get(&tx(1)), RUNS);
+            assert_eq!(lines.get(&tx(2)), None, "behind the write");
+
+            rows.advance(&with_lines(block(3), vec![gone(1)]));
+            assert!(rows.members[&tx(2)].head.is_some());
+            assert_eq!(named(&rows, clock(4)).get(&tx(2)), RUNS);
+
+            let mut unheaded = MemberIndex::empty(ShardId::ROOT);
+            unheaded.insert_row(unplaced(3, far(), &shared(vec![(key(2), READ)])));
+            assert_eq!(named(&unheaded, clock(1)).get(&tx(3)), None, "never placed");
+        }
+
+        /// A determined candidate on a key a shared row stands on, named
+        /// or not, waits for that row to leave; one on another key runs.
+        #[test]
+        fn a_determined_candidate_waits_for_a_queued_shared_member() {
+            let holder = unready(vec![(key(1), READ)]);
+            let mut rows = committed(&[
+                (1, &holder),
+                (2, &alone(vec![(key(1), WRITE)])),
+                (3, &alone(vec![(key(2), WRITE)])),
+            ]);
+            let lines = named(&rows, clock(4));
+            assert_eq!(lines.get(&tx(1)), None, "the holder waits on its peer");
+            assert_eq!(lines.get(&tx(2)), None, "refused by the holder's place");
+            assert_eq!(lines.get(&tx(3)), RUNS);
+
+            rows.advance(&with_lines(block(4), vec![gone(1)]));
+            assert_eq!(named(&rows, clock(5)).get(&tx(2)), RUNS);
+        }
+
+        /// Two members each reading what the other reserves are placed
+        /// in commit order: the first runs, the second waits for it to
+        /// settle, and neither waits on the other at once.
+        #[test]
+        fn crossed_reads_and_reservations_queue_without_deadlock() {
+            let first = shared(vec![(key(1), READ), (key(2), RESERVE)]);
+            let second = shared(vec![(key(2), READ), (key(1), RESERVE)]);
+            let mut rows = committed(&[(1, &first), (2, &second)]);
+            let lines = named(&rows, clock(3));
+            assert_eq!(lines.get(&tx(1)), RUNS);
+            assert_eq!(lines.get(&tx(2)), None);
+
+            rows.advance(&with_lines(block(3), vec![run(1, &first)]));
+            assert_eq!(named(&rows, clock(4)).get(&tx(2)), None, "in flight ahead");
+            rows.advance(&MemberInputs {
+                settled: vec![SettledHalf {
+                    tick: TickId::new(ShardId::ROOT, BlockHeight::new(3)),
+                    half: TickHalf::Stated,
+                    deleted: vec![tx(1)],
+                    accepted: Vec::new(),
+                    stated: Vec::new(),
+                }],
+                ..block(4)
+            });
+            assert!(rows.members[&tx(2)].head.is_some());
+            assert_eq!(named(&rows, clock(5)).get(&tx(2)), RUNS);
+        }
+
+        /// A reservation placed after a served read of its vault is not
+        /// named while the read stands.
+        #[test]
+        fn a_reservation_is_not_named_over_an_earlier_served_read() {
+            let reading = unready(vec![(key(1), READ), (key(1), RESERVE)]);
+            let reserving = shared(vec![(key(1), RESERVE)]);
+            let rows = committed(&[(1, &reading), (2, &reserving)]);
+            assert_eq!(rows.members[&tx(2)].head, None);
+            assert_eq!(named(&rows, clock(3)).get(&tx(2)), None);
+        }
+
+        /// A served read placed after a reservation of its vault waits
+        /// for the reservation to leave, then runs.
+        #[test]
+        fn a_served_read_waits_for_an_earlier_reservation() {
+            let reserving = unready(vec![(key(1), RESERVE)]);
+            let reading = shared(vec![(key(1), READ), (key(1), RESERVE)]);
+            let mut rows = committed(&[(1, &reserving), (2, &reading)]);
+            assert_eq!(named(&rows, clock(3)).get(&tx(2)), None);
+            rows.advance(&with_lines(block(3), vec![gone(1)]));
+            assert_eq!(named(&rows, clock(4)).get(&tx(2)), RUNS);
+        }
+
+        /// A leg reserving a vault and named first stands ahead of a
+        /// shared member placed after it that reads the vault: the read
+        /// heads once the leg's tick settles it.
+        #[test]
+        fn a_leg_reserving_a_vault_settles_before_a_later_read_heads() {
+            let reserving = awaited(vec![(key(1), RESERVE)]);
+            let reading = shared(vec![(key(1), READ), (key(1), RESERVE)]);
+            let mut rows = committed(&[(1, &reserving)]);
+            assert_eq!(named(&rows, clock(2)).get(&tx(1)), RUNS);
+            rows.advance(&with_lines(block(2), vec![run(1, &reserving)]));
+            let mut third = block(3);
+            commit(&mut third, 2, &reading, far());
+            rows.advance(&third);
+            assert_eq!(
+                rows.members[&tx(2)].head,
+                None,
+                "the leg's write stands ahead"
+            );
+            assert_eq!(named(&rows, clock(4)).get(&tx(2)), None);
+
+            rows.advance(&MemberInputs {
+                settled: vec![SettledHalf {
+                    tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                    half: TickHalf::Stated,
+                    deleted: vec![tx(1)],
+                    accepted: Vec::new(),
+                    stated: Vec::new(),
+                }],
+                ..block(4)
+            });
+            assert!(rows.members[&tx(2)].head.is_some());
+            assert_eq!(named(&rows, clock(5)).get(&tx(2)), RUNS);
+        }
+
+        /// A determined core, settled on its own shard's certificate
+        /// though it reaches a counterpart, takes no place in `Queue`
+        /// and no served pin: it waits on no determined member's tick,
+        /// and once named stands only in its tick's pins.
+        #[test]
+        fn a_determined_core_takes_no_served_pin() {
+            let core = |mode| MemberTerms {
+                reach: Capped::from_array([PEER]),
+                ..alone(vec![(key(1), mode)])
+            };
+            let (writer, reader) = (core(WRITE), core(READ));
+            let mut rows = committed(&[(1, &writer)]);
+            rows.advance(&with_lines(block(2), vec![run(1, &writer)]));
+            assert!(rows.ticks[&BlockHeight::new(2)].determined_unsettled);
+            let mut third = block(3);
+            commit(&mut third, 2, &reader, far());
+            rows.advance(&third);
+            assert_eq!(
+                named(&rows, clock(4)).get(&tx(2)),
+                RUNS,
+                "an owed determined tick holds no determined member back"
+            );
+            rows.advance(&with_lines(block(4), vec![run(2, &reader)]));
+            assert!(QueueHolds::of(&rows).is_empty(), "nothing stands in Queue");
+            assert!(!rows.members[&tx(2)].seated());
+        }
+
+        /// A shared member nothing stands ahead of heads in the block
+        /// that commits it, so the lines that block names run it.
+        #[test]
+        fn an_uncontended_shared_member_is_named_in_its_committing_block() {
+            let mut rows = MemberIndex::empty(ShardId::ROOT);
+            let mut first = block(1);
+            commit(&mut first, 1, &shared(vec![(key(1), WRITE)]), far());
+            rows.advance_content(&first);
+            assert_eq!(
+                rows.members[&tx(1)].head.map(|head| head.height),
+                Some(BlockHeight::new(1))
+            );
+            assert_eq!(named(&rows, clock(1)).get(&tx(1)), RUNS);
+        }
+
+        /// A head that refuses a waiter takes the clock of the block
+        /// that first shows it, and keeps it through later refusals and
+        /// the first waiter's leaving: its naming window closes that
+        /// clock's [`NAMING_WINDOW`] on, short of its deadline.
+        #[test]
+        fn the_window_runs_from_the_first_refusal_and_does_not_reset() {
+            let head = unready(vec![(key(1), READ)]);
+            let mut rows = committed(&[(1, &head), (2, &alone(vec![(key(1), WRITE)]))]);
+            assert_eq!(rows.members[&tx(1)].blocked_at, Some(clock(2)));
+            let mut third = with_lines(block(3), vec![gone(2)]);
+            commit(&mut third, 3, &alone(vec![(key(1), WRITE)]), far());
+            rows.advance(&third);
+            assert_eq!(rows.members[&tx(1)].blocked_at, Some(clock(2)), "set once");
+
+            let closes = clock(2).plus(NAMING_WINDOW);
+            assert_eq!(
+                named(&rows, closes.minus(Duration::from_millis(1))).get(&tx(1)),
+                None
+            );
+            assert_eq!(
+                named(&rows, closes).get(&tx(1)),
+                Some(&Joins::Aborted),
+                "aborted unnamed at the window"
+            );
+        }
+
+        /// A leg debiting a vault an unnamed shared member reserves waits
+        /// for that member: neither's writes are in a view until it
+        /// resolves, so the leg is held out both ways. It runs once the
+        /// reserver leaves.
+        #[test]
+        fn a_debiting_leg_waits_behind_a_waiting_reservation() {
+            let mut rows = committed(&[
+                (1, &unready(vec![(key(1), RESERVE)])),
+                (2, &awaited(vec![(key(1), DEBIT)])),
+            ]);
+            assert_eq!(named(&rows, clock(3)).get(&tx(2)), None);
+            assert_eq!(
+                rows.members[&tx(1)].blocked_at,
+                Some(clock(2)),
+                "the reserver is armed by the leg it holds out"
+            );
+            rows.advance(&with_lines(block(3), vec![gone(1)]));
+            assert_eq!(named(&rows, clock(4)).get(&tx(2)), RUNS);
+        }
+
+        /// A leg debiting a vault a shared member reserves in flight runs
+        /// beside it: the reservation's hold is counted from its run.
+        #[test]
+        fn a_debiting_leg_runs_beside_an_inflight_reservation() {
+            let reserving = shared(vec![(key(1), RESERVE)]);
+            let mut rows = committed(&[(1, &reserving)]);
+            rows.advance(&with_lines(block(2), vec![run(1, &reserving)]));
+            let mut third = block(3);
+            commit(&mut third, 2, &awaited(vec![(key(1), DEBIT)]), far());
+            rows.advance(&third);
+            assert_eq!(named(&rows, clock(4)).get(&tx(2)), RUNS);
+        }
+
+        /// A determined member debiting a vault an unnamed shared member
+        /// reserves runs beside it, and arms nothing: its output is in the
+        /// view the reservation is judged over.
+        #[test]
+        fn a_determined_debit_runs_beside_a_waiting_reservation() {
+            let rows = committed(&[
+                (1, &unready(vec![(key(1), RESERVE)])),
+                (2, &alone(vec![(key(1), DEBIT)])),
+            ]);
+            assert_eq!(named(&rows, clock(3)).get(&tx(2)), RUNS);
+            assert_eq!(rows.members[&tx(1)].blocked_at, None);
+        }
+
+        /// A shared head whose own pins conflict with each other is named:
+        /// its own entries in the queue never hold it out, and it is never
+        /// a party its own window is armed for.
+        #[test]
+        fn a_self_conflicting_shared_head_is_named() {
+            let head = shared(vec![
+                (key(1), WRITE),
+                (key(2), READ),
+                (key(2), CREDIT),
+                (key(3), RESERVE),
+                (key(3), DEBIT),
+            ]);
+            let rows = committed(&[(1, &head)]);
+            assert!(rows.members[&tx(1)].head.is_some());
+            assert_eq!(rows.members[&tx(1)].blocked_at, None);
+            assert_eq!(named(&rows, clock(2)).get(&tx(1)), RUNS);
+        }
+
+        /// The uncrossed pair: H1 and W span A and C, H1 placed first on
+        /// both. On A, H1 writes a key W reads; on C, H1 reserves a vault
+        /// W debits. W heads on neither shard while H1 waits, so H1 heads
+        /// and runs on both and W follows: on C beside H1 in flight, on A
+        /// once H1 settles there.
+        #[test]
+        fn the_m1_cycle_leaves_w_behind_on_both_shards() {
+            const H1: u8 = 1;
+            const W: u8 = 2;
+            let (h1_a, w_a) = (shared(vec![(key(1), WRITE)]), shared(vec![(key(1), READ)]));
+            let (h1_c, w_c) = (
+                shared(vec![(key(2), RESERVE)]),
+                shared(vec![(key(2), DEBIT)]),
+            );
+            let mut a = committed(&[(H1, &h1_a), (W, &w_a)]);
+            let mut c = committed(&[(H1, &h1_c), (W, &w_c)]);
+            for (shard, rows) in [("A", &a), ("C", &c)] {
+                assert!(rows.members[&tx(H1)].head.is_some(), "H1 heads on {shard}");
+                assert_eq!(rows.members[&tx(W)].head, None, "W is behind on {shard}");
+                let lines = named(rows, clock(3));
+                assert_eq!(lines.get(&tx(H1)), RUNS, "on {shard}");
+                assert_eq!(lines.get(&tx(W)), None, "on {shard}");
+            }
+            a.advance(&with_lines(block(3), vec![run(H1, &h1_a)]));
+            c.advance(&with_lines(block(3), vec![run(H1, &h1_c)]));
+            assert_eq!(named(&a, clock(4)).get(&tx(W)), None, "a write in flight");
+            assert!(c.members[&tx(W)].head.is_some(), "a reservation in flight");
+            assert_eq!(named(&c, clock(4)).get(&tx(W)), RUNS);
+            a.advance(&MemberInputs {
+                settled: vec![SettledHalf {
+                    tick: TickId::new(ShardId::ROOT, BlockHeight::new(3)),
+                    half: TickHalf::Stated,
+                    deleted: vec![tx(H1)],
+                    accepted: Vec::new(),
+                    stated: Vec::new(),
+                }],
+                ..block(4)
+            });
+            assert_eq!(named(&a, clock(5)).get(&tx(W)), RUNS);
+        }
+
+        /// The lines named over `rows` at `anchor`.
+        fn lines_at(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<TickLine> {
+            let live = |_, _| Evidence::Live { terminating: false };
+            let (lines, missing) = lines_and_missing(
+                rows,
+                anchor,
+                &Held::default(),
+                &live,
+                false,
+                &BTreeSet::new(),
+            );
+            assert!(missing.is_empty());
+            lines
+        }
+
+        /// Two sponsored transactions, each with its payer core on one
+        /// shard and its leg on the other: T1 pays on A and its leg runs
+        /// on C, T2 pays on C and its leg runs on A. Each core waits on the
+        /// record its own leg writes on the other shard, and stands ahead
+        /// of the other transaction's leg on its own, so neither leg runs
+        /// and neither record comes. Both cores are armed, and at their
+        /// window each is named aborted on its shard; the abort lines free
+        /// the legs, and the stating halves end both rows.
+        #[test]
+        fn a_two_shard_payer_core_and_leg_cycle_ends_at_the_window() {
+            const T1: u8 = 1;
+            const T2: u8 = 2;
+            const A: ShardId = ShardId::leaf(1, 0);
+            const C: ShardId = PEER;
+            let crossing = |seed: u8| CrossingId {
+                producer: Address::new([seed; 31], AddressClass::Component),
+                consumer: Address::new([seed; 31], AddressClass::Component),
+                intent: IntentHash(Hash32([seed; 32])),
+                local: 0,
+                output: 0,
+            };
+            let on = |shard: ShardId, height: u64| MemberInputs {
+                shard,
+                ..block(height)
+            };
+            // A payer core awaiting `there`, owed `record`, its fee vault
+            // and its write under `owner`, whose shard it stands on.
+            let core = |there: ShardId, owner: u8, record: u8| MemberTerms {
+                reach: Capped::from_array([there]),
+                awaits: Capped::from_array([there]),
+                crossings: Capped::from_array([crossing(record)]),
+                charge: AbortCharge {
+                    vault: SubstateKey {
+                        owner: Address::new([owner; 31], AddressClass::Principal),
+                        local: LocalKey([0xEE; 16]),
+                    },
+                    amount: 1,
+                },
+                ..shared(vec![(cell(owner, 1), WRITE)])
+            };
+            let leg_on = |there: ShardId, owner: u8| MemberTerms {
+                reach: Capped::from_array([there]),
+                ..awaited(vec![(cell(owner, 1), WRITE)])
+            };
+            let (t1_core, t2_core) = (core(C, 0x01, 7), core(A, 0x91, 8));
+            let (t1_leg, t2_leg) = (leg_on(A, 0x91), leg_on(C, 0x01));
+
+            let mut a = MemberIndex::empty(A);
+            let mut c = MemberIndex::empty(C);
+            let mut next = on(A, 1);
+            commit(&mut next, T1, &t1_core, far());
+            a.advance(&next);
+            let mut next = on(C, 1);
+            commit(&mut next, T1, &t1_leg, far());
+            c.advance(&next);
+            let mut next = on(A, 2);
+            commit(&mut next, T2, &t2_leg, far());
+            a.advance(&next);
+            let mut next = on(C, 2);
+            commit(&mut next, T2, &t2_core, far());
+            c.advance(&next);
+
+            let closes = clock(2).plus(NAMING_WINDOW);
+            for (rows, core, leg) in [(&mut a, T1, T2), (&mut c, T2, T1)] {
+                let shard = rows.shard();
+                assert!(rows.members[&tx(core)].head.is_some(), "on {shard:?}");
+                assert_eq!(rows.members[&tx(core)].blocked_at, Some(clock(2)));
+                let short = named(rows, closes.minus(Duration::from_millis(1)));
+                assert_eq!(short.get(&tx(core)), None, "unready, short of the window");
+                assert_eq!(short.get(&tx(leg)), None, "held out by the core");
+                assert!(closes < far().at());
+
+                let lines = lines_at(rows, closes);
+                assert!(
+                    lines.iter().any(|line| matches!(
+                        line,
+                        TickLine::Member { tx: named, joins: Joins::Aborted, .. }
+                            if *named == tx(core)
+                    )),
+                    "the core is aborted at its window on {shard:?}: {lines:?}",
+                );
+                rows.advance(&MemberInputs {
+                    shard,
+                    ..with_lines(block(3), lines)
+                });
+                assert_eq!(
+                    named(rows, clock(4)).get(&tx(leg)),
+                    RUNS,
+                    "the abort frees the leg on {shard:?}"
+                );
+                rows.advance(&MemberInputs {
+                    shard,
+                    settled: vec![SettledHalf {
+                        tick: TickId::new(shard, BlockHeight::new(3)),
+                        half: TickHalf::Stated,
+                        deleted: vec![tx(core)],
+                        accepted: Vec::new(),
+                        stated: Vec::new(),
+                    }],
+                    ..block(4)
+                });
+                assert!(!rows.members.contains_key(&tx(core)), "on {shard:?}");
+            }
+        }
+
+        /// Fold `inputs` into `rows` as their store writes it, keeping in
+        /// `written` the leaves standing, so a shard's seats can be read.
+        fn fold_written(
+            rows: &mut MemberIndex,
+            written: &mut BTreeSet<SubstateKey>,
+            inputs: &MemberInputs,
+        ) {
+            for (key, change) in member_writes(&*rows, inputs) {
+                let leaf = entry_leaf_key(&ProtocolHasher, key);
+                if change.is_some() {
+                    written.insert(leaf);
+                } else {
+                    written.remove(&leaf);
+                }
+            }
+            rows.advance(inputs);
+        }
+
+        /// The crossed pair: H1 and W span A and C, H1 the earlier hash.
+        /// On A, H1 writes a key W reads, H1 placed first; on C, W
+        /// reserves a vault H1 debits, W placed first. Each is named where
+        /// it sits first, and the pair ends well short of either deadline
+        /// and of C's window:
+        ///
+        /// - W named on C leaves its reservation in flight there, read one
+        ///   way, so H1 heads and runs on C beside it; A's question reads
+        ///   H1 seated on C, which wounds nobody, and W runs on A once H1
+        ///   settles there;
+        /// - W left unnamed at its head on C keeps H1 behind it both ways,
+        ///   and A's question about holder H1 and waiting W, read off C's
+        ///   committed seats, wounds W on A.
+        #[test]
+        fn a_crossed_reserve_and_debit_pair_ends_before_either_deadline() {
+            const H1: u8 = 1;
+            const W: u8 = 2;
+            const A: ShardId = ShardId::leaf(1, 0);
+            const C: ShardId = PEER;
+            assert!(tx(H1) < tx(W));
+            let (k_a, vault) = (cell(0x01, 1), cell(0x91, 1));
+            let deadline = Deadline::of(clock(1).plus(MAX_VALIDITY_RANGE));
+            let spanning = |there: ShardId, engages: &[ShardId], declared| MemberTerms {
+                reach: Capped::from_array([there]),
+                awaits: Capped::from_array([there]),
+                ..leg(declared, engages)
+            };
+            let h1 = |there| spanning(there, &[], vec![(k_a, WRITE), (vault, DEBIT)]);
+            let w = |there, engages: &[ShardId]| {
+                spanning(there, engages, vec![(k_a, READ), (vault, RESERVE)])
+            };
+            let on = |shard: ShardId, height: u64| MemberInputs {
+                shard,
+                ..block(height)
+            };
+
+            for w_named_on_c in [true, false] {
+                let w_on_c = w(A, if w_named_on_c { &[] } else { &[A] });
+                let mut a = MemberIndex::empty(A);
+                let mut c = MemberIndex::empty(C);
+                let mut written = BTreeSet::new();
+                for (rows, first, second, on_shard) in [
+                    (&mut a, (H1, h1(C)), (W, w(C, &[])), A),
+                    (&mut c, (W, w_on_c.clone()), (H1, h1(A)), C),
+                ] {
+                    for (height, (seed, terms)) in [(1, first), (2, second)] {
+                        let mut next = on(on_shard, height);
+                        commit(&mut next, seed, &terms, deadline);
+                        if on_shard == C {
+                            fold_written(rows, &mut written, &next);
+                        } else {
+                            rows.advance(&next);
+                        }
+                    }
+                }
+                assert_eq!(a.members[&tx(W)].head, None, "W behind H1 on A");
+                assert_eq!(c.members[&tx(H1)].head, None, "H1 behind W on C");
+                assert_eq!(named(&a, clock(3)).get(&tx(H1)), RUNS);
+                a.advance(&with_lines(on(A, 3), vec![run(H1, &h1(C))]));
+
+                if w_named_on_c {
+                    assert_eq!(named(&c, clock(3)).get(&tx(W)), RUNS);
+                    let naming_w = with_lines(on(C, 3), vec![run(W, &w_on_c)]);
+                    fold_written(&mut c, &mut written, &naming_w);
+                    assert!(c.members[&tx(H1)].head.is_some(), "beside W in flight");
+                    assert_eq!(named(&c, clock(4)).get(&tx(H1)), RUNS);
+                } else {
+                    assert_eq!(named(&c, clock(3)).get(&tx(W)), None, "unready on C");
+                    fold_written(&mut c, &mut written, &on(C, 3));
+                }
+
+                // A asks either way, and reads the answer off C's seats.
+                let question = SeatQuestion {
+                    shard: C,
+                    waiting: tx(W),
+                    holder: tx(H1),
+                    validity_end: deadline.validity_end(),
+                };
+                assert_eq!(seat_questions(&a, clock(4)), vec![question]);
+                let leaves: Vec<SubstateKey> = question
+                    .keys()
+                    .into_iter()
+                    .filter(|key| written.contains(key))
+                    .collect();
+                let reading = proven_claim(C, 3, &leaves, &question.keys());
+                let victims = wounded(&a, clock(4), from_ref(&reading));
+
+                if w_named_on_c {
+                    // H1 holds a seat on C too: no cycle, nobody wounded.
+                    assert!(leaves.contains(&seat_leaf(C, tx(H1))), "H1 heads on C");
+                    assert!(victims.is_empty());
+                    assert_eq!(named(&a, clock(4)).get(&tx(W)), None, "H1 in flight");
+                    a.advance(&MemberInputs {
+                        settled: vec![SettledHalf {
+                            tick: TickId::new(A, BlockHeight::new(3)),
+                            half: TickHalf::Stated,
+                            deleted: vec![tx(H1)],
+                            accepted: Vec::new(),
+                            stated: Vec::new(),
+                        }],
+                        ..on(A, 4)
+                    });
+                    assert_eq!(named(&a, clock(5)).get(&tx(W)), RUNS, "H1 settled on A");
+                    continue;
+                }
+
+                assert_eq!(victims, BTreeSet::from([tx(W)]));
+                let live = |_, _| Evidence::Live { terminating: false };
+                let (lines, _) =
+                    lines_and_missing(&a, clock(4), &Held::default(), &live, false, &victims);
+                assert!(
+                    lines.iter().any(|line| matches!(
+                        line,
+                        TickLine::Member { tx: named, joins: Joins::Aborted, .. }
+                            if *named == tx(W)
+                    )),
+                    "W is aborted unnamed on A: {lines:?}",
+                );
+                let window = c.members[&tx(W)].blocked_at.expect("W refuses H1 on C");
+                assert!(clock(4) < window.plus(NAMING_WINDOW) && clock(4) < deadline.at());
+            }
+        }
+
+        /// Terms writing a key of A's and one of C's, awaiting `there` and
+        /// unready for want of its bundle.
+        fn spanning_unready(there: ShardId) -> MemberTerms {
+            MemberTerms {
+                reach: Capped::from_array([there]),
+                awaits: Capped::from_array([there]),
+                ..leg(
+                    vec![(cell(0x01, 1), WRITE), (cell(0x91, 1), WRITE)],
+                    &[there],
+                )
+            }
+        }
+
+        /// Two members headed in opposite order on A and C, each unready at
+        /// its head and refusing the other placed behind it. Each shard
+        /// asks the other about its own pair and reads the cycle off the
+        /// other's committed seats, and both name the same victim, the
+        /// later hash: the waiting row on one shard and the head on the
+        /// other. Over both hash orders.
+        #[test]
+        fn a_queue_order_cycle_wounds_the_later_member_on_both_shards() {
+            const A: ShardId = ShardId::leaf(1, 0);
+            const C: ShardId = PEER;
+            let on = |shard: ShardId, height: u64| MemberInputs {
+                shard,
+                ..block(height)
+            };
+            for (first, second) in [(1, 2), (2, 1)] {
+                let victim = tx(first).max(tx(second));
+                let (mut a, mut c) = (MemberIndex::empty(A), MemberIndex::empty(C));
+                let (mut on_a, mut on_c) = (BTreeSet::new(), BTreeSet::new());
+                for (rows, written, shard, there, order) in [
+                    (&mut a, &mut on_a, A, C, [first, second]),
+                    (&mut c, &mut on_c, C, A, [second, first]),
+                ] {
+                    for (height, seed) in (1u64..).zip(order) {
+                        let mut next = on(shard, height);
+                        commit(&mut next, seed, &spanning_unready(there), far());
+                        fold_written(rows, written, &next);
+                    }
+                    let (head, behind) =
+                        (&rows.members[&tx(order[0])], &rows.members[&tx(order[1])]);
+                    assert!(
+                        head.head.is_some() && head.blocked_at.is_some(),
+                        "on {shard:?}"
+                    );
+                    assert!(
+                        behind.queued.is_some() && behind.head.is_none(),
+                        "on {shard:?}"
+                    );
+                }
+                for (rows, there, read, head, behind) in
+                    [(&a, C, &on_c, first, second), (&c, A, &on_a, second, first)]
+                {
+                    let question = SeatQuestion {
+                        shard: there,
+                        waiting: tx(behind),
+                        holder: tx(head),
+                        validity_end: far().validity_end(),
+                    };
+                    assert_eq!(seat_questions(rows, clock(3)), vec![question]);
+                    let leaves: Vec<SubstateKey> = question
+                        .keys()
+                        .into_iter()
+                        .filter(|key| read.contains(key))
+                        .collect();
+                    let reading = proven_claim(there, 2, &leaves, &question.keys());
+                    assert_eq!(
+                        wounded(rows, clock(3), from_ref(&reading)),
+                        BTreeSet::from([victim]),
+                        "{:?} wounds the later hash, {first} placed first on A",
+                        rows.shard(),
+                    );
+                }
+            }
+        }
+
+        /// The victim's unnamed abort clears its queue entries in the
+        /// block naming it, whose own fold heads the survivor placed behind
+        /// it.
+        #[test]
+        fn the_survivor_heads_in_the_block_naming_the_victims_abort() {
+            const A: ShardId = ShardId::leaf(1, 0);
+            const C: ShardId = PEER;
+            let (victim, survivor) = (2, 1);
+            assert!(tx(survivor) < tx(victim));
+            let on = |height: u64| MemberInputs {
+                shard: A,
+                ..block(height)
+            };
+            let mut a = MemberIndex::empty(A);
+            for (height, seed) in [(1, victim), (2, survivor)] {
+                let mut next = on(height);
+                commit(&mut next, seed, &spanning_unready(C), far());
+                a.advance(&next);
+            }
+            assert!(a.members[&tx(victim)].head.is_some());
+            assert!(a.members[&tx(survivor)].head.is_none());
+
+            let [question] = seat_questions(&a, clock(3))[..] else {
+                panic!("one pair is asked about");
+            };
+            assert_eq!(question.victim(), tx(victim), "the head is the victim");
+            let reading = proven_claim(
+                C,
+                2,
+                &[seat_leaf(C, tx(survivor)), member_row_leaf(C, tx(victim))],
+                &question.keys(),
+            );
+            let victims = wounded(&a, clock(3), from_ref(&reading));
+            assert_eq!(victims, BTreeSet::from([tx(victim)]));
+            let live = |_, _| Evidence::Live { terminating: false };
+            let (lines, _) =
+                lines_and_missing(&a, clock(3), &Held::default(), &live, false, &victims);
+            assert!(
+                lines.iter().any(|line| matches!(
+                    line,
+                    TickLine::Member { tx: named, joins: Joins::Aborted, .. }
+                        if *named == tx(victim)
+                )),
+                "the victim is aborted unnamed: {lines:?}",
+            );
+            a.advance(&with_lines(on(3), lines));
+            assert_eq!(
+                a.members[&tx(survivor)].head.map(|head| head.height),
+                Some(BlockHeight::new(3)),
+                "the survivor heads in the block naming the abort",
+            );
+        }
+
+        /// A head that refuses nobody stands until its deadline, however
+        /// long past its head clock.
+        #[test]
+        fn a_head_refusing_nobody_keeps_its_deadline() {
+            let deadline = Deadline::of(clock(1).plus(NAMING_WINDOW * 3));
+            let mut rows = MemberIndex::empty(ShardId::ROOT);
+            let mut first = block(1);
+            commit(&mut first, 1, &unready(vec![(key(1), READ)]), deadline);
+            rows.advance(&first);
+            assert!(rows.members[&tx(1)].head.is_some());
+            assert_eq!(rows.members[&tx(1)].blocked_at, None);
+            let short = deadline.at().minus(Duration::from_millis(1));
+            assert_eq!(named(&rows, short).get(&tx(1)), None);
+            assert_eq!(
+                named(&rows, deadline.at()).get(&tx(1)),
+                Some(&Joins::Aborted)
+            );
+        }
     }
 }

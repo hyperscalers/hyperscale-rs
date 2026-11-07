@@ -1,7 +1,6 @@
 //! Reshape lifecycle scenarios.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
@@ -112,7 +111,7 @@ pub fn split_lifecycle(c: &mut impl Cluster) {
     // Keep the parent committing through its final window: a real transfer
     // gives it activity so it coasts to its crossing and the fold seeds both
     // children from the terminal contribution.
-    c.submit(Arc::new(build_probe_transfer_tx(validity_around(c.now()))));
+    c.submit(build_probe_transfer_tx(validity_around(c.now())));
 
     // Each child seats from the terminal crossing its members followed,
     // ahead of the fold that publishes its anchor. Serving alone would
@@ -250,11 +249,11 @@ fn run_probe_train<C: Cluster>(
     world: &mut World,
     spacing: Duration,
     handed_over: impl Fn(&C) -> bool,
-) -> Vec<Arc<Transaction>> {
+) -> Vec<Transaction> {
     let live = handed_over;
-    let mut probes: Vec<Arc<Transaction>> = Vec::new();
+    let mut probes: Vec<Transaction> = Vec::new();
     while probes.len() < MAX_REPLAY_PROBES as usize && !live(c) {
-        let probe = Arc::new(build_probe_transfer_tx(validity_around(c.now())));
+        let probe = build_probe_transfer_tx(validity_around(c.now()));
         charges.record(&probe);
         // A probe whose delivery the cut costs leaves its crossing owed,
         // standing in the record until whoever holds the recipient's
@@ -264,7 +263,7 @@ fn run_probe_train<C: Cluster>(
                 .expect("a scenario transfer derives")
                 .legs,
         ));
-        probes.push(Arc::clone(&probe));
+        probes.push(probe.clone());
         c.submit(probe);
         let until = c.now() + spacing;
         c.run_until(epochs(4), |c| live(c) || c.now() >= until);
@@ -289,11 +288,7 @@ fn run_probe_train<C: Cluster>(
 ///
 /// Panics when no probe qualifies, which would leave every assertion
 /// resting on it vacuous.
-fn pick_replay(
-    c: &impl Cluster,
-    terminating: ShardId,
-    probes: &[Arc<Transaction>],
-) -> Arc<Transaction> {
+fn pick_replay(c: &impl Cluster, terminating: ShardId, probes: &[Transaction]) -> Transaction {
     let anchor = clock(c);
     probes
         .iter()
@@ -329,7 +324,7 @@ fn pick_replay(
 /// Panics if `successor` reports no origin, if its origin is network
 /// genesis (nothing predates that, so the probe would not be pre-cut), or
 /// if the built window no longer contains the current clock.
-fn build_precut_probe(c: &impl Cluster, successor: ShardId, payer: u8) -> Arc<Transaction> {
+fn build_precut_probe(c: &impl Cluster, successor: ShardId, payer: u8) -> Transaction {
     let origin = c
         .chain_origin(successor)
         .expect("the successor is live, so it reports the origin it started at");
@@ -348,7 +343,7 @@ fn build_precut_probe(c: &impl Cluster, successor: ShardId, payer: u8) -> Arc<Tr
         "a probe opening before the cut ({cut:?}) must still be signed for now ({anchor:?}) — \
          the successor came up more than a validity window after its predecessor terminated",
     );
-    Arc::new(build_probe_transfer_tx_from(payer, range))
+    build_probe_transfer_tx_from(payer, range)
 }
 
 /// How far before the cut [`build_precut_probe`] opens its window. Any
@@ -415,7 +410,7 @@ pub fn split_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
     c.submit(replay);
     for (_, probe) in &stranded {
         charges.record(probe);
-        c.submit(Arc::clone(probe));
+        c.submit(probe.clone());
     }
     for (child, probe) in &stranded {
         let hash = probe.hash();
@@ -596,17 +591,14 @@ pub fn split_boundary_hands_back_what_it_never_included(c: &mut impl Cluster) {
 /// # Panics
 ///
 /// Panics if the beacon has not scheduled `parent`'s cut yet.
-fn build_post_cut_probe(
-    c: &impl Cluster,
-    parent: ShardId,
-) -> (Arc<Transaction>, WeightedTimestamp) {
+fn build_post_cut_probe(c: &impl Cluster, parent: ShardId) -> (Transaction, WeightedTimestamp) {
     let terminal = scheduled_terminal_epoch(c, parent).expect("the cut is scheduled");
     let windows = epoch_windows(c).expect("a scheduled cut implies a committed beacon");
     // The epoch after the parent's last: its chain has ended by then, and
     // its successors are the only thing that can include this.
     let opens = windows.window_of(terminal).end;
     let range = TimestampRange::new(opens, opens.plus(POST_CUT_PROBE_LIFE));
-    (Arc::new(build_probe_transfer_tx(range)), opens)
+    (build_probe_transfer_tx(range), opens)
 }
 
 /// How far inside a pool's reach the post-cut probe is submitted.
@@ -689,7 +681,7 @@ pub fn merge_boundary_admits_an_uncommitted_precut_tx(c: &mut impl Cluster) {
 /// Panics if neither child commits a probe within budget.
 fn probe_payer_shard(c: &mut impl Cluster, charges: &mut Charges, parent: ShardId) -> ShardId {
     let (left, right) = parent.children();
-    let probe = Arc::new(build_probe_transfer_tx(validity_around(c.now())));
+    let probe = build_probe_transfer_tx(validity_around(c.now()));
     let hash = charges.record(&probe);
     c.submit(probe);
     assert!(

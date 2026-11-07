@@ -29,19 +29,20 @@ use thiserror::Error;
 use crate::shard::commit_proof::{CommitProof, CommitProofVerifyError, ResolvedCommittee};
 use crate::{
     BlockHash, BlockHeight, BlockVoteMessage, CertifiedBlockHeader, ConsensusPublicKey,
-    ConsensusSignature, EpochWindows, NetworkDefinition, QuorumCertificate, RecoveryBinding, Round,
-    ShardId, TopologySchedule, ValidatorId, Verified, Verify, signed_bytes,
+    ConsensusSignature, Epoch, NetworkDefinition, QcAdmission, QuorumCertificate, RecoveryBinding,
+    Round, ShardId, TopologySchedule, ValidatorId, Verified, Verify, signed_bytes,
 };
 
 /// Self-authenticating evidence that a single validator double-voted at
 /// one `(shard, height, round)` for two different blocks.
 ///
-/// Each side carries the block it voted, the parent hash the vote bound
-/// in (needed to reconstruct the signing message —
-/// [`BlockVoteMessage`] binds the parent), and the signature. The
-/// contradiction is `block_hash_a != block_hash_b`: an honest validator
-/// votes at most once per round, so two valid signatures over different
-/// block hashes at the same slot prove the key voted twice.
+/// Each side carries the block it voted, the parent hash and committee
+/// epoch the vote bound in (needed to reconstruct the signing message —
+/// [`BlockVoteMessage`] binds both), and the signature. The contradiction
+/// is `block_hash_a != block_hash_b`: an honest validator votes at most
+/// once per round, so two valid signatures over different block hashes
+/// at the same slot prove the key voted twice. Two epochs over one block
+/// are no contradiction: the same vote under two views of the schedule.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ShardVoteEquivocation {
     /// Validator that double-voted.
@@ -56,12 +57,16 @@ pub struct ShardVoteEquivocation {
     pub block_hash_a: BlockHash,
     /// First side's parent hash, bound into the signing message.
     pub parent_block_hash_a: BlockHash,
+    /// First side's committee epoch, bound into the signing message.
+    pub committee_epoch_a: Epoch,
     /// First side's signature over `BlockVoteMessage` for side A.
     pub sig_a: ConsensusSignature,
     /// Second side's voted block (must differ from `block_hash_a`).
     pub block_hash_b: BlockHash,
     /// Second side's parent hash, bound into the signing message.
     pub parent_block_hash_b: BlockHash,
+    /// Second side's committee epoch, bound into the signing message.
+    pub committee_epoch_b: Epoch,
     /// Second side's signature over `BlockVoteMessage` for side B.
     pub sig_b: ConsensusSignature,
 }
@@ -108,6 +113,7 @@ pub fn verify_shard_vote_equivocation(
             round: ev.round,
             block_hash: ev.block_hash_a,
             parent_block_hash: ev.parent_block_hash_a,
+            committee_epoch: ev.committee_epoch_a,
         },
         network,
     );
@@ -118,6 +124,7 @@ pub fn verify_shard_vote_equivocation(
             round: ev.round,
             block_hash: ev.block_hash_b,
             parent_block_hash: ev.parent_block_hash_b,
+            committee_epoch: ev.committee_epoch_b,
         },
         network,
     );
@@ -214,7 +221,7 @@ pub enum ShardForkProofVerifyError {
 impl ShardForkProof {
     /// The shard the fork is on.
     #[must_use]
-    pub const fn shard(&self) -> ShardId {
+    pub fn shard(&self) -> ShardId {
         let Self::ConflictingCommits { a, .. } = self;
         a.shard()
     }
@@ -236,13 +243,13 @@ impl ShardForkProof {
         v
     }
 
-    /// Resolve each QC's committee from the schedule, keyed by the block's
-    /// committee anchor — its *parent's* weighted timestamp, since that is
-    /// what selects the committee that signed it — and recovery-bridged like
-    /// any certified artifact. `None` if any QC's governing epoch is not
-    /// folded, or if a proof carries no parent for its certified block; the
-    /// caller defers, exactly as cross-shard consumption does. The result
-    /// lines up positionally with [`Self::qc_headers`].
+    /// Resolve each QC's committee from the schedule: the window its
+    /// signers signed, admitted ([`TopologySchedule::admits`]) at the
+    /// block's committee anchor — its *parent's* weighted timestamp — and
+    /// the QC's stamp. `None` if any QC is not admitted, or if a proof
+    /// carries no parent for its certified block; the caller defers,
+    /// exactly as cross-shard consumption does. The result lines up
+    /// positionally with [`Self::qc_headers`].
     #[must_use]
     pub fn resolve_committees(
         &self,
@@ -250,19 +257,28 @@ impl ShardForkProof {
     ) -> Option<Vec<ResolvedCommittee>> {
         let Self::ConflictingCommits { a, b } = self;
         let anchors = [
-            a.certified_committee_anchor()?,
-            a.child_committee_anchor(),
-            b.certified_committee_anchor()?,
-            b.child_committee_anchor(),
+            a.committee_anchor_of_certified()?,
+            a.committee_anchor_of_child(),
+            b.committee_anchor_of_certified()?,
+            b.committee_anchor_of_child(),
         ];
         self.qc_headers()
             .into_iter()
             .zip(anchors)
             .map(|(ch, anchor_wt)| {
-                let shard = ch.shard_id();
-                let qc_wt = ch.qc().weighted_timestamp();
-                let (snapshot, _bridged) =
-                    schedule.at_for_shard_certified(shard, anchor_wt, qc_wt)?;
+                let (shard, qc) = (ch.shard_id(), ch.qc());
+                if qc.is_genesis() {
+                    return None;
+                }
+                let QcAdmission::Admit(committee) = schedule.admits(
+                    shard,
+                    anchor_wt,
+                    qc.weighted_timestamp(),
+                    qc.committee_epoch(),
+                ) else {
+                    return None;
+                };
+                let snapshot = committee.snapshot;
                 let public_keys = snapshot
                     .consensus_committee_for_shard(shard)
                     .iter()
@@ -336,26 +352,22 @@ impl ShardForkProof {
 
     /// Whether either side's certified block is on a branch one of
     /// `history`'s recoveries discarded
-    /// ([`RecoveryBinding::discards`]), proving no fork of the committee
-    /// that governs. While a recovery is pending, a fork of the retained
-    /// cohort's suffix is what makes the fresh committee seed from the
-    /// frontier rather than harvest the tip, so callers ask this only once
-    /// no recovery is pending.
+    /// ([`RecoveryBinding::discards`]): its QC signed under a committee
+    /// the recovery replaced, above the recovery's frontier. Such a fork
+    /// proves nothing of the committee that governs. While a recovery is
+    /// pending, a fork of the retained cohort's suffix is what makes the
+    /// fresh committee seed from the frontier rather than harvest the tip,
+    /// so callers ask this only once no recovery is pending.
     #[must_use]
     pub fn on_a_discarded_branch(
         &self,
         history: impl IntoIterator<Item = RecoveryBinding>,
-        windows: EpochWindows,
     ) -> bool {
         let Self::ConflictingCommits { a, b } = self;
         history.into_iter().any(|binding| {
             [a, b].into_iter().any(|side| {
                 let certified = side.certified();
-                binding.discards(
-                    windows,
-                    certified.height(),
-                    certified.qc().weighted_timestamp(),
-                )
+                binding.discards(certified.height(), certified.qc().committee_epoch())
             })
         })
     }
@@ -394,35 +406,73 @@ mod tests {
     use super::*;
     use crate::{BlockVote, Hash, ProposerTimestamp};
 
-    /// Sign a real block vote and return `(block_hash, parent_hash, sig)`
-    /// so tests assemble evidence from genuine signatures.
+    /// One side of a double vote: the block, its parent and the committee
+    /// epoch the vote bound in, and the signature.
+    struct Side {
+        block: BlockHash,
+        parent: BlockHash,
+        epoch: Epoch,
+        sig: ConsensusSignature,
+    }
+
+    /// Sign a real block vote under `epoch` so tests assemble evidence from
+    /// genuine signatures.
     fn signed_side(
         network: &NetworkDefinition,
         sk: &BlsSigner,
-        shard: ShardId,
-        height: BlockHeight,
-        round: Round,
-        block_hash: BlockHash,
-        parent_block_hash: BlockHash,
-    ) -> (BlockHash, BlockHash, ConsensusSignature) {
+        (shard, height, round): (ShardId, BlockHeight, Round),
+        block: BlockHash,
+        parent: BlockHash,
+        epoch: Epoch,
+    ) -> Side {
         let vote = BlockVote::new(
             network,
-            block_hash,
-            parent_block_hash,
+            block,
+            parent,
             shard,
             height,
             round,
+            epoch,
             ValidatorId::new(7),
             sk,
             ProposerTimestamp::ZERO,
         )
         .expect("sign");
-        (block_hash, parent_block_hash, vote.signature())
+        Side {
+            block,
+            parent,
+            epoch,
+            sig: vote.signature(),
+        }
+    }
+
+    fn evidence(
+        (shard, height, round): (ShardId, BlockHeight, Round),
+        a: &Side,
+        b: &Side,
+    ) -> ShardVoteEquivocation {
+        ShardVoteEquivocation {
+            validator: ValidatorId::new(7),
+            shard,
+            height,
+            round,
+            block_hash_a: a.block,
+            parent_block_hash_a: a.parent,
+            committee_epoch_a: a.epoch,
+            sig_a: a.sig,
+            block_hash_b: b.block,
+            parent_block_hash_b: b.parent,
+            committee_epoch_b: b.epoch,
+            sig_b: b.sig,
+        }
     }
 
     fn hash(bytes: &[u8]) -> BlockHash {
         BlockHash::from_raw(Hash::from_bytes(bytes))
     }
+
+    const SLOT: (ShardId, BlockHeight, Round) =
+        (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
 
     /// Two genuine signatures over different blocks at one slot verify.
     #[test]
@@ -430,40 +480,51 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let sk = BlsSigner::generate();
         let pk = sk.public_key();
-        let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
-        let (ba, pa, sa) = signed_side(
-            &net,
-            &sk,
-            shard,
-            height,
-            round,
-            hash(b"block-a"),
-            hash(b"parent-a"),
+        let epoch = Epoch::new(5);
+        let a = signed_side(&net, &sk, SLOT, hash(b"block-a"), hash(b"parent-a"), epoch);
+        let b = signed_side(&net, &sk, SLOT, hash(b"block-b"), hash(b"parent-b"), epoch);
+        assert_eq!(
+            verify_shard_vote_equivocation(&BlsVerifier, &evidence(SLOT, &a, &b), &net, &pk),
+            Ok(())
         );
-        let (bb, pb, sb) = signed_side(
-            &net,
-            &sk,
-            shard,
-            height,
-            round,
-            hash(b"block-b"),
-            hash(b"parent-b"),
-        );
-        let ev = ShardVoteEquivocation {
-            validator: ValidatorId::new(7),
-            shard,
-            height,
-            round,
-            block_hash_a: ba,
-            parent_block_hash_a: pa,
-            sig_a: sa,
-            block_hash_b: bb,
-            parent_block_hash_b: pb,
-            sig_b: sb,
-        };
+    }
+
+    /// A double vote is still jailable with each side's committee epoch in
+    /// the evidence, whichever epochs the two sides signed; evidence that
+    /// misstates a side's epoch does not verify.
+    #[test]
+    fn a_double_vote_is_still_jailed() {
+        let net = NetworkDefinition::simulator();
+        let sk = BlsSigner::generate();
+        let pk = sk.public_key();
+        let a = signed_side(&net, &sk, SLOT, hash(b"a"), hash(b"p"), Epoch::new(5));
+        let b = signed_side(&net, &sk, SLOT, hash(b"b"), hash(b"p"), Epoch::new(6));
+        let ev = evidence(SLOT, &a, &b);
         assert_eq!(
             verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk),
             Ok(())
+        );
+        let misstated = ShardVoteEquivocation {
+            committee_epoch_b: Epoch::new(5),
+            ..ev
+        };
+        assert_eq!(
+            verify_shard_vote_equivocation(&BlsVerifier, &misstated, &net, &pk),
+            Err(ShardVoteEquivocationVerifyError::BadSignature)
+        );
+    }
+
+    /// One block voted under two epochs is no contradiction.
+    #[test]
+    fn one_block_under_two_epochs_is_not_equivocation() {
+        let net = NetworkDefinition::simulator();
+        let sk = BlsSigner::generate();
+        let pk = sk.public_key();
+        let a = signed_side(&net, &sk, SLOT, hash(b"a"), hash(b"p"), Epoch::new(5));
+        let b = signed_side(&net, &sk, SLOT, hash(b"a"), hash(b"p"), Epoch::new(6));
+        assert_eq!(
+            verify_shard_vote_equivocation(&BlsVerifier, &evidence(SLOT, &a, &b), &net, &pk),
+            Err(ShardVoteEquivocationVerifyError::BlocksEqual)
         );
     }
 
@@ -474,30 +535,16 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let sk = BlsSigner::generate();
         let pk = sk.public_key();
-        let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
-        let (ba, pa, sa) = signed_side(
+        let a = signed_side(
             &net,
             &sk,
-            shard,
-            height,
-            round,
+            SLOT,
             hash(b"block-a"),
             hash(b"parent-a"),
+            Epoch::GENESIS,
         );
-        let ev = ShardVoteEquivocation {
-            validator: ValidatorId::new(7),
-            shard,
-            height,
-            round,
-            block_hash_a: ba,
-            parent_block_hash_a: pa,
-            sig_a: sa,
-            block_hash_b: ba,
-            parent_block_hash_b: pa,
-            sig_b: sa,
-        };
         assert_eq!(
-            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk),
+            verify_shard_vote_equivocation(&BlsVerifier, &evidence(SLOT, &a, &a), &net, &pk),
             Err(ShardVoteEquivocationVerifyError::BlocksEqual)
         );
     }
@@ -510,41 +557,20 @@ mod tests {
         let sk = BlsSigner::generate();
         let pk = sk.public_key();
         let intruder = BlsSigner::generate();
-        let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
-        let (ba, pa, sa) = signed_side(
-            &net,
-            &sk,
-            shard,
-            height,
-            round,
-            hash(b"block-a"),
-            hash(b"parent-a"),
-        );
+        let epoch = Epoch::GENESIS;
+        let a = signed_side(&net, &sk, SLOT, hash(b"block-a"), hash(b"parent-a"), epoch);
         // Side B signed by an unrelated key: the message is well-formed
         // but the signature won't verify under `pk`.
-        let (bb, pb, sb) = signed_side(
+        let b = signed_side(
             &net,
             &intruder,
-            shard,
-            height,
-            round,
+            SLOT,
             hash(b"block-b"),
             hash(b"parent-b"),
+            epoch,
         );
-        let ev = ShardVoteEquivocation {
-            validator: ValidatorId::new(7),
-            shard,
-            height,
-            round,
-            block_hash_a: ba,
-            parent_block_hash_a: pa,
-            sig_a: sa,
-            block_hash_b: bb,
-            parent_block_hash_b: pb,
-            sig_b: sb,
-        };
         assert_eq!(
-            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk),
+            verify_shard_vote_equivocation(&BlsVerifier, &evidence(SLOT, &a, &b), &net, &pk),
             Err(ShardVoteEquivocationVerifyError::BadSignature)
         );
     }
@@ -559,9 +585,11 @@ mod tests {
             round: Round::INITIAL,
             block_hash_a: hash(b"block-a"),
             parent_block_hash_a: hash(b"parent-a"),
+            committee_epoch_a: Epoch::new(3),
             sig_a: ConsensusSignature::new([1u8; 96]),
             block_hash_b: hash(b"block-b"),
             parent_block_hash_b: hash(b"parent-b"),
+            committee_epoch_b: Epoch::new(4),
             sig_b: ConsensusSignature::new([2u8; 96]),
         };
         let bytes = hbor_to_vec(&ev).unwrap();
@@ -582,7 +610,7 @@ mod tests {
             TestCommittee, anchor_qc, certify_header, direct_commit_proof, fork_header,
             live_fork_header,
         };
-        use crate::{BlockHeader, Epoch, Hash, TopologySchedule, WeightedTimestamp};
+        use crate::{BlockHeader, EpochWindows, Hash, TopologySchedule, WeightedTimestamp};
 
         const SHARD: ShardId = ShardId::ROOT;
 
@@ -677,9 +705,24 @@ mod tests {
                 above,
                 3,
             );
+            let signed_in = |epoch: u64| {
+                let (hash, shard, height, parent, round, _, signers, sig, ts) =
+                    anchor_qc(SHARD, above).into_parts();
+                QuorumCertificate::new(
+                    hash,
+                    shard,
+                    height,
+                    parent,
+                    round,
+                    Epoch::new(epoch),
+                    signers,
+                    sig,
+                    ts,
+                )
+            };
             let proof = CommitProof::direct(
-                CertifiedBlockHeader::new(certified_header, anchor_qc(SHARD, above)),
-                CertifiedBlockHeader::new(child_header, anchor_qc(SHARD, above)),
+                CertifiedBlockHeader::new(certified_header, signed_in(0)),
+                CertifiedBlockHeader::new(child_header, signed_in(1)),
                 Some(certified_parent),
             );
             let fork = ShardForkProof::ConflictingCommits {

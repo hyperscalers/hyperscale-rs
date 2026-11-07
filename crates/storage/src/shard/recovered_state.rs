@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Anchor, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin,
-    CommittedTip, Hash, Provisions, QuorumCertificate, ReadFrontier, ShardAnchor, StateRoot,
+    CommittedTip, Epoch, Hash, Provision, QuorumCertificate, ReadFrontier, ShardAnchor, StateRoot,
     Verified, WeightedTimestamp,
 };
 
@@ -89,7 +89,7 @@ pub struct RecoveredState {
     /// The provision bodies still held for the blocks that carried them.
     /// A stored block keeps only their hashes, so this is what puts them
     /// back in the shared store a restarted node reads them from.
-    pub retained_provisions: Vec<Arc<Provisions>>,
+    pub retained_provisions: Vec<Provision>,
 
     /// Last committed block hash (None for fresh start).
     pub committed_hash: Option<BlockHash>,
@@ -322,5 +322,70 @@ impl RecoveredState {
     pub fn committee_anchor_wt(&self) -> WeightedTimestamp {
         self.committed_committee_anchor_wt
             .unwrap_or_else(|| self.block_anchor_wt())
+    }
+
+    /// The epoch the committee that certified the recovered tip signed,
+    /// read off the copy of its QC the store kept, which its child's
+    /// header pinned. Never off a snap-synced anchor QC, which the shard
+    /// has yet to verify. `None` for a fresh start, after a snap sync, and
+    /// for a tip no committee signed — a chain's genesis block.
+    #[must_use]
+    pub fn verified_committee_epoch(&self) -> Option<Epoch> {
+        self.latest_qc
+            .as_deref()
+            .filter(|qc| qc.signer_count() > 0)
+            .map(QuorumCertificate::committee_epoch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::{
+        AggregateSignature, Round, ShardId, SignerBitfield, Verified, WeightedTimestamp,
+    };
+
+    use super::*;
+
+    fn qc_stating(epoch: u64, signers: usize) -> QuorumCertificate {
+        let mut bitfield = SignerBitfield::new(4);
+        for index in 0..signers {
+            bitfield.set(index);
+        }
+        QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"tip")),
+            ShardId::ROOT,
+            BlockHeight::new(7),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            Epoch::new(epoch),
+            bitfield,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(7_000),
+        )
+    }
+
+    /// The tip's window is the one its stored QC signed: the persisted
+    /// copy on a restart, none after a snap sync, whose anchor QC the
+    /// shard alone checks, and none for a tip no committee signed.
+    #[test]
+    fn the_tips_committee_epoch_is_read_off_its_stored_qc() {
+        let restarted = RecoveredState {
+            latest_qc: Some(Verified::new_unchecked_for_test(qc_stating(21, 3))),
+            ..RecoveredState::default()
+        };
+        assert_eq!(restarted.verified_committee_epoch(), Some(Epoch::new(21)));
+
+        let snapped = RecoveredState {
+            anchor_qc: Some(qc_stating(9, 3)),
+            ..RecoveredState::default()
+        };
+        assert_eq!(snapped.verified_committee_epoch(), None);
+
+        let genesis = RecoveredState {
+            latest_qc: Some(Verified::new_unchecked_for_test(qc_stating(0, 0))),
+            ..RecoveredState::default()
+        };
+        assert_eq!(genesis.verified_committee_epoch(), None);
+        assert_eq!(RecoveredState::default().verified_committee_epoch(), None);
     }
 }

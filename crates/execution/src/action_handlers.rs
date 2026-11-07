@@ -14,24 +14,69 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{
-    Action, ActionContext, CrossShardExecutionRequest, ProtocolEvent, TickBatchOutcome,
+    ActionContext, CrossShardExecutionRequest, ExecutionAction, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
+use hyperscale_engine::{ExecutedTx, PointReads, ServedPart, TickBatchContext, TickTxInput};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
+use hyperscale_provisions::own_served_entries;
 use hyperscale_storage::{
-    ProvisionalTx, ShardStorage, TickOutput, declared_reservations, fold_state_writes, staged_yes,
+    ProvisionalTx, ShardStorage, TickChain, TickOutput, declared_reservations, fold_state_writes,
+    staged_yes,
 };
 use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVoteNotification,
 };
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
-    ExecutionCertificatesSenderMessage, ExecutionVote, Finalization, FinalizationContext,
+    ExecutionCertificatesSenderMessage, ExecutionVote, Finalization, FinalizationContext, ShardId,
     StateWrites, Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, Verifiable,
     Verified, shard_prefix_path, signed_bytes,
 };
+
+/// What each of `requests` that serves itself a part reads of it: the
+/// entries a counterpart sharing its verdict absorbed, read at its head
+/// height.
+///
+/// # Panics
+///
+/// If the store does not hold a head height, which the dispatch gate and
+/// retention rule out, or a range names an entry with no leaf. Either
+/// is a defect every replica may share, and running on anything else
+/// would split the member from its counterparts.
+fn own_parts<S: ShardStorage>(
+    chain: &TickChain<S>,
+    shard: ShardId,
+    requests: &[CrossShardExecutionRequest],
+) -> BTreeMap<TxHash, ServedPart> {
+    let mut snapshots = BTreeMap::new();
+    let mut parts = BTreeMap::new();
+    for request in requests {
+        let Some(head) = request.served_at else {
+            continue;
+        };
+        let state = snapshots.entry(head).or_insert_with(|| {
+            chain.base_at(head).unwrap_or_else(|| {
+                panic!(
+                    "BFT CRITICAL: the store holds no head height {head} a dispatched tick reads"
+                )
+            })
+        });
+        let part = own_served_entries(&*state, shard, request.tx_hash, &request.holds)
+            .unwrap_or_else(|| {
+                panic!(
+                    "BFT CRITICAL: a range of {} names an entry with no leaf at its head height",
+                    request.tx_hash
+                )
+            });
+        parts.insert(
+            request.tx_hash,
+            ServedPart::new(part.entries, &part.cells, &part.ranges),
+        );
+    }
+    parts
+}
 
 // ============================================================================
 // Tick-based execution voting handlers
@@ -172,21 +217,20 @@ fn granted_reservations(
         .map_or_default(|r| declared_reservations(&r.transaction.routing().declared_modes))
 }
 
-/// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
-/// crates hit `unreachable!()` — node's dispatcher routes by variant prefix.
+/// Run execution work. Outcomes flow through `ctx.notify`.
 ///
 /// # Panics
 ///
-/// Panics if the dispatcher routes a variant owned by another crate, or if
-/// the executor breaks its "one result per input transaction" contract.
-#[allow(clippy::too_many_lines)] // single dispatch over execution-owned Action variants
-pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
+/// Panics if the executor breaks its "one result per input transaction"
+/// contract.
+#[allow(clippy::too_many_lines)] // single dispatch over ExecutionAction variants
+pub fn handle_action<S, N>(action: ExecutionAction, ctx: &ActionContext<'_, S, N>)
 where
     S: ShardStorage,
     N: Network,
 {
     match action {
-        Action::AggregateExecutionCertificate {
+        ExecutionAction::AggregateExecutionCertificate {
             tick_id,
             global_receipt_root,
             votes,
@@ -201,10 +245,10 @@ where
             );
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateAggregated {
                 tick_id,
-                certificate: Arc::new(certificate),
+                certificate,
             });
         }
-        Action::VerifyAndAggregateExecutionVotes {
+        ExecutionAction::VerifyAndAggregateExecutionVotes {
             tick_id,
             block_hash,
             votes,
@@ -220,7 +264,7 @@ where
                 verified_votes,
             });
         }
-        Action::VerifyExecutionCertificateSignature {
+        ExecutionAction::VerifyExecutionCertificateSignature {
             certificate,
             public_keys,
             ..
@@ -230,13 +274,10 @@ where
                 network: ctx.topology_snapshot.network(),
                 public_keys: &public_keys,
             };
-            let result = certificate
-                .upgrade(&ctx_ec)
-                .map(Arc::new)
-                .map_err(|(raw, err)| (Arc::new(raw), err));
+            let result = certificate.upgrade(&ctx_ec);
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified { result });
         }
-        Action::VerifyFinalization {
+        ExecutionAction::VerifyFinalization {
             finalization,
             public_keys,
         } => {
@@ -245,13 +286,10 @@ where
                 network: ctx.topology_snapshot.network(),
                 public_keys: public_keys.as_deref(),
             };
-            let result = Arc::unwrap_or_clone(finalization)
-                .upgrade(&fw_ctx)
-                .map(Arc::new)
-                .map_err(|(raw, err)| (Arc::new(raw), err));
+            let result = finalization.upgrade(&fw_ctx);
             ctx.notify_protocol(ProtocolEvent::FinalizationVerified { result });
         }
-        Action::BuildLegsHalf {
+        ExecutionAction::BuildLegsHalf {
             tick,
             names,
             tip,
@@ -273,7 +311,7 @@ where
             });
             ctx.notify_protocol(ProtocolEvent::LegsHalfBuilt { tick, tip, half });
         }
-        Action::ExecuteTransactions {
+        ExecutionAction::ExecuteTransactions {
             tick,
             fates,
             tick_ts,
@@ -291,7 +329,13 @@ where
             let view = ctx
                 .tick_chain
                 .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));
-            let view_snap = view.snapshot();
+            // One base snapshot for the batch: the pre-read and every
+            // probe past it read through it, so a probe answers at the
+            // anchor even once a floor raise lets retention pass it.
+            let view_snap = Arc::new(view.snapshot());
+            // Beside it, on the same terms: each height a member reads its
+            // own part at, for as long as the batch runs.
+            let served_parts = own_parts(ctx.tick_chain, ctx.shard, &requests);
             // From the same view as the baseline, so a leg's debit and
             // the hold standing for it are never both visible, nor are a
             // burn and the fee hold it came out of.
@@ -304,6 +348,7 @@ where
                 env,
                 holds: &holds,
                 fee_holds: &fee_holds,
+                points: Some(Arc::clone(&view_snap) as Arc<dyn PointReads>),
             };
             let inputs: Vec<TickTxInput<'_>> = requests
                 .iter()
@@ -315,11 +360,12 @@ where
                     prices: r.prices,
                     member: r.member.clone(),
                     arrivals: &r.arrivals,
+                    served_part: served_parts.get(&r.tx_hash),
                 })
                 .collect();
             let executed = match ctx
                 .executor
-                .execute_tick_batch(&tick_ctx, &view_snap, &inputs)
+                .execute_tick_batch(&tick_ctx, &*view_snap, &inputs)
             {
                 Ok(executed) => executed,
                 // Nothing ran and nothing was attested, so the tick is
@@ -368,7 +414,7 @@ where
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
-        Action::SignAndSendExecutionVote {
+        ExecutionAction::SignAndSendExecutionVote {
             block_hash,
             vote_anchor_ts,
             tick_id,
@@ -416,7 +462,7 @@ where
             }
         }
 
-        Action::BroadcastExecutionCertificate {
+        ExecutionAction::BroadcastExecutionCertificate {
             shard: _,
             certificate,
             recipients,
@@ -426,7 +472,7 @@ where
                 tracing::error!("execution certificate dispatched without a signer; skipping");
                 return;
             };
-            let cert = Arc::unwrap_or_clone(certificate).into_inner();
+            let cert = certificate.into_inner();
             let msg = signed_bytes(
                 &ExecutionCertificatesSenderMessage::new(
                     cert.shard_id(),
@@ -445,7 +491,5 @@ where
                 ExecutionCertificatesNotification::new(Capped::from_array([cert]), signing.me, sig);
             ctx.network.notify(&recipients, &batch);
         }
-
-        _ => unreachable!("hyperscale_execution::handle_action called with non-execution action"),
     }
 }

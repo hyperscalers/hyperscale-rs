@@ -760,25 +760,33 @@ impl StateClaim {
     /// absence its absence, and a held value must hash to the presence
     /// the proof reconstructs for its key.
     ///
+    /// The proof must also be the one its own keys restrict it to, so a
+    /// claim admitted here can be cut by key wherever a block carrying it
+    /// needs to, and a cut that keeps every cell gives it back unchanged.
+    ///
     /// # Errors
     ///
     /// As [`StateProofError`] lists them: a proof that does not decode,
     /// misses or exceeds the claim's keys, or reconstructs another root,
-    /// and [`StateProofError::ReadingMismatch`] for a reading the proof
-    /// does not bear out.
+    /// [`StateProofError::ReadingMismatch`] for a reading the proof does
+    /// not bear out, and [`StateProofError::Noncanonical`] for a proof
+    /// its keys do not restrict it to.
     pub fn verify(&self) -> Result<(), StateProofError> {
+        let keys = self.keys();
         let proven =
             self.proof
-                .exact_inclusions(self.anchor.state_root, self.anchor.shard, &self.keys())?;
-        if proven
+                .exact_inclusions(self.anchor.state_root, self.anchor.shard, &keys)?;
+        if !proven
             .iter()
             .zip(self.cells.iter())
             .all(|((_, proved), (_, stated))| *proved == stated.inclusion())
         {
-            Ok(())
-        } else {
-            Err(StateProofError::ReadingMismatch)
+            return Err(StateProofError::ReadingMismatch);
         }
+        if self.proof.restrict(&keys).ok().as_ref() != Some(&self.proof) {
+            return Err(StateProofError::Noncanonical);
+        }
+        Ok(())
     }
 
     /// The cells this claim answers for.
@@ -822,7 +830,9 @@ impl StateClaim {
     /// The cut proof is the one a fresh fetch over the kept keys would
     /// bring, so the piece is a claim in its own right: what a proposer
     /// carries when the whole does not fit, and what a composer holds
-    /// once a block has carried the rest.
+    /// once a block has carried the rest. That holds of a cut that keeps
+    /// every cell too: a proof that arrived with more than its claim
+    /// reads comes out as the one [`Self::verify`] takes.
     #[must_use]
     pub fn restrict(&self, keep: impl Fn(SubstateKey) -> bool) -> Option<Self> {
         let cells: Vec<(SubstateKey, Stated)> = self
@@ -833,9 +843,6 @@ impl StateClaim {
             .collect();
         if cells.is_empty() {
             return None;
-        }
-        if cells.len() == self.cells.len() {
-            return Some(self.clone());
         }
         let keys: Vec<SubstateKey> = cells.iter().map(|(key, _)| *key).collect();
         let proof = self.proof.restrict(&keys).ok()?;
@@ -1274,6 +1281,87 @@ mod tests {
         assert!(whole.restrict(|_| false).is_none());
         assert_eq!(whole.restrict(|_| true), Some(whole.clone()));
         assert!(piece.wire_weight() < whole.wire_weight());
+    }
+
+    /// A proof that bears out every reading and reconstructs the root,
+    /// but carries its empty siblings as explicit zero hashes, decodes
+    /// to the tree a fresh proof describes and is not that proof's
+    /// bytes. A cut of the claim would rebuild the fresh bytes, so the
+    /// claim is refused where it is verified.
+    #[test]
+    fn a_claim_whose_proof_does_not_restrict_to_itself_fails_verify() {
+        use hyperscale_jmt::MultiProof;
+
+        let (held, missing) = (test_key(1), test_key(2));
+        // A neighbour under the same owner puts a run of one-sided
+        // branches above the two, each with an empty sibling.
+        let neighbour = SubstateKey {
+            owner: held.owner,
+            local: LocalKey([0x81; 16]),
+        };
+        let claim = proven_claim(ShardId::ROOT, 3, &[held, neighbour], &[held, missing]);
+        assert_eq!(claim.verify(), Ok(()));
+
+        let bytes = claim.proof.as_bytes();
+        let decoded = MultiProof::decode(bytes).expect("a fixture proof decodes");
+        let empty = decoded
+            .siblings
+            .iter()
+            .filter(|sibling| **sibling == [0u8; 32])
+            .count();
+        assert!(empty > 0, "the fixture proof skips an empty sibling");
+        let count = decoded.siblings.len();
+        let bitmap = count.div_ceil(8);
+        let carried = (count - empty) * 32;
+        let at = bytes.len() - carried - bitmap;
+        let mut padded = bytes[..at].to_vec();
+        padded.extend(std::iter::repeat_n(0xFF_u8, bitmap));
+        if count % 8 != 0 {
+            let last = padded.len() - 1;
+            padded[last] = (1u8 << (count % 8)) - 1;
+        }
+        for sibling in &decoded.siblings {
+            padded.extend_from_slice(sibling);
+        }
+        assert_eq!(
+            MultiProof::decode(&padded).expect("the padded proof decodes"),
+            decoded,
+            "the same tree, other bytes"
+        );
+
+        let mut padding = claim.clone();
+        padding.proof = MerkleInclusionProof::new(padded);
+        assert_eq!(
+            padding
+                .proof
+                .exact_inclusions(padding.anchor.state_root, ShardId::ROOT, &padding.keys())
+                .map(|inclusions| inclusions.len()),
+            Ok(2),
+            "it proves every reading"
+        );
+        assert_eq!(padding.verify(), Err(StateProofError::Noncanonical));
+
+        let recut = padding.restrict(|_| true).expect("every cell kept");
+        assert_eq!(recut.verify(), Ok(()), "a whole cut rebuilds the proof");
+        assert_eq!(recut, claim, "the claim a fresh fetch would have built");
+    }
+
+    /// A proof claiming keys its claim does not read comes out of a cut
+    /// that keeps every cell as the proof over those cells alone.
+    #[test]
+    fn a_whole_cut_drops_the_claims_its_cells_do_not_read() {
+        let (read, extra) = (test_key(1), test_key(2));
+        let wide = proven_claim(ShardId::ROOT, 3, &[read, extra], &[read, extra]);
+        let narrower = StateClaim::new(
+            wide.anchor,
+            [(read, wide.reading(read).expect("read"))],
+            wide.proof,
+        );
+        assert_eq!(narrower.verify(), Err(StateProofError::ExtraClaim));
+
+        let recut = narrower.restrict(|_| true).expect("the cell kept");
+        assert_eq!(recut.verify(), Ok(()));
+        assert!(recut.wire_weight() < narrower.wire_weight());
     }
 
     fn crossing(seed: u8) -> CrossingId {

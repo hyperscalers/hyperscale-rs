@@ -3640,7 +3640,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Pending core members proposed blocks leave out behind a core member's holds (one per pair per block), and those aborted as the proven victims of a hold cycle",
+      "description": "Pending core members proposed blocks leave out behind a core member's holds (one per pair per block), those aborted as the proven victims of a hold cycle, and heads aborted at their naming window (counted per block built)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3730,6 +3730,15 @@
           "expr": "avg(rate(hyperscale_hold_inversions_proven_total[1m]))",
           "legendFormat": "Proven inversions (avg/validator)",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "avg(rate(hyperscale_heads_windowed_total[1m]))",
+          "legendFormat": "Windowed heads (avg/validator)",
+          "refId": "C"
         }
       ],
       "title": "Hold Contention",

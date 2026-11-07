@@ -45,8 +45,8 @@ use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    BlockHeight, DeclaredKey, Mode, Movement, ProvisionalHolds, ShardId, StateWrites, SubstateKey,
-    TickId, TxHash, amount_cell, read_amount,
+    BlockHeight, DeclaredKey, EntryKey, Mode, Movement, ProvisionalHolds, ShardId, StateWrites,
+    SubstateKey, TickId, TxHash, WeightedTimestamp, amount_cell, read_amount,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -54,7 +54,7 @@ use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::shard::fee_holds::{FeeTerms, HeldByTx, StandingFeeHolds, release_of};
 use crate::shard::members::{MemberIndex, RowState, row_state};
 use crate::shard::writes::{entry_overlay_range, fold_state_writes, merge_entry_overlay};
-use crate::{Substates, VersionedStore};
+use crate::{Anchored, Substates, VersionedStore};
 
 /// One cross-shard transaction's provisional contribution to a tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -740,9 +740,16 @@ where
     ///
     /// Every entry at or below the floor goes whole, readable or pending,
     /// and nothing else: every contribution at or below it is in the base
-    /// or discarded, and no run above it is under way yet. The base is
-    /// held at the floor, so the first tick past the crossing reads a
-    /// baseline still there.
+    /// or discarded, and no run above it is under way yet. The hold on the
+    /// base is [`prune_persisted`](Self::prune_persisted)'s to move, which
+    /// the crossing's next publication does: the executed height it reads
+    /// stands at the floor by then, so the first tick past the crossing
+    /// reads a baseline still there.
+    ///
+    /// A run at or below the floor may still be under way, and that hold
+    /// passes its anchor. Its output is dropped when it appends, and it
+    /// reads until then through the snapshot its view took
+    /// ([`TickView::snapshot`]), which the hold no longer has to cover.
     ///
     /// The holds of the pending legs it drops stay, as stated holds: the
     /// crossing keeps each stated row, and a legs half above the floor
@@ -784,8 +791,6 @@ where
             }
         }
         drop(entries);
-        let persisted = *read_or_recover(&self.persisted);
-        self.base.hold_retention_at(persisted.min(floor));
     }
 
     /// Resolve a tick's fate: a settled verdict promotes each member's
@@ -855,17 +860,31 @@ where
     /// measured against a tip clock that a halt recovery moves by the
     /// whole halt.
     ///
+    /// `served` is the lowest height a queued tick reads a member's own
+    /// part at, its execution coordinator's `served_floor()`. It holds the
+    /// base and nothing else: a part reads store history, not this
+    /// chain's folds, so eviction and stated drops stay at the floor.
+    /// `clock` is that coordinator's committed clock, and goes to the
+    /// store with the hold. This is the one publisher of both.
+    ///
     /// A stated hold drops at the same floor, once the base there holds
     /// its row in no tick of its own: every view at or above the floor
     /// reads the row's end through the base, and a tick still queued
     /// below the end reads the hold.
-    pub fn prune_persisted(&self, persisted: BlockHeight, executed: BlockHeight) {
+    pub fn prune_persisted(
+        &self,
+        persisted: BlockHeight,
+        executed: BlockHeight,
+        served: Option<BlockHeight>,
+        clock: WeightedTimestamp,
+    ) {
         {
             let mut recorded = write_or_recover(&self.persisted);
             *recorded = (*recorded).max(persisted);
         }
         let floor = persisted.min(executed);
-        self.base.hold_retention_at(floor);
+        self.base
+            .hold_retention_at(served.map_or(floor, |served| floor.min(served)), clock);
         let mut entries = write_or_recover(&self.entries);
         entries.retain(|_, entry| !entry.covered_by(floor));
         let mut stated = write_or_recover(&self.stated);
@@ -881,6 +900,15 @@ where
         });
         drop(stated);
         drop(entries);
+    }
+
+    /// The base at `height`, or `None` where it does not hold that height.
+    ///
+    /// A tick reads a member's own part through this, at the height whose
+    /// state serves it. Dispatch waited for that height, and retention
+    /// holds it until the tick has run.
+    pub fn base_at(&self, height: BlockHeight) -> Option<S::Versioned> {
+        self.base.snapshot_held_at(height)
     }
 
     /// The highest height the settled base is known to carry: the
@@ -963,7 +991,7 @@ where
         let mut released = HeldByTx::new();
         // Taken by the first fold that has a deletion to ask about, and
         // shared by the rest.
-        let mut base_at_tick: Option<S::Snapshot<'_>> = None;
+        let mut base_at_tick: Option<S::Versioned> = None;
         let mut release = |key: SubstateKey| {
             let base = base_at_tick.get_or_insert_with(|| self.base.snapshot_at(tick));
             release_of(base, key)
@@ -1054,8 +1082,13 @@ pub struct TickView<S> {
 impl<S: VersionedStore> TickView<S> {
     /// Snapshot for batch execution: the folds over the base as of this
     /// view's anchor height.
+    ///
+    /// The base snapshot is taken here and owned by what this returns,
+    /// so every read through it, a probe the batch makes long after the
+    /// pre-read included, answers at the anchor however far the base's
+    /// retention has moved since. The floor is judged only now.
     #[must_use]
-    pub fn snapshot(&self) -> TickViewSnapshot<S::Snapshot<'_>> {
+    pub fn snapshot(&self) -> TickViewSnapshot<S::Versioned> {
         TickViewSnapshot {
             base_snapshot: self.base.snapshot_at(self.anchor),
             overlays: Arc::clone(&self.overlays),
@@ -1084,7 +1117,7 @@ impl<S: VersionedStore> TickView<S> {
         &self,
         included: &[FeeTerms],
         prefix: &NibblePath,
-    ) -> StandingFeeHolds<S::Snapshot<'_>> {
+    ) -> StandingFeeHolds<S::Versioned> {
         StandingFeeHolds::new(
             self.base.snapshot_at(self.anchor),
             Arc::clone(&self.released),
@@ -1099,6 +1132,15 @@ impl<S: VersionedStore> TickView<S> {
 pub struct TickViewSnapshot<Snap> {
     base_snapshot: Snap,
     overlays: Arc<Vec<Arc<StateWrites>>>,
+}
+
+impl<Snap: Anchored> std::fmt::Debug for TickViewSnapshot<Snap> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TickViewSnapshot")
+            .field("anchor", &self.base_snapshot.anchor())
+            .field("layers", &self.overlays.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
@@ -1195,6 +1237,25 @@ impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
             limit,
         )
     }
+
+    /// The topmost layer that reached the order key, a removal included,
+    /// and the base beneath them all: the width-one interval, read
+    /// without collapsing one.
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        let key = EntryKey {
+            owner,
+            collection,
+            order,
+        };
+        self.overlays
+            .iter()
+            .rev()
+            .find_map(|layer| layer.entries.get(&key))
+            .map_or_else(
+                || self.base_snapshot.entry(owner, collection, order),
+                Clone::clone,
+            )
+    }
 }
 
 #[cfg(test)]
@@ -1206,7 +1267,7 @@ mod tests {
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, Deadline, DeclaredRange, EntryKey, GlobalReceiptHash,
         Hash, Joins, LocalKey, MemberCollection, Movement, Owes, ResourceAddr, Settlement,
-        StateRoot, WeightedTimestamp, encode_amount,
+        StateRoot, encode_amount,
     };
     use hyperscale_vm_effects::{FeeHold, ProtocolHasher, fee_hold_total_key};
 
@@ -1320,8 +1381,6 @@ mod tests {
     }
 
     struct StubSnapshot(HashMap<SubstateKey, Vec<u8>>, BTreeMap<EntryKey, Vec<u8>>);
-    use crate::Anchored;
-
     impl Anchored for StubSnapshot {
         fn anchor(&self) -> BlockHeight {
             BlockHeight::GENESIS
@@ -1355,15 +1414,17 @@ mod tests {
     }
 
     impl VersionedStore for StubStore {
+        type Versioned = StubSnapshot;
+
         fn retention_floor(&self) -> u64 {
             0
         }
 
-        fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        fn snapshot_held_at(&self, height: BlockHeight) -> Option<StubSnapshot> {
             (height <= self.tip).then(|| self.snapshot_at(height))
         }
 
-        fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+        fn snapshot_at(&self, height: BlockHeight) -> StubSnapshot {
             lock_or_recover(&self.anchors).push(height);
             self.at(height)
         }
@@ -1371,7 +1432,7 @@ mod tests {
             None
         }
 
-        fn hold_retention_at(&self, height: BlockHeight) {
+        fn hold_retention_at(&self, height: BlockHeight, _clock: WeightedTimestamp) {
             lock_or_recover(&self.holds).push(height);
         }
     }
@@ -1736,7 +1797,12 @@ mod tests {
                 },
             );
         }
-        chain.prune_persisted(BlockHeight::new(10), BlockHeight::new(3));
+        chain.prune_persisted(
+            BlockHeight::new(10),
+            BlockHeight::new(3),
+            None,
+            WeightedTimestamp::MAX,
+        );
 
         // The tick at the first settlement, between them, above both —
         // then back down, because a queued tick anchors below a
@@ -1787,7 +1853,12 @@ mod tests {
                 writes: vec![(tx(7), debit(key(1), 300))],
             },
         );
-        chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS);
+        chain.prune_persisted(
+            BlockHeight::new(9),
+            BlockHeight::GENESIS,
+            None,
+            WeightedTimestamp::MAX,
+        );
 
         // Below the settlement and at it, in both directions: one answer.
         for anchor in [4u64, 8, 9, 8, 4] {
@@ -1877,6 +1948,97 @@ mod tests {
         );
     }
 
+    /// A point read answers what the width-one interval does, for an
+    /// entry a layer wrote, one an upper layer deleted over the base, and
+    /// one only the base holds, with the base persisted past the anchor
+    /// and moving each of them there.
+    #[test]
+    fn a_point_reads_what_its_interval_does() {
+        let owner = Address::new([3; 31], AddressClass::Component);
+        let collection = CollectionId([4; 16]);
+        let mut store = StubStore::with_cell(key(1), b"base");
+        let key = |order: u128| EntryKey {
+            owner,
+            collection,
+            order,
+        };
+        store.entries = BTreeMap::from([
+            (
+                BlockHeight::GENESIS,
+                vec![
+                    (key(1), Some(b"base one".to_vec())),
+                    (key(2), Some(b"base two".to_vec())),
+                    (key(3), Some(b"base three".to_vec())),
+                ],
+            ),
+            // Above the anchor: the settlements a lagging tick queue
+            // has persisted and the anchor must not read.
+            (
+                BlockHeight::new(9),
+                vec![
+                    (key(1), Some(b"later".to_vec())),
+                    (key(2), None),
+                    (key(3), Some(b"later".to_vec())),
+                    (key(4), Some(b"later".to_vec())),
+                ],
+            ),
+        ]);
+        let chain = TickChain::new(Arc::new(store));
+        let entry = |order: u128, value: Option<&[u8]>| {
+            let mut written = StateWrites::default();
+            written
+                .entries
+                .insert(key(order), value.map(<[u8]>::to_vec));
+            written
+        };
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: vec![
+                    (tx(1), entry(2, Some(b"one wrote"))),
+                    (tx(2), entry(3, Some(b"one wrote"))),
+                ],
+                provisional: Vec::new(),
+            },
+            &[],
+        );
+        chain.append(
+            BlockHeight::new(2),
+            TickOutput {
+                determined: vec![
+                    (tx(3), entry(2, Some(b"two wrote"))),
+                    (tx(4), entry(3, None)),
+                ],
+                provisional: Vec::new(),
+            },
+            &[],
+        );
+
+        let snapshot = chain.view_at(BlockHeight::new(2)).snapshot();
+        let interval = |order: u128| {
+            snapshot
+                .entries_in_range(owner, collection, order, order, 1)
+                .into_iter()
+                .next()
+                .map(|(_, value)| value)
+        };
+        let expected: [(u128, Option<&[u8]>); 4] = [
+            (1, Some(b"base one")),
+            (2, Some(b"two wrote")),
+            (3, None),
+            (4, None),
+        ];
+        for (order, value) in expected {
+            let point = snapshot.entry(owner, collection, order);
+            assert_eq!(point.as_deref(), value, "the point at {order}");
+            assert_eq!(
+                point,
+                interval(order),
+                "the point at {order} and its interval"
+            );
+        }
+    }
+
     /// A tick reads the base at its own height, wherever persistence
     /// sits above it. That keeps a lagging replica — which has already
     /// persisted settlements belonging to ticks it has not run — from
@@ -1890,7 +2052,12 @@ mod tests {
             b"settled",
         ));
         let chain = TickChain::new(Arc::clone(&store));
-        chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS);
+        chain.prune_persisted(
+            BlockHeight::new(9),
+            BlockHeight::GENESIS,
+            None,
+            WeightedTimestamp::MAX,
+        );
 
         let _ = chain.view_at(BlockHeight::new(4)).snapshot();
         let _ = chain.view_at(BlockHeight::new(9)).snapshot();
@@ -1932,7 +2099,12 @@ mod tests {
         ));
         let chain = TickChain::new(Arc::clone(&store));
         chain.append(BlockHeight::new(4), TickOutput::default(), &[]);
-        chain.prune_persisted(BlockHeight::new(9), BlockHeight::new(4));
+        chain.prune_persisted(
+            BlockHeight::new(9),
+            BlockHeight::new(4),
+            None,
+            WeightedTimestamp::MAX,
+        );
 
         assert_eq!(
             *lock_or_recover(&store.holds),
@@ -1941,7 +2113,12 @@ mod tests {
         );
 
         chain.append(BlockHeight::new(9), TickOutput::default(), &[]);
-        chain.prune_persisted(BlockHeight::new(9), BlockHeight::new(9));
+        chain.prune_persisted(
+            BlockHeight::new(9),
+            BlockHeight::new(9),
+            None,
+            WeightedTimestamp::MAX,
+        );
 
         assert_eq!(
             lock_or_recover(&store.holds).last().copied(),
@@ -2090,17 +2267,72 @@ mod tests {
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"five".to_vec()));
     }
 
-    /// The base is held at the floor, so the first tick past the
-    /// crossing reads a baseline still there.
+    /// A raise publishes nothing: the next publication holds the base at
+    /// the floor, with the served height and the clock that go with it.
     #[test]
-    fn a_raised_floor_holds_retention_at_it() {
+    fn a_raise_leaves_the_hold_to_its_one_publisher() {
         let store = Arc::new(StubStore::with_cell(key(1), b"base"));
         let chain = TickChain::new(Arc::clone(&store));
-        chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS);
+        let unbound = WeightedTimestamp::MAX;
+        chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS, None, unbound);
         chain.raise_floor(BlockHeight::new(3), SHARD);
         assert_eq!(
             lock_or_recover(&store.holds).last().copied(),
+            Some(BlockHeight::GENESIS),
+        );
+        chain.prune_persisted(BlockHeight::new(9), BlockHeight::new(3), None, unbound);
+        assert_eq!(
+            lock_or_recover(&store.holds).last().copied(),
             Some(BlockHeight::new(3)),
+        );
+    }
+
+    /// A served height below the floor holds the base and evicts nothing
+    /// sooner or later: entries and stated holds stay at the floor.
+    #[test]
+    fn a_served_height_holds_the_base_below_the_floor_and_only_it() {
+        let store = Arc::new(StubStore::with_cell(key(1), b"base"));
+        let chain = TickChain::new(Arc::clone(&store));
+        chain.append(
+            BlockHeight::new(2),
+            determined(&[(key(1), Some(b"two"))], 2),
+            &[],
+        );
+        chain.append(
+            BlockHeight::new(5),
+            determined(&[(key(1), Some(b"five"))], 5),
+            &[],
+        );
+        chain.resolve(
+            &tick(2),
+            &TickResolution::Settled {
+                height: BlockHeight::new(3),
+                members: BTreeSet::from([tx(2)]),
+                aborted: BTreeSet::new(),
+            },
+        );
+        chain.prune_persisted(
+            BlockHeight::new(9),
+            BlockHeight::new(4),
+            Some(BlockHeight::new(1)),
+            WeightedTimestamp::MAX,
+        );
+        assert_eq!(
+            lock_or_recover(&store.holds).last().copied(),
+            Some(BlockHeight::new(1)),
+        );
+        assert_eq!(chain.len(), 1, "eviction reads the floor, not the term");
+
+        chain.prune_persisted(
+            BlockHeight::new(9),
+            BlockHeight::new(4),
+            Some(BlockHeight::new(7)),
+            WeightedTimestamp::MAX,
+        );
+        assert_eq!(
+            lock_or_recover(&store.holds).last().copied(),
+            Some(BlockHeight::new(4)),
+            "a term above the floor does not lift the hold past it",
         );
     }
 
@@ -2183,7 +2415,12 @@ mod tests {
             "the tick at 6 is unresolved, so nothing of it is readable"
         );
 
-        chain.prune_persisted(BlockHeight::new(7), BlockHeight::new(7));
+        chain.prune_persisted(
+            BlockHeight::new(7),
+            BlockHeight::new(7),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(chain.len(), 1, "only the resolved tick evicts");
     }
 
@@ -2254,13 +2491,23 @@ mod tests {
         assert_eq!(held(2), 60, "a tick below the abandonment reads the hold");
         assert_eq!(held(3), 0, "the tick at it does not");
 
-        chain.prune_persisted(BlockHeight::new(4), BlockHeight::new(2));
+        chain.prune_persisted(
+            BlockHeight::new(4),
+            BlockHeight::new(2),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(
             chain.len(),
             1,
             "a read below the abandonment can still come"
         );
-        chain.prune_persisted(BlockHeight::new(4), BlockHeight::new(4));
+        chain.prune_persisted(
+            BlockHeight::new(4),
+            BlockHeight::new(4),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert!(chain.is_empty());
     }
 
@@ -2353,7 +2600,12 @@ mod tests {
 
         // And the entry can now evict rather than pin: nothing pends and
         // the fold is stamped, so the base carries everything it held.
-        chain.prune_persisted(BlockHeight::new(2), BlockHeight::new(2));
+        chain.prune_persisted(
+            BlockHeight::new(2),
+            BlockHeight::new(2),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(chain.len(), 0);
     }
 
@@ -2409,12 +2661,22 @@ mod tests {
         // once the base carries it and that executor is past it.
         chain.append(BlockHeight::new(3), ran(), &[]);
         chain.resolve(&tick(3), &settled);
-        chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(8));
+        chain.prune_persisted(
+            BlockHeight::new(8),
+            BlockHeight::new(8),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert!(chain.is_empty());
         assert_eq!(read(8), 900);
 
         // A second executor is seated below it and runs the tick again.
-        chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(2));
+        chain.prune_persisted(
+            BlockHeight::new(8),
+            BlockHeight::new(2),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(read(2), 1_000);
         chain.append(BlockHeight::new(3), ran(), std::slice::from_ref(&settled));
 
@@ -2459,7 +2721,12 @@ mod tests {
                 aborted: BTreeSet::new(),
             },
         );
-        chain.prune_persisted(BlockHeight::new(11), BlockHeight::new(3));
+        chain.prune_persisted(
+            BlockHeight::new(11),
+            BlockHeight::new(3),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(
             chain.len(),
             1,
@@ -2499,7 +2766,12 @@ mod tests {
         );
 
         // Unresolved: survives any persistence progress.
-        chain.prune_persisted(BlockHeight::new(10), BlockHeight::new(1));
+        chain.prune_persisted(
+            BlockHeight::new(10),
+            BlockHeight::new(1),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(chain.len(), 1);
 
         chain.resolve(
@@ -2513,7 +2785,12 @@ mod tests {
 
         // Resolved and persisted, but execution has only reached tick 1 —
         // the next tick anchors there, and the base gained the write at 3.
-        chain.prune_persisted(BlockHeight::new(3), BlockHeight::new(1));
+        chain.prune_persisted(
+            BlockHeight::new(3),
+            BlockHeight::new(1),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(
             chain.len(),
             1,
@@ -2530,9 +2807,19 @@ mod tests {
             },
             &[],
         );
-        chain.prune_persisted(BlockHeight::new(2), BlockHeight::new(3));
+        chain.prune_persisted(
+            BlockHeight::new(2),
+            BlockHeight::new(3),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(chain.len(), 2, "persistence has not caught up");
-        chain.prune_persisted(BlockHeight::new(3), BlockHeight::new(3));
+        chain.prune_persisted(
+            BlockHeight::new(3),
+            BlockHeight::new(3),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(chain.len(), 1, "only the settled tick evicts");
     }
 
@@ -2612,7 +2899,12 @@ mod tests {
                         aborted: BTreeSet::from([tx(8)]),
                     },
                 );
-                chain.prune_persisted(BlockHeight::new(4), BlockHeight::new(2));
+                chain.prune_persisted(
+                    BlockHeight::new(4),
+                    BlockHeight::new(2),
+                    None,
+                    WeightedTimestamp::MAX,
+                );
             }
             let view = chain.view_at(BlockHeight::new(2));
             (available(&view, key(1)), available(&view, key(2)))
@@ -2728,7 +3020,12 @@ mod tests {
         );
         chain.resolve(&w, &settled);
         chain.resolve(&w, &settled);
-        chain.prune_persisted(BlockHeight::new(1), BlockHeight::new(1));
+        chain.prune_persisted(
+            BlockHeight::new(1),
+            BlockHeight::new(1),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert!(chain.is_empty());
     }
 
@@ -3206,6 +3503,10 @@ mod tests {
             covered: false,
             executed: true,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
+            orphaned: false,
         }
     }
 
@@ -3374,14 +3675,24 @@ mod tests {
         let chain = TickChain::new(Arc::new(store));
         chain.seed_stated(&rows_stating(tx(1)));
 
-        chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(5));
+        chain.prune_persisted(
+            BlockHeight::new(8),
+            BlockHeight::new(5),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert_eq!(
             held(&chain, 5),
             BTreeMap::from([(tx(1), RESERVED)]),
             "a tick still queued below the release reads the hold",
         );
 
-        chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(6));
+        chain.prune_persisted(
+            BlockHeight::new(8),
+            BlockHeight::new(6),
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert!(
             held(&chain, 5).is_empty(),
             "the hold dropped once the eviction floor reached the release",
@@ -3440,7 +3751,12 @@ mod tests {
         let store = Arc::new(stated_at_three(tx(1)));
         let chain = TickChain::new(Arc::clone(&store));
         chain.seed_stated(&rows_stating(tx(1)));
-        chain.prune_persisted(BlockHeight::new(8), BlockHeight::GENESIS);
+        chain.prune_persisted(
+            BlockHeight::new(8),
+            BlockHeight::GENESIS,
+            None,
+            WeightedTimestamp::MAX,
+        );
         assert!(
             lock_or_recover(&store.anchors).is_empty(),
             "no base was read at the floor",

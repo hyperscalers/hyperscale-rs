@@ -10,8 +10,8 @@ use hyperscale_storage::test_helpers::{
     make_test_receipt, paced, placeholder_local_ec, position, registers, state_key,
     test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
-    test_a_fresh_store_holds_nothing, test_a_leg_entry_holds_the_floor_to_its_horizon,
-    test_a_legs_own_finalization_keeps_the_floor,
+    test_a_forged_certificate_clock_moves_no_retirement, test_a_fresh_store_holds_nothing,
+    test_a_leg_entry_holds_the_floor_to_its_horizon, test_a_legs_own_finalization_keeps_the_floor,
     test_a_member_row_naming_an_unheld_height_keeps_nothing,
     test_a_package_cell_lands_in_the_artifact_index, test_a_rebuilt_store_carries_signed_rounds,
     test_a_recovery_anchor_reads_back, test_a_replayed_sweep_reads_what_its_block_removed,
@@ -19,7 +19,7 @@ use hyperscale_storage::test_helpers::{
     test_a_standing_member_row_keeps_its_rows,
     test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives,
     test_a_stating_blocks_yes_receipts_prune_with_it, test_a_stored_block_keeps_its_terms,
-    test_a_successor_keeps_its_predecessors_terminal,
+    test_a_successor_keeps_its_predecessors_terminal, test_a_ticks_probe_outlives_a_raised_floor,
     test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does,
     test_chain_floor_prunes_beneath_it, test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_bundle_outlives_sealing,
@@ -47,9 +47,9 @@ use hyperscale_storage::{
 use hyperscale_types::test_utils::{finalization_of, make_finalization};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
-    ConsensusReceipt, DiscardCause, ExecutionOutcome, Finalization, FinalizationHash,
-    FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Role, Round, ShardId, StateWrites,
-    StoredReceipt, SweepFrontier, SyncHint, TickHalf, TickId, TickLine, TickManifest,
+    ConsensusReceipt, DiscardCause, Epoch, ExecutionOutcome, Finalization, FinalizationHash,
+    FrontierInputs, GlobalReceiptHash, Hash, Provision, QuorumCertificate, Role, Round, ShardId,
+    StateWrites, StoredReceipt, SweepFrontier, SyncHint, TickHalf, TickId, TickLine, TickManifest,
     TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, WeightedTimestamp,
     WitnessSources,
 };
@@ -165,6 +165,19 @@ fn snapshot_at_below_the_floor_panics() {
 fn historical_reads_respect_retention() {
     let (_dir, storage) = open_fresh();
     test_historical_reads_respect_retention(&storage);
+}
+
+/// The history under the anchor is collected as well as retired, so the
+/// probe answers only through what its view holds.
+#[test]
+fn a_ticks_probe_outlives_a_raised_floor() {
+    let (_dir, storage) = open_fresh();
+    test_a_ticks_probe_outlives_a_raised_floor(&storage, |storage| {
+        assert!(
+            storage.run_state_history_gc() > 0,
+            "history retired under the anchor"
+        );
+    });
 }
 
 #[test]
@@ -347,6 +360,7 @@ fn test_recovery_with_qc() {
             BlockHeight::new(100),
             BlockHash::from_raw(Hash::from_bytes(&[98; 32])),
             Round::new(5),
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
@@ -465,7 +479,7 @@ fn test_empty_state_on_fresh_database() {
 
 /// Append a `Finalization` to a block in place. Because `Block` is an enum,
 /// this replaces the whole value via `std::mem::replace`.
-fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
+fn push_finalization(block: &mut Block, fw: Verifiable<Finalization>) {
     let taken = std::mem::replace(
         block,
         Block::Sealed {
@@ -576,10 +590,7 @@ fn a_settling_claim_folds_its_removals() {
 
 /// A finalization whose single receipt carries `writes`. Its placeholder
 /// EC refuses nothing, so the whole set settles.
-fn finalization_with_writes(
-    height: BlockHeight,
-    writes: StateWrites,
-) -> Arc<Verifiable<Finalization>> {
+fn finalization_with_writes(height: BlockHeight, writes: StateWrites) -> Verifiable<Finalization> {
     let tick_id = TickId::new(ShardId::ROOT, height);
     let receipt = StoredReceipt {
         tx_hash: TxHash::from(Hash::from_bytes(&height.inner().to_le_bytes())),
@@ -590,12 +601,12 @@ fn finalization_with_writes(
             events: Capped::empty(),
         }),
     };
-    Arc::new(Verifiable::from(Finalization::new(
+    Verifiable::from(Finalization::new(
         tick_id,
         TickHalf::Determined,
         Some(placeholder_local_ec(ShardId::ROOT, height)),
         Capped::from_array([receipt]),
-    )))
+    ))
 }
 
 /// A prepared block's priors come from the pending chain it was prepared
@@ -728,7 +739,7 @@ fn test_commit_block_stores_certificates() {
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight::new(1));
-    let fw_certificates = Arc::new(Capped::from_array([Arc::new(cert.into())]));
+    let fw_certificates = Arc::new(Capped::from_array([cert.into()]));
     let block = match block {
         Block::Live {
             header,
@@ -942,6 +953,13 @@ fn a_replay_keeps_a_leg_its_own_finalization_settled() {
 }
 
 #[test]
+fn a_forged_certificate_clock_moves_no_retirement() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_forged_certificate_clock_moves_no_retirement(&storage);
+}
+
+#[test]
 fn a_leg_entry_holds_the_floor_to_its_horizon() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
@@ -963,7 +981,7 @@ fn test_ec_survives_reopen() {
     let finalization = Finalization::new(
         tick_id,
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::from_array([]),
     );
     let id = finalization.receipt_hash();
@@ -971,7 +989,7 @@ fn test_ec_survives_reopen() {
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
         let mut block = make_test_block(BlockHeight::new(1));
-        push_finalization(&mut block, Arc::new(finalization.into()));
+        push_finalization(&mut block, finalization.into());
         commit_settled_at(
             &storage,
             &make_test_certified(block),
@@ -1005,11 +1023,9 @@ fn a_historically_imported_block_reads_back_with_its_receipts() {
     let mut block = make_test_block(height);
     push_finalization(
         &mut block,
-        Arc::new(
-            make_finalization(height, receipt.tx_hash, TransactionDecision::Accept)
-                .with_receipts(Capped::from_array([receipt.clone()]))
-                .into(),
-        ),
+        make_finalization(height, receipt.tx_hash, TransactionDecision::Accept)
+            .with_receipts(Capped::from_array([receipt.clone()]))
+            .into(),
     );
     storage.import_historical_block(&make_test_certified(block));
 
@@ -1056,11 +1072,9 @@ fn block_settling_receipt(
     let mut block = make_test_block(height);
     push_finalization(
         &mut block,
-        Arc::new(
-            finalization_of(height, vec![outcome])
-                .with_receipts(Capped::from_array([receipt]))
-                .into(),
-        ),
+        finalization_of(height, vec![outcome])
+            .with_receipts(Capped::from_array([receipt]))
+            .into(),
     );
     block
 }
@@ -1143,12 +1157,12 @@ fn a_stray_column_family_is_dropped_on_open() {
     let finalization = Finalization::new(
         *ec.tick_id(),
         TickHalf::Determined,
-        Some(Arc::new(ec)),
+        Some(ec),
         Capped::from_array([]),
     );
     let id = finalization.receipt_hash();
     let mut block = make_test_block(BlockHeight::new(1));
-    push_finalization(&mut block, Arc::new(finalization.into()));
+    push_finalization(&mut block, finalization.into());
     commit_settled_at(
         &storage,
         &make_test_certified(block),
@@ -1371,7 +1385,7 @@ fn a_committed_bundle_survives_a_reopen() {
             .load_recovered_state(ShardId::ROOT)
             .retained_provisions
             .iter()
-            .map(|bundle| bundle.hash())
+            .map(Provision::hash)
             .collect::<Vec<_>>(),
         vec![hash],
     );

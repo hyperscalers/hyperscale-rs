@@ -14,9 +14,9 @@ use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::crossing_ids;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
-use hyperscale_storage::{ShardChainReader, member_row_leaf};
+use hyperscale_storage::{ShardChainReader, member_row_leaf, record_arrivals};
 use hyperscale_types::{
-    Address, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline,
+    Address, Anchor, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline,
     DeclaredRange, Epoch, EpochWindows, ExecutionOutcome, Inclusion, MAX_FINALIZATION_DELAY,
     MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape, RETENTION_HORIZON,
     ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateClaim, StateRoot,
@@ -495,6 +495,32 @@ pub fn chain_fate(
     (committed, finalized.or(fated))
 }
 
+/// Walk `store`'s committed chain for the source block that served it
+/// `tx`'s part from `source`: the `source_height` of the first engagement
+/// a block of it committed for the pair.
+///
+/// The block committing a member serves the targets that do not share
+/// its verdict, and the block making it head the ones that do; each
+/// target is served once, so this names the one block that served it.
+#[must_use]
+pub fn served_at(store: &impl CommittedChain, source: ShardId, tx: TxHash) -> Option<BlockHeight> {
+    let tip = store.tip();
+    let mut height = store.first().max(BlockHeight::new(1));
+    while height <= tip {
+        if let Some(certified) = store.block(height)
+            && let Some(engagement) = certified
+                .block()
+                .engagements()
+                .iter()
+                .find(|engagement| engagement.source == source && engagement.tx_hash == tx)
+        {
+            return Some(engagement.source_height);
+        }
+        height = height.next();
+    }
+    None
+}
+
 /// Walk `store`'s committed chain for the block that burned `tx`'s
 /// price there, apart from any decision on it.
 ///
@@ -539,6 +565,11 @@ pub struct ChainMentions {
     pub(crate) finalized: Vec<(TxHash, BlockHeight)>,
     /// Every fate a manifest names for one.
     pub(crate) fated: Vec<(TxHash, BlockHeight)>,
+    /// Every member line naming one to run: the tick that runs it.
+    pub(crate) run: Vec<(TxHash, BlockHeight)>,
+    /// Every claim reading a record one issued live: where a crossing it
+    /// consumes arrived.
+    pub(crate) arrived: Vec<(TxHash, BlockHeight)>,
     /// What each of those finalizations decided, in the same order.
     pub(crate) decisions: Vec<(TxHash, TransactionDecision)>,
     /// Every stating half stating one: where its row came to stand
@@ -595,13 +626,29 @@ pub fn chain_mentions(
                     .heard
                     .extend(claim.verdicts.iter().filter_map(|tx| at(*tx)));
             }
+            mentions.arrived.extend(
+                record_arrivals(block.state_claims())
+                    .into_iter()
+                    .filter_map(|(_, tx)| at(tx)),
+            );
             mentions
                 .fated
                 .extend(block.tick_manifest().iter().filter_map(|line| match line {
                     TickLine::Fate { tx, .. } => at(*tx),
-                    TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => {
-                        None
-                    }
+                    TickLine::Member { .. }
+                    | TickLine::Discard { .. }
+                    | TickLine::End { .. }
+                    | TickLine::Recovered { .. } => None,
+                }));
+            mentions
+                .run
+                .extend(block.tick_manifest().iter().filter_map(|line| match line {
+                    TickLine::Member { tx, joins, .. } if joins.dispatched() => at(*tx),
+                    TickLine::Member { .. }
+                    | TickLine::Fate { .. }
+                    | TickLine::Discard { .. }
+                    | TickLine::End { .. }
+                    | TickLine::Recovered { .. } => None,
                 }));
             for record in block.abandonment_records().iter() {
                 mentions
@@ -870,6 +917,49 @@ pub fn record_wait(store: &impl CommittedChain, tx: TxHash, key: SubstateKey) ->
         height = height.next();
     }
     None
+}
+
+/// The anchor of the first claim of `store`'s committed chain holding the
+/// value at `key`.
+#[must_use]
+pub fn record_reading_anchor(store: &impl CommittedChain, key: SubstateKey) -> Option<Anchor> {
+    let tip = store.tip();
+    let mut height = store.first().max(BlockHeight::new(1));
+    while height <= tip {
+        let carried = store.block(height).and_then(|certified| {
+            certified
+                .block()
+                .state_claims()
+                .iter()
+                .find(|claim| claim.held(key).is_some())
+                .map(|claim| claim.anchor)
+        });
+        if carried.is_some() {
+            return carried;
+        }
+        height = height.next();
+    }
+    None
+}
+
+/// How many claims of `store`'s committed chain read `key` absent.
+#[must_use]
+pub fn absent_record_readings(store: &impl CommittedChain, key: SubstateKey) -> usize {
+    let tip = store.tip();
+    let mut absent = 0;
+    let mut height = store.first().max(BlockHeight::new(1));
+    while height <= tip {
+        if let Some(certified) = store.block(height) {
+            absent += certified
+                .block()
+                .state_claims()
+                .iter()
+                .filter(|claim| claim.reading(key) == Some(Inclusion::Absent))
+                .count();
+        }
+        height = height.next();
+    }
+    absent
 }
 
 /// Walk `store`'s committed chain for every crossing refusal naming
@@ -1386,6 +1476,7 @@ mod tests {
             at,
             BlockHash::ZERO,
             Round::new(height),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1_000 * height),

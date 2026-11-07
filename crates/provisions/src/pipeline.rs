@@ -24,33 +24,35 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use hyperscale_types::network::encoded_len;
 use hyperscale_types::{
-    BlockHeight, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, ShardId, Verified, WeightedTimestamp,
+    BlockHeight, MAX_FETCH_RESPONSE_BYTES, Provision, ProvisionHash, ShardId, Verified,
+    WeightedTimestamp,
 };
 
 use crate::store::ProvisionStore;
 
 type Key = (ShardId, BlockHeight);
 
-/// Hard ceiling on provision entries buffered across every pending key —
-/// the count cap a single-signer holding class takes (see
-/// [`hyperscale_types::verifiable`]).
+/// Hard ceiling on the bytes of provision parts buffered across every
+/// pending key, held by each [`ProvisionPipeline`] — one per hosted shard
+/// seat, so a host with k seats holds up to k times this.
 ///
-/// A pending bundle is committee-gated at ingress but its merkle proof is
+/// A pending part is committee-gated at ingress but its merkle proof is
 /// not checked until the paired header arrives, and the source block height
 /// it names is the sender's own — so one Byzantine member of any source
-/// shard can mint distinct `(shard, height)` keys and fill each with a
-/// block's worth of entries, held until the deadline sweep a whole
-/// `RETENTION_HORIZON` out. The bound is on entries rather than keys or
-/// bundles because entries are what carries the bytes.
+/// shard can mint distinct `(shard, height)` keys and fill each with parts
+/// up to a fetch response's budget apiece, held until the deadline sweep a
+/// whole `RETENTION_HORIZON` out. A count cap would let each of those parts
+/// weigh that much; bytes are what the buffer costs.
 ///
-/// Sized at a block's worth per legitimately in-flight source header, with
-/// room for several proposal rounds each: honest buffering only spans the
+/// Thirty-two full fetch responses: honest buffering only spans the
 /// headers a shard has not yet verified, which is normally none. Past the
-/// ceiling new bundles are dropped, and a drop is recoverable — the
+/// ceiling new parts are dropped, and a drop is recoverable — a fetch the
+/// dropped part answered is released to be asked again, and the
 /// expectation tracker fetches what a commit-proven header says it is owed,
-/// which is the path a bundle that never arrived takes anyway.
-pub const MAX_PENDING_PROVISION_ENTRIES: usize = 64 * MAX_TXS_PER_BLOCK;
+/// which is the path a part that never arrived takes anyway.
+pub const MAX_PENDING_PROVISION_BYTES: usize = 32 * MAX_FETCH_RESPONSE_BYTES;
 
 /// Outputs of one deadline sweep — partitioned so the coordinator can
 /// prune header buffers from one half and emit fetch cancellations from
@@ -69,7 +71,7 @@ pub struct DeadlineSweep {
 /// block's `weighted_timestamp` for deadline-anchored eviction.
 #[derive(Debug, Clone)]
 struct VerifiedProvision {
-    provisions: Arc<Verified<Provisions>>,
+    provision: Verified<Provision>,
     source_block_ts: WeightedTimestamp,
 }
 
@@ -79,8 +81,19 @@ struct VerifiedProvision {
 /// only drops entries whose true deadline has passed.
 #[derive(Debug, Clone)]
 struct PendingProvision {
-    provisions: Provisions,
+    provision: Provision,
     received_at: WeightedTimestamp,
+    /// What it counts against [`MAX_PENDING_PROVISION_BYTES`], fixed at
+    /// buffering so every removal returns exactly what it took.
+    weight: usize,
+}
+
+impl PendingProvision {
+    /// Its encoding plus the slot it occupies, so a buffer of tiny parts
+    /// is charged for its bookkeeping too.
+    fn weigh(provision: &Provision) -> usize {
+        encoded_len(provision).saturating_add(size_of::<Self>())
+    }
 }
 
 /// Pending → verified → store lifecycle for inbound provisions.
@@ -100,11 +113,10 @@ struct PendingProvision {
 /// actually-committed batch when a fetch later retrieves it.
 pub struct ProvisionPipeline {
     pending: HashMap<Key, Vec<PendingProvision>>,
-    /// Running total of provision entries across every `pending` entry,
-    /// kept in step with it so the [`MAX_PENDING_PROVISION_ENTRIES`] cap is
-    /// an O(1) check. Every path that drops a pending bundle subtracts what
-    /// it dropped.
-    pending_entries: usize,
+    /// Running total of part weights across every `pending` entry, kept
+    /// in step with it so the [`MAX_PENDING_PROVISION_BYTES`] cap is an
+    /// O(1) check. Every path that drops a pending part subtracts it.
+    pending_bytes: usize,
     verified: HashMap<ProvisionHash, VerifiedProvision>,
     store: Arc<ProvisionStore>,
 }
@@ -113,7 +125,7 @@ impl ProvisionPipeline {
     pub(crate) fn new(store: Arc<ProvisionStore>) -> Self {
         Self {
             pending: HashMap::new(),
-            pending_entries: 0,
+            pending_bytes: 0,
             verified: HashMap::new(),
             store,
         }
@@ -126,44 +138,44 @@ impl ProvisionPipeline {
         self.verified.contains_key(hash)
     }
 
-    /// Buffer provisions awaiting their paired remote header.
+    /// Buffer a part awaiting its paired remote header.
     ///
-    /// Returns `false` if the bundle was dropped because the buffer is at
-    /// [`MAX_PENDING_PROVISION_ENTRIES`] capacity.
+    /// Returns `false` if the part was dropped because it would carry
+    /// the buffer past [`MAX_PENDING_PROVISION_BYTES`]. What is already
+    /// buffered stays: the newcomer is the one dropped.
     pub(crate) fn buffer_pending(
         &mut self,
         key: Key,
-        provisions: Provisions,
+        provision: Provision,
         received_at: WeightedTimestamp,
     ) -> bool {
-        let entries = provisions.transactions().len();
-        if self.pending_entries.saturating_add(entries) > MAX_PENDING_PROVISION_ENTRIES {
+        let weight = PendingProvision::weigh(&provision);
+        if self.pending_bytes.saturating_add(weight) > MAX_PENDING_PROVISION_BYTES {
             tracing::debug!(
                 source_shard = key.0.inner(),
                 block_height = key.1.inner(),
-                buffered = self.pending_entries,
-                entries,
-                "Pending provision buffer at capacity — dropping bundle"
+                buffered_bytes = self.pending_bytes,
+                weight,
+                "Pending provision buffer at capacity — dropping part"
             );
             return false;
         }
         self.pending.entry(key).or_default().push(PendingProvision {
-            provisions,
+            provision,
             received_at,
+            weight,
         });
-        self.pending_entries += entries;
+        self.pending_bytes += weight;
         true
     }
 
-    /// Drain every provisions entry buffered for `key`. The coordinator
-    /// calls this when the matching header arrives; each drained entry is
-    /// then run through merkle proof verification.
-    pub(crate) fn drain_pending_for_key(&mut self, key: Key) -> Vec<Provisions> {
+    /// Drain every part buffered for `key`. The coordinator calls this
+    /// when the matching header arrives; each drained part is then run
+    /// through its leaf and merkle proof checks.
+    pub(crate) fn drain_pending_for_key(&mut self, key: Key) -> Vec<Provision> {
         self.pending.remove(&key).map_or_default(|entries| {
-            for p in &entries {
-                self.pending_entries -= p.provisions.transactions().len();
-            }
-            entries.into_iter().map(|p| p.provisions).collect()
+            self.pending_bytes -= entries.iter().map(|p| p.weight).sum::<usize>();
+            entries.into_iter().map(|p| p.provision).collect()
         })
     }
 
@@ -176,39 +188,36 @@ impl ProvisionPipeline {
         frontier: BlockHeight,
     ) -> Vec<ProvisionHash> {
         let mut evicted = Vec::new();
-        let pending_entries = &mut self.pending_entries;
+        let pending_bytes = &mut self.pending_bytes;
         self.pending.retain(|&(s, h), entries| {
             if s != shard || h <= frontier {
                 return true;
             }
-            for p in entries.iter() {
-                *pending_entries -= p.provisions.transactions().len();
-            }
-            evicted.extend(entries.iter().map(|p| p.provisions.hash()));
+            *pending_bytes -= entries.iter().map(|p| p.weight).sum::<usize>();
+            evicted.extend(entries.iter().map(|p| p.provision.hash()));
             false
         });
         evicted
     }
 
-    /// Insert verified provisions into the pipeline + store. Returns the
-    /// verified `Arc` the coordinator hands downstream (queue + `ProvisionsAdmitted`
+    /// Insert a verified part into the pipeline + store. Returns the
+    /// verified part the coordinator hands downstream (queue + `ProvisionsAdmitted`
     /// emit). Idempotent if the same content hash is inserted twice.
     ///
-    /// The shared [`ProvisionStore`] holds raw `Arc<Provisions>` because the
-    /// network worker thread reads it to serve wire bodies; the body clone
-    /// at the seam keeps every wire read clone-free at the cost of one
-    /// allocation per verified batch.
+    /// The shared [`ProvisionStore`] holds raw parts because the network
+    /// worker thread reads it to serve wire bodies; the raw copy shares
+    /// the verified part's body.
     pub(crate) fn insert_verified(
         &mut self,
-        verified: Arc<Verified<Provisions>>,
+        verified: Verified<Provision>,
         source_block_ts: WeightedTimestamp,
-    ) -> Arc<Verified<Provisions>> {
+    ) -> Verified<Provision> {
         let hash = verified.hash();
-        self.store.insert(Arc::new((**verified).clone()));
+        self.store.insert(verified.as_ref().clone());
         self.verified.insert(
             hash,
             VerifiedProvision {
-                provisions: Arc::clone(&verified),
+                provision: verified.clone(),
                 source_block_ts,
             },
         );
@@ -233,12 +242,12 @@ impl ProvisionPipeline {
         let mut evicted_keys = Vec::new();
         let store = &self.store;
         self.verified.retain(|hash, entry| {
-            let alive = entry.provisions.deadline(entry.source_block_ts) > now;
+            let alive = entry.provision.deadline(entry.source_block_ts) > now;
             if !alive {
                 store.evict(std::iter::once(*hash));
                 evicted_keys.push((
-                    entry.provisions.source_shard(),
-                    entry.provisions.block_height(),
+                    entry.provision.source_shard(),
+                    entry.provision.block_height(),
                 ));
             }
             alive
@@ -249,13 +258,13 @@ impl ProvisionPipeline {
         // so `received_at + RETENTION_HORIZON` conservatively bounds the
         // true deadline — past that, it has provably passed.
         let mut evicted_pending = Vec::new();
-        let pending_entries = &mut self.pending_entries;
+        let pending_bytes = &mut self.pending_bytes;
         self.pending.retain(|_, entries| {
             entries.retain(|p| {
-                let alive = p.provisions.deadline(p.received_at) > now;
+                let alive = p.provision.deadline(p.received_at) > now;
                 if !alive {
-                    *pending_entries -= p.provisions.transactions().len();
-                    evicted_pending.push(p.provisions.hash());
+                    *pending_bytes -= p.weight;
+                    evicted_pending.push(p.provision.hash());
                 }
                 alive
             });
@@ -275,18 +284,22 @@ impl ProvisionPipeline {
     pub(crate) fn get_provisions_by_hash(
         &self,
         hash: ProvisionHash,
-    ) -> Option<Arc<Verified<Provisions>>> {
-        self.verified.get(&hash).map(|v| Arc::clone(&v.provisions))
+    ) -> Option<Verified<Provision>> {
+        self.verified.get(&hash).map(|v| v.provision.clone())
     }
 
     pub(crate) const fn store(&self) -> &Arc<ProvisionStore> {
         &self.store
     }
 
-    /// Provision entries buffered, not keys: the figure the cap is on and
-    /// the one that tracks what the buffer actually holds.
-    pub(crate) const fn pending_len(&self) -> usize {
-        self.pending_entries
+    /// Parts buffered, not keys.
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.values().map(Vec::len).sum()
+    }
+
+    /// Bytes buffered: the figure the cap is on.
+    pub(crate) const fn pending_bytes(&self) -> usize {
+        self.pending_bytes
     }
 
     pub(crate) fn verified_len(&self) -> usize {
@@ -297,7 +310,9 @@ impl ProvisionPipeline {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::Capped;
-    use hyperscale_types::{Hash, MerkleInclusionProof, ProvisionEntry, TxHash};
+    use hyperscale_types::{
+        Hash, LeafPath, MAX_MERKLE_PROOF_LEN, MerkleInclusionProof, ProvisionParts, TxHash,
+    };
 
     use super::*;
 
@@ -305,17 +320,12 @@ mod tests {
         WeightedTimestamp::from_millis(ms)
     }
 
-    fn make_provisions(seed: u8, source_shard: ShardId, height: BlockHeight) -> Provisions {
-        Provisions::new(
+    fn make_provisions(seed: u8, source_shard: ShardId, height: BlockHeight) -> Provision {
+        Provision::dummy(
             source_shard,
             ShardId::leaf(2, 0),
             height,
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(&[seed])),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(&[seed])),
         )
     }
 
@@ -342,8 +352,7 @@ mod tests {
             make_provisions(2, ShardId::leaf(2, 1), BlockHeight::new(10)),
             ts(100),
         );
-        // Two bundles of one entry each under one key: the count is
-        // entries, which is what the cap is on and what holds the bytes.
+        // Two parts under one key: the count is parts.
         assert_eq!(pl.pending_len(), 2);
         let drained = pl.drain_pending_for_key(key);
         assert_eq!(drained.len(), 2);
@@ -359,8 +368,8 @@ mod tests {
         let recount = |pl: &ProvisionPipeline| -> usize {
             pl.pending
                 .values()
-                .flat_map(|entries| entries.iter())
-                .map(|p| p.provisions.transactions().len())
+                .flatten()
+                .map(|p| PendingProvision::weigh(&p.provision))
                 .sum()
         };
 
@@ -377,49 +386,72 @@ mod tests {
             ));
         }
         assert_eq!(pl.pending_len(), 6);
-        assert_eq!(pl.pending_len(), recount(&pl));
+        assert_eq!(pl.pending_bytes(), recount(&pl));
 
         // Drained by a header arriving.
         pl.drain_pending_for_key((shard, BlockHeight::new(1)));
-        assert_eq!(pl.pending_len(), recount(&pl));
+        assert_eq!(pl.pending_bytes(), recount(&pl));
 
         // Purged by a recovery fence above height 3.
         pl.purge_fenced(shard, BlockHeight::new(3));
-        assert_eq!(pl.pending_len(), recount(&pl));
+        assert_eq!(pl.pending_bytes(), recount(&pl));
 
         // Swept past the deadline.
         pl.drop_past_deadline(ts(u64::MAX / 2));
         assert_eq!(pl.pending_len(), 0);
-        assert_eq!(pl.pending_len(), recount(&pl));
+        assert_eq!(pl.pending_bytes(), 0);
+        assert_eq!(pl.pending_bytes(), recount(&pl));
     }
 
-    /// Past the ceiling a bundle is refused rather than buffered — the
+    /// A part whose proof sits at its decode cap, the widest a source
+    /// legitimately sends, at `height`.
+    fn heavy(shard: ShardId, height: BlockHeight) -> Provision {
+        Provision::new(ProvisionParts {
+            source_shard: shard,
+            target_shard: ShardId::leaf(2, 0),
+            block_height: height,
+            source_block_ts: WeightedTimestamp::ZERO,
+            clock: WeightedTimestamp::ZERO,
+            tx_hash: TxHash::from(Hash::from_bytes(&height.inner().to_le_bytes())),
+            entries: Capped::empty(),
+            proof: MerkleInclusionProof::new(vec![0x5A; MAX_MERKLE_PROOF_LEN]),
+            leaf: LeafPath {
+                count: 1,
+                index: 0,
+                siblings: Capped::empty(),
+            },
+        })
+    }
+
+    /// Past its byte budget a part is refused rather than buffered — the
     /// gate a source shard's byzantine member would otherwise walk past,
-    /// one fabricated source height at a time.
+    /// one fabricated source height at a time, with parts as heavy as a
+    /// source may send. What is already held stays, and a drain reopens
+    /// room for the part refused.
     #[test]
-    fn a_pending_buffer_at_capacity_refuses_a_bundle() {
+    fn a_pending_buffer_refuses_a_part_past_its_byte_budget() {
         let mut pl = ProvisionPipeline::new(Arc::new(ProvisionStore::new()));
         let shard = ShardId::leaf(2, 1);
-        for i in 0..MAX_PENDING_PROVISION_ENTRIES {
+        let weight = PendingProvision::weigh(&heavy(shard, BlockHeight::new(0)));
+        let fits = MAX_PENDING_PROVISION_BYTES / weight;
+        for i in 0..fits {
             let h = BlockHeight::new(u64::try_from(i).unwrap());
-            assert!(pl.buffer_pending(
-                (shard, h),
-                make_provisions(u8::try_from(i % 251).unwrap(), shard, h),
-                ts(100),
-            ));
+            assert!(pl.buffer_pending((shard, h), heavy(shard, h), ts(100)));
         }
-        assert_eq!(pl.pending_len(), MAX_PENDING_PROVISION_ENTRIES);
+        assert_eq!(pl.pending_len(), fits);
+        assert!(pl.pending_bytes() <= MAX_PENDING_PROVISION_BYTES);
 
-        let over = BlockHeight::new(u64::try_from(MAX_PENDING_PROVISION_ENTRIES).unwrap());
+        let over = BlockHeight::new(u64::try_from(fits).unwrap());
         assert!(
-            !pl.buffer_pending((shard, over), make_provisions(7, shard, over), ts(100)),
-            "a bundle past the ceiling must be refused",
+            !pl.buffer_pending((shard, over), heavy(shard, over), ts(100)),
+            "a part past the byte budget must be refused",
         );
-        assert_eq!(pl.pending_len(), MAX_PENDING_PROVISION_ENTRIES);
+        assert_eq!(pl.pending_len(), fits, "what was held stays");
 
         // A drain reopens room for exactly what it freed.
         pl.drain_pending_for_key((shard, BlockHeight::new(0)));
-        assert!(pl.buffer_pending((shard, over), make_provisions(7, shard, over), ts(100)));
+        assert!(pl.buffer_pending((shard, over), heavy(shard, over), ts(100)));
+        assert!(pl.pending_bytes() <= MAX_PENDING_PROVISION_BYTES);
     }
 
     #[test]
@@ -437,10 +469,7 @@ mod tests {
         let mut pl = ProvisionPipeline::new(Arc::clone(&store));
         let provisions = make_provisions(1, ShardId::leaf(2, 1), BlockHeight::new(10));
         let hash = provisions.hash();
-        let arc = pl.insert_verified(
-            Arc::new(Verified::new_unchecked_for_test(provisions)),
-            ts(1_000),
-        );
+        let arc = pl.insert_verified(Verified::new_unchecked_for_test(provisions), ts(1_000));
         assert!(pl.has_verified(&hash));
         assert!(store.get(hash).is_some());
         assert_eq!(arc.source_shard(), ShardId::leaf(2, 1));
@@ -465,8 +494,8 @@ mod tests {
         let hash_b = p_b.hash();
         assert_ne!(hash_a, hash_b);
 
-        pl.insert_verified(Arc::new(Verified::new_unchecked_for_test(p_a)), ts(1_000));
-        pl.insert_verified(Arc::new(Verified::new_unchecked_for_test(p_b)), ts(1_000));
+        pl.insert_verified(Verified::new_unchecked_for_test(p_a), ts(1_000));
+        pl.insert_verified(Verified::new_unchecked_for_test(p_b), ts(1_000));
 
         assert!(pl.has_verified(&hash_a));
         assert!(pl.has_verified(&hash_b));
@@ -483,10 +512,7 @@ mod tests {
         let hash_v = provisions_v.hash();
         let source_ts = ts(1_000);
         let live_after = provisions_v.deadline(source_ts);
-        pl.insert_verified(
-            Arc::new(Verified::new_unchecked_for_test(provisions_v)),
-            source_ts,
-        );
+        pl.insert_verified(Verified::new_unchecked_for_test(provisions_v), source_ts);
 
         let pending = make_provisions(2, ShardId::leaf(2, 2), BlockHeight::new(5));
         let pending_hash = pending.hash();

@@ -2,13 +2,12 @@
 //!
 //! [`SharedCaches`] groups the in-memory caches that back peer-facing
 //! request handlers (transaction, finalization, execution-cert,
-//! provision) plus the cross-thread transaction-status view used by
-//! external RPC consumers. Each field is `Arc`-shared, so the same
-//! handles flow into the network handler closures (registered once at
-//! genesis) and into RPC state.
+//! provision) and the replica stores they read. Each field is
+//! `Arc`-shared, so the same handles flow into the network handler
+//! closures registered for the shard.
 //!
-//! The caches are independent of the consensus state machine; the `io_loop`
-//! mutates them in response to outbound events
+//! The caches are independent of the consensus state machine; the shard's
+//! loop mutates them in response to outbound events
 //! (`Continuation(FinalizationsAdmitted)`, validated transactions, terminal
 //! status), and handlers read them on remote-peer requests.
 
@@ -20,7 +19,7 @@ use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
 use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{Finalization, FinalizationHash, Verifiable};
 
-use crate::state::NodeStateMachine;
+use crate::replica::NodeStateMachine;
 
 /// Default certificate cache capacity.
 pub(super) const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
@@ -34,10 +33,10 @@ pub struct SharedCaches {
     /// — both hold `Arc<TxStore>` pointing at the same map, so the network
     /// worker can read bodies without contending on a mempool lock.
     pub(crate) tx_store: Arc<TxStore>,
-    /// Finalizations, keyed by `TickId`. Populated by `io_loop`'s
+    /// Finalizations, keyed by `FinalizationHash`. Populated by the loop's
     /// `Continuation(FinalizationsAdmitted)` interception; queried by the
     /// inbound finalization handler.
-    pub(crate) finalization: Arc<BoundedCache<FinalizationHash, Arc<Verifiable<Finalization>>>>,
+    pub(crate) finalization: Arc<BoundedCache<FinalizationHash, Verifiable<Finalization>>>,
     /// Outbound + local provision store, owned by the
     /// [`ProvisionCoordinator`]. Cloned here so handlers (block, block-topup,
     /// local-provision, cross-shard provision) can read it without going

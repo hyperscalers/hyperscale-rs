@@ -546,11 +546,15 @@ impl BlockHeader {
     /// Per-target-shard merkle commitment over the tx hashes a target shard
     /// should receive provisions for from this block.
     ///
-    /// Key = target shard; value = `compute_merkle_root` over the
-    /// ordered tx hashes destined for that target (block order, already
-    /// hash-ascending). Lets the target verify a received `Provisions`
-    /// contains the full set it was meant to receive — catches silently
-    /// dropped txs on the broadcast path.
+    /// Key = target shard; value = [`ProvisionTxRoot::over`] the tagged
+    /// leaves of the transactions destined for that target, in block
+    /// order, which commits their count. Each leaf binds its transaction
+    /// to the keys its part serves out of the state this block leaves.
+    /// Lets the target hold every part it receives to a real leaf of the
+    /// full set it was meant to receive, carrying exactly the committed
+    /// keys.
+    ///
+    /// [`ProvisionTxRoot::over`]: crate::ProvisionTxRoot::over
     #[must_use]
     pub const fn provision_tx_roots(&self) -> &ProvisionTxRootsMap {
         &self.provision_tx_roots
@@ -770,6 +774,28 @@ impl BlockHeader {
     pub fn is_genesis(&self) -> bool {
         let parent_qc = self.parent_qc();
         parent_qc.is_genesis() && self.height == parent_qc.height()
+    }
+
+    /// The QC a genesis header is certified by, which no committee
+    /// signed: its own genesis parent QC naming this block. `None` for
+    /// any header that is not [genesis](Self::is_genesis).
+    #[must_use]
+    pub fn genesis_certifying_qc(&self) -> Option<QuorumCertificate> {
+        if !self.is_genesis() {
+            return None;
+        }
+        let base = self.parent_qc();
+        Some(QuorumCertificate::new(
+            self.hash(),
+            base.shard_id(),
+            base.height(),
+            base.parent_block_hash(),
+            base.round(),
+            base.committee_epoch(),
+            base.signers().clone(),
+            base.aggregated_signature(),
+            base.weighted_timestamp(),
+        ))
     }
 
     /// Get the expected proposer for this height (round-robin).

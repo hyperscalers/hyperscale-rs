@@ -13,17 +13,17 @@
 //! `ledger` is what ends that wait.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member};
 use hyperscale_engine::tick_select::{
-    CommittedInputs, Judged, ManifestBudget, Nameable, ProvisionalCells, Standing, readiness,
-    select_members, terms_of_member,
+    CommittedInputs, Judged, ManifestBudget, Nameable, Standing, ready, select_members,
+    terms_of_member,
 };
+use hyperscale_storage::QueueHolds;
 use hyperscale_types::{
-    Deadline, EscrowedValue, Joins, MemberTerms, PriceTable, ShardId, ShardTrie, SubstateKey,
-    TickLine, Transaction, TxHash, Verified, WeightedTimestamp,
+    Deadline, EscrowedValue, MemberTerms, PriceTable, ShardId, ShardTrie, SubstateKey, TickLine,
+    Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
@@ -34,7 +34,7 @@ use crate::tick_state::Membership;
 /// One committed transaction awaiting a tick.
 #[derive(Debug)]
 struct Candidate {
-    tx: Arc<Verified<Transaction>>,
+    tx: Verified<Transaction>,
     /// This shard's member of it, derived once at registration: the
     /// frozen classification, where it runs, which of its shard's legs it
     /// takes and what the transaction reaches. Every per-member question
@@ -53,14 +53,15 @@ struct Candidate {
     /// a member that reaches an engine has to attest what a member that
     /// never does would have restated.
     committed_prices: PriceTable,
-}
-
-impl Candidate {
-    /// The terms the member's committing block states of it: classified
-    /// under `trie` and priced as that block named.
-    fn terms(&self, trie: &ShardTrie) -> MemberTerms {
-        terms_of_member(&self.member, &self.tx, trie, &self.committed_prices)
-    }
+    /// The terms the member's committing block states of it, derived
+    /// under that block's trie and table.
+    ///
+    /// Frozen rather than derived at each tick: the chain names a member
+    /// on the terms its committing block stated, so a source that has
+    /// split or merged since still names the shard whose bundle the member
+    /// waits on, and the readiness asked here is the readiness that named
+    /// it.
+    terms: MemberTerms,
 }
 
 /// What committed claims attested for the escrowed edges `tx`'s legs on
@@ -146,10 +147,6 @@ pub struct Admitted {
     /// Whose certificate its settlement waits on, and who its own is
     /// owed to.
     pub membership: Membership,
-    /// The terms it joins on. Everything composition admits runs; the
-    /// payer's leg whose counterparts never engaged runs and is attested
-    /// `Aborted` regardless.
-    pub joins: Joins,
     /// The table the block that committed this member named.
     ///
     /// What its own share is priced at: the abandonment of a member that
@@ -186,71 +183,69 @@ impl TickCandidates {
     /// sees the block once and one that replays it.
     pub fn register(
         &mut self,
-        tx: Arc<Verified<Transaction>>,
+        tx: Verified<Transaction>,
         participating: BTreeSet<ShardId>,
         committed_ts: WeightedTimestamp,
+        trie: &ShardTrie,
         committed_prices: PriceTable,
         classified: Classified,
     ) {
         let member = Member::of(classified, self.local_shard, participating);
-        self.register_member(tx, member, committed_ts, committed_prices);
+        self.register_member(tx, member, committed_ts, trie, committed_prices);
     }
 
-    /// Record `member` of `tx` as a candidate, under the clock of the
-    /// block that committed it.
+    /// Record `member` of `tx` as a candidate, under the clock, trie and
+    /// table of the block that committed it.
     pub fn register_member(
         &mut self,
-        tx: Arc<Verified<Transaction>>,
+        tx: Verified<Transaction>,
         member: Member,
         committed_ts: WeightedTimestamp,
+        trie: &ShardTrie,
         committed_prices: PriceTable,
     ) {
-        self.candidates.entry(tx.hash()).or_insert(Candidate {
-            tx,
-            member,
-            committed_ts,
-            committed_prices,
-        });
+        self.candidates
+            .entry(tx.hash())
+            .or_insert_with(|| Candidate {
+                terms: terms_of_member(&member, &tx, trie, &committed_prices),
+                tx,
+                member,
+                committed_ts,
+                committed_prices,
+            });
     }
 
     /// The member lines this node's own committed inputs name at `now`:
     /// every candidate [`select_members`] admits under `held`, in
     /// canonical order. What a block's manifest names where this node's
     /// inputs are the chain's, which is what a fixture building a block
-    /// stands in for. An abort of a candidate, which never ran, answers
-    /// every crossing it consumes unless `covered` says an abandonment
-    /// record names it.
+    /// stands in for. A fixture keeps no queue of its candidates, so
+    /// each stands head. An abort of a candidate, which never ran,
+    /// answers every crossing it consumes unless `covered` says an
+    /// abandonment record names it.
     #[must_use]
     pub fn named(
         &self,
-        trie: &ShardTrie,
         provisioning: &ProvisioningTracker,
-        held: &mut ProvisionalCells,
+        held: &mut QueueHolds,
         now: WeightedTimestamp,
         covered: &dyn Fn(TxHash) -> bool,
     ) -> Vec<TickLine> {
-        let terms: Vec<(TxHash, MemberTerms, Deadline)> = self
-            .candidates
-            .iter()
-            .map(|(tx_hash, candidate)| {
-                (
-                    *tx_hash,
-                    candidate.terms(trie),
-                    Deadline::of_transaction(&candidate.tx),
-                )
-            })
-            .collect();
         select_members(
+            self.local_shard,
             now,
-            terms.iter().map(|(tx_hash, terms, deadline)| Nameable {
-                tx: *tx_hash,
-                deadline: *deadline,
-                standing: Standing::Pending(Judged::of(terms)),
-                charge: terms.charge,
-                share: terms.share,
-                reserves: &terms.reserves,
-                crossings: &terms.crossings,
-                covered: covered(*tx_hash),
+            self.candidates.iter().map(|(tx_hash, candidate)| {
+                let terms = &candidate.terms;
+                Nameable {
+                    tx: *tx_hash,
+                    deadline: Deadline::of_transaction(&candidate.tx),
+                    standing: Standing::Pending(Judged::of(terms).headed()),
+                    charge: terms.charge,
+                    share: terms.share,
+                    reserves: &terms.reserves,
+                    crossings: &terms.crossings,
+                    covered: covered(*tx_hash),
+                }
             }),
             &Absorbed(provisioning),
             held,
@@ -273,15 +268,17 @@ impl TickCandidates {
         &mut self,
         lines: &[TickLine],
         provisioning: &ProvisioningTracker,
-        trie: &ShardTrie,
-        anchor: WeightedTimestamp,
     ) -> (Vec<Admitted>, bool) {
         let local = self.local_shard;
         let mut admitted = Vec::new();
         let mut in_hand = true;
         for line in lines {
             let TickLine::Member {
-                tx: tx_hash, joins, ..
+                tx: tx_hash,
+                joins,
+                holds,
+                served_at,
+                ..
             } = line
             else {
                 continue;
@@ -293,42 +290,42 @@ impl TickCandidates {
                 in_hand = false;
                 continue;
             };
-            if *joins == Joins::Executes {
-                in_hand &= readiness(
-                    *tx_hash,
-                    &Judged::of(&candidate.terms(trie)),
-                    Deadline::of_transaction(&candidate.tx),
-                    anchor,
-                    &Absorbed(provisioning),
-                ) == Some(Joins::Executes);
-            }
+            in_hand &= ready(
+                *tx_hash,
+                &Judged::of(&candidate.terms),
+                &Absorbed(provisioning),
+            );
             let reaches_beyond = candidate.member.reaches_beyond();
             // What arrived for the edges this member's legs consume, read
             // off the record cells the committed claims proved.
             let arrivals =
                 arrivals_for(*tx_hash, candidate.member.classified(), provisioning, local);
-            // A remote-payer leg executes under the anchor its payer
-            // bundle carried; every other member under its own committing
-            // block's.
-            let anchor = provisioning.payer_anchor(*tx_hash);
+            // A member with no clock yet is one this node is short of a
+            // bundle for, so the tick is never run here and the clock it
+            // stands in with is never read.
+            let clock =
+                provisioning.transaction_clock(*tx_hash, &candidate.member, candidate.committed_ts);
+            in_hand &= clock.is_some();
+            let clock = clock.unwrap_or(candidate.committed_ts);
             admitted.push(Admitted {
                 request: CrossShardExecutionRequest {
                     tx_hash: *tx_hash,
-                    transaction: Arc::clone(&candidate.tx),
+                    transaction: candidate.tx.clone(),
                     provisions: if reaches_beyond {
                         provisioning.provisions_for(*tx_hash)
                     } else {
                         Vec::new()
                     },
-                    clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
+                    clock,
                     // Resolved against that clock once the schedule is
                     // in hand, where the member is seated.
                     prices: PriceTable::GENESIS,
                     member: candidate.member.clone(),
                     arrivals,
+                    served_at: *served_at,
+                    holds: holds.clone(),
                 },
                 membership: Membership::of(&candidate.member),
-                joins: *joins,
                 committed_prices: candidate.committed_prices,
             });
         }
@@ -378,19 +375,17 @@ mod tests {
     use hyperscale_types::test_utils::{
         stub_abort_charge, test_prefix, test_transaction_with_prefixes,
     };
-    use hyperscale_types::{Settlement, WeightedTimestamp};
+    use hyperscale_types::{Joins, Settlement, WeightedTimestamp, pins_of};
 
     use super::*;
 
     const LOCAL: ShardId = ShardId::ROOT;
 
-    fn tx(seed: u8) -> Arc<Verified<Transaction>> {
-        Arc::new(Verified::new_unchecked_for_test(
-            test_transaction_with_prefixes(
-                &[seed, seed + 1, seed + 2],
-                &[test_prefix(seed)],
-                &[test_prefix(seed.wrapping_add(10))],
-            ),
+    fn tx(seed: u8) -> Verified<Transaction> {
+        Verified::new_unchecked_for_test(test_transaction_with_prefixes(
+            &[seed, seed + 1, seed + 2],
+            &[test_prefix(seed)],
+            &[test_prefix(seed.wrapping_add(10))],
         ))
     }
 
@@ -398,12 +393,13 @@ mod tests {
         WeightedTimestamp::from_millis(v)
     }
 
-    fn local_only(candidates: &mut TickCandidates, tx: Arc<Verified<Transaction>>) -> TxHash {
+    fn local_only(candidates: &mut TickCandidates, tx: Verified<Transaction>) -> TxHash {
         let hash = tx.hash();
         candidates.register(
             tx,
             BTreeSet::from([LOCAL]),
             ms(1_000),
+            &ShardTrie::single(),
             PriceTable::GENESIS,
             Classified::whole(),
         );
@@ -426,6 +422,7 @@ mod tests {
             tx,
             BTreeSet::from([LOCAL]),
             ms(1_000),
+            &ShardTrie::single(),
             moved,
             Classified::whole(),
         );
@@ -434,9 +431,10 @@ mod tests {
             &[TickLine::Member {
                 staged: 0,
                 tx: hash,
-                joins: Joins::ExecutesAborted,
+                joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
@@ -444,15 +442,13 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of(ms(60_000)),
                 crossings: Capped::empty(),
+                served_at: None,
             }],
             &ProvisioningTracker::new(),
-            &ShardTrie::uniform(0),
-            ms(1_000),
         );
-        assert!(in_hand, "a member run attested aborted needs no bundle");
+        assert!(in_hand, "a member on this shard alone needs no bundle");
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].request.tx_hash, hash);
-        assert_eq!(admitted[0].joins, Joins::ExecutesAborted);
         assert_eq!(
             admitted[0].committed_prices, moved,
             "the committing block's table, not the composing tick's"
@@ -474,6 +470,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
@@ -481,10 +478,9 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of(ms(60_000)),
                 crossings: Capped::empty(),
+                served_at: None,
             }],
             &ProvisioningTracker::new(),
-            &ShardTrie::uniform(0),
-            ms(1_000),
         );
         assert!(admitted.is_empty());
         assert!(!in_hand, "a named member with no body is a gap");
@@ -511,6 +507,7 @@ mod tests {
             tx,
             BTreeSet::from([local, venue]),
             ms(1_000),
+            &trie,
             PriceTable::GENESIS,
             classified,
         );
@@ -521,6 +518,7 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
@@ -528,10 +526,9 @@ mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of(ms(60_000)),
                 crossings: Capped::empty(),
+                served_at: None,
             }],
             &ProvisioningTracker::new(),
-            &trie,
-            ms(1_000),
         );
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].membership.awaited(), &BTreeSet::from([local]));
@@ -543,6 +540,181 @@ mod tests {
             admitted[0].request.member.reaches_beyond(),
             "reach is what the request carries"
         );
+    }
+
+    /// Every member of a tick reads every list the tick's dispatches
+    /// carry, so each dispatch carries its required sources' lists and
+    /// no other. One member also holds a predecessor's part, off a block
+    /// its successor committed the transaction again past; neither it
+    /// nor its batch-mate carries that part.
+    #[test]
+    fn a_dispatch_carries_only_its_required_sources() {
+        use std::sync::Arc;
+
+        use hyperscale_engine::tick_select::Requirement;
+        use hyperscale_hbor::Bytes;
+        use hyperscale_types::test_utils::test_key;
+        use hyperscale_types::{
+            BlockHeight, LeafPath, MerkleInclusionProof, Provision, ProvisionParts, SubstateEntry,
+        };
+
+        use crate::fixtures::{leaf, payer, swap, trie};
+
+        let trie = trie();
+        let (home, venue) = (leaf(0), leaf(1));
+        let predecessor = ShardId::ROOT;
+        let classified = Classified::freeze(&swap(), payer(), &[], &trie);
+        let key = test_key(1);
+        let part = |source: ShardId, height: u64, tx: TxHash, value: u8| {
+            Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+                source_shard: source,
+                target_shard: venue,
+                block_height: BlockHeight::new(height),
+                source_block_ts: ms(height * 1_000),
+                clock: ms(height * 1_000),
+                tx_hash: tx,
+                entries: Capped::from_array([SubstateEntry::new(
+                    key,
+                    Some(Bytes::from_array([value])),
+                )]),
+                proof: MerkleInclusionProof::dummy(),
+                leaf: LeafPath {
+                    count: 1,
+                    index: 0,
+                    siblings: Capped::empty(),
+                },
+            }))
+        };
+
+        let mut candidates = TickCandidates::new(venue);
+        let mut provisioning = ProvisioningTracker::new();
+        let members = [tx(5), tx(6)].map(|member| {
+            let hash = member.hash();
+            candidates.register(
+                member,
+                BTreeSet::from([home, venue]),
+                ms(1_000),
+                &trie,
+                PriceTable::GENESIS,
+                classified.clone(),
+            );
+            provisioning.record_required(hash, BTreeSet::from([Requirement::CommittedState(home)]));
+            provisioning.absorb_provisions(&part(home, 9, hash, 2));
+            hash
+        });
+        provisioning.absorb_provisions(&part(predecessor, 7, members[0], 1));
+
+        let line = |tx: TxHash| TickLine::Member {
+            staged: 0,
+            tx,
+            joins: Joins::Executes,
+            settlement: Settlement::Awaited,
+            holds: Capped::empty(),
+            pins: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: stub_abort_charge(0),
+            share: 0,
+            reserves: Capped::empty(),
+            deadline: Deadline::of(ms(60_000)),
+            crossings: Capped::empty(),
+            served_at: None,
+        };
+        let (admitted, _) = candidates.take_named(&members.map(line), &provisioning);
+        assert_eq!(admitted.len(), 2);
+        for seated in &admitted {
+            assert_eq!(
+                seated.request.provisions,
+                vec![Arc::new(vec![SubstateEntry::new(
+                    key,
+                    Some(Bytes::from_array([2]))
+                )])],
+                "only the required source's list rides with {:?}",
+                seated.request.tx_hash,
+            );
+        }
+    }
+
+    /// A whole member whose remote source splits between the block that
+    /// commits it and the one naming it stands on the committing block's
+    /// terms: the bundle it waits on is the one the source committed
+    /// before it split, and holding it is holding everything the line
+    /// names. Short of that bundle, the tick is still not in hand.
+    #[test]
+    fn a_member_whose_source_split_since_its_commit_is_judged_on_its_terms() {
+        use hyperscale_engine::tick_select::Requirement;
+        use hyperscale_types::{
+            BlockHeight, LeafPath, MerkleInclusionProof, Provision, ProvisionParts,
+        };
+
+        let committed = ShardTrie::uniform(1);
+        let (local, source) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut naming = committed.clone();
+        naming.split(source);
+        let member = Verified::new_unchecked_for_test(test_transaction_with_prefixes(
+            &[0x01, 0x02, 0x03],
+            &[test_prefix(0xC0)],
+            &[test_prefix(0x04)],
+        ));
+        assert_eq!(committed.shard_for_prefix(member.fee_payer()), local);
+        assert_eq!(committed.shard_for_prefix(test_prefix(0xC0)), source);
+        assert_ne!(naming.shard_for_prefix(test_prefix(0xC0)), source);
+        let hash = member.hash();
+        let line = TickLine::Member {
+            staged: 0,
+            tx: hash,
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+            holds: Capped::empty(),
+            pins: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: stub_abort_charge(0),
+            share: 0,
+            reserves: Capped::empty(),
+            deadline: Deadline::of(ms(60_000)),
+            crossings: Capped::empty(),
+            served_at: None,
+        };
+        let take = |provisioning: &ProvisioningTracker| {
+            let mut candidates = TickCandidates::new(local);
+            candidates.register(
+                member.clone(),
+                BTreeSet::from([local, source]),
+                ms(1_000),
+                &committed,
+                PriceTable::GENESIS,
+                Classified::whole(),
+            );
+            candidates.take_named(std::slice::from_ref(&line), provisioning)
+        };
+
+        let mut provisioning = ProvisioningTracker::new();
+        provisioning.record_required(hash, BTreeSet::from([Requirement::CommittedState(source)]));
+        let (admitted, in_hand) = take(&provisioning);
+        assert_eq!(admitted.len(), 1);
+        assert!(!in_hand, "the source's bundle is not held");
+
+        provisioning.absorb_provisions(&Verified::<Provision>::new_unchecked_for_test(
+            Provision::new(ProvisionParts {
+                source_shard: source,
+                target_shard: local,
+                block_height: BlockHeight::new(3),
+                source_block_ts: ms(900),
+                clock: ms(900),
+                tx_hash: hash,
+                entries: Capped::empty(),
+                proof: MerkleInclusionProof::dummy(),
+                leaf: LeafPath {
+                    count: 1,
+                    index: 0,
+                    siblings: Capped::empty(),
+                },
+            }),
+        ));
+        let (admitted, in_hand) = take(&provisioning);
+        assert_eq!(admitted.len(), 1);
+        assert!(in_hand, "the bundle its committing block waits on is held");
     }
 
     /// A record key names its producer's intent and no transaction, so
@@ -583,9 +755,10 @@ mod tests {
             );
             let mut candidates = TickCandidates::new(venue);
             candidates.register(
-                Arc::clone(&member),
+                member.clone(),
                 BTreeSet::from([home, venue]),
                 ms(1_000),
+                &trie,
                 PriceTable::GENESIS,
                 classified.clone(),
             );
@@ -593,9 +766,10 @@ mod tests {
                 &[TickLine::Member {
                     staged: 0,
                     tx: hash,
-                    joins: Joins::ExecutesAborted,
+                    joins: Joins::Executes,
                     settlement: Settlement::Awaited,
                     holds: Capped::empty(),
+                    pins: Capped::empty(),
                     reach: Capped::empty(),
                     awaits: Capped::empty(),
                     charge: stub_abort_charge(0),
@@ -603,10 +777,9 @@ mod tests {
                     reserves: Capped::empty(),
                     deadline: Deadline::of(ms(60_000)),
                     crossings: Capped::empty(),
+                    served_at: None,
                 }],
                 &provisioning,
-                &trie,
-                ms(1_000),
             );
             assert_eq!(admitted.len(), 1);
             admitted[0].request.arrivals.clone()
@@ -636,13 +809,11 @@ mod tests {
     fn a_node_names_what_the_one_rule_admits() {
         let mut candidates = TickCandidates::new(LOCAL);
         let contender = tx(5);
-        let hash = local_only(&mut candidates, Arc::clone(&contender));
-        let trie = ShardTrie::single();
+        let hash = local_only(&mut candidates, contender.clone());
 
         let named = candidates.named(
-            &trie,
             &ProvisioningTracker::new(),
-            &mut ProvisionalCells::default(),
+            &mut QueueHolds::default(),
             ms(1_000),
             &|_| false,
         );
@@ -651,17 +822,13 @@ mod tests {
             [TickLine::Member { tx, joins: Joins::Executes, .. }] if *tx == hash
         ));
 
-        let mut held = ProvisionalCells::default();
-        held.claim(&contender.routing().declared_modes);
+        let mut held = QueueHolds::default();
+        held.hold(&pins_of(&contender.routing().declared_modes, LOCAL));
         assert!(
             candidates
-                .named(
-                    &trie,
-                    &ProvisioningTracker::new(),
-                    &mut held,
-                    ms(1_000),
-                    &|_| false
-                )
+                .named(&ProvisioningTracker::new(), &mut held, ms(1_000), &|_| {
+                    false
+                })
                 .is_empty(),
             "the cell is spoken for",
         );

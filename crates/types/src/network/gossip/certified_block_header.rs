@@ -1,7 +1,5 @@
 //! `CertifiedBlockHeader` gossip message for cross-shard header broadcast.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 
 use crate::network::{GossipMessage, GossipScope};
@@ -22,7 +20,7 @@ pub struct CertifiedBlockHeaderGossip {
     /// The committed block header (header + QC). Wire bytes always land
     /// in `Verifiable::Unverified`; local-dispatched broadcasts from a
     /// colocated proposer preserve `Verifiable::Verified`.
-    pub certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
+    pub certified_header: Verifiable<CertifiedBlockHeader>,
     /// The validator who sent this gossip (should be the block proposer).
     pub sender: ValidatorId,
     /// Signature over the domain-separated signing message, by the sender.
@@ -138,7 +136,7 @@ mod tests {
         );
 
         let gossip = CertifiedBlockHeaderGossip {
-            certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),
+            certified_header: Verifiable::from(CertifiedBlockHeader::new(header, qc)),
             sender: ValidatorId::new(0),
             sender_signature: ConsensusSignature::ZERO,
         };
@@ -166,7 +164,7 @@ mod tests {
             ChainOrigin::root(WeightedTimestamp::ZERO),
         );
         CertifiedBlockHeaderGossip {
-            certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),
+            certified_header: Verifiable::from(CertifiedBlockHeader::new(header, qc)),
             sender: ValidatorId::new(sender),
             sender_signature: ConsensusSignature::new([signature; 96]),
         }

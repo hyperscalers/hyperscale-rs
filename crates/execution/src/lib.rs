@@ -40,11 +40,13 @@ mod vote_tracker;
 
 pub use coordinator::{CommitEffects, CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
 pub use counterparts::{
-    CrossingIndex, CrossingIndexSlot, CrossingRead, MAX_VERDICT_ASKS_PER_SIBLING, Offers,
+    CrossingIndex, CrossingIndexSlot, CrossingRead, MAX_RECORD_ASKS_PER_HOLDER,
+    MAX_VERDICT_ASKS_PER_SIBLING, Offers,
 };
 pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;
-pub use lookups::{attesting_committee, provision_request, records_written};
+pub use lookups::{attesting_committee, records_written};
+pub use record_reads::RECORD_PUSH_GRACE_FLOOR;
 pub use tick_state::TickState;
 pub use ticks::VOTE_RETRY_TIMEOUT;
 pub use vote_tracker::VoteTracker;

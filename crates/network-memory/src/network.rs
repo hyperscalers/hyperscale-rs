@@ -33,10 +33,11 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use blake3::Hasher as Blake3Hasher;
+use hyperscale_network::deferred::{DEFER_TIMEOUT, WaitId};
 use hyperscale_network::fault::{
     Decision, DropSpec, Engine, FaultBuilder, HostId, MessageContext, Rewrite, RuleHandle, Tier,
 };
@@ -44,7 +45,10 @@ use hyperscale_network::retry::{
     AllHeld, Attempts, Outcome, PeerHealthBook, Resolution, RetryConfig,
 };
 use hyperscale_network::stream_backoff::{StreamBackoff, StreamFailure};
-use hyperscale_network::{Answerers, HandlerRegistry, RequestError, ResponseVerdict, compression};
+use hyperscale_network::{
+    Answerers, HandlerRegistry, PeerId, Provenance, RequestError, ResponseVerdict, Verdict,
+    compression,
+};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
@@ -332,6 +336,20 @@ enum RequestEvent {
         on_response: ResponseCallback,
         result: Result<Vec<u8>, RequestError>,
     },
+    /// Give up on an answer's deferred verdict in the registry that held
+    /// it, which a restarted process no longer shares.
+    Expire {
+        registry: Arc<HandlerRegistry>,
+        wait: WaitId,
+    },
+}
+
+/// An answer whose deferred verdict found it false, waiting for the next
+/// flush to count it against its peer.
+struct RefusedAnswer {
+    requester: NodeIndex,
+    peer: NodeIndex,
+    empty: bool,
 }
 
 /// How an attempt ended at its requester.
@@ -576,6 +594,10 @@ pub struct SimulatedNetwork {
     /// Hosts whose process is down: nothing reaches them or leaves them,
     /// whatever the partitions say.
     down: BTreeSet<NodeIndex>,
+    /// Answers refused by a deferred verdict since the last flush. A
+    /// check settles on its host's thread, which holds no handle on the
+    /// requesters' peer health.
+    refused_answers: Arc<Mutex<Vec<RefusedAnswer>>>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -588,6 +610,28 @@ impl std::fmt::Debug for SimulatedNetwork {
             .field("pending_notifications", &self.pending_notifications.len())
             .field("pending_requests", &self.pending_requests.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// What a message from host `from` hands a handler: the simulation keeps
+/// a peer by its host, as it keeps the peer's health.
+fn peer(from: NodeIndex) -> Provenance {
+    Provenance::Peer(PeerId::new(u64::from(from)))
+}
+
+/// Count an answer its requester refused against the peer that gave it.
+/// An empty one says the peer did not hold what was asked; any other, or
+/// one that does not decode, says the peer answered falsely.
+fn refuse_answer(
+    health: &mut PeerHealthBook<NodeIndex>,
+    peer: NodeIndex,
+    empty: bool,
+    now: Duration,
+) {
+    if empty {
+        health.record_rejected(peer);
+    } else {
+        health.record_invalid(peer, now);
     }
 }
 
@@ -628,6 +672,7 @@ impl SimulatedNetwork {
             notifications_carried: BTreeMap::new(),
             geography,
             down: BTreeSet::new(),
+            refused_answers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -794,6 +839,10 @@ impl SimulatedNetwork {
     /// waiting on, the gossip it had seen, what it had learned of its
     /// peers — and its handlers with them, so the adapter a restarted
     /// process takes from [`Self::create_adapter`] starts empty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the refused answers' lock is poisoned.
     pub fn take_down(&mut self, node: NodeIndex) {
         let i = node as usize;
         self.down.insert(node);
@@ -802,6 +851,10 @@ impl SimulatedNetwork {
         self.gossip_seen[i].clear();
         self.peer_health[i] = PeerHealthBook::default();
         self.stream_backoff[i].clear();
+        self.refused_answers
+            .lock()
+            .expect("refused answers lock")
+            .retain(|refused| refused.requester != node);
     }
 
     /// Bring `node`'s process back up hosting `hosted`, the shards it
@@ -811,6 +864,13 @@ impl SimulatedNetwork {
     pub fn bring_up(&mut self, node: NodeIndex, hosted: BTreeSet<ShardId>) {
         self.down.remove(&node);
         self.registries[node as usize] = Arc::new(HandlerRegistry::new(hosted));
+    }
+
+    /// How far `requester` distrusts `peer` at `now`, from 0 to 1, for
+    /// answers that held up to nothing.
+    #[must_use]
+    pub fn distrust(&self, requester: NodeIndex, peer: NodeIndex, now: Duration) -> f64 {
+        self.peer_health[requester as usize].distrust(peer, now)
     }
 
     /// Whether `node`'s process is down.
@@ -1130,6 +1190,7 @@ impl SimulatedNetwork {
         let mut stats = FulfillmentStats::default();
         let mut answered = 0;
         let mut steps = 0usize;
+        self.count_refused_answers(now);
         while let Some(Reverse(next)) = self.pending_requests.peek() {
             if next.time > now {
                 break;
@@ -1178,9 +1239,25 @@ impl SimulatedNetwork {
                     let _ = on_response(result);
                     answered += 1;
                 }
+                RequestEvent::Expire { registry, wait } => registry.expire_answer(wait),
             }
         }
         (answered, stats)
+    }
+
+    /// Count every answer a deferred verdict has refused since the last
+    /// flush against the peer that gave it, at `now`.
+    fn count_refused_answers(&mut self, now: Duration) {
+        let refused =
+            std::mem::take(&mut *self.refused_answers.lock().expect("refused answers lock"));
+        for RefusedAnswer {
+            requester,
+            peer,
+            empty,
+        } in refused
+        {
+            refuse_answer(&mut self.peer_health[requester as usize], peer, empty, now);
+        }
     }
 
     /// Send `request`'s next attempt to a peer whose stream is not backing
@@ -1505,15 +1582,33 @@ impl SimulatedNetwork {
                 };
                 let peer = open.attempts.peer();
                 let empty = (open.is_empty_response)(&bytes);
-                if (open.on_response)(Ok(bytes)) == ResponseVerdict::Reject {
-                    // An empty answer the caller rejects says the peer did
-                    // not hold what was asked; any other it rejects, or one
-                    // that does not decode, says the peer answered falsely.
-                    let health = &mut self.peer_health[requester as usize];
-                    if empty {
-                        health.record_rejected(peer);
-                    } else {
-                        health.record_invalid(peer, now);
+                match (open.on_response)(Ok(bytes)) {
+                    ResponseVerdict::Accept => {}
+                    ResponseVerdict::Reject => {
+                        refuse_answer(&mut self.peer_health[requester as usize], peer, empty, now);
+                    }
+                    ResponseVerdict::Defer(deferral) => {
+                        let refused = Arc::clone(&self.refused_answers);
+                        let score = Box::new(move |verdict: &Verdict| {
+                            if *verdict == Verdict::Reject {
+                                refused
+                                    .lock()
+                                    .expect("refused answers lock")
+                                    .push(RefusedAnswer {
+                                        requester,
+                                        peer,
+                                        empty,
+                                    });
+                            }
+                        });
+                        let registry = Arc::clone(&self.registries[requester as usize]);
+                        if let Some(wait) = registry.await_answer(&deferral, score) {
+                            self.schedule_request_event(
+                                now + DEFER_TIMEOUT,
+                                RequestEvent::Expire { registry, wait },
+                            );
+                        }
+                        self.count_refused_answers(now);
                     }
                 }
                 1
@@ -1676,6 +1771,54 @@ impl SimulatedNetwork {
         }));
     }
 
+    /// Hand `host` its own notification, as production dispatches it in
+    /// process while sending: no partition, loss or latency touches it, and
+    /// it is no traffic on the wire. A scenario's drop rule still takes it,
+    /// so a cut the scenario installs on a message type holds wherever the
+    /// recipients sit; whether it fired is returned. A rewrite installed on
+    /// the host still reaches it, and that copy, like a duplicate or replay
+    /// the network brings on the link, arrives as a peer's: production never
+    /// hands a host anything but its own bytes as its own.
+    fn notify_in_process(
+        &mut self,
+        host: NodeIndex,
+        now: Duration,
+        type_id: &'static str,
+        mut carried: Carried,
+        streams: &mut LinkStreams,
+    ) -> Decision {
+        let decision = self.faults.decide(
+            &MessageContext {
+                sender: HostId(host),
+                recipient: HostId(host),
+                type_id,
+                tier: Tier::Notification,
+            },
+            now,
+        );
+        // Sim-only: iroh's fault gate guards only the legs it sends to
+        // peers, so there a drop rule never reaches a host's own copy.
+        if decision == Decision::Drop {
+            return decision;
+        }
+        let sent = self.rewritten(host, host, type_id, Tier::Notification, &carried.payload);
+        let provenance = if sent == carried.payload {
+            Provenance::Local
+        } else {
+            peer(host)
+        };
+        carried.payload = sent;
+        if let Some(handler) = self
+            .registries
+            .get(host as usize)
+            .and_then(|registry| registry.get_notification(type_id))
+        {
+            let _ = handler(carried.payload.clone(), provenance);
+        }
+        self.echo_notification(host, host, now, type_id, carried, streams);
+        decision
+    }
+
     // ─── Notification Acceptance (Latency-Modeled) ───
 
     /// Buffer notifications for delivery with simulated latency.
@@ -1684,7 +1827,8 @@ impl SimulatedNetwork {
     /// live on: checks partition/loss, samples latency, and queues into
     /// `pending_notifications`. Recipients sharing a host collapse to one
     /// delivery, as the production transport dispatches a host's local
-    /// recipients once.
+    /// recipients once. The sender's own host is handed its copy here and
+    /// now ([`Self::notify_in_process`]).
     ///
     /// The harness calls [`flush_notifications()`](Self::flush_notifications)
     /// to deliver due messages via each target's registered notification handler.
@@ -1726,6 +1870,20 @@ impl SimulatedNetwork {
                 }
             }
             for to in hosts {
+                if to == sender {
+                    let carried = Carried {
+                        payload: payload.clone(),
+                        shard: None,
+                        class,
+                        wire_bytes: data.len(),
+                    };
+                    if self.notify_in_process(sender, now, type_id, carried, streams)
+                        == Decision::Drop
+                    {
+                        stats.messages_dropped_fault += 1;
+                    }
+                    continue;
+                }
                 match self.should_deliver(sender, to, now, data.len(), streams.link(sender, to)) {
                     None => {
                         if self.is_partitioned(sender, to, now) {
@@ -1947,6 +2105,9 @@ impl SimulatedNetwork {
                 ..
             } = scheduled;
             let (to, message_type, shard) = (record.to, record.message_type, record.shard);
+            // A publisher is never scheduled its own publication: the
+            // registry hands its hosted shards the original in process.
+            let provenance = peer(record.from);
             if down.contains(&record.from)
                 || down.contains(&to)
                 || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
@@ -1976,12 +2137,12 @@ impl SimulatedNetwork {
             };
             match (gossip, host_handler) {
                 (Some(gossip), Some(host_handler)) => {
-                    let _ = gossip(payload.clone(), shard);
+                    let _ = gossip(payload.clone(), shard, provenance);
                     host_handler(payload);
                     true
                 }
                 (Some(gossip), None) => {
-                    let _ = gossip(payload, shard);
+                    let _ = gossip(payload, shard, provenance);
                     true
                 }
                 (None, Some(host_handler)) => {
@@ -2036,7 +2197,7 @@ impl SimulatedNetwork {
             let ScheduledNotification {
                 record, payload, ..
             } = scheduled;
-            let (to, message_type) = (record.to, record.message_type);
+            let (from, to, message_type) = (record.from, record.to, record.message_type);
             if down.contains(&record.from)
                 || down.contains(&to)
                 || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
@@ -2057,7 +2218,7 @@ impl SimulatedNetwork {
                 return false;
             };
             // The simulator charges no peer, so the verdict changes nothing.
-            let _ = handler(payload);
+            let _ = handler(payload, peer(from));
             true
         });
         (delivered, stats)
@@ -2120,12 +2281,12 @@ mod tests {
 
     use hyperscale_hbor::Capped;
     use hyperscale_network::retry::stream_timeout;
-    use hyperscale_network::{Network, RawRequestHandler};
+    use hyperscale_network::{Network, RawRequestHandler, VerdictKey};
     use rand::SeedableRng;
 
     use super::*;
 
-    type SharedRequestResult = Arc<std::sync::Mutex<Option<Result<Vec<u8>, RequestError>>>>;
+    type SharedRequestResult = Arc<Mutex<Option<Result<Vec<u8>, RequestError>>>>;
 
     /// Construct a network over a uniform layout (default transport config).
     fn sim_network(num_shards: u32, validators_per_shard: u32) -> SimulatedNetwork {
@@ -2443,7 +2604,7 @@ mod tests {
         shard: ShardId,
         preferred_peer: Option<ValidatorId>,
     ) -> (PendingRequest, SharedRequestResult) {
-        let result = Arc::new(std::sync::Mutex::new(None));
+        let result = Arc::new(Mutex::new(None));
         let result_clone = result.clone();
         let request = PendingRequest {
             shard,
@@ -2668,6 +2829,104 @@ mod tests {
         assert!(
             rejected < 85,
             "the rejected peer answered {rejected} of the last 200"
+        );
+    }
+
+    /// An answer whose verdict waits on a check counts against its peer
+    /// once the check finds it false, as a rejected one does at once.
+    #[test]
+    fn a_deferred_answer_found_false_counts_against_its_peer() {
+        let mut network = sim_network(1, 3);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        for i in 1..3 {
+            let marker = vec![u8::try_from(i).unwrap()];
+            let handler: Arc<RawRequestHandler> =
+                Arc::new(move |_: &[u8]| -> Vec<u8> { marker.clone() });
+            network.create_adapter(i).registry.register_raw_request(
+                "test.request",
+                ShardId::leaf(1, 0),
+                handler,
+            );
+        }
+        let requester = network.create_adapter(0);
+
+        let from_refused = Arc::new(AtomicU32::new(0));
+        for round in 0..400u64 {
+            let counter = Arc::clone(&from_refused);
+            let request = PendingRequest {
+                shard: ShardId::leaf(1, 0),
+                answerers: Answerers::LocalFirst,
+                preferred_peer: None,
+                type_id: "test.request",
+                class: MessageClass::Recovery,
+                response_class: MessageClass::Recovery,
+                request_bytes: vec![1],
+                is_empty_response: <[u8]>::is_empty,
+                on_response: Box::new(move |answer| {
+                    let answer = answer.unwrap();
+                    if answer == vec![1] && round >= 200 {
+                        counter.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    ResponseVerdict::defer(VerdictKey::of(&(round, answer)))
+                }),
+            };
+            let now = Duration::from_secs(round);
+            network.accept_requests(0, now, vec![request], &mut streams);
+            network.flush_requests(now + Duration::from_secs(1), &mut streams);
+            for peer in 1..3u8 {
+                let verdict = if peer == 1 {
+                    Verdict::Reject
+                } else {
+                    Verdict::Accept
+                };
+                requester.settle(VerdictKey::of(&(round, vec![peer])), verdict);
+            }
+        }
+
+        let refused = from_refused.load(AtomicOrdering::Relaxed);
+        assert!(
+            refused < 85,
+            "the refused peer answered {refused} of the last 200"
+        );
+    }
+
+    /// An answer whose verdict no check settles is given up after the
+    /// deferral timeout, leaving no wait behind and its peer unscored.
+    #[test]
+    fn an_unsettled_deferred_answer_is_given_up() {
+        let mut network = sim_network(1, 2);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let handler: Arc<RawRequestHandler> = Arc::new(|_: &[u8]| -> Vec<u8> { vec![1] });
+        network.create_adapter(1).registry.register_raw_request(
+            "test.request",
+            ShardId::leaf(1, 0),
+            handler,
+        );
+        let requester = network.create_adapter(0);
+        let key = VerdictKey::of(&1u8);
+        let request = PendingRequest {
+            shard: ShardId::leaf(1, 0),
+            answerers: Answerers::LocalFirst,
+            preferred_peer: None,
+            type_id: "test.request",
+            class: MessageClass::Recovery,
+            response_class: MessageClass::Recovery,
+            request_bytes: vec![1],
+            is_empty_response: <[u8]>::is_empty,
+            on_response: Box::new(move |_| ResponseVerdict::defer(key)),
+        };
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        network.flush_requests(Duration::from_secs(1), &mut streams);
+        assert_eq!(requester.registry.awaited_answers(), 1);
+
+        network.flush_requests(Duration::from_secs(1) + DEFER_TIMEOUT, &mut streams);
+        assert_eq!(requester.registry.awaited_answers(), 0);
+        requester.settle(key, Verdict::Reject);
+        assert!(
+            network.refused_answers.lock().unwrap().is_empty(),
+            "a verdict after the wait is given up scores nothing"
         );
     }
 
@@ -3168,13 +3427,13 @@ mod tests {
     /// Each handler is registered for a single message type, so the type is
     /// implicit — we only need to record the payloads.
     struct RecordingHandler {
-        received: std::sync::Mutex<Vec<Vec<u8>>>,
+        received: Mutex<Vec<Vec<u8>>>,
     }
 
     impl RecordingHandler {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                received: std::sync::Mutex::new(Vec::new()),
+                received: Mutex::new(Vec::new()),
             })
         }
 
@@ -3203,11 +3462,12 @@ mod tests {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
-                let raw: Arc<RawGossipHandler> =
-                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
+                let raw: Arc<RawGossipHandler> = Arc::new(
+                    move |payload: Vec<u8>, _shard: Option<ShardId>, _: Provenance| {
                         handler_clone.received.lock().unwrap().push(payload);
                         Some(Verdict::Accept)
-                    });
+                    },
+                );
                 adapter.registry.register_raw_gossip(TEST_GOSSIP_TYPE, raw);
                 handler
             })
@@ -3782,10 +4042,11 @@ mod tests {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let sink = handler.clone();
-                let raw: Arc<RawNotificationHandler> = Arc::new(move |payload: Vec<u8>| {
-                    sink.received.lock().unwrap().push(payload);
-                    Verdict::Accept
-                });
+                let raw: Arc<RawNotificationHandler> =
+                    Arc::new(move |payload: Vec<u8>, _: Provenance| {
+                        sink.received.lock().unwrap().push(payload);
+                        Verdict::Accept
+                    });
                 adapter.registry.register_raw_notification(TYPE, raw);
                 handler
             })
@@ -4004,11 +4265,12 @@ mod tests {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
-                let raw: Arc<RawGossipHandler> =
-                    Arc::new(move |payload: Vec<u8>, _shard: Option<ShardId>| {
+                let raw: Arc<RawGossipHandler> = Arc::new(
+                    move |payload: Vec<u8>, _shard: Option<ShardId>, _: Provenance| {
                         handler_clone.received.lock().unwrap().push(payload);
                         Some(Verdict::Accept)
-                    });
+                    },
+                );
                 adapter
                     .registry
                     .register_raw_gossip("transaction.gossip", raw);
@@ -4019,8 +4281,10 @@ mod tests {
         let adapter0 = network.create_adapter(0);
 
         // Node 0 broadcasts a transaction via its adapter
-        let gossip = TransactionGossip::new(Capped::from_array([Arc::new(
-            test_transaction_with_prefixes(&[1, 2, 3], &[test_prefix(1)], &[test_prefix(2)]),
+        let gossip = TransactionGossip::new(Capped::from_array([test_transaction_with_prefixes(
+            &[1, 2, 3],
+            &[test_prefix(1)],
+            &[test_prefix(2)],
         )]));
         Network::broadcast_to_shard(&adapter0, ShardId::leaf(1, 0), &gossip);
 
@@ -4042,5 +4306,176 @@ mod tests {
         let payloads = handlers[1].payloads();
         assert_eq!(payloads.len(), 1);
         assert!(!payloads[0].is_empty());
+    }
+
+    /// What one host's notification handler was handed, and as whose.
+    type Handed = Arc<Mutex<Vec<(Vec<u8>, Provenance)>>>;
+
+    /// What each host's notification handler for `message_type` is handed.
+    fn record_notifications(network: &SimulatedNetwork, message_type: &'static str) -> Vec<Handed> {
+        use hyperscale_network::Verdict;
+        use hyperscale_network::registry::RawNotificationHandler;
+        (0..network.total_nodes() as NodeIndex)
+            .map(|i| {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let sink = Arc::clone(&seen);
+                let raw: Arc<RawNotificationHandler> =
+                    Arc::new(move |payload: Vec<u8>, provenance: Provenance| {
+                        sink.lock().unwrap().push((payload, provenance));
+                        Verdict::Accept
+                    });
+                network
+                    .create_adapter(i)
+                    .registry
+                    .register_raw_notification(message_type, raw);
+                seen
+            })
+            .collect()
+    }
+
+    fn notify(
+        network: &mut SimulatedNetwork,
+        from: NodeIndex,
+        to: u64,
+        message_type: &'static str,
+        bytes: &[u8],
+        streams: &mut LinkStreams,
+    ) {
+        network.accept_notifications(
+            from,
+            Duration::ZERO,
+            vec![PendingNotification {
+                recipients: vec![ValidatorId::new(to)],
+                type_id: message_type,
+                class: MessageClass::Bulk,
+                data: compression::compress(bytes),
+            }],
+            streams,
+        );
+        network.flush_notifications(FAR_FUTURE);
+    }
+
+    /// A host's notification to itself is its own, but a replay the network
+    /// brings along on that link is another host's bytes, and arrives as a
+    /// peer's: the link's own, for the link is all the network names it by.
+    #[test]
+    fn a_replay_on_a_hosts_own_link_is_a_peers() {
+        const TYPE: &str = "test.notification";
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                replay_rate: 1.0,
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let seen = record_notifications(&network, TYPE);
+        let mut streams = LinkStreams::new(42);
+
+        notify(&mut network, 1, 0, TYPE, b"foreign", &mut streams);
+        seen[0].lock().unwrap().clear();
+        notify(&mut network, 0, 0, TYPE, b"own", &mut streams);
+
+        let mut got = seen[0].lock().unwrap().clone();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                (b"foreign".to_vec(), peer(0)),
+                (b"own".to_vec(), Provenance::Local),
+            ]
+        );
+    }
+
+    /// A host's notification to itself is dispatched in process as it is
+    /// sent, as production does: a partition or loss that takes every leg on
+    /// the wire never touches it, and it waits on no latency.
+    #[test]
+    fn a_hosts_notification_to_itself_is_handed_over_at_once() {
+        const TYPE: &str = "test.notification";
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 1.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let seen = record_notifications(&network, TYPE);
+        let mut streams = LinkStreams::new(42);
+        network.isolate_node(0);
+
+        network.accept_notifications(
+            0,
+            Duration::ZERO,
+            vec![PendingNotification {
+                recipients: vec![ValidatorId::new(0), ValidatorId::new(1)],
+                type_id: TYPE,
+                class: MessageClass::Bulk,
+                data: compression::compress(b"own"),
+            }],
+            &mut streams,
+        );
+
+        assert_eq!(
+            *seen[0].lock().unwrap(),
+            vec![(b"own".to_vec(), Provenance::Local)]
+        );
+        network.flush_notifications(FAR_FUTURE);
+        assert_eq!(seen[0].lock().unwrap().len(), 1);
+        assert!(seen[1].lock().unwrap().is_empty(), "the wire leg is lost");
+    }
+
+    /// A drop rule a scenario installs on a message type takes a host's
+    /// notification to itself too, so the cut holds wherever its
+    /// recipients sit.
+    #[test]
+    fn a_drop_rule_takes_a_hosts_notification_to_itself() {
+        const TYPE: &str = "test.notification";
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let seen = record_notifications(&network, TYPE);
+        let mut streams = LinkStreams::new(42);
+        let _rule = network.fault().drop_type(TYPE).install();
+
+        notify(&mut network, 0, 0, TYPE, b"own", &mut streams);
+
+        assert!(seen[0].lock().unwrap().is_empty());
+    }
+
+    /// A rewrite installed on a host reaches its notification to itself too,
+    /// and what it hands the host is not what the host sent.
+    #[test]
+    fn a_rewritten_notification_to_oneself_is_a_peers() {
+        const TYPE: &str = "test.notification";
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let seen = record_notifications(&network, TYPE);
+        let mut streams = LinkStreams::new(42);
+        let _rule = network.rewrite_notifications(
+            0,
+            TYPE,
+            Arc::new(|_asked: &[u8], bytes: &[u8]| [bytes, b"-forged"].concat()),
+        );
+
+        notify(&mut network, 0, 0, TYPE, b"own", &mut streams);
+
+        assert_eq!(
+            *seen[0].lock().unwrap(),
+            vec![(b"own-forged".to_vec(), peer(0))]
+        );
     }
 }

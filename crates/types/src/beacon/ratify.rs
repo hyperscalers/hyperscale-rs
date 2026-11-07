@@ -29,6 +29,7 @@
 //! in the beacon crate; these pure verifiers see single messages.
 
 use std::collections::{BTreeMap, btree_map};
+use std::sync::Arc;
 
 use hyperscale_crypto::{SignError, Signer, Verifier};
 use hyperscale_hbor::{Capped, Hbor};
@@ -616,8 +617,17 @@ pub fn build_ratify_cert(
 /// ratify cert: SPC cert against the committee, embedded equivocation
 /// witnesses, and the committed-proposal binding. An honest member
 /// prevotes only hashes that would be valid blocks.
+///
+/// Every clone shares one allocation, so moving a candidate between its
+/// raw, verifiable and verified forms, or into the serve cache and onto
+/// the wire, copies a pointer rather than its proposals.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-pub struct CandidateBeaconBlock {
+#[hbor(transparent)]
+pub struct CandidateBeaconBlock(Arc<Carried>);
+
+/// What every clone of one [`CandidateBeaconBlock`] shares.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Carried {
     block: BeaconBlock,
     spc: Box<SpcCert>,
 }
@@ -625,44 +635,45 @@ pub struct CandidateBeaconBlock {
 impl CandidateBeaconBlock {
     /// Pair a block with the SPC cert that authenticates its content.
     #[must_use]
-    pub const fn new(block: BeaconBlock, spc: Box<SpcCert>) -> Self {
-        Self { block, spc }
+    pub fn new(block: BeaconBlock, spc: Box<SpcCert>) -> Self {
+        Self(Arc::new(Carried { block, spc }))
     }
 
     /// Inner block.
     #[must_use]
-    pub const fn block(&self) -> &BeaconBlock {
-        &self.block
+    pub fn block(&self) -> &BeaconBlock {
+        &self.0.block
     }
 
     /// SPC proposal certificate.
     #[must_use]
-    pub(crate) const fn spc(&self) -> &SpcCert {
-        &self.spc
+    pub(crate) fn spc(&self) -> &SpcCert {
+        &self.0.spc
     }
 
     /// Block hash — the value a ratify prevote names.
     #[must_use]
     pub fn block_hash(&self) -> BeaconBlockHash {
-        self.block.block_hash()
+        self.0.block.block_hash()
     }
 
     /// Epoch of the inner block.
     #[must_use]
-    pub const fn epoch(&self) -> Epoch {
-        self.block.epoch()
+    pub fn epoch(&self) -> Epoch {
+        self.0.block.epoch()
     }
 
     /// `prev_block_hash` of the inner block — the ratification anchor.
     #[must_use]
-    pub const fn prev_block_hash(&self) -> BeaconBlockHash {
-        self.block.prev_block_hash()
+    pub fn prev_block_hash(&self) -> BeaconBlockHash {
+        self.0.block.prev_block_hash()
     }
 
     /// Consume and return parts.
     #[must_use]
     pub(crate) fn into_parts(self) -> (BeaconBlock, Box<SpcCert>) {
-        (self.block, self.spc)
+        let Carried { block, spc } = Arc::unwrap_or_clone(self.0);
+        (block, spc)
     }
 }
 
@@ -919,7 +930,7 @@ mod tests {
     use hyperscale_hbor::{Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::Hash;
+    use crate::{Hash, Verifiable};
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -1290,6 +1301,27 @@ mod tests {
         let bytes = hbor_to_vec(&original).unwrap();
         let decoded: CandidateBeaconBlock = hbor_from_slice(&bytes).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    /// The serve cache holds the verified form and the wire carries the
+    /// verifiable one; moving between them must hand over the one body
+    /// rather than copy its proposals.
+    #[test]
+    fn every_form_of_a_candidate_shares_one_body() {
+        let assembled = Verified::<CandidateBeaconBlock>::assemble(
+            Epoch::new(3),
+            anchor(),
+            Vec::new(),
+            BTreeMap::new(),
+            Verified::new_unchecked(*dummy_spc_cert()),
+        );
+        let wire: Verifiable<CandidateBeaconBlock> = assembled.clone().into();
+        let lifted = wire
+            .clone()
+            .into_verified()
+            .expect("the marker rides along");
+        assert!(Arc::ptr_eq(&assembled.0, &wire.as_unverified().0));
+        assert!(Arc::ptr_eq(&assembled.0, &lifted.0));
     }
 
     /// The candidate's hash and anchor are the inner block's — the SPC

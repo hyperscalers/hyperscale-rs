@@ -21,7 +21,7 @@
 //! ## Header Flow
 //!
 //! 1. Gossip arrives → `IoLoop` verifies sender signature → `RemoteHeaderReceived` event
-//! 2. Coordinator stores header as pending, emits `Action::VerifyRemoteHeaderQc`
+//! 2. Coordinator stores header as pending, emits `ConsensusAction::VerifyRemoteHeaderQc`
 //! 3. Async QC verification completes → `RemoteHeaderQcVerified` event
 //! 4. Coordinator promotes to verified, emits `Action::Continuation(RemoteHeaderAdmitted)`
 //! 5. shard consensus, Provision, Execution consume the verified header

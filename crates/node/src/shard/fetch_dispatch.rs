@@ -8,14 +8,16 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{LocalTimestamp, MessageClass, ShardId, ValidatorId};
-use tracing::warn;
 
-use super::{ShardIo, ShardLoop, TimerOp, TimerOwner};
-use crate::fetch::{FetchInput, FetchOutput, FetchedBy, Intent, Release, ShardReply};
+use super::{ShardIo, ShardLoop};
+use crate::event::{TimerOp, TimerOwner};
+use crate::fetch::{
+    FetchInput, FetchOutput, FetchedBy, Intent, Release, ShardReply, SolicitedAnswer,
+};
 use crate::shard::consensus::ProposalBinding;
 use crate::shard::cross_shard::{
-    FinalizationBinding, LocalProvisionBinding, ProvisionBinding, SettledTxsBinding,
-    StateProofBinding, VerdictProofBinding,
+    FinalizationBinding, LocalProvisionBinding, ProvisionBinding, RecordProofBinding,
+    SettledTxsBinding, StateProofBinding, VerdictProofBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -33,6 +35,7 @@ macro_rules! every_fetch_binding {
             RemoteProvisions => ProvisionBinding,
             StateProofs => StateProofBinding,
             VerdictProofs => VerdictProofBinding,
+            RecordProofs => RecordProofBinding,
             SettledTxs => SettledTxsBinding,
             Proposals => ProposalBinding,
         }
@@ -129,11 +132,6 @@ where
             ($($arm:ident => $binding:ty,)*) => {
                 match ids {
                     $(FetchIds::$arm(ids) => self.drive_fetch::<$binding>(intent.input(ids)),)*
-                    // No replica emits a beacon fetch: the host's beacon
-                    // loop drives them for its fold and participants.
-                    FetchIds::Beacon(ids) => {
-                        warn!(?ids, "a beacon fetch reached a shard loop — dropping");
-                    }
                 }
             };
         }
@@ -184,16 +182,37 @@ where
                     self.drive_fetch::<TransactionBinding>(FetchInput::Admitted { ids });
                 }
             }
-            ProtocolEvent::ProvisionsAdmitted { provisions, .. } => {
+            ProtocolEvent::ProvisionsAdmitted { provision, .. } => {
                 self.drive_fetch::<LocalProvisionBinding>(FetchInput::Admitted {
-                    ids: vec![provisions.hash()],
+                    ids: vec![provision.hash()],
                 });
                 self.drive_fetch::<ProvisionBinding>(FetchInput::Admitted {
-                    ids: vec![(
-                        provisions.source_shard(),
-                        provisions.target_shard(),
-                        provisions.block_height(),
-                    )],
+                    ids: ProvisionBinding::answers_for(provision)
+                        .into_iter()
+                        .collect(),
+                });
+            }
+            // A refused part settles neither fetch that could have
+            // carried it, so both go out again, off the peer that
+            // answered. A gossiped part failing while a fetch for the
+            // same id is out sends that fetch again early; the retry
+            // hold bounds how often.
+            ProtocolEvent::StateProvisionsVerified { results, .. } => {
+                let refused: Vec<_> = results
+                    .iter()
+                    .filter_map(|result| result.as_ref().err().map(|(part, _)| part))
+                    .collect();
+                if refused.is_empty() {
+                    return;
+                }
+                self.drive_fetch::<LocalProvisionBinding>(FetchInput::Failed {
+                    ids: refused.iter().map(|part| part.hash()).collect(),
+                });
+                self.drive_fetch::<ProvisionBinding>(FetchInput::Failed {
+                    ids: refused
+                        .iter()
+                        .flat_map(|part| ProvisionBinding::answers_for(part))
+                        .collect(),
                 });
             }
             ProtocolEvent::FinalizationsAdmitted { finalizations } => {
@@ -211,11 +230,30 @@ where
     N: Network,
     D: Dispatch,
 {
+    /// Handle `ShardScopedInput::FetchTick`, which fires on the periodic
+    /// `FetchTick` timer this shard schedules for itself. It advances every
+    /// fetch protocol's idle clock so retries / chunk emission progresses
+    /// without waiting for an admission event. Pending entries are drained
+    /// by `drive_fetch_admission` on canonical admission events and by
+    /// explicit `Action::AbandonFetch` actions emitted from the originating
+    /// coordinator at every expected-set drop site.
+    pub(crate) fn handle_fetch_tick(&mut self) {
+        self.fetch_tick.fired();
+        let now = self.now;
+        let outputs = self.io.consensus.block_tick(now);
+        self.process_block_sync_outputs(outputs);
+
+        let outputs = self.io.cross_shard.remote_header_tick(now);
+        self.process_remote_header_sync_outputs(outputs);
+
+        self.tick_every_fetch();
+    }
+
     /// Refresh this shard's `FetchTick` timer based on whether any of its
     /// subsystems (mempool, consensus block-sync, cross-shard) has pending
-    /// work. Each shard manages its own ticker
-    /// — a shard with idle fetches stops paying for the 200ms wake-up while
-    /// busier shards keep ticking.
+    /// work. Each shard manages its own ticker — a shard with idle fetches
+    /// stops paying for the periodic wake-up while busier shards keep
+    /// ticking.
     pub(crate) fn update_fetch_tick_timer(&mut self) {
         let any_pending = self.io.mempool.has_pending()
             || self.io.consensus.has_pending()
@@ -280,14 +318,16 @@ impl FetchTicker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_core::BeaconFetchIds;
+    use hyperscale_core::{Action, ProvisionRefusal};
+    use hyperscale_network_memory::PendingRequest;
     use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::network::request::GetProvisionsRequest;
     use hyperscale_types::{
-        Address, AddressClass, BeaconBlockHash, BlockHash, BlockHeight, Epoch, Hash,
+        Anchor, BlockHash, BlockHeight, Hash, Provision, StateRoot, TxHash, WeightedTimestamp,
     };
 
     use super::*;
-    use crate::shard::test_host::{Fixture, Loop, loop_of};
+    use crate::shard::test_host::{Fixture, Host, Loop, loop_of};
 
     const SHARD: ShardId = ShardId::leaf(1, 0);
 
@@ -324,38 +364,100 @@ mod tests {
         ));
     }
 
-    /// A beacon fetch that reaches a shard loop is dropped: nothing is
-    /// asked, nothing is left pending, and the loop's tick drives none.
+    /// One route can carry the parts of two source blocks: the chunk is
+    /// split by scope, so each block's indices go out in a request of
+    /// their own, every index in one.
     #[test]
-    fn the_shard_fetch_tick_drives_no_beacon_fetch() {
+    fn a_route_carrying_two_heights_sends_two_requests() {
         let fix = Fixture::new();
         let mut host = fix.host(BlockHeight::GENESIS);
         let _ = host.network().drain_pending_requests();
-        let shard_loop = loop_of(&mut host);
-        let candidate = (
-            Epoch::new(1),
-            BeaconBlockHash::from_raw(Hash::from_bytes(b"candidate")),
+        let source = ShardId::leaf(1, 1);
+        let (low, high) = (BlockHeight::new(10), BlockHeight::new(11));
+        loop_of(&mut host).request_fetch(
+            FetchIds::RemoteProvisions(vec![
+                (source, SHARD, low, 0),
+                (source, SHARD, high, 0),
+                (source, SHARD, low, 2),
+                (source, SHARD, high, 1),
+            ]),
+            source,
+            None,
+            None,
         );
-        for ids in [
-            BeaconFetchIds::Candidates(vec![candidate]),
-            BeaconFetchIds::InstanceRecords(vec![Address::new([3; 31], AddressClass::Component)]),
-            BeaconFetchIds::PackageArtifacts(vec![Hash::from_bytes(b"package")]),
-        ] {
-            shard_loop.request_fetch(FetchIds::Beacon(ids), SHARD, None, None);
-        }
-        shard_loop.handle_fetch_tick();
-        shard_loop.pending_timer_ops.clear();
-        shard_loop.update_fetch_tick_timer();
-        assert!(
-            !shard_loop
-                .pending_timer_ops
+        let mut asked: Vec<(BlockHeight, Vec<u32>)> = host
+            .network()
+            .drain_pending_requests()
+            .iter()
+            .filter_map(PendingRequest::request::<GetProvisionsRequest>)
+            .map(|request| (request.height, request.indices.to_vec()))
+            .collect();
+        asked.sort();
+        assert_eq!(asked, vec![(low, vec![0, 2]), (high, vec![0, 1])]);
+    }
+
+    /// A refused bundle sends out again both fetches that could have
+    /// carried it: an answer left in flight is one nothing would ever ask
+    /// for again. The verdict the coordinator emits as a continuation
+    /// releases each once, so the retry goes out rather than being held
+    /// for the tick.
+    #[test]
+    fn a_refused_bundle_asks_both_fetches_again() {
+        let fix = Fixture::new();
+        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
+        let _ = host.network().drain_pending_requests();
+        let source = ShardId::leaf(1, 1);
+        let height = BlockHeight::new(10);
+        let provisions_asked = |host: &mut Host| {
+            host.network()
+                .drain_pending_requests()
                 .iter()
-                .any(|op| is_set(Some(op))),
-            "nothing is left pending for the shard's tick to drive",
+                .filter(|pending| pending.request::<GetProvisionsRequest>().is_some())
+                .count()
+        };
+
+        let bundle = Provision::dummy(source, SHARD, height, TxHash::from(Hash::from_bytes(b"tx")));
+        let shard_loop = loop_of(&mut host);
+        shard_loop.request_fetch(
+            FetchIds::RemoteProvisions(vec![(source, SHARD, height, 0)]),
+            source,
+            None,
+            None,
         );
-        assert!(
-            host.network().drain_pending_requests().is_empty(),
-            "no beacon ask leaves a shard loop",
+        shard_loop.request_fetch(
+            FetchIds::LocalProvisions(vec![bundle.hash()]),
+            SHARD,
+            None,
+            None,
+        );
+        assert_eq!(provisions_asked(&mut host), 1);
+
+        loop_of(&mut host).drain_actions(vec![Action::Continuation(
+            ProtocolEvent::StateProvisionsVerified {
+                results: vec![Err((bundle, ProvisionRefusal::ContentMismatch))],
+                anchor: Anchor {
+                    shard: source,
+                    height,
+                    state_root: StateRoot::ZERO,
+                    ts: WeightedTimestamp::ZERO,
+                },
+            },
+        )]);
+        for event in events.try_iter() {
+            let _ = host.step(event);
+        }
+
+        assert_eq!(provisions_asked(&mut host), 1, "the fetch goes out again");
+        let io = &mut loop_of(&mut host).io;
+        assert_eq!(
+            ProvisionBinding::fetch_mut(io).in_flight_count(),
+            1,
+            "the remote fetch is out again, not held"
+        );
+        assert_eq!(
+            LocalProvisionBinding::fetch_mut(io).in_flight_count(),
+            1,
+            "the fetch by hash is out again, not held"
         );
     }
 

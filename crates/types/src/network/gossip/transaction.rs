@@ -6,8 +6,6 @@
 //! recipient, a dedup entry and a handler dispatch are paid per message,
 //! so they scale with message *count*, not bytes.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::{GossipMessage, GossipScope};
@@ -28,14 +26,14 @@ pub const MAX_GOSSIP_TX_BATCH: usize = 1_000;
 #[derive(Debug, Clone, Hbor)]
 pub struct TransactionGossip {
     /// The transactions in this batch.
-    pub transactions: Capped<Vec<Arc<Transaction>>, MAX_GOSSIP_TX_BATCH>,
+    pub transactions: Capped<Vec<Transaction>, MAX_GOSSIP_TX_BATCH>,
 }
 
 impl TransactionGossip {
-    /// Build a gossip batch from a vector of `Arc`-wrapped transactions.
+    /// Build a gossip batch from a vector of transactions.
     /// The batch cap is enforced at encode and decode, not here.
     #[must_use]
-    pub const fn new(transactions: Capped<Vec<Arc<Transaction>>, MAX_GOSSIP_TX_BATCH>) -> Self {
+    pub const fn new(transactions: Capped<Vec<Transaction>, MAX_GOSSIP_TX_BATCH>) -> Self {
         Self { transactions }
     }
 
@@ -96,19 +94,10 @@ mod tests {
 
     #[test]
     fn new_carries_transactions() {
-        let tx1 = Arc::new(test_transaction_with_prefixes(
-            &[1, 2, 3],
-            &[test_prefix(1)],
-            &[test_prefix(2)],
-        ));
-        let tx2 = Arc::new(test_transaction_with_prefixes(
-            &[4, 5, 6],
-            &[test_prefix(3)],
-            &[test_prefix(4)],
-        ));
+        let tx1 = test_transaction_with_prefixes(&[1, 2, 3], &[test_prefix(1)], &[test_prefix(2)]);
+        let tx2 = test_transaction_with_prefixes(&[4, 5, 6], &[test_prefix(3)], &[test_prefix(4)]);
 
-        let gossip =
-            TransactionGossip::new(Capped::from_array([Arc::clone(&tx1), Arc::clone(&tx2)]));
+        let gossip = TransactionGossip::new(Capped::from_array([tx1.clone(), tx2.clone()]));
         assert_eq!(gossip.len(), 2);
         assert!(!gossip.is_empty());
         assert_eq!(gossip.transactions[0].hash(), tx1.hash());
@@ -124,13 +113,13 @@ mod tests {
 
     #[test]
     fn hbor_roundtrip_multi_tx() {
-        let txs: Vec<Arc<Transaction>> = (0..5)
+        let txs: Vec<Transaction> = (0..5)
             .map(|i| {
-                Arc::new(test_transaction_with_prefixes(
+                test_transaction_with_prefixes(
                     &[i, i + 1, i + 2],
                     &[test_prefix(i)],
                     &[test_prefix(i + 1)],
-                ))
+                )
             })
             .collect();
         let original =

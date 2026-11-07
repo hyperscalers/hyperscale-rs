@@ -12,22 +12,35 @@
 //! request-serving cache, cross-cutting and read-only.
 
 mod deferred;
-mod fetch;
-mod serve;
+mod transaction_fetch;
+mod transaction_serve;
 mod validation;
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 pub use deferred::{DeferredForRecords, DeferredTransaction, Orphaned};
-pub use fetch::{TransactionBinding, TransactionFetch};
 use hyperscale_types::network::gossip::MAX_GOSSIP_TX_BATCH;
 use hyperscale_types::{ShardId, Transaction, TxHash};
-pub use serve::serve_transaction_request;
+pub use transaction_fetch::{TransactionBinding, TransactionFetch};
+pub use transaction_serve::serve_transaction_request;
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
+
+/// How an envelope reached this loop's admission, which decides what
+/// admission may refuse it for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Gossip or a submission: nobody here asked for it. The payer
+    /// filters and the pool's ceiling apply, and a refusal costs
+    /// nothing, since what a block names is fetched.
+    Unbidden,
+    /// A fetch answering an id a block or a tick here named. It is chain
+    /// content, so neither the payer filters nor the pool's ceiling
+    /// refuse it: refusing it would strand what asked.
+    Asked,
+}
 
 /// Per-shard mempool subsystem state.
 ///
@@ -36,11 +49,11 @@ pub struct MempoolState {
     /// Per-block transaction fetch (intra-shard, pinned to proposer).
     pub(crate) transaction: TransactionFetch,
 
-    /// Hashes currently in the validation pipeline — either sitting in
-    /// `validation_batch` or being verified off-thread. Acts as a
-    /// dedup guard so duplicate gossip / re-submits don't enqueue
-    /// twice. Entries are removed by `TransactionValidated` /
-    /// `TransactionValidationsFailed` handlers.
+    /// Hashes currently in the validation pipeline — sitting in
+    /// `validation_batch`, being verified off-thread, or held in
+    /// `deferred_records`. The dedup guard an unbidden offer checks, so
+    /// duplicate gossip and re-submits do not enqueue twice. Entries are
+    /// removed when a verdict on the hash comes back.
     pub(crate) pending_validation: HashSet<TxHash>,
 
     /// Subset of `pending_validation` for which this shard is the
@@ -57,9 +70,9 @@ pub struct MempoolState {
     /// admit at all.
     pub(crate) locally_submitted: HashSet<TxHash>,
 
-    /// Pending transactions awaiting batched signature / format /
-    /// declared-shard verification on the `tx_validation` pool.
-    pub(crate) validation_batch: BatchAccumulator<Arc<Transaction>>,
+    /// Envelopes awaiting batched verification, each beside how it
+    /// reached admission.
+    pub(crate) validation_batch: BatchAccumulator<(Transaction, Origin)>,
 
     /// Envelopes this node cannot derive yet, waiting on the component
     /// records a fetch is out for. Entries stay in
@@ -73,7 +86,7 @@ pub struct MempoolState {
     /// fills until its count cap or time window expires, then flushes
     /// as a single batched gossip message published to the destination
     /// shard's topic.
-    pub(crate) outbound_gossip_batches: BTreeMap<ShardId, BatchAccumulator<Arc<Transaction>>>,
+    pub(crate) outbound_gossip_batches: BTreeMap<ShardId, BatchAccumulator<Transaction>>,
 
     /// Size cap for new tx-gossip accumulators.
     pub(crate) tx_gossip_max: usize,

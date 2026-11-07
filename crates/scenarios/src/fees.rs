@@ -11,8 +11,6 @@
 //! unit-tested on its own, and what nothing else walks is the path from
 //! a cast ballot to a repriced transaction.
 
-use std::sync::Arc;
-
 use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
     NetworkParams, PriceBounds, PriceTable, ReshapeThresholds, TransactionDecision,
@@ -139,7 +137,7 @@ pub fn a_vote_opens_the_band_and_the_level_moves<C: Cluster>(c: &mut C) {
     let (payer, from) = pool_operator();
     let tx = build_transfer_tx(&payer, from, from, 1, validity_around(c.now()));
     let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    c.submit(tx);
     let status = await_tx_terminal(c, hash, epochs(8));
     assert!(
         matches!(

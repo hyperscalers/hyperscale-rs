@@ -109,7 +109,7 @@ pub use hyperscale_vm_types::{
     ModeKind, Movement, NativeAddr, NotCallable, OverDebit, PackageAddr, Presence, PriceBounds,
     PriceTable, PrincipalAddr, ResourceAddr, SWEEP_BUCKET_BYTES, SWEEP_BUCKET_SHIFT, SchemeId,
     SettledCells, SettledEntries, SettledWrites, StateWrites, SubstateKey, SweepBucket,
-    Utilization, amount_cell, compatible, encode_amount, entry_leaf_key, read_amount,
+    Utilization, amount_cell, compatible, encode_amount, entry_leaf_key, range_lift, read_amount,
 };
 pub use network::{
     GossipMessage, GossipScope, MessageClass, NetworkMessage, Request, Signed, SignedContext,
@@ -131,16 +131,21 @@ pub use primitives::identifiers::{
 };
 pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_range_proof, compute_sparse_proof,
-    verify_merkle_inclusion, verify_range_inclusion, verify_sparse_inclusion,
+    merkle_paths, verify_merkle_inclusion, verify_range_inclusion, verify_sparse_inclusion,
 };
 pub use primitives::positional_bundle::PositionalBundle;
 pub use primitives::randomness::{RANDOMNESS_BYTES, Randomness};
 pub use primitives::seeds::{EpochSeed, SEED_WINDOW_EPOCHS, SeedRing, SeedSource};
 pub use primitives::signer_bitfield::SignerBitfield;
-pub use provisioning::entry::ProvisionEntry;
-pub use provisioning::limits::{MAX_MERKLE_PROOF_LEN, MAX_STATE_ENTRIES_PER_TX};
-pub use provisioning::proof::{Inclusion, MerkleInclusionProof, StateProofError};
-pub use provisioning::provisions::{Provisions, ProvisionsContext, ProvisionsVerifyError};
+pub use provisioning::limits::{
+    MAX_MERKLE_PROOF_LEN, MAX_PROVISION_PART_BYTES, MAX_PROVISION_WEIGHT, PROVISION_FRAMING_BYTES,
+};
+pub use provisioning::proof::{
+    CheckedStateProof, Inclusion, MerkleInclusionProof, StateProofError,
+};
+pub use provisioning::provision::{
+    Provision, ProvisionContext, ProvisionParts, ProvisionVerifyError,
+};
 pub use provisioning::substate::{SubstateEntry, SubstateLeaf};
 pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH, absorb_committed_cells};
 pub use receipt::event::{
@@ -155,7 +160,7 @@ pub use shard::abandonment::{
 };
 pub use shard::anchor::Anchor;
 pub use shard::certified::{CertifiedBlock, CertifiedBlockHashMismatch, LinkageError};
-pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError};
+pub use shard::certified_header::{CertifiedBlockHeader, CertifiedHeaderVerifyError, HeaderSource};
 pub use shard::chain_origin::ChainOrigin;
 pub use shard::commit_proof::{
     CommitProof, CommitProofVerifyError, MAX_COMMIT_PROOF_ANCESTRY, ResolvedCommittee,
@@ -184,25 +189,27 @@ pub use shard::limits::{
     MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
     MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_OWED_TOWARD_SHARD, MAX_PREFIXES_PER_TX,
     MAX_PROOFS_PER_QUERY, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_STAGED_RECEIPT_BYTES, MAX_STANDING_ANSWERS,
-    MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-    MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES, MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES,
-    MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES,
-    ROUTE_PREFIX_BYTES, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM,
-    TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES,
-    TICK_TERMS_BYTES, TX_CAPS, UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction,
-    claims_admit_block, drain_admits_block, evidence_admits_block, staged_yes_bound,
-    staged_yes_bytes, state_claims_admit_block, sweep_admits_block, tick_manifest_admits_block,
-    tick_manifest_admits_members, tick_terms_admit_block,
+    MAX_PROVISIONS_PER_BLOCK, MAX_RECOVERY_BANDS, MAX_ROUND_GAP, MAX_STAGED_RECEIPT_BYTES,
+    MAX_STANDING_ANSWERS, MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEP_PER_BLOCK,
+    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES,
+    MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES,
+    MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS,
+    MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES,
+    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIM_CROSSING_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, TICK_BAND_BYTES,
+    TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_REACH_BYTES,
+    TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TX_CAPS, UNSETTLED_TX_BYTES, budget_admits_block,
+    caps_admit_transaction, claims_admit_block, drain_admits_block, evidence_admits_block,
+    staged_yes_bound, staged_yes_bytes, state_claims_admit_block, sweep_admits_block,
+    tick_manifest_admits_block, tick_manifest_admits_members, tick_terms_admit_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad, SubstateClaim};
 pub use shard::manifest::{BlockManifest, BlockManifestParts, BlockMetadata};
 pub use shard::member_keys::{
     MemberCollection, MemberFamily, member_order, staged_leaf, verdict_leaf,
 };
+pub use shard::pin::{Modes, Pin, PinClass, PinKey, Pins, is_protocol_vault, pins_of};
 pub use shard::proven_anchors::ProvenAnchors;
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::read_frontier::{
@@ -211,12 +218,13 @@ pub use shard::read_frontier::{
 pub use shard::reshape::{ReshapeKind, ReshapeThresholds, ReshapeTrigger, Settling};
 pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, BodyRootContext, BodyRootVerifyError,
-    CommittingShards, LeafRoot, ProvisionTxRootsContext, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, REVEAL_CHAIN_DOMAIN_TAG, SectionRoots, SetRoot, SplitChildRoots,
+    LeafPath, LeafRoot, MAX_PROVISION_PATH_DEPTH, PROVISION_LEAF_DOMAIN_TAG,
+    PROVISION_ROOT_DOMAIN_TAG, PROVISION_SERVED_DOMAIN_TAG, ProvisionCount, ProvisionTxRootsJudged,
+    ProvisionTxRootsMap, REVEAL_CHAIN_DOMAIN_TAG, SectionRoots, SetRoot, SplitChildRoots,
     StateRootContext, StateRootVerifyError, UnboundBody, commit_witness_window, derive_leaves,
     derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
-    settled_txs_root_from_hashes, settling_in,
+    missed_proposals_since_prev_commit, next_reveal_chain, provision_leaf, ready_leaf_payload,
+    served_digest, settled_txs_root_from_hashes, settling_in,
 };
 pub use shard::state_claim::{
     BoundaryOffer, CarriedClaims, Issuer, Recarried, StateClaim, Stated, answer_hashes,
@@ -224,8 +232,8 @@ pub use shard::state_claim::{
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::tick_manifest::{
-    Crossings, DiscardCause, Holds, Joins, MemberTerms, Owes, Reach, Reserves, Settlement,
-    StatedTerms, TermsSection, TickLine, TickManifest,
+    Crossings, DiscardCause, Holds, Joins, MemberTerms, Owes, Reach, RecoveryBand, RecoveryBands,
+    Reserves, Settlement, StatedTerms, TermsSection, TickLine, TickManifest,
 };
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::timeout_cert::{
@@ -262,17 +270,18 @@ pub use time::range::{MAX_INTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, TimestampRa
 pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
     DEDUP_WINDOW, EPOCH_DURATION, HALT_HARVEST_WAIT, IDLE_PROPOSAL_INTERVAL,
-    MAX_FINALIZATION_DELAY, MIN_EPOCH_DURATION, PROGRESS_WAIT_MULTIPLIER, RATIFY_ROUND_TIMEOUT,
-    REATTESTATION_STEP, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT,
-    VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MAX,
-    VIEW_CHANGE_TIMEOUT_MIN,
+    MAX_FINALIZATION_DELAY, MIN_EPOCH_DURATION, NAMING_WINDOW, PROGRESS_WAIT_MULTIPLIER,
+    RATIFY_ROUND_TIMEOUT, REATTESTATION_STEP, REMOTE_HEADER_RETENTION, RETENTION_HORIZON,
+    SKIP_TIMEOUT, VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT,
+    VIEW_CHANGE_TIMEOUT_MAX, VIEW_CHANGE_TIMEOUT_MIN,
 };
 pub use time::timestamp::{CommittedClock, LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
-    BoundaryAttestation, Formed, Reshaping, RoutingCommittees, ScheduleLookup, SplitAtBoundary,
-    Terminating, TopologySchedule, Unpublished, WindowLookup, WindowView,
+    BlockCommittee, BlockResolution, BoundaryAttestation, Formed, QcAdmission, Reshaping,
+    RoutingCommittees, ScheduleLookup, SigningAnchor, SplitAtBoundary, Terminating,
+    TopologySchedule, Unpublished, WindowLookup, WindowView,
 };
 pub use topology::settled_set::{Evidence, SettledTxSet, TerminalEvidence, partner_evidence};
 pub use topology::shard_prefix::shard_prefix_path;

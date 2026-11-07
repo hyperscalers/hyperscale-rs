@@ -2,9 +2,9 @@
 //! transactions.
 //!
 //! One absorption per source shard and transaction —
-//! [`absorbed`](ProvisioningTracker::absorbed) — holds what that shard's
-//! committed bundles carried: the environment its earliest bundle stated
-//! and every leaf, by key. It is what a cross-shard dispatch carries and
+//! [`absorbed`](ProvisioningTracker::absorbed) — holds the part that
+//! shard's committing block sent: the environment it stated and its
+//! leaves, by key. It is what a cross-shard dispatch carries and
 //! the evidence that the shard committed the transaction. Beside it,
 //! `required` is what each candidate waits for, as one set of
 //! [`Requirement`]s, and `arrived` the crossing records committed
@@ -17,10 +17,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use hyperscale_engine::legs::Member;
 use hyperscale_engine::tick_select::Requirement;
 use hyperscale_storage::live_record;
 use hyperscale_types::{
-    MAX_FINALIZATION_DELAY, Provisions, RETENTION_HORIZON, ShardId, StateClaim, SubstateEntry,
+    BlockHeight, Provision, RETENTION_HORIZON, Role, ShardId, StateClaim, SubstateEntry,
     SubstateKey, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingCell;
@@ -33,18 +34,17 @@ pub struct WantedRecord {
     pub key: SubstateKey,
     /// The transaction the record must name as its issuer.
     pub tx: TxHash,
-    /// The committed clock past which the read arms on the clock alone:
-    /// one finalization delay past the commit that filed the want, for
-    /// a requirement filed here, by when the producer's leg has
-    /// finalized or never will and a push that was coming has come.
-    /// `None` where only the producer's certificate arms it. The
-    /// certificate arms either sooner.
-    pub arms_at: Option<WeightedTimestamp>,
+    /// The committed clock of the commit that filed the want. Its read
+    /// arms one finalization delay past it on the clock alone, by when
+    /// the producer's leg has finalized or never will and a push that
+    /// was coming has come, and its reads drain oldest filed first.
+    pub filed_at: WeightedTimestamp,
 }
 
-/// The environment a source block's bundle carries for the transactions
-/// that block committed: the clock, checked against the commit-proven
-/// source header at verification.
+/// The environment a source's part carries for a transaction: the clock
+/// of the source block that committed it, which the part's leaf binds
+/// under the root of the block that served it, whether that block
+/// committed it or made its member head.
 ///
 /// One field, and it stays a record because what a bundle carries about
 /// the environment is a set rather than a value — a seed is the
@@ -52,21 +52,22 @@ pub struct WantedRecord {
 /// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceAnchor {
-    /// The source block's parent-QC weighted timestamp.
+    /// The parent-QC weighted timestamp of the source block that commits
+    /// the transaction, as the part's leaf binds it.
     pub(crate) clock: WeightedTimestamp,
 }
 
-/// What one source shard's committed bundles carried for a transaction.
+/// What one source shard's committed part carried for a transaction:
+/// the part read off the source block that served it, the block that
+/// committed the transaction or, for a member that shares this shard's
+/// verdict, the block that made it head there.
 #[derive(Debug, Clone)]
 pub struct Absorbed {
-    /// The environment the shard's earliest bundle carried.
+    /// The height of the source block the part was read off.
+    height: BlockHeight,
+    /// The environment that block fixes for the transaction.
     anchor: SourceAnchor,
-    /// Every leaf the shard's bundles carried, sorted by key. A shard
-    /// sends a transaction bundles off several of its blocks — its
-    /// committed state when the transaction commits there, the record
-    /// cells its certificate wrote when that commits, and those cells
-    /// again off any later block that offers the crossing anew — and
-    /// each restates or adds keys, never taking one away.
+    /// The leaves the part carried, sorted by key.
     entries: Arc<Vec<SubstateEntry>>,
     /// The commit clock at the latest absorption, which bounds an
     /// absorption no candidate here has filed for.
@@ -74,61 +75,46 @@ pub struct Absorbed {
 }
 
 impl Absorbed {
-    fn new(at: WeightedTimestamp, anchor: SourceAnchor, entries: &[SubstateEntry]) -> Self {
+    fn new(
+        at: WeightedTimestamp,
+        height: BlockHeight,
+        anchor: SourceAnchor,
+        entries: &[SubstateEntry],
+    ) -> Self {
         let mut entries = entries.to_vec();
         entries.sort_by_key(|entry| entry.key);
         entries.dedup_by_key(|entry| entry.key);
         Self {
+            height,
             anchor,
             entries: Arc::new(entries),
             at,
         }
     }
 
-    /// Fold another bundle from the same shard in. A bundle restating
-    /// what is held adds nothing.
+    /// Fold another part from the same shard in.
     ///
-    /// The anchor kept is the earliest a bundle from this shard carried,
-    /// never the latest. It is the environment the transaction runs
-    /// under, which the block that committed it on the source shard
-    /// fixes — and that block is the earliest of that shard's that can
-    /// name the transaction at all. Taking the latest instead would let
-    /// a shard offering a crossing anew restamp the clock its consumer
-    /// executes under, so two consumers reached by different bundles
-    /// would run one transaction in two environments; and it would make
-    /// the answer turn on the order two bundles happened to arrive in,
-    /// where the earliest does not.
-    ///
-    /// The merge is anchor blind — one anchor over the whole held set —
-    /// and what makes that sound is that the bundle kinds a shard sends
-    /// carry **disjoint keys**, so a key is added by one kind or
-    /// restated by a re-broadcast of the same kind, never carried by
-    /// both at two anchors with two values. Were they to overlap, the
-    /// held set would mix anchors while `anchor` named only one, and a
-    /// consumer proving a reading against that anchor would be proving
-    /// it against a value taken at another.
-    ///
-    /// Stated rather than enforced, deliberately: the bundles are a
-    /// counterpart's committed content, so refusing a contradiction here
-    /// would let one shard halt another.
-    fn absorb(&mut self, at: WeightedTimestamp, anchor: SourceAnchor, entries: &[SubstateEntry]) {
-        self.at = at;
-        self.anchor.clock = self.anchor.clock.min(anchor.clock);
-        let restated = entries.iter().all(|entry| {
-            self.entries
-                .binary_search_by_key(&entry.key, |held| held.key)
-                .is_ok_and(|index| self.entries[index].value == entry.value)
-        });
-        if restated {
-            return;
+    /// A part off the block already held restates it and adds nothing:
+    /// one source block reads one transaction once. A part off another
+    /// block replaces the entries and the anchor whole. A source commits
+    /// a transaction in a second block only once a recovery has let go
+    /// of the first, and admission takes the second block's part only
+    /// under an anchor that orphans the first, so the part committed
+    /// later is the one that stands. Its entries are a reading of the
+    /// recovered chain's state, so none of the first block's are kept
+    /// beside them, an absent cell included.
+    fn absorb(
+        &mut self,
+        at: WeightedTimestamp,
+        height: BlockHeight,
+        anchor: SourceAnchor,
+        entries: &[SubstateEntry],
+    ) {
+        if self.height == height && self.anchor == anchor {
+            self.at = at;
+        } else {
+            *self = Self::new(at, height, anchor, entries);
         }
-        let mut merged: BTreeMap<SubstateKey, SubstateEntry> = self
-            .entries
-            .iter()
-            .map(|entry| (entry.key, entry.clone()))
-            .collect();
-        merged.extend(entries.iter().map(|entry| (entry.key, entry.clone())));
-        self.entries = Arc::new(merged.into_values().collect());
     }
 }
 
@@ -253,14 +239,47 @@ impl ProvisioningTracker {
             .is_some_and(|by_shard| by_shard.contains_key(&shard))
     }
 
-    /// The environment carried by the remote payer's bundle: the
-    /// payer-shard committing block's parent-QC weighted timestamp.
-    /// `None` when the payer is local (the tick block is the anchor) or
-    /// the bundle has not been absorbed.
+    /// The clock `member` of `tx_hash` executes under, where `own` is
+    /// the parent-QC weighted timestamp of the block that committed it
+    /// here.
+    ///
+    /// One value for every shard that runs the same nodes, read off
+    /// anchors each of them holds before it runs:
+    ///
+    /// - A whole member runs under its payer's committing clock: its
+    ///   own where the payer is local, the remote payer's bundle's
+    ///   otherwise.
+    /// - A core member runs under the earliest of the core shards'
+    ///   committing clocks, its own included. It runs only once every
+    ///   other core shard's bundle is in hand, and each bundle carries
+    ///   its committing block's clock, bound by its leaf, so every core
+    ///   shard takes the minimum over one set.
+    /// - A leg runs alone and under its own.
+    ///
+    /// `None` while a bundle the clock is read off is not absorbed: a
+    /// core member's from another core shard, or a whole member's from
+    /// its remote payer. A node short of one is short of what the
+    /// member's line names it to run on, and its peers run under a clock
+    /// it cannot read.
     #[must_use]
-    pub(crate) fn payer_anchor(&self, tx_hash: TxHash) -> Option<SourceAnchor> {
-        let payer = self.payer_shards.get(&tx_hash)?;
-        Some(self.absorbed.get(&tx_hash)?.get(payer)?.anchor)
+    pub(crate) fn transaction_clock(
+        &self,
+        tx_hash: TxHash,
+        member: &Member,
+        own: WeightedTimestamp,
+    ) -> Option<WeightedTimestamp> {
+        let absorbed = self.absorbed.get(&tx_hash);
+        let clock_of = |shard: &ShardId| absorbed?.get(shard).map(|part| part.anchor.clock);
+        match member.role() {
+            Role::Whole => self.payer_shards.get(&tx_hash).map_or(Some(own), clock_of),
+            Role::Core => member
+                .classified()
+                .core()
+                .iter()
+                .filter(|&&shard| shard != member.local())
+                .try_fold(own, |earliest, shard| Some(earliest.min(clock_of(shard)?))),
+            Role::Leg | Role::Settling => Some(own),
+        }
     }
 
     /// Whether every requirement for `tx_hash` is met. Returns `false`
@@ -278,9 +297,8 @@ impl ProvisioningTracker {
     }
 
     /// Every crossing a candidate here waits on with no arrival for it,
-    /// with the transaction the record must name and the clock its read
-    /// arms on: one finalization delay past the commit that filed it,
-    /// so a pushed reading has its chance to land before any ask.
+    /// with the transaction the record must name and the clock of the
+    /// commit that filed it, which its read is paced from.
     ///
     /// The records alone, and not the shard a requirement might name:
     /// who holds a record now is its own prefix, read against the
@@ -298,7 +316,7 @@ impl ProvisioningTracker {
                     wanted.push(WantedRecord {
                         key: *key,
                         tx: *tx_hash,
-                        arms_at: Some(filed_at.plus(MAX_FINALIZATION_DELAY)),
+                        filed_at: *filed_at,
                     });
                 }
             }
@@ -307,21 +325,40 @@ impl ProvisioningTracker {
         wanted
     }
 
+    /// [`Self::wanted_records`] as a committing block's `state_claims`
+    /// leave it: a want the block's fold ends asks nothing of this
+    /// commit, which cuts its reading from what is held and folds its
+    /// arrival only after everything that reads the wants has run.
+    pub(crate) fn wanted_past(&self, state_claims: &[StateClaim]) -> Vec<WantedRecord> {
+        let arriving = self.arrivals_in(state_claims);
+        let mut wanted = self.wanted_records();
+        wanted.retain(|want| !arriving.contains_key(&want.key));
+        wanted
+    }
+
     /// Fold the crossing records a committed block's claims read, for
     /// the requirements filed here.
     ///
     /// Every claim the block carries is read, whatever question this
     /// replica had open, so a reading pushed to the proposer folds with
-    /// no ask ever put. A live record naming the requirement's own
-    /// transaction as its issuer is the arrival; a tombstone, a bare
-    /// presence and a record of another transaction are not. Read after
-    /// the block's transactions are registered, so a reading that rides
-    /// in the transaction's own block counts, and only for requirements
-    /// already filed, so a reading in a block before the transaction's
-    /// commit here is never an arrival and the key is read again.
+    /// no ask ever put. Read after the block's transactions are
+    /// registered, so a reading that rides in the transaction's own block
+    /// counts, and only for requirements already filed, so a reading in a
+    /// block before the transaction's commit here is never an arrival and
+    /// the key is read again.
     pub(crate) fn fold_record_readings(&mut self, state_claims: &[StateClaim]) {
+        let arriving = self.arrivals_in(state_claims);
+        self.arrived.extend(arriving);
+    }
+
+    /// The arrivals `state_claims` hold for the requirements filed here
+    /// with none yet. A live record naming the requirement's own
+    /// transaction as its issuer is the arrival; a tombstone, a bare
+    /// presence and a record of another transaction are not.
+    fn arrivals_in(&self, state_claims: &[StateClaim]) -> BTreeMap<SubstateKey, Arrival> {
+        let mut arrivals = BTreeMap::new();
         if state_claims.is_empty() {
-            return;
+            return arrivals;
         }
         for (tx_hash, (_, required)) in &self.required {
             for requirement in required {
@@ -334,39 +371,35 @@ impl ProvisioningTracker {
                 if let Some((_, cell)) = live_record(state_claims, *key)
                     && cell.tx == *tx_hash
                 {
-                    self.arrived.insert(*key, Arrival { cell });
+                    arrivals.insert(*key, Arrival { cell });
                 }
             }
         }
+        arrivals
     }
 
     // ─── Batch absorption ───────────────────────────────────────────────
 
-    /// Absorb a committed bundle: what it carries for each transaction
-    /// is folded into the source shard's absorption for it, so a
-    /// re-broadcast restates what is held rather than doubling it.
+    /// Absorb a committed part: what it carries for its transaction is
+    /// folded into the source shard's absorption for it
+    /// ([`Absorbed::absorb`]), so a re-broadcast restates what is held
+    /// rather than doubling it.
     ///
-    /// Returns the `tx_hash`es touched — the caller uses these to compute
+    /// Returns the `tx_hash` touched — the caller uses it to compute
     /// which local ticks are affected and to drive the dispatch check.
-    /// Preserves iteration order of `provisions.transactions` (callers sort
-    /// batches upstream for determinism).
-    pub(crate) fn absorb_provisions(&mut self, provisions: &Verified<Provisions>) -> Vec<TxHash> {
-        let mut touched = Vec::with_capacity(provisions.transactions().len());
-        let source_shard = provisions.source_shard();
+    pub(crate) fn absorb_provisions(&mut self, part: &Verified<Provision>) -> TxHash {
+        let tx_hash = part.tx_hash();
+        let height = part.block_height();
         let anchor = SourceAnchor {
-            clock: provisions.source_block_ts(),
+            clock: part.clock(),
         };
-        for tx_entry in provisions.transactions() {
-            let tx_hash = tx_entry.tx_hash;
-            self.absorbed
-                .entry(tx_hash)
-                .or_default()
-                .entry(source_shard)
-                .and_modify(|absorbed| absorbed.absorb(self.now, anchor, &tx_entry.entries))
-                .or_insert_with(|| Absorbed::new(self.now, anchor, &tx_entry.entries));
-            touched.push(tx_hash);
-        }
-        touched
+        self.absorbed
+            .entry(tx_hash)
+            .or_default()
+            .entry(part.source_shard())
+            .and_modify(|absorbed| absorbed.absorb(self.now, height, anchor, part.entries()))
+            .or_insert_with(|| Absorbed::new(self.now, height, anchor, part.entries()));
+        tx_hash
     }
 
     // ─── Retention ──────────────────────────────────────────────────────
@@ -400,18 +433,28 @@ impl ProvisioningTracker {
 
     // ─── Accessors ──────────────────────────────────────────────────────
 
-    /// What was absorbed for `tx_hash`, one entry list per source shard
-    /// in shard order — what a cross-shard execution request carries.
+    /// What was absorbed for `tx_hash` from the shards its candidate
+    /// requires, one entry list per source shard in shard order — what a
+    /// cross-shard execution request carries.
+    ///
+    /// Only a required source's list: the requirement was filed off the
+    /// committing block, so it names the sources the member's readiness
+    /// judged, by exact shard. A predecessor whose block a successor
+    /// re-committed the transaction past, or a shard shipping content
+    /// the member's scope never reads, would otherwise ride into a tick
+    /// baseline every member of the batch reads.
     #[must_use]
     pub(crate) fn provisions_for(&self, tx_hash: TxHash) -> Vec<Arc<Vec<SubstateEntry>>> {
-        self.absorbed
-            .get(&tx_hash)
-            .map_or_else(Vec::new, |by_shard| {
-                by_shard
-                    .values()
-                    .map(|absorbed| Arc::clone(&absorbed.entries))
-                    .collect()
-            })
+        let (Some(by_shard), Some((_, required))) =
+            (self.absorbed.get(&tx_hash), self.required.get(&tx_hash))
+        else {
+            return Vec::new();
+        };
+        by_shard
+            .iter()
+            .filter(|(shard, _)| required.contains(&Requirement::CommittedState(**shard)))
+            .map(|(_, absorbed)| Arc::clone(&absorbed.entries))
+            .collect()
     }
 
     /// Hand this shard a crossing, as a committed claim would.
@@ -449,8 +492,8 @@ mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        BlockHeight, Hash, MAX_STATE_ENTRIES_PER_TX, MerkleInclusionProof, ProvisionEntry,
-        ShardTrie,
+        BlockHeight, Hash, LeafPath, MAX_PROVISION_WEIGHT, MerkleInclusionProof, ProvisionParts,
+        ShardTrie, Transaction, Verifiable,
     };
     use hyperscale_vm_types::{LegShape, ProtocolHasher};
 
@@ -465,49 +508,184 @@ mod tests {
         source: ShardId,
         block_height: BlockHeight,
         anchor: SourceAnchor,
-        tx_hashes: Vec<TxHash>,
-    ) -> Verified<Provisions> {
-        let transactions: Vec<ProvisionEntry> = tx_hashes
-            .into_iter()
-            .map(|tx_hash| ProvisionEntry::new(tx_hash, Capped::from_array([])))
-            .collect();
-        Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
+        tx_hash: TxHash,
+    ) -> Verified<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::dummy_at(
             source,
             ShardId::leaf(2, 0),
             block_height,
             anchor.clock,
-            MerkleInclusionProof::dummy(),
-            Capped::new(transactions).expect("a list written out in a test"),
+            tx_hash,
         ))
     }
 
     fn make_provisions(
         source: ShardId,
         block_height: BlockHeight,
-        tx_hashes: Vec<TxHash>,
-    ) -> Verified<Provisions> {
-        make_provisions_at(source, block_height, anchor(0), tx_hashes)
+        tx_hash: TxHash,
+    ) -> Verified<Provision> {
+        make_provisions_at(source, block_height, anchor(0), tx_hash)
     }
+
+    /// A keyless part from `source` for `tx`, whose transaction the
+    /// source committed at `clock_ms` and a block anchored [`SERVE_LAG_MS`]
+    /// later roots.
+    fn served_late(
+        source: ShardId,
+        block_height: BlockHeight,
+        clock_ms: u64,
+        tx_hash: TxHash,
+    ) -> Verified<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+            source_shard: source,
+            target_shard: ShardId::leaf(2, 0),
+            block_height,
+            source_block_ts: anchor(clock_ms + SERVE_LAG_MS).clock,
+            clock: anchor(clock_ms).clock,
+            tx_hash,
+            entries: Capped::empty(),
+            proof: MerkleInclusionProof::new(Vec::new()),
+            leaf: LeafPath {
+                count: 1,
+                index: 0,
+                siblings: Capped::empty(),
+            },
+        }))
+    }
+
+    /// How long after its commit a [`served_late`] part's rooting block
+    /// is anchored: past every clock the clock tests compare, so a reader
+    /// of the rooting clock reads none of them.
+    const SERVE_LAG_MS: u64 = 10_000;
 
     fn bundle_for(
         source: ShardId,
         tx_hash: TxHash,
-        entries: Capped<Vec<SubstateEntry>, MAX_STATE_ENTRIES_PER_TX>,
-    ) -> Verified<Provisions> {
-        Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-            source,
-            ShardId::leaf(2, 0),
-            BlockHeight::new(5),
-            anchor(0).clock,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(tx_hash, entries)]),
-        ))
+        entries: Capped<Vec<SubstateEntry>, MAX_PROVISION_WEIGHT>,
+    ) -> Verified<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+            source_shard: source,
+            target_shard: ShardId::leaf(2, 0),
+            block_height: BlockHeight::new(5),
+            source_block_ts: anchor(0).clock,
+            clock: anchor(0).clock,
+            tx_hash,
+            entries,
+            proof: MerkleInclusionProof::dummy(),
+            leaf: LeafPath {
+                count: 1,
+                index: 0,
+                siblings: Capped::empty(),
+            },
+        }))
     }
 
     fn anchor(clock_ms: u64) -> SourceAnchor {
         SourceAnchor {
             clock: WeightedTimestamp::from_millis(clock_ms),
         }
+    }
+
+    /// File `tx` as waiting on the committed state of `shards`.
+    fn require(t: &mut ProvisioningTracker, tx: TxHash, shards: &[ShardId]) {
+        t.record_required(
+            tx,
+            shards
+                .iter()
+                .copied()
+                .map(Requirement::CommittedState)
+                .collect(),
+        );
+    }
+
+    /// A list of `key` holding `value`, or absent.
+    fn list(entries: &[(SubstateKey, Option<u8>)]) -> Arc<Vec<SubstateEntry>> {
+        Arc::new(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    SubstateEntry::new(*key, value.map(|byte| Bytes::from_array([byte])))
+                })
+                .collect(),
+        )
+    }
+
+    /// A part from `source` at `height`, anchored at `clock_ms`, carrying
+    /// `entries` for `tx`.
+    fn part(
+        source: ShardId,
+        height: u64,
+        clock_ms: u64,
+        tx: TxHash,
+        entries: &[(SubstateKey, Option<u8>)],
+    ) -> Verified<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+            source_shard: source,
+            target_shard: ShardId::leaf(2, 0),
+            block_height: BlockHeight::new(height),
+            source_block_ts: anchor(clock_ms).clock,
+            clock: anchor(clock_ms).clock,
+            tx_hash: tx,
+            entries: Capped::new(list(entries).to_vec()).expect("a list written out in a test"),
+            proof: MerkleInclusionProof::dummy(),
+            leaf: LeafPath {
+                count: 1,
+                index: 0,
+                siblings: Capped::empty(),
+            },
+        }))
+    }
+
+    /// A source re-committed past its predecessor's orphaned block: the
+    /// target holds both parts, and the dispatch carries the successor's
+    /// list alone. Neither a cell the predecessor read nor a value it
+    /// held for a cell the successor carries as absent reaches it.
+    #[test]
+    fn provisions_for_carries_only_the_required_sources() {
+        let s = ShardId::leaf(1, 0);
+        let s1 = s.children().1;
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let (a, b) = (test_key(1), test_key(2));
+        let mut t = ProvisioningTracker::new();
+        require(&mut t, tx, &[s1]);
+        t.absorb_provisions(&part(s, 7, 20_500, tx, &[(a, Some(1)), (b, Some(2))]));
+        t.absorb_provisions(&part(s1, 3, 41_000, tx, &[(a, None)]));
+
+        assert!(t.has_received_from(tx, s), "the orphaned part is held");
+        assert_eq!(t.provisions_for(tx), vec![list(&[(a, None)])]);
+    }
+
+    /// A shard the candidate does not wait on can ship it content, and
+    /// the dispatch leaves that out.
+    #[test]
+    fn an_unrequired_absorption_stays_out_of_the_dispatch() {
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let (a, b) = (test_key(1), test_key(2));
+        let mut t = ProvisioningTracker::new();
+        require(&mut t, tx, &[shard(1)]);
+        t.absorb_provisions(&part(shard(1), 5, 1_000, tx, &[(a, Some(1))]));
+        t.absorb_provisions(&part(shard(2), 5, 1_000, tx, &[(b, Some(2))]));
+
+        assert_eq!(t.provisions_for(tx), vec![list(&[(a, Some(1))])]);
+    }
+
+    /// A remote payer is required, so its list rides beside the read
+    /// set's and its anchor is the one the member runs under.
+    #[test]
+    fn a_remote_payer_stays_in_the_dispatch() {
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let (a, b) = (test_key(1), test_key(2));
+        let mut t = ProvisioningTracker::new();
+        require(&mut t, tx, &[shard(1), shard(2)]);
+        t.record_payer_shard(tx, shard(2));
+        t.absorb_provisions(&part(shard(1), 5, 7_000, tx, &[(a, Some(1))]));
+        t.absorb_provisions(&part(shard(2), 9, 9_500, tx, &[(b, Some(2))]));
+
+        assert_eq!(
+            t.provisions_for(tx),
+            vec![list(&[(a, Some(1))]), list(&[(b, Some(2))])],
+        );
+        assert_eq!(whole_clock(&t, tx), Some(anchor(9_500).clock));
     }
 
     #[test]
@@ -527,7 +705,7 @@ mod tests {
         // An empty-entry bundle — the payer shard's engagement evidence
         // for a commutative leg — counts exactly like a state-carrying
         // one: absorption is the commitment axis.
-        let batch = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
+        let batch = make_provisions(shard(1), BlockHeight::new(5), tx);
         t.absorb_provisions(&batch);
         assert!(t.has_received_from(tx, shard(1)));
         assert!(!t.has_received_from(tx, shard(2)));
@@ -548,12 +726,12 @@ mod tests {
         assert!(!t.is_fully_provisioned(tx));
 
         // Only shard 1 landed.
-        let batch1 = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
+        let batch1 = make_provisions(shard(1), BlockHeight::new(5), tx);
         t.absorb_provisions(&batch1);
         assert!(!t.is_fully_provisioned(tx));
 
         // Shard 2 lands → fully provisioned.
-        let batch2 = make_provisions(shard(2), BlockHeight::new(5), vec![tx]);
+        let batch2 = make_provisions(shard(2), BlockHeight::new(5), tx);
         t.absorb_provisions(&batch2);
         assert!(t.is_fully_provisioned(tx));
     }
@@ -636,10 +814,10 @@ mod tests {
         );
         both.fold_record_readings(&[claim_of(6, held(cell_of(tx, Terms::Owed)))]);
         assert!(!both.is_fully_provisioned(tx));
-        both.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), vec![tx]));
+        both.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), tx));
         assert!(both.is_fully_provisioned(tx));
 
-        // The want names what arms it: the commit that filed it.
+        // The want names the commit that filed it.
         let mut waiting = ProvisioningTracker::new();
         waiting.advance_clock(WeightedTimestamp::from_millis(7_000));
         waiting.record_required(tx, BTreeSet::from([requirement]));
@@ -648,7 +826,7 @@ mod tests {
             vec![WantedRecord {
                 key: record,
                 tx,
-                arms_at: Some(WeightedTimestamp::from_millis(7_000).plus(MAX_FINALIZATION_DELAY)),
+                filed_at: WeightedTimestamp::from_millis(7_000),
             }]
         );
         let _ = LocalKey([0; 16]);
@@ -749,6 +927,161 @@ mod tests {
         );
     }
 
+    /// The route of [`fixtures::route`] as a routed transaction paid on
+    /// leaf 0: each core node writes a cell of its own component, the
+    /// inbound leg debits the payer.
+    fn routed_route() -> Verifiable<Transaction> {
+        use hyperscale_types::test_utils::{StubVmStatics, stub_transaction};
+        use hyperscale_types::{
+            Address, DeclaredKey, Mode, PrincipalAddr, Routing, TimestampRange,
+        };
+        use hyperscale_vm_types::Moves;
+
+        let payer = PrincipalAddr::new([0x11; 31]);
+        let cell = |owner| DeclaredKey::substate(owner, [0xC0; 16]);
+        let writes = [cell(fixtures::owner_at(1)), cell(fixtures::owner_at(2))];
+        let vault = DeclaredKey::substate(payer.address(), [0xFE; 16]);
+        let mut declared_modes: Vec<(DeclaredKey, Mode)> = writes
+            .iter()
+            .map(|key| (*key, Mode::Write { moves: Moves::Both }))
+            .chain([(vault, Mode::Delta { moves: Moves::Out })])
+            .collect();
+        declared_modes.sort_unstable();
+        let mut write_keys: Vec<DeclaredKey> = declared_modes.iter().map(|(key, _)| *key).collect();
+        write_keys.sort_unstable();
+        let mut write_prefixes: Vec<Address> = write_keys.iter().map(DeclaredKey::owner).collect();
+        write_prefixes.sort_unstable();
+        write_prefixes.dedup();
+        let routing = Routing {
+            read_keys: Vec::new(),
+            write_keys,
+            read_prefixes: Vec::new(),
+            write_prefixes,
+            provision_keys: writes.to_vec(),
+            provision_prefixes: writes.iter().map(DeclaredKey::owner).collect(),
+            declared_modes,
+        };
+        let validity = TimestampRange::new(
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::from_millis(60_000),
+        );
+        Verifiable::from(
+            stub_transaction(payer, &[], 1_000, validity)
+                .with_routing(&StubVmStatics, routing)
+                .with_legs(&StubVmStatics, fixtures::route()),
+        )
+    }
+
+    /// A leg calling a core of two shards waits on both cores' parts, and
+    /// each core serves the leg's shard from the block that commits the
+    /// transaction there: the leg shares no verdict with the core, so its
+    /// part is never held to a core's head, and the core never waits on
+    /// a record the leg could only write once that head came. Each core
+    /// serves its sibling no part at its commit.
+    #[test]
+    fn a_leg_calling_a_two_shard_core_engages_at_the_cores_commit() {
+        use hyperscale_engine::tick_select::member_of;
+        use hyperscale_provisions::provision_request;
+
+        let trie = fixtures::trie();
+        let tx = routed_route();
+        let (leg, cores) = (fixtures::leaf(0), [fixtures::leaf(1), fixtures::leaf(2)]);
+        let member = member_of(&tx, &trie, leg);
+        assert_eq!(member.role(), Role::Leg);
+        let required = divided_requirements(tx.legs(), member.classified(), leg);
+        assert_eq!(
+            required,
+            cores
+                .iter()
+                .map(|&core| Requirement::CommittedState(core))
+                .collect(),
+            "the leg waits on each core shard's part",
+        );
+
+        let mut tracker = ProvisioningTracker::new();
+        tracker.record_required(tx.hash(), required);
+        for (at, &core) in cores.iter().enumerate() {
+            let committed = 1_000 * (at as u64 + 1);
+            let request = provision_request(&trie, &tx, core, anchor(committed).clock)
+                .expect("the core serves the leg's shard at its commit");
+            assert_eq!(
+                request.targets,
+                vec![leg],
+                "{core:?} serves the leg alone at commit"
+            );
+            assert!(!tracker.is_fully_provisioned(tx.hash()));
+            tracker.absorb_provisions(&part(core, 3 + at as u64, committed, tx.hash(), &[]));
+        }
+        assert!(
+            tracker.is_fully_provisioned(tx.hash()),
+            "the cores' commit-time parts are all the leg waits on",
+        );
+        assert_eq!(
+            tracker.transaction_clock(tx.hash(), &member, anchor(9_000).clock),
+            Some(anchor(9_000).clock),
+            "and the leg runs under its own clock",
+        );
+    }
+
+    /// A core's part to a leg's shard serves only the cells the core's
+    /// own shard holds of what the transaction declares, and the leg's
+    /// dispatch carries each core's part as served at its commit: the
+    /// records the leg admits the manifest against, and nothing either
+    /// core read for its sibling.
+    #[test]
+    fn a_leg_reads_only_component_records_of_a_core_part() {
+        use hyperscale_provisions::provision_request;
+        use hyperscale_types::DeclaredKey;
+
+        let trie = fixtures::trie();
+        let tx = routed_route();
+        let (leg, cores) = (fixtures::leaf(0), [fixtures::leaf(1), fixtures::leaf(2)]);
+        let mut tracker = ProvisioningTracker::new();
+        tracker.record_required(
+            tx.hash(),
+            cores
+                .iter()
+                .map(|&core| Requirement::CommittedState(core))
+                .collect(),
+        );
+        for (at, &core) in cores.iter().enumerate() {
+            let request = provision_request(&trie, &tx, core, anchor(1_000).clock)
+                .expect("the core serves the leg's shard at its commit");
+            let owner = fixtures::owner_at(u8::try_from(at + 1).expect("a leaf path"));
+            assert_eq!(
+                request.local_keys,
+                vec![
+                    DeclaredKey::substate(owner, [0xC0; 16])
+                        .cell()
+                        .expect("a cell")
+                ],
+                "{core:?} serves its own component's cell to {leg:?}, and nothing else",
+            );
+            let entries: Vec<(SubstateKey, Option<u8>)> = request
+                .local_keys
+                .iter()
+                .map(|key| (*key, Some(7)))
+                .collect();
+            tracker.absorb_provisions(&part(core, 3, 1_000, tx.hash(), &entries));
+        }
+        let carried: Vec<SubstateKey> = tracker
+            .provisions_for(tx.hash())
+            .iter()
+            .flat_map(|entries| entries.iter().map(|entry| entry.key).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(
+            carried,
+            [1u8, 2]
+                .map(|path| {
+                    DeclaredKey::substate(fixtures::owner_at(path), [0xC0; 16])
+                        .cell()
+                        .expect("a cell")
+                })
+                .to_vec(),
+            "the leg's dispatch carries each core's own cells as served at its commit",
+        );
+    }
+
     #[test]
     fn an_empty_requirement_is_immediately_satisfied() {
         // The dependency-free cross-shard leg: requirements recorded as
@@ -766,26 +1099,25 @@ mod tests {
         // Absorbed provisions records `received[tx]` but there's no `required` —
         // the query must not report fully-provisioned just because
         // anything landed.
-        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), tx);
         t.absorb_provisions(&provisions);
         assert!(!t.is_fully_provisioned(tx));
     }
 
     #[test]
-    fn absorb_provisions_returns_touched_tx_hashes_in_order() {
+    fn absorb_provisions_returns_the_touched_tx_hash() {
         let mut t = ProvisioningTracker::new();
         let tx_a = TxHash::from(Hash::from_bytes(b"a"));
-        let tx_b = TxHash::from(Hash::from_bytes(b"b"));
-        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx_a, tx_b]);
-        let touched = t.absorb_provisions(&provisions);
-        assert_eq!(touched, vec![tx_a, tx_b]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), tx_a);
+        assert_eq!(t.absorb_provisions(&provisions), tx_a);
     }
 
     #[test]
     fn absorb_provisions_records_the_source_once() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        let provisions = make_provisions(shard(1), BlockHeight::new(5), vec![tx]);
+        let provisions = make_provisions(shard(1), BlockHeight::new(5), tx);
+        require(&mut t, tx, &[shard(1)]);
         t.absorb_provisions(&provisions);
 
         assert_eq!(t.absorbed_len(), 1);
@@ -800,8 +1132,9 @@ mod tests {
     fn absorb_multiple_batches_for_same_tx_accumulates() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), vec![tx]));
-        t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), vec![tx]));
+        require(&mut t, tx, &[shard(1), shard(2)]);
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), tx));
+        t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(5), tx));
 
         assert_eq!(
             t.provisions_for(tx).len(),
@@ -812,11 +1145,11 @@ mod tests {
         assert!(t.has_received_from(tx, shard(2)));
     }
 
-    /// A re-broadcast restates what is held: the dispatch carries the
-    /// bundle once, and a second bundle from the same shard adds its
-    /// cells beside the first's rather than beneath a second copy.
+    /// A part off the block already held restates it: the dispatch
+    /// carries the part once, and another part off the same block adds
+    /// nothing beside it.
     #[test]
-    fn a_shards_later_bundle_restates_or_adds_and_never_doubles() {
+    fn a_part_off_the_held_block_restates_it() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         let a = test_key(1);
@@ -828,35 +1161,83 @@ mod tests {
                 Capped::from_array([SubstateEntry::new(a, Some(Bytes::from_array([1])))]),
             )
         };
+        require(&mut t, tx, &[shard(1)]);
         t.absorb_provisions(&first());
         t.absorb_provisions(&first());
-        assert_eq!(
-            t.provisions_for(tx).len(),
-            1,
-            "a re-broadcast is absorbed once"
-        );
-        let value_of = |t: &ProvisioningTracker, key: SubstateKey| {
-            t.provisions_for(tx)[0]
-                .iter()
-                .find(|entry| entry.key == key)
-                .and_then(|entry| entry.value.as_ref().map(|v| v.to_vec()))
-        };
-        assert_eq!(value_of(&t, a), Some(vec![1]));
-
         t.absorb_provisions(&bundle_for(
             shard(1),
             tx,
             Capped::from_array([SubstateEntry::new(b, Some(Bytes::from_array([2])))]),
         ));
-        let carried = t.provisions_for(tx);
-        assert_eq!(carried.len(), 1, "still one absorption for the shard");
-        assert_eq!(carried[0].len(), 2, "holding both bundles' cells");
-        assert_eq!(value_of(&t, a), Some(vec![1]));
-        assert_eq!(value_of(&t, b), Some(vec![2]));
+        assert_eq!(
+            t.provisions_for(tx),
+            vec![Arc::new(vec![SubstateEntry::new(
+                a,
+                Some(Bytes::from_array([1]))
+            )])],
+        );
     }
 
+    /// A part off another block of the same shard replaces what is held
+    /// whole: the dispatch carries the later block's entries and the
+    /// environment it fixes, and a cell it carries as absent stays
+    /// absent whatever the first block read. A block at the held height
+    /// under another anchor is another block.
     #[test]
-    fn payer_anchor_reads_the_payer_bundles_clock_and_draw() {
+    fn a_part_off_another_block_replaces_entries_and_anchor_whole() {
+        let (a, b) = (test_key(1), test_key(2));
+        let off = |height: u64, clock_ms: u64, entries: Vec<SubstateEntry>| {
+            Verified::<Provision>::new_unchecked_for_test(Provision::new(ProvisionParts {
+                source_shard: shard(1),
+                target_shard: ShardId::leaf(2, 0),
+                block_height: BlockHeight::new(height),
+                source_block_ts: anchor(clock_ms).clock,
+                clock: anchor(clock_ms).clock,
+                tx_hash: TxHash::from(Hash::from_bytes(b"tx")),
+                entries: Capped::new(entries).expect("a list written out in a test"),
+                proof: MerkleInclusionProof::dummy(),
+                leaf: LeafPath {
+                    count: 1,
+                    index: 0,
+                    siblings: Capped::empty(),
+                },
+            }))
+        };
+        let first = off(
+            7,
+            20_500,
+            vec![
+                SubstateEntry::new(a, Some(Bytes::from_array([1]))),
+                SubstateEntry::new(b, Some(Bytes::from_array([2]))),
+            ],
+        );
+        for (height, clock_ms) in [(9, 21_500), (7, 21_500)] {
+            let mut t = ProvisioningTracker::new();
+            let tx = first.tx_hash();
+            require(&mut t, tx, &[shard(1)]);
+            t.record_payer_shard(tx, shard(1));
+            t.absorb_provisions(&first);
+            t.absorb_provisions(&off(height, clock_ms, vec![SubstateEntry::new(a, None)]));
+            assert_eq!(
+                t.provisions_for(tx),
+                vec![Arc::new(vec![SubstateEntry::new(a, None)])],
+                "at height {height}",
+            );
+            assert_eq!(whole_clock(&t, tx), Some(anchor(clock_ms).clock));
+        }
+    }
+
+    /// The clock a whole member on leaf 0 runs under, committed here at
+    /// [`OWN_CLOCK_MS`].
+    fn whole_clock(t: &ProvisioningTracker, tx: TxHash) -> Option<WeightedTimestamp> {
+        t.transaction_clock(tx, &Member::whole(shard(0)), anchor(OWN_CLOCK_MS).clock)
+    }
+
+    /// Where the member under test committed its transaction.
+    const OWN_CLOCK_MS: u64 = 8_000;
+
+    #[test]
+    fn a_whole_member_runs_under_its_payers_clock() {
         let mut t = ProvisioningTracker::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         t.record_required(
@@ -868,25 +1249,101 @@ mod tests {
         );
         t.record_payer_shard(tx, shard(2));
 
-        // A read-set owner's bundle lands first: no payer anchor yet.
+        // A read-set owner's bundle lands first: its clock is not the
+        // payer's, so the member has none until the payer's lands.
         t.absorb_provisions(&make_provisions_at(
             shard(1),
             BlockHeight::new(5),
             anchor(7_000),
-            vec![tx],
+            tx,
         ));
-        assert_eq!(t.payer_anchor(tx), None);
+        assert_eq!(whole_clock(&t, tx), None);
 
-        // The payer's bundle carries the committing block's clock and
-        // reveal chain — the environment every participant executes the
-        // transaction under.
+        // The payer's bundle carries its committing block's clock, which
+        // every participant executes the transaction under.
         t.absorb_provisions(&make_provisions_at(
             shard(2),
             BlockHeight::new(9),
             anchor(9_500),
-            vec![tx],
+            tx,
         ));
-        assert_eq!(t.payer_anchor(tx), Some(anchor(9_500)));
+        assert_eq!(whole_clock(&t, tx), Some(anchor(9_500).clock));
+
+        // A payer's part rooted by a later block than the one committing
+        // the transaction carries the committing clock, and that is the
+        // clock the member runs under, not the rooting block's.
+        let mut t = ProvisioningTracker::new();
+        t.record_payer_shard(tx, shard(2));
+        t.absorb_provisions(&served_late(shard(2), BlockHeight::new(12), 9_500, tx));
+        assert_eq!(whole_clock(&t, tx), Some(anchor(9_500).clock));
+    }
+
+    /// The member `local` runs of a core over leaf(1, 0) and leaf(2, 2),
+    /// fed by an inbound leg on leaf(2, 3).
+    fn divided_member(local: ShardId) -> Member {
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+
+        let legs = [
+            leg(3, LegRole::Inbound, &[]),
+            leg(0, LegRole::Core, &[(0, 0)]),
+            leg(2, LegRole::Core, &[(1, 0)]),
+        ];
+        let shards = [
+            ShardId::leaf(1, 0),
+            ShardId::leaf(2, 2),
+            ShardId::leaf(2, 3),
+        ];
+        let classified =
+            Classified::freeze(&legs, legs[0].target, &[], &ShardTrie::from_leaves(shards));
+        assert_eq!(
+            classified.core(),
+            &BTreeSet::from([ShardId::leaf(1, 0), ShardId::leaf(2, 2)])
+        );
+        Member::of(classified, local, shards.into_iter().collect())
+    }
+
+    /// Both core shards run every core node, so both run it under the
+    /// earliest of their committing clocks: each takes its own and the
+    /// other's bundle, and neither reads the leg's, though the leg pays
+    /// and committed first, nor that of a shard outside the core holding
+    /// a component the transaction calls, which also committed before
+    /// either. The leg runs alone, under its own. Each bundle is rooted
+    /// by a block later than the one committing the transaction, and the
+    /// clock is the committing block's.
+    #[test]
+    fn every_core_member_runs_under_the_earliest_core_clock() {
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let (early, late) = (ShardId::leaf(2, 2), ShardId::leaf(1, 0));
+        let (leg, holder) = (ShardId::leaf(2, 3), ShardId::leaf(2, 1));
+        let tracker_beside = |other: ShardId, other_ms: u64| {
+            let mut t = ProvisioningTracker::new();
+            t.record_payer_shard(tx, leg);
+            for (source, ms) in [(other, other_ms), (leg, 1_000), (holder, 3_000)] {
+                t.absorb_provisions(&served_late(source, BlockHeight::new(5), ms, tx));
+            }
+            t
+        };
+
+        let on_late = tracker_beside(early, 7_000);
+        let on_early = tracker_beside(late, 9_000);
+        let clock = |t: &ProvisioningTracker, local, own_ms| {
+            t.transaction_clock(tx, &divided_member(local), anchor(own_ms).clock)
+        };
+        assert_eq!(clock(&on_late, late, 9_000), Some(anchor(7_000).clock));
+        assert_eq!(clock(&on_early, early, 7_000), Some(anchor(7_000).clock));
+        assert_eq!(
+            tracker_beside(early, 7_000).transaction_clock(
+                tx,
+                &divided_member(leg),
+                anchor(1_000).clock
+            ),
+            Some(anchor(1_000).clock),
+        );
+        // Short of the other core shard's bundle, a core member has no
+        // clock, whatever else is in hand.
+        assert_eq!(clock(&on_late, early, 7_000), None);
     }
 
     /// A requirement is its candidate's: the sweep drops it the moment
@@ -901,7 +1358,7 @@ mod tests {
             tx,
             std::iter::once(Requirement::CommittedState(shard(1))).collect(),
         );
-        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), vec![tx]));
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), tx));
         assert!(t.is_fully_provisioned(tx));
 
         let long_after = WeightedTimestamp::from_millis(1_000)
@@ -918,7 +1375,7 @@ mod tests {
         assert!(!t.is_fully_provisioned(tx));
         assert_eq!(t.absorbed_len(), 0);
         assert_eq!(t.required_len(), 0);
-        assert_eq!(t.payer_anchor(tx), None);
+        assert_eq!(whole_clock(&t, tx), Some(anchor(OWN_CLOCK_MS).clock));
     }
 
     #[test]
@@ -949,17 +1406,10 @@ mod tests {
         let tx_fresh = TxHash::from(Hash::from_bytes(b"fresh"));
 
         t.advance_clock(WeightedTimestamp::from_millis(1_000));
-        t.absorb_provisions(&make_provisions(
-            shard(1),
-            BlockHeight::new(5),
-            vec![tx_old, tx_fresh],
-        ));
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), tx_old));
+        t.absorb_provisions(&make_provisions(shard(1), BlockHeight::new(5), tx_fresh));
         t.advance_clock(WeightedTimestamp::from_millis(60_000));
-        t.absorb_provisions(&make_provisions(
-            shard(2),
-            BlockHeight::new(6),
-            vec![tx_fresh],
-        ));
+        t.absorb_provisions(&make_provisions(shard(2), BlockHeight::new(6), tx_fresh));
 
         // Past the first bundle's horizon but not the second's.
         let now = WeightedTimestamp::from_millis(1_001).plus(RETENTION_HORIZON);

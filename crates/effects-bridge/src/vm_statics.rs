@@ -20,7 +20,7 @@ use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
     ArtifactTerm, Attestation, Attested, Declared, DeclaredKey, DeclaredRange, Derivation,
     DerivationError, Derived, EnvelopeExt, Hash, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
-    MAX_STATE_ENTRIES_PER_TX, MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing,
+    MAX_PROVISION_WEIGHT, MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing,
     TimestampRange, TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, vault_cell};
@@ -36,7 +36,7 @@ use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectSet, EffectTarget,
     LegShape, LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey, Terms,
-    TermsRefusal, admit_event_bounds, attestation_work, read_bytes, written_leaf,
+    TermsRefusal, admit_event_bounds, attestation_work, range_lift, read_bytes, written_leaf,
 };
 
 use crate::ProtocolHasher;
@@ -489,23 +489,23 @@ impl<'a> CallEnvelope<'a> {
 ///
 /// # Errors
 ///
-/// [`DerivationError::Refused`] on a debiting delta or a write whose
-/// target is a principal's protocol vault, or on a reservation above
-/// [`MAX_DECLARED_RESERVE`].
+/// [`DerivationError::Refused`] on a debiting delta, a write or a read
+/// whose target is a principal's protocol vault, or on a reservation
+/// above [`MAX_DECLARED_RESERVE`].
 fn admit_declared_debits(declared: &EffectSet) -> Result<(), DerivationError> {
     for effect in declared.iter() {
-        let debits_outside_a_reservation = match effect.mode {
+        let reaches_past_a_reservation = match effect.mode {
             Mode::Delta { moves } => moves.debits(),
-            Mode::Write { .. } => true,
-            Mode::Read | Mode::Reserve { .. } => false,
+            Mode::Write { .. } | Mode::Read => true,
+            Mode::Reserve { .. } => false,
         };
         if let EffectTarget::Point(cell) = effect.target
-            && debits_outside_a_reservation
+            && reaches_past_a_reservation
             && is_protocol_vault(&cell)
         {
             return Err(DerivationError::Refused(format!(
-                "{cell:?} is a principal's protocol vault, debited only by a reservation or the \
-                 fee"
+                "{cell:?} is a principal's protocol vault, read by no body and debited only by a \
+                 reservation or the fee"
             )));
         }
         if let Mode::Reserve { amount } = effect.mode
@@ -608,16 +608,7 @@ pub fn vault_key(owner: impl Into<Address>, resource: ResourceAddr) -> SubstateK
     vault_cell(&ProtocolHasher, owner, resource)
 }
 
-/// Whether `key` is a principal's vault of the protocol resource: the
-/// one kind of cell a fee hold stands on.
-///
-/// A component's cell of the same resource is not one. No transaction
-/// names a component as its fee payer, so nothing is ever held against
-/// its balance.
-#[must_use]
-pub fn is_protocol_vault(key: &SubstateKey) -> bool {
-    key.owner.class() == AddressClass::Principal && *key == vault_key(key.owner, *PROTOCOL_RESOURCE)
-}
+pub use hyperscale_types::is_protocol_vault;
 
 /// The stored-authority cell under `owner` — what `securify` writes,
 /// and what the injected sign-in condition and the payer shard's
@@ -853,25 +844,28 @@ fn classify_declared_access(declared: &EffectSet, fee_payer: PrincipalAddr) -> D
     access
 }
 
-/// Refuse a declaration whose provisions could outgrow one bundle.
+/// Refuse a declaration whose provisions could outgrow one part.
 ///
-/// The wire codec refuses a provision bundle past
-/// [`MAX_STATE_ENTRIES_PER_TX`], so a declaration that could ask for
-/// more is refused here — at admission, before an honest server does
-/// enumeration work a bundle it cannot encode would throw away. A cell
-/// serves one entry; a range serves at most its declared cap.
+/// A part carries one transaction's entries under one proof, and both
+/// the entry list a reader decodes and the claims one proof may carry
+/// are capped, so a declaration that could ask for more than
+/// [`MAX_PROVISION_WEIGHT`] is refused here — at admission, before an
+/// honest server does enumeration work a part it cannot build would
+/// throw away. A cell serves one entry; a range serves at most its
+/// [`range_lift`], one past its declared cap, and an entry, its own
+/// width-one interval, serves one.
 fn check_provision_weight(provision_keys: &BTreeSet<DeclaredKey>) -> Result<(), DerivationError> {
     let weight: usize = provision_keys
         .iter()
         .map(|key| match key {
             DeclaredKey::Cell(_) => 1,
-            DeclaredKey::Range(range) => usize::try_from(range.cap).unwrap_or(usize::MAX),
+            DeclaredKey::Range(range) => range_lift(range.lo, range.hi, range.cap),
         })
         .fold(0, usize::saturating_add);
-    if weight > MAX_STATE_ENTRIES_PER_TX {
+    if weight > MAX_PROVISION_WEIGHT {
         return Err(DerivationError::Refused(format!(
             "declared provisions could serve {weight} entries, past the \
-             {MAX_STATE_ENTRIES_PER_TX} one bundle may carry"
+             {MAX_PROVISION_WEIGHT} one part may carry"
         )));
     }
     Ok(())
@@ -1328,10 +1322,11 @@ mod tests {
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
-        Answered, Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef, GraphArg,
-        GraphNode, Hash32, Hasher, InstanceMeta, InstanceRegistry, Intent, IntentHash,
-        ManifestGraph, Member, MetadataCache, PackageHash, RuleBytes, SignedIntent, Socket,
-        StoredRule, ValueRef, child_key, never, nullifier_expiry_ms, nullifier_key,
+        Answered, Authority, Binding, Claim, ClaimRef, Constraint, EdgeRef, GiveRef,
+        GrantedBehaviour, GraphArg, GraphNode, Hash32, Hasher, Holding, InstanceMeta,
+        InstanceRegistry, Intent, IntentHash, ManifestGraph, Member, MetadataCache, PackageHash,
+        ResourceGrants, ResourceKind, ResourceMeta, RuleBytes, SignedIntent, Socket, StoredRule,
+        ValueRef, child_key, never, nullifier_expiry_ms, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::wrap_publish;
     use hyperscale_vm_stdlib::account;
@@ -1422,16 +1417,106 @@ mod tests {
         }
     }
 
+    /// A read of a principal's protocol vault is refused, the payer's own
+    /// or anyone's, so no served set holds a vault that fee holds and
+    /// burns land on.
+    #[test]
+    fn a_declared_read_of_a_protocol_vault_is_refused() {
+        for vault in [protocol_vault(), vault_key(payer(), *PROTOCOL_RESOURCE)] {
+            let refusal = admit_declared_debits(&declaring(&[(vault, Mode::Read)]))
+                .expect_err("a read of a protocol vault is refused");
+            assert!(
+                matches!(&refusal, DerivationError::Refused(reason)
+                    if reason.contains("read by no body")),
+                "{refusal:?}",
+            );
+        }
+        admit_declared_debits(&declaring(&[(vault_key(payer(), RES_X), Mode::Read)]))
+            .expect("a principal's vault of another resource is read as any cell is");
+    }
+
+    /// A presentation of a vault as a badge reads it, so presenting the
+    /// protocol resource refuses at derivation, and any other resource
+    /// presents.
+    #[test]
+    fn presenting_the_protocol_resource_as_a_badge_is_refused() {
+        let presenting = |resource: ResourceAddr| {
+            let mut present = withdraw(composer_addr(), resource, 0);
+            present.method = "present_badge".into();
+            present.args = vec![GraphArg::Literal(Value::Address(resource.address()))];
+            envelope(&intent_tree(composer_addr(), vec![present]), &[])
+        };
+        let refusal = statics()
+            .derive(&presenting(*PROTOCOL_RESOURCE))
+            .expect_err("the protocol resource is no badge");
+        assert!(
+            matches!(&refusal, DerivationError::Refused(reason)
+                if reason.contains("read by no body")),
+            "{refusal:?}",
+        );
+        statics()
+            .derive(&presenting(RES_X))
+            .expect("any other resource presents");
+    }
+
+    /// A resource whose movement rule asks the mover's balance of the
+    /// protocol resource makes a principal mover read its protocol vault,
+    /// so the movement refuses. The same rule over any other resource
+    /// admits it.
+    #[test]
+    fn a_rule_asking_a_protocol_balance_refuses_a_principal_mover() {
+        let moving = |badge: ResourceAddr| {
+            let mut rules = ResourceGrants::new();
+            rules.set(
+                GrantedBehaviour::Withdraw,
+                RuleBytes::try_from(&StoredRule::held(badge, Holding::Balance))
+                    .expect("a rule within the caps encodes"),
+            );
+            let meta = ResourceMeta {
+                namespace: Address::new([0x6A; 31], AddressClass::Component),
+                kind: ResourceKind::Fungible,
+                material: Capped::new(vec![Bytes::new(b"governed".to_vec()).unwrap()]).unwrap(),
+                rules,
+            };
+            let governed = meta.address(&ProtocolHasher);
+            let mut tree = intent_tree(
+                composer_addr(),
+                vec![
+                    withdraw(composer_addr(), governed, 1),
+                    deposit_edge(bob_addr(), 0, governed),
+                ],
+            );
+            tree.resources = Capped::new(vec![meta]).unwrap();
+            envelope(&tree, &[])
+        };
+        let refusal = statics()
+            .derive(&moving(*PROTOCOL_RESOURCE))
+            .expect_err("the mover reads its protocol vault");
+        assert!(
+            matches!(&refusal, DerivationError::Refused(reason)
+                if reason.contains("read by no body")),
+            "{refusal:?}",
+        );
+        statics()
+            .derive(&moving(RES_X))
+            .expect("a rule over any other resource admits the mover");
+    }
+
     #[test]
     fn a_reservation_and_a_credit_of_one_are_admitted() {
-        let vault = protocol_vault();
+        admit_declared_debits(&declaring(&[
+            (protocol_vault(), Mode::Reserve { amount: 7 }),
+            (protocol_vault(), IN),
+        ]))
+        .expect("a reservation and a credit of a protocol vault are admitted");
+        let vault = vault_key(PrincipalAddr::new([0x52; 31]), RES_X);
         let declared = declaring(&[
             (vault, Mode::Reserve { amount: 7 }),
             (vault, IN),
             (vault, Mode::Read),
         ]);
         admit_declared_debits(&declared)
-            .expect("a reservation, a credit and a read of a protocol vault are admitted");
+            .expect("a reservation, a credit and a read of any other vault are admitted");
         let access = classify_declared_access(&declared, payer());
         let on_vault: Vec<Mode> = access
             .declared_modes
@@ -2747,36 +2832,185 @@ mod tests {
         let _typed: IntentHash = tree.root.members[0].signed.intent.hash(&ProtocolHasher);
     }
 
-    /// The provision-weight cap: cells count one, ranges count their
-    /// declared cap, and a set the wire codec could not carry as one
-    /// bundle is refused at admission.
+    /// Every provision key is a target of the declared set, so every
+    /// byte a part serves is priced by `read_bytes` at its slot's
+    /// declared width. The fee vault, the one key added beside the set,
+    /// is written and never provisioned.
     #[test]
-    fn a_declaration_past_one_bundles_weight_is_refused() {
-        let owner = Address::new([9; 31], AddressClass::Component);
-        let range = |cap: u32, salt: u128| {
-            DeclaredKey::Range(DeclaredRange {
-                owner,
-                collection: CollectionId([3; 16]),
-                lo: salt,
-                hi: salt,
-                cap,
-            })
-        };
-        let cap_u32 = u32::try_from(MAX_STATE_ENTRIES_PER_TX).unwrap();
+    fn every_provision_key_is_a_declared_target() {
+        let component = Address::new([0x53; 31], AddressClass::Component);
+        let collection = CollectionId([3; 16]);
+        let mut declared = declaring(&[
+            (protocol_vault(), Mode::Read),
+            (
+                vault_key(component, RES_X),
+                Mode::Write { moves: Moves::Both },
+            ),
+            (vault_key(component, *PROTOCOL_RESOURCE), OUT),
+            (protocol_vault(), Mode::Reserve { amount: 5 }),
+        ]);
+        for (target, mode) in [
+            (
+                EffectTarget::Entry {
+                    owner: component,
+                    collection,
+                    order: 7,
+                },
+                Mode::Read,
+            ),
+            (
+                EffectTarget::Range {
+                    owner: component,
+                    collection,
+                    lo: 10,
+                    hi: 20,
+                    cap: 4,
+                },
+                Mode::Read,
+            ),
+            (
+                EffectTarget::Range {
+                    owner: component,
+                    collection,
+                    lo: 30,
+                    hi: 40,
+                    cap: 2,
+                },
+                Mode::Write { moves: Moves::Both },
+            ),
+        ] {
+            declared
+                .insert_at_cap(Effect { target, mode })
+                .expect("the fixture's accesses fold");
+        }
+        let access = classify_declared_access(&declared, payer());
+        let targets: BTreeSet<DeclaredKey> = declared
+            .targets()
+            .map(|target| admission_key(&target))
+            .collect();
+        assert_eq!(access.provision_keys.len(), 5);
+        assert!(
+            access.provision_keys.is_subset(&targets),
+            "{:?} is not within {targets:?}",
+            access.provision_keys
+        );
+        assert!(
+            !access
+                .provision_keys
+                .contains(&DeclaredKey::Cell(vault_key(payer(), *PROTOCOL_RESOURCE)))
+        );
+    }
 
-        let at_cap: BTreeSet<DeclaredKey> = [range(cap_u32, 0)].into();
+    /// A wide interval from `lo` at `cap`, which weighs its lift.
+    fn wide_range(cap: u32, lo: u128) -> DeclaredKey {
+        DeclaredKey::Range(DeclaredRange {
+            owner: Address::new([9; 31], AddressClass::Component),
+            collection: CollectionId([3; 16]),
+            lo,
+            hi: u128::MAX,
+            cap,
+        })
+    }
+
+    /// The provision-weight cap: cells count one, ranges count their
+    /// lift, and a set no one part could carry is refused at admission.
+    #[test]
+    fn a_declaration_past_one_parts_weight_is_refused() {
+        let owner = Address::new([9; 31], AddressClass::Component);
+        let lifts_whole = u32::try_from(MAX_PROVISION_WEIGHT).unwrap() - 1;
+
+        let at_cap: BTreeSet<DeclaredKey> = [wide_range(lifts_whole, 0)].into();
         assert!(check_provision_weight(&at_cap).is_ok());
 
-        let over: BTreeSet<DeclaredKey> = [range(cap_u32, 0), range(1, 1)].into();
+        let over: BTreeSet<DeclaredKey> = [wide_range(lifts_whole, 0), wide_range(1, 1)].into();
         assert!(check_provision_weight(&over).is_err());
+
+        let cells_fill: BTreeSet<DeclaredKey> = [
+            DeclaredKey::substate(owner, [1; 16]),
+            wide_range(lifts_whole - 1, 0),
+        ]
+        .into();
+        assert!(check_provision_weight(&cells_fill).is_ok());
 
         let cells_count: BTreeSet<DeclaredKey> = [
             DeclaredKey::substate(owner, [1; 16]),
-            range(cap_u32 - 1, 0),
-            range(1, 1),
+            wide_range(lifts_whole, 0),
         ]
         .into();
         assert!(check_provision_weight(&cells_count).is_err());
+    }
+
+    /// A range weighs what its part serves: the cap and the successor
+    /// past it, or the whole interval where it is narrower. The injected
+    /// any-instance interval, a cap of one over every id, weighs two.
+    #[test]
+    fn a_range_weighs_its_cap_and_its_successor() {
+        let weight = MAX_PROVISION_WEIGHT;
+        let cap = u32::try_from(weight).unwrap();
+        assert!(check_provision_weight(&[wide_range(cap - 1, 0)].into()).is_ok());
+        assert!(
+            check_provision_weight(&[wide_range(cap, 0)].into()).is_err(),
+            "a cap at the weight lifts one past it"
+        );
+        let narrow = DeclaredKey::Range(DeclaredRange {
+            owner: Address::new([9; 31], AddressClass::Component),
+            collection: CollectionId([3; 16]),
+            lo: 0,
+            hi: u128::from(cap) - 1,
+            cap,
+        });
+        assert!(
+            check_provision_weight(&[narrow].into()).is_ok(),
+            "an interval narrower than its lift weighs its width"
+        );
+        let any_instance = DeclaredKey::Range(DeclaredRange {
+            owner: Address::new([9; 31], AddressClass::Component),
+            collection: CollectionId([3; 16]),
+            lo: 0,
+            hi: u128::from(u64::MAX),
+            cap: 1,
+        });
+        let mut fits: BTreeSet<DeclaredKey> = (0..weight - 2)
+            .map(|index| {
+                DeclaredKey::substate(
+                    Address::new([9; 31], AddressClass::Component),
+                    u128::try_from(index).unwrap().to_be_bytes(),
+                )
+            })
+            .collect();
+        fits.insert(any_instance);
+        assert!(check_provision_weight(&fits).is_ok());
+        fits.insert(DeclaredKey::substate(
+            Address::new([8; 31], AddressClass::Component),
+            [0; 16],
+        ));
+        assert!(check_provision_weight(&fits).is_err());
+    }
+
+    /// An entry target is its width-one interval and weighs one, as a
+    /// cell does: it has no successor to serve.
+    #[test]
+    fn an_entry_weighs_one() {
+        let entry = admission_key(&EffectTarget::Entry {
+            owner: Address::new([9; 31], AddressClass::Component),
+            collection: CollectionId([3; 16]),
+            order: 7,
+        });
+        let mut fits: BTreeSet<DeclaredKey> = (0..MAX_PROVISION_WEIGHT - 1)
+            .map(|index| {
+                DeclaredKey::substate(
+                    Address::new([9; 31], AddressClass::Component),
+                    u128::try_from(index).unwrap().to_be_bytes(),
+                )
+            })
+            .collect();
+        fits.insert(entry);
+        assert!(check_provision_weight(&fits).is_ok());
+        fits.insert(DeclaredKey::substate(
+            Address::new([8; 31], AddressClass::Component),
+            [0; 16],
+        ));
+        assert!(check_provision_weight(&fits).is_err());
     }
 
     /// A record is seated under the address its own contents derive, and

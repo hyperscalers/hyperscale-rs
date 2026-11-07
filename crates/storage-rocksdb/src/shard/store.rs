@@ -14,7 +14,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Block, BlockHeight, DeclaredRange, Hash, QuorumCertificate, StateRoot, SubstateKey,
-    SweepBucket, SweepFrontier, Verified,
+    SweepBucket, SweepFrontier, Verified, WeightedTimestamp,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
@@ -22,7 +22,7 @@ use super::column_families::{PackageArtifactsCf, StateCf, SweepIndexCf};
 use super::core::{BatchRows, RocksDbShardStorage, fold_sweep_rows};
 use super::metadata::read_jmt_metadata;
 use super::retention::retention_floor;
-use super::snapshot::RocksDbSnapshot;
+use super::snapshot::{OwnedSnapshot, RocksDbSnapshot};
 use super::substate_key::SubstateKeyCodec;
 use super::sweep_key::{SweepRowCodec, row_seek};
 use crate::typed_cf::{DbCodec, TypedCf, get, iter_all};
@@ -77,7 +77,9 @@ impl SubstateStore for RocksDbShardStorage {
 }
 
 impl VersionedStore for RocksDbShardStorage {
-    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+    type Versioned = OwnedSnapshot;
+
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<OwnedSnapshot> {
         // Take the DB snapshot FIRST, then read the tip and the floor
         // THROUGH it. Reading either from the live DB and then taking the
         // snapshot races with concurrent commits: a commit between the
@@ -85,42 +87,47 @@ impl VersionedStore for RocksDbShardStorage {
         // snapshot's LSN, and a reader told a version is retained by one
         // and gone by the other. Capturing everything from the one
         // snapshot gives one consistent view.
-        let snapshot = self.db.snapshot();
-        let (current_version, _) = read_jmt_metadata(&snapshot);
-        let held =
-            height.inner() <= current_version && height.inner() >= retention_floor(&snapshot);
-        held.then(|| RocksDbSnapshot {
-            snapshot,
-            db: &self.db,
-            version: height.inner(),
-            current_version,
-        })
+        let snapshot = OwnedSnapshot::take(&self.db, |db| {
+            let snapshot = db.snapshot();
+            let (current_version, _) = read_jmt_metadata(&snapshot);
+            RocksDbSnapshot {
+                snapshot,
+                db,
+                version: height.inner(),
+                current_version,
+            }
+        });
+        snapshot.held().then_some(snapshot)
     }
 
-    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
-        let snapshot = self.db.snapshot();
-        let (current_version, _) = read_jmt_metadata(&snapshot);
-        let floor = retention_floor(&snapshot);
-        assert!(
-            height.inner() >= floor,
-            "snapshot_at({height}) below retention floor {floor} \
-             (current_version={current_version}) — \
-             Shard consensus + DA invariant broken; caller must anchor within retention",
-        );
-        RocksDbSnapshot {
-            snapshot,
-            db: &self.db,
-            version: height.inner(),
-            current_version,
-        }
+    fn snapshot_at(&self, height: BlockHeight) -> OwnedSnapshot {
+        OwnedSnapshot::take(&self.db, |db| {
+            let snapshot = db.snapshot();
+            let (current_version, _) = read_jmt_metadata(&snapshot);
+            let floor = retention_floor(&snapshot);
+            assert!(
+                height.inner() >= floor,
+                "snapshot_at({height}) below retention floor {floor} \
+                 (current_version={current_version}) — \
+                 Shard consensus + DA invariant broken; caller must anchor within retention",
+            );
+            RocksDbSnapshot {
+                snapshot,
+                db,
+                version: height.inner(),
+                current_version,
+            }
+        })
     }
 
     fn substate_bytes_at(&self, height: BlockHeight) -> Option<u64> {
         self.substate_bytes_at_version(height.inner())
     }
 
-    fn hold_retention_at(&self, height: BlockHeight) {
+    fn hold_retention_at(&self, height: BlockHeight, clock: WeightedTimestamp) {
         self.retention_hold.store(height.inner(), Ordering::Relaxed);
+        self.retention_clock
+            .store(clock.as_millis(), Ordering::Release);
     }
 
     fn retention_floor(&self) -> u64 {

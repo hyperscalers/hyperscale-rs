@@ -13,7 +13,6 @@
 //!
 //! [`BeaconState`]: hyperscale_types::BeaconState
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
@@ -1013,7 +1012,7 @@ pub fn a_timed_out_newcomer_is_let_back_in_from_its_own_host<C: RestartableClust
             newcomer,
             validity_around(c.now()),
         );
-        c.submit_at_host(host, Arc::new(unjail));
+        c.submit_at_host(host, unjail);
     };
     let_back_in(c, newcomer, attempt);
 }
@@ -1037,7 +1036,7 @@ pub fn a_timed_out_newcomer_is_let_back_in_by_a_sponsored_intent<C: RestartableC
             newcomer,
             validity_around(c.now()),
         );
-        c.submit(Arc::new(unjail));
+        c.submit(unjail);
     };
     let_back_in(c, newcomer, attempt);
 }
@@ -1061,13 +1060,13 @@ fn time_out_a_founding_newcomer(
     let newcomer = seat_the_staged_newcomer(c);
     if funded {
         let (key, from) = delegator();
-        c.submit(Arc::new(build_transfer_tx(
+        c.submit(build_transfer_tx(
             &key,
             from,
             founder,
             FOUNDER_FUNDING,
             validity_around(c.now()),
-        )));
+        ));
     }
     let host = c.host_of(newcomer).expect("the newcomer has a host");
     c.stop_host(host, epochs(12));

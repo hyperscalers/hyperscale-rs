@@ -12,11 +12,10 @@
 //! data structures here — no topology, no time source.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, ProvisionHash, Provisions, ShardId, Verified, WeightedTimestamp,
+    BlockHeight, LocalTimestamp, Provision, ProvisionHash, ShardId, Verified, WeightedTimestamp,
 };
 
 /// A queued provisions entry awaiting block inclusion. `added_at` drives
@@ -24,7 +23,7 @@ use hyperscale_types::{
 /// via [`Provision::deadline`].
 #[derive(Debug, Clone)]
 struct QueuedProvision {
-    provisions: Arc<Verified<Provisions>>,
+    provisions: Verified<Provision>,
     added_at: LocalTimestamp,
     source_block_ts: WeightedTimestamp,
 }
@@ -33,28 +32,47 @@ struct QueuedProvision {
 #[derive(Debug)]
 pub struct QueuedProvisionBuffer {
     queue: Vec<QueuedProvision>,
+    /// The hash of every entry in `queue`, each once.
+    queued: HashSet<ProvisionHash>,
     min_dwell_time: Duration,
 }
 
 impl QueuedProvisionBuffer {
-    pub(crate) const fn new(min_dwell_time: Duration) -> Self {
+    pub(crate) fn new(min_dwell_time: Duration) -> Self {
         Self {
             queue: Vec::new(),
+            queued: HashSet::new(),
             min_dwell_time,
         }
     }
 
-    /// Push verified provisions onto the proposal queue.
+    /// Push verified provisions onto the proposal queue. A part already
+    /// queued keeps its place and its dwell.
     pub(crate) fn enqueue(
         &mut self,
-        provisions: Arc<Verified<Provisions>>,
+        provisions: Verified<Provision>,
         source_block_ts: WeightedTimestamp,
         added_at: LocalTimestamp,
     ) {
+        if !self.queued.insert(provisions.hash()) {
+            return;
+        }
         self.queue.push(QueuedProvision {
             provisions,
             added_at,
             source_block_ts,
+        });
+    }
+
+    /// Keep only the entries `keep` holds to.
+    fn retain(&mut self, keep: impl Fn(&QueuedProvision) -> bool) {
+        let queued = &mut self.queued;
+        self.queue.retain(|q| {
+            let kept = keep(q);
+            if !kept {
+                queued.remove(&q.provisions.hash());
+            }
+            kept
         });
     }
 
@@ -64,21 +82,19 @@ impl QueuedProvisionBuffer {
         if committed_hashes.is_empty() {
             return;
         }
-        self.queue
-            .retain(|q| !committed_hashes.contains(&q.provisions.hash()));
+        self.retain(|q| !committed_hashes.contains(&q.provisions.hash()));
     }
 
     /// Drop queued provisions whose deadline has passed `now`.
     pub(crate) fn drop_past_deadline(&mut self, now: WeightedTimestamp) {
-        self.queue
-            .retain(|q| q.provisions.deadline(q.source_block_ts) > now);
+        self.retain(|q| q.provisions.deadline(q.source_block_ts) > now);
     }
 
     /// Drop queued provisions sourced from `shard` strictly above a pending
     /// recovery's attested frontier — every peer rejects them, so proposing
     /// them only burns rounds.
     pub(crate) fn purge_fenced(&mut self, shard: ShardId, frontier: BlockHeight) {
-        self.queue.retain(|q| {
+        self.retain(|q| {
             q.provisions.source_shard() != shard || q.provisions.block_height() <= frontier
         });
     }
@@ -93,12 +109,12 @@ impl QueuedProvisionBuffer {
         &self,
         now: LocalTimestamp,
         weighted_now: WeightedTimestamp,
-    ) -> Vec<Arc<Verified<Provisions>>> {
+    ) -> Vec<Verified<Provision>> {
         self.queue
             .iter()
             .filter(|q| now.saturating_sub(q.added_at) >= self.min_dwell_time)
             .filter(|q| q.provisions.deadline(q.source_block_ts) > weighted_now)
-            .map(|q| Arc::clone(&q.provisions))
+            .map(|q| q.provisions.clone())
             .collect()
     }
 
@@ -125,10 +141,7 @@ impl QueuedProvisionBuffer {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Capped;
-    use hyperscale_types::{
-        BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, ShardId, TxHash,
-    };
+    use hyperscale_types::{BlockHeight, Hash, ShardId, TxHash};
 
     use super::*;
 
@@ -144,18 +157,13 @@ mod tests {
         seed: u8,
         source_shard: ShardId,
         height: BlockHeight,
-    ) -> Arc<Verified<Provisions>> {
-        Arc::new(Verified::new_unchecked_for_test(Provisions::new(
+    ) -> Verified<Provision> {
+        Verified::new_unchecked_for_test(Provision::dummy(
             source_shard,
             ShardId::leaf(1, 0),
             height,
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(&[seed])),
-                Capped::empty(),
-            )]),
-        )))
+            TxHash::from(Hash::from_bytes(&[seed])),
+        ))
     }
 
     #[test]
@@ -169,7 +177,7 @@ mod tests {
     fn enqueue_then_queued_with_zero_dwell_returns_immediately() {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
         let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
-        buf.enqueue(Arc::clone(&provisions), ts(1_000), local(100));
+        buf.enqueue(provisions, ts(1_000), local(100));
         assert_eq!(buf.queued(local(100), ts(1_000)).len(), 1);
     }
 
@@ -177,7 +185,7 @@ mod tests {
     fn dwell_filter_skips_young_provisions() {
         let mut buf = QueuedProvisionBuffer::new(Duration::from_millis(500));
         let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
-        buf.enqueue(Arc::clone(&provisions), ts(1_000), local(0));
+        buf.enqueue(provisions, ts(1_000), local(0));
         assert!(buf.queued(local(100), ts(1_000)).is_empty());
         assert_eq!(buf.queued(local(500), ts(1_000)).len(), 1);
     }
@@ -189,8 +197,8 @@ mod tests {
 
         let early = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
         let late = make_provisions(2, ShardId::leaf(1, 1), BlockHeight::new(11));
-        buf.enqueue(Arc::clone(&early), ts(1_000), local(100));
-        buf.enqueue(Arc::clone(&late), ts(2_000), local(300));
+        buf.enqueue(early.clone(), ts(1_000), local(100));
+        buf.enqueue(late.clone(), ts(2_000), local(300));
         assert_eq!(
             buf.next_eligible_at(local(200), ts(1_000)),
             Some(local(600))
@@ -213,7 +221,7 @@ mod tests {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
         let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
         let source_ts = ts(1_000);
-        buf.enqueue(Arc::clone(&provisions), source_ts, local(0));
+        buf.enqueue(provisions.clone(), source_ts, local(0));
         let live = provisions.deadline(source_ts);
         assert_eq!(
             buf.queued(local(0), live.minus(Duration::from_millis(1)))
@@ -232,7 +240,7 @@ mod tests {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
         let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
         let hash = provisions.hash();
-        buf.enqueue(Arc::clone(&provisions), ts(1_000), local(0));
+        buf.enqueue(provisions, ts(1_000), local(0));
 
         let committed: HashSet<_> = std::iter::once(hash).collect();
         buf.on_block_committed(&committed);
@@ -240,12 +248,28 @@ mod tests {
         assert_eq!(buf.queue_len(), 0);
     }
 
+    /// A part queued twice is offered once, keeps its first dwell, and
+    /// queues again once its entry has gone.
+    #[test]
+    fn a_part_queued_twice_is_offered_once() {
+        let mut buf = QueuedProvisionBuffer::new(Duration::from_millis(500));
+        let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
+        buf.enqueue(provisions.clone(), ts(1_000), local(0));
+        buf.enqueue(provisions.clone(), ts(1_000), local(400));
+        assert_eq!(buf.queue_len(), 1);
+        assert_eq!(buf.queued(local(500), ts(1_000)).len(), 1);
+
+        buf.on_block_committed(&std::iter::once(provisions.hash()).collect());
+        buf.enqueue(provisions, ts(1_000), local(600));
+        assert_eq!(buf.queue_len(), 1);
+    }
+
     #[test]
     fn drop_past_deadline_evicts_aged_provisions() {
         let mut buf = QueuedProvisionBuffer::new(Duration::ZERO);
         let provisions = make_provisions(1, ShardId::leaf(1, 1), BlockHeight::new(10));
         let source_block_ts = ts(1_000);
-        buf.enqueue(Arc::clone(&provisions), source_block_ts, local(0));
+        buf.enqueue(provisions.clone(), source_block_ts, local(0));
 
         let well_past = ts(1_000 + provisions.deadline(source_block_ts).as_millis() + 1);
         buf.drop_past_deadline(well_past);

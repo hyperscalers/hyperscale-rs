@@ -89,16 +89,36 @@ impl RocksDbShardStorage {
     }
 
     /// Install a reshape successor's derived `genesis` as this store's
-    /// chain origin and committed tip: [`adopt_plan`] decided over this
-    /// store's vintage under the commit lock, then applied in one atomic
-    /// batch, so a crash at any later point recovers the store as a
-    /// committed chain at its genesis.
+    /// chain origin and committed tip, then evict every pin beneath the
+    /// genesis.
+    ///
+    /// Those pins are the predecessor's boundaries — an observer's import
+    /// pins the parent's anchor it assembled at — and no joiner of this
+    /// chain is sent to one. Kept, the oldest of them would stand as the
+    /// store's oldest pin, which the chain floor discards as beneath the
+    /// origin, holding the floor at the genesis until retention evicted
+    /// it. The eviction follows the adoption's write, so a re-run after a
+    /// crash between the two still performs it.
     ///
     /// # Errors
     ///
     /// What [`adopt_plan`] refused, or a store that cannot yield the
     /// subtree it named.
     pub(crate) fn adopt_genesis(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+        source: AdoptSource,
+    ) -> Result<StateRoot, StorageError> {
+        let adopted = self.apply_adoption(origin, genesis, source)?;
+        self.checkpoints.evict_below(origin.genesis_height);
+        Ok(adopted)
+    }
+
+    /// [`adopt_plan`] decided over this store's vintage under the commit
+    /// lock, then applied in one atomic batch, so a crash at any later
+    /// point recovers the store as a committed chain at its genesis.
+    fn apply_adoption(
         &self,
         origin: ChainOrigin,
         genesis: &Block,
@@ -248,9 +268,10 @@ impl RocksDbShardStorage {
         // A child's history begins here, and its genesis QC carries the
         // chain origin's anchor: dating it is what puts the floor at the
         // adoption rather than below everything the parent held. The hold
-        // goes with it — every reader that named a version beneath the
-        // adoption belonged to the chain this one replaces.
+        // and its clock go with it — every reader that named a version
+        // beneath the adoption belonged to the chain this one replaces.
         self.retention_hold.store(u64::MAX, Ordering::Relaxed);
+        self.retention_clock.store(u64::MAX, Ordering::Release);
         let floor = self.advance_retention_floor(
             batch,
             genesis.height().inner(),
@@ -873,6 +894,20 @@ mod tests {
         assert_eq!(child.substate_bytes_at_version(10), Some(0));
     }
 
+    /// A pin at `height` lands exactly when the store's tree stands there,
+    /// and then captures the tree as it stands. A follower whose half the
+    /// last followed block missed is below that block, so its older state
+    /// is never labelled with the block's height.
+    fn assert_pins_only_at_its_tree(store: &RocksDbShardStorage, height: BlockHeight) {
+        let tree = store.read_jmt_metadata();
+        let pinned = store.pin_boundary(height).is_ok();
+        assert_eq!(pinned, tree.0 == height.inner());
+        if pinned {
+            let boundary = store.open_boundary(height).expect("pinned");
+            assert_eq!(boundary.read_jmt_metadata(), tree);
+        }
+    }
+
     /// Partition independence over follows: two child stores each
     /// following only their half of a chain's block writes assemble
     /// exactly the two child subtrees of a root store fed the same
@@ -950,6 +985,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
+            assert_pins_only_at_its_tree(store, BlockHeight::new(8));
             let terminal = Block::genesis(
                 ShardId::ROOT,
                 ValidatorId::new(0),
@@ -976,6 +1012,7 @@ mod tests {
             assert_eq!(recovered.committed_height, BlockHeight::new(9));
             assert_eq!(recovered.committed_hash, Some(genesis.hash()));
             assert!(recovered.latest_qc.is_none());
+            assert_pins_only_at_its_tree(store, BlockHeight::new(9));
             // Idempotent: a re-run lands on the same values.
             assert_eq!(
                 store

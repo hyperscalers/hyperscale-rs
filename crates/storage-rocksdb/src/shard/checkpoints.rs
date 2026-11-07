@@ -348,7 +348,8 @@ impl CheckpointRing {
     }
 
     /// Create a checkpoint of the database's current state, labelled with
-    /// the committed block `height` it captures.
+    /// the committed block `height` it captures. The caller holds the
+    /// store's `commit_lock` with the store at `height`.
     ///
     /// Idempotent: if a checkpoint for `height` already exists it is kept
     /// as-is (a replayed commit must not clobber a checkpoint a joiner
@@ -410,10 +411,25 @@ impl CheckpointRing {
     pub(crate) fn trim(&self, retention: BoundaryRetention) {
         let entries = self.entries();
         let evicted = retention.evicted(entries.iter().map(|(height, _)| *height));
+        Self::remove(
+            entries
+                .into_iter()
+                .filter(|(height, _)| evicted.binary_search(height).is_ok()),
+        );
+    }
+
+    /// Remove every entry below `height`, logging a failed removal as
+    /// [`Self::trim`] does.
+    pub(crate) fn evict_below(&self, height: BlockHeight) {
+        Self::remove(
+            self.entries()
+                .into_iter()
+                .filter(|(pinned, _)| *pinned < height),
+        );
+    }
+
+    fn remove(entries: impl IntoIterator<Item = (BlockHeight, PathBuf)>) {
         for (height, path) in entries {
-            if evicted.binary_search(&height).is_err() {
-                continue;
-            }
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 warn!(%height, path = %path.display(), error = %e, "checkpoint eviction failed");
             }
@@ -556,7 +572,24 @@ impl BoundaryStore for RocksDbShardStorage {
         MemberIndex::load(self, shard)
     }
 
+    /// A checkpoint captures the live store, so the pin holds
+    /// `commit_lock`: no block lands between the check that the store
+    /// stands at `height` and the capture labelled with it, and no two
+    /// creations share the ring's temporary name at once.
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| "commit lock poisoned".to_string())?;
+        if self.checkpoints.entry_path(height).exists() {
+            return Ok(());
+        }
+        let (version, _) = self.read_jmt_metadata();
+        if version != height.inner() {
+            return Err(format!(
+                "the store stands at {version}, not at the boundary {height}"
+            ));
+        }
         self.checkpoints.create(height).map_err(|e| e.to_string())
     }
 
@@ -650,7 +683,7 @@ impl BoundaryStore for RocksDbShardStorage {
                 .write(batch)
                 .map_err(|e| format!("boundary header write failed: {e}"))?;
         }
-        if let Err(error) = self.checkpoints.create(height) {
+        if let Err(error) = self.pin_boundary(height) {
             warn!(
                 %height,
                 %error,
@@ -798,6 +831,7 @@ mod tests {
         test_a_receipt_and_an_owed_credit_fill_a_vault_on_every_path,
         test_a_split_follower_applies_the_half_of_a_reclaim_it_holds,
         test_a_split_follower_drops_a_late_write_beside_a_reclaim,
+        test_an_adoption_evicts_the_pins_beneath_its_genesis,
         test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
@@ -917,6 +951,30 @@ mod tests {
         );
     }
 
+    /// A pin asked for once the boundary's child has landed — a caller
+    /// that saw the store at the boundary, then lost the race to the
+    /// child's write — is refused rather than labelling the child's
+    /// state as the boundary's. A pin the store already holds stands.
+    #[test]
+    fn a_pin_after_the_child_lands_never_captures_the_child() {
+        let temp = TempDir::new().unwrap();
+        let storage = open_storage(temp.path());
+        commit_one(&storage, 1);
+        commit_one(&storage, 2);
+
+        assert!(storage.pin_boundary(BlockHeight::new(1)).is_err());
+        assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
+
+        storage.pin_boundary(BlockHeight::new(2)).unwrap();
+        commit_one(&storage, 3);
+        storage.pin_boundary(BlockHeight::new(2)).unwrap();
+        let (version, _) = storage
+            .open_boundary(BlockHeight::new(2))
+            .expect("pinned")
+            .read_jmt_metadata();
+        assert_eq!(version, 2);
+    }
+
     #[test]
     fn pin_is_idempotent_per_height() {
         let temp = TempDir::new().unwrap();
@@ -955,6 +1013,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
         test_boundary_unpinned_height_not_served(&storage);
+    }
+
+    #[test]
+    fn an_adoption_evicts_the_pins_beneath_its_genesis() {
+        let temp = TempDir::new().unwrap();
+        let storage =
+            RocksDbShardStorage::open(temp.path(), shard_prefix_path(ShardId::ROOT.children().1))
+                .unwrap();
+        test_an_adoption_evicts_the_pins_beneath_its_genesis(&storage);
     }
 
     /// Full serve → import round trip: leaves enumerated and resolved

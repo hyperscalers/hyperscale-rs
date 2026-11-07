@@ -41,7 +41,7 @@
 //! let shared_dispatch = Arc::new(dispatch);
 //! ```
 //!
-//! [`ShardLoop`]: hyperscale_node::shard::ShardLoop
+//! [`ShardLoop`]: hyperscale_node::ShardLoop
 //! [`PooledDispatch`]: hyperscale_dispatch_pooled::PooledDispatch
 
 mod beacon_thread;

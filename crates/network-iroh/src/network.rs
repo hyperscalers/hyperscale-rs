@@ -13,6 +13,7 @@ use bytes::Bytes;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_metrics::record_request_retry;
 use hyperscale_network::compression::compress;
+use hyperscale_network::deferred::DEFER_TIMEOUT;
 use hyperscale_network::fault::Tier;
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
@@ -25,6 +26,7 @@ use hyperscale_types::{
 };
 use iroh::EndpointId;
 use tokio::runtime::Handle;
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::bind::LocalVnodeIdentity;
@@ -48,6 +50,18 @@ fn translate_request_error(err: RmRequestError) -> RequestError {
         RmRequestError::Network(e) => RequestError::PeerError(format!("{e}")),
         RmRequestError::Shutdown => RequestError::Shutdown,
     }
+}
+
+/// Count an answer the caller refused against the peer that gave it. An
+/// empty one says the peer did not hold what was asked; any other says
+/// it answered falsely.
+fn refuse_answer(rm: &RequestManager, peer: EndpointId, empty: bool) {
+    if empty {
+        rm.record_rejected(peer);
+    } else {
+        rm.record_invalid(peer);
+    }
+    record_request_retry("app_rejected");
 }
 
 /// Production network adapter implementing the Network trait over iroh.
@@ -320,6 +334,7 @@ impl Network for IrohNetwork {
         let routing_committees = Arc::clone(&self.routing_committees);
         let adapter = Arc::clone(&self.adapter);
         let rm = Arc::clone(&self.request_manager);
+        let answers = Arc::clone(&self.registry);
         let peer_unreachable_count = Arc::clone(&self.peer_unreachable_count);
 
         self.tokio_handle.spawn(async move {
@@ -417,19 +432,26 @@ impl Network for IrohNetwork {
                 .await
             {
                 Ok((peer, bytes)) => {
-                    // An empty answer the caller rejects says the peer did
-                    // not hold what was asked; any other it rejects, or one
-                    // that does not decode, says the peer answered falsely.
+                    // An answer that does not decode says the peer answered
+                    // falsely. A deferred verdict scores the peer once the
+                    // checks it waits on settle.
                     match hbor_from_slice::<R::Response>(&bytes) {
                         Ok(response) => {
                             let empty = R::is_empty_response(&response);
-                            if matches!(on_response(Ok(response)), ResponseVerdict::Reject) {
-                                if empty {
-                                    rm.record_rejected(peer);
-                                } else {
-                                    rm.record_invalid(peer);
+                            match on_response(Ok(response)) {
+                                ResponseVerdict::Accept => {}
+                                ResponseVerdict::Reject => refuse_answer(&rm, peer, empty),
+                                ResponseVerdict::Defer(deferral) => {
+                                    let score = Box::new(move |verdict: &Verdict| {
+                                        if *verdict == Verdict::Reject {
+                                            refuse_answer(&rm, peer, empty);
+                                        }
+                                    });
+                                    if let Some(id) = answers.await_answer(&deferral, score) {
+                                        sleep(DEFER_TIMEOUT).await;
+                                        answers.expire_answer(id);
+                                    }
                                 }
-                                record_request_retry("app_rejected");
                             }
                         }
                         Err(e) => {

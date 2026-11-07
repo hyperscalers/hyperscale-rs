@@ -1,7 +1,5 @@
 //! Single-proposal fetch response.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 
 use crate::{BeaconProposal, MessageClass, NetworkMessage, Verifiable};
@@ -17,13 +15,13 @@ use crate::{BeaconProposal, MessageClass, NetworkMessage, Verifiable};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetBeaconProposalResponse {
     /// The proposal, if the responder had it pooled.
-    pub proposal: Option<Arc<Verifiable<BeaconProposal>>>,
+    pub proposal: Option<Verifiable<BeaconProposal>>,
 }
 
 impl GetBeaconProposalResponse {
     /// Build a response from an optional proposal.
     #[must_use]
-    pub const fn new(proposal: Option<Arc<Verifiable<BeaconProposal>>>) -> Self {
+    pub const fn new(proposal: Option<Verifiable<BeaconProposal>>) -> Self {
         Self { proposal }
     }
 
@@ -51,10 +49,8 @@ mod tests {
     use super::*;
     use crate::VrfProof;
 
-    fn sample_proposal() -> Arc<Verifiable<BeaconProposal>> {
-        Arc::new(Verifiable::from(BeaconProposal::vrf_only(VrfProof::new(
-            [0xCD; 96],
-        ))))
+    fn sample_proposal() -> Verifiable<BeaconProposal> {
+        Verifiable::from(BeaconProposal::vrf_only(VrfProof::new([0xCD; 96])))
     }
 
     #[test]

@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use common::{HoldFilter, ShardCoordinatorSim, perturb_header_timestamp};
 use hyperscale_types::{
-    AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, Hash,
-    IDLE_PROPOSAL_INTERVAL, ProposerTimestamp, QuorumCertificate, Round, SignerBitfield,
-    VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, WeightedTimestamp,
+    AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest,
+    Epoch, Hash, IDLE_PROPOSAL_INTERVAL, ProposerTimestamp, QuorumCertificate, Round,
+    SignerBitfield, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, WeightedTimestamp,
 };
 
 const MAX_STEPS: usize = 5_000;
@@ -133,6 +133,7 @@ fn header_on_a_claimed_qc(
         parent_height,
         BlockHash::ZERO,
         parent_round,
+        Epoch::GENESIS,
         signers,
         AggregateSignature::ZERO,
         WeightedTimestamp::ZERO,

@@ -7,7 +7,7 @@
 //! reads the beacon coordinator.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_types::network::request::beacon::GetBeaconCandidateRequest;
@@ -28,7 +28,7 @@ pub struct BeaconCandidateCache {
 
 struct CachedEpoch {
     epoch: Epoch,
-    candidates: BTreeMap<BeaconBlockHash, Arc<Verified<CandidateBeaconBlock>>>,
+    candidates: BTreeMap<BeaconBlockHash, Verified<CandidateBeaconBlock>>,
 }
 
 impl BeaconCandidateCache {
@@ -44,7 +44,7 @@ impl BeaconCandidateCache {
     /// Hold `candidate`, advancing the cache to its epoch when newer.
     /// A candidate for an older epoch, or past the per-epoch cap, is
     /// not held.
-    pub(crate) fn admit(&self, candidate: Arc<Verified<CandidateBeaconBlock>>) {
+    pub(crate) fn admit(&self, candidate: Verified<CandidateBeaconBlock>) {
         let mut cached = self.inner.lock().expect("beacon candidate cache lock");
         let epoch = candidate.epoch();
         if epoch > cached.epoch {
@@ -68,9 +68,7 @@ impl BeaconCandidateCache {
                 .then(|| cached.candidates.get(&req.block_hash).cloned())
                 .flatten()
         };
-        let response = GetBeaconCandidateResponse::new(
-            candidate.map(|held| Arc::new(Verifiable::from((*held).clone()))),
-        );
+        let response = GetBeaconCandidateResponse::new(candidate.map(Verifiable::from));
         record_fetch_response_sent(
             "beacon_candidate",
             usize::from(response.candidate.is_some()),

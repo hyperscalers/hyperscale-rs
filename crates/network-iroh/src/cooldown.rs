@@ -15,7 +15,8 @@
 //! item for item. What keeps an honest peer clear is that the refusals it
 //! causes cost little: a host that is behind ignores items it cannot place
 //! yet, and is charged only the work of reading them, while the heavy
-//! charge is kept for items no honest peer sends.
+//! charge is kept for items no honest peer sends. An item refused because
+//! this host has no room for it is not charged at all.
 //!
 //! A cooldown, once begun, runs its course. Work charged while it lasts is
 //! for traffic read before it began, so it adds to the debt without

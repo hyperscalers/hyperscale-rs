@@ -343,14 +343,11 @@ where
 
     /// Certified header at `height`. Header-only view of
     /// [`Self::certified_block`] — pending entry first, base store fallback.
-    pub fn certified_header(
-        &self,
-        height: BlockHeight,
-    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    pub fn certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
         if let Some(certified) = self.pending_certified_at(height) {
-            return Some(Arc::new(certified.certified_header()));
+            return Some(certified.certified_header());
         }
-        self.base.get_certified_header(height).map(Arc::new)
+        self.base.get_certified_header(height)
     }
 
     /// Certified-but-uncommitted header at `height`, if any — the certified
@@ -365,9 +362,9 @@ where
     pub fn certified_uncommitted_header(
         &self,
         height: BlockHeight,
-    ) -> Option<Arc<Verified<CertifiedBlockHeader>>> {
+    ) -> Option<Verified<CertifiedBlockHeader>> {
         self.pending_certified_uncommitted_at(height)
-            .map(|certified| Arc::new(certified.certified_header()))
+            .map(|certified| certified.certified_header())
     }
 
     /// Whether the block at `height` carries `tx`, or `None` when no
@@ -483,7 +480,7 @@ where
     /// `None` where the block itself is absent or any of the
     /// finalizations its manifest names is: the settled fold derives its
     /// set from these, so a short read is a hole and not a shorter block.
-    fn attestations_at(&self, height: BlockHeight) -> Option<Vec<Arc<Verifiable<Finalization>>>> {
+    fn attestations_at(&self, height: BlockHeight) -> Option<Vec<Verifiable<Finalization>>> {
         if let Some(certified) = self
             .pending_certified_at(height)
             .or_else(|| self.pending_certified_uncommitted_at(height))
@@ -500,8 +497,7 @@ where
         let metadata = self.base.get_block_metadata(height)?;
         let ids = metadata.manifest().cert_ids();
         let stored = self.base.get_certificates_batch(ids);
-        (stored.len() == ids.len())
-            .then(|| stored.into_iter().map(|fw| Arc::new(fw.into())).collect())
+        (stored.len() == ids.len()).then(|| stored.into_iter().map(Verifiable::from).collect())
     }
 
     /// The settled-transaction root a terminating boundary header
@@ -523,7 +519,7 @@ where
     pub fn terminal_settled_txs_root(
         &self,
         window: &TerminalWindow,
-        own_certificates: &[Arc<Verifiable<Finalization>>],
+        own_certificates: &[Verifiable<Finalization>],
     ) -> Result<SettledTxsRoot, WindowCoverage> {
         let (settled, coverage) = self.settled_txs_in_window(
             window.local_shard,
@@ -1105,6 +1101,58 @@ impl<Snap: Substates> Anchored for ViewSnapshot<Snap> {
     }
 }
 
+/// The state a block leaves, read before the block is held anywhere: its
+/// parent's anchored state with the block's own settled writes laid over
+/// it.
+///
+/// What a proposer and a voter hold between `prepare_block_commit` and
+/// the block's commit. It reads what [`PendingChain::view_at`] of the
+/// block reads once the block is held, pending or persisted: the
+/// block's settled writes state every cell and entry it changed outright.
+pub struct PreparedBlockView<'a, P> {
+    /// The parent's anchored state.
+    pub parent: &'a P,
+    /// The block's prepared tree, whose settled writes are its complete
+    /// change.
+    pub block: &'a JmtSnapshot,
+}
+
+impl<P: Substates> Substates for PreparedBlockView<'_, P> {
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        let mut value = self.parent.cell(key);
+        self.block.settled.lay_leaf(key, &mut value);
+        value
+    }
+
+    fn entries_in_range(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        lo: u128,
+        hi: u128,
+        limit: usize,
+    ) -> Vec<(u128, Vec<u8>)> {
+        merge_entry_overlay(
+            self.parent,
+            entry_overlay_range(self.block.settled.entries(), owner, collection, lo, hi),
+            owner,
+            collection,
+            lo,
+            hi,
+            limit,
+        )
+    }
+}
+
+/// A view whose state at its anchor is held neither by its own chain nor
+/// by the base: retention has passed the anchor, or the anchor is above
+/// the base's tip where the view's chain does not end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchorUnheld {
+    /// The view's anchor.
+    pub anchor: BlockHeight,
+}
+
 /// A sweep walk over a store that had persisted past the view's anchor
 /// by the time the walk finished.
 ///
@@ -1224,11 +1272,96 @@ impl<S: SubstateStore + VersionedStore> SubstateView<S> {
     pub fn serves_at(&self, height: BlockHeight) -> bool {
         height.inner() >= self.base.retention_floor()
     }
+
+    /// Whether this view holds the state the block at `height` left: a
+    /// block of its own chain, or one the base has persisted. A read at
+    /// a height it does not hold answers the base's tip instead.
+    #[must_use]
+    pub fn holds(&self, height: BlockHeight) -> bool {
+        height <= (*self.base).jmt_height()
+            || self.versioned_settled.iter().any(|(at, _)| *at == height)
+    }
+
+    /// This view's state at its anchor, or `None` where the view does not
+    /// hold it: an anchor above the base's tip that its own chain does
+    /// not end at, or one at or below the tip whose history the base no
+    /// longer keeps.
+    ///
+    /// The reading a network-supplied anchor goes through, where
+    /// [`SubstateStore::snapshot`] would read a stale tip or panic below
+    /// the retention floor.
+    #[must_use]
+    pub fn served_snapshot(&self) -> Option<ViewSnapshot<S::Versioned>> {
+        self.held_base()
+            .map(|base_snapshot| self.over(base_snapshot))
+    }
+
+    /// The base as of the anchor, where the view holds it: history at or
+    /// below the base's tip, or the tip its own chain ends at.
+    fn held_base(&self) -> Option<S::Versioned> {
+        if self.anchor_height <= (*self.base).jmt_height() {
+            (*self.base).snapshot_held_at(self.anchor_height)
+        } else if self
+            .versioned_settled
+            .last()
+            .is_some_and(|(at, _)| *at == self.anchor_height)
+        {
+            Some((*self.base).snapshot_at(self.anchor_height))
+        } else {
+            None
+        }
+    }
+
+    /// The entry at `order` as this view reads it at its anchor.
+    ///
+    /// The pending entries answer first; beneath them the base is read
+    /// on [`Self::served_snapshot`]'s terms, so a pending tip answers and
+    /// a base whose retention passed the anchor says it cannot rather
+    /// than reading a later version or panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`AnchorUnheld`] where neither the pending entries nor the base
+    /// can answer at the anchor.
+    pub fn entry_held(
+        &self,
+        owner: Address,
+        collection: CollectionId,
+        order: u128,
+    ) -> Result<Option<Vec<u8>>, AnchorUnheld> {
+        let key = EntryKey {
+            owner,
+            collection,
+            order,
+        };
+        if let Some(change) = self.overlay_entries.get(&key) {
+            return Ok(change.clone());
+        }
+        self.held_base()
+            .map(|base| base.entry(owner, collection, order))
+            .ok_or(AnchorUnheld {
+                anchor: self.anchor_height,
+            })
+    }
+
+    /// The view's overlay laid over `base_snapshot`, a base reading at
+    /// the anchor.
+    fn over<Snap>(&self, base_snapshot: Snap) -> ViewSnapshot<Snap> {
+        ViewSnapshot {
+            base_snapshot,
+            anchor: self.anchor_height,
+            overlay: Arc::clone(&self.overlay),
+            overlay_entries: Arc::clone(&self.overlay_entries),
+            // Share the base-read cache so reads via either the view's
+            // direct impl or this snapshot populate the same map.
+            base_reads: Arc::clone(&self.base_reads),
+        }
+    }
 }
 
 impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
     type Snapshot<'a>
-        = ViewSnapshot<S::Snapshot<'a>>
+        = ViewSnapshot<S::Versioned>
     where
         Self: 'a;
 
@@ -1239,15 +1372,7 @@ impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
         // leak post-anchor writes when this validator has persisted past
         // descendants that others haven't. This is the determinism fix
         // for cross-validator state_root computation.
-        ViewSnapshot {
-            base_snapshot: (*self.base).snapshot_at(self.anchor_height),
-            anchor: self.anchor_height,
-            overlay: Arc::clone(&self.overlay),
-            overlay_entries: Arc::clone(&self.overlay_entries),
-            // Share the base-read cache so reads via either the view's
-            // direct impl or this snapshot populate the same map.
-            base_reads: Arc::clone(&self.base_reads),
-        }
+        self.over((*self.base).snapshot_at(self.anchor_height))
     }
 
     fn jmt_height(&self) -> BlockHeight {
@@ -1353,9 +1478,9 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{test_prefix, test_transaction};
     use hyperscale_types::{
-        Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
+        Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader, Epoch,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, LocalKey, Provisions, Role, Round, SettledWrites, SignerBitfield, StateWrites,
+        Hash, LocalKey, Provision, Role, Round, SettledWrites, SignerBitfield, StateWrites,
         TickHalf, TickId, Transaction, TxHash, TxOutcome, WitnessSources,
     };
 
@@ -1495,15 +1620,17 @@ mod tests {
     }
 
     impl VersionedStore for StubStore {
+        type Versioned = StubSnapshot;
+
         fn retention_floor(&self) -> u64 {
             0
         }
 
-        fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
+        fn snapshot_held_at(&self, height: BlockHeight) -> Option<StubSnapshot> {
             (height <= self.jmt_height()).then(|| self.snapshot_at(height))
         }
 
-        fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+        fn snapshot_at(&self, height: BlockHeight) -> StubSnapshot {
             self.recorded_snapshot_at
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1515,7 +1642,7 @@ mod tests {
             None
         }
 
-        fn hold_retention_at(&self, _height: BlockHeight) {}
+        fn hold_retention_at(&self, _height: BlockHeight, _clock: WeightedTimestamp) {}
     }
 
     impl TreeReader for StubStore {
@@ -1531,7 +1658,7 @@ mod tests {
     }
 
     impl ShardChainReader for StubStore {
-        fn provisions_at(&self, _height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+        fn provisions_at(&self, _height: BlockHeight) -> Vec<Verifiable<Provision>> {
             Vec::new()
         }
 
@@ -1887,6 +2014,30 @@ mod tests {
         assert_eq!(view.cell(cell(test_prefix(9), [1; 16])), None);
     }
 
+    /// A served reading exists only where the view holds its anchor's
+    /// state: its own chain ends there, or the base has persisted it. A
+    /// view of a block whose prep this chain does not hold, above the
+    /// base's tip, would read the tip instead, so it serves nothing.
+    #[test]
+    fn a_served_snapshot_needs_the_anchors_state() {
+        let chain = empty_chain();
+        let height = BlockHeight::new(3);
+        let (held, unheld) = (bh(b"held"), bh(b"unheld"));
+        chain.insert(
+            held,
+            entry_at(bh(b"parent"), height, &StateWrites::default()),
+        );
+
+        assert!(chain.view_at(held, height).served_snapshot().is_some());
+        assert!(chain.view_at(unheld, height).served_snapshot().is_none());
+
+        chain.base().persisted.store(3, Ordering::SeqCst);
+        assert!(
+            chain.view_at(unheld, height).served_snapshot().is_some(),
+            "a persisted height is the base's to read",
+        );
+    }
+
     // ── chain reader accessors ────────────────────────────────────────
 
     use crate::test_helpers::{make_test_block, make_test_block_with_anchor_wt, make_test_qc};
@@ -2186,8 +2337,8 @@ mod tests {
 
     /// The tick's certificate, settling one leg that ran: what reaches
     /// beyond this shard, and so what puts it in the settled set.
-    fn ec_for(tick: &TickId) -> Arc<ExecutionCertificate> {
-        Arc::new(ExecutionCertificate::new(
+    fn ec_for(tick: &TickId) -> ExecutionCertificate {
+        ExecutionCertificate::new(
             *tick,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
@@ -2200,7 +2351,7 @@ mod tests {
             .as_role(Role::Leg)]),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ))
+        )
     }
 
     /// A `BlockForSync` at `height` whose QC carries `wt_ms` and whose
@@ -2217,7 +2368,7 @@ mod tests {
         else {
             unreachable!("make_test_block returns a Live block")
         };
-        let certs = vec![Arc::new(
+        let certs = vec![
             Finalization::new(
                 *settles,
                 TickHalf::Determined,
@@ -2225,7 +2376,7 @@ mod tests {
                 Capped::from_array([]),
             )
             .into(),
-        )];
+        ];
         let block = Block::Live {
             header,
             transactions,
@@ -2248,6 +2399,7 @@ mod tests {
             height,
             block.header().parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::new([0u8; 96]),
             WeightedTimestamp::from_millis(wt_ms.saturating_add(1_000_000)),
@@ -2362,9 +2514,9 @@ mod tests {
         else {
             unreachable!("make_test_block returns a Live block")
         };
-        let txs: Vec<Arc<Verifiable<Transaction>>> = seeds
+        let txs: Vec<Verifiable<Transaction>> = seeds
             .iter()
-            .map(|&seed| Arc::new(Verifiable::from(test_transaction(seed))))
+            .map(|&seed| Verifiable::from(test_transaction(seed)))
             .collect();
         let block = Block::Live {
             header,
@@ -2388,6 +2540,7 @@ mod tests {
             height,
             block.header().parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(4),
             AggregateSignature::new([0u8; 96]),
             WeightedTimestamp::from_millis(wt_ms.saturating_add(1_000_000)),

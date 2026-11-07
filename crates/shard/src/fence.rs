@@ -24,8 +24,8 @@
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Block, BoundaryAttestation, CounterpartMirror, ProvenAnchors,
-    ShardId, StateClaim, TopologySchedule, WeightedTimestamp,
+    AbandonmentRecord, Anchor, Block, BoundaryAttestation, CounterpartMirror, MAX_VALIDITY_RANGE,
+    ProvenAnchors, ShardId, StateClaim, TopologySchedule, WeightedTimestamp,
 };
 
 use crate::precut::{Precut, PrecutStatus};
@@ -290,6 +290,14 @@ impl VoteFence<'_> {
     /// rather than deferring on the first unresolved transaction it
     /// meets.
     ///
+    /// The line is the block's own anchor. One anchored
+    /// `MAX_VALIDITY_RANGE` or more past the cut passes here: no window
+    /// it can carry opens before the cut, and the body root check refuses
+    /// one that claims to. Below it a right child that has stopped asking
+    /// defers, so a block that does not extend this validator's committed
+    /// block cannot carry a pre-cut transaction past a guard its commit
+    /// retired.
+    ///
     /// Provisions are left out. A batch carries its *source* shard's
     /// weighted timestamp where the cut is in this chain's, so a rule
     /// written on that comparison would refuse honest batches near the
@@ -301,6 +309,9 @@ impl VoteFence<'_> {
     /// A transaction the parent's terminal state marks committed, or one
     /// not yet answered for.
     pub(crate) fn precut(&self, block: &Block) -> Result<(), Withheld> {
+        if block.header().parent_qc().weighted_timestamp() >= self.cut.plus(MAX_VALIDITY_RANGE) {
+            return Ok(());
+        }
         let mut deferred = None;
         for tx in block
             .transactions()
@@ -480,7 +491,10 @@ mod tests {
         for (at, boundary) in boundaries.iter().enumerate() {
             schedule.insert(Epoch::new(at as u64 + 1), snapshot(Some(boundary)));
         }
-        schedule.set_head(snapshot(boundaries.last()));
+        schedule.set_head(
+            Epoch::new(boundaries.len() as u64),
+            snapshot(boundaries.last()),
+        );
         schedule
     }
 
@@ -492,6 +506,7 @@ mod tests {
             BlockHeight::new(5),
             BlockHash::ZERO,
             Round::new(5),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(anchor_ms),
@@ -783,12 +798,7 @@ mod tests {
             WeightedTimestamp::from_millis(500),
             WeightedTimestamp::from_millis(60_000),
         );
-        let tx = Arc::new(stub_transaction(
-            test_principal(1),
-            &[test_prefix(1)],
-            1_000,
-            validity,
-        ));
+        let tx = stub_transaction(test_principal(1), &[test_prefix(1)], 1_000, validity);
         let marker = committed_tx_cell_key(parent, tx.hash(), validity.end_timestamp_exclusive);
         let block = make_live_block(
             right,
@@ -858,7 +868,7 @@ mod tests {
                 committed: CommittedAt {
                     height: BlockHeight::new(3),
                     anchor: WeightedTimestamp::from_millis(3_000),
-                    committee_anchor: WeightedTimestamp::from_millis(2_000),
+                    committee_epoch: Epoch::GENESIS,
                 },
                 reach: Capped::from_array([RoutePrefix::of(Address::new(
                     [0x33; 31],

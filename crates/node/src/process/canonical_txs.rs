@@ -1,7 +1,6 @@
 //! Process-wide canonical transaction instances.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 
 use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{Transaction, TxHash};
@@ -18,7 +17,7 @@ const CANONICAL_TX_CACHE_SIZE: usize = 10_000;
 /// and every arrival decodes a fresh allocation with an empty
 /// `validated` cache — left alone, each shard re-runs the full
 /// signature/decode validation. Mapping every ingress onto one canonical
-/// `Arc` shares the instance's `OnceLock` validation verdict instead:
+/// body shares the instance's `OnceLock` validation verdict instead:
 /// the first shard to validate populates it, concurrent shards block
 /// on the in-flight init rather than racing, and failed verdicts
 /// dedupe the same way. Per-shard admission (pending-validation
@@ -27,7 +26,7 @@ const CANONICAL_TX_CACHE_SIZE: usize = 10_000;
 /// Identity here is the body hash — the same identity every per-shard
 /// dedup (tx store, pending-validation set) already keys by.
 pub struct CanonicalTxs {
-    cache: BoundedCache<TxHash, Arc<Transaction>>,
+    cache: BoundedCache<TxHash, Transaction>,
 }
 
 impl CanonicalTxs {
@@ -39,10 +38,10 @@ impl CanonicalTxs {
 
     /// Map `tx` onto the process-wide canonical instance for its hash.
     /// The first arrival's instance wins; later arrivals get it back.
-    pub(crate) fn canonicalize(&self, tx: &Arc<Transaction>) -> Arc<Transaction> {
+    pub(crate) fn canonicalize(&self, tx: &Transaction) -> Transaction {
         let hash = tx.hash();
         self.cache
-            .get_or_insert_with(&hash, || Ok::<_, Infallible>(Arc::clone(tx)))
+            .get_or_insert_with(&hash, || Ok::<_, Infallible>(tx.clone()))
             .expect("get_or_insert_with closure is infallible")
     }
 }
@@ -56,22 +55,23 @@ mod tests {
     #[test]
     fn later_arrivals_map_onto_the_first_instance() {
         let canon = CanonicalTxs::new();
-        let first = Arc::new(test_transaction(1));
-        let second = Arc::new(first.as_ref().clone());
-        assert!(!Arc::ptr_eq(&first, &second));
+        let first = test_transaction(1);
+        let second = test_transaction(1);
+        assert_eq!(first.hash(), second.hash());
+        assert!(!first.same_body(&second));
 
         let a = canon.canonicalize(&first);
         let b = canon.canonicalize(&second);
-        assert!(Arc::ptr_eq(&a, &first));
-        assert!(Arc::ptr_eq(&b, &first));
+        assert!(a.same_body(&first));
+        assert!(b.same_body(&first));
     }
 
     #[test]
     fn distinct_transactions_keep_distinct_instances() {
         let canon = CanonicalTxs::new();
-        let one = canon.canonicalize(&Arc::new(test_transaction(1)));
-        let two = canon.canonicalize(&Arc::new(test_transaction(2)));
-        assert!(!Arc::ptr_eq(&one, &two));
+        let one = canon.canonicalize(&test_transaction(1));
+        let two = canon.canonicalize(&test_transaction(2));
+        assert!(!one.same_body(&two));
         assert_ne!(one.hash(), two.hash());
     }
 }

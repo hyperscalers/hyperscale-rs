@@ -1,26 +1,34 @@
 //! `ProvisionsNotification` message for cross-shard provisions.
 
-use std::sync::Arc;
+use hyperscale_hbor::{Capped, Hbor};
 
-use hyperscale_hbor::Hbor;
-
+use crate::provisioning::provision::in_leaf_order;
 use crate::{
-    ConsensusSignature, MessageClass, NetworkDefinition, NetworkMessage, Provisions,
-    ProvisionsSenderMessage, Signed, ValidatorId, Verifiable, signed_bytes,
+    BlockHeight, ConsensusSignature, MAX_TXS_PER_BLOCK, MessageClass, NetworkDefinition,
+    NetworkMessage, Provision, ProvisionsSenderMessage, ShardId, Signed, ValidatorId, Verifiable,
+    signed_bytes,
 };
 
-/// Cross-shard state provisions for one (`source_block`, `target_shard`) pair.
+/// Some of one source block's parts for one target shard, packed under
+/// one signature.
 ///
 /// Only the block proposer sends these. The sender signature authenticates
-/// the notification, allowing receivers to reject forged provisions before
-/// doing expensive merkle proof verification.
+/// the notification, allowing receivers to reject forged parts before
+/// doing expensive merkle proof verification. A block's parts for a
+/// target ride in as many notifications as the frame needs; each part
+/// stands on its own once it lands.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ProvisionsNotification {
-    /// The provisions bundle being sent (one bundle per target shard).
-    /// Wire bytes always land in `Verifiable::Unverified`;
-    /// local-dispatched sends from a colocated proposer preserve
-    /// `Verifiable::Verified`.
-    pub provisions: Arc<Verifiable<Provisions>>,
+    /// The shard the parts were produced on.
+    pub source_shard: ShardId,
+    /// The shard the parts serve.
+    pub target_shard: ShardId,
+    /// The source block the parts were read at.
+    pub block_height: BlockHeight,
+    /// The packed parts, each naming the scope above. Wire bytes always
+    /// land in `Verifiable::Unverified`; local-dispatched sends from a
+    /// colocated proposer preserve `Verifiable::Verified`.
+    pub parts: Capped<Vec<Verifiable<Provision>>, MAX_TXS_PER_BLOCK>,
     /// The validator who sent this notification.
     pub(crate) sender: ValidatorId,
     /// Signature over the domain-separated signing message, by the sender.
@@ -30,16 +38,34 @@ pub struct ProvisionsNotification {
 impl ProvisionsNotification {
     /// Create a new signed provisions notification.
     #[must_use]
-    pub fn new(
-        provisions: impl Into<Arc<Verifiable<Provisions>>>,
+    pub const fn new(
+        source_shard: ShardId,
+        target_shard: ShardId,
+        block_height: BlockHeight,
+        parts: Capped<Vec<Verifiable<Provision>>, MAX_TXS_PER_BLOCK>,
         sender: ValidatorId,
         sender_signature: ConsensusSignature,
     ) -> Self {
         Self {
-            provisions: provisions.into(),
+            source_shard,
+            target_shard,
+            block_height,
+            parts,
             sender,
             sender_signature,
         }
+    }
+
+    /// Whether every packed part names the notification's own scope, the
+    /// parts strictly ascending by leaf index, so none rides in twice.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        self.parts.iter().all(|part| {
+            let part = part.as_unverified();
+            part.source_shard() == self.source_shard
+                && part.target_shard() == self.target_shard
+                && part.block_height() == self.block_height
+        }) && in_leaf_order(self.parts.iter().map(Verifiable::as_unverified))
     }
 }
 
@@ -54,7 +80,12 @@ impl Signed for ProvisionsNotification {
 
     fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(
-            &ProvisionsSenderMessage::new(self.provisions.as_unverified()),
+            &ProvisionsSenderMessage::new(
+                self.source_shard,
+                self.target_shard,
+                self.block_height,
+                self.parts.iter().map(Verifiable::as_unverified),
+            ),
             network,
         )
     }
@@ -67,5 +98,50 @@ impl NetworkMessage for ProvisionsNotification {
 
     fn class() -> MessageClass {
         MessageClass::CrossShardProgress
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Hash, TxHash};
+
+    const SOURCE: ShardId = ShardId::leaf(1, 0);
+    const TARGET: ShardId = ShardId::leaf(1, 1);
+
+    fn packing(indices: &[u32]) -> ProvisionsNotification {
+        let parts = indices
+            .iter()
+            .map(|&index| {
+                Verifiable::from(
+                    Provision::dummy(
+                        SOURCE,
+                        TARGET,
+                        BlockHeight::new(4),
+                        TxHash::from(Hash::from_bytes(&index.to_le_bytes())),
+                    )
+                    .at_leaf(index, 8),
+                )
+            })
+            .collect();
+        ProvisionsNotification::new(
+            SOURCE,
+            TARGET,
+            BlockHeight::new(4),
+            Capped::new(parts).expect("a few parts"),
+            ValidatorId::new(0),
+            ConsensusSignature::ZERO,
+        )
+    }
+
+    /// A pack lays its parts out strictly by leaf index, so one carrying
+    /// a part twice, or out of order, is refused before its signature is
+    /// paid for.
+    #[test]
+    fn a_pack_repeating_or_reordering_a_leaf_is_refused() {
+        assert!(packing(&[]).is_well_formed());
+        assert!(packing(&[0, 2, 5]).is_well_formed());
+        assert!(!packing(&[0, 2, 2]).is_well_formed(), "a leaf twice");
+        assert!(!packing(&[2, 0]).is_well_formed(), "out of order");
     }
 }

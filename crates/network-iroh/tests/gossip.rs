@@ -2,21 +2,24 @@
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::fault::HostId;
-use hyperscale_network::{HandlerRegistry, Network, ValidatorKeyMap, Verdict, VerdictKey};
+use hyperscale_network::{
+    HandlerRegistry, Network, PeerId, Provenance, ValidatorKeyMap, Verdict, VerdictKey,
+};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::testing::CountingVerifier;
 use hyperscale_network_iroh::{
     AddVnodeError, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, RequestManager,
     RequestManagerConfig, RequestPool, RequestStreams,
 };
+use hyperscale_node::event::{HostEvent, ShardScopedInput, network_lane};
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GossipMessage, GossipScope, MessageClass, NetworkDefinition, NetworkMessage, RoutingCommittees,
@@ -128,6 +131,27 @@ impl NetworkMessage for Vote {
     }
 }
 
+/// A notification as large as a busy peer's, as far as the transport is
+/// concerned.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Bulk {
+    seq: u64,
+    body: Vec<u8>,
+}
+
+impl NetworkMessage for Bulk {
+    fn message_type_id() -> &'static str {
+        "test.bulk"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Bulk
+    }
+}
+
+/// Places in the shard lane a quota test fills.
+const QUOTA_LANE: usize = 4;
+
 /// Votes a cooled down peer sends while it is watched.
 const VOTES_WHILE_COOLING: u64 = 10;
 
@@ -154,6 +178,13 @@ const HONEST_RATE: u32 = 300;
 
 /// How long the honest peer keeps sending.
 const HONEST_WATCH_SECS: u32 = 15;
+
+/// Size of a header a host with no room refuses: at [`HONEST_RATE`], the
+/// work of reading such headers outruns what time pays down.
+const BUSY_HEADER_BYTES: usize = 128 * 1024;
+
+/// How long the peer keeps sending a host with no room.
+const BUSY_WATCH_SECS: u32 = 6;
 
 /// Items a validator sends from each endpoint it binds as.
 const ROTATION_FLOOD: u64 = 200;
@@ -484,11 +515,11 @@ async fn a_host_that_serves_no_shard_receives_a_beacon_block() {
     // one that accepts keeps the type known to its registry.
     follower
         .network
-        .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId, _: Provenance| Verdict::Accept);
     for seated in &hosts[..SEATED as usize] {
         seated
             .network
-            .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
+            .register_gossip_handler(|_: BeaconBlock, _: ShardId, _: Provenance| Verdict::Accept);
     }
 
     // The follower learned the committee from the host it bootstrapped to.
@@ -515,11 +546,12 @@ async fn a_shard_item_reaches_its_committee_and_nobody_else() {
     let mut receivers = Vec::new();
     for host in &hosts {
         let (tx, rx) = mpsc::unbounded_channel();
-        host.network
-            .register_gossip_handler(move |item: Transactions, shard: ShardId| {
+        host.network.register_gossip_handler(
+            move |item: Transactions, shard: ShardId, _: Provenance| {
                 let _ = tx.send((item, shard));
                 Verdict::Accept
-            });
+            },
+        );
         receivers.push(rx);
     }
 
@@ -552,7 +584,7 @@ async fn a_global_item_is_handled_once_however_many_copies_arrive() {
         let count = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&count);
         host.network
-            .register_gossip_handler(move |_: BeaconBlock, _: ShardId| {
+            .register_gossip_handler(move |_: BeaconBlock, _: ShardId, _: Provenance| {
                 counted.fetch_add(1, Ordering::SeqCst);
                 Verdict::Accept
             });
@@ -701,12 +733,12 @@ async fn a_host_that_is_behind_still_hears_a_peer_whose_items_it_refuses() {
     // has not learned. The sender is honest and busy.
     let handled = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&handled);
-    receiver
-        .network
-        .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
+    receiver.network.register_gossip_handler(
+        move |_: CommittedHeader, _: ShardId, _: Provenance| {
             counted.fetch_add(1, Ordering::SeqCst);
             Verdict::Ignore
-        });
+        },
+    );
 
     let sent = HONEST_RATE * HONEST_WATCH_SECS;
     let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
@@ -724,6 +756,42 @@ async fn a_host_that_is_behind_still_hears_a_peer_whose_items_it_refuses() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_host_with_no_room_does_not_cool_down_a_peer_whose_items_it_refuses() {
+    let fixtures = TestFixtures::new(21, 2);
+    let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
+
+    // The receiver's queues are full and it refuses every header for want
+    // of room. The headers are large enough that reading each one, were
+    // it charged, would cost the sender more than time pays down.
+    let handled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&handled);
+    receiver.network.register_gossip_handler(
+        move |_: CommittedHeader, _: ShardId, _: Provenance| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Verdict::Busy
+        },
+    );
+
+    let sent = HONEST_RATE * BUSY_WATCH_SECS;
+    let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+    for seq in 0..sent {
+        tick.tick().await;
+        sender.network.broadcast_global(&CommittedHeader {
+            seq: u64::from(seq),
+            body: vec![7; BUSY_HEADER_BYTES],
+        });
+    }
+    wait_for("every refused header is still read", || {
+        handled.load(Ordering::SeqCst) == sent as usize
+    })
+    .await;
+    assert!(
+        !receiver.adapter.cooling_down(vid(1)),
+        "refusing for want of room costs the sender nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_peer_whose_items_are_rejected_is_cooled_down() {
     let fixtures = TestFixtures::new(21, 2);
     let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
@@ -732,12 +800,12 @@ async fn a_peer_whose_items_are_rejected_is_cooled_down() {
     // header is the sender's fault: each costs it a signature check's worth.
     let handled = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&handled);
-    receiver
-        .network
-        .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
+    receiver.network.register_gossip_handler(
+        move |_: CommittedHeader, _: ShardId, _: Provenance| {
             counted.fetch_add(1, Ordering::SeqCst);
             Verdict::Reject
-        });
+        },
+    );
 
     let start = Instant::now();
     let sent = HONEST_RATE * REJECTED_WATCH_SECS;
@@ -798,7 +866,7 @@ async fn an_item_travels_on_only_once_its_deferred_check_holds_up() {
     let (keys_tx, mut keys) = mpsc::unbounded_channel();
     relay
         .network
-        .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
+        .register_gossip_handler(move |block: BeaconBlock, _: ShardId, _: Provenance| {
             let key = VerdictKey::of(&block);
             let _ = keys_tx.send(key);
             Verdict::defer(key)
@@ -811,7 +879,7 @@ async fn an_item_travels_on_only_once_its_deferred_check_holds_up() {
         });
     follower
         .network
-        .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId, _: Provenance| Verdict::Accept);
 
     sender.network.broadcast_global(&BeaconBlock(7));
     let key = timeout(BUDGET, keys.recv())
@@ -847,9 +915,8 @@ async fn a_peer_whose_items_fail_their_deferred_check_is_cooled_down() {
     let counted = Arc::clone(&checked);
     let network = Arc::clone(&receiver.network);
     let handle = Handle::current();
-    receiver
-        .network
-        .register_gossip_handler(move |header: CommittedHeader, _: ShardId| {
+    receiver.network.register_gossip_handler(
+        move |header: CommittedHeader, _: ShardId, _: Provenance| {
             let key = VerdictKey::of(&header);
             let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
             handle.spawn(async move {
@@ -858,7 +925,8 @@ async fn a_peer_whose_items_fail_their_deferred_check_is_cooled_down() {
                 network.settle(key, Verdict::Reject);
             });
             Verdict::defer(key)
-        });
+        },
+    );
 
     let start = Instant::now();
     let sent = HONEST_RATE * REJECTED_WATCH_SECS;
@@ -889,12 +957,12 @@ async fn a_validator_binding_again_under_a_new_endpoint_is_still_cooled_down() {
     let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
     let handled = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&handled);
-    receiver
-        .network
-        .register_gossip_handler(move |_: CommittedHeader, _: ShardId| {
+    receiver.network.register_gossip_handler(
+        move |_: CommittedHeader, _: ShardId, _: Provenance| {
             counted.fetch_add(1, Ordering::SeqCst);
             Verdict::Reject
-        });
+        },
+    );
     let flood = |host: &Host, from: u64| {
         for seq in from..from + ROTATION_FLOOD {
             host.network.broadcast_global(&CommittedHeader {
@@ -968,7 +1036,7 @@ async fn gossip_does_not_cross_a_partition() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     second
         .network
-        .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
+        .register_gossip_handler(move |block: BeaconBlock, _: ShardId, _: Provenance| {
             let _ = tx.send(block);
             Verdict::Accept
         });
@@ -987,18 +1055,124 @@ async fn gossip_does_not_cross_a_partition() {
     assert_eq!(delivered, Some(BeaconBlock(2)));
 }
 
+/// A receiver and two senders bound to it, each known to it by its own
+/// validator.
+async fn counted_trio(fixtures: &TestFixtures) -> (Host, Host, Host) {
+    let (receiver, _counted, first) = counted_pair(fixtures, &[ShardId::ROOT]).await;
+    let second = host(
+        fixtures,
+        2,
+        &[ShardId::ROOT],
+        vec![receiver.adapter.endpoint_addr()],
+    )
+    .await;
+    wait_for("the second sender binds", || {
+        receiver.adapter.peer_for_validator(vid(2)).is_some()
+            && second.adapter.peer_for_validator(vid(0)).is_some()
+    })
+    .await;
+    (receiver, first, second)
+}
+
+/// The peer a host carrying validator `index` is to its handlers.
+fn peer_of(index: u32) -> Provenance {
+    Provenance::Peer(PeerId::new(u64::from(index)))
+}
+
+/// A handler is told which peer handed it each notification: the peer as
+/// its budget is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_is_told_which_peer_handed_it_each_notification() {
+    let fixtures = TestFixtures::new(21, 3);
+    let (receiver, first, second) = counted_trio(&fixtures).await;
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&heard);
+    receiver
+        .network
+        .register_notification_handler(move |vote: Vote, provenance: Provenance| {
+            recorded.lock().unwrap().push((vote.0, provenance));
+            Verdict::Accept
+        });
+
+    first.network.notify(&[vid(0)], &Vote(1));
+    second.network.notify(&[vid(0)], &Vote(2));
+    wait_for("both votes are heard", || heard.lock().unwrap().len() == 2).await;
+
+    let mut heard = heard.lock().unwrap().clone();
+    heard.sort_by_key(|(vote, _)| *vote);
+    assert_eq!(heard, vec![(1, peer_of(1)), (2, peer_of(2))]);
+}
+
+/// A peer that holds a shard's network lane past its share, once another
+/// peer wants room there, is refused as ignored and cooled down; the other
+/// peer, within its share, is refused for want of room and owes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_past_its_share_of_a_full_lane_is_cooled_down_and_one_within_it_is_not() {
+    let fixtures = TestFixtures::new(21, 3);
+    let (receiver, flooder, honest) = counted_trio(&fixtures).await;
+    // The shard's driver is stalled: nothing drains the lane.
+    let (lane, _stalled) = network_lane(QUOTA_LANE);
+    let offered = lane.clone();
+    receiver
+        .network
+        .register_notification_handler(move |_: Bulk, provenance: Provenance| {
+            let Provenance::Peer(peer) = provenance else {
+                return Verdict::Accept;
+            };
+            let event = HostEvent::shard(ShardId::ROOT, ShardScopedInput::FetchTick);
+            offered.offer(event, peer).verdict()
+        });
+    let bulk = |seq| Bulk {
+        seq,
+        body: vec![7; BUSY_HEADER_BYTES],
+    };
+
+    // The flooder fills the lane while it is the only peer using it.
+    for seq in 0..QUOTA_LANE as u64 {
+        flooder.network.notify(&[vid(0)], &bulk(seq));
+    }
+    wait_for("the flooder fills the lane", || lane.held() == QUOTA_LANE).await;
+
+    let flood = Arc::clone(&flooder.network);
+    let flooding = spawn(async move {
+        let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+        let mut seq = QUOTA_LANE as u64;
+        loop {
+            tick.tick().await;
+            flood.notify(&[vid(0)], &bulk(seq));
+            seq += 1;
+        }
+    });
+    let mut tick = interval(Duration::from_secs(1) / HONEST_RATE);
+    for seq in 0..u64::from(HONEST_RATE * BUSY_WATCH_SECS) {
+        tick.tick().await;
+        honest.network.notify(&[vid(0)], &bulk(seq));
+    }
+    flooding.abort();
+
+    assert!(
+        receiver.adapter.cooling_down(vid(1)),
+        "the flooder past its share is cooled down"
+    );
+    assert!(
+        !receiver.adapter.cooling_down(vid(2)),
+        "a peer within its share owes nothing for a full lane"
+    );
+    assert_eq!(lane.held_by(PeerId::new(2)), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_cooled_down_for_its_gossip_is_refused_its_notifications_too() {
     let fixtures = TestFixtures::new(21, 2);
     let (receiver, _counted, sender) = counted_pair(&fixtures, &[ShardId::ROOT]).await;
     receiver
         .network
-        .register_gossip_handler(|_: CommittedHeader, _: ShardId| Verdict::Reject);
+        .register_gossip_handler(|_: CommittedHeader, _: ShardId, _: Provenance| Verdict::Reject);
     let heard = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&heard);
     receiver
         .network
-        .register_notification_handler(move |_: Vote| {
+        .register_notification_handler(move |_: Vote, _: Provenance| {
             counted.fetch_add(1, Ordering::SeqCst);
             Verdict::Accept
         });
@@ -1061,11 +1235,11 @@ async fn a_forged_copy_does_not_keep_an_honest_one_from_its_handler() {
 
     // The receiver finds a forged copy false, as a committed header whose
     // sender signature fails, and takes an honest one.
-    let handled: Arc<std::sync::Mutex<Vec<Copy>>> = Arc::default();
+    let handled: Arc<Mutex<Vec<Copy>>> = Arc::default();
     let seen = Arc::clone(&handled);
     receiver
         .network
-        .register_gossip_handler(move |copy: Copy, _: ShardId| {
+        .register_gossip_handler(move |copy: Copy, _: ShardId, _: Provenance| {
             let false_on_its_face = copy.forged;
             seen.lock().unwrap().push(copy);
             if false_on_its_face {
@@ -1117,7 +1291,7 @@ async fn an_item_travels_on_only_once_every_check_it_rests_on_holds() {
     let (keys_tx, mut keys) = mpsc::unbounded_channel();
     relay
         .network
-        .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
+        .register_gossip_handler(move |block: BeaconBlock, _: ShardId, _: Provenance| {
             let checks = [VerdictKey::of(&block), certificate_of(&block)];
             let _ = keys_tx.send(checks);
             Verdict::defer_all(checks)
@@ -1130,7 +1304,7 @@ async fn an_item_travels_on_only_once_every_check_it_rests_on_holds() {
         });
     follower
         .network
-        .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId, _: Provenance| Verdict::Accept);
 
     sender.network.broadcast_global(&BeaconBlock(7));
     let [signature, certificate] = timeout(BUDGET, keys.recv())
@@ -1166,7 +1340,7 @@ async fn a_part_checked_before_its_item_arrives_is_settled_for_it() {
     let (keys_tx, mut keys) = mpsc::unbounded_channel();
     relay
         .network
-        .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
+        .register_gossip_handler(move |block: BeaconBlock, _: ShardId, _: Provenance| {
             let own = VerdictKey::of(&block);
             let _ = keys_tx.send(own);
             Verdict::defer_all([own, certificate_of(&block)])
@@ -1179,7 +1353,7 @@ async fn a_part_checked_before_its_item_arrives_is_settled_for_it() {
         });
     follower
         .network
-        .register_gossip_handler(|_: BeaconBlock, _: ShardId| Verdict::Accept);
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId, _: Provenance| Verdict::Accept);
 
     // As a ratify vote a proof carries was checked when it arrived alone:
     // the item that carries it waits only on its own check.
@@ -1220,9 +1394,8 @@ async fn a_peer_whose_items_fail_a_later_check_is_cooled_down() {
     let counted = Arc::clone(&checked);
     let network = Arc::clone(&receiver.network);
     let handle = Handle::current();
-    receiver
-        .network
-        .register_gossip_handler(move |header: CommittedHeader, _: ShardId| {
+    receiver.network.register_gossip_handler(
+        move |header: CommittedHeader, _: ShardId, _: Provenance| {
             let signature = VerdictKey::of(&header);
             let certificate = VerdictKey::of(&(header.seq, 1u8));
             let (counted, network) = (Arc::clone(&counted), Arc::clone(&network));
@@ -1234,7 +1407,8 @@ async fn a_peer_whose_items_fail_a_later_check_is_cooled_down() {
                 network.settle(certificate, Verdict::Reject);
             });
             Verdict::defer_all([signature, certificate])
-        });
+        },
+    );
 
     let start = Instant::now();
     let sent = HONEST_RATE * REJECTED_WATCH_SECS;

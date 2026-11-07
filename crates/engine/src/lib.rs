@@ -4,7 +4,7 @@
 //! deterministic simulator. The [`Executor`] does NOT own storage: the
 //! runner owns it and passes a snapshot per call.
 //!
-//! State machines emit `Action::ExecuteTransactions`; the runner drives
+//! State machines emit `ExecutionAction::ExecuteTransactions`; the runner drives
 //! the executor over the tick's batch, which projects the
 //! [`CachedOutput`] into the local shard's [`ExecutedTx`] via
 //! [`project_to_shard`].
@@ -39,12 +39,12 @@ pub mod sharding;
 pub mod tick_select;
 
 pub use backend::Availability;
-pub use batch::{TickBatchContext, TickEnvironment, TickTxInput};
+pub use batch::{ServedPart, TickBatchContext, TickEnvironment, TickTxInput};
 #[cfg(feature = "test-utils")]
 pub use executor::AllCodeRuns;
 pub use executor::{
-    CodeAvailability, CodeUnavailable, Executor, artifact_package, build_refusal_receipt,
-    instance_of_record, protocol_hash,
+    CodeAvailability, CodeUnavailable, Executor, PointReads, artifact_package,
+    build_refusal_receipt, instance_of_record, protocol_hash,
 };
 pub use genesis::{GenesisConfig, PROTOCOL_RESOURCE, World, genesis_world, genesis_writes};
 pub use hyperscale_effects_bridge::{RecordStore, account_address, declared_of};
@@ -52,6 +52,6 @@ pub use hyperscale_vm_kernel::{DOMAIN_SEALED_DRAW, ExecutionMode};
 pub use output::ExecutedTx;
 pub use preview::{
     DeclaredReads, FetchedCells, FetchedEntries, Holds, PreviewGrants, PreviewInputs,
-    PreviewOutcome, PreviewReport, ResourceChange,
+    PreviewOutcome, PreviewPoints, PreviewReport, ResourceChange, UnprovenInterval,
 };
 pub use receipt::{CachedOutput, project_to_shard};

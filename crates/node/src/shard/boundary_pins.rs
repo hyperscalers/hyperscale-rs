@@ -1,6 +1,6 @@
 //! The node's boundary retention rule over one shard's store.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use hyperscale_storage::{BoundaryRetention, ShardStorage};
 use hyperscale_types::{BeaconChainConfig, BlockHeight, ShardId};
@@ -16,11 +16,19 @@ use crate::shard::SharedTopologySnapshot;
 /// `boundary_retention_epochs`, and the held anchor from the boundary the
 /// committed topology attests for the shard — the anchor a joiner is told
 /// to snap-sync from.
+///
+/// The only writer of the store's pins once its loop runs, so it keeps
+/// the oldest pin for every persist to read without asking the store.
 pub struct BoundaryPins<S> {
     storage: Arc<S>,
     shard: ShardId,
     newest: usize,
     topology: SharedTopologySnapshot,
+    /// The store's oldest pin as the last pin and trim left it. Held
+    /// across each pin and trim, so pins from the commit flush and from
+    /// the shard thread apply one at a time and the reading follows the
+    /// last of them.
+    oldest: Mutex<Option<BlockHeight>>,
 }
 
 impl<S: ShardStorage> BoundaryPins<S> {
@@ -30,11 +38,13 @@ impl<S: ShardStorage> BoundaryPins<S> {
         chain_config: &BeaconChainConfig,
         topology: SharedTopologySnapshot,
     ) -> Self {
+        let oldest = Mutex::new(storage.oldest_pin());
         Self {
             storage,
             shard,
             newest: usize::try_from(chain_config.boundary_retention_epochs()).unwrap_or(usize::MAX),
             topology,
+            oldest,
         }
     }
 
@@ -42,6 +52,7 @@ impl<S: ShardStorage> BoundaryPins<S> {
     /// no longer keeps. A failed pin degrades serving, never correctness,
     /// so it is logged and the trim still runs.
     pub fn pin(&self, height: BlockHeight) {
+        let mut oldest = self.oldest.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(error) = self.storage.pin_boundary(height) {
             warn!(
                 shard = ?self.shard,
@@ -51,6 +62,13 @@ impl<S: ShardStorage> BoundaryPins<S> {
             );
         }
         self.storage.trim_boundaries(self.retention());
+        *oldest = self.storage.oldest_pin();
+    }
+
+    /// The lowest height the store keeps pinned, or `None` while it pins
+    /// nothing.
+    pub fn oldest(&self) -> Option<BlockHeight> {
+        *self.oldest.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn retention(&self) -> BoundaryRetention {
@@ -129,5 +147,33 @@ mod tests {
         pins.pin(BlockHeight::new(last + 1));
         assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
         assert!(storage.open_boundary(BlockHeight::new(last)).is_some());
+    }
+
+    /// The oldest pin the persists read is the store's: the one it held
+    /// when the pins opened over it, then wherever each pin and trim
+    /// left it.
+    #[test]
+    fn the_oldest_pin_follows_the_store() {
+        let storage = Arc::new(SimShardStorage::default());
+        commit_one(&*storage, 1);
+        storage.pin_boundary(BlockHeight::new(1)).unwrap();
+        let topology: SharedTopologySnapshot = Arc::new(ArcSwap::new(anchored_at(1)));
+        let chain_config = BeaconChainConfig::default();
+        let newest = chain_config.boundary_retention_epochs();
+        let pins = BoundaryPins::new(
+            Arc::clone(&storage),
+            ShardId::ROOT,
+            &chain_config,
+            Arc::clone(&topology),
+        );
+        assert_eq!(pins.oldest(), Some(BlockHeight::new(1)));
+
+        topology.store(anchored_at(newest + 2));
+        for height in 2..=newest + 2 {
+            commit_one(&*storage, u8::try_from(height).unwrap());
+            pins.pin(BlockHeight::new(height));
+            assert_eq!(pins.oldest(), storage.oldest_pin());
+        }
+        assert_eq!(pins.oldest(), Some(BlockHeight::new(3)));
     }
 }

@@ -328,11 +328,16 @@ pub trait BoundaryStore {
     /// block. Pins accumulate until [`Self::trim_boundaries`] evicts
     /// them. Idempotent per height.
     ///
+    /// Callers pin the height the store stands at. A backend that
+    /// captures its live state checks that under the lock its commits
+    /// take, and refuses a height the store has moved past rather than
+    /// label a later block's state with it.
+    ///
     /// # Errors
     ///
-    /// Returns a description of the failure (e.g. checkpoint I/O). A
-    /// failed pin degrades serving, never correctness — callers log and
-    /// continue.
+    /// Returns a description of the failure (e.g. checkpoint I/O, or a
+    /// store no longer at `height`). A failed pin degrades serving,
+    /// never correctness — callers log and continue.
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String>;
 
     /// Evict every pin `retention` does not keep. A failed eviction
@@ -420,10 +425,12 @@ pub trait BoundaryStore {
     ///
     /// The block arrives unverified, and the caller's tie is the hash
     /// line: each block is the one the block above it names as its
-    /// parent, up to the beacon-attested anchor. That settles which block
-    /// stands at the height — which is the whole question here — and no
-    /// signature check could add to it, so this takes the pairing as it
-    /// comes rather than asking for a marker the walk does not produce.
+    /// parent, up to the beacon-attested anchor, and is paired with the
+    /// parent QC that block's header carries — or, for the anchor block,
+    /// with the anchor QC the import seated. That settles which block
+    /// stands at the height and which QC certifies it, so this takes the
+    /// pairing as it comes rather than asking for a marker the walk does
+    /// not produce.
     fn import_historical_block(&self, certified: &CertifiedBlock);
 
     /// Apply the subset of a followed chain's block that falls under
@@ -461,6 +468,8 @@ pub trait BoundaryStore {
     /// Install a reshape successor's derived `genesis` as this store's
     /// chain origin and committed tip, returning the adopted state root:
     /// [`adopt_plan`] decided over this store's vintage, then applied.
+    /// Every pin beneath the genesis is evicted: it is a predecessor's
+    /// boundary, which no joiner of this chain is sent to.
     ///
     /// Idempotent: a re-run over an already-adopted store returns the
     /// recorded adoption.

@@ -42,8 +42,8 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey, Epoch,
-    EpochWindows, NetworkDefinition, QuorumCertificate, Randomness, SeedRing, SettledTxsRoot,
-    ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
+    EpochWindows, NetworkDefinition, QuorumCertificate, Randomness, RecoveryBand, SeedRing,
+    SettledTxsRoot, ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
     WeightedTimestamp,
 };
 
@@ -689,6 +689,19 @@ pub struct ShardRecovery {
     pub attested_frontier: BlockHeight,
 }
 
+impl ShardRecovery {
+    /// The binding this recovery stamps at its seating, before its first
+    /// crossing completes it.
+    #[must_use]
+    pub const fn binding(&self) -> RecoveryBinding {
+        RecoveryBinding {
+            rotated_at: self.rotated_at,
+            attested_frontier: self.attested_frontier,
+            completed: false,
+        }
+    }
+}
+
 /// One halt recovery of a shard in its [`BeaconState::recoveries`]
 /// history: the committee binding it established, kept for as long as
 /// the history keeps it.
@@ -723,30 +736,33 @@ impl RecoveryBinding {
         self.rotated_at.next()
     }
 
-    /// Whether a block at `height`, certified at `certified`, has the
-    /// shape of one this recovery discarded: certified below the window
-    /// before the bridge, at a height above the frontier.
+    /// Whether work whose QC's committee signed `committee_epoch` was
+    /// signed by a committee this recovery took the shard from: below the
+    /// bridge. The fresh committee signs the bridge's window or a later
+    /// one, since a recovery is seated only on a shard whose scheduled
+    /// terminal, if any, is no earlier than the bridge.
+    #[must_use]
+    pub const fn replaced(self, committee_epoch: Epoch) -> bool {
+        committee_epoch.inner() < self.bridge().inner()
+    }
+
+    /// Whether a block at `height`, whose QC's committee signed
+    /// `committee_epoch`, has the shape of one this recovery discarded:
+    /// signed below the bridge ([`Self::replaced`]), at a height above
+    /// the frontier.
     ///
     /// Every block the fresh committee certifies above the frontier is
-    /// certified at or past the window before the bridge: its bridge
-    /// crossing there, since its committee resolves through the bridge
-    /// only from that window on, and every later block past it. A block
-    /// above the frontier certified earlier is a replaced committee's, and
-    /// its certificate verifies under that committee's keys once the
-    /// recovery is no longer pending. A fork recovery's chain extends none
-    /// of those. A halt recovery's fresh chain can extend the halted tail
-    /// it harvested, which has this shape too, so for a halt recovery the
-    /// shape is a discard only where no fresh-certified block descends
-    /// from the block.
+    /// signed under the bridge's window or a later one: its committee is
+    /// the one the bridge seated. A block above the frontier signed below
+    /// it is a replaced committee's, and its certificate verifies under
+    /// that committee's keys once the recovery is no longer pending. A fork
+    /// recovery's chain extends none of those. A halt recovery's fresh
+    /// chain can extend the halted tail it harvested, which has this shape
+    /// too, so for a halt recovery the shape is a discard only where no
+    /// fresh-certified block descends from the block.
     #[must_use]
-    pub const fn discards(
-        self,
-        windows: EpochWindows,
-        height: BlockHeight,
-        certified: WeightedTimestamp,
-    ) -> bool {
-        windows.epoch_for(certified).next().inner() < self.bridge().inner()
-            && height.inner() > self.attested_frontier.inner()
+    pub const fn discards(self, height: BlockHeight, committee_epoch: Epoch) -> bool {
+        self.replaced(committee_epoch) && height.inner() > self.attested_frontier.inner()
     }
 
     /// Whether work of the shard at `height` anchored at `anchor` is in
@@ -771,6 +787,17 @@ impl RecoveryBinding {
     ) -> bool {
         windows.epoch_for(anchor).inner() < self.bridge().inner()
             && height.inner() > self.attested_frontier.inner()
+    }
+
+    /// This recovery's band as a crossing block's marker carries it, its
+    /// bridge placed on the epoch grid `windows`: a band orphans exactly
+    /// what [`Self::orphans`] does, wherever the grid has a crossing.
+    #[must_use]
+    pub const fn band(self, windows: EpochWindows) -> RecoveryBand {
+        RecoveryBand {
+            attested_frontier: self.attested_frontier,
+            bridge_start: windows.window_of(self.bridge()).start,
+        }
     }
 
     /// The newest completed recovery in a shard's `history`.
@@ -926,8 +953,9 @@ pub struct BeaconState {
     /// the shard reveal chains folded this epoch; an epoch where no
     /// reveal folds mixes the accepted ceremony VRF outputs instead.
     pub randomness: Randomness,
-    /// The seeds of the epochs still inside [`SEED_WINDOW_EPOCHS`](crate::SEED_WINDOW_EPOCHS), each
-    /// beside the roll that produced it.
+    /// The seeds of the epochs still inside
+    /// [`SeedRing::retained_epochs`] of the chain's grid, each beside the
+    /// roll that produced it.
     ///
     /// `randomness` is the head of this: what a draw resolving against a
     /// past epoch needs is the value as it stood then, and reading the
@@ -2602,7 +2630,9 @@ mod tests {
             randomness: Randomness::new([0x5A; 32]),
             source: SeedSource::Reveals,
         };
-        state.seeds.record(Epoch::new(4), seed);
+        state
+            .seeds
+            .record(Epoch::new(4), seed, state.chain_config.epoch_windows());
         state.current_epoch = Epoch::new(4);
 
         for snapshot in [

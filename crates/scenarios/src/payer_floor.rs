@@ -13,6 +13,7 @@ use std::time::Duration;
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::package_key;
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_storage::RowState;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TimestampRange,
     TransactionDecision, TxHash, WeightedTimestamp,
@@ -325,7 +326,7 @@ pub fn a_payer_spends_beside_its_pending_leg<C: FaultableCluster>(
     // window it is measured in is the two blocks after the leg's, and a
     // spend that reached the next proposers only by gossip would arrive a
     // hop and a dwell behind wherever the leg's proposer sat.
-    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, spend_tx);
+    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, &spend_tx);
 
     let context = format!(
         "a {spend:?} spend of {amount} beside a pending leg of {reserved} under a {ceiling:?} \
@@ -461,7 +462,7 @@ pub fn a_payer_spends_beside_its_routes_pending_core<C: FaultableCluster>(
     // At every member of the payer's committee at once, so the next
     // proposer holds it after its own dwell rather than a gossip hop
     // later: the window it is measured in is a few blocks wide.
-    let spend_hash = charges.submit_to_committee(c, FIRST_VENUE_SHARD, spend_tx);
+    let spend_hash = charges.submit_to_committee(c, FIRST_VENUE_SHARD, &spend_tx);
 
     let context = format!(
         "a {spend:?} spend of {amount} beside a route's pending core reserving {reserved} of its \
@@ -543,12 +544,12 @@ pub fn a_payer_publishes_beside_its_unsettled_spend<C: FaultableCluster>(
     // proposer holds each after its own dwell rather than a gossip hop
     // later: the window the publish is measured in is a few blocks wide,
     // and two submitted together reach the same proposer together.
-    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, spend);
+    let spend_hash = charges.submit_to_committee(c, PAYER_SHARD, &spend);
     between(c, spend_hash);
     let publish = build_publish_tx(&payer_key, artifact, validity_around(c.now()));
     let publish_price = declared_price(c, &publish);
     let pooled = pooled_at(c, PAYER_SHARD);
-    let publish_hash = charges.submit_to_committee(c, PAYER_SHARD, publish);
+    let publish_hash = charges.submit_to_committee(c, PAYER_SHARD, &publish);
 
     let context = "a publish beside an unsettled spend";
     await_pair(
@@ -613,20 +614,19 @@ pub fn contested_publish_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// rival's publish, signed for the widest window, is still in flight.
 const CONTESTED_LIFE: Duration = Duration::from_secs(30);
 
-/// A publish its package's shard refuses after the payer's shard
-/// completed it still pays, and leaves its payer's vault free.
+/// A publish its package's shard refuses still pays, and leaves its
+/// payer's vault free.
 ///
 /// Two payers on one shard publish the same artifact, whose package cell
 /// the other shard keeps, so each publish runs whole on both shards and
 /// either shard can refuse it. The package's shard is cut off from the
 /// payers' shard's state and certificates, so it never reads the
 /// rival's publish accepted there and its own row stays stated holding
-/// the package cell, and the payer's publish, committed behind it,
-/// waits on that hold until its deadline and is aborted unrun. The
-/// payers' shard reads everything: it accepts the rival's publish, runs
-/// the payer's to completion and states it, and then reads the package
-/// shard's abort, on which it aborts its own row, discarding what it
-/// wrote, the burn and the end of the fee hold among it.
+/// the package cell, and the payer's publish, committed behind it, never
+/// heads there: it waits on that hold until its deadline and is aborted
+/// unrun. The package's shard serves the payers' shard the payer's part
+/// only from the block that would make it head, so the payers' shard
+/// never runs it either, and aborts it at the same deadline.
 ///
 /// What a chain owes the payer then is what it owes any refused attempt:
 /// the price once, no fee hold left standing for it, and a vault whose
@@ -635,10 +635,10 @@ const CONTESTED_LIFE: Duration = Duration::from_secs(30);
 /// # Panics
 ///
 /// Panics if the rival's publish is not in flight on the package's shard
-/// when the payer's ends, if the payers' shard does not complete the
-/// payer's publish, if the package's shard does not abort it, if the
-/// payer is not charged its price exactly once, if its fee hold stands,
-/// or if a transfer of everything the vault has left does not accept.
+/// when the payer's ends, if either shard completes the payer's publish
+/// or does not abort it, if the payer is not charged its price exactly
+/// once, if its fee hold stands, or if a transfer of everything the vault
+/// has left does not accept.
 pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
@@ -710,7 +710,7 @@ pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableC
         "the rival's publish must still be in flight on the package's shard: {:?}",
         c.chain_fate(REMOTE_SHARD, first_hash),
     );
-    assert_completed_then_refused(c, publish_hash);
+    assert_completed_on_neither(c, publish_hash);
     c.clear_drops();
 
     let context = "a publish its package's shard refused";
@@ -745,6 +745,100 @@ pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableC
     );
 }
 
+/// A whole member placed behind an earlier writer of a key it reads is
+/// served from the block that settles the writer.
+///
+/// Two payers on one shard publish the same artifact, whose package cell
+/// the other shard keeps, so each publish runs whole on both shards. The
+/// package's shard is cut off from the payers' shard's state and
+/// certificates while the rival's publish stands there stated, holding
+/// the package cell, and the payer's publish commits there behind it.
+/// Once the cut lifts the package's shard reads the rival's accept and
+/// lets its row go, and the block whose fold does that makes the payer's
+/// publish head: that block serves the payers' shard its part, over the
+/// package cell as the rival left it.
+///
+/// # Panics
+///
+/// Panics if either publish misses its budget, if the payer's publish
+/// does not wait behind the rival's on the package's shard, if its part
+/// is served by any block but the one settling the rival's there, or if
+/// the payers' world is not conserved.
+pub fn a_whole_members_part_is_served_by_the_block_settling_an_earlier_writer<
+    C: FaultableCluster,
+>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let Contest {
+        rival_key,
+        rival,
+        payer_key,
+        payer,
+        neighbour,
+    } = contest();
+    committees_on_separate_hosts(c, PAYER_SHARD, REMOTE_SHARD);
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [rival.address(), payer.address(), neighbour.address()],
+        [],
+    );
+    let mut charges = Charges::default();
+    let artifact = artifact_kept_on(c, REMOTE_SHARD);
+    let cut = [
+        isolate_ec_intake(c, REMOTE_SHARD, PAYER_SHARD),
+        isolate_crossing_intake(c, REMOTE_SHARD, PAYER_SHARD),
+    ];
+    let first = build_publish_tx(&rival_key, artifact.clone(), validity_around(c.now()));
+    let first_hash = charges.submit(c, first);
+    assert!(
+        c.run_until(budget, |c| c
+            .chain_fate(PAYER_SHARD, first_hash)
+            .1
+            .is_some()
+            && c.chain_fate(REMOTE_SHARD, first_hash).0.is_some()),
+        "the rival's publish must commit on the package's shard and end on its own",
+    );
+    let publish = build_publish_tx(&payer_key, artifact, validity_around(c.now()));
+    let publish_hash = charges.submit(c, publish);
+    let waits = |c: &C| {
+        c.queued_rows(REMOTE_SHARD).is_some_and(|rows| {
+            rows.get(&publish_hash).is_some_and(|row| {
+                row.state == RowState::Pending && row.queued.is_some() && row.head.is_none()
+            })
+        })
+    };
+    assert!(
+        c.run_until(budget, waits),
+        "the payer's publish must wait behind the rival's on the package's shard",
+    );
+    assert!(
+        cut.iter().all(|handle| handle.fired() > 0),
+        "the certificates and readings must have been cut",
+    );
+    c.clear_drops();
+
+    let context = "a whole member behind an earlier writer";
+    assert!(
+        c.run_until(budget, |c| c
+            .tx_status(publish_hash)
+            .is_some_and(|status| status.is_final())),
+        "{context}: the payer's publish must end once the rival's has settled",
+    );
+    let settled = c
+        .chain_fate(REMOTE_SHARD, first_hash)
+        .1
+        .map(|(height, _)| height)
+        .expect("the rival's publish settled on the package's shard");
+    assert_eq!(
+        c.served_at(REMOTE_SHARD, PAYER_SHARD, publish_hash),
+        Some(settled),
+        "{context}: the payer's publish is served by the block settling the rival's",
+    );
+    world.assert_settles_within(c, &charges, budget, context);
+}
+
 /// Some storm artifact whose package cell `shard` keeps.
 fn artifact_kept_on<C: Cluster>(c: &C, shard: ShardId) -> Vec<u8> {
     (0u16..64)
@@ -756,24 +850,19 @@ fn artifact_kept_on<C: Cluster>(c: &C, shard: ShardId) -> Vec<u8> {
         .unwrap_or_else(|| panic!("no artifact's package cell falls on {shard:?}"))
 }
 
-/// Assert the payers' shard attested `publish` completed, the package's
-/// shard attested only a refusal of it, and both ended it aborted.
-fn assert_completed_then_refused<C: Cluster>(c: &C, publish: TxHash) {
-    let ran = c.ran(PAYER_SHARD, publish);
-    assert!(
-        ran.iter().any(|ran| ran.succeeded),
-        "the payers' shard must have completed the publish before it was refused: {ran:?}",
-    );
-    let refused = c.ran(REMOTE_SHARD, publish);
-    assert!(
-        !refused.is_empty() && refused.iter().all(|ran| !ran.succeeded),
-        "the package's shard must have refused the publish: {refused:?}",
-    );
+/// Assert neither shard attested `publish` completed, and both ended it
+/// aborted.
+fn assert_completed_on_neither<C: Cluster>(c: &C, publish: TxHash) {
     for shard in [PAYER_SHARD, REMOTE_SHARD] {
+        let ran = c.ran(shard, publish);
+        assert!(
+            ran.iter().all(|ran| !ran.succeeded),
+            "{shard:?} must not complete a publish the package's shard never served: {ran:?}",
+        );
         assert_eq!(
             c.chain_fate(shard, publish).1.map(|(_, decision)| decision),
             Some(TransactionDecision::Aborted),
-            "{shard:?} ends the publish its package's shard refused as aborted",
+            "{shard:?} ends the publish the package's shard held behind the rival as aborted",
         );
     }
 }

@@ -19,29 +19,31 @@ use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_engine::tick_select::SeatQuestion;
 use hyperscale_metrics::{
     record_boundary_cells_asked, record_boundary_claims_carried, record_boundary_drained,
-    record_decline_folded, record_fenced_claim, record_rebuilt_record_entry, record_reclaim_folded,
-    record_records_repushed, record_repush_due, record_repush_paused, record_sibling_absence_read,
-    record_sibling_question_pending, set_standing_answers, set_wanted_records,
+    record_crossing_push_dropped, record_decline_folded, record_fenced_claim,
+    record_rebuilt_record_entry, record_reclaim_folded, record_records_repushed, record_repush_due,
+    record_repush_paused, record_sibling_absence_read, record_sibling_question_pending,
+    set_standing_answers, set_wanted_records,
 };
 #[cfg(test)]
 use hyperscale_storage::CrossingJournal;
 use hyperscale_storage::{
-    CrossingCursor, committed_tx_cell_key, member_row_leaf, reclaimed, unclaimed_records,
+    CrossingCursor, committed_tx_cell_key, live_record, member_row_leaf, reclaimed,
+    unclaimed_records,
 };
 use hyperscale_types::network::response::ServedValue;
 #[cfg(test)]
 use hyperscale_types::shard_prefix_path;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Address, Anchor, Block, BlockHeight,
-    BoundaryAttestation, BoundaryOffer, CarriedClaims, CounterpartMirror, Deadline, EpochWindows,
-    ExecutionCertificate, FrontierInputs, Inclusion, Issuer, LocalKey, MAX_CLAIMS_PER_BLOCK,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE,
-    MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, ProvenAnchors, RETENTION_HORIZON, ReadFrontier,
-    ReadMark, STATE_CLAIM_CELL_BYTES, SettledTxSet, ShardId, ShardTrie, StateClaim, Stated,
-    SubstateKey, TerminalEvidence, TickLine, TopologySchedule, TxHash, TxOutcome, TxResolution,
-    UnsettledTx, VerdictCells, VerdictQuestion, Verifiable, Verified, WeightedTimestamp,
-    answer_hashes, said_at, verdict_leaf,
+    BoundaryAttestation, BoundaryOffer, CarriedClaims, CheckedStateProof, CounterpartMirror,
+    Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion, Issuer, LocalKey,
+    MAX_CLAIMS_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MAX_VALIDITY_RANGE, MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, ProvenAnchors,
+    RETENTION_HORIZON, ReadFrontier, ReadMark, STATE_CLAIM_CELL_BYTES, SettledTxSet, ShardId,
+    ShardTrie, StateClaim, Stated, SubstateKey, TerminalEvidence, TickLine, TopologySchedule,
+    TxHash, TxOutcome, TxResolution, UnsettledTx, VerdictCells, VerdictQuestion, Verifiable,
+    Verified, WeightedTimestamp, answer_hashes, said_at, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher, Terms,
@@ -49,7 +51,7 @@ use hyperscale_vm_effects::{
 
 use crate::ledger::{Ledger, Question, Unanswerable};
 use crate::provisioning::WantedRecord;
-use crate::record_reads::RecordReads;
+use crate::record_reads::{RecordAsk, RecordReads};
 
 /// What one block's abandonment records may still spend.
 ///
@@ -289,15 +291,20 @@ impl CrossingIndex for TestRows {
 ///
 /// The second map is the first one turned over: for each shard and
 /// cell a held claim reads, the anchor of every claim reading it, once
-/// per claim. It is written by every method that adds or removes a
-/// claim and by nothing else, so it holds exactly what a walk of the
-/// claims would find, and a question asked of every held claim is one
-/// lookup.
+/// per claim, with the transaction that issued the record it holds
+/// there, if it holds one. It is written by every method that adds or
+/// removes a claim and by nothing else, so it holds exactly what a walk
+/// of the claims would find, and a question asked of every held claim
+/// is one lookup.
 #[derive(Debug, Default)]
 struct HeldClaims {
     claims: BTreeMap<StateClaim, BTreeSet<TxHash>>,
-    readings: BTreeMap<(ShardId, SubstateKey), Vec<Anchor>>,
+    readings: CellReadings,
 }
+
+/// For each shard and cell, where a held claim reads it and the issuer
+/// of the record held there.
+type CellReadings = BTreeMap<(ShardId, SubstateKey), Vec<(Anchor, Option<TxHash>)>>;
 
 impl HeldClaims {
     /// The held claims, in their own order.
@@ -319,6 +326,14 @@ impl HeldClaims {
     /// Whether a held claim reads `key` on `shard`.
     fn reads(&self, shard: ShardId, key: SubstateKey) -> bool {
         self.readings.contains_key(&(shard, key))
+    }
+
+    /// Whether a held claim reads on `shard` the record `tx` issued at
+    /// `key`, which is what a want of `tx` at `key` arrives as.
+    fn reads_arrival(&self, shard: ShardId, key: SubstateKey, tx: TxHash) -> bool {
+        self.readings
+            .get(&(shard, key))
+            .is_some_and(|read_at| read_at.iter().any(|(_, issuer)| *issuer == Some(tx)))
     }
 
     /// Hold `claim`, where it is not held already, and hand back the
@@ -350,7 +365,10 @@ impl HeldClaims {
         self.claims = std::mem::take(&mut self.claims)
             .into_iter()
             .filter_map(|(claim, speaks_for)| {
-                let Some(keys) = carried.get(&claim.anchor) else {
+                let met = carried
+                    .get(&claim.anchor)
+                    .filter(|keys| claim.cells.iter().any(|(key, _)| keys.contains(key)));
+                let Some(keys) = met else {
                     return Some((claim, speaks_for));
                 };
                 claim
@@ -364,13 +382,15 @@ impl HeldClaims {
         }
     }
 
-    /// Name `claim`'s anchor under every cell it reads.
-    fn note(readings: &mut BTreeMap<(ShardId, SubstateKey), Vec<Anchor>>, claim: &StateClaim) {
+    /// Name `claim`'s anchor under every cell it reads, with the issuer
+    /// of the record it holds there.
+    fn note(readings: &mut CellReadings, claim: &StateClaim) {
         for (key, _) in claim.cells.iter() {
+            let issuer = held_record(claim, *key).map(|(_, cell)| cell.tx);
             readings
                 .entry((claim.anchor.shard, *key))
                 .or_default()
-                .push(claim.anchor);
+                .push((claim.anchor, issuer));
         }
     }
 
@@ -381,7 +401,7 @@ impl HeldClaims {
             let Some(read_at) = self.readings.get_mut(&cell) else {
                 continue;
             };
-            if let Some(held) = read_at.iter().position(|at| *at == claim.anchor) {
+            if let Some(held) = read_at.iter().position(|(at, _)| *at == claim.anchor) {
                 read_at.swap_remove(held);
             }
             if read_at.is_empty() {
@@ -431,6 +451,11 @@ fn verdict_cells(question: &VerdictQuestion) -> VerdictCells {
 /// as its three cells, and a request names no more cells than a
 /// state-proof request.
 pub const MAX_VERDICT_ASKS_PER_SIBLING: usize = 21;
+
+/// How many record reads stand toward one holder at once, its oldest
+/// filed first: one request's, so holders that never answer leave the
+/// fetch's other places to the rest.
+pub const MAX_RECORD_ASKS_PER_HOLDER: usize = 64;
 
 /// How many verdict claims one proposal is offered, as they are held.
 ///
@@ -674,6 +699,13 @@ const fn past_ask_gap(newest: BlockHeight, asked: BlockHeight) -> bool {
 fn answer_ask_gap(asked: u32) -> u64 {
     (1u64 << asked.saturating_sub(1).min(6)).min(MAX_ANSWER_ASK_GAP)
 }
+
+/// The counterpart heights a seat question is asked at: those this
+/// divides, with no backoff. Every standing question then shares an
+/// anchor, so the cells two of them read are fetched once, and a cycle
+/// forming under a question long since asked is read within this many
+/// heights, well inside the naming window.
+const SEAT_ASK_GAP: u64 = 4;
 
 /// One carried record's re-push pacing on this validator alone.
 ///
@@ -1536,11 +1568,11 @@ fn in_disjoint_spans(claims: impl IntoIterator<Item = StateClaim>) -> Vec<StateC
 /// shard holds is read only at that shard's boundaries, apart from every
 /// other reading.
 ///
-/// Two sites need exactly this set: a fetch that lands is offered in a
-/// block only if something here wants it, and a reading held to offer is
-/// kept only while something here wants it. None of these questions
-/// names a transaction of this chain's, which is why the keys are read
-/// rather than the names.
+/// A reading held to offer is kept only while something here wants it.
+/// What is taken up in the first place is narrower, reading by reading
+/// ([`Counterparts::kept_for_wants`]). None of these questions names a
+/// transaction of this chain's, which is why the keys are read rather
+/// than the names.
 fn wants_reading(
     awaited: &BTreeSet<SubstateKey>,
     wanted: &BTreeSet<SubstateKey>,
@@ -1698,6 +1730,35 @@ fn fenced_cells(claim: &StateClaim) -> impl Iterator<Item = SubstateKey> + '_ {
     })
 }
 
+/// What [`Counterparts::kept_for_wants`] keeps of a reading, by the rule
+/// that keeps each key.
+#[derive(Debug, Default)]
+struct KeptForWants {
+    /// The keys it reads as the arrival of a want here, a live record
+    /// the wanting transaction issued, each with that transaction and
+    /// its want's filing.
+    arrivals: BTreeMap<SubstateKey, (TxHash, WeightedTimestamp)>,
+    /// The escrowed records nothing here waits on that the fold could
+    /// decline, with each one's validity end: held under
+    /// [`MAX_UNSOLICITED_RECORDS_PER_PRODUCER`].
+    unasked: Vec<(WeightedTimestamp, SubstateKey)>,
+    /// The keys the crossing rows await, read whichever way, and the
+    /// owed records the fold credits.
+    rows: BTreeSet<SubstateKey>,
+}
+
+impl KeptForWants {
+    /// Every key kept, by whichever rule.
+    fn keys(&self) -> BTreeSet<SubstateKey> {
+        self.arrivals
+            .keys()
+            .chain(&self.rows)
+            .copied()
+            .chain(self.unasked.iter().map(|(_, key)| *key))
+            .collect()
+    }
+}
+
 /// One fetch per anchor, asking every key `wanted` names at it once.
 fn fetches(wanted: BTreeMap<Anchor, Vec<SubstateKey>>) -> Vec<Action> {
     wanted
@@ -1725,35 +1786,89 @@ struct Probe {
 }
 
 /// A seat question this validator put to a counterpart: the header it
-/// was asked at, whether every reading it asked for has come back, how
-/// many times it has been asked, and the readings come back so far.
+/// was asked at, whether every reading it asked for has come back, and
+/// the readings come back so far.
 ///
-/// The fetch layer tracks each key on its own, so one question's four
-/// keys can return in different answers — split across chunks, or folded
+/// The fetch layer tracks each key on its own, so one question's keys
+/// can return in different answers — split across chunks, or folded
 /// into another asker's fetch of the same key. The question closes on
 /// the last of them, and the readings are offered only then, and only
-/// where together they read the cycle.
+/// where together they read the cycle or the victim's leaving.
+///
+/// Its question's keys are held here: a hot queue stands hundreds of
+/// probes at one anchor, and each proof and each turnover of the head
+/// consults every one of them on the driver thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SeatProbe {
     anchor: Anchor,
     returned: bool,
-    asked: u32,
-    parts: Vec<StateClaim>,
+    keys: Vec<SubstateKey>,
+    parts: Vec<SeatPart>,
 }
 
 impl SeatProbe {
-    /// What the readings come back so far say of `key`.
-    fn read(&self, key: SubstateKey) -> Option<Inclusion> {
-        self.parts.iter().find_map(|part| part.reading(key))
+    /// The keys `question` reads, derived once for as long as it stands.
+    fn keys_of(question: &SeatQuestion) -> Vec<SubstateKey> {
+        #[cfg(test)]
+        SEAT_KEY_DERIVATIONS.with(|count| count.set(count.get() + 1));
+        question.keys()
     }
 
-    /// Whether this probe still waits on a fetch of `key` at `anchor`.
-    fn awaits(&self, question: &SeatQuestion, anchor: Anchor, key: SubstateKey) -> bool {
-        !self.returned
-            && self.anchor == anchor
-            && question.keys().contains(&key)
-            && self.read(key).is_none()
+    /// What the readings come back so far say of `key`.
+    fn read(&self, key: SubstateKey) -> Option<Inclusion> {
+        self.parts.iter().find_map(|part| part.read(key))
     }
+
+    /// The fetches this probe still waits on.
+    fn awaited(&self) -> impl Iterator<Item = (Anchor, SubstateKey)> + '_ {
+        self.keys
+            .iter()
+            .filter(|key| !self.returned && self.read(**key).is_none())
+            .map(|key| (self.anchor, *key))
+    }
+}
+
+/// What one answer gave a seat probe: its readings, beside the whole
+/// proof of that answer, which every probe it speaks to shares. Plain
+/// contention closes on nothing it would carry, so the proof is cut only
+/// for a question the readings prove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeatPart {
+    cells: Vec<(SubstateKey, Inclusion)>,
+    proof: Arc<MerkleInclusionProof>,
+}
+
+impl SeatPart {
+    /// What these readings say of `key`.
+    fn read(&self, key: SubstateKey) -> Option<Inclusion> {
+        self.cells
+            .iter()
+            .find_map(|&(cell, inclusion)| (cell == key).then_some(inclusion))
+    }
+
+    /// The readings as a claim at `anchor`, the proof cut down to them.
+    fn claim(&self, anchor: Anchor) -> Option<StateClaim> {
+        #[cfg(test)]
+        SEAT_PROOF_CUTS.with(|count| count.set(count.get() + 1));
+        let keys: Vec<SubstateKey> = self.cells.iter().map(|(key, _)| *key).collect();
+        let cut = self.proof.restrict(&keys).ok()?;
+        Some(StateClaim::new(anchor, stated(&self.cells), cut))
+    }
+}
+
+/// `cells` as a claim states them.
+fn stated(cells: &[(SubstateKey, Inclusion)]) -> impl Iterator<Item = (SubstateKey, Stated)> + '_ {
+    cells
+        .iter()
+        .map(|&(key, inclusion)| (key, Stated::Inclusion(inclusion)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has derived a seat question's keys.
+    static SEAT_KEY_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many times this thread has cut a proof for a seat probe.
+    static SEAT_PROOF_CUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What a commit folded, and what it could not answer for.
@@ -1903,11 +2018,12 @@ pub struct Counterparts {
     /// record is kept to offer against.
     wanted: BTreeSet<SubstateKey>,
 
-    /// Each of `wanted` with the transaction whose member waits on it.
+    /// Each of `wanted` with the transaction whose member waits on it,
+    /// and the clock the want was filed at.
     /// A record is an arrival only for the transaction that issued it,
     /// so a record another transaction left at a wanted key is one
     /// nothing here waits on.
-    wanted_of: BTreeSet<(SubstateKey, TxHash)>,
+    wanted_of: BTreeMap<(SubstateKey, TxHash), WeightedTimestamp>,
 
     /// The reads of those records this validator has put, with their
     /// pacing.
@@ -1986,7 +2102,7 @@ impl Counterparts {
             clock: WeightedTimestamp::ZERO,
             frontier,
             wanted: BTreeSet::new(),
-            wanted_of: BTreeSet::new(),
+            wanted_of: BTreeMap::new(),
             records: RecordReads::new(),
             local_crossings: BTreeSet::new(),
             probes: BTreeMap::new(),
@@ -2046,7 +2162,7 @@ impl Counterparts {
         }
         // The reads still worth pacing: the records something here
         // waits on.
-        self.records.sweep(now, &self.wanted);
+        let ended = self.records.sweep(now, &self.wanted);
         self.count_carried(block);
         // A reading the chain now carries is everybody's: its answers
         // are folded here, and nothing offers it again. Retired by key
@@ -2061,6 +2177,9 @@ impl Counterparts {
         let mut actions = Vec::new();
         if !released.is_empty() {
             actions.push(Action::AbandonFetch(FetchIds::StateProofs(released)));
+        }
+        if !ended.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::RecordProofs(ended)));
         }
         // Every verdict this block carries resolves its transactions,
         // whichever way it went; what is left past every window that
@@ -2085,7 +2204,10 @@ impl Counterparts {
             .iter()
             .filter_map(|line| match line {
                 TickLine::Fate { tx, .. } => self.ledger.fated(*tx),
-                TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+                TickLine::Member { .. }
+                | TickLine::Discard { .. }
+                | TickLine::End { .. }
+                | TickLine::Recovered { .. } => None,
             })
             .collect();
         settled.extend(self.ledger.closes());
@@ -2256,20 +2378,22 @@ impl Counterparts {
         self.want(records);
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         self.ask_entries(now, &mut wanted);
-        self.ask_wanted_records(trie, now, records, windows, &mut wanted);
-        fetches(wanted)
+        let mut actions = self.ask_wanted_records(trie, now, records, windows);
+        actions.extend(fetches(wanted));
+        actions
     }
 
     /// Ask each counterpart a seat question the committed tip stands,
-    /// at its newest commit-proven header standing at `now`.
+    /// at its newest commit-proven header standing at `now` whose height
+    /// [`SEAT_ASK_GAP`] divides.
     ///
-    /// A question is asked once per header, and again at a newer one
-    /// only after the fetch returns without the cycle, backing off as an
-    /// answer does: plain contention reads no cycle, and asking it every
-    /// block would spend a fetch per contended pair per block. One the
-    /// claims this validator holds to offer already prove is not asked
-    /// again, and a question the tip no longer stands lets go of the
-    /// fetches only it was waiting on.
+    /// A question is asked once per header, and again at the next such
+    /// header only after the fetch returns without an answer: plain
+    /// contention reads none, and asking it every block would spend a
+    /// fetch per contended pair per block. One the claims this validator
+    /// holds to offer already prove is not asked again, and a question
+    /// the tip no longer stands lets go of the fetches only it was
+    /// waiting on.
     pub(crate) fn ask_seats(
         &mut self,
         questions: &[SeatQuestion],
@@ -2280,53 +2404,55 @@ impl Counterparts {
             .seats
             .extract_if(.., |question, _| !standing.contains(question))
             .collect();
-        let mut released: Vec<(Anchor, SubstateKey)> = dropped
+        let released: BTreeSet<(Anchor, SubstateKey)> = dropped
             .iter()
-            .flat_map(|(question, probe)| {
-                question
-                    .keys()
-                    .into_iter()
-                    .filter(|key| probe.awaits(question, probe.anchor, *key))
-                    .map(|key| (probe.anchor, key))
-            })
+            .flat_map(|(_, probe)| probe.awaited())
             .collect();
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
+        let mut aligned: BTreeMap<ShardId, Option<Anchor>> = BTreeMap::new();
         for question in standing {
-            if question.proven_by(self.fetched.claims()) {
-                continue;
-            }
-            let Some(anchor) = self.proven_anchors.newest_licensed(question.shard, now, ..) else {
+            let Some(anchor) = *aligned.entry(question.shard).or_insert_with(|| {
+                let newest = self
+                    .proven_anchors
+                    .newest_licensed(question.shard, now, ..)?;
+                let height = newest.height.inner();
+                self.proven_anchors.at(
+                    question.shard,
+                    BlockHeight::new(height - height % SEAT_ASK_GAP),
+                )
+            }) else {
                 continue;
             };
-            let prior = self
-                .seats
-                .get(&question)
-                .map(|probe| (probe.anchor, probe.returned, probe.asked));
-            if prior.is_some_and(|(asked_at, returned, asked)| {
-                !returned || anchor.height.inner() < asked_at.height.inner() + answer_ask_gap(asked)
+            if self.seats.get(&question).is_some_and(|probe| {
+                !probe.returned || anchor.height.inner() <= probe.anchor.height.inner()
             }) {
                 continue;
             }
+            if question.proven_by(self.fetched.claims()) {
+                continue;
+            }
+            let keys = self
+                .seats
+                .remove(&question)
+                .map_or_else(|| SeatProbe::keys_of(&question), |probe| probe.keys);
+            wanted
+                .entry(anchor)
+                .or_default()
+                .extend(keys.iter().copied());
             self.seats.insert(
                 question,
                 SeatProbe {
                     anchor,
                     returned: false,
-                    asked: prior.map_or(1, |(_, _, asked)| asked.saturating_add(1)),
+                    keys,
                     parts: Vec::new(),
                 },
             );
-            let asking = wanted.entry(anchor).or_default();
-            for key in question.keys() {
-                if !asking.contains(&key) {
-                    asking.push(key);
-                }
-            }
         }
         // Judged once this call's own questions are in: a key one of them
         // has just asked for is theirs to wait on, however the fetch layer
         // folds the two asks into one.
-        released.retain(|(anchor, key)| !self.fetch_awaited(*anchor, *key));
+        let released = self.unawaited(released.into_iter().collect());
         let mut actions = fetches(wanted);
         if !released.is_empty() {
             actions.push(Action::AbandonFetch(FetchIds::StateProofs(released)));
@@ -2334,16 +2460,22 @@ impl Counterparts {
         actions
     }
 
-    /// Whether a probe of either kind still waits on a fetch of `key` at
-    /// `anchor`, so letting it go would strand that probe.
-    fn fetch_awaited(&self, anchor: Anchor, key: SubstateKey) -> bool {
-        self.probes
+    /// What is left of `released` once the fetches a probe of either kind
+    /// still waits on are taken out, since letting those go would strand
+    /// their probes.
+    fn unawaited(&self, mut released: Vec<(Anchor, SubstateKey)>) -> Vec<(Anchor, SubstateKey)> {
+        if released.is_empty() {
+            return released;
+        }
+        let awaited: BTreeSet<(Anchor, SubstateKey)> = self
+            .probes
             .values()
-            .any(|probe| !probe.returned && probe.anchor == anchor && probe.question.key == key)
-            || self
-                .seats
-                .iter()
-                .any(|(question, probe)| probe.awaits(question, anchor, key))
+            .filter(|probe| !probe.returned)
+            .map(|probe| (probe.anchor, probe.question.key))
+            .chain(self.seats.values().flat_map(SeatProbe::awaited))
+            .collect();
+        released.retain(|fetch| !awaited.contains(fetch));
+        released
     }
 
     /// The questions this shard's entries open, each at the newest
@@ -2468,7 +2600,7 @@ impl Counterparts {
         self.wanted = records.iter().map(|record| record.key).collect();
         self.wanted_of = records
             .iter()
-            .map(|record| (record.key, record.tx))
+            .map(|record| ((record.key, record.tx), record.filed_at))
             .collect();
     }
 
@@ -2608,37 +2740,99 @@ impl Counterparts {
     /// The fallback read, for a record no push has brought. Every
     /// validator derives the wanted set and asks for itself, so f
     /// validators withholding their fetch cannot suppress the read; the
-    /// pacing is [`RecordReads`]', armed on the evidence that the
-    /// producer's leg has finalized or never will. Asked at the newest
+    /// arming and the pacing are [`RecordReads`]'. Asked at the newest
     /// anchor of the holder this validator has commit-proven where that
     /// anchor is at or above the read frontier's floor, since a reading
     /// below it is one every voter refuses, and never of a shard this
-    /// chain holds itself, nor while a reading fetched or pushed is
-    /// already held to offer.
+    /// chain holds itself, nor while the want's arrival, fetched or
+    /// pushed, is already held to offer. Another reading of the key
+    /// held here answers nothing the want asks.
+    ///
+    /// One ask stands for a key: a later one takes the earlier's place,
+    /// and one whose key has every want's arrival held, or has moved to
+    /// another holder, is let go of here, whichever way the arrival came. The
+    /// oldest filed go first, and no more than
+    /// [`MAX_RECORD_ASKS_PER_HOLDER`] stand toward one holder, so a
+    /// holder that never answers takes no place from another's. Filing
+    /// order is the chain's, where key order is an address's to grind.
     fn ask_wanted_records(
         &mut self,
         trie: &ShardTrie,
         now: WeightedTimestamp,
         records: &[WantedRecord],
         windows: EpochWindows,
-        wanted: &mut BTreeMap<Anchor, Vec<SubstateKey>>,
-    ) {
-        for record in records {
-            let holder = trie.shard_for_prefix(record.key.owner);
-            if holder == self.ledger.local() {
-                continue;
-            }
-            self.records.arm(record, holder, now);
-            let Some(anchor) = self.newest_above_floor(holder, now, windows) else {
-                continue;
-            };
-            if self.fetched.reads(holder, record.key) {
-                continue;
-            }
-            if self.records.due(record.key, anchor) {
-                wanted.entry(anchor).or_default().push(record.key);
+    ) -> Vec<Action> {
+        let mut filed: Vec<(&WantedRecord, ShardId)> = records
+            .iter()
+            .map(|record| (record, trie.shard_for_prefix(record.key.owner)))
+            .collect();
+        filed.sort_unstable_by_key(|(record, _)| (record.filed_at, record.key));
+        let unread: BTreeSet<SubstateKey> = filed
+            .iter()
+            .filter(|(record, holder)| !self.fetched.reads_arrival(*holder, record.key, record.tx))
+            .map(|(record, _)| record.key)
+            .collect();
+        let mut abandoned: Vec<RecordAsk> = Vec::new();
+        for (record, holder) in &filed {
+            let moved = self
+                .records
+                .out(record.key)
+                .is_some_and(|at| at.shard != *holder);
+            if moved || !unread.contains(&record.key) {
+                abandoned.extend(self.records.take_out(record.key));
             }
         }
+        let local = self.ledger.local();
+        let mut live: BTreeMap<ShardId, usize> = BTreeMap::new();
+        let mut newest_of: BTreeMap<ShardId, Option<Anchor>> = BTreeMap::new();
+        let mut asks: BTreeMap<ShardId, Vec<RecordAsk>> = BTreeMap::new();
+        for (record, holder) in filed {
+            if holder == local {
+                continue;
+            }
+            let newest = *newest_of
+                .entry(holder)
+                .or_insert_with(|| self.newest_above_floor(holder, now, windows));
+            self.records.arm(record, holder, now, newest);
+            if self.fetched.reads_arrival(holder, record.key, record.tx) {
+                continue;
+            }
+            let Some(anchor) = newest else {
+                continue;
+            };
+            let live = live
+                .entry(holder)
+                .or_insert_with(|| self.records.live(holder));
+            if self.records.out(record.key).is_none() && *live >= MAX_RECORD_ASKS_PER_HOLDER {
+                continue;
+            }
+            if !self.records.due_at(record.key, anchor, now) {
+                continue;
+            }
+            let ask = (record.filed_at, anchor, record.key);
+            let replaced = self.records.put(ask);
+            if replaced == Some(ask) {
+                continue;
+            }
+            match replaced {
+                Some(replaced) => abandoned.push(replaced),
+                None => *live += 1,
+            }
+            asks.entry(holder).or_default().push(ask);
+        }
+        let mut actions = Vec::new();
+        if !abandoned.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::RecordProofs(abandoned)));
+        }
+        actions.extend(asks.into_iter().map(|(shard, ids)| {
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::RecordProofs(ids),
+                shard,
+                preferred: None,
+                class: None,
+            })
+        }));
+        actions
     }
 
     /// The newest anchor of `shard` this validator has commit-proven
@@ -2951,10 +3145,10 @@ impl Counterparts {
         (offers, retirements)
     }
 
-    /// Take a proof fetched at `anchor` for `questions`, each whole, and
-    /// hold what is worth a block's bytes.
+    /// Take a proof fetched for `questions`, each whole, and hold what is
+    /// worth a block's bytes.
     ///
-    /// Every question asked at the anchor that the proof reads is closed
+    /// Every question asked at the proof's anchor that it reads is closed
     /// there. Its reading is the leaf where the leaf reads present, and
     /// the leaf, the row and the marker where it reads absent, and it is
     /// held only where [`VerdictQuestion::offers`] holds and no reading
@@ -2966,22 +3160,13 @@ impl Counterparts {
     /// request asks, so no more than three times that many cells.
     pub(crate) fn on_verdict_proof_fetched(
         &mut self,
-        anchor: Anchor,
         questions: &[VerdictCells],
-        proof: &MerkleInclusionProof,
+        proof: &CheckedStateProof,
         windows: EpochWindows,
     ) {
+        let anchor = proof.anchor();
         let sibling = anchor.shard;
-        let keys: Vec<SubstateKey> = questions.iter().flat_map(VerdictCells::keys).collect();
-        let Ok(inclusions) = proof.inclusions(anchor.state_root, sibling, &keys) else {
-            tracing::warn!(
-                shard = ?sibling,
-                height = anchor.height.inner(),
-                "A fetched verdict proof does not answer for its keys"
-            );
-            return;
-        };
-        let read: BTreeMap<SubstateKey, Inclusion> = inclusions.into_iter().collect();
+        let read: BTreeMap<SubstateKey, Inclusion> = proof.inclusions().iter().copied().collect();
         let mark = ReadMark::of(&anchor, windows);
         let mut cells: Vec<(SubstateKey, Inclusion)> = Vec::new();
         let mut taken: Vec<(TxHash, VerdictCells)> = Vec::new();
@@ -3035,7 +3220,7 @@ impl Counterparts {
             return;
         }
         let kept: Vec<SubstateKey> = cells.iter().map(|(key, _)| *key).collect();
-        let Ok(cut) = proof.restrict(&kept) else {
+        let Ok(cut) = proof.proof().restrict(&kept) else {
             tracing::warn!(
                 shard = ?sibling,
                 height = anchor.height.inner(),
@@ -3386,8 +3571,8 @@ impl Counterparts {
     /// answers, and hold the claim it proves to offer in a block this
     /// validator proposes.
     ///
-    /// The proof is walked once, under the anchor's root, and what
-    /// comes back is the reading. What the ledger asked about is what
+    /// The proof arrives read under the anchor's root, and what it says
+    /// of each key is the reading. What the ledger asked about is what
     /// is offered: the probes the proof spoke to are marked answered,
     /// so the question is not put to the same header again, and the
     /// claim is kept beside the transactions it answered for, which is
@@ -3399,13 +3584,18 @@ impl Counterparts {
     /// A record value the server proved present rides in the claim as
     /// a held reading, which is how a consumer comes to read the
     /// record's terms.
-    pub(crate) fn on_proof_fetched(
+    pub(crate) fn take_fetched_proof(
         &mut self,
-        anchor: Anchor,
-        keys: &[SubstateKey],
-        proof: &MerkleInclusionProof,
+        checked: &CheckedStateProof,
         values: &[ServedValue],
     ) {
+        let anchor = checked.anchor();
+        let keys = checked.keys();
+        let proof = checked.proof();
+        let inclusions = checked.inclusions();
+        for key in keys {
+            self.records.answered(*key, anchor);
+        }
         let answered: Vec<Question> = self
             .probes
             .values_mut()
@@ -3417,17 +3607,9 @@ impl Counterparts {
                 probe.question
             })
             .collect();
-        let Ok(inclusions) = proof.inclusions(anchor.state_root, anchor.shard, keys) else {
-            tracing::warn!(
-                shard = ?anchor.shard,
-                height = anchor.height.inner(),
-                "A fetched state proof does not answer for its keys"
-            );
-            return;
-        };
         // The cells asked at a boundary for an answer's deletion are
         // held apart, and are no other question's to keep.
-        let at_boundary = self.hold_boundary_readings(anchor, &inclusions, proof);
+        let at_boundary = self.hold_boundary_readings(anchor, inclusions, proof);
         // A question the proof answered is not put again, and the
         // reading that answered it is the one held to offer: what the
         // answer means is still the chain's to say, and until a block
@@ -3453,19 +3635,46 @@ impl Counterparts {
                 record_sibling_question_pending();
             }
         }
-        answering.extend(
-            inclusions
-                .iter()
-                .map(|(key, _)| *key)
-                .filter(|key| !at_boundary.contains(key))
-                .filter(|key| wants_reading(&self.rows.awaited, &self.wanted, *key)),
+        let read = StateClaim::new(
+            anchor,
+            inclusions.iter().map(|&(key, inclusion)| {
+                let held = values
+                    .iter()
+                    .find(|(served, _)| *served == key)
+                    .map(|(_, bytes)| Stated::Held(bytes.clone()));
+                (key, held.unwrap_or(Stated::Inclusion(inclusion)))
+            }),
+            proof.clone(),
         );
-        for (reading, victim) in self.answer_seats(anchor, keys, proof, &inclusions) {
+        let mut for_wants = self.kept_for_wants(&read);
+        for_wants
+            .unasked
+            .retain(|(_, key)| !answering.contains(key));
+        answering.extend(
+            for_wants
+                .keys()
+                .into_iter()
+                .filter(|key| !at_boundary.contains(key)),
+        );
+        for (reading, victim) in self.answer_seats(anchor, proof, inclusions) {
             self.hold_seat_reading(&reading, victim);
         }
-        if answering.is_empty() {
-            return;
+        if !answering.is_empty() {
+            self.hold_fetched(&read, &answering, speaks_for, for_wants.unasked);
         }
+    }
+
+    /// Hold the cells `answering` of the fetched reading `read`, speaking
+    /// for `speaks_for`, with `unasked` the validity end and key of each
+    /// unsolicited record among them.
+    fn hold_fetched(
+        &mut self,
+        read: &StateClaim,
+        answering: &BTreeSet<SubstateKey>,
+        speaks_for: BTreeSet<TxHash>,
+        unasked: Vec<(WeightedTimestamp, SubstateKey)>,
+    ) {
+        let anchor = read.anchor;
         // A cell a held claim at this anchor already reads is not held
         // twice; the transactions this proof spoke for lean on that
         // claim instead.
@@ -3486,11 +3695,17 @@ impl Counterparts {
                 }
             }
         }
+        let unasked = unasked
+            .into_iter()
+            .filter(|(_, key)| fresh.contains(key))
+            .collect();
+        for refused in self.cap_unsolicited(anchor.shard, unasked) {
+            fresh.remove(&refused);
+        }
         if fresh.is_empty() {
             return;
         }
-        let kept: Vec<SubstateKey> = fresh.iter().copied().collect();
-        let Ok(proof) = proof.restrict(&kept) else {
+        let Some(kept) = read.restrict(|key| fresh.contains(&key)) else {
             tracing::warn!(
                 shard = ?anchor.shard,
                 height = anchor.height.inner(),
@@ -3498,27 +3713,54 @@ impl Counterparts {
             );
             return;
         };
-        let cells = inclusions
-            .iter()
-            .filter(|(key, _)| fresh.contains(key))
-            .map(|&(key, inclusion)| {
-                let held = values
-                    .iter()
-                    .find(|(served, _)| *served == key)
-                    .map(|(_, bytes)| Stated::Held(bytes.clone()));
-                (key, held.unwrap_or(Stated::Inclusion(inclusion)))
-            });
         // Each reading of a crossing's cell names the crossing, off what
         // the asker holds: a held record's answers, and a held answer's
         // record. What the reading licenses the fold to remove is read
-        // off the name, by every replica alike.
-        let named: Vec<(SubstateKey, CrossingId)> = kept
+        // off the name, by every replica alike. An owed record addressed
+        // here names its own, as a pushed one does.
+        let local = self.ledger.local();
+        let named: Vec<(SubstateKey, CrossingId)> = fresh
             .iter()
-            .filter_map(|key| self.crossing_of(*key).map(|id| (*key, id)))
+            .filter_map(|key| {
+                self.crossing_of(*key)
+                    .or_else(|| owed_here(&kept, *key, local, self.index.as_ref()))
+                    .map(|id| (*key, id))
+            })
             .collect();
-        self.fetched
-            .hold(StateClaim::new(anchor, cells, proof).naming(named))
-            .extend(speaks_for);
+        self.fetched.hold(kept.naming(named)).extend(speaks_for);
+    }
+
+    /// What of `claim`, whichever door it came in by, is worth holding
+    /// for what waits here: the one rule for a fetched reading and a
+    /// pushed one.
+    ///
+    /// A record a want's own transaction issued is its arrival. An
+    /// escrowed record nothing here waits on is kept where the fold could
+    /// decline it ([`Self::unsolicited`]), and a key the crossing rows
+    /// await and an owed record the fold credits are kept by those rules.
+    /// A wanted key read any other way, absent above all, holds nothing:
+    /// the fold takes nothing from it, and a block carrying it would
+    /// spend a place to say so. Any member of the anchor's committee can
+    /// send such a reading, so it must leave the want's read running.
+    fn kept_for_wants(&self, claim: &StateClaim) -> KeptForWants {
+        let local = self.ledger.local();
+        let mut kept = KeptForWants::default();
+        for key in claim.keys() {
+            let arrival = live_record(std::slice::from_ref(claim), key).and_then(|(_, cell)| {
+                let filed_at = self.wanted_of.get(&(key, cell.tx))?;
+                Some((cell.tx, *filed_at))
+            });
+            if let Some(arrival) = arrival {
+                kept.arrivals.insert(key, arrival);
+            } else if let Some((_, end)) = self.unsolicited(claim, key) {
+                kept.unasked.push((end, key));
+            } else if self.rows.awaited.contains(&key)
+                || owed_here(claim, key, local, self.index.as_ref()).is_some()
+            {
+                kept.rows.insert(key);
+            }
+        }
+        kept
     }
 
     /// Take a fetched proof at `anchor` into the seat questions it speaks
@@ -3527,40 +3769,58 @@ impl Counterparts {
     ///
     /// Each question keeps the part of the proof that reads its own keys,
     /// and closes once every one of them has come back. Its readings are
-    /// held only where together they read the cycle: anything else is
-    /// plain contention, and the question is put again at a newer header.
+    /// held only where together they read the cycle or the victim's
+    /// leaving: anything else is plain contention, and the question is
+    /// put again at a newer header.
     fn answer_seats(
         &mut self,
         anchor: Anchor,
-        keys: &[SubstateKey],
         proof: &MerkleInclusionProof,
         inclusions: &[(SubstateKey, Inclusion)],
     ) -> Vec<(StateClaim, TxHash)> {
         let mut held = Vec::new();
+        let out = |probe: &SeatProbe| !probe.returned && probe.anchor == anchor;
+        if !self.seats.values().any(out) {
+            return held;
+        }
+        let answered: BTreeMap<SubstateKey, Inclusion> = inclusions.iter().copied().collect();
+        let proof = Arc::new(proof.clone());
         for (question, probe) in &mut self.seats {
-            let arrived: Vec<SubstateKey> = question
-                .keys()
-                .into_iter()
-                .filter(|key| keys.contains(key) && probe.awaits(question, anchor, *key))
-                .collect();
-            if arrived.is_empty() {
+            if !out(probe) {
                 continue;
             }
-            let Ok(cut) = proof.restrict(&arrived) else {
-                continue;
-            };
-            let cells = inclusions
+            let cells: Vec<(SubstateKey, Inclusion)> = probe
+                .keys
                 .iter()
-                .filter(|(key, _)| arrived.contains(key))
-                .map(|&(key, inclusion)| (key, Stated::Inclusion(inclusion)));
-            probe.parts.push(StateClaim::new(anchor, cells, cut));
-            if question.keys().iter().any(|key| probe.read(*key).is_none()) {
+                .filter(|key| probe.read(**key).is_none())
+                .filter_map(|key| answered.get(key).map(|inclusion| (*key, *inclusion)))
+                .collect();
+            if cells.is_empty() {
+                continue;
+            }
+            probe.parts.push(SeatPart {
+                cells,
+                proof: Arc::clone(&proof),
+            });
+            if probe.keys.iter().any(|key| probe.read(*key).is_none()) {
                 continue;
             }
             probe.returned = true;
             let parts = std::mem::take(&mut probe.parts);
-            if question.proven_by(&parts) {
-                held.extend(parts.into_iter().map(|part| (part, question.waiting)));
+            // Read here and never carried, so it goes without a proof.
+            let readings = StateClaim::new(
+                anchor,
+                parts.iter().flat_map(|part| stated(&part.cells)),
+                MerkleInclusionProof::new(Vec::new()),
+            );
+            if question.proven_by([&readings]) {
+                let victim = question.victim();
+                held.extend(
+                    parts
+                        .iter()
+                        .filter_map(|part| part.claim(anchor))
+                        .map(|claim| (claim, victim)),
+                );
             }
         }
         held
@@ -3851,7 +4111,7 @@ impl Counterparts {
             self.clock,
             self.index.as_ref(),
         )?;
-        (!self.wanted_of.contains(&(key, issuer.tx)))
+        (!self.wanted_of.contains_key(&(key, issuer.tx)))
             .then_some((id, WeightedTimestamp::from_millis(issuer.validity_end_ms)))
     }
 
@@ -3983,19 +4243,18 @@ impl Counterparts {
     }
 
     /// Keep a pushed claim's cells while something here wants them, and
-    /// say whether the claim is done with: `false` where nothing wants
-    /// it yet and something may come to. `records` is the wanted set as
-    /// the coordinator derives it now, since a push lands between the
-    /// commits and probes that otherwise refresh it. A claim carrying
-    /// nothing wanted costs no memory here: a push that lands before
-    /// its consumer's transaction commits here, or before any body
-    /// reports its record, is the caller's to hold for the want. One
-    /// carrying only escrowed records past their taking
+    /// hand back what of it may yet come to be wanted, cut to those
+    /// cells. `records` is the wanted set as the coordinator derives it
+    /// now, since a push lands between the commits and probes that
+    /// otherwise refresh it. A cell nothing wants yet costs no memory
+    /// here: a push that lands before its consumer's transaction commits
+    /// here, or before any body reports its record, is the caller's to
+    /// hold for the want. An escrowed record past its taking
     /// ([`past_its_taking`]) is held for no want, since none can be
-    /// filed for it, and neither is one carrying only the consumer's
-    /// `Taken` of records this shard holds: a pushed `Taken` is pacing
-    /// for its producer, which retires only on a reading at a boundary
-    /// of the consumer's shard.
+    /// filed for it, and neither is the consumer's `Taken` of a record
+    /// this shard holds: a pushed `Taken` is pacing for its producer,
+    /// which retires only on a reading at a boundary of the consumer's
+    /// shard. A claim past the retention horizon hands back nothing.
     ///
     /// Two kinds of record are kept that nothing here asks for: an owed
     /// record this shard's fold credits ([`owed_here`]), and an escrowed
@@ -4006,44 +4265,50 @@ impl Counterparts {
     /// whose transaction holds a member row here is not one: it is
     /// kept only where that member waits on it, and takes no place
     /// under the cap.
-    /// What is kept is cut to the wanted keys not already held at the
-    /// anchor, so the section stays one proof per claim, disjoint per
-    /// anchor, and each kept key's read counts the push as an ask
-    /// answered at its anchor.
+    ///
+    /// What is kept is cut to the keys not already held at the anchor,
+    /// so the section stays one proof per claim, disjoint per anchor,
+    /// and each arrival's read counts the push as an ask answered at its
+    /// anchor. The rule is [`Self::kept_for_wants`]', and a wanted key it
+    /// declines is not handed back: every commit would release it from
+    /// the caller's hold while the want lives, only to decline it again.
+    /// Nor is an absence, which that rule keeps only for a key the rows
+    /// await now: held for later it would spend a place and a member of
+    /// the committee could fill the hold with absences of any key.
     pub(crate) fn offer_pushed(
         &mut self,
-        claim: &StateClaim,
+        pushed: StateClaim,
         records: &[WantedRecord],
         now: WeightedTimestamp,
-    ) -> bool {
+    ) -> Option<StateClaim> {
+        let claim = &pushed;
         if now.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON {
-            return false;
+            record_crossing_push_dropped("retired");
+            return None;
         }
         self.want(records);
         self.clock = now;
         self.pause_on(claim);
         let anchor = claim.anchor;
         let local = self.ledger.local();
-        let unasked: Vec<(WeightedTimestamp, SubstateKey)> = claim
-            .keys()
-            .into_iter()
-            .filter_map(|key| self.unsolicited(claim, key).map(|(_, end)| (end, key)))
-            .collect();
-        let mut wanted: BTreeSet<SubstateKey> = claim
+        let for_wants = self.kept_for_wants(claim);
+        let mut wanted = for_wants.keys();
+        let undecided: BTreeSet<SubstateKey> = claim
             .keys()
             .into_iter()
             .filter(|key| {
-                wants_reading(&self.rows.awaited, &self.wanted, *key)
-                    || owed_here(claim, *key, local, self.index.as_ref()).is_some()
+                !wanted.contains(key)
+                    && !self.wanted.contains(key)
+                    && claim.reading(*key) != Some(Inclusion::Absent)
+                    && !self.rows.retires_on(*key)
+                    && !held_record(claim, *key)
+                        .is_some_and(|(_, cell)| past_its_taking(&cell, local, now))
             })
-            .chain(unasked.iter().map(|(_, key)| *key))
             .collect();
-        if wanted.is_empty() {
-            return claim.keys().into_iter().all(|key| {
-                held_record(claim, key).is_some_and(|(_, cell)| past_its_taking(&cell, local, now))
-                    || self.rows.retires_on(key)
-            });
+        if undecided.len() == claim.cells.len() {
+            return Some(pushed);
         }
+        let remainder = claim.restrict(|key| undecided.contains(&key));
         for held in self.fetched.claims() {
             if held.anchor == anchor {
                 for key in held.keys() {
@@ -4051,18 +4316,17 @@ impl Counterparts {
                 }
             }
         }
-        let unasked: Vec<(WeightedTimestamp, SubstateKey)> = unasked
-            .into_iter()
+        let unasked: Vec<(WeightedTimestamp, SubstateKey)> = for_wants
+            .unasked
+            .iter()
             .filter(|(_, key)| wanted.contains(key))
+            .copied()
             .collect();
         for refused in self.cap_unsolicited(anchor.shard, unasked) {
             wanted.remove(&refused);
         }
-        if wanted.is_empty() {
-            return true;
-        }
         let Some(kept) = claim.restrict(|key| wanted.contains(&key)) else {
-            return false;
+            return remainder;
         };
         // An owed record addressed here names its own crossing, which
         // is what the fold credits it under.
@@ -4079,11 +4343,24 @@ impl Counterparts {
                 kept.crossings.iter().copied().chain(owed).collect();
             kept.naming(named)
         };
-        for key in &wanted {
-            self.records.pushed(*key, anchor);
+        // How far the holder's clock stands past each filing as the first
+        // push of a key lands: what the grace is compared against, so a
+        // push landing inside the grace draws no ask, whatever the
+        // latency. A key already held takes no sample, so a member moves
+        // the grace only with the keys it withheld, at the anchor heights
+        // it picks for them, and the grace's ceiling bounds what that buys.
+        let reached = self
+            .proven_anchors
+            .newest_licensed(anchor.shard, now, ..)
+            .map_or(anchor.ts, |newest| newest.ts);
+        for (key, (tx, filed_at)) in &for_wants.arrivals {
+            if wanted.contains(key) && !self.fetched.reads_arrival(anchor.shard, *key, *tx) {
+                let span = reached.elapsed_since(*filed_at);
+                self.records.pushed(*key, anchor, span, now);
+            }
         }
         let _ = self.fetched.hold(kept);
-        true
+        remainder
     }
 
     /// Drop the claims no transaction they answered for still needs,
@@ -4095,10 +4372,8 @@ impl Counterparts {
         let unresolved = &self.ledger;
         // A claim is worth carrying while something still wants what it
         // answers: a transaction the ledger owes an outcome for, or a
-        // leaf-driven question of this shard's, by [`wants_reading`] —
-        // the same predicate that decided the reading was worth keeping
-        // when the fetch landed — or a record this shard's fold credits
-        // or declines unasked.
+        // leaf-driven question of this shard's, by [`wants_reading`], or
+        // a record this shard's fold credits or declines unasked.
         // A claim stands only at an anchor this validator still holds
         // commit-proven, since a retired or fenced anchor is one no
         // voter could stand it at, so one whose anchor is gone is let go
@@ -4143,7 +4418,7 @@ impl Counterparts {
             }
             false
         });
-        released.retain(|(anchor, key)| !self.fetch_awaited(*anchor, *key));
+        let released = self.unawaited(released);
         if released.is_empty() {
             Vec::new()
         } else {
@@ -4260,7 +4535,7 @@ impl Counterparts {
     /// make two answers of one transaction.
     pub(crate) fn on_certificate(
         &mut self,
-        ec: &Arc<Verified<ExecutionCertificate>>,
+        ec: &Verified<ExecutionCertificate>,
         now: WeightedTimestamp,
     ) {
         self.records.certified(
@@ -4336,6 +4611,34 @@ mod tests {
     };
 
     use super::*;
+    use crate::parked_claims::ParkedClaims;
+
+    impl Counterparts {
+        /// Read `proof` against `anchor` for `keys` and take it, as a
+        /// fetch's answer arrives.
+        fn on_proof_fetched(
+            &mut self,
+            anchor: Anchor,
+            keys: &[SubstateKey],
+            proof: &MerkleInclusionProof,
+            values: &[ServedValue],
+        ) {
+            let checked = CheckedStateProof::check(anchor, keys.to_vec(), proof.clone())
+                .expect("a fetch's answer reads under its anchor");
+            self.take_fetched_proof(&checked, values);
+        }
+
+        /// Offer a pushed claim, and say whether none of it is left for
+        /// the caller to hold.
+        fn done_with_push(
+            &mut self,
+            claim: &StateClaim,
+            records: &[WantedRecord],
+            now: WeightedTimestamp,
+        ) -> bool {
+            self.offer_pushed(claim.clone(), records, now).is_none()
+        }
+    }
 
     /// One name reaching `routes` prefixes, seeded by `seed`.
     fn name(seed: usize, routes: usize) -> UnsettledTx {
@@ -4354,7 +4657,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(1),
                 anchor: WeightedTimestamp::ZERO,
-                committee_anchor: WeightedTimestamp::ZERO,
+                committee_epoch: Epoch::GENESIS,
             },
             reach: Capped::new(
                 (0..routes)
@@ -4489,7 +4792,10 @@ mod tests {
         for (at, boundary) in boundaries.iter().enumerate() {
             schedule.insert(Epoch::new(at as u64 + 1), snapshot(Some(boundary)));
         }
-        schedule.set_head(snapshot(boundaries.last()));
+        schedule.set_head(
+            Epoch::new(boundaries.len() as u64),
+            snapshot(boundaries.last()),
+        );
         schedule
     }
 
@@ -4986,7 +5292,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x71, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        assert!(producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now));
+        assert!(producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now));
         assert_eq!(paused_from(&producer, record), Some(40_000));
         assert!(
             !pushes(&mut producer, record, 1),
@@ -5005,7 +5311,7 @@ mod tests {
         let now = WeightedTimestamp::from_millis(40_000);
         let recorder = MemoryRecorder::new();
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
             read_at_boundary(&mut producer, (&id, &cell), &[], 40, 50_000);
         });
         assert_eq!(paused_from(&producer, record), None);
@@ -5030,10 +5336,10 @@ mod tests {
         let pushed = pushed_taken(&id, &cell, cell.tx, 40_000);
         let recorder = MemoryRecorder::new();
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed, &[], now);
+            producer.done_with_push(&pushed, &[], now);
             read_at_boundary(&mut producer, (&id, &cell), &[], 40, 50_000);
-            producer.offer_pushed(&pushed, &[], now);
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 50_000), &[], now);
+            producer.done_with_push(&pushed, &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 50_000), &[], now);
         });
         assert_eq!(paused_from(&producer, record), None);
         assert_eq!(recorder.counter("repush_paused", Some("set")), 1);
@@ -5042,7 +5348,7 @@ mod tests {
             "the record is pushed again"
         );
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 55_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 55_000), &[], now);
         });
         assert_eq!(paused_from(&producer, record), Some(55_000));
         assert_eq!(recorder.counter("repush_paused", Some("set")), 2);
@@ -5056,7 +5362,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x73, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         read_at_boundary(&mut producer, (&id, &cell), &[], 40, 40_000);
         assert_eq!(paused_from(&producer, record), Some(40_000));
         assert!(!pushes(&mut producer, record, 1));
@@ -5071,7 +5377,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x74, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         let boundary = Anchor {
             shard: CONSUMER,
             height: BlockHeight::new(40),
@@ -5097,7 +5403,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x75, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         read_at_boundary(
             &mut producer,
             (&id, &cell),
@@ -5118,7 +5424,7 @@ mod tests {
         let record = id.record_key(&ProtocolHasher);
         let stranger = TxHash::from(Hash::from_bytes(b"another transaction"));
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, stranger, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, stranger, 40_000), &[], now);
         assert_eq!(paused_from(&producer, record), None);
         assert!(pushes(&mut producer, record, 1));
     }
@@ -5146,7 +5452,7 @@ mod tests {
         );
         producer.derive_asks(&ShardTrie::from_leaves([CONSUMER, PRODUCER]));
         let (paused, id, cell) = &records[0];
-        producer.offer_pushed(
+        producer.done_with_push(
             &pushed_taken(id, cell, cell.tx, 40_000),
             &[],
             WeightedTimestamp::from_millis(40_000),
@@ -5177,15 +5483,15 @@ mod tests {
         let now = WeightedTimestamp::from_millis(40_000);
         let recorder = MemoryRecorder::new();
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 35_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 35_000), &[], now);
         });
         assert_eq!(paused_from(&producer, record), Some(40_000));
         assert_eq!(recorder.counter("repush_paused", Some("set")), 1);
         let later = WeightedTimestamp::from_millis(45_000);
         with_recorder(&recorder, || {
-            producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 45_000), &[], later);
+            producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 45_000), &[], later);
         });
         assert_eq!(paused_from(&producer, record), Some(45_000));
         assert_eq!(recorder.counter("repush_paused", Some("set")), 2);
@@ -5253,7 +5559,7 @@ mod tests {
         let (mut producer, id, cell, taken, _) = escrowed_producer(&rows, 0x7C, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         let (left, right) = CONSUMER.children();
         let split = ShardTrie::from_leaves([left, right, PRODUCER]);
         assert!([left, right].contains(&split.shard_for_prefix(taken.owner)));
@@ -5272,7 +5578,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x7D, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         let boundary = Anchor {
             shard: CONSUMER,
             height: BlockHeight::new(40),
@@ -5312,7 +5618,7 @@ mod tests {
         let (mut producer, id, cell, _, _) = escrowed_producer(&rows, 0x7A, DUE_MS);
         let record = id.record_key(&ProtocolHasher);
         let now = WeightedTimestamp::from_millis(40_000);
-        producer.offer_pushed(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
+        producer.done_with_push(&pushed_taken(&id, &cell, cell.tx, 40_000), &[], now);
         rows.restart();
         producer.derive_asks(&ShardTrie::from_leaves([CONSUMER, PRODUCER]));
         assert!(producer.rows.rejudge, "the read was whole");
@@ -5646,8 +5952,7 @@ mod tests {
     #[test]
     fn a_held_claim_is_let_go_once_its_anchor_ages_past_the_horizon() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
-        // No row here names the cells, so each is read unnamed, for the
-        // records a consumer here waits on.
+        // No row here names the cells, so each is read unnamed.
         let (mut producer, _, anchors, _rows) = producing(0, deadline);
         let claim = claim_of(0, deadline);
         let decline = consumer_decline(0, deadline);
@@ -5660,7 +5965,7 @@ mod tests {
             ts: now,
         };
         anchors.record(anchor);
-        producer.wanted = BTreeSet::from([claim]);
+        producer.rows.awaited = BTreeSet::from([claim]);
         producer.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
 
         let at_the_horizon = now.plus(RETENTION_HORIZON);
@@ -5830,7 +6135,7 @@ mod tests {
         ) = answering_many(24);
         let now = WeightedTimestamp::from_millis(400_000);
 
-        // Readings something waits on: a record a consumer here wants,
+        // Readings something waits on: a cell the crossing rows await,
         // read at the producer's fresh header and at another shard's.
         let other = ShardId::leaf(2, 0);
         let wanted = [
@@ -5844,7 +6149,7 @@ mod tests {
                 },
             ),
         ];
-        counterparts.wanted = wanted.iter().map(|(_, _, key)| *key).collect();
+        counterparts.rows.awaited = wanted.iter().map(|(_, _, key)| *key).collect();
         for (shard, height, key) in wanted {
             let (state_root, proof) = state_and_proof(shard, &[], &[key]);
             let anchor = Anchor {
@@ -6539,8 +6844,8 @@ mod tests {
         let retired = StateClaim::new(suffix, [(record, Inclusion::Absent)], suffix_proof.clone());
         let during = WeightedTimestamp::from_millis(EPOCH_MS + 16_000);
         assert!(
-            !counterparts.offer_pushed(&retired, &[], during),
-            "a fresh absence of the record is nothing this shard keeps to offer",
+            counterparts.done_with_push(&retired, &[], during),
+            "a fresh absence of the record is nothing this shard keeps or holds for later",
         );
         counterparts.on_proof_fetched(suffix, &[record], &suffix_proof, &[]);
         assert!(
@@ -6578,7 +6883,7 @@ mod tests {
             "a mark at a lower height in a later epoch passes the frontier's floor",
         );
         assert!(
-            !counterparts.offer_pushed(&pushed, &[], now),
+            !counterparts.done_with_push(&pushed, &[], now),
             "with the Taken standing the recovered chain's push is dropped",
         );
         let offered = counterparts.offers(&CarriedClaims::default()).state_claims;
@@ -6592,7 +6897,7 @@ mod tests {
         // Had the Taken gone on the retirement, the same push would be
         // kept and would credit the record a second time.
         rows.remove(taken);
-        assert!(counterparts.offer_pushed(&pushed, &[], now));
+        assert!(counterparts.done_with_push(&pushed, &[], now));
         let offered = counterparts.offers(&CarriedClaims::default()).state_claims;
         let writes = owed_credits(&offered, &StateWrites::default(), &NoCells);
         assert_eq!(
@@ -6992,7 +7297,7 @@ mod tests {
             proof,
         );
         assert!(
-            producer.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000)),
+            producer.done_with_push(&pushed, &[], WeightedTimestamp::from_millis(2_000)),
             "the claim is done with: nothing parks it",
         );
         assert!(
@@ -7077,7 +7382,7 @@ mod tests {
                 ReadFrontier::default(),
             );
             let kept =
-                counterparts.offer_pushed(&pushed, &[], WeightedTimestamp::from_millis(2_000));
+                counterparts.done_with_push(&pushed, &[], WeightedTimestamp::from_millis(2_000));
             (kept, counterparts.state_claims(&CarriedClaims::default()))
         };
 
@@ -7142,11 +7447,15 @@ mod tests {
         key: SubstateKey,
         cell: &CrossingCell,
     ) -> StateClaim {
+        // A proof over the whole keyspace, so any key may sit on any
+        // producer here: past ingress nothing reads it against a shard.
+        let (state_root, proof) =
+            state_and_proof_holding(ShardId::ROOT, &[(key, cell.to_bytes())], &[key]);
         StateClaim {
             anchor: Anchor {
                 shard: producer,
                 height: BlockHeight::new(height),
-                state_root: StateRoot::from_raw(Hash::ZERO),
+                state_root,
                 ts: WeightedTimestamp::from_millis(height * 1_000),
             },
             cells: Capped::new(vec![(
@@ -7156,7 +7465,7 @@ mod tests {
             .expect("one cell"),
             crossings: Capped::empty(),
             verdicts: Capped::empty(),
-            proof: MerkleInclusionProof::dummy(),
+            proof,
         }
     }
 
@@ -7275,7 +7584,7 @@ mod tests {
 
         let (early, _, early_cell) = escrowed_record(0xF0, 100_001);
         assert!(
-            !consumer.offer_pushed(&pushed_record(PRODUCER, 1, early, &early_cell), &[], now),
+            !consumer.done_with_push(&pushed_record(PRODUCER, 1, early, &early_cell), &[], now),
             "short of its validity end nothing here wants an unasked record",
         );
 
@@ -7288,7 +7597,7 @@ mod tests {
                 .to_bytes(),
         );
         assert!(
-            consumer.offer_pushed(
+            consumer.done_with_push(
                 &pushed_record(PRODUCER, 2, declined, &declined_cell),
                 &[],
                 now
@@ -7310,7 +7619,7 @@ mod tests {
                 .to_bytes(),
         );
         assert!(
-            consumer.offer_pushed(
+            consumer.done_with_push(
                 &pushed_record(PRODUCER, 2, declined, &declined_cell),
                 &[],
                 now
@@ -7350,7 +7659,7 @@ mod tests {
         let record = |seed: u8| escrowed_record(seed, u64::from(seed) * 1_000);
         for seed in 5..=20u8 {
             let (key, _, cell) = record(seed);
-            assert!(consumer.offer_pushed(
+            assert!(consumer.done_with_push(
                 &pushed_record(PRODUCER, u64::from(seed), key, &cell),
                 &[],
                 now
@@ -7367,7 +7676,7 @@ mod tests {
         assert!(one_lineage(child, PRODUCER));
         for producer in [PRODUCER, child] {
             assert!(
-                consumer.offer_pushed(
+                consumer.done_with_push(
                     &pushed_record(producer, 30, younger, &younger_cell),
                     &[],
                     now
@@ -7377,12 +7686,20 @@ mod tests {
             assert_eq!(held(&consumer), sixteen);
         }
         let (again, _, again_cell) = record(7);
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 31, again, &again_cell), &[], now));
+        assert!(consumer.done_with_push(
+            &pushed_record(PRODUCER, 31, again, &again_cell),
+            &[],
+            now
+        ));
         assert_eq!(consumer.state_claims(&CarriedClaims::default()).len(), 16);
 
         // An older one takes the youngest's place.
         let (older, _, older_cell) = record(1);
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 32, older, &older_cell), &[], now));
+        assert!(consumer.done_with_push(
+            &pushed_record(PRODUCER, 32, older, &older_cell),
+            &[],
+            now
+        ));
         let mut expected = sixteen;
         expected.remove(&record(20).0);
         expected.insert(older);
@@ -7393,9 +7710,9 @@ mod tests {
         let wanted = [WantedRecord {
             key: younger,
             tx: younger_cell.tx,
-            arms_at: None,
+            filed_at: now,
         }];
-        assert!(consumer.offer_pushed(
+        assert!(consumer.done_with_push(
             &pushed_record(PRODUCER, 33, younger, &younger_cell),
             &wanted,
             now
@@ -7425,7 +7742,7 @@ mod tests {
         let wanted = [WantedRecord {
             key: awaited,
             tx: awaited_cell.tx,
-            arms_at: None,
+            filed_at: now,
         }];
         let asked = ShardId::leaf(2, 3);
         // The unasked producer's anchor is the oldest held.
@@ -7434,7 +7751,7 @@ mod tests {
             pushed_record(asked, 40, awaited, &awaited_cell),
             pushed_record(asked, 30, also_unasked, &also_unasked_cell),
         ] {
-            assert!(consumer.offer_pushed(&claim, &wanted, now));
+            assert!(consumer.done_with_push(&claim, &wanted, now));
         }
         let offered: Vec<(ShardId, u64)> = consumer
             .state_claims(&CarriedClaims::default())
@@ -7453,7 +7770,7 @@ mod tests {
             pushed_record(asked, 30, also_unasked, &also_unasked_cell),
             pushed_record(PRODUCER, 5, unasked, &unasked_cell),
         ] {
-            assert!(unasking.offer_pushed(&claim, &[], now));
+            assert!(unasking.done_with_push(&claim, &[], now));
         }
         let offered: Vec<(ShardId, u64)> = unasking
             .state_claims(&CarriedClaims::default())
@@ -7512,7 +7829,7 @@ mod tests {
         rows.put(row, vec![1]);
         for height in 1..=64 {
             assert!(
-                consumer.offer_pushed(&pushed_record(PRODUCER, height, key, &cell), &[], now),
+                consumer.done_with_push(&pushed_record(PRODUCER, height, key, &cell), &[], now),
                 "past its validity end the record is held for no later want",
             );
             assert!(
@@ -7522,7 +7839,7 @@ mod tests {
         }
 
         rows.remove(row);
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 65, key, &cell), &[], now));
+        assert!(consumer.done_with_push(&pushed_record(PRODUCER, 65, key, &cell), &[], now));
         assert_eq!(named(&consumer), vec![(key, id)]);
     }
 
@@ -7539,7 +7856,7 @@ mod tests {
         for seed in 5..=20u8 {
             let (key, _, cell) = record(seed);
             rows.put(member_row_leaf(CONSUMER, cell.tx), vec![1]);
-            assert!(consumer.offer_pushed(
+            assert!(consumer.done_with_push(
                 &pushed_record(PRODUCER, u64::from(seed), key, &cell),
                 &[],
                 now
@@ -7547,7 +7864,7 @@ mod tests {
             assert!(consumer.state_claims(&CarriedClaims::default()).is_empty());
         }
         let (younger, younger_id, younger_cell) = record(21);
-        assert!(consumer.offer_pushed(
+        assert!(consumer.done_with_push(
             &pushed_record(PRODUCER, 30, younger, &younger_cell),
             &[],
             now
@@ -7557,7 +7874,7 @@ mod tests {
         for seed in 5..=20u8 {
             let (key, _, cell) = record(seed);
             rows.remove(member_row_leaf(CONSUMER, cell.tx));
-            assert!(consumer.offer_pushed(
+            assert!(consumer.done_with_push(
                 &pushed_record(PRODUCER, 40 + u64::from(seed), key, &cell),
                 &[],
                 now
@@ -7581,7 +7898,7 @@ mod tests {
             let mut consumer = consuming(rows);
             let claim = pushed_record(PRODUCER, 7, key, &cell);
             consumer.proven_anchors.record(claim.anchor);
-            assert!(consumer.offer_pushed(&claim, &[], now));
+            assert!(consumer.done_with_push(&claim, &[], now));
             consumer
         };
 
@@ -7632,13 +7949,13 @@ mod tests {
                 WantedRecord {
                     key,
                     tx: cell.tx,
-                    arms_at: None,
+                    filed_at: now,
                 }
             })
             .collect();
         for seed in 1..=17u8 {
             let (key, _, cell) = record(seed);
-            assert!(consumer.offer_pushed(
+            assert!(consumer.done_with_push(
                 &pushed_record(PRODUCER, u64::from(seed), key, &cell),
                 &wanted,
                 now
@@ -7720,13 +8037,13 @@ mod tests {
             [WantedRecord {
                 key,
                 tx,
-                arms_at: None,
+                filed_at: now,
             }]
         };
         let offered = |wanted: &[WantedRecord]| {
             let rows = Arc::new(TestRows::default());
             let mut consumer = consuming(&rows);
-            assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 2, key, &cell), wanted, now));
+            assert!(consumer.done_with_push(&pushed_record(PRODUCER, 2, key, &cell), wanted, now));
             assert_eq!(offered_keys(&consumer), BTreeSet::from([key]));
             named(&consumer)
         };
@@ -7742,6 +8059,669 @@ mod tests {
             offered(&wanted_by(cell.tx)).is_empty(),
             "its own transaction's member takes it as an arrival",
         );
+    }
+
+    /// A want of `key` for `tx` filed at the start of the clock, so
+    /// armed at any clock past one finalization delay.
+    fn armed_want(key: SubstateKey, tx: TxHash) -> WantedRecord {
+        WantedRecord {
+            key,
+            tx,
+            filed_at: WeightedTimestamp::ZERO,
+        }
+    }
+
+    /// `PRODUCER`'s anchor at `height`, over a tree holding the record
+    /// `leaf`, with a proof of `key` under it.
+    fn producer_read(
+        height: u64,
+        leaf: Option<&CrossingCell>,
+        key: SubstateKey,
+    ) -> (Anchor, MerkleInclusionProof) {
+        let leaves: Vec<(SubstateKey, Vec<u8>)> =
+            leaf.iter().map(|cell| (key, cell.to_bytes())).collect();
+        let (state_root, proof) = state_and_proof_holding(PRODUCER, &leaves, &[key]);
+        (
+            Anchor {
+                shard: PRODUCER,
+                height: BlockHeight::new(height),
+                state_root,
+                ts: WeightedTimestamp::from_millis(height * 1_000),
+            },
+            proof,
+        )
+    }
+
+    /// `cell`'s value, as a server hands it back beside its proof.
+    fn served(key: SubstateKey, cell: &CrossingCell) -> Vec<ServedValue> {
+        vec![(key, Bytes::new(cell.to_bytes()).expect("a record fits"))]
+    }
+
+    /// The `(anchor, key)` of every record read `actions` put.
+    fn record_asks(actions: &[Action]) -> Vec<(Anchor, SubstateKey)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::RecordProofs(ids),
+                    ..
+                }) => Some(ids.iter().map(|(_, anchor, key)| (*anchor, *key))),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Which door a reading of a record comes in by.
+    #[derive(Clone, Copy, Debug)]
+    enum Door {
+        Fetch,
+        Push,
+    }
+
+    impl Door {
+        /// Bring the reading of `key` at `anchor` in by this door,
+        /// holding `cell` if there is one and absent if not, and say
+        /// whether a push is done with.
+        fn bring(
+            self,
+            consumer: &mut Counterparts,
+            wanted: &[WantedRecord],
+            (anchor, proof): &(Anchor, MerkleInclusionProof),
+            key: SubstateKey,
+            cell: Option<&CrossingCell>,
+            now: WeightedTimestamp,
+        ) -> bool {
+            match self {
+                Self::Fetch => {
+                    consumer.want(wanted);
+                    consumer.clock = now;
+                    let values = cell.map_or_else(Vec::new, |cell| served(key, cell));
+                    consumer.on_proof_fetched(*anchor, &[key], proof, &values);
+                    true
+                }
+                Self::Push => {
+                    let stated = cell.map_or(Stated::Inclusion(Inclusion::Absent), |cell| {
+                        Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits"))
+                    });
+                    let claim = StateClaim::new(*anchor, [(key, stated)], proof.clone());
+                    consumer.done_with_push(&claim, wanted, now)
+                }
+            }
+        }
+    }
+
+    /// A holder may answer one key with a proof of more. A read of the
+    /// one key stands down on that arrival, so what is held has to be
+    /// the claim a block admits, or nothing here would carry the record.
+    #[test]
+    fn an_answer_proving_more_than_its_key_is_held_as_a_block_admits_it() {
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let (extra, _, _) = escrowed_record(0xA2, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (state_root, proof) = state_and_proof_holding(
+            PRODUCER,
+            &[(key, cell.to_bytes())],
+            &sorted(vec![key, extra]),
+        );
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(3),
+            state_root,
+            ts: WeightedTimestamp::from_millis(3_000),
+        };
+        consumer.proven_anchors.record(anchor);
+
+        Door::Fetch.bring(
+            &mut consumer,
+            &want,
+            &(anchor, proof),
+            key,
+            Some(&cell),
+            now,
+        );
+
+        let held = consumer.state_claims(&CarriedClaims::default());
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].keys(), vec![key]);
+        assert_eq!(held[0].verify(), Ok(()));
+    }
+
+    /// A read that comes back absent found a record its producer has not
+    /// written yet. Nothing folds from that, so it holds no block slot
+    /// and leaves the read running, and the next due anchor is asked.
+    #[test]
+    fn an_absent_reading_of_a_wanted_record_is_not_held() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+
+        let (first, proof) = producer_read(3, None, key);
+        consumer.proven_anchors.record(first);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(first, key)],
+        );
+        consumer.on_proof_fetched(first, &[key], &proof, &[]);
+        assert!(
+            consumer.fetched.is_empty(),
+            "the absence holds nothing to offer",
+        );
+        assert!(consumer.state_claims(&CarriedClaims::default()).is_empty());
+
+        let (next, _) = producer_read(5, None, key);
+        consumer.proven_anchors.record(next);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(next, key)],
+            "the next due anchor is asked again",
+        );
+    }
+
+    /// Any member of the anchor's committee may push a proven absence of
+    /// a wanted key. It keeps nothing, is done with rather than parked,
+    /// and the armed key is still asked.
+    #[test]
+    fn an_absent_push_does_not_suppress_the_read() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+
+        let read = producer_read(3, None, key);
+        consumer.proven_anchors.record(read.0);
+        assert!(
+            Door::Push.bring(&mut consumer, &want, &read, key, None, now),
+            "done with, so the caller parks nothing",
+        );
+        assert!(consumer.fetched.is_empty());
+        assert!(consumer.state_claims(&CarriedClaims::default()).is_empty());
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(read.0, key)],
+            "the absence stood for no ask",
+        );
+
+        let (beside, _, beside_cell) = escrowed_record(0xA2, 200_000);
+        let (state_root, proof) = state_and_proof_holding(
+            PRODUCER,
+            &[(beside, beside_cell.to_bytes())],
+            &sorted(vec![key, beside]),
+        );
+        let mixed = StateClaim::new(
+            Anchor {
+                state_root,
+                height: BlockHeight::new(4),
+                ..read.0
+            },
+            [
+                (key, Stated::Inclusion(Inclusion::Absent)),
+                (
+                    beside,
+                    Stated::Held(Bytes::new(beside_cell.to_bytes()).expect("a record fits")),
+                ),
+            ],
+            proof,
+        );
+        assert_eq!(
+            consumer
+                .offer_pushed(mixed, &want, now)
+                .map(|rest| rest.keys()),
+            Some(vec![beside]),
+            "a key nothing wants yet is handed back without the declined one",
+        );
+    }
+
+    /// A push past the horizon is let go of here, keeps nothing, and is
+    /// counted as every other dropped push is.
+    #[test]
+    fn a_push_past_the_horizon_is_counted_retired() {
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let read = producer_read(3, Some(&cell), key);
+        consumer.proven_anchors.record(read.0);
+
+        let recorder = MemoryRecorder::new();
+        let at_the_horizon = read.0.ts.plus(RETENTION_HORIZON);
+        let past_it = at_the_horizon.plus(Duration::from_millis(1));
+        let done = with_recorder(&recorder, || {
+            Door::Push.bring(&mut consumer, &want, &read, key, Some(&cell), past_it)
+        });
+        assert!(done);
+        assert_eq!(
+            recorder.counter("crossing_pushes_dropped", Some("retired")),
+            1
+        );
+        assert!(consumer.fetched.is_empty());
+
+        with_recorder(&recorder, || {
+            Door::Push.bring(
+                &mut consumer,
+                &want,
+                &read,
+                key,
+                Some(&cell),
+                at_the_horizon,
+            )
+        });
+        assert_eq!(
+            recorder.counter("crossing_pushes_dropped", Some("retired")),
+            1,
+            "a push at the horizon still counts as landed",
+        );
+        assert!(!consumer.fetched.is_empty());
+    }
+
+    /// A proven absence of a key nothing here wants can never come to be
+    /// kept, so it takes no place in what the caller holds for later.
+    #[test]
+    fn an_absence_nothing_wants_is_not_handed_back() {
+        let (key, _, _) = escrowed_record(0xA1, 200_000);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let read = producer_read(3, None, key);
+        consumer.proven_anchors.record(read.0);
+        assert!(Door::Push.bring(&mut consumer, &[], &read, key, None, now));
+        assert!(consumer.fetched.is_empty());
+    }
+
+    /// A push may carry a record whose want is filed beside one whose
+    /// want is not. The first is kept and the second parks alone, so a
+    /// commit of the first want leaves it parked, and it arrives when
+    /// its own want files, with no read behind it.
+    #[test]
+    fn a_pushed_record_filed_after_its_push_arrives_from_the_parked_part() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (filed, _, filed_cell) = escrowed_record(0xA1, 200_000);
+        let (unfiled, _, unfiled_cell) = escrowed_record(0xA2, 200_000);
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (state_root, proof) = state_and_proof_holding(
+            PRODUCER,
+            &[
+                (filed, filed_cell.to_bytes()),
+                (unfiled, unfiled_cell.to_bytes()),
+            ],
+            &sorted(vec![filed, unfiled]),
+        );
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(3),
+            state_root,
+            ts: WeightedTimestamp::from_millis(3_000),
+        };
+        consumer.proven_anchors.record(anchor);
+        let held =
+            |cell: &CrossingCell| Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits"));
+        let push = StateClaim::new(
+            anchor,
+            [(filed, held(&filed_cell)), (unfiled, held(&unfiled_cell))],
+            proof,
+        );
+        assert_eq!(push.verify(), Ok(()));
+
+        let first = [armed_want(filed, filed_cell.tx)];
+        let rest = consumer
+            .offer_pushed(push, &first, now)
+            .expect("the unfiled record is left to hold");
+        assert_eq!(rest.keys(), vec![unfiled]);
+        assert_eq!(rest.verify(), Ok(()));
+        assert_eq!(offered_keys(&consumer), BTreeSet::from([filed]));
+
+        let mut parked = ParkedClaims::new();
+        parked.hold_early(rest).expect("room to park");
+        assert!(
+            parked.release_early(&BTreeSet::from([filed])).is_empty(),
+            "the filed want's commits leave it parked",
+        );
+
+        let both = [
+            armed_want(filed, filed_cell.tx),
+            armed_want(unfiled, unfiled_cell.tx),
+        ];
+        let released = parked.release_early(&BTreeSet::from([unfiled]));
+        assert_eq!(released.len(), 1);
+        assert!(consumer.done_with_push(&released[0], &both, now));
+        assert_eq!(offered_keys(&consumer), BTreeSet::from([filed, unfiled]));
+        assert!(
+            record_asks(&consumer.probe(&trie, now, &both, windows)).is_empty(),
+            "its arrival stands for the read",
+        );
+        for claim in consumer.state_claims(&CarriedClaims::default()) {
+            assert_eq!(claim.verify(), Ok(()));
+        }
+    }
+
+    /// A wanted key holding the record of another transaction is kept
+    /// unsolicited through either door, under the one cap, offered named
+    /// so the fold can decline it, and it leaves the want's read running.
+    /// One that nothing could decline yet is held for nothing, and not
+    /// parked. The want's own arrival does stand the read down.
+    #[test]
+    fn another_transactions_record_at_a_wanted_key_is_kept_unsolicited() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let later = TxHash::from(Hash::from_bytes(b"a later transaction"));
+        for door in [Door::Fetch, Door::Push] {
+            let (key, id, cell) = escrowed_record(0xF1, 2_000);
+            let want = [armed_want(key, later)];
+            let rows = Arc::new(TestRows::default());
+            let mut consumer = consuming(&rows);
+            let read = producer_read(3, Some(&cell), key);
+            consumer.proven_anchors.record(read.0);
+            assert!(door.bring(&mut consumer, &want, &read, key, Some(&cell), now));
+            assert_eq!(offered_keys(&consumer), BTreeSet::from([key]), "{door:?}");
+            assert_eq!(named(&consumer), vec![(key, id)], "{door:?}");
+            assert_eq!(
+                record_asks(&consumer.probe(&trie, now, &want, windows)),
+                vec![(read.0, key)],
+                "{door:?}: it is no arrival of the want's, so the read runs",
+            );
+
+            let (young, _, young_cell) = escrowed_record(0xF2, 200_000);
+            let want = [armed_want(young, later)];
+            let rows = Arc::new(TestRows::default());
+            let mut consumer = consuming(&rows);
+            let read = producer_read(3, Some(&young_cell), young);
+            assert!(
+                door.bring(&mut consumer, &want, &read, young, Some(&young_cell), now),
+                "{door:?}: done with, so the caller parks nothing",
+            );
+            assert!(consumer.fetched.is_empty(), "{door:?}");
+
+            let want = [armed_want(young, young_cell.tx)];
+            let mut consumer = consuming(&rows);
+            consumer.proven_anchors.record(read.0);
+            assert!(door.bring(&mut consumer, &want, &read, young, Some(&young_cell), now));
+            assert_eq!(offered_keys(&consumer), BTreeSet::from([young]), "{door:?}");
+            assert!(named(&consumer).is_empty(), "{door:?}");
+            assert!(
+                record_asks(&consumer.probe(&trie, now, &want, windows)).is_empty(),
+                "{door:?}: an arrival held stands the read down",
+            );
+        }
+    }
+
+    /// The record reads `actions` let go of.
+    fn record_abandons(actions: &[Action]) -> Vec<RecordAsk> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::RecordProofs(ids)) => Some(ids.iter().copied()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// An arrival held stands the read down at the next commit, however
+    /// it came: a push, or a fetch answered at an older anchor than the
+    /// ask still out. A read the fetch still holds goes with it.
+    #[test]
+    fn a_held_arrival_abandons_its_id_at_the_next_commit() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        for door in [Door::Fetch, Door::Push] {
+            let (key, _, cell) = escrowed_record(0xA1, 200_000);
+            let want = [armed_want(key, cell.tx)];
+            let rows = Arc::new(TestRows::default());
+            let mut consumer = consuming(&rows);
+
+            let older = producer_read(3, Some(&cell), key);
+            consumer.proven_anchors.record(older.0);
+            assert_eq!(
+                record_asks(&consumer.probe(&trie, now, &want, windows)),
+                vec![(older.0, key)],
+            );
+            let (newer, _) = producer_read(5, Some(&cell), key);
+            consumer.proven_anchors.record(newer);
+            let replaced = consumer.probe(&trie, now, &want, windows);
+            assert_eq!(record_asks(&replaced), vec![(newer, key)]);
+            assert_eq!(
+                record_abandons(&replaced),
+                vec![(want[0].filed_at, older.0, key)],
+                "{door:?}: the newer ask takes the older's place",
+            );
+
+            assert!(door.bring(&mut consumer, &want, &older, key, Some(&cell), now));
+            assert_eq!(
+                consumer.records.out(key),
+                Some(newer),
+                "{door:?}: an answer at another anchor leaves the ask out",
+            );
+            let next = consumer.probe(&trie, now, &want, windows);
+            assert!(record_asks(&next).is_empty(), "{door:?}");
+            assert_eq!(
+                record_abandons(&next),
+                vec![(want[0].filed_at, newer, key)],
+                "{door:?}",
+            );
+            assert_eq!(consumer.records.live(PRODUCER), 0, "{door:?}");
+        }
+    }
+
+    /// A key takes one sample, from the push that first brought it: a
+    /// copy at a later anchor is held and moves no grace, so a member
+    /// cannot stretch a span by repeating what it or an honest proposer
+    /// already delivered.
+    #[test]
+    fn a_held_arrival_pushed_again_takes_no_second_sample() {
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        for (height, sampled) in [(3, 1), (5, 1)] {
+            let read = producer_read(height, Some(&cell), key);
+            consumer.proven_anchors.record(read.0);
+            assert!(Door::Push.bring(&mut consumer, &want, &read, key, Some(&cell), now));
+            assert_eq!(consumer.records.sampled_heights(PRODUCER), sampled);
+        }
+    }
+
+    /// Two transactions may want one key. One's arrival held leaves the
+    /// ask out for the other, which stands until its own arrival.
+    #[test]
+    fn an_arrival_leaves_the_ask_of_another_want_of_its_key() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let other = TxHash::from(Hash::from_bytes(b"another want of the key"));
+        let want = [armed_want(key, cell.tx), armed_want(key, other)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let read = producer_read(3, Some(&cell), key);
+        consumer.proven_anchors.record(read.0);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(read.0, key)],
+        );
+        let (newer, _) = producer_read(5, Some(&cell), key);
+        consumer.proven_anchors.record(newer);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(newer, key)],
+        );
+
+        assert!(Door::Push.bring(&mut consumer, &want, &read, key, Some(&cell), now));
+        assert_eq!(consumer.records.out(key), Some(newer));
+        let next = consumer.probe(&trie, now, &want, windows);
+        assert!(record_abandons(&next).is_empty());
+        assert_eq!(consumer.records.out(key), Some(newer));
+
+        let lone = [armed_want(key, cell.tx)];
+        assert_eq!(
+            record_abandons(&consumer.probe(&trie, now, &lone, windows)),
+            vec![(lone[0].filed_at, newer, key)],
+            "with its last want answered the ask goes",
+        );
+    }
+
+    /// No more than the cap of asks stand toward one holder, whatever
+    /// armed them. The cap takes the oldest filed, not the lowest keys,
+    /// and a key past it goes out when a place frees.
+    #[test]
+    fn a_holder_takes_its_oldest_filed_up_to_the_cap() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let count = u8::try_from(MAX_RECORD_ASKS_PER_HOLDER + 1).expect("small");
+        let mut wants: Vec<WantedRecord> = (0..count)
+            .map(|seed| {
+                let (key, _, cell) = escrowed_record(seed, 200_000);
+                WantedRecord {
+                    key,
+                    tx: cell.tx,
+                    filed_at: WeightedTimestamp::from_millis(u64::from(seed)),
+                }
+            })
+            .collect();
+        wants.sort_unstable_by_key(|want| (want.key, want.tx));
+        let youngest = wants
+            .iter()
+            .max_by_key(|want| want.filed_at)
+            .expect("a want")
+            .key;
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (anchor, _) = producer_read(3, None, youngest);
+        consumer.proven_anchors.record(anchor);
+
+        let asked = record_asks(&consumer.probe(&trie, now, &wants, windows));
+        assert_eq!(asked.len(), MAX_RECORD_ASKS_PER_HOLDER);
+        assert!(!asked.contains(&(anchor, youngest)));
+        assert_eq!(consumer.records.live(PRODUCER), MAX_RECORD_ASKS_PER_HOLDER);
+        assert!(
+            record_asks(&consumer.probe(&trie, now, &wants, windows)).is_empty(),
+            "no place has freed",
+        );
+
+        let oldest = wants
+            .iter()
+            .min_by_key(|want| want.filed_at)
+            .expect("a want")
+            .key;
+        let (_, freed) = producer_read(3, None, oldest);
+        consumer.on_proof_fetched(anchor, &[oldest], &freed, &[]);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &wants, windows)),
+            vec![(anchor, youngest)],
+            "an answer frees a place for the next filed",
+        );
+    }
+
+    /// A read the frontier reset, with the holder's newest anchor where
+    /// it was, is asked as the very ask still out: nothing is put, and
+    /// nothing abandoned that would kill it.
+    #[test]
+    fn a_reset_at_an_unmoved_anchor_leaves_the_ask_out_alone() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (anchor, _) = producer_read(3, None, key);
+        consumer.proven_anchors.record(anchor);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(anchor, key)],
+        );
+
+        consumer.records.reset(key);
+        let again = consumer.probe(&trie, now, &want, windows);
+        assert!(record_asks(&again).is_empty(), "{again:?}");
+        assert!(record_abandons(&again).is_empty(), "{again:?}");
+        assert_eq!(consumer.records.out(key), Some(anchor));
+    }
+
+    /// A holder's prefix moved by a cut: the ask at the old holder is let
+    /// go of at the next pass, and counts under neither.
+    #[test]
+    fn a_holders_cut_lets_go_of_the_ask_at_the_old_holder() {
+        let windows = EpochWindows::new(0, 0);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, _, cell) = escrowed_record(0xA1, 200_000);
+        let want = [armed_want(key, cell.tx)];
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let (anchor, _) = producer_read(3, None, key);
+        consumer.proven_anchors.record(anchor);
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        assert_eq!(
+            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            vec![(anchor, key)],
+        );
+
+        let cut = ShardTrie::from_leaves([CONSUMER, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
+        let holder = cut.shard_for_prefix(key.owner);
+        let next = consumer.probe(&cut, now, &want, windows);
+        assert_eq!(
+            record_abandons(&next),
+            vec![(want[0].filed_at, anchor, key)]
+        );
+        assert!(record_asks(&next).is_empty(), "no anchor of the new holder");
+        assert_eq!(consumer.records.live(PRODUCER), 0);
+        assert_eq!(consumer.records.live(holder), 0);
+    }
+
+    /// Unsolicited records held at a wanted key answer to the one cap,
+    /// whichever door each came in by.
+    #[test]
+    fn fetched_unsolicited_records_are_held_under_the_cap() {
+        let now = WeightedTimestamp::from_millis(100_000);
+        let later = TxHash::from(Hash::from_bytes(b"a later transaction"));
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let count = u8::try_from(MAX_UNSOLICITED_RECORDS_PER_PRODUCER + 1).expect("small");
+        for seed in 1..=count {
+            let (key, _, cell) = escrowed_record(seed, u64::from(seed) * 1_000);
+            let want = [armed_want(key, later)];
+            let read = producer_read(u64::from(seed), Some(&cell), key);
+            consumer.proven_anchors.record(read.0);
+            Door::Fetch.bring(&mut consumer, &want, &read, key, Some(&cell), now);
+        }
+        assert_eq!(
+            offered_keys(&consumer),
+            (1..count)
+                .map(|seed| escrowed_record(seed, u64::from(seed) * 1_000).0)
+                .collect(),
+            "the youngest validity end is the one left out",
+        );
+    }
+
+    /// An absence at a key the crossing rows await is a reading of its
+    /// own, through either door.
+    #[test]
+    fn an_absence_at_an_awaited_key_is_still_held() {
+        let now = WeightedTimestamp::from_millis(30_000);
+        for door in [Door::Fetch, Door::Push] {
+            let rows = Arc::new(TestRows::default());
+            let (mut producer, id, cell, taken, _) = escrowed_producer(&rows, 0x52, 36_000);
+            producer.rows.awaited.insert(taken);
+            let read = answered_at(&id, &cell, &[], &[taken], 20, 30_000);
+            assert!(door.bring(&mut producer, &[], &read, taken, None, now));
+            assert!(producer.fetched.reads(CONSUMER, taken), "{door:?}");
+        }
     }
 
     /// A record whose own transaction lost the decline key is carried
@@ -7783,7 +8763,7 @@ mod tests {
             id.answer(later, Answered::Never, 36_000).to_bytes(),
         );
         let mut consumer = consuming(&rows);
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 4, key, &cell), &[], end));
+        assert!(consumer.done_with_push(&pushed_record(PRODUCER, 4, key, &cell), &[], end));
         let mut block = consumer.state_claims(&CarriedClaims::default());
         assert_eq!(named(&consumer), vec![(key, id)]);
         block.push(StateClaim::new(
@@ -7806,7 +8786,7 @@ mod tests {
 
         rows.put(decline, own.clone());
         assert!(Issuer::from(&cell).answered_by(&id, Answered::Never, &own));
-        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 5, key, &cell), &[], end));
+        assert!(consumer.done_with_push(&pushed_record(PRODUCER, 5, key, &cell), &[], end));
         assert!(
             consumer
                 .state_claims(&CarriedClaims::default())
@@ -7925,9 +8905,10 @@ mod tests {
             shard: PRODUCER,
             waiting: TxHash::from(Hash::from_bytes(&[2; 32])),
             holder: cell.tx,
+            validity_end: WeightedTimestamp::from_millis(36_000),
         };
         let keys = question.keys();
-        let [seat, row, ..] = keys;
+        let (seat, row) = (keys[0], keys[1]);
         assert_eq!(row, member_row_leaf(PRODUCER, cell.tx));
         let absent: Vec<SubstateKey> = keys
             .into_iter()
@@ -7935,7 +8916,9 @@ mod tests {
             .collect();
         let whole = holding_the_record(3, record, &[seat, row], &absent);
         let presence = whole.restrict(|key| key == record).expect("one cell");
-        let reading = whole.restrict(|key| key != record).expect("four cells");
+        let reading = whole
+            .restrict(|key| key != record)
+            .expect("the question's cells");
         let _ = counterparts.fetched.hold(presence);
         let _ = counterparts.fetched.hold(reading.clone());
         assert!(question.proven_by(counterparts.fetched.claims()));
@@ -8011,8 +8994,7 @@ mod tests {
     #[test]
     fn a_fetched_proof_is_held_as_a_claim_over_its_answering_keys() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
-        // No row here names the cells, so each is read unnamed, for the
-        // records a consumer here waits on.
+        // No row here names the cells, so each is read unnamed.
         let (mut producer, _, anchors, _rows) = producing(0, deadline);
         let (claim0, claim1, claim2) = (
             claim_of(0, deadline),
@@ -8032,7 +9014,7 @@ mod tests {
             ts: now,
         };
         anchors.record(anchor);
-        producer.wanted = BTreeSet::from([claim0, claim1, claim2]);
+        producer.rows.awaited = BTreeSet::from([claim0, claim1, claim2]);
 
         // The fixture tree's leaf value is the key's own bytes; served
         // beside the proof, it rides in the claim as a held reading.
@@ -8079,14 +9061,14 @@ mod tests {
 
     /// Where each cell the held claims read was read, by a walk of
     /// every claim, each cell's anchors in order.
-    fn readings_by_walk(held: &HeldClaims) -> BTreeMap<(ShardId, SubstateKey), Vec<Anchor>> {
-        let mut readings: BTreeMap<(ShardId, SubstateKey), Vec<Anchor>> = BTreeMap::new();
+    fn readings_by_walk(held: &HeldClaims) -> CellReadings {
+        let mut readings = CellReadings::new();
         for claim in held.claims.keys() {
             for key in claim.keys() {
                 readings
                     .entry((claim.anchor.shard, key))
                     .or_default()
-                    .push(claim.anchor);
+                    .push((claim.anchor, held_record(claim, key).map(|(_, c)| c.tx)));
             }
         }
         for read_at in readings.values_mut() {
@@ -8096,7 +9078,7 @@ mod tests {
     }
 
     /// The held claims' readings as kept, each cell's anchors in order.
-    fn readings_kept(held: &HeldClaims) -> BTreeMap<(ShardId, SubstateKey), Vec<Anchor>> {
+    fn readings_kept(held: &HeldClaims) -> CellReadings {
         let mut readings = held.readings.clone();
         for read_at in readings.values_mut() {
             read_at.sort_unstable();
@@ -8143,11 +9125,13 @@ mod tests {
                         .map(|claim| claim.anchor)
                         .collect();
                     assert_eq!(held.reads(shard, key), !walked.is_empty());
-                    let mut read_at = held
+                    let mut read_at: Vec<Anchor> = held
                         .readings
                         .get(&(shard, key))
-                        .cloned()
-                        .unwrap_or_default();
+                        .into_iter()
+                        .flatten()
+                        .map(|(anchor, _)| *anchor)
+                        .collect();
                     read_at.sort_unstable();
                     assert_eq!(read_at, walked);
                 }
@@ -8326,8 +9310,7 @@ mod tests {
 
     /// A seat question whose keys come back in separate answers closes on
     /// the last of them, and its readings are held to offer only where
-    /// together they read the cycle; a question the tip no longer stands
-    /// lets go of the fetch it was waiting on.
+    /// together they read the cycle or the victim's leaving.
     #[test]
     fn a_seat_question_closes_on_its_last_reading_however_they_arrive() {
         let anchors = Arc::new(ProvenAnchors::default());
@@ -8339,17 +9322,25 @@ mod tests {
             ReadFrontier::default(),
         );
         let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let validity_end = WeightedTimestamp::from_millis(36_000);
         let question = SeatQuestion {
             shard: PRODUCER,
             waiting: tx(2),
             holder: tx(1),
+            validity_end,
         };
-        let [seat, row, none, unsaid] = question.keys();
-        let (state_root, _) = state_and_proof(PRODUCER, &[seat, row], &[seat, row, none, unsaid]);
+        let keys = question.keys();
+        assert_eq!(
+            keys.len(),
+            7,
+            "a waiting victim's leaving reads three cells more"
+        );
+        let (seat, row, none) = (keys[0], keys[1], keys[2]);
+        let (state_root, _) = state_and_proof(PRODUCER, &[seat, row], &keys);
         let now = WeightedTimestamp::from_millis(10_000);
         let anchor = Anchor {
             shard: PRODUCER,
-            height: BlockHeight::new(7),
+            height: BlockHeight::new(8),
             state_root,
             ts: now,
         };
@@ -8360,57 +9351,100 @@ mod tests {
             matches!(
                 asked.as_slice(),
                 [Action::Fetch(FetchRequest::Ask { ids: FetchIds::StateProofs(ids), .. })]
-                    if ids.len() == 4
+                    if ids.len() == 7
             ),
-            "the four cells are asked at the newest anchor: {asked:?}",
+            "the seven cells are asked at the newest aligned anchor: {asked:?}",
         );
 
         let (_, first) = state_and_proof(PRODUCER, &[seat, row], &[seat]);
         counterparts.on_proof_fetched(anchor, &[seat], &first, &[]);
         assert!(
             counterparts.fetched.is_empty(),
-            "one reading of four is held back"
+            "one reading of seven is held back"
         );
         let (_, more) = state_and_proof(PRODUCER, &[seat, row], &[row, none]);
         counterparts.on_proof_fetched(anchor, &[row, none], &more, &[]);
         assert!(
             counterparts.fetched.is_empty(),
-            "three readings of four are held back: the holder's verdict leaf is unread",
+            "three readings of seven are held back: the verdict leaves are unread",
         );
-        let (_, rest) = state_and_proof(PRODUCER, &[seat, row], &[unsaid]);
-        counterparts.on_proof_fetched(anchor, &[unsaid], &rest, &[]);
+        let unread = &keys[3..];
+        let (_, rest) = state_and_proof(PRODUCER, &[seat, row], unread);
+        counterparts.on_proof_fetched(anchor, unread, &rest, &[]);
         assert!(
             question.proven_by(counterparts.fetched.claims()),
-            "the last reading closes the question, and the cycle is held to offer",
+            "the last readings close the question, and the cycle is held to offer",
         );
+        for claim in counterparts.fetched.claims() {
+            assert!(
+                claim
+                    .proof
+                    .inclusions(state_root, PRODUCER, &claim.keys())
+                    .is_ok(),
+                "a held reading carries the proof cut down to its own cells",
+            );
+        }
         assert!(
             counterparts.ask_seats(&[question], now).is_empty(),
             "a question the held claims prove is not asked again",
         );
+    }
 
-        // A question still out when the tip stops standing it lets go of
-        // its fetch.
+    /// A question still out when the tip stops standing it lets go of the
+    /// fetches only it was waiting on.
+    #[test]
+    fn a_dropped_seat_question_lets_go_of_the_cells_it_alone_awaits() {
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            Arc::new(TestRows::default()) as _,
+            ReadFrontier::default(),
+        );
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let validity_end = WeightedTimestamp::from_millis(36_000);
+        let question = SeatQuestion {
+            shard: PRODUCER,
+            waiting: tx(2),
+            holder: tx(1),
+            validity_end,
+        };
+        let now = WeightedTimestamp::from_millis(10_000);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(8),
+            state_root: StateRoot::from_raw(Hash::ZERO),
+            ts: now,
+        };
+        anchors.record(anchor);
+        assert_eq!(counterparts.ask_seats(&[question], now).len(), 1);
+
         let other = SeatQuestion {
             shard: PRODUCER,
             waiting: tx(4),
             holder: tx(3),
+            validity_end,
         };
         assert_eq!(counterparts.ask_seats(&[question, other], now).len(), 1);
         let released = counterparts.ask_seats(&[question], now);
         assert!(
             matches!(
                 released.as_slice(),
-                [Action::AbandonFetch(FetchIds::StateProofs(ids))] if ids.len() == 4
+                [Action::AbandonFetch(FetchIds::StateProofs(ids))] if ids.len() == 7
             ),
-            "the dropped question releases its four cells: {released:?}",
+            "the dropped question releases its seven cells: {released:?}",
         );
 
         // One that drops as another asks the same holder's cells at the
-        // same anchor releases only the cell no question is left waiting on.
+        // same anchor releases only the cells no question is left waiting
+        // on: its waiting member's seat, and those of its victim's cells
+        // the other does not read.
         let first = SeatQuestion {
             shard: PRODUCER,
             waiting: tx(6),
             holder: tx(5),
+            validity_end,
         };
         let next = SeatQuestion {
             waiting: tx(7),
@@ -8426,11 +9460,130 @@ mod tests {
             })
             .flatten()
             .collect();
+        let mut alone: Vec<(Anchor, SubstateKey)> = first
+            .keys()
+            .into_iter()
+            .filter(|key| !next.keys().contains(key))
+            .map(|key| (anchor, key))
+            .collect();
+        alone.sort_unstable();
+        assert!(alone.contains(&(anchor, first.keys()[0])));
+        assert!(!alone.contains(&(anchor, first.keys()[1])));
         assert_eq!(
             abandoned,
-            vec![&(anchor, first.keys()[0])],
+            alone.iter().collect::<Vec<_>>(),
             "the holder's cells stay asked for the question taking them over",
         );
+    }
+
+    /// A seat question is asked at the counterpart's newest proven height
+    /// that [`SEAT_ASK_GAP`] divides, and once its fetch returns without
+    /// an answer it is asked again at the next such height and no sooner,
+    /// however many times it has been asked: two questions standing apart
+    /// share every ask's anchor.
+    #[test]
+    fn a_seat_question_is_asked_at_aligned_heights() {
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            Arc::new(TestRows::default()) as _,
+            ReadFrontier::default(),
+        );
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let question = SeatQuestion {
+            shard: PRODUCER,
+            waiting: tx(2),
+            holder: tx(1),
+            validity_end: WeightedTimestamp::from_millis(u64::MAX / 2),
+        };
+        let keys = question.keys();
+        let (seat, row) = (keys[0], keys[1]);
+        let at = |height: u64| {
+            let (state_root, proof) = state_and_proof(PRODUCER, &[seat, row, keys[3]], &keys);
+            (
+                Anchor {
+                    shard: PRODUCER,
+                    height: BlockHeight::new(height),
+                    state_root,
+                    ts: WeightedTimestamp::from_millis(height * 1_000),
+                },
+                proof,
+            )
+        };
+        let asked_at = |actions: &[Action]| -> Vec<BlockHeight> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Fetch(FetchRequest::Ask {
+                        ids: FetchIds::StateProofs(ids),
+                        ..
+                    }) => Some(ids),
+                    _ => None,
+                })
+                .flatten()
+                .map(|(anchor, _)| anchor.height)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let mut proofs = BTreeMap::new();
+        for height in 1..=20 {
+            let (anchor, proof) = at(height);
+            anchors.record(anchor);
+            proofs.insert(height, (anchor, proof));
+        }
+        let now = |height: u64| WeightedTimestamp::from_millis(height * 1_000);
+
+        assert!(
+            counterparts.ask_seats(&[question], now(3)).is_empty(),
+            "no proven height under the clock is aligned but zero, which is not held",
+        );
+        assert_eq!(
+            asked_at(&counterparts.ask_seats(&[question], now(6))),
+            vec![BlockHeight::new(4)],
+            "the newest proven height is 6, so the ask is anchored at 4",
+        );
+        for height in [7, 8, 9] {
+            assert!(
+                counterparts.ask_seats(&[question], now(height)).is_empty(),
+                "a question out is not asked again",
+            );
+        }
+        let (anchor, proof) = &proofs[&4];
+        counterparts.on_proof_fetched(*anchor, &keys, proof, &[]);
+        assert!(counterparts.seats[&question].returned);
+        assert!(
+            counterparts.fetched.is_empty(),
+            "the holder's verdict leaf stands: plain contention",
+        );
+
+        // A second question put now shares the first's next anchor.
+        let other = SeatQuestion {
+            waiting: tx(3),
+            ..question
+        };
+        for round in [8, 12, 16, 20] {
+            assert_eq!(
+                asked_at(&counterparts.ask_seats(&[question, other], now(round + 3))),
+                vec![BlockHeight::new(round)],
+                "every ask in the round is anchored at {round}",
+            );
+            assert!(
+                counterparts
+                    .ask_seats(&[question, other], now(round + 3))
+                    .is_empty(),
+                "and none is repeated before the next aligned height",
+            );
+            let (anchor, proof) = &proofs[&round];
+            counterparts.on_proof_fetched(*anchor, &keys, proof, &[]);
+            assert_eq!(
+                counterparts.seats[&question].anchor.height.inner(),
+                round,
+                "the question is asked again at {round}, with no backoff",
+            );
+        }
     }
 
     /// A seat question answered with the holder's verdict leaf standing
@@ -8452,14 +9605,15 @@ mod tests {
             shard: PRODUCER,
             waiting: tx(2),
             holder: tx(1),
+            validity_end: WeightedTimestamp::from_millis(36_000),
         };
         let keys = question.keys();
-        let [seat, row, _, said] = keys;
-        let (state_root, proof) = state_and_proof(PRODUCER, &[seat, row, said], &keys);
+        let stated = [keys[0], keys[1], keys[3]];
+        let (state_root, proof) = state_and_proof(PRODUCER, &stated, &keys);
         let now = WeightedTimestamp::from_millis(10_000);
         let anchor = Anchor {
             shard: PRODUCER,
-            height: BlockHeight::new(7),
+            height: BlockHeight::new(8),
             state_root,
             ts: now,
         };
@@ -8564,7 +9718,9 @@ mod tests {
     ) {
         let keys: Vec<SubstateKey> = questions.iter().flat_map(VerdictCells::keys).collect();
         let (_, proof) = state_and_proof(anchor.shard, present, &keys);
-        counterparts.on_verdict_proof_fetched(anchor, questions, &proof, GRID);
+        let proof = CheckedStateProof::check(anchor, keys, proof)
+            .expect("the fixture proof answers for its keys");
+        counterparts.on_verdict_proof_fetched(questions, &proof, GRID);
     }
 
     /// A claim at `anchor` reading `keys` over a tree holding `present`.
@@ -9246,7 +10402,7 @@ mod tests {
         let cells = verdict_cells(&question);
         anchors.record(producer_at(7, &[]));
         counterparts.ask_verdicts(&[question], FAR);
-        let first = producer_at(8, &[]);
+        let first = producer_at(8, &[cells.leaf]);
         anchors.record(first);
         let fetch = counterparts.ask_verdicts(&[question], FAR);
         assert_eq!(asked(&fetch), vec![(first, cells)]);
@@ -10155,6 +11311,129 @@ mod tests {
             recorder.counter("records_repushed", Some("escrowed")),
             u64::try_from(MAX_UNSOLICITED_RECORDS_PER_PRODUCER * 2).expect("small"),
             "and each push is counted",
+        );
+    }
+
+    /// The seat questions of the routes `head + 1` through `last` waiting
+    /// behind route `head`.
+    fn queue_behind(head: u16, last: u16) -> Vec<SeatQuestion> {
+        let tx = |seed: u16| {
+            let mut bytes = [0u8; 32];
+            bytes[..2].copy_from_slice(&seed.to_be_bytes());
+            TxHash::from(Hash::from_bytes(&bytes))
+        };
+        (head + 1..=last)
+            .map(|waiting| SeatQuestion {
+                shard: PRODUCER,
+                waiting: tx(waiting),
+                holder: tx(head),
+                validity_end: WeightedTimestamp::from_millis(36_000),
+            })
+            .collect()
+    }
+
+    /// Every cell `questions` read, once and in key order.
+    fn cells_of<'q>(questions: impl IntoIterator<Item = &'q SeatQuestion>) -> Vec<SubstateKey> {
+        let cells: BTreeSet<SubstateKey> =
+            questions.into_iter().flat_map(SeatQuestion::keys).collect();
+        cells.into_iter().collect()
+    }
+
+    /// A hot queue of five hundred routes behind one head, the head
+    /// turning over with every probe out: the whole line's questions drop
+    /// and stand again at one anchor, then the answers come back to plain
+    /// contention. Each question derives its keys once, and no proof is
+    /// cut for a reading nothing will carry.
+    #[test]
+    fn a_hot_queue_derives_each_seat_question_once_and_cuts_no_proof() {
+        const WAITING: u16 = 500;
+        let spent = || {
+            (
+                SEAT_KEY_DERIVATIONS.with(std::cell::Cell::get),
+                SEAT_PROOF_CUTS.with(std::cell::Cell::get),
+            )
+        };
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            Arc::new(TestRows::default()) as _,
+            ReadFrontier::default(),
+        );
+        let first = queue_behind(1, WAITING + 1);
+        let second = queue_behind(2, WAITING + 1);
+        let every = cells_of(first.iter().chain(&second));
+        let (state_root, _) = state_and_proof(PRODUCER, &every, &[]);
+        let now = WeightedTimestamp::from_millis(10_000);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(8),
+            state_root,
+            ts: now,
+        };
+        anchors.record(anchor);
+
+        let before = spent();
+        assert_eq!(counterparts.ask_seats(&first, now).len(), 1);
+        let turned_over = counterparts.ask_seats(&second, now);
+        assert_eq!(
+            spent().0 - before.0,
+            first.len() + second.len(),
+            "a turnover derives only the keys of the questions it stands",
+        );
+        let released: Vec<&(Anchor, SubstateKey)> = turned_over
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::StateProofs(ids)) => Some(ids),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !released.is_empty() && released.windows(2).all(|pair| pair[0] < pair[1]),
+            "each cell the dropped questions held is let go of once",
+        );
+
+        let answers: Vec<(Vec<SubstateKey>, MerkleInclusionProof)> = cells_of(&second)
+            .chunks(MAX_PROOFS_PER_QUERY)
+            .map(|chunk| {
+                let (_, proof) = state_and_proof(PRODUCER, &every, chunk);
+                (chunk.to_vec(), proof)
+            })
+            .collect();
+        let before = spent();
+        for (keys, proof) in &answers {
+            counterparts.on_proof_fetched(anchor, keys, proof, &[]);
+        }
+        assert_eq!(
+            spent(),
+            before,
+            "answers read the keys held and cut no proof for plain contention",
+        );
+        assert!(
+            second
+                .iter()
+                .all(|question| counterparts.seats[question].returned),
+            "every question closes on its answers",
+        );
+        assert!(
+            counterparts.fetched.is_empty(),
+            "plain contention holds nothing to offer",
+        );
+
+        let later = Anchor {
+            height: BlockHeight::new(12),
+            ts: now.plus(Duration::from_secs(2)),
+            ..anchor
+        };
+        anchors.record(later);
+        let before = spent();
+        assert_eq!(counterparts.ask_seats(&second, later.ts).len(), 1);
+        assert_eq!(
+            spent(),
+            before,
+            "a question asked again reads the keys it holds",
         );
     }
 }

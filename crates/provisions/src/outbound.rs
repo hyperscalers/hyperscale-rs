@@ -21,7 +21,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHeight, ProvisionHash, Provisions, ShardId, TxHash, TxOutcome, Verified, WeightedTimestamp,
+    BlockHeight, Provision, ProvisionHash, ShardId, TxHash, TxOutcome, Verified, WeightedTimestamp,
 };
 use tracing::{debug, warn};
 
@@ -82,52 +82,42 @@ impl OutboundProvisionTracker {
         }
     }
 
-    /// Register provisions our proposer just broadcast. Inserts into the
-    /// shared store (which maintains the `(source_block, target)` index
-    /// used by cross-shard fast-path serving); idempotent.
+    /// Register a part our proposer just broadcast. Inserts into the
+    /// shared store (which maintains the `(source_block, target, index)`
+    /// index used by cross-shard fast-path serving); idempotent.
     ///
-    /// Takes a `Verified` handle — the proposer built the bundle from a
+    /// Takes a `Verified` handle — the proposer built the part from a
     /// local JMT view so the merkle predicate holds. The shared
     /// [`ProvisionStore`] holds raw bodies (wire-serving doesn't carry
     /// the marker), so the body is cloned once at the seam.
-    pub fn on_broadcast(&mut self, provisions: &Arc<Verified<Provisions>>, target_shard: ShardId) {
-        let provision_hash = provisions.hash();
+    pub fn on_broadcast(&mut self, part: &Verified<Provision>) {
+        let provision_hash = part.hash();
         if self.entries.contains_key(&provision_hash) {
             return;
         }
-
-        let tx_hashes: BTreeSet<TxHash> = provisions
-            .transactions()
-            .iter()
-            .map(|tx| tx.tx_hash)
-            .collect();
-        if tx_hashes.is_empty() {
-            return;
-        }
-
-        for tx in &tx_hashes {
-            self.by_tx.entry(*tx).or_default().insert(provision_hash);
-        }
-
-        self.store
-            .insert_outbound(Arc::new((***provisions).clone()), target_shard);
-
+        let target_shard = part.target_shard();
+        let tx_hash = part.tx_hash();
+        self.by_tx
+            .entry(tx_hash)
+            .or_default()
+            .insert(provision_hash);
+        self.store.insert_outbound(part.as_ref().clone());
         self.entries.insert(
             provision_hash,
             OutboundEntry {
                 target_shard,
-                source_block_height: provisions.block_height(),
-                pending_txs: tx_hashes,
-                deadline: provisions.deadline(provisions.source_block_ts()),
+                source_block_height: part.block_height(),
+                pending_txs: BTreeSet::from([tx_hash]),
+                deadline: part.deadline(part.source_block_ts()),
             },
         );
 
         debug!(
             provision_hash = ?provision_hash,
             target_shard = target_shard.inner(),
-            source_block_height = provisions.block_height().inner(),
-            tx_count = provisions.transactions().len(),
-            "Tracking outbound provisions"
+            source_block_height = part.block_height().inner(),
+            tx_hash = %tx_hash,
+            "Tracking outbound provision"
         );
     }
 
@@ -228,11 +218,7 @@ impl OutboundProvisionTracker {
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_hbor::Capped;
-    use hyperscale_types::{
-        ExecutionOutcome, GlobalReceiptHash, Hash, MerkleInclusionProof, ProvisionEntry,
-        RETENTION_HORIZON,
-    };
+    use hyperscale_types::{ExecutionOutcome, GlobalReceiptHash, Hash, RETENTION_HORIZON};
 
     use super::*;
 
@@ -244,29 +230,28 @@ mod tests {
         TxHash::from(Hash::from_bytes(label))
     }
 
-    fn make_provisions(source_block: BlockHeight, txs: &[TxHash]) -> Arc<Verified<Provisions>> {
-        make_provisions_at(source_block, WeightedTimestamp::ZERO, txs)
-    }
-
-    fn make_provisions_at(
+    fn part_to(
+        target: ShardId,
         source_block: BlockHeight,
         source_block_ts: WeightedTimestamp,
-        txs: &[TxHash],
-    ) -> Arc<Verified<Provisions>> {
-        let transactions = Capped::new(
-            txs.iter()
-                .map(|h| ProvisionEntry::new(*h, Capped::from_array([])))
-                .collect(),
-        )
-        .expect("a list written out in a test");
-        Arc::new(Verified::new_unchecked_for_test(Provisions::new(
+        tx_hash: TxHash,
+    ) -> Verified<Provision> {
+        Verified::new_unchecked_for_test(Provision::dummy_at(
             ShardId::leaf(2, 0),
-            ShardId::leaf(2, 1),
+            target,
             source_block,
             source_block_ts,
-            MerkleInclusionProof::dummy(),
-            transactions,
-        )))
+            tx_hash,
+        ))
+    }
+
+    fn part(source_block: BlockHeight, tx_hash: TxHash) -> Verified<Provision> {
+        part_to(
+            ShardId::leaf(2, 1),
+            source_block,
+            WeightedTimestamp::ZERO,
+            tx_hash,
+        )
     }
 
     fn executed(tx_hash: TxHash) -> TxOutcome {
@@ -283,41 +268,41 @@ mod tests {
     }
 
     #[test]
-    fn on_broadcast_stores_provisions_and_tracks_txs() {
+    fn on_broadcast_stores_parts_and_tracks_txs() {
         let store = Arc::new(ProvisionStore::new());
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
-        let a = tx(b"a");
-        let b = tx(b"b");
-        let provisions = make_provisions(BlockHeight::new(10), &[a, b]);
-        let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
+        let first = part(BlockHeight::new(10), tx(b"a"));
+        let provision_hash = first.hash();
+        tracker.on_broadcast(&first);
+        tracker.on_broadcast(&part(BlockHeight::new(10), tx(b"b")));
 
-        assert_eq!(tracker.memory_stats().tracked_provisions, 1);
+        assert_eq!(tracker.memory_stats().tracked_provisions, 2);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 2);
         assert!(store.get(provision_hash).is_some());
-        let hit = store.get_outbound(BlockHeight::new(10), ShardId::leaf(2, 1));
+        let hit = store.get_outbound(BlockHeight::new(10), ShardId::leaf(2, 1), 0);
         assert!(hit.is_some());
     }
 
     #[test]
-    fn executed_ec_evicts_when_all_txs_drained() {
+    fn executed_ec_evicts_each_part_it_acknowledges() {
         let store = Arc::new(ProvisionStore::new());
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
         let b = tx(b"b");
-        let provisions = make_provisions(BlockHeight::new(10), &[a, b]);
-        let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
+        let (part_a, part_b) = (part(BlockHeight::new(10), a), part(BlockHeight::new(10), b));
+        tracker.on_broadcast(&part_a);
+        tracker.on_broadcast(&part_b);
 
         tracker.on_ec_observed(ShardId::leaf(2, 1), &[executed(a)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
-        assert!(store.get(provision_hash).is_some());
+        assert!(store.get(part_a.hash()).is_none());
+        assert!(store.get(part_b.hash()).is_some());
 
         tracker.on_ec_observed(ShardId::leaf(2, 1), &[executed(b)]);
         assert_eq!(tracker.memory_stats().tracked_provisions, 0);
-        assert!(store.get(provision_hash).is_none());
+        assert!(store.get(part_b.hash()).is_none());
     }
 
     #[test]
@@ -326,9 +311,14 @@ mod tests {
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
-        let provisions = make_provisions(BlockHeight::new(7), &[a]);
-        let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardId::leaf(2, 2));
+        let provision = part_to(
+            ShardId::leaf(2, 2),
+            BlockHeight::new(7),
+            WeightedTimestamp::ZERO,
+            a,
+        );
+        let provision_hash = provision.hash();
+        tracker.on_broadcast(&provision);
 
         tracker.on_ec_observed(ShardId::leaf(2, 2), &[aborted(a)]);
         assert!(store.get(provision_hash).is_none());
@@ -340,8 +330,7 @@ mod tests {
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
-        let provisions = make_provisions(BlockHeight::new(5), &[a]);
-        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
+        tracker.on_broadcast(&part(BlockHeight::new(5), a));
 
         // EC from a different target shard must not acknowledge these provisions.
         tracker.on_ec_observed(ShardId::leaf(2, 2), &[executed(a)]);
@@ -355,9 +344,9 @@ mod tests {
         tracker.on_block_committed(ts(1_000_000));
 
         let a = tx(b"a");
-        let provisions = make_provisions_at(BlockHeight::new(5), ts(1_000_000), &[a]);
+        let provisions = part_to(ShardId::leaf(2, 1), BlockHeight::new(5), ts(1_000_000), a);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
+        tracker.on_broadcast(&provisions);
 
         let past_max = RETENTION_HORIZON + Duration::from_secs(1);
         tracker.on_block_committed(ts(
@@ -378,9 +367,9 @@ mod tests {
 
         let source_ts = ts(60_000_000);
         let a = tx(b"a");
-        let provisions = make_provisions_at(BlockHeight::new(5), source_ts, &[a]);
+        let provisions = part_to(ShardId::leaf(2, 1), BlockHeight::new(5), source_ts, a);
         let provision_hash = provisions.hash();
-        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
+        tracker.on_broadcast(&provisions);
 
         // The first live commit, one block past the source. The bundle is
         // a block old, not a retention horizon old.
@@ -398,9 +387,9 @@ mod tests {
         let mut tracker = OutboundProvisionTracker::new(Arc::clone(&store));
 
         let a = tx(b"a");
-        let provisions = make_provisions(BlockHeight::new(10), &[a]);
-        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
-        tracker.on_broadcast(&provisions, ShardId::leaf(2, 1));
+        let provisions = part(BlockHeight::new(10), a);
+        tracker.on_broadcast(&provisions);
+        tracker.on_broadcast(&provisions);
         assert_eq!(tracker.memory_stats().tracked_provisions, 1);
         assert_eq!(tracker.memory_stats().tracked_tx_entries, 1);
     }

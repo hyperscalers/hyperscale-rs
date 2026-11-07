@@ -237,7 +237,7 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::{BlockHash, BlockHeight, ValidatorId, WeightedTimestamp};
+    use crate::{BlockHash, BlockHeight, Epoch, ValidatorId, WeightedTimestamp};
 
     const SHARD: ShardId = ShardId::ROOT;
     const ROUND: Round = Round::new(9);
@@ -249,6 +249,7 @@ mod tests {
             BlockHeight::new(round),
             BlockHash::ZERO,
             Round::new(round),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

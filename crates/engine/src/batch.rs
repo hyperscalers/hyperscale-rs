@@ -17,29 +17,31 @@ use std::sync::Arc;
 
 use hyperscale_storage::FeeHoldReading;
 use hyperscale_types::{
-    Epoch, EpochWindows, EscrowedValue, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry,
-    TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
+    DeclaredRange, EpochWindows, EscrowedValue, ProvisionalHolds, SeedRing, ShardId, ShardTrie,
+    SubstateEntry, SubstateKey, TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
 };
+use hyperscale_vm_kernel::{ServedRange, ServedReads};
 use hyperscale_vm_types::{PriceTable, SeedWindow};
 
+use crate::executor::PointReads;
 use crate::legs::Member;
 
 /// What a block fixes about the environment its tick executes under.
 ///
-/// Resolved from the snapshot governing the block rather than from a
-/// node's own head: a node's head advances as it folds the beacon, and
-/// two members fold at their own pace, so a window taken from one would
-/// answer `Pending` on a laggard where it answers `Ready` on a leader —
-/// two receipts for one tick. Carried from the commit that composed the
-/// tick, on the same terms as the clock beside it.
+/// Carried from the commit that composed the tick, on the same terms as
+/// the clock beside it.
 #[derive(Clone, Debug)]
 pub struct TickEnvironment {
-    /// The epochs a sealed draw in this batch may settle on.
+    /// The seeds this tick's members draw on: the ring the window
+    /// governing the block carried, and the ring of each member's own
+    /// window where that one falls short, which it does only for a member
+    /// clocked past the governing window.
     ///
-    /// Global rather than per transaction: the seeds are the beacon's,
-    /// so every shard resolves the same value for the same epoch and
-    /// nothing about which block executes a leg reaches the answer.
-    pub seeds: SeedWindow,
+    /// Only a store. What a member draws on is
+    /// [`Self::seed_window_for`] its own clock, which the ring answers
+    /// alike whichever copy of a window it came from and however far
+    /// this node had folded the beacon when it took it.
+    pub seeds: SeedRing,
     /// The grid that turns a member's clock into the epoch a seal it
     /// writes records — so the epoch rides the clock the transaction
     /// already carries rather than travelling beside it.
@@ -57,22 +59,10 @@ pub struct TickEnvironment {
 impl TickEnvironment {
     /// The environment the block governed by `snapshot` executes under,
     /// on the grid `windows` lays down.
-    ///
-    /// Only the reveal-folded epochs cross into the seed window. A
-    /// ceremony roll is a seed a beacon member could have withheld from,
-    /// and a draw settled on one is settled on a value somebody had a
-    /// lever over — so a seal maturing into such an epoch answers
-    /// `Expired` and the round closes again.
     #[must_use]
     pub fn governing(snapshot: &TopologySnapshot, windows: EpochWindows) -> Self {
-        let ring = snapshot.seeds();
         Self {
-            seeds: SeedWindow::new(
-                ring.folded()
-                    .map(|(epoch, seed)| (epoch.inner(), *seed.as_bytes()))
-                    .collect(),
-                ring.newest().map(Epoch::inner),
-            ),
+            seeds: snapshot.seeds().clone(),
             windows,
         }
     }
@@ -80,11 +70,23 @@ impl TickEnvironment {
     /// An environment no seal can open, over the single-window grid.
     /// For callers with no committed block to take one from.
     #[must_use]
-    pub const fn unfolded() -> Self {
+    pub fn unfolded() -> Self {
         Self {
-            seeds: SeedWindow::unfolded(),
+            seeds: SeedRing::default(),
             windows: EpochWindows::new(0, 0),
         }
+    }
+
+    /// The seed window a member clocked at `clock` draws on: the
+    /// [`SeedRing::window_for`] the epoch its clock falls in. One answer
+    /// on every shard running the member, since the clock is the
+    /// transaction's and the window is a function of its epoch alone.
+    ///
+    /// `None` while the ring lacks a seed of it, which the tick waits out
+    /// before it dispatches.
+    #[must_use]
+    pub fn seed_window_for(&self, clock: WeightedTimestamp) -> Option<SeedWindow> {
+        self.seeds.window_for(self.windows.epoch_for(clock))
     }
 }
 
@@ -116,6 +118,11 @@ pub struct TickBatchContext<'a> {
     /// burned was promised, and a member's own burn comes out of its
     /// own hold.
     pub fee_holds: &'a dyn FeeHoldReading,
+    /// What answers an entry point of this shard's own owners that no
+    /// declaration's pre-read named, read at the snapshot's version: the
+    /// tick view's own reads. `None` answers every point from the
+    /// pre-read alone.
+    pub points: Option<Arc<dyn PointReads>>,
 }
 
 /// One member of a tick's batch.
@@ -128,14 +135,16 @@ pub struct TickTxInput<'a> {
     /// What names the member, and what its receipt is keyed by.
     pub tx_hash: TxHash,
     /// The transaction to execute.
-    pub transaction: &'a Arc<Verified<Transaction>>,
+    pub transaction: &'a Verified<Transaction>,
     /// Verified provision entry lists, one per source shard contribution.
     /// Empty for a single-shard member.
     pub provisions: &'a [Arc<Vec<SubstateEntry>>],
-    /// The transaction clock, identical on every participant: the
-    /// tick anchor for a single-shard member, the payer-shard
-    /// committing block's parent-QC weighted timestamp for a cross-shard
-    /// leg.
+    /// The transaction clock, identical on every shard running the same
+    /// body: the tick anchor for a single-shard member, the payer-shard
+    /// committing block's parent-QC weighted timestamp for a whole
+    /// cross-shard member, the earliest of the core shards' committing
+    /// clocks for a core member, and its own committing block's for a
+    /// leg, which runs alone.
     pub clock: WeightedTimestamp,
     /// The price table the block that committed this member named.
     ///
@@ -157,4 +166,103 @@ pub struct TickTxInput<'a> {
     /// What committed bundles attested for the edges this shard's legs
     /// consume. Empty for a member that runs whole.
     pub arrivals: &'a [EscrowedValue],
+    /// The part its own shard serves it, where a counterpart shares its
+    /// verdict and reads keys of this shard.
+    pub served_part: Option<&'a ServedPart>,
+}
+
+/// The part a shard serves a member of its own, as the batch reads it:
+/// beneath the baseline with the rest of what the member was handed, and
+/// over it on the keys the part answers for.
+#[derive(Debug, Clone)]
+pub struct ServedPart {
+    pub(crate) entries: Arc<Vec<SubstateEntry>>,
+    pub(crate) served: Arc<ServedReads>,
+}
+
+impl ServedPart {
+    /// The part holding `entries`, which answers for `cells` and `ranges`.
+    #[must_use]
+    pub fn new(
+        entries: Vec<SubstateEntry>,
+        cells: &[SubstateKey],
+        ranges: &[DeclaredRange],
+    ) -> Self {
+        Self {
+            entries: Arc::new(entries),
+            served: Arc::new(ServedReads {
+                cells: cells.iter().copied().collect(),
+                ranges: ranges
+                    .iter()
+                    .map(|range| ServedRange {
+                        owner: range.owner,
+                        collection: range.collection,
+                        lo: range.lo,
+                        hi: range.hi,
+                    })
+                    .collect(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::{Epoch, EpochSeed, Randomness, SeedSource};
+    use hyperscale_vm_types::Drawn;
+
+    use super::*;
+
+    const ED: u64 = 1_000;
+    const WINDOWS: EpochWindows = EpochWindows::new(0, ED);
+
+    /// A tick's environment whose ring the beacon folded through `newest`.
+    fn folded_through(newest: u64) -> TickEnvironment {
+        let mut seeds = SeedRing::default();
+        for epoch in 1..=newest {
+            seeds.record(
+                Epoch::new(epoch),
+                EpochSeed {
+                    randomness: Randomness::new([u8::try_from(epoch % 251).unwrap(); 32]),
+                    source: SeedSource::Reveals,
+                },
+                WINDOWS,
+            );
+        }
+        TickEnvironment {
+            seeds,
+            windows: WINDOWS,
+        }
+    }
+
+    /// Two shards of one divided core tick its member in different
+    /// windows, under one clock: the earliest of their committing clocks,
+    /// in epoch `E`. One ticks in `E` on the copy of it the fold of
+    /// `E - 1` published; the other ticks in `E + 1` on the copy the fold
+    /// of `E + 1` froze, two seeds further on. Each half of the core opens
+    /// a seal alike, or the two halves apply different branches.
+    #[test]
+    fn core_members_ticking_in_different_windows_draw_alike() {
+        const E: u64 = 90;
+        let clock = WeightedTimestamp::from_millis(E * ED + 700);
+        let early = folded_through(E - 1).seed_window_for(clock).expect("held");
+        let late = folded_through(E + 1).seed_window_for(clock).expect("held");
+        assert_eq!(early, late);
+        assert_eq!(late.at(E), Drawn::Pending, "the clock's own epoch is ahead");
+        assert_eq!(late.at(E + 1), Drawn::Pending);
+        assert_eq!(late.at(E - 1), Drawn::Ready([89; 32]));
+    }
+
+    /// Members of one tick clocked in different epochs draw on different
+    /// windows: the window is the member's, not the tick's.
+    #[test]
+    fn each_member_draws_on_its_own_clocks_window() {
+        let env = folded_through(80);
+        let at = |epoch: u64| {
+            env.seed_window_for(WeightedTimestamp::from_millis(epoch * ED))
+                .expect("held")
+        };
+        assert_eq!(at(78).at(78), Drawn::Pending);
+        assert_eq!(at(79).at(78), Drawn::Ready([78; 32]));
+    }
 }

@@ -9,7 +9,6 @@
 //! through ordinary sync regardless.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
 
 use hyperscale_types::{ExecutionCertificate, Finalization, ShardId, Verifiable};
 
@@ -37,7 +36,7 @@ pub enum Parked {
     /// A certificate received by broadcast or fetch.
     Certificate(Box<Verifiable<ExecutionCertificate>>),
     /// A finalization fetched from a peer.
-    Fetched(Arc<Verifiable<Finalization>>),
+    Fetched(Verifiable<Finalization>),
 }
 
 impl Parked {

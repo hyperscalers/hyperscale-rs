@@ -12,9 +12,10 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemo
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
-    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, ProposerTimestamp,
-    ProvisionHash, ProvisionTxRoot, QuorumCertificate, Round, ShardId, SignerBitfield,
-    TopologySchedule, TopologySnapshot, Verified, WeightedTimestamp, WitnessSources,
+    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Epoch, Hash, LocalTimestamp,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRoot, QuorumCertificate, Round, ShardId,
+    SignerBitfield, TopologySchedule, TopologySnapshot, Verified, WeightedTimestamp,
+    WitnessSources,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -67,6 +68,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
             __qc.height(),
             __qc.parent_block_hash(),
             __qc.round(),
+            __qc.committee_epoch(),
             __qc.signers().clone(),
             __qc.aggregated_signature(),
             WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
@@ -82,7 +84,7 @@ fn make_remote_header_targeting(
     source_shard: ShardId,
     height: BlockHeight,
     local_shard: ShardId,
-) -> Arc<Verified<CertifiedBlockHeader>> {
+) -> Verified<CertifiedBlockHeader> {
     // The expectation tracker keys on the header owing us a bundle — a
     // `provision_tx_roots` entry, and nothing else.
     let provision_tx_roots = std::collections::BTreeMap::from([(
@@ -109,13 +111,12 @@ fn make_remote_header_targeting(
         height,
         BlockHash::ZERO,
         Round::INITIAL,
+        Epoch::GENESIS,
         SignerBitfield::empty(),
         AggregateSignature::ZERO,
         WeightedTimestamp::ZERO,
     );
-    Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
-        header, qc,
-    )))
+    Verified::new_unchecked_for_test(CertifiedBlockHeader::new(header, qc))
 }
 
 #[test]
@@ -146,6 +147,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     let ProvisionMemoryStats {
         verified_remote_headers,
         pending_provisions,
+        pending_provision_bytes,
         verified_provisions,
         expected_provisions,
         provisions_by_hash,
@@ -154,6 +156,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
 
     assert_eq!(verified_remote_headers, 0);
     assert_eq!(pending_provisions, 0);
+    assert_eq!(pending_provision_bytes, 0);
     assert_eq!(verified_provisions, 0);
     assert_eq!(expected_provisions, 0);
     assert_eq!(provisions_by_hash, 0);
@@ -220,7 +223,7 @@ fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
     let stored = coord
         .get_remote_header(remote, BlockHeight::new(5))
         .expect("present after the committed event");
-    assert!(Arc::ptr_eq(&stored, &header));
+    assert!(stored.same_body(&header));
 }
 
 #[test]

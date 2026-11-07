@@ -7,7 +7,7 @@
 //! # Design
 //!
 //! Storage is an implementation detail of runners, not the state machine.
-//! The state machine emits `Action::ExecuteTransactions` and receives
+//! The state machine emits `ExecutionAction::ExecuteTransactions` and receives
 //! `ProtocolEvent::ExecutionBatchCompleted` - it never touches storage directly.
 //!
 //! Runners own storage and pass it to the executor:
@@ -72,7 +72,8 @@ pub use shard::members::{
 };
 pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{
-    BaseReadCache, ChainEntry, PendingChain, PersistedPastAnchor, SubstateView, TerminalWindow,
+    AnchorUnheld, BaseReadCache, ChainEntry, PendingChain, PersistedPastAnchor, PreparedBlockView,
+    SubstateView, TerminalWindow,
 };
 pub use shard::read_frontier::{load_read_frontier, read_frontier_writes, with_frontier};
 pub use shard::recovered_state::{RECENT_HEADER_REPLAY, RecoveredState, recent_headers};
@@ -100,6 +101,7 @@ pub use shard::writes::{
     merge_state_writes, merge_writes_from_receipts, pending_write, prefix_low_key, settle_writes,
     settled_block_at, settled_writes_at, settling_writes,
 };
+pub use shard::{Head, Place, QueueHolds, pinned_holds, served_from_head, served_rows};
 pub use tree::{CollectedWrites, JmtSnapshot};
 
 /// Umbrella bound for storage backends threaded as a generic `S` through

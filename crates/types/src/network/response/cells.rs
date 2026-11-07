@@ -44,7 +44,8 @@ const _: () = assert!(MAX_CELLS_PER_QUERY <= MAX_ENTRIES_PER_ANSWER as u64);
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct RangeAnswer {
     /// The entries found, `(order, value)`, ascending and no more than
-    /// the interval's declared cap.
+    /// the interval's lift: one past its declared cap, or the whole
+    /// interval where it is narrower.
     pub entries: Capped<Vec<(u128, Bytes<MAX_CELL_VALUE_LEN>)>, MAX_ENTRIES_PER_ANSWER>,
 }
 

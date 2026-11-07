@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
@@ -381,13 +380,7 @@ pub fn halted_shard_recovery_replays_a_sweep_its_suffix_walked<C: FaultableClust
         validity_around(c.now()).start_timestamp_inclusive,
         WeightedTimestamp::from_millis(validity_end),
     );
-    let tx = Arc::new(build_transfer_tx(
-        key,
-        *from,
-        *to,
-        STRADDLER_PAYMENT,
-        validity,
-    ));
+    let tx = build_transfer_tx(key, *from, *to, STRADDLER_PAYMENT, validity);
     let cell = committed_tx_cell_key(halted, tx.hash(), validity.end_timestamp_exclusive);
     c.submit(tx);
     let held = |c: &C| c.substate(halted, cell.owner, cell.local.0).is_some();
@@ -484,8 +477,9 @@ const ANSWERED_SUFFIX_CLOSING_EIGHTHS: u64 = 6;
 /// and freezes before the epoch's next boundary: the blocks writing the
 /// answers sit above the frontier the beacon last attested, in the
 /// suffix. A fresh member commits that suffix as certified, never
-/// judging the cap on it, and the first block it builds on it stands in
-/// the recovery's suffix band, where the cap is out of play; every
+/// judging the cap on it, and the first block it builds on it extends a
+/// block certified by the committee the recovery replaced, where the cap
+/// is out of play; every
 /// later block is judged against the count the suffix left. The
 /// recovered shard resumes, its replicas agree on one state root, each
 /// transfer is credited once, a transfer each way settles after the
@@ -498,7 +492,7 @@ const ANSWERED_SUFFIX_CLOSING_EIGHTHS: u64 = 6;
 /// re-bases one, so its leaders build blocks that add nothing. Biting
 /// on the band needs a fresh leader holding a count over voters that
 /// hold none, which no harness seam arranges; the band's rule is the
-/// coordinator's `a_block_with_its_parent_in_a_suffix_band_is_not_capped`.
+/// coordinator's `a_block_over_a_replaced_committees_parent_is_not_capped`.
 ///
 /// Requires [`halt_straddler_setup`] at genesis and two committees'
 /// worth of pool surplus, as [`halted_shard_recovers_by_committee_redraw`]
@@ -731,7 +725,7 @@ pub fn a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues<
             );
         }
         offered.insert(route.hash());
-        c.submit(Arc::new(route));
+        c.submit(route);
     }
 
     let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
@@ -775,7 +769,7 @@ pub fn a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues<
             validity_around(c.now()),
         );
         let hash = control.hash();
-        c.submit(Arc::new(control));
+        c.submit(control);
         let status = await_tx_terminal(c, hash, epochs(2));
         assert!(
             matches!(
@@ -866,7 +860,7 @@ pub fn a_silent_sibling_holds_no_more_than_a_quarter<C: FaultableCluster>(c: &mu
             window,
         );
         offered.insert(route.hash());
-        c.submit(Arc::new(route));
+        c.submit(route);
     }
 
     let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
@@ -902,7 +896,7 @@ pub fn a_silent_sibling_holds_no_more_than_a_quarter<C: FaultableCluster>(c: &mu
             validity_around(c.now()),
         );
         let hash = control.hash();
-        c.submit(Arc::new(control));
+        c.submit(control);
         let status = await_tx_terminal(c, hash, epochs(2));
         assert!(
             matches!(
@@ -927,7 +921,7 @@ pub fn a_silent_sibling_holds_no_more_than_a_quarter<C: FaultableCluster>(c: &mu
         validity_around(c.now()),
     );
     let hash = fresh.hash();
-    c.submit(Arc::new(fresh));
+    c.submit(fresh);
     let status = await_tx_terminal(c, hash, epochs(8));
     assert!(
         matches!(

@@ -95,6 +95,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// terminal transaction — the replicated-execution factor.
     fn record_transaction_executed(&self) {}
 
+    /// Record the provisioned collection entries a core member on `shard`
+    /// executes over: the remote interval reads its counterparts served
+    /// it, as opposed to the cells they served.
+    fn record_provision_range_entries_consumed(&self, shard: u64, count: usize) {}
+
     /// Set the current block height gauge for a shard.
     fn set_block_height(&self, shard: u64, height: u64) {}
 
@@ -134,8 +139,17 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// and `_sum / threads` gives utilization per pool.
     fn record_pool_task_completed(&self, pool: &str, latency_secs: f64) {}
 
-    /// Set the depths of one shard loop's callback and timer channels.
-    fn set_shard_channel_depths(&self, shard: u64, callback: usize, timer: usize) {}
+    /// Set the depths of one shard loop's callback, network and timer
+    /// channels.
+    fn set_shard_channel_depths(&self, shard: u64, callback: usize, network: usize, timer: usize) {}
+
+    /// An inbound network input refused because its shard's network lane
+    /// was full, by shard and input kind.
+    fn record_network_input_refused(&self, shard: u64, kind: &str) {}
+
+    /// An inbound network input refused because its peer already held its
+    /// share of its shard's network lane, by shard.
+    fn record_network_input_over_share(&self, shard: u64) {}
 
     /// Record execution latency.
     fn record_execution_latency(&self, latency_secs: f64) {}
@@ -233,6 +247,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Pending core members a proposed block aborts as the proven victims
     /// of a hold cycle.
     fn record_hold_inversions_proven(&self, victims: usize) {}
+
+    /// Unnamed heads a proposed block aborts at their naming window,
+    /// which tells a cycle a window ended from one a wound ended.
+    fn record_heads_windowed(&self, heads: usize) {}
 
     /// Stated or accepted rows a terminal's manifest fated or ended, one
     /// count per row at each derivation of that manifest: the proposer's,
@@ -358,6 +376,18 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// The records consumers here wait on with no arrival for, at a
     /// commit.
     fn set_wanted_records(&self, count: usize) {}
+
+    /// The span a kept arrival's push took: its holder's newest proven
+    /// clock less the clock its want was filed at, in milliseconds.
+    fn record_record_push_span(&self, millis: u64) {
+        let _ = millis;
+    }
+
+    /// The grace `holder`'s records are read past, in milliseconds, as
+    /// a new height's sample moves it.
+    fn set_record_push_grace(&self, holder: u64, millis: u64) {
+        let _ = (holder, millis);
+    }
 
     /// A claim the commit fold acts on by its anchor: one carrying a
     /// record presence (`"record"`), either carried by a committed block
@@ -676,6 +706,13 @@ pub fn record_transaction_executed() {
     recorder().record_transaction_executed();
 }
 
+/// Record the provisioned collection entries a core member on `shard`
+/// executes over.
+#[inline]
+pub fn record_provision_range_entries_consumed(shard: u64, count: usize) {
+    recorder().record_provision_range_entries_consumed(shard, count);
+}
+
 /// Set the current block height gauge for a shard.
 #[inline]
 pub fn set_block_height(shard: u64, height: u64) {
@@ -738,10 +775,24 @@ pub fn record_pool_task_completed(pool: &str, latency_secs: f64) {
     recorder().record_pool_task_completed(pool, latency_secs);
 }
 
-/// Set the depths of one shard loop's callback and timer channels.
+/// Set the depths of one shard loop's callback, network and timer
+/// channels.
 #[inline]
-pub fn set_shard_channel_depths(shard: u64, callback: usize, timer: usize) {
-    recorder().set_shard_channel_depths(shard, callback, timer);
+pub fn set_shard_channel_depths(shard: u64, callback: usize, network: usize, timer: usize) {
+    recorder().set_shard_channel_depths(shard, callback, network, timer);
+}
+
+/// Record an inbound network input refused at its shard's full network
+/// lane.
+#[inline]
+pub fn record_network_input_refused(shard: u64, kind: &str) {
+    recorder().record_network_input_refused(shard, kind);
+}
+
+/// Record an inbound network input refused for its peer's share of the lane.
+#[inline]
+pub fn record_network_input_over_share(shard: u64) {
+    recorder().record_network_input_over_share(shard);
 }
 
 /// Record execution latency.
@@ -865,6 +916,12 @@ pub fn record_hold_contentions(pairs: usize) {
 #[inline]
 pub fn record_hold_inversions_proven(victims: usize) {
     recorder().record_hold_inversions_proven(victims);
+}
+
+/// Record the heads a proposed block aborts at their naming window.
+#[inline]
+pub fn record_heads_windowed(heads: usize) {
+    recorder().record_heads_windowed(heads);
 }
 
 /// Record the hearing rows one derivation of a terminal's manifest named.
@@ -995,6 +1052,18 @@ pub fn record_pushes_placed_on_carry(count: usize) {
 #[inline]
 pub fn set_wanted_records(count: usize) {
     recorder().set_wanted_records(count);
+}
+
+/// Record the span a kept arrival's push took.
+#[inline]
+pub fn record_record_push_span(millis: u64) {
+    recorder().record_record_push_span(millis);
+}
+
+/// Set the grace `holder`'s records are read past.
+#[inline]
+pub fn set_record_push_grace(holder: u64, millis: u64) {
+    recorder().set_record_push_grace(holder, millis);
 }
 
 /// Record a fenced claim carried by a block or refused by the read

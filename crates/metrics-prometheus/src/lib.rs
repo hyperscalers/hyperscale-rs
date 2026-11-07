@@ -43,6 +43,7 @@ pub struct Metrics {
     // === Transactions ===
     pub transactions_finalized: HistogramVec,
     pub transactions_executed: Counter,
+    pub provision_range_entries_consumed: CounterVec,
     /// Per-replica mempool size.
     pub mempool_size: GaugeVec,
 
@@ -64,7 +65,10 @@ pub struct Metrics {
 
     // === Shard Loop Channel Depths ===
     pub callback_channel_depth: GaugeVec,
+    pub network_channel_depth: GaugeVec,
     pub timer_channel_depth: GaugeVec,
+    pub network_inputs_refused: CounterVec,
+    pub network_inputs_over_share: CounterVec,
 
     // === Transaction Ingress ===
     pub tx_ingress_rejected_syncing: Counter,
@@ -157,6 +161,7 @@ pub struct Metrics {
     pub batches_unavailable: Counter,
     pub hold_contentions: Counter,
     pub hold_inversions_proven: Counter,
+    pub heads_windowed: Counter,
     /// Stated or accepted rows a chain's terminal named; any count is a
     /// cut the quiet gate should have held.
     pub terminal_fated_hearing_rows: Counter,
@@ -225,6 +230,8 @@ pub struct Metrics {
     pub pushes_placed_on_carry: Counter,
     /// Records consumers here wait on with no arrival for, at a commit.
     pub wanted_records: Gauge,
+    pub record_push_span: Histogram,
+    pub record_push_grace: GaugeVec,
     /// Proposals a leader made at once rather than holding an empty
     /// block, by the condition that forced it.
     pub eager_proposals: CounterVec,
@@ -333,6 +340,13 @@ impl Metrics {
             )
             .unwrap(),
 
+            provision_range_entries_consumed: register_counter_vec!(
+                "hyperscale_provision_range_entries_consumed_total",
+                "Provisioned collection entries a core member executes over, by executing shard",
+                &["shard"]
+            )
+            .unwrap(),
+
             mempool_size: register_gauge_vec!(
                 "hyperscale_mempool_size",
                 "Number of pending transactions in mempool, per shard replica",
@@ -419,9 +433,30 @@ impl Metrics {
             )
             .unwrap(),
 
+            network_channel_depth: register_gauge_vec!(
+                "hyperscale_network_channel_depth",
+                "Inbound peer inputs queued on a shard loop's bounded network channel",
+                &["shard"]
+            )
+            .unwrap(),
+
             timer_channel_depth: register_gauge_vec!(
                 "hyperscale_timer_channel_depth",
                 "Timer fires queued on a shard loop's timer channel",
+                &["shard"]
+            )
+            .unwrap(),
+
+            network_inputs_refused: register_counter_vec!(
+                "hyperscale_network_inputs_refused_total",
+                "Inbound peer inputs refused because the shard loop's network channel was full",
+                &["shard", "kind"]
+            )
+            .unwrap(),
+
+            network_inputs_over_share: register_counter_vec!(
+                "hyperscale_network_inputs_over_share_total",
+                "Inbound peer inputs refused because their peer already held its share of the shard loop's network channel",
                 &["shard"]
             )
             .unwrap(),
@@ -801,6 +836,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            heads_windowed: register_counter!(
+                "hyperscale_heads_windowed_total",
+                "Unnamed heads proposed blocks aborted at their naming window"
+            )
+            .unwrap(),
+
             terminal_fated_hearing_rows: register_counter!(
                 "hyperscale_terminal_fated_hearing_rows_total",
                 "Stated or accepted rows a terminal manifest named, per derivation"
@@ -991,6 +1032,20 @@ impl Metrics {
             )
             .unwrap(),
 
+            record_push_span: register_histogram!(
+                "hyperscale_record_push_span_seconds",
+                "Seconds of a holder's proven clock from a want's filing to its pushed arrival",
+                vec![0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 30.0]
+            )
+            .unwrap(),
+
+            record_push_grace: register_gauge_vec!(
+                "hyperscale_record_push_grace_seconds",
+                "Seconds past a want's filing a holder's record is read, as last derived",
+                &["holder"]
+            )
+            .unwrap(),
+
             eager_proposals: register_counter_vec!(
                 "hyperscale_eager_proposals_total",
                 "Proposals a leader made at once rather than holding an empty block, by reason",
@@ -1156,6 +1211,13 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.transactions_executed.inc();
     }
 
+    fn record_provision_range_entries_consumed(&self, shard: u64, count: usize) {
+        self.metrics
+            .provision_range_entries_consumed
+            .with_label_values(&[&shard.to_string()])
+            .inc_by(count as f64);
+    }
+
     fn set_block_height(&self, shard: u64, height: u64) {
         self.metrics
             .block_height
@@ -1230,12 +1292,16 @@ impl MetricsRecorder for PrometheusRecorder {
             .observe(latency_secs);
     }
 
-    fn set_shard_channel_depths(&self, shard: u64, callback: usize, timer: usize) {
+    fn set_shard_channel_depths(&self, shard: u64, callback: usize, network: usize, timer: usize) {
         let shard = shard.to_string();
         self.metrics
             .callback_channel_depth
             .with_label_values(&[&shard])
             .set(callback as f64);
+        self.metrics
+            .network_channel_depth
+            .with_label_values(&[&shard])
+            .set(network as f64);
         self.metrics
             .timer_channel_depth
             .with_label_values(&[&shard])
@@ -1345,6 +1411,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_hold_inversions_proven(&self, victims: usize) {
         self.metrics.hold_inversions_proven.inc_by(victims as f64);
+    }
+
+    fn record_heads_windowed(&self, heads: usize) {
+        self.metrics.heads_windowed.inc_by(heads as f64);
     }
 
     fn record_terminal_fated_hearing_rows(&self, rows: usize) {
@@ -1492,6 +1562,19 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.wanted_records.set(count as f64);
     }
 
+    fn record_record_push_span(&self, millis: u64) {
+        self.metrics
+            .record_push_span
+            .observe(millis as f64 / 1_000.0);
+    }
+
+    fn set_record_push_grace(&self, holder: u64, millis: u64) {
+        self.metrics
+            .record_push_grace
+            .with_label_values(&[&holder.to_string()])
+            .set(millis as f64 / 1_000.0);
+    }
+
     fn record_fenced_claim(&self, reading: &str, carried: bool) {
         let counter = if carried {
             &self.metrics.fenced_claims_carried
@@ -1505,6 +1588,20 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics
             .eager_proposals
             .with_label_values(&[reason])
+            .inc();
+    }
+
+    fn record_network_input_refused(&self, shard: u64, kind: &str) {
+        self.metrics
+            .network_inputs_refused
+            .with_label_values(&[&shard.to_string(), kind])
+            .inc();
+    }
+
+    fn record_network_input_over_share(&self, shard: u64) {
+        self.metrics
+            .network_inputs_over_share
+            .with_label_values(&[&shard.to_string()])
             .inc();
     }
 

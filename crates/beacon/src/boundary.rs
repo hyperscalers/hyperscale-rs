@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BeaconProposal, BeaconState, BlockHash, BlockHeader, BlockHeight, LocalTimestamp,
-    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, QcContext, QuorumCertificate,
-    ScheduleLookup, ShardEpochContribution, ShardId, TopologySchedule, ValidatorId, Verified,
+    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, QcAdmission, QcContext,
+    QuorumCertificate, ShardEpochContribution, ShardId, TopologySchedule, ValidatorId, Verified,
     Verifier, Verify,
 };
 use tracing::{debug, warn};
@@ -475,17 +475,16 @@ fn boundary_header_for(
 /// and let it catch up), a below-floor one marks a crossing every consumer
 /// frontier has passed.
 ///
-/// Resolution is terminal-clamped and recovery-bridged
-/// (`lookup_for_shard_certified`): a splitting shard's terminal crossing
-/// can be anchored exactly on its cut — a crossing is parent-inclusive at
-/// the cut — and a terminal is anchored past it, where the anchor's
-/// half-open window no longer carries the shard; the block is still
-/// proposed and signed by
-/// the shard's final-epoch committee, the same resolution its own
-/// replicas applied when voting it, so the QC must verify against that
-/// committee. A halt recovery's bridge block — the crossing that
-/// completes the recovery — is anchored below the bridge window but
-/// certified at or past it, and verifies against the fresh committee.
+/// The QC verifies under the window its signers signed, admitted at the
+/// committee anchor and its stamp ([`TopologySchedule::admits_fenced`]).
+/// A splitting shard's terminal crossing can be anchored exactly on its
+/// cut — a crossing is parent-inclusive at the cut — and a terminal is
+/// anchored past it, where the anchor's half-open window no longer carries
+/// the shard; the block is still proposed and signed by the shard's
+/// final-epoch committee, which its voters signed, so the QC verifies
+/// against that committee. A halt recovery's bridge block — the crossing
+/// that completes the recovery — is anchored below the bridge window but
+/// signs it, and verifies against the fresh committee.
 fn boundary_qc_authentic(
     verifier: &dyn Verifier,
     shard: ShardId,
@@ -503,38 +502,46 @@ fn boundary_qc_authentic(
         |parent| parent.parent_qc().weighted_timestamp(),
     );
     // The only legitimate boundary crossing during a halt recovery is the
-    // fresh committee's — the one that completes the recovery, which
-    // re-binds (a stale anchor certified at or past the bridge) or anchors
-    // at a current window. The halted suffix has no epoch crossing of its
-    // own, so a crossing the fenced lookup rejects is the orphan a
-    // beyond-f cohort forged extending the halted tip. Folding it would
-    // clear the recovery and drop the cross-shard freeze.
-    let snapshot = match topology_schedule.lookup_for_shard_certified_fenced(
+    // fresh committee's — the one that completes the recovery, which signs
+    // the bridge's window or a later one. The halted suffix has no epoch
+    // crossing of its own, so a crossing the signed-epoch fence refuses is
+    // the orphan a beyond-f cohort forged extending the halted tip, under
+    // the window it was seated in and whatever stamp it chose. Folding it
+    // would clear the recovery and drop the cross-shard freeze.
+    if qc.is_genesis() {
+        return false;
+    }
+    let snapshot = match topology_schedule.admits_fenced(
         shard,
         committee_anchor_wt,
         qc.weighted_timestamp(),
+        qc.committee_epoch(),
     ) {
-        None => {
+        QcAdmission::Admit(committee) => committee.snapshot,
+        QcAdmission::Fenced => {
             warn!(
                 shard = shard.inner(),
-                "Rejecting boundary QC that resolves the retained committee during a halt recovery"
+                epoch = qc.committee_epoch().inner(),
+                "Rejecting boundary QC signed under a committee a pending recovery replaced"
             );
             return false;
         }
-        Some((ScheduleLookup::Committee(snapshot), _)) => snapshot,
-        Some((ScheduleLookup::NotYetCommitted, _)) => {
+        QcAdmission::Wait => {
             debug!(
                 shard = shard.inner(),
-                "Boundary QC's committee epoch not committed yet — abstaining"
+                "Boundary QC's committee epoch not decidable yet — abstaining"
             );
             return false;
         }
-        Some((ScheduleLookup::Evicted, _)) => {
-            warn!(
+        // Under the boundary's own anchor, standing in for a parent not
+        // held, the parent is what decides: `awaited_boundaries` names it.
+        QcAdmission::Refuse => {
+            debug!(
                 shard = shard.inner(),
                 anchor_epoch = topology_schedule.epoch_for(committee_anchor_wt).inner(),
                 qc_epoch = topology_schedule.epoch_for(qc.weighted_timestamp()).inner(),
-                "Boundary QC's committee epoch is below the schedule floor — abstaining"
+                epoch = qc.committee_epoch().inner(),
+                "Boundary QC's signed epoch is not admitted at its anchor — abstaining"
             );
             return false;
         }
@@ -595,6 +602,7 @@ mod tests {
             BlockHeight::new(height.saturating_sub(1)),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(anchor_ms),
@@ -611,9 +619,16 @@ mod tests {
     }
 
     /// A genuine 2f+1 QC over `header`, signed by `committee`'s first three
-    /// seats, whose weighted timestamp lands at `wt_ms`.
-    fn signed_qc(committee: &TestCommittee, header: &BlockHeader, wt_ms: u64) -> QuorumCertificate {
+    /// seats under the window `epoch`, whose weighted timestamp lands at
+    /// `wt_ms`.
+    fn signed_qc(
+        committee: &TestCommittee,
+        header: &BlockHeader,
+        epoch: u64,
+        wt_ms: u64,
+    ) -> QuorumCertificate {
         let hash = header.hash();
+        let epoch = Epoch::new(epoch);
         let votes: Vec<(usize, Verified<BlockVote>)> = (0..3)
             .map(|i| {
                 let vote = BlockVote::new(
@@ -623,6 +638,7 @@ mod tests {
                     SHARD,
                     header.height(),
                     Round::INITIAL,
+                    epoch,
                     ValidatorId::new(i as u64),
                     committee.signer(i).as_ref(),
                     ProposerTimestamp::from_millis(wt_ms),
@@ -637,6 +653,7 @@ mod tests {
             SHARD,
             header.height(),
             Round::INITIAL,
+            epoch,
             header.parent_block_hash(),
             header.parent_qc().weighted_timestamp(),
             &votes,
@@ -672,6 +689,7 @@ mod tests {
             header.height(),
             header.parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(wt_ms),
@@ -679,11 +697,11 @@ mod tests {
     }
 
     /// `header` as a tracker holds it, under a stand-in certificate.
-    fn held(header: &BlockHeader) -> Arc<Verified<CertifiedBlockHeader>> {
-        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+    fn held(header: &BlockHeader) -> Verified<CertifiedBlockHeader> {
+        Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
             header.clone(),
             unsigned_qc(header, 0),
-        )))
+        ))
     }
 
     /// A tracker that followed `headers` in order.
@@ -704,6 +722,7 @@ mod tests {
             qc.height(),
             qc.parent_block_hash(),
             qc.round(),
+            qc.committee_epoch(),
             qc.signers().clone(),
             qc.aggregated_signature(),
             WeightedTimestamp::from_millis(wt_ms),
@@ -793,12 +812,12 @@ mod tests {
         // committee is epoch 0's — the window its parent anchors in.
         let parent = chained_header(9, 9, BlockHash::ZERO, ED - 1);
         let boundary = chained_header(10, 10, parent.hash(), ED + 1);
-        let qc = signed_qc(&committee_a, &boundary, ED + 2);
+        let qc = signed_qc(&committee_a, &boundary, 0, ED + 2);
 
         let mut shard_source = ShardSourceTracker::new();
-        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(parent, boundary.parent_qc().clone()),
-        )));
+        ));
 
         assert!(
             boundary_qc_authentic(
@@ -847,22 +866,22 @@ mod tests {
 
         let parent = chained_header(9, 9, BlockHash::ZERO, ED - 1);
         let boundary = chained_header(10, 10, parent.hash(), ED + 1);
-        let qc = signed_qc(&committee_a, &boundary, ED + 2);
+        let qc = signed_qc(&committee_a, &boundary, 0, ED + 2);
         let parent_slot = (SHARD, BlockHeight::new(9));
 
         let mut shard_source = ShardSourceTracker::new();
-        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(boundary.clone(), qc.clone()),
-        )));
+        ));
         let proposal = proposing(&qc);
         assert!(
             awaited_boundaries(&proposal, &shard_source).contains(&parent_slot),
             "the missing parent is asked for",
         );
 
-        shard_source.admit_proven_boundary(Arc::new(Verified::new_unchecked_for_test(
+        shard_source.admit_proven_boundary(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(parent, boundary.parent_qc().clone()),
-        )));
+        ));
         assert!(!awaited_boundaries(&proposal, &shard_source).contains(&parent_slot));
         assert!(
             boundary_qc_authentic(
@@ -875,6 +894,61 @@ mod tests {
                 &NetworkDefinition::simulator(),
             ),
             "the proven parent names the window that signed the boundary",
+        );
+    }
+
+    /// The guessed anchor refuses on the signed epoch alone. With one
+    /// committee seated on both sides of the cut, the keys verify the QC
+    /// under either window, but it names the window its parent anchors in.
+    /// Without the parent, the boundary's own anchor admits no committee
+    /// at that epoch, so the member abstains and asks for the parent; once
+    /// the parent is proven the QC is admitted under it and verifies.
+    #[test]
+    fn a_guessed_anchor_across_a_cut_waits_for_the_parent() {
+        let committee = TestCommittee::new(4, 1);
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(2),
+            Arc::new(committee.topology_snapshot(1)),
+        );
+        schedule.insert(Epoch::new(0), Arc::new(committee.topology_snapshot(1)));
+        schedule.insert(Epoch::new(1), Arc::new(committee.topology_snapshot(1)));
+
+        let parent = chained_header(9, 9, BlockHash::ZERO, ED - 1);
+        let boundary = chained_header(10, 10, parent.hash(), ED + 1);
+        let qc = signed_qc(&committee, &boundary, 0, ED + 2);
+        let parent_slot = (SHARD, BlockHeight::new(9));
+        let authentic = |tracker: &ShardSourceTracker| {
+            boundary_qc_authentic(
+                &BlsVerifier,
+                SHARD,
+                &boundary,
+                &qc,
+                tracker,
+                &schedule,
+                &NetworkDefinition::simulator(),
+            )
+        };
+
+        let mut shard_source = ShardSourceTracker::new();
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(boundary.clone(), qc.clone()),
+        ));
+        assert!(
+            !authentic(&shard_source),
+            "the guess admits no committee at the signed epoch"
+        );
+        assert!(
+            awaited_boundaries(&proposing(&qc), &shard_source).contains(&parent_slot),
+            "the missing parent is asked for",
+        );
+
+        shard_source.admit_proven_boundary(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(parent, boundary.parent_qc().clone()),
+        ));
+        assert!(
+            authentic(&shard_source),
+            "the parent's window admits the epoch"
         );
     }
 
@@ -894,7 +968,7 @@ mod tests {
         let (state, schedule) = live_shard(&committee);
 
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
-        let qc = signed_qc(&committee, &boundary, ED + 1);
+        let qc = signed_qc(&committee, &boundary, 0, ED + 1);
         let admissible =
             |headers: &[&BlockHeader]| admits(&following(headers), &state, &schedule, &qc);
 
@@ -936,7 +1010,7 @@ mod tests {
         let (state, schedule) = live_shard(&committee);
 
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
-        let qc = signed_qc(&committee, &boundary, ED + 1);
+        let qc = signed_qc(&committee, &boundary, 0, ED + 1);
         let child = child_embedding(&boundary, &qc, 11);
         let above = child_embedding(&child, &unsigned_qc(&child, ED + 2), 12);
         let tracker = following(&[&boundary, &child, &above]);
@@ -1054,7 +1128,7 @@ mod tests {
         // The block anchors and certifies inside epoch 0: its certificate
         // lands short of the cut at `ED`, so it crosses nothing.
         let block = chained_header(10, 10, BlockHash::ZERO, ED - 200);
-        let committed_qc = signed_qc(&committee, &block, ED - 100);
+        let committed_qc = signed_qc(&committee, &block, 0, ED - 100);
         assert!(committed_qc.weighted_timestamp().as_millis() < ED);
 
         // The round-contiguous child embeds that certificate and commits
@@ -1074,17 +1148,18 @@ mod tests {
             child.height(),
             child.parent_block_hash(),
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(ED - 50),
         );
         let mut shard_source = ShardSourceTracker::new();
-        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(block.clone(), committed_qc.clone()),
-        )));
-        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+        ));
+        shard_source.on_verified_source_header(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(child, child_qc),
-        )));
+        ));
         shard_source.observe_crossing(SHARD, EpochWindows::new(0, ED));
         assert!(shard_source.commit_established(SHARD, &block));
         assert!(
@@ -1115,6 +1190,7 @@ mod tests {
             committed_qc.height(),
             committed_qc.parent_block_hash(),
             committed_qc.round(),
+            committed_qc.committee_epoch(),
             committed_qc.signers().clone(),
             committed_qc.aggregated_signature(),
             WeightedTimestamp::from_millis(ED + 1),
@@ -1144,7 +1220,7 @@ mod tests {
         let (state, schedule) = live_shard(&committee);
 
         let short = chained_header(10, 10, BlockHash::ZERO, ED - 200);
-        let short_qc = signed_qc(&committee, &short, ED - 100);
+        let short_qc = signed_qc(&committee, &short, 0, ED - 100);
         let child = child_embedding(&short, &short_qc, 11);
         let above = child_embedding(&child, &unsigned_qc(&child, ED - 50), 12);
         let tracker = following(&[&short, &child, &above]);
@@ -1182,9 +1258,9 @@ mod tests {
     fn a_far_dated_copy_of_an_older_block_does_not_outrank_a_newer_boundary() {
         let committee = TestCommittee::new(4, 1);
         let older = chained_header(10, 10, BlockHash::ZERO, ED - 200);
-        let older_qc = signed_qc(&committee, &older, ED + 1);
+        let older_qc = signed_qc(&committee, &older, 0, ED + 1);
         let newer = chained_header(20, 20, BlockHash::ZERO, 2 * ED - 1);
-        let newer_qc = signed_qc(&committee, &newer, 2 * ED + 1);
+        let newer_qc = signed_qc(&committee, &newer, 1, 2 * ED + 1);
 
         let (honest, byzantine) = (proposing(&newer_qc), proposing(&redated(&older_qc, 9 * ED)));
         for order in [[&honest, &byzantine], [&byzantine, &honest]] {
@@ -1207,8 +1283,8 @@ mod tests {
         let (state, schedule) = live_shard(&committee);
 
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
-        let orphaned_qc = signed_qc(&committee, &boundary, ED + 1);
-        let committed_qc = signed_qc(&committee, &boundary, ED + 3);
+        let orphaned_qc = signed_qc(&committee, &boundary, 0, ED + 1);
+        let committed_qc = signed_qc(&committee, &boundary, 0, ED + 3);
         let orphan = child_embedding(&boundary, &orphaned_qc, 11);
         let kept = child_embedding(&boundary, &committed_qc, 12);
         let above = child_embedding(&kept, &unsigned_qc(&kept, ED + 4), 13);
@@ -1255,8 +1331,8 @@ mod tests {
         let (state, schedule) = live_shard(&committee);
 
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
-        let orphaned_qc = signed_qc(&committee, &boundary, ED + 1);
-        let committed_qc = signed_qc(&committee, &boundary, ED + 3);
+        let orphaned_qc = signed_qc(&committee, &boundary, 0, ED + 1);
+        let committed_qc = signed_qc(&committee, &boundary, 0, ED + 3);
         let orphan = child_embedding(&boundary, &orphaned_qc, 11);
         let kept = child_embedding(&boundary, &committed_qc, 12);
         let gapped = child_embedding(&kept, &unsigned_qc(&kept, ED + 4), 14);
@@ -1289,8 +1365,8 @@ mod tests {
         let (state, schedule) = live_shard(&committee);
 
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
-        let orphaned_qc = signed_qc(&committee, &boundary, ED + 1);
-        let committed_qc = signed_qc(&committee, &boundary, ED + 3);
+        let orphaned_qc = signed_qc(&committee, &boundary, 0, ED + 1);
+        let committed_qc = signed_qc(&committee, &boundary, 0, ED + 3);
         let orphan = child_embedding(&boundary, &orphaned_qc, 11);
         let kept = child_embedding(&boundary, &committed_qc, 12);
 
@@ -1344,13 +1420,13 @@ mod tests {
         );
 
         let crossing = chained_header(10, 10, BlockHash::ZERO, ED - 1);
-        let crossing_qc = signed_qc(&committee, &crossing, ED + 1);
+        let crossing_qc = signed_qc(&committee, &crossing, 0, ED + 1);
         let terminal = BlockHeader::new(BlockHeaderParts {
             terminal_settled_txs: Some(SettledTxsRoot::ZERO),
             ..child_embedding(&crossing, &crossing_qc, 11).into_parts()
         });
-        let terminal_qc = signed_qc(&committee, &terminal, ED + 2);
-        let other_qc = signed_qc(&committee, &terminal, ED + 9);
+        let terminal_qc = signed_qc(&committee, &terminal, 0, ED + 2);
+        let other_qc = signed_qc(&committee, &terminal, 0, ED + 9);
         let coast = child_embedding(&terminal, &terminal_qc, 12);
         let orphaned_coast = child_embedding(&terminal, &other_qc, 12);
 
@@ -1402,12 +1478,12 @@ mod tests {
             },
         );
         let crossing = chained_header(10, 10, BlockHash::ZERO, ED - 1);
-        let crossing_qc = signed_qc(&committee, &crossing, ED + 1);
+        let crossing_qc = signed_qc(&committee, &crossing, 0, ED + 1);
         let terminal = BlockHeader::new(BlockHeaderParts {
             terminal_settled_txs: Some(SettledTxsRoot::ZERO),
             ..child_embedding(&crossing, &crossing_qc, 11).into_parts()
         });
-        let terminal_qc = signed_qc(&committee, &terminal, ED + 2);
+        let terminal_qc = signed_qc(&committee, &terminal, 0, ED + 2);
         let coast = child_embedding(&terminal, &terminal_qc, 12);
         let tracker = following(&[&crossing, &terminal, &coast]);
         (state, schedule, tracker, crossing, terminal, terminal_qc)
@@ -1488,7 +1564,7 @@ mod tests {
             .expect("the reach fits");
         let certified_ms = 2 * reach;
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
-        let qc = signed_qc(&committee, &boundary, certified_ms);
+        let qc = signed_qc(&committee, &boundary, 0, certified_ms);
         let child = child_embedding(&boundary, &qc, 11);
         let above = child_embedding(&child, &unsigned_qc(&child, certified_ms + 1), 12);
         let tracker = following(&[&boundary, &child, &above]);
@@ -1551,17 +1627,19 @@ mod tests {
     }
 
     /// A committed crossing at `height` anchored at `anchor_ms`, extending
-    /// `parent`, under the certificate `committee` dates `certified_ms`:
-    /// the tracker that followed it and its two-chain, and the certificate.
+    /// `parent`, under the certificate `committee` signs under `epoch` and
+    /// dates `certified_ms`: the tracker that followed it and its
+    /// two-chain, and the certificate.
     fn committed_crossing(
         committee: &TestCommittee,
         height: u64,
         parent: BlockHash,
         anchor_ms: u64,
+        epoch: u64,
         certified_ms: u64,
     ) -> (ShardSourceTracker, BlockHeader, QuorumCertificate) {
         let crossing = chained_header(height, height, parent, anchor_ms);
-        let qc = signed_qc(committee, &crossing, certified_ms);
+        let qc = signed_qc(committee, &crossing, epoch, certified_ms);
         let child = child_embedding(&crossing, &qc, height + 1);
         let above = child_embedding(&child, &unsigned_qc(&child, certified_ms + 1), height + 2);
         (following(&[&crossing, &child, &above]), crossing, qc)
@@ -1598,7 +1676,7 @@ mod tests {
 
         let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
         let (bridge_tracker, bridge, bridge_qc) =
-            committed_crossing(&fresh, 12, tip.hash(), 1_900, 10_100);
+            committed_crossing(&fresh, 12, tip.hash(), 1_900, 10, 10_100);
         assert!(
             admits(&bridge_tracker, &stamped, &pending, &bridge_qc),
             "the bridge crossing verifies under the fresh committee and clears the recovery",
@@ -1610,14 +1688,14 @@ mod tests {
         assert!(admits(&bridge_tracker, &state, &cleared, &bridge_qc));
 
         let (fresh_tracker, _, fresh_qc) =
-            committed_crossing(&fresh, 20, BlockHash::ZERO, 10_900, 11_100);
+            committed_crossing(&fresh, 20, BlockHash::ZERO, 10_900, 10, 11_100);
         assert!(
             admits(&fresh_tracker, &state, &cleared, &fresh_qc),
             "the fresh committee's next crossing is admitted",
         );
 
         let (orphan_tracker, _, orphan_qc) =
-            committed_crossing(&replaced, 14, tip.hash(), 4_900, 5_100);
+            committed_crossing(&replaced, 14, tip.hash(), 4_900, 4, 5_100);
         assert!(
             !admits(&orphan_tracker, &stamped, &pending, &orphan_qc),
             "the discarded branch's crossing is refused while the recovery is pending",
@@ -1656,7 +1734,7 @@ mod tests {
         let stamped = with_history(state.clone(), stamped_history);
 
         let (bridge_tracker, bridge, bridge_qc) =
-            committed_crossing(&second, 15, BlockHash::ZERO, 1_900, 30_100);
+            committed_crossing(&second, 15, BlockHash::ZERO, 1_900, 30, 30_100);
         assert!(
             admits(&bridge_tracker, &stamped, &pending, &bridge_qc),
             "the second bridge crossing verifies under the second fresh committee",
@@ -1665,7 +1743,7 @@ mod tests {
         assert!(admits(&bridge_tracker, &state, &cleared, &bridge_qc));
 
         let (discarded_tracker, _, discarded_qc) =
-            committed_crossing(&first, 60, BlockHash::ZERO, 20_900, 21_100);
+            committed_crossing(&first, 60, BlockHash::ZERO, 20_900, 20, 21_100);
         assert!(
             !admits(&discarded_tracker, &stamped, &pending, &discarded_qc),
             "the first committee's crossing is refused while the second recovery is pending",
@@ -1693,7 +1771,7 @@ mod tests {
         let eras = [(&replaced, 0..10), (&fresh, 10..12)];
         let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
         let (tracker, orphan, orphan_qc) =
-            committed_crossing(&replaced, 14, tip.hash(), 4_900, 5_100);
+            committed_crossing(&replaced, 14, tip.hash(), 4_900, 4, 5_100);
 
         let (state, _) = live_shard(&replaced);
         let mut state = with_history(state, vec![binding(9, 8, true)]);
@@ -1782,11 +1860,11 @@ mod tests {
             beacon_witness_leaf_count: BeaconWitnessLeafCount::new(1),
             ..chained_header(14, 14, tip.hash(), 4_900).into_parts()
         });
-        let orphan_qc = signed_qc(&replaced, &orphan, 5_100);
+        let orphan_qc = signed_qc(&replaced, &orphan, 4, 5_100);
         let orphan_child = child_embedding(&orphan, &orphan_qc, 15);
         let orphan_above = child_embedding(&orphan_child, &unsigned_qc(&orphan_child, 5_200), 16);
         let next = chained_header(20, 20, BlockHash::ZERO, 10_900);
-        let next_qc = signed_qc(&fresh, &next, 11_100);
+        let next_qc = signed_qc(&fresh, &next, 10, 11_100);
         let next_child = child_embedding(&next, &next_qc, 21);
         let next_above = child_embedding(&next_child, &unsigned_qc(&next_child, 11_200), 22);
         let tracker = following(&[
@@ -1802,13 +1880,12 @@ mod tests {
         assert_eq!(sourced.boundary_header().hash(), next.hash());
     }
 
-    /// The window before a bridge is outside the band and is judged by the
-    /// committee its certificate resolves. With the recovery stamped at 9
-    /// (bridge 10), a fresh bridge crossing certified in window 9 is
-    /// admitted while the recovery is pending and after it clears. An
-    /// orphan the replaced committee certifies in the same window is
-    /// outside the band too, and after the clear the certified lookup
-    /// bridges it to the fresh committee, whose keys refuse it.
+    /// The band reads the epoch a crossing's signers signed, not its
+    /// stamp. With the recovery stamped at 9 (bridge 10), a fresh bridge
+    /// crossing signed under 10 and stamped in window 9 is outside the band
+    /// and admitted while the recovery is pending and after it clears. An
+    /// orphan the replaced committee signs under its own window, stamped
+    /// in the same window, is in the band, and refused after the clear.
     #[test]
     fn a_crossing_certified_in_the_window_before_the_bridge_is_judged_by_its_committee() {
         let replaced = TestCommittee::new(4, 1);
@@ -1821,7 +1898,7 @@ mod tests {
         let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
 
         let (bridge_tracker, bridge, bridge_qc) =
-            committed_crossing(&fresh, 12, tip.hash(), 1_900, 9_100);
+            committed_crossing(&fresh, 12, tip.hash(), 1_900, 10, 9_100);
         assert!(!rules::in_discarded_recovery_band(
             &stamped, SHARD, &bridge, &bridge_qc
         ));
@@ -1833,17 +1910,62 @@ mod tests {
         assert!(admits(&bridge_tracker, &state, &cleared, &bridge_qc));
 
         let (orphan_tracker, orphan, orphan_qc) =
-            committed_crossing(&replaced, 14, tip.hash(), 4_900, 9_100);
-        assert!(!rules::in_discarded_recovery_band(
+            committed_crossing(&replaced, 14, tip.hash(), 4_900, 4, 9_100);
+        assert!(rules::in_discarded_recovery_band(
             &state, SHARD, &orphan, &orphan_qc
         ));
         assert!(!admits(&orphan_tracker, &state, &cleared, &orphan_qc));
     }
 
+    /// The seating-epoch forgery at the boundary fold. The replaced
+    /// committee, beyond f, certifies a crossing extending the halted tip
+    /// under the window it was seated in and stamps it in the epoch the
+    /// recovery was seated (9, bridge 10), where that window's interval
+    /// meets the bridge's: its signatures verify there, and the
+    /// signed-epoch fence alone refuses it, whatever the stamp. Chained,
+    /// the first fresh committee states its own bridge (10) stamped in the
+    /// second seating epoch (29) against the pending second bridge (30).
+    /// The honest crossings beside them — signed under the pending
+    /// bridge, stamped in its seating epoch — are admitted.
+    #[test]
+    fn a_retained_quorum_stamped_in_the_seating_epoch_is_fenced() {
+        let replaced = TestCommittee::new(4, 1);
+        let fresh = TestCommittee::new(4, 2);
+        let (state, _) = live_shard(&replaced);
+        let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
+
+        let pending = schedule_over(
+            &[(&replaced, 0..10), (&fresh, 10..12)],
+            vec![binding(9, 8, false)],
+            Some(recovery(9, 8)),
+        );
+        for certified_ms in [9_100, 9_900] {
+            let (tracker, _, qc) =
+                committed_crossing(&replaced, 14, tip.hash(), 4_900, 4, certified_ms);
+            assert!(
+                !admits(&tracker, &state, &pending, &qc),
+                "the orphan stamped at {certified_ms} is fenced",
+            );
+        }
+        let (tracker, _, qc) = committed_crossing(&fresh, 12, tip.hash(), 1_900, 10, 9_100);
+        assert!(admits(&tracker, &state, &pending, &qc));
+
+        let second = TestCommittee::new(4, 3);
+        let chained = schedule_over(
+            &[(&replaced, 0..10), (&fresh, 10..30), (&second, 30..32)],
+            vec![binding(9, 8, true), binding(29, 8, false)],
+            Some(recovery(29, 8)),
+        );
+        let (tracker, _, qc) = committed_crossing(&fresh, 40, tip.hash(), 1_900, 10, 29_100);
+        assert!(!admits(&tracker, &state, &chained, &qc));
+        let (tracker, _, qc) = committed_crossing(&second, 40, tip.hash(), 1_900, 30, 29_100);
+        assert!(admits(&tracker, &state, &chained, &qc));
+    }
+
     /// A chained recovery's first committee, cut off from the beacon, keeps
     /// certifying into the window before the second bridge (30) and past
-    /// it. None of those crossings is in the band; each is bridged to the
-    /// second committee, whose keys refuse it.
+    /// it, signing its own windows. Each of those crossings is signed below
+    /// the second bridge, so each is in the band and refused.
     #[test]
     fn a_chained_first_committee_certifying_past_the_band_is_refused_by_its_successor() {
         let halted = TestCommittee::new(4, 1);
@@ -1857,10 +1979,14 @@ mod tests {
             recording(state, BlockHash::from_raw(Hash::from_bytes(b"bridge")), 15),
             history,
         );
-        for (anchor_ms, certified_ms) in [(20_900, 29_100), (28_900, 30_100), (30_100, 31_100)] {
+        for (anchor_ms, epoch, certified_ms) in [
+            (20_900, 20, 29_100),
+            (28_900, 28, 30_100),
+            (30_100, 29, 31_100),
+        ] {
             let (tracker, header, qc) =
-                committed_crossing(&first, 60, BlockHash::ZERO, anchor_ms, certified_ms);
-            assert!(!rules::in_discarded_recovery_band(
+                committed_crossing(&first, 60, BlockHash::ZERO, anchor_ms, epoch, certified_ms);
+            assert!(rules::in_discarded_recovery_band(
                 &state, SHARD, &header, &qc
             ));
             assert!(
@@ -1887,7 +2013,7 @@ mod tests {
             ],
         );
         let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
-        let (_, orphan, orphan_qc) = committed_crossing(&replaced, 14, tip.hash(), 4_900, 5_100);
+        let (_, orphan, orphan_qc) = committed_crossing(&replaced, 14, tip.hash(), 4_900, 4, 5_100);
         assert!(rules::in_discarded_recovery_band(
             &state, SHARD, &orphan, &orphan_qc
         ));

@@ -1,5 +1,6 @@
 //! A bound peer as the limits on its traffic see it.
 
+use hyperscale_network::{PeerId, Provenance};
 use hyperscale_types::ValidatorId;
 use iroh::EndpointId;
 
@@ -14,4 +15,12 @@ use iroh::EndpointId;
 pub struct Peer {
     pub endpoint: EndpointId,
     pub principal: ValidatorId,
+}
+
+impl Peer {
+    /// What the peer hands a handler: kept by its principal, as its
+    /// budget is.
+    pub const fn provenance(self) -> Provenance {
+        Provenance::Peer(PeerId::new(self.principal.inner()))
+    }
 }

@@ -26,15 +26,15 @@ use hyperscale_effects_bridge::{
     RecordStore, admit_package, declared_vector, envelope_bytes, is_protocol_vault,
     witness_from_event,
 };
-use hyperscale_metrics::record_transaction_executed;
-use hyperscale_storage::entry_from_leaf;
+use hyperscale_metrics::{record_provision_range_entries_consumed, record_transaction_executed};
+use hyperscale_storage::{Anchored, TickViewSnapshot, entry_from_leaf};
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
-    EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
+    BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, Epoch, EscrowedValue,
+    Event, EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash,
     MAX_STAGED_RECEIPT_BYTES, MAX_TICK_STAGED_BYTES, Movement, PriceTable, PrincipalAddr,
-    ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry, Transaction,
-    TxHash, Verified, WeightedTimestamp, compute_merkle_root, install_protocol_statics,
-    staged_yes_bytes, whole_work, witness_root, writes_root,
+    ProvisionalHolds, Role, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
+    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    install_protocol_statics, staged_yes_bytes, whole_work, witness_root, writes_root,
 };
 use hyperscale_vm_effects::{
     Admitted, Answered, ChainRecords, Composed, CrossingId, Declaration, DeclaredAccess,
@@ -42,18 +42,19 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_kernel::{
     AmountLedger, Baseline, BatchError, BatchTx, EnvInputs, ExecutionMode, FeeBurn, FeeHolds, Job,
-    LegPlan, ManifestWalk, OverlayStore, OwnerSet, Receipt, StoreError, Substates, WithheldCredits,
-    execute_batch,
+    LegPlan, ManifestWalk, MemoryStore, OverlayStore, OwnerSet, Receipt, ServedReads, StoreError,
+    Substates, WithheldCredits, execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
-    EntryKey, Mode, Moves, Outcome, ResourceAddr, SubstateKey, UnmetCondition,
+    EntryKey, Mode, Moves, Outcome, ResourceAddr, SeedWindow, SubstateKey, UnmetCondition,
+    range_lift,
 };
 
 use crate::backend::{Availability, EngineBackend};
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
 use crate::legs::{Member, never_answer};
-use crate::records::BatchRecords;
+use crate::records::MemberRecords;
 use crate::sharding::owned_by;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
 
@@ -119,19 +120,42 @@ pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
     *blake3_hash(data).as_bytes()
 }
 
-/// The environment a member executes under: its own clock, the epoch
-/// that clock falls in, and the seeds a seal written in that epoch can
-/// later be opened against.
+/// The environment a member executes under: its transaction clock, the
+/// epoch that clock falls in, and the seeds a draw clocked there reads.
 ///
-/// Every input is a fact about the transaction or about the beacon, and
-/// none is a fact about the block executing it — which is what lets the
-/// shards of a cross-shard transaction derive one receipt, and what
-/// leaves nothing for an attempt to grind.
-fn env_at(ctx: &TickBatchContext<'_>, clock: WeightedTimestamp) -> EnvInputs {
+/// All three are facts about the transaction: every shard running the
+/// same body passes one clock, the epoch is the grid's answer for it,
+/// and the seed window is a function of that epoch alone, so two shards
+/// running one core in ticks under different windows pass one window.
+///
+/// Each epoch's window is built once into `drawn` and shared by every
+/// member clocked in it.
+///
+/// # Panics
+///
+/// Where the tick's ring lacks a seed of the member's window. A tick
+/// dispatches only once it holds every member's, so this is a dispatch
+/// that skipped the wait; answering it anyway would be a draw this node
+/// alone answers.
+fn env_at(
+    ctx: &TickBatchContext<'_>,
+    drawn: &mut BTreeMap<Epoch, SeedWindow>,
+    clock: WeightedTimestamp,
+) -> EnvInputs {
+    let epoch = ctx.env.windows.epoch_for(clock);
+    let seeds = drawn
+        .entry(epoch)
+        .or_insert_with(|| {
+            ctx.env
+                .seeds
+                .window_for(epoch)
+                .expect("a tick dispatches once its ring holds every member's seed window")
+        })
+        .clone();
     EnvInputs {
         clock_ms: clock.as_millis(),
-        epoch: ctx.env.windows.epoch_for(clock).inner(),
-        seeds: ctx.env.seeds.clone(),
+        epoch: epoch.inner(),
+        seeds,
     }
 }
 
@@ -159,6 +183,36 @@ pub struct TickBaseline {
     /// reach, its own members named apart. Empty for a baseline with
     /// nothing committed over it — a preview.
     pub(crate) fee_holds: BTreeMap<SubstateKey, FeeHolds>,
+    /// The owners whose entry points fall through, and the reader that
+    /// answers one no pre-read named, at the version the pre-read read.
+    /// The owners are the ones the trie routes to the executing shard,
+    /// the same rule [`materialize_declared`]'s locality and the fee
+    /// paths apply. `None` answers every point from the map alone.
+    pub(crate) points: Option<(OwnerSet, Arc<dyn PointReads>)>,
+}
+
+/// Point reads of ordered-collection entries at a baseline's version.
+///
+/// What a take or a filing probes at an order no declaration's pre-read
+/// could know, since a filing can follow a mint whose ids the issuer
+/// chose. Ranges never reach this: they are the pre-read's.
+pub trait PointReads: Send + Sync + std::fmt::Debug {
+    /// The entry at `order`, if any.
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>>;
+}
+
+/// The owners `trie` routes to `shard`: a batch's share of the world
+/// when it reaches beyond its shard, and the owners whose points fall
+/// through to its reader.
+pub fn routed_to(trie: &ShardTrie, shard: ShardId) -> OwnerSet {
+    let trie = trie.clone();
+    OwnerSet::of(move |owner: Address| trie.shard_for_prefix(owner) == shard)
+}
+
+impl<Snap: Anchored + 'static> PointReads for TickViewSnapshot<Snap> {
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        Substates::entry(self, owner, collection, order)
+    }
 }
 
 impl Substates for TickBaseline {
@@ -193,6 +247,27 @@ impl Substates for TickBaseline {
             .map(|(key, value)| (key.order, value.clone()))
             .collect()
     }
+
+    /// The map, then the point reader for an owner the trie routes here.
+    /// Any other owner's entry answers from the map alone: read out of
+    /// this store it would differ between replicas, which hold nothing of
+    /// another shard's subtree in common, and the pre-read named none of
+    /// it either.
+    fn entry(&self, owner: Address, collection: CollectionId, order: u128) -> Option<Vec<u8>> {
+        let key = EntryKey {
+            owner,
+            collection,
+            order,
+        };
+        if let Some(value) = self.entries.get(&key) {
+            return Some(value.clone());
+        }
+        let (routed, points) = self.points.as_ref()?;
+        if !routed.covers(owner) {
+            return None;
+        }
+        points.entry(owner, collection, order)
+    }
 }
 
 impl Baseline for TickBaseline {
@@ -211,7 +286,9 @@ impl Baseline for TickBaseline {
 
 /// Materialize one declaration's baseline from the tick snapshot: for
 /// every declared effect this shard owns, the committed content it
-/// reads — the point cell, or the entries of the collection interval.
+/// reads — the point cell, or the interval's [`range_lift`] lowest
+/// entries, which is what the kernel's page lifts and what a provision
+/// part serves of the same interval.
 ///
 /// The one pre-read: `run_batch` and `preview` both fill their baselines
 /// here, so ordered-collection support exists in exactly one place and
@@ -251,7 +328,8 @@ pub fn materialize_declared(
             } => (owner, collection, lo, hi, cap),
         };
         if locality.covers(owner) {
-            for (order, value) in snapshot.entries_in_range(owner, collection, lo, hi, cap as usize)
+            for (order, value) in
+                snapshot.entries_in_range(owner, collection, lo, hi, range_lift(lo, hi, cap))
             {
                 base.entries.insert(
                     EntryKey {
@@ -264,6 +342,37 @@ pub fn materialize_declared(
             }
         }
     }
+}
+
+/// What one member's counterparts provisioned it, as the content its
+/// session reads beneath the batch's baseline.
+///
+/// A provisioned leaf is a cell or an ordered-collection entry, and the
+/// leaf says which: an entry re-derives its own key and lands where the
+/// kernel's range capabilities read. An absent leaf adds nothing.
+/// Returns the reads and how many of them are entries.
+fn provisioned_reads(lists: &[Arc<Vec<SubstateEntry>>]) -> (MemoryStore, usize) {
+    let mut reads = MemoryStore::new();
+    let entries = lists.iter().map(|list| absorb_part(&mut reads, list)).sum();
+    (reads, entries)
+}
+
+/// Write `part` into `reads`, and how many of its leaves were collection
+/// entries. An absent cell writes nothing: it reads absent.
+fn absorb_part(reads: &mut MemoryStore, part: &[SubstateEntry]) -> usize {
+    let mut entries = 0;
+    for entry in part {
+        let Some(value) = entry.value.as_ref() else {
+            continue;
+        };
+        if let Some((key, value)) = entry_from_leaf(entry.key, value) {
+            reads.entry_write(key.owner, key.collection, key.order, value);
+            entries += 1;
+        } else {
+            reads.write(entry.key, value.clone().into_inner());
+        }
+    }
+    entries
 }
 
 /// The VM engine: the genesis-static world, the compiled stdlib guests,
@@ -559,14 +668,14 @@ impl Executor {
     /// Deterministically only as far as `chain` is: a refusal is this
     /// member's contribution to a receipt root, so what answers a target
     /// on the commit path has to answer the same on every member. That
-    /// is [`BatchRecords`], which reads the block and committed state
+    /// is [`MemberRecords`], which reads the block and committed state
     /// and nothing a node accumulated on its own.
     ///
     /// Nothing of the engine enters it, which is the same statement from
     /// the other side: what an envelope declares is a function of the
     /// envelope and the records, and of no node running it.
     ///
-    /// [`BatchRecords`]: crate::records::BatchRecords
+    /// [`MemberRecords`]: crate::records::MemberRecords
     pub(crate) fn prepare(
         tx: &Transaction,
         chain: &dyn ChainRecords,
@@ -580,7 +689,7 @@ impl Executor {
     /// crossing cells declared.
     fn prepare_shape(
         tx: &Transaction,
-        records: &BatchRecords,
+        records: &MemberRecords,
         packages: &PackageCache,
         member: &Member,
         arrivals: &[EscrowedValue],
@@ -1248,27 +1357,90 @@ fn declare(
 
 /// What every transaction in a batch assembles against: the pre-read
 /// baseline its receipts fold over, the share of the world this shard
-/// applies, and what the witness lift needs to decide whether an emitted
-/// event is a beacon fact — what code each instance runs and how it is
-/// configured, and the code a pool must be running.
+/// applies, and the code a pool must be running, which the witness lift
+/// asks to decide whether an emitted event is a beacon fact.
 #[derive(Clone, Copy)]
 struct BatchInputs<'a> {
     base: &'a TickBaseline,
     locality: &'a OwnerSet,
-    instances: &'a dyn ChainRecords,
     staking_package: PackageHash,
 }
 
 /// What one member assembles from: the receipt the kernel ran it to, its
-/// payer and the charge set apart for it, the input its block froze, and
-/// the instance records its envelope carries.
+/// payer and the charge set apart for it, the input its block froze, what
+/// its own counterparts provisioned it, and the instance records it
+/// resolves through — its batch's and the ones its envelope carries.
 #[derive(Clone, Copy)]
 struct MemberInputs<'a> {
     vm_tx: TxHash,
     receipt: &'a Receipt,
     fee: Option<(PayerFee, u128)>,
     input: Option<&'a TickTxInput<'a>>,
+    own_reads: Option<&'a MemberReads>,
+    instances: &'a dyn ChainRecords,
     presented: &'a [InstanceMeta],
+}
+
+/// What one member reads that no batch-mate does: what it was provisioned
+/// and the part its own shard serves it, and the keys of that part, which
+/// it reads from there and nowhere else.
+#[derive(Debug)]
+struct MemberReads {
+    store: Arc<MemoryStore>,
+    served: Arc<ServedReads>,
+}
+
+/// The committed value `key` holds as one member reads it: the part alone
+/// on a key its own shard serves it, an absence included, and otherwise
+/// the batch's baseline, and beneath it what that member alone was
+/// provisioned.
+fn member_cell(
+    base: &TickBaseline,
+    own_reads: Option<&MemberReads>,
+    key: SubstateKey,
+) -> Option<Vec<u8>> {
+    if let Some(own) = own_reads
+        && own.served.cells.contains(&key)
+    {
+        return own.store.cell(key);
+    }
+    base.cells
+        .get(&key)
+        .cloned()
+        .or_else(|| own_reads.and_then(|own| own.store.cell(key)))
+}
+
+/// What a member that ran is charged, and the charge its refusal receipt
+/// settles apart where it settles one.
+///
+/// A completed run burned its price in the kernel, judged against the
+/// vault with its own hold ended, so the figure is the price and a charge
+/// built beside it for an abort is judged too. Every other outcome
+/// settles the figure carried beside the payer: what the charge pass
+/// found the floor to leave of the price once the member's hold ended.
+fn member_charge(
+    fee: Option<(PayerFee, u128)>,
+    outcome: &Outcome,
+) -> (u128, Option<(SubstateKey, Movement)>) {
+    let completed = matches!(outcome, Outcome::Completed { .. });
+    let charged = fee.map_or(
+        0,
+        |(payer, apart)| {
+            if completed { payer.burned() } else { apart }
+        },
+    );
+    let charge = fee
+        .map(|(payer, _)| payer)
+        .filter(|payer| settled_apart(outcome, *payer))
+        .map(|payer| {
+            let charge = if completed {
+                Movement::debit(*PROTOCOL_RESOURCE, charged)
+            } else {
+                Movement::unjudged(*PROTOCOL_RESOURCE, charged)
+            };
+            (payer.vault, charge)
+        });
+    (charged, charge)
 }
 
 fn assemble_executed_tx(
@@ -1278,39 +1450,18 @@ fn assemble_executed_tx(
     member_inputs: MemberInputs<'_>,
 ) -> ExecutedTx {
     let MemberInputs {
-        vm_tx,
+        vm_tx: tx_hash,
         receipt,
         fee,
         input,
+        own_reads,
+        instances,
         presented,
     } = member_inputs;
     let member = input.map(|input| &input.member);
     let BatchInputs { base, locality, .. } = inputs;
-    let tx_hash = vm_tx;
     let completed = matches!(receipt.outcome, Outcome::Completed { .. });
-    // A completed run burned its price in the kernel, judged against the
-    // vault with its own hold ended, so the figure is the price and a
-    // charge built beside it for an abort is judged too. Every other
-    // outcome settles the figure carried beside the payer: what the
-    // charge pass found the floor to leave of the price once the
-    // member's hold ended.
-    let charged = fee.map_or(
-        0,
-        |(payer, apart)| {
-            if completed { payer.burned() } else { apart }
-        },
-    );
-    let charge = fee
-        .map(|(payer, _)| payer)
-        .filter(|payer| settled_apart(&receipt.outcome, *payer))
-        .map(|payer| {
-            let charge = if completed {
-                Movement::debit(*PROTOCOL_RESOURCE, charged)
-            } else {
-                Movement::unjudged(*PROTOCOL_RESOURCE, charged)
-            };
-            (payer.vault, charge)
-        });
+    let (charged, charge) = member_charge(fee, &receipt.outcome);
     // The member's answers where it can still be refused: here, by
     // its own outcome, or later, by a counterpart's verdict. A
     // multi-core consumer that completed here, holds no vault and is
@@ -1321,7 +1472,7 @@ fn assemble_executed_tx(
         never_answers(input, tx_hash, ctx.local_shard, locality, |key| {
             fold.running
                 .get(&key)
-                .map_or_else(|| base.cells.get(&key).cloned(), Clone::clone)
+                .map_or_else(|| member_cell(base, own_reads, key), Clone::clone)
         })
     };
     let refusal_receipt =
@@ -1372,7 +1523,7 @@ fn assemble_executed_tx(
         // derive: every participant holds the same envelope, so a pool
         // this transaction seals speaks here and is read alike
         // everywhere.
-        let records = Composed::new(inputs.instances, presented, &ProtocolHasher);
+        let records = Composed::new(instances, presented, &ProtocolHasher);
         let witnesses: Vec<(Address, BeaconWitnessEvent)> = events
             .iter()
             .filter_map(|event| {
@@ -1469,7 +1620,7 @@ fn cap_staged_yes(folded: &mut BTreeMap<TxHash, ExecutedTx>, abortable: impl Fn(
 /// body it runs over.
 struct BatchMember {
     tx_hash: TxHash,
-    body: Arc<Verified<Transaction>>,
+    body: Verified<Transaction>,
     /// The table this member's committing block anchored to: what its
     /// fee is weighed at, carried per member because that is the grain
     /// the anchor has.
@@ -1496,18 +1647,42 @@ impl Executor {
             .iter()
             .map(|i| BatchMember {
                 tx_hash: i.tx_hash,
-                body: Arc::clone(i.transaction),
+                body: i.transaction.clone(),
                 prices: i.prices,
             })
             .collect();
-        let provisions_by_tx: BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = inputs
+        // What each member reads beneath the batch's baseline: its own
+        // provisions and no batch-mate's. Two members can hold one remote
+        // cell at different heights of its source, and the shards running
+        // a transaction batch it with different neighbours, so a value
+        // read off a neighbour's list would split its receipt. The part
+        // its own shard serves it sits there too, and reads over the
+        // baseline, so a key absent from that part reads absent here as
+        // it does on every counterpart, provisions or none.
+        let own_reads: BTreeMap<TxHash, MemberReads> = inputs
             .iter()
-            .filter(|i| !i.provisions.is_empty())
-            .map(|i| (i.tx_hash, i.provisions.to_vec()))
+            .filter(|i| !i.provisions.is_empty() || i.served_part.is_some())
+            .map(|i| {
+                let (mut reads, entries) = provisioned_reads(i.provisions);
+                if entries > 0 && i.member.role() == Role::Core {
+                    record_provision_range_entries_consumed(ctx.local_shard.inner(), entries);
+                }
+                if let Some(part) = i.served_part {
+                    absorb_part(&mut reads, &part.entries);
+                }
+                let reads = MemberReads {
+                    store: Arc::new(reads),
+                    served: i
+                        .served_part
+                        .map_or_else(Arc::default, |part| Arc::clone(&part.served)),
+                };
+                (i.tx_hash, reads)
+            })
             .collect();
+        let mut drawn = BTreeMap::new();
         let env_by_tx: BTreeMap<TxHash, EnvInputs> = inputs
             .iter()
-            .map(|i| (i.tx_hash, env_at(ctx, i.clock)))
+            .map(|i| (i.tx_hash, env_at(ctx, &mut drawn, i.clock)))
             .collect();
         let shapes: BTreeMap<TxHash, &TickTxInput<'_>> =
             inputs.iter().map(|i| (i.tx_hash, i)).collect();
@@ -1518,9 +1693,7 @@ impl Executor {
         let locality = if inputs.iter().all(|i| !i.member.reaches_beyond()) {
             OwnerSet::whole()
         } else {
-            let trie = ctx.shard_trie.clone();
-            let local_shard = ctx.local_shard;
-            OwnerSet::of(move |owner: Address| trie.shard_for_prefix(owner) == local_shard)
+            routed_to(ctx.shard_trie, ctx.local_shard)
         };
         // Publishes carry no manifest, so they never reach the kernel;
         // they settle in their own pass below.
@@ -1533,17 +1706,27 @@ impl Executor {
             })
             .collect();
 
-        // What this batch resolves its targets through: genesis, this
-        // shard's committed leaves, and the ones its counterparts
-        // provisioned. Every member of the shard builds the same three
-        // from the same block, which is what makes a refusal below a
-        // property of the transaction rather than of the node.
-        let records = BatchRecords::new(
-            self.world.cache.load(),
-            self.world.instances.seeded(),
-            &provisions_by_tx,
-            snapshot,
-        );
+        // What each member resolves its targets through: genesis, this
+        // shard's committed leaves, and the ones its own counterparts
+        // provisioned it. Every replica of the shard builds the same
+        // three for a member from the same block, and every shard running
+        // the transaction reads the same provisioned leaves whatever its
+        // batch-mates, which is what makes a refusal below a property of
+        // the transaction rather than of the node or of its neighbours.
+        let packages = self.world.cache.load();
+        let seeded = self.world.instances.seeded();
+        let records: BTreeMap<TxHash, MemberRecords<'_>> = inputs
+            .iter()
+            .map(|input| {
+                let records = MemberRecords::new(
+                    Arc::clone(&packages),
+                    Arc::clone(&seeded),
+                    input.provisions,
+                    snapshot,
+                );
+                (input.tx_hash, records)
+            })
+            .collect();
 
         // Derive every transaction; refusals become deterministic
         // failures without touching the batch.
@@ -1554,6 +1737,9 @@ impl Executor {
             if publishes.contains_key(&vm_tx) {
                 continue;
             }
+            let records = records
+                .get(&vm_tx)
+                .expect("every input resolves through its own records");
             // What this shard runs of the member: the whole shape unless
             // the coordinator froze a division, and then the legs its
             // placement gives it. A plan that cannot be built is a
@@ -1561,7 +1747,7 @@ impl Executor {
             // every replica reads the same legs and the same arrivals.
             let planned = Self::prepare_shape(
                 input.transaction,
-                &records,
+                records,
                 &self.world.cache,
                 &input.member,
                 input.arrivals,
@@ -1578,29 +1764,18 @@ impl Executor {
             }
         }
 
-        // The committed baseline: provisioned remote cells first — a
-        // key's owner prefix routes it to exactly one source, so nothing
-        // arbitrates — then the locally owned declared content from the
-        // tick snapshot.
-        let mut base = TickBaseline::default();
-        for lists in provisions_by_tx.values() {
-            for entries in lists {
-                for entry in entries.iter() {
-                    if let Some(value) = entry.value.as_ref() {
-                        // A provisioned leaf is a cell or an
-                        // ordered-collection entry, and the leaf says
-                        // which: an entry re-derives its own key, and
-                        // lands in the interval map the kernel's range
-                        // capabilities read.
-                        if let Some((entry_key, entry_value)) = entry_from_leaf(entry.key, value) {
-                            base.entries.insert(entry_key, entry_value);
-                        } else {
-                            base.cells.insert(entry.key, value.clone().into_inner());
-                        }
-                    }
-                }
-            }
-        }
+        // The committed baseline every member shares: the locally owned
+        // declared content from the tick snapshot. Provisioned content is
+        // each member's own, beneath it.
+        let mut base = TickBaseline {
+            points: ctx.points.as_ref().map(|points| {
+                (
+                    routed_to(ctx.shard_trie, ctx.local_shard),
+                    Arc::clone(points),
+                )
+            }),
+            ..TickBaseline::default()
+        };
         for entry in prepared.values() {
             materialize_declared(snapshot, &entry.declaration.set, &locality, &mut base);
         }
@@ -1732,7 +1907,7 @@ impl Executor {
                     .get(vm_tx)
                     .cloned()
                     .expect("every prepared transaction has an environment");
-                batch_entry(
+                let batched = batch_entry(
                     *vm_tx,
                     entry,
                     env,
@@ -1748,7 +1923,13 @@ impl Executor {
                     shapes
                         .get(vm_tx)
                         .is_none_or(|input| input.member.abortable()),
-                )
+                );
+                match own_reads.get(vm_tx) {
+                    Some(own) => {
+                        batched.with_served_reads(Arc::clone(&own.store), Arc::clone(&own.served))
+                    }
+                    None => batched,
+                }
             })
             .collect();
         let walk = ManifestWalk {
@@ -1819,7 +2000,6 @@ impl Executor {
                 BatchInputs {
                     base: &base,
                     locality: &locality,
-                    instances: &records,
                     staking_package: self.world.staking_package,
                 },
                 &mut fold,
@@ -1828,6 +2008,10 @@ impl Executor {
                     receipt,
                     fee: fee_by_tx.get(vm_tx).map(|payer| (*payer, apart(vm_tx))),
                     input: shapes.get(vm_tx).copied(),
+                    own_reads: own_reads.get(vm_tx),
+                    instances: records
+                        .get(vm_tx)
+                        .expect("every receipt is an input's, which resolves through its own"),
                     presented: prepared
                         .get(vm_tx)
                         .map_or(&[][..], |entry| &entry.presented),
@@ -1927,12 +2111,13 @@ impl Executor {
                     // Refused before any of it ran, so nothing of this
                     // batch wrote its answers: the tick's baseline is
                     // what says whether one already stands.
+                    let own = own_reads.get(&vm_tx);
                     let nevers = never_answers(
                         shapes.get(&vm_tx).copied(),
                         vm_tx,
                         ctx.local_shard,
                         &locality,
-                        |key| base.cells.get(&key).cloned(),
+                        |key| member_cell(&base, own, key),
                     );
                     executed.refusal_receipt = build_refusal_receipt(
                         ctx.local_shard,
@@ -1975,7 +2160,7 @@ impl Executor {
         ctx: &TickBatchContext<'_>,
         prices: PriceTable,
         snapshot: &(dyn Substates + Sync),
-        transactions: &[Arc<Verified<Transaction>>],
+        transactions: &[Verified<Transaction>],
     ) -> Result<Vec<ExecutedTx>, CodeUnavailable> {
         // Every member runs whole on its own shard and reads the
         // context's own clock: one block committed them all, so one
@@ -1990,6 +2175,7 @@ impl Executor {
                 prices,
                 member: Member::whole(ctx.local_shard),
                 arrivals: &[],
+                served_part: None,
             })
             .collect();
         self.run_batch(ctx, snapshot, &inputs)
@@ -2020,10 +2206,44 @@ impl Executor {
 mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{AddressClass, ExecutionOutcome, GlobalReceiptHash, LocalKey, Presence};
+    use hyperscale_vm_kernel::{KernelHost, KernelSession};
     use hyperscale_vm_types::{AbortReason, encode_amount};
 
     use super::*;
     use crate::genesis::vault_key;
+
+    /// A served key answers from the part alone, an absence included,
+    /// over a baseline that holds it. Any other key reads the baseline,
+    /// and the member's own reads only beneath it.
+    #[test]
+    fn member_cell_reads_a_served_key_from_the_part() {
+        let cell = |seed: u8| SubstateKey {
+            owner: Address::new([seed; 31], AddressClass::Component),
+            local: LocalKey([seed; 16]),
+        };
+        let (served, absent, plain, own_only) = (cell(1), cell(2), cell(3), cell(4));
+        let mut base = TickBaseline::default();
+        for key in [served, absent, plain] {
+            base.cells.insert(key, b"view".to_vec());
+        }
+        let mut store = MemoryStore::new();
+        store.write(served, b"part".to_vec());
+        store.write(plain, b"part".to_vec());
+        store.write(own_only, b"part".to_vec());
+        let own = MemberReads {
+            store: Arc::new(store),
+            served: Arc::new(ServedReads {
+                cells: [served, absent].into_iter().collect(),
+                ranges: Vec::new(),
+            }),
+        };
+        let read = |key| member_cell(&base, Some(&own), key);
+        assert_eq!(read(served), Some(b"part".to_vec()));
+        assert_eq!(read(absent), None, "the part proved it absent");
+        assert_eq!(read(plain), Some(b"view".to_vec()));
+        assert_eq!(read(own_only), Some(b"part".to_vec()));
+        assert_eq!(member_cell(&base, None, served), Some(b"view".to_vec()));
+    }
 
     /// A success writing one cell `width` bytes wide, beside the refusal
     /// receipt its member settles if refused: its charge out of the
@@ -2332,5 +2552,168 @@ mod tests {
     #[should_panic(expected = "BFT CRITICAL")]
     fn a_charge_on_a_vault_that_is_no_amount_stops_the_batch() {
         let _ = charge_over(b"not an amount".to_vec(), 0);
+    }
+
+    const LADDER_OWNER: Address = Address::new([0x11; 31], AddressClass::Component);
+    const LADDER: CollectionId = CollectionId([4; 16]);
+
+    /// A store holding an entry at each order in `0..count` of the
+    /// ladder.
+    fn ladder_of(count: u8) -> MemoryStore {
+        let mut store = MemoryStore::new();
+        for order in 0..count {
+            store.entry_write(LADDER_OWNER, LADDER, u128::from(order), vec![order]);
+        }
+        store
+    }
+
+    /// The whole ladder at `cap`, in `mode`.
+    fn ladder_at(cap: u32, mode: Mode) -> Effect {
+        Effect {
+            target: EffectTarget::Range {
+                owner: LADDER_OWNER,
+                collection: LADDER,
+                lo: 0,
+                hi: u128::MAX,
+                cap,
+            },
+            mode,
+        }
+    }
+
+    fn declared_of(effects: &[Effect]) -> EffectSet {
+        let mut set = EffectSet::new();
+        for effect in effects {
+            set.insert_at_cap(*effect)
+                .expect("the fixture's accesses fold");
+        }
+        set
+    }
+
+    /// The orders of the ladder a baseline holds.
+    fn orders_in(base: &TickBaseline) -> Vec<u128> {
+        base.entries.keys().map(|key| key.order).collect()
+    }
+
+    /// A declared range lifts one past its cap: the successor a page's
+    /// coverage turns on.
+    #[test]
+    fn a_declared_range_materializes_its_successor() {
+        let mut base = TickBaseline::default();
+        materialize_declared(
+            &ladder_of(6),
+            &declared_of(&[ladder_at(3, Mode::Read)]),
+            &OwnerSet::whole(),
+            &mut base,
+        );
+        assert_eq!(orders_in(&base), vec![0, 1, 2, 3]);
+    }
+
+    /// The source's baseline holds whatever a batch-mate's wider read
+    /// materializes beside a member's own interval, and a counterpart's
+    /// holds the member's part alone. A page that removes what it shows
+    /// counts and covers alike over both, because both answer its lift.
+    #[test]
+    fn a_full_page_answers_coverage_alike_on_both_shards() {
+        let store = ladder_of(10);
+        let member = ladder_at(4, Mode::Write { moves: Moves::Both });
+        let mut source = TickBaseline::default();
+        materialize_declared(
+            &store,
+            &declared_of(&[member, ladder_at(8, Mode::Read)]),
+            &OwnerSet::whole(),
+            &mut source,
+        );
+        let mut counterpart = TickBaseline::default();
+        materialize_declared(
+            &store,
+            &declared_of(&[member]),
+            &OwnerSet::whole(),
+            &mut counterpart,
+        );
+        assert_eq!(orders_in(&source).len(), 9, "the batch-mate's read");
+        assert_eq!(orders_in(&counterpart), vec![0, 1, 2, 3, 4], "the part");
+
+        let walk = |base: TickBaseline| {
+            let mut session = KernelSession::materialize(
+                OverlayStore::new(Arc::new(base)),
+                &Declaration::from_set(declared_of(&[member])),
+                TxHash::from(Hash::from_bytes(b"walker")),
+                EnvInputs::unsealed(0),
+                protocol_hash,
+            )
+            .expect("one write interval materializes");
+            let mut answers = Vec::new();
+            for _ in 0..4 {
+                answers.push((
+                    session.range_count(0, 0).unwrap(),
+                    KernelHost::site_covered(&mut session, 0, 0).unwrap(),
+                ));
+                session.range_remove(0, 0, 0).unwrap();
+            }
+            answers.push((
+                session.range_count(0, 0).unwrap(),
+                KernelHost::site_covered(&mut session, 0, 0).unwrap(),
+            ));
+            answers
+        };
+        let on_source = walk(source);
+        assert_eq!(on_source, walk(counterpart));
+        assert_eq!(
+            on_source,
+            vec![(4, false), (3, false), (2, false), (1, false), (0, false)]
+        );
+    }
+
+    /// A reader answering every point it is asked.
+    #[derive(Debug)]
+    struct Everywhere;
+
+    impl PointReads for Everywhere {
+        fn entry(&self, _: Address, _: CollectionId, _: u128) -> Option<Vec<u8>> {
+            Some(vec![7])
+        }
+    }
+
+    /// A baseline executing on `shard` under `trie`, its points read by
+    /// [`Everywhere`].
+    fn probing(trie: &ShardTrie, shard: ShardId) -> TickBaseline {
+        TickBaseline {
+            points: Some((routed_to(trie, shard), Arc::new(Everywhere))),
+            ..TickBaseline::default()
+        }
+    }
+
+    /// A point the map lacks falls through to the reader for an owner
+    /// the trie routes to this shard, and never for one it routes away:
+    /// another shard's cell read out of this store would differ between
+    /// replicas.
+    #[test]
+    fn a_point_of_another_shards_owner_never_falls_through() {
+        let trie = ShardTrie::uniform_from_count(2);
+        let ours = Address::new([0x00; 31], AddressClass::Component);
+        let theirs = Address::new([0xFF; 31], AddressClass::Component);
+        let shard = trie.shard_for_prefix(ours);
+        assert_ne!(trie.shard_for_prefix(theirs), shard);
+        let base = probing(&trie, shard);
+        assert_eq!(base.entry(ours, LADDER, 5), Some(vec![7]));
+        assert_eq!(base.entry(theirs, LADDER, 5), None);
+        // And a baseline with no reader answers from its map alone.
+        assert_eq!(TickBaseline::default().entry(ours, LADDER, 5), None);
+    }
+
+    /// A shard the trie has split, as a straddling parent executing after
+    /// its split is, routes no owner to itself, so no point falls through:
+    /// the gate is the pre-read's locality, which names none of its old
+    /// subtree either, not the prefix the parent once owned.
+    #[test]
+    fn a_point_on_a_shard_no_longer_a_leaf_never_falls_through() {
+        let trie = ShardTrie::uniform_from_count(2);
+        let base = probing(&trie, ShardId::ROOT);
+        for owner in [[0x00; 31], [0xFF; 31]] {
+            let owner = Address::new(owner, AddressClass::Component);
+            assert!(ShardTrie::shard_owns_prefix(ShardId::ROOT, owner));
+            assert_eq!(base.entry(owner, LADDER, 5), None);
+        }
     }
 }

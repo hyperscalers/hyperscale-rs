@@ -168,7 +168,7 @@ impl RocksDbShardStorage {
                 batch,
                 transactions_cf,
                 &Hash::from(tx.hash()),
-                tx.as_ref(),
+                tx,
                 Some(tx.cached_wire_bytes()),
             );
         }
@@ -237,7 +237,7 @@ impl RocksDbShardStorage {
                 batch,
                 transactions_cf,
                 &Hash::from(tx.hash()),
-                tx.as_ref(),
+                tx,
                 Some(tx.cached_wire_bytes()),
             );
         }

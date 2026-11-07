@@ -17,18 +17,26 @@
 
 pub mod action_handlers;
 mod build;
+mod content;
 mod coordinator;
 mod crossing_push;
 mod expected;
 mod outbound;
 mod pipeline;
 mod queue;
+mod requests;
 mod store;
+#[cfg(test)]
+mod test_fixtures;
 mod verification;
 mod verified_headers;
 
+#[cfg(feature = "test-utils")]
 pub use build::build_provisions;
+pub use build::{Owed, OwnPart, build_part, own_served_entries};
+pub use content::{Unrouted, leaves_over_requests, provision_tx_roots, served_keys, served_leaf};
 pub use coordinator::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 pub use outbound::{OutboundMemoryStats, OutboundProvisionTracker};
+pub use requests::{block_requests, provision_request};
 pub use store::ProvisionStore;
 pub use verified_headers::VerifiedHeaderBuffer;

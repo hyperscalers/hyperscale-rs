@@ -51,7 +51,7 @@ impl NetworkMessage for BlockVoteNotification {
 mod tests {
     use super::*;
     use crate::{
-        BlockHash, BlockHeight, ConsensusSignature, Hash, ProposerTimestamp, Round, ShardId,
+        BlockHash, BlockHeight, ConsensusSignature, Epoch, Hash, ProposerTimestamp, Round, ShardId,
         ValidatorId,
     };
 
@@ -62,6 +62,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(10),
             Round::INITIAL,
+            Epoch::GENESIS,
             ValidatorId::new(2),
             ConsensusSignature::ZERO,
             ProposerTimestamp::from_millis(1_000_000_000_000),
@@ -78,6 +79,7 @@ mod tests {
             ShardId::ROOT,
             BlockHeight::new(5),
             Round::INITIAL,
+            Epoch::GENESIS,
             ValidatorId::new(1),
             ConsensusSignature::ZERO,
             ProposerTimestamp::from_millis(1_000_000_000_000),

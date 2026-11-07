@@ -299,6 +299,14 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("transactions_executed", None, 1);
     }
 
+    fn record_provision_range_entries_consumed(&self, shard: u64, count: usize) {
+        self.inc(
+            "provision_range_entries_consumed",
+            Some(&shard.to_string()),
+            count as u64,
+        );
+    }
+
     fn set_block_height(&self, shard: u64, height: u64) {
         self.set("block_height", Some(&shard.to_string()), height as f64);
     }
@@ -397,6 +405,10 @@ impl MetricsRecorder for MemoryRecorder {
 
     fn record_hold_inversions_proven(&self, victims: usize) {
         self.inc("hold_inversions_proven", None, victims as u64);
+    }
+
+    fn record_heads_windowed(&self, heads: usize) {
+        self.inc("heads_windowed", None, heads as u64);
     }
 
     fn record_terminal_fated_hearing_rows(&self, rows: usize) {
@@ -522,6 +534,16 @@ impl MetricsRecorder for MemoryRecorder {
         self.observe("wanted_records", None, count as f64);
     }
 
+    fn record_record_push_span(&self, millis: u64) {
+        self.observe("record_push_span", None, millis as f64);
+    }
+
+    fn set_record_push_grace(&self, holder: u64, millis: u64) {
+        let holder = holder.to_string();
+        self.set("record_push_grace", Some(&holder), millis as f64);
+        self.observe("record_push_grace", None, millis as f64);
+    }
+
     fn record_fenced_claim(&self, reading: &str, carried: bool) {
         let name = if carried {
             "fenced_claims_carried"
@@ -533,6 +555,20 @@ impl MetricsRecorder for MemoryRecorder {
 
     fn record_eager_proposal(&self, reason: &str) {
         self.inc("eager_proposals", Some(reason), 1);
+    }
+
+    fn record_network_input_refused(&self, shard: u64, kind: &str) {
+        self.inc("network_inputs_refused", None, 1);
+        self.inc(
+            "network_inputs_refused",
+            Some(&format!("{shard}:{kind}")),
+            1,
+        );
+    }
+
+    fn record_network_input_over_share(&self, shard: u64) {
+        self.inc("network_inputs_over_share", None, 1);
+        self.inc("network_inputs_over_share", Some(&shard.to_string()), 1);
     }
 
     fn record_crossing_push_dropped(&self, reason: &str) {

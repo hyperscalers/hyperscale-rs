@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     AggregateSignature, BlockHash, BlockHeight, BlockVote, BlockVoteMessage, ChainOrigin,
-    ConsensusPublicKey, NetworkDefinition, Round, ShardId, SignerBitfield, Verified, Verify,
+    ConsensusPublicKey, Epoch, NetworkDefinition, Round, ShardId, SignerBitfield, Verified, Verify,
     VoteCount, WeightedTimestamp, signed_bytes,
 };
 
@@ -24,6 +24,7 @@ pub struct QuorumCertificate {
     height: BlockHeight,
     parent_block_hash: BlockHash,
     round: Round,
+    committee_epoch: Epoch,
     signers: SignerBitfield,
     aggregated_signature: AggregateSignature,
     weighted_timestamp: WeightedTimestamp,
@@ -31,7 +32,7 @@ pub struct QuorumCertificate {
 
 impl QuorumCertificate {
     /// Build a `QuorumCertificate` from its parts.
-    #[allow(clippy::too_many_arguments)] // mirrors the 8 stored fields
+    #[allow(clippy::too_many_arguments)] // mirrors the 9 stored fields
     #[must_use]
     pub const fn new(
         block_hash: BlockHash,
@@ -39,6 +40,7 @@ impl QuorumCertificate {
         height: BlockHeight,
         parent_block_hash: BlockHash,
         round: Round,
+        committee_epoch: Epoch,
         signers: SignerBitfield,
         aggregated_signature: AggregateSignature,
         weighted_timestamp: WeightedTimestamp,
@@ -49,6 +51,7 @@ impl QuorumCertificate {
             height,
             parent_block_hash,
             round,
+            committee_epoch,
             signers,
             aggregated_signature,
             weighted_timestamp,
@@ -71,6 +74,10 @@ impl QuorumCertificate {
     /// [`ChainOrigin::root`]; a child chain created by a shard split
     /// continues the parent's height line and clock instead of resetting
     /// them mid-network-life.
+    ///
+    /// Its committee epoch is [`Epoch::GENESIS`] whatever window the chain
+    /// starts in: a sentinel, since no committee signed it. Nothing
+    /// resolves a committee from a genesis QC.
     #[must_use]
     pub const fn genesis(shard_id: ShardId, origin: ChainOrigin) -> Self {
         Self {
@@ -79,6 +86,7 @@ impl QuorumCertificate {
             height: origin.genesis_height,
             parent_block_hash: BlockHash::ZERO,
             round: Round::INITIAL,
+            committee_epoch: Epoch::GENESIS,
             signers: SignerBitfield::empty(),
             aggregated_signature: AggregateSignature::ZERO,
             weighted_timestamp: origin.anchor_wt,
@@ -115,6 +123,16 @@ impl QuorumCertificate {
         self.round
     }
 
+    /// The epoch keying the window whose committee signed this QC: every
+    /// signer signed it, so it is the quorum's statement and no relay can
+    /// move it. What a reader of the certified block resolves its committee,
+    /// trie and prices from. [`Epoch::GENESIS`] on a genesis QC, which no
+    /// committee signed.
+    #[must_use]
+    pub const fn committee_epoch(&self) -> Epoch {
+        self.committee_epoch
+    }
+
     /// Bitfield indicating which validators signed.
     #[must_use]
     pub const fn signers(&self) -> &SignerBitfield {
@@ -144,6 +162,7 @@ impl QuorumCertificate {
         BlockHeight,
         BlockHash,
         Round,
+        Epoch,
         SignerBitfield,
         AggregateSignature,
         WeightedTimestamp,
@@ -154,6 +173,7 @@ impl QuorumCertificate {
             self.height,
             self.parent_block_hash,
             self.round,
+            self.committee_epoch,
             self.signers,
             self.aggregated_signature,
             self.weighted_timestamp,
@@ -173,6 +193,7 @@ impl QuorumCertificate {
                 round: self.round,
                 block_hash: self.block_hash,
                 parent_block_hash: self.parent_block_hash,
+                committee_epoch: self.committee_epoch,
             },
             network,
         )
@@ -325,7 +346,10 @@ impl Verified<QuorumCertificate> {
     /// caller's quorum pre-check is what makes the typed result honest.
     ///
     /// Returns `None` when the signature aggregation library rejects the
-    /// signature set (empty input or internal validation failure).
+    /// signature set (empty input or internal validation failure), and when
+    /// a vote names another epoch than `committee_epoch`: the QC's message
+    /// carries one epoch, so a vote signed under another would not verify
+    /// inside the aggregate.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // mirrors the QC's signed-over fields
     pub fn from_verified_votes(
@@ -334,10 +358,17 @@ impl Verified<QuorumCertificate> {
         shard_id: ShardId,
         height: BlockHeight,
         round: Round,
+        committee_epoch: Epoch,
         parent_block_hash: BlockHash,
         parent_weighted_timestamp: WeightedTimestamp,
         verified_votes: &[(usize, Verified<BlockVote>)],
     ) -> Option<Self> {
+        if verified_votes
+            .iter()
+            .any(|(_, vote)| vote.committee_epoch() != committee_epoch)
+        {
+            return None;
+        }
         let mut sorted: Vec<_> = verified_votes.to_vec();
         sorted.sort_by_key(|(idx, _)| *idx);
 
@@ -394,6 +425,7 @@ impl Verified<QuorumCertificate> {
             height,
             parent_block_hash,
             round,
+            committee_epoch,
             signers,
             aggregated_signature,
             WeightedTimestamp::from_millis(weighted_timestamp_ms),
@@ -496,6 +528,7 @@ mod tests {
             BlockHeight::new(1),
             parent_block_hash,
             Round::INITIAL,
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1000),
@@ -531,6 +564,7 @@ mod tests {
                 round,
                 block_hash,
                 parent_block_hash: BlockHash::ZERO,
+                committee_epoch: Epoch::new(3),
             },
             &net,
         );
@@ -552,6 +586,7 @@ mod tests {
             height,
             BlockHash::ZERO,
             round,
+            Epoch::new(3),
             signers,
             agg_sig,
             WeightedTimestamp::ZERO,
@@ -614,6 +649,7 @@ mod tests {
                 round: Round::INITIAL,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"other_block")),
                 parent_block_hash: BlockHash::ZERO,
+                committee_epoch: Epoch::new(3),
             },
             &net,
         );
@@ -622,9 +658,10 @@ mod tests {
             .map(|&i| keys[i].sign(&wrong_msg).expect("sign"))
             .collect();
         let bad_agg = BlsVerifier.aggregate(&bad_sigs).unwrap();
-        let (block_hash, shard, height, parent, round, signers, _sig, ts) = qc.clone().into_parts();
+        let (block_hash, shard, height, parent, round, epoch, signers, _sig, ts) =
+            qc.clone().into_parts();
         qc = QuorumCertificate::new(
-            block_hash, shard, height, parent, round, signers, bad_agg, ts,
+            block_hash, shard, height, parent, round, epoch, signers, bad_agg, ts,
         );
 
         let err = qc.verify(&ctx(&net, &pubs, VoteCount::new(3))).unwrap_err();
@@ -649,13 +686,14 @@ mod tests {
             BlockHeight::new(1),
             Round::INITIAL,
         );
-        let (block_hash, shard, height, _parent, round, signers, sig, ts) = qc.into_parts();
+        let (block_hash, shard, height, _parent, round, epoch, signers, sig, ts) = qc.into_parts();
         let forged = QuorumCertificate::new(
             block_hash,
             shard,
             height,
             BlockHash::from_raw(Hash::from_bytes(b"sibling")),
             round,
+            epoch,
             signers,
             sig,
             ts,
@@ -666,6 +704,57 @@ mod tests {
             .verify(&ctx(&net, &pubs, VoteCount::new(3)))
             .unwrap_err();
         assert_eq!(err, QcVerifyError::InvalidSignature);
+    }
+
+    /// The committee epoch is inside the signed message: a relay that
+    /// rewrites it, the way it can rewrite the stamp, breaks the aggregate,
+    /// while a rewritten stamp leaves the epoch the quorum signed.
+    #[test]
+    fn a_rewritten_epoch_fails_and_a_rewritten_stamp_keeps_the_epoch() {
+        let keys: Vec<_> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
+        let qc = signed_qc(
+            &keys,
+            &[0, 1, 2],
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            Round::INITIAL,
+        );
+        let net = NetworkDefinition::simulator();
+        let (block_hash, shard, height, parent, round, epoch, signers, sig, _ts) = qc.into_parts();
+        let restamped = QuorumCertificate::new(
+            block_hash,
+            shard,
+            height,
+            parent,
+            round,
+            epoch,
+            signers.clone(),
+            sig,
+            WeightedTimestamp::from_millis(987_654),
+        );
+        let verified = restamped
+            .verify(&ctx(&net, &pubs, VoteCount::new(3)))
+            .expect("the stamp rides outside the signed message");
+        assert_eq!(verified.committee_epoch(), epoch);
+        let moved = QuorumCertificate::new(
+            block_hash,
+            shard,
+            height,
+            parent,
+            round,
+            epoch.next(),
+            signers,
+            sig,
+            WeightedTimestamp::ZERO,
+        );
+        assert_eq!(
+            moved
+                .verify(&ctx(&net, &pubs, VoteCount::new(3)))
+                .unwrap_err(),
+            QcVerifyError::InvalidSignature
+        );
     }
 
     #[test]
@@ -706,6 +795,7 @@ mod tests {
             BlockHeight::new(1),
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::new(2),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

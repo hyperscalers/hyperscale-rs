@@ -24,8 +24,8 @@ use hyperscale_engine::{AllCodeRuns, ExecutionMode, Executor};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
-use hyperscale_node::shard::HostEvent;
-use hyperscale_node::{HostedChain, NodeConfig, NodeHost, ReplicaConfig, TimerOp};
+use hyperscale_node::event::{HostEvent, TimerOp};
+use hyperscale_node::{HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig};
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
@@ -143,8 +143,8 @@ impl Fixture {
                 storage: SimShardStorage::new(shard_prefix_path(shard)),
                 recovered: &RecoveredState::default(),
                 signers: idxs.iter().map(|&idx| self.identity(idx)).collect(),
+                inbox: event_tx.into(),
             },
-            event_tx,
         );
     }
 
@@ -163,16 +163,17 @@ impl Fixture {
         let network = SimNetworkAdapter::new(Arc::clone(&registry));
         let (event_tx, event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
-            self.replica_config(),
+            &self.replica_config(),
+            HostResources {
+                beacon_storage: Arc::clone(&self.beacon_storage),
+                executor: Arc::new(Executor::new(ExecutionMode::Serial)),
+                network,
+                dispatch: SyncDispatch::new(),
+                beacon_event_sender: event_tx,
+                topology_snapshot: Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
+            },
             Vec::new(),
             vec![self.identity(idx)],
-            Arc::clone(&self.beacon_storage),
-            Arc::new(Executor::new(ExecutionMode::Serial)),
-            network,
-            SyncDispatch::new(),
-            BTreeMap::new(),
-            event_tx,
-            Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             NodeConfig::default(),
             LocalTimestamp::ZERO,
         );
@@ -287,7 +288,6 @@ fn pooled_ratify_voter_signs_its_skip_prevote() {
 fn ratify_vote_gossip_routes_to_the_beacon_loop() {
     let fix = fixture();
     let (mut host, registry, event_rx) = fix.follower_host(0);
-    host.register_inbound_handlers();
     while event_rx.try_recv().is_ok() {}
 
     // A peer's signed prevote arrives via global gossip.

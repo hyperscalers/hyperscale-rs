@@ -117,8 +117,8 @@ mod tests {
     use hyperscale_types::network::request::{BlockIntent, MAX_REMOTE_HEADERS_PER_REQUEST};
     use hyperscale_types::test_utils::{TestCommittee, signed_child_block};
     use hyperscale_types::{
-        Block, BlockHeight, CertifiedBlockHeader, ElidedCertifiedBlock, Inventory, Round, ShardId,
-        WeightedTimestamp,
+        Block, BlockHeight, CertifiedBlockHeader, ElidedCertifiedBlock, Epoch, Inventory, Round,
+        ShardId, WeightedTimestamp,
     };
 
     use super::*;
@@ -127,6 +127,7 @@ mod tests {
         committee.sign_qc(
             block.header(),
             &committee.quorum_indices(),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(900),
         )
     }
@@ -142,12 +143,14 @@ mod tests {
             committee,
             &base,
             Round::new(2),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(100),
         );
         let b3 = signed_child_block(
             committee,
             &b2,
             Round::new(3),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(200),
         );
         [base, b2, b3]
@@ -228,12 +231,14 @@ mod tests {
             &committee,
             &base,
             Round::new(4),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(300),
         );
         let off_chain = signed_child_block(
             &committee,
             &fork,
             Round::new(5),
+            Epoch::GENESIS,
             WeightedTimestamp::from_millis(400),
         );
         assert_eq!(

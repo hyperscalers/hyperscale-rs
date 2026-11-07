@@ -375,8 +375,10 @@ mod tests {
     use super::*;
 
     fn test_gossip() -> TransactionGossip {
-        TransactionGossip::new(Capped::from_array([Arc::new(
-            test_transaction_with_prefixes(&[1, 2, 3], &[test_prefix(1)], &[test_prefix(2)]),
+        TransactionGossip::new(Capped::from_array([test_transaction_with_prefixes(
+            &[1, 2, 3],
+            &[test_prefix(1)],
+            &[test_prefix(2)],
         )]))
     }
 

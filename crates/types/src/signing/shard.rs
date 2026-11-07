@@ -3,7 +3,7 @@
 use hyperscale_hbor::Hbor;
 
 use crate::signing::NetworkId;
-use crate::{BlockHash, BlockHeight, Round, ShardId};
+use crate::{BlockHash, BlockHeight, Epoch, Round, ShardId};
 
 /// What a block vote's signature covers.
 ///
@@ -11,7 +11,10 @@ use crate::{BlockHash, BlockHeight, Round, ShardId};
 /// verification, and view-change `highest_qc` verification.
 /// `parent_block_hash` is bound in so the QC's committable-block selector
 /// (the two-chain rule) is authenticated by the quorum, not merely
-/// trusted.
+/// trusted. `committee_epoch` is bound in for the same reason: it names
+/// the window whose committee the voter judged the block under, so the
+/// committee a QC's readers resolve is the quorum's statement rather than
+/// a relay's.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 #[hbor(signing_domain = "hyperscale-block-vote-v1", signing_context = NetworkId)]
 pub struct BlockVoteMessage {
@@ -25,6 +28,9 @@ pub struct BlockVoteMessage {
     pub block_hash: BlockHash,
     /// The voted block's parent.
     pub parent_block_hash: BlockHash,
+    /// The epoch keying the window whose committee the voter belongs to
+    /// for this block, after the terminal clamp.
+    pub committee_epoch: Epoch,
 }
 
 /// What a shard timeout share's signature covers: the round it gives up on
@@ -116,10 +122,32 @@ mod tests {
                     round: Round::INITIAL,
                     block_hash: block,
                     parent_block_hash: parent,
+                    committee_epoch: Epoch::GENESIS,
                 },
                 &net(),
             )
         };
         assert_ne!(mk(parent_a), mk(parent_b));
+    }
+
+    /// Same block and round under two committee epochs → two messages, so
+    /// a relay cannot move the epoch a quorum signed.
+    #[test]
+    fn block_vote_message_binds_committee_epoch() {
+        let block = BlockHash::from_raw(Hash::from_bytes(b"test_block"));
+        let mk = |epoch: Epoch| {
+            signed_bytes(
+                &BlockVoteMessage {
+                    shard_group: ShardId::ROOT,
+                    height: BlockHeight::new(10),
+                    round: Round::INITIAL,
+                    block_hash: block,
+                    parent_block_hash: BlockHash::ZERO,
+                    committee_epoch: epoch,
+                },
+                &net(),
+            )
+        };
+        assert_ne!(mk(Epoch::new(3)), mk(Epoch::new(4)));
     }
 }

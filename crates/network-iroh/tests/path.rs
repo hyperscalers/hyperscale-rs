@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
-use hyperscale_network::{HandlerRegistry, Network, RequestError, ResponseVerdict, Verdict};
+use hyperscale_network::{
+    HandlerRegistry, Network, Provenance, RequestError, ResponseVerdict, Verdict,
+};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::testing::{LocalRelay, Star, UdpBridge};
 use hyperscale_network_iroh::{
@@ -343,14 +345,14 @@ async fn a_relayed_peer_gets_consensus_traffic_and_no_bulk() {
     let (vote_tx, mut votes) = mpsc::unbounded_channel();
     server
         .network
-        .register_notification_handler(move |vote: Vote| {
+        .register_notification_handler(move |vote: Vote, _: Provenance| {
             let _ = vote_tx.send(vote);
             Verdict::Accept
         });
     let (backfill_tx, mut backfills) = mpsc::unbounded_channel();
     server
         .network
-        .register_gossip_handler(move |item: Backfill, _: ShardId| {
+        .register_gossip_handler(move |item: Backfill, _: ShardId, _: Provenance| {
             let _ = backfill_tx.send(item);
             Verdict::Accept
         });

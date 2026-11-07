@@ -19,9 +19,12 @@
 //! Bounded on two axes for each kind, and a bound that trips leaves the
 //! reading to the fallback read: per anchor the claims weigh at most one
 //! block's section, and per shard at most [`MAX_PARKED_CLAIM_HEIGHTS`]
-//! heights are held, the highest going first, since it is the one
-//! furthest from proving and a flood ahead of the frontier evicts
-//! itself.
+//! heights are held, [`MAX_EARLY_CLAIM_HEIGHTS`] for a record waiting on
+//! a want. An unproven height gives way highest first, since it is the
+//! one furthest from proving and a flood ahead of the frontier evicts
+//! itself. A proven one gives way lowest first: the height pushed longest
+//! ago is the one least likely still wanted, so heights that nothing
+//! comes to want leave a newer push its place.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,6 +36,15 @@ use hyperscale_types::{
 
 /// How many unproven heights of one shard are held at once.
 pub const MAX_PARKED_CLAIM_HEIGHTS: usize = 8;
+
+/// How many proven heights of one shard are held waiting on a want.
+///
+/// A proven height's stay is this many of the holder's heights when each
+/// parks something, so this is how far a consumer's filing can run behind
+/// a holder's pushes and still find them: about 11 s of its blocks, the
+/// window a holder's grace is derived over. Short of the lag, every early
+/// push goes just before its want files, and each costs a read.
+const MAX_EARLY_CLAIM_HEIGHTS: usize = 32;
 
 /// The verified claims waiting on their anchor's proof, and the ones at
 /// a proven anchor waiting on a want.
@@ -63,22 +75,23 @@ pub struct ParkedClaims {
 /// Which height of a shard gives way when it holds too many.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GivesWay {
-    /// The one furthest from proving or from a want.
+    /// The one furthest from proving.
     Highest,
-    /// The one held longest.
+    /// The one pushed longest ago.
     Lowest,
 }
 
 /// Hold `claim` in `held` under the bounds, or say why not: a claim
 /// whose keys a held claim at the same anchor already covers adds
 /// nothing; one that would take the anchor's claims past a block's
-/// section cannot be carried whole; and one at a height past the
-/// shard's held heights, or one that pushes the shard's highest height
-/// out, is left to the fallback read.
+/// section cannot be carried whole; and past `max_heights` of the shard
+/// one height gives way as `gives_way` says, which left to the fallback
+/// read is the claim itself where that height is its own.
 fn hold(
     held: &mut BTreeMap<(ShardId, BlockHeight), Vec<StateClaim>>,
     claim: StateClaim,
     gives_way: GivesWay,
+    max_heights: usize,
 ) -> Result<(), &'static str> {
     let anchor = claim.anchor;
     let key = (anchor.shard, anchor.height);
@@ -105,7 +118,7 @@ fn hold(
         .range((anchor.shard, BlockHeight::GENESIS)..=(anchor.shard, BlockHeight::new(u64::MAX)))
         .map(|((_, height), _)| *height)
         .collect();
-    if heights.len() > MAX_PARKED_CLAIM_HEIGHTS {
+    if heights.len() > max_heights {
         let going = match gives_way {
             GivesWay::Highest => heights.last(),
             GivesWay::Lowest => heights.first(),
@@ -170,7 +183,7 @@ impl ParkedClaims {
         } else {
             &mut self.unproven_heard
         };
-        hold(held, claim, GivesWay::Highest)
+        hold(held, claim, GivesWay::Highest, MAX_PARKED_CLAIM_HEIGHTS)
     }
 
     /// The claims held on exactly this anchor, now that it is proven.
@@ -187,13 +200,23 @@ impl ParkedClaims {
     /// Hold `claim`, at a proven anchor, until a key of its is wanted, or
     /// say why it was not held.
     pub fn hold_early(&mut self, claim: StateClaim) -> Result<(), &'static str> {
-        hold(&mut self.early, claim, GivesWay::Highest)
+        hold(
+            &mut self.early,
+            claim,
+            GivesWay::Lowest,
+            MAX_EARLY_CLAIM_HEIGHTS,
+        )
     }
 
     /// Hold `claim`, verdict leaves at a proven anchor, until a question
     /// names one of them, or say why it was not held.
     pub fn hold_unasked(&mut self, claim: StateClaim) -> Result<(), &'static str> {
-        hold(&mut self.unasked, claim, GivesWay::Lowest)
+        hold(
+            &mut self.unasked,
+            claim,
+            GivesWay::Lowest,
+            MAX_PARKED_CLAIM_HEIGHTS,
+        )
     }
 
     /// The early claims carrying any of `wanted`, now that it is.
@@ -352,6 +375,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             (3..=10).collect::<Vec<_>>(),
             "the lowest height went",
+        );
+    }
+
+    /// Early claims give way lowest height first, so heights nothing
+    /// comes to want never keep a newer push out, and one lower than
+    /// every height held is the one let go.
+    #[test]
+    fn early_claims_give_way_oldest_first() {
+        let mut parked = ParkedClaims::new();
+        let top = 1 + u64::try_from(MAX_EARLY_CLAIM_HEIGHTS).expect("a small bound");
+        for height in 2..=top {
+            parked.hold_early(claim_at(height, 1_000, 1)).unwrap();
+        }
+        assert_eq!(parked.hold_early(claim_at(1, 1_000, 2)), Err("outlasted"));
+        assert_eq!(parked.hold_early(claim_at(top + 1, 1_000, 3)), Ok(()));
+        assert_eq!(parked.len(), MAX_EARLY_CLAIM_HEIGHTS);
+        assert!(
+            parked
+                .release_early(&BTreeSet::from([test_key(2)]))
+                .is_empty(),
+            "the lower push went",
+        );
+        assert_eq!(
+            parked.release_early(&BTreeSet::from([test_key(3)])).len(),
+            1,
+            "the newest stayed",
+        );
+    }
+
+    /// A filing running a steady lag behind a holder's pushes still finds
+    /// them: a push stays 31 parked heights, past the 3 s a venue's filing
+    /// can trail, with every height between parking something.
+    #[test]
+    fn a_push_outlasts_a_steady_lag_of_its_want() {
+        let mut parked = ParkedClaims::new();
+        parked.hold_early(claim_at(1, 1_000, 1)).unwrap();
+        for height in 2..=32 {
+            parked.hold_early(claim_at(height, 1_000, 2)).unwrap();
+        }
+        assert_eq!(
+            parked.release_early(&BTreeSet::from([test_key(1)])).len(),
+            1,
         );
     }
 

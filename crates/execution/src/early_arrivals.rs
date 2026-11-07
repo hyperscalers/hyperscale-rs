@@ -52,8 +52,7 @@
 //!   matching the sender-side deadline used by
 //!   [`OutboundExecutionCertificateTracker`](crate::outbound_certs::OutboundExecutionCertificateTracker).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use hyperscale_types::{
@@ -90,7 +89,7 @@ pub const MAX_BUFFERED_EARLY_VOTES: usize = 65_536;
 /// and the entry is dropped.
 #[derive(Debug)]
 struct BufferedEc {
-    ec: Arc<Verified<ExecutionCertificate>>,
+    ec: Verified<ExecutionCertificate>,
     pending_txs: BTreeSet<TxHash>,
 }
 
@@ -101,7 +100,7 @@ pub struct EarlyArrivalBuffer {
     /// Reverse index from `tx_hash` to any buffered ECs mentioning it.
     /// Multiple `tx_hash` entries may reference the same handle (one EC
     /// covers many txs).
-    tx_index: HashMap<TxHash, Vec<Arc<Verified<ExecutionCertificate>>>>,
+    tx_index: HashMap<TxHash, Vec<Verified<ExecutionCertificate>>>,
 
     /// Per-EC bookkeeping. `tx_index` and `pending_routing` must stay
     /// consistent: an EC present in `tx_index[tx_hash]` for some `tx_hash`
@@ -200,11 +199,7 @@ impl EarlyArrivalBuffer {
     /// assignment. Idempotent: `tx_hashes` already tracked for this EC's
     /// `tick_id` are skipped, so replaying a previously-buffered EC won't
     /// create duplicate entries in the reverse index.
-    pub(crate) fn buffer_ec(
-        &mut self,
-        ec: &Arc<Verified<ExecutionCertificate>>,
-        tx_hashes: &[TxHash],
-    ) {
+    pub(crate) fn buffer_ec(&mut self, ec: &Verified<ExecutionCertificate>, tx_hashes: &[TxHash]) {
         if tx_hashes.is_empty() {
             return;
         }
@@ -212,15 +207,12 @@ impl EarlyArrivalBuffer {
             .pending_routing
             .entry(*ec.tick_id())
             .or_insert_with(|| BufferedEc {
-                ec: Arc::clone(ec),
+                ec: ec.clone(),
                 pending_txs: BTreeSet::new(),
             });
         for tx_hash in tx_hashes {
             if entry.pending_txs.insert(*tx_hash) {
-                self.tx_index
-                    .entry(*tx_hash)
-                    .or_default()
-                    .push(Arc::clone(ec));
+                self.tx_index.entry(*tx_hash).or_default().push(ec.clone());
             }
         }
     }
@@ -231,7 +223,7 @@ impl EarlyArrivalBuffer {
     /// drained explicitly by [`drain_ecs_for_txs`] when those txs commit.
     pub(crate) fn clear_routed(
         &mut self,
-        ec: &Arc<Verified<ExecutionCertificate>>,
+        ec: &Verified<ExecutionCertificate>,
         tx_hashes: &[TxHash],
     ) {
         let Some(entry) = self.pending_routing.get_mut(ec.tick_id()) else {
@@ -246,7 +238,7 @@ impl EarlyArrivalBuffer {
     }
 
     /// Drain any buffered ECs that mention any hash in `tx_hashes`. The
-    /// returned vec is deduplicated by `Arc` identity — a single EC that
+    /// returned vec is deduplicated by body identity — a single EC that
     /// covers multiple newly-committed txs appears once.
     ///
     /// The reverse index is cleared for each drained `tx_hash`; the
@@ -256,14 +248,12 @@ impl EarlyArrivalBuffer {
     pub(crate) fn drain_ecs_for_txs(
         &mut self,
         tx_hashes: &[TxHash],
-    ) -> Vec<Arc<Verified<ExecutionCertificate>>> {
-        let mut ecs: Vec<Arc<Verified<ExecutionCertificate>>> = Vec::new();
-        let mut seen_ptrs: HashSet<usize> = HashSet::new();
+    ) -> Vec<Verified<ExecutionCertificate>> {
+        let mut ecs: Vec<Verified<ExecutionCertificate>> = Vec::new();
         for tx_hash in tx_hashes {
             if let Some(entries) = self.tx_index.remove(tx_hash) {
                 for ec in entries {
-                    let ptr = Arc::as_ptr(&ec) as usize;
-                    if seen_ptrs.insert(ptr) {
+                    if !ecs.iter().any(|held| held.same_body(&ec)) {
                         ecs.push(ec);
                     }
                 }
@@ -295,7 +285,7 @@ impl EarlyArrivalBuffer {
             };
             for tx_hash in &entry.pending_txs {
                 if let Some(vec) = self.tx_index.get_mut(tx_hash) {
-                    vec.retain(|e| !Arc::ptr_eq(e, &entry.ec));
+                    vec.retain(|e| !e.same_body(&entry.ec));
                     if vec.is_empty() {
                         self.tx_index.remove(tx_hash);
                     }
@@ -362,7 +352,7 @@ mod tests {
         )
     }
 
-    fn make_ec(tick_id: TickId, tx_hashes: &[TxHash]) -> Arc<Verified<ExecutionCertificate>> {
+    fn make_ec(tick_id: TickId, tx_hashes: &[TxHash]) -> Verified<ExecutionCertificate> {
         make_ec_with_anchor(tick_id, tx_hashes, WeightedTimestamp::ZERO)
     }
 
@@ -370,16 +360,16 @@ mod tests {
         tick_id: TickId,
         tx_hashes: &[TxHash],
         vote_anchor_ts: WeightedTimestamp,
-    ) -> Arc<Verified<ExecutionCertificate>> {
+    ) -> Verified<ExecutionCertificate> {
         let outcomes: Vec<TxOutcome> = tx_hashes.iter().map(|h| make_tx_outcome(*h)).collect();
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             vote_anchor_ts,
             GlobalReceiptRoot::ZERO,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )))
+        ))
     }
 
     fn make_vote(tick_id: TickId, anchor_ts: WeightedTimestamp, voter: u64) -> ExecutionVote {
@@ -624,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_ecs_for_txs_dedups_arc_identity() {
+    fn drain_ecs_for_txs_dedups_body_identity() {
         let mut b = EarlyArrivalBuffer::new();
         let w = tick(1);
         let tx_a = TxHash::from(Hash::from_bytes(b"a"));
@@ -634,7 +624,7 @@ mod tests {
         b.buffer_ec(&ec, &[tx_a, tx_b]);
 
         let drained = b.drain_ecs_for_txs(&[tx_a, tx_b]);
-        assert_eq!(drained.len(), 1, "identity-dedup on Arc pointer");
+        assert_eq!(drained.len(), 1, "identity-dedup on the shared body");
     }
 
     #[test]

@@ -15,7 +15,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::genesis::GenesisPackages;
@@ -32,6 +31,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{Answered, ProtocolHasher, fee_hold_total_key};
 
+use crate::book::BookRoute;
 use crate::faults::{StagedHalt, await_halt_recovery, await_recovery_resume, freeze_shard};
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
@@ -1799,11 +1799,11 @@ fn offer_the_load<C: Cluster>(
     venue: &StockedVenue,
     cut: WeightedTimestamp,
     samples: &mut Vec<LoadSample>,
-) -> (BTreeMap<TxHash, Arc<Transaction>>, TimestampRange) {
+) -> (BTreeMap<TxHash, Transaction>, TimestampRange) {
     let survivor = STRADDLER_SURVIVOR;
     let callers = load_callers();
     let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
-    let mut offered: BTreeMap<TxHash, Arc<Transaction>> = BTreeMap::new();
+    let mut offered: BTreeMap<TxHash, Transaction> = BTreeMap::new();
     let mut committed: BTreeSet<TxHash> = BTreeSet::new();
     let mut last_window = validity_around(c.now());
     while offered.len() < LOAD_SWAPS && clock(c) < cut {
@@ -1818,7 +1818,7 @@ fn offer_the_load<C: Cluster>(
         for _ in 0..wanted.min(LOAD_SWAPS - offered.len()) {
             let (key, caller) = &callers[offered.len() % callers.len()];
             let input = LOAD_INPUT + u128::try_from(offered.len()).expect("a count of swaps");
-            let swap = Arc::new(build_swap_tx(
+            let swap = build_swap_tx(
                 key,
                 *caller,
                 &venue.meta,
@@ -1826,8 +1826,8 @@ fn offer_the_load<C: Cluster>(
                 input,
                 0,
                 last_window,
-            ));
-            c.submit(Arc::clone(&swap));
+            );
+            c.submit(swap.clone());
             offered.insert(swap.hash(), swap);
         }
         let from = height(c);
@@ -1856,7 +1856,7 @@ impl StrandedLeg {
     ///
     /// Panics if the harness reads no member rows, or if a waiting row
     /// is no swap of the load.
-    fn read<C: Cluster>(c: &C, load: &BTreeMap<TxHash, Arc<Transaction>>) -> Vec<Self> {
+    fn read<C: Cluster>(c: &C, load: &BTreeMap<TxHash, Transaction>) -> Vec<Self> {
         c.member_rows(STRADDLER_SURVIVOR)
             .expect("the harness reads the survivor's member rows")
             .into_iter()
@@ -2119,7 +2119,7 @@ impl Accounts {
     /// Panics if a swap of the load does not derive.
     fn of<C: Cluster>(
         c: &C,
-        load: &BTreeMap<TxHash, Arc<Transaction>>,
+        load: &BTreeMap<TxHash, Transaction>,
         bystanders: &[(Ed25519PrivateKey, PrincipalAddr)],
         venue: &StockedVenue,
     ) -> Self {
@@ -2717,6 +2717,59 @@ fn await_departed<C: Cluster>(c: &mut C) {
     );
 }
 
+/// A route through a book whose fill reads a capped interval reads the
+/// interval its book's committing block left, before, during and after
+/// the split of the venue's shard.
+///
+/// The book sits on the second venue shard, which stays, and holds more
+/// asks than its fill's cap; the venue sits on the first, which is
+/// voted to split. Each route walks the book and sells what it bought at
+/// the venue, so its core spans both shards and the venue's shard runs
+/// the fill over the entries the book's shard provisions it. Local fills
+/// on the book's shard, submitted just before each route and beside it,
+/// delete the cheapest asks in the blocks around the route's. A route
+/// runs while both shards are live, one once the split is admitted, and
+/// one against the child the venue lands on after the cut. Each settles
+/// at the closed form over the lowest asks standing at the book's
+/// committing height, both worlds are conserved, and the venue's shard
+/// and the child counted provisioned entries a core member executed
+/// over.
+///
+/// # Panics
+///
+/// Panics as [`BookRoute::stand_up`] and [`BookRoute::run`] do, if the
+/// split is not admitted on the venue's shard alone or the cut is not
+/// served, if the venue's shard or its child counted no provisioned
+/// entry, or if either world does not settle.
+pub fn a_book_route_reads_its_range_across_a_split<C: FaultableCluster>(c: &mut C) {
+    let mut route = BookRoute::stand_up(c);
+    route.run(c, epochs(12), "live");
+
+    cast_threshold_vote(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
+    assert_only_the_departing_venue_admitted(c, epochs(20));
+    route.run(c, epochs(12), "departing");
+
+    await_cut(c, FIRST_VENUE_SHARD);
+    let child = owning_shard(c, route.venue_reserve().owner);
+    assert_ne!(
+        child, FIRST_VENUE_SHARD,
+        "the cut must land the venue on a child"
+    );
+    route.run(c, epochs(12), "split");
+
+    for shard in [FIRST_VENUE_SHARD, child] {
+        let consumed = c.metric(
+            "provision_range_entries_consumed",
+            Some(&shard.inner().to_string()),
+        );
+        assert!(
+            consumed > 0,
+            "{shard:?} must execute a route's fill over provisioned entries as a core member",
+        );
+    }
+    route.assert_conserved(c, epochs(12));
+}
+
 /// The venue whose shard the late vote takes away — one half of the
 /// pair the grow's own split leaves behind, which the vote collapses
 /// back into their parent.
@@ -2838,7 +2891,7 @@ fn cast_late_threshold_vote<C: Cluster>(c: &mut C, split_bytes: u64, lead: u64) 
             activate_at,
             validity_around(c.now()),
         );
-        c.submit(Arc::new(vote));
+        c.submit(vote);
         if c.run_until(epochs(6), |c| {
             c.beacon_state().is_some_and(|state| {
                 state.param_votes.values().any(|proposal| {
@@ -2896,7 +2949,7 @@ pub fn a_venue_sealed_on_a_fresh_split_child_runs<C: Cluster>(c: &mut C) {
         validity_around(c.now()),
     );
     let hash = swap.hash();
-    c.submit(Arc::new(swap));
+    c.submit(swap);
     let status = await_tx_terminal(c, hash, epochs(24));
     assert!(
         matches!(

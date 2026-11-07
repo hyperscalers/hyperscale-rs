@@ -21,6 +21,8 @@
 //!   stored-byte totals a header attests, which the beacon reweights
 //!   emission by.
 //! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
+//! - [`pin`]: [`Pin`](pin::Pin), one key a member stands on in its
+//!   shard's queue, under the modes it declares there.
 //! - [`member_keys`]: [`MemberCollection`](member_keys::MemberCollection), where
 //!   a shard's tick membership family sits in its state.
 //! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
@@ -64,6 +66,7 @@ pub mod limits;
 pub mod load;
 pub mod manifest;
 pub mod member_keys;
+pub mod pin;
 pub mod proven_anchors;
 pub mod quorum_certificate;
 pub mod read_frontier;
@@ -161,12 +164,12 @@ mod tests {
     #[test]
     fn test_compute_transaction_root_deterministic() {
         install_stub_protocol_statics();
-        let tx = Arc::new(Verifiable::from(stub_transaction(
+        let tx = Verifiable::from(stub_transaction(
             test_principal(1),
             &[test_prefix(2)],
             1_000,
             test_validity_range(),
-        )));
+        ));
 
         let root1 = Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner();
         let root2 = Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner();
@@ -182,8 +185,8 @@ mod tests {
 
     #[test]
     fn test_compute_certificate_root_deterministic() {
-        let make_fw = |seed: u8| -> Arc<Verifiable<Finalization>> {
-            let ec = Arc::new(ExecutionCertificate::new(
+        let make_fw = |seed: u8| -> Verifiable<Finalization> {
+            let ec = ExecutionCertificate::new(
                 TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
                 WeightedTimestamp::from_millis(11),
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
@@ -197,16 +200,14 @@ mod tests {
                 )]),
                 AggregateSignature::new([0u8; 96]),
                 SignerBitfield::new(4),
-            ));
-            Arc::new(
-                Finalization::new(
-                    TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
-                    TickHalf::Determined,
-                    Some(ec),
-                    Capped::from_array([]),
-                )
-                .into(),
+            );
+            Finalization::new(
+                TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
+                TickHalf::Determined,
+                Some(ec),
+                Capped::from_array([]),
             )
+            .into()
         };
 
         let certs = vec![make_fw(1), make_fw(2)];
@@ -218,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_compute_certificate_root_single_cert() {
-        let ec = Arc::new(ExecutionCertificate::new(
+        let ec = ExecutionCertificate::new(
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
             WeightedTimestamp::from_millis(11),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
@@ -230,7 +231,7 @@ mod tests {
             )]),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
-        ));
+        );
         let cert = Finalization::new(
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
             TickHalf::Determined,
@@ -238,7 +239,7 @@ mod tests {
             Capped::from_array([]),
         );
         let expected_receipt_hash = cert.receipt_hash();
-        let fw: Arc<Verifiable<Finalization>> = Arc::new(cert.into());
+        let fw: Verifiable<Finalization> = cert.into();
 
         let root = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         // Single cert: the section root equals the cert's receipt_hash

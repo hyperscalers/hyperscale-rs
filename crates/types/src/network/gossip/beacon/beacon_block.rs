@@ -1,7 +1,5 @@
 //! Finalized beacon-block gossip.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 
 use crate::network::{GossipMessage, GossipScope};
@@ -24,7 +22,7 @@ use crate::{CertifiedBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct BeaconBlockGossip {
     /// The finalized beacon block paired with its authenticating cert.
-    pub block: Arc<Verifiable<CertifiedBeaconBlock>>,
+    pub block: Verifiable<CertifiedBeaconBlock>,
 }
 
 impl BeaconBlockGossip {
@@ -32,7 +30,7 @@ impl BeaconBlockGossip {
     /// a raw block or a `Verified<CertifiedBeaconBlock>` — the wrapper
     /// preserves the marker.
     #[must_use]
-    pub fn new(block: impl Into<Arc<Verifiable<CertifiedBeaconBlock>>>) -> Self {
+    pub fn new(block: impl Into<Verifiable<CertifiedBeaconBlock>>) -> Self {
         Self {
             block: block.into(),
         }
@@ -48,7 +46,7 @@ impl BeaconBlockGossip {
     /// Consume and return the inner block, preserving the
     /// verification marker.
     #[must_use]
-    pub fn into_block(self) -> Arc<Verifiable<CertifiedBeaconBlock>> {
+    pub fn into_block(self) -> Verifiable<CertifiedBeaconBlock> {
         self.block
     }
 }
@@ -77,7 +75,7 @@ mod tests {
     #[test]
     fn hbor_round_trip() {
         let block = CertifiedBeaconBlock::genesis(GenesisConfigHash::ZERO);
-        let g = BeaconBlockGossip::new(Arc::new(Verifiable::from(block)));
+        let g = BeaconBlockGossip::new(block);
         let bytes = hbor_to_vec(&g).unwrap();
         let decoded: BeaconBlockGossip = hbor_from_slice(&bytes).unwrap();
         assert_eq!(g, decoded);

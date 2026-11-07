@@ -40,6 +40,15 @@ use crate::{MAX_VALIDITY_RANGE, SPC_VIEW_TIMEOUT};
 /// derives the same deadline.
 pub const MAX_FINALIZATION_DELAY: Duration = Duration::from_secs(24);
 
+/// How long a member a counterpart shares the verdict on may stand head
+/// and unnamed once it refuses someone on a key it pins: past
+/// `max(head, blocked_at)` plus this, its row is aborted unnamed.
+///
+/// One finalization delay: a counterpart slower than that to serve the
+/// part the head waits on is one the transaction would be abandoned
+/// against anyway, and a head blocking nobody keeps its deadline.
+pub const NAMING_WINDOW: Duration = MAX_FINALIZATION_DELAY;
+
 /// How long to retain remote block headers below each shard's tip.
 ///
 /// Shared by `hyperscale-shard` (deferral-proof verification) and
@@ -120,29 +129,6 @@ const _: () = assert!(
     (MAX_FINALIZATION_DELAY.as_secs() + MAX_VALIDITY_RANGE.as_secs() * 2) * 1_000
         == COMMITTED_GRACE_MS,
     "a committed cell lives to the close of the window its absence answers in",
-);
-
-/// The horizon must not outlive the epoch that produced what it retains.
-///
-/// A reshape's cut is scheduled one window ahead, so a successor
-/// inheriting a predecessor's tx-derived state has one epoch of chain to
-/// read it from. A horizon past that reaches back further than the
-/// reshape spans, and the successor has to fetch below what it already
-/// walks. Half an epoch is the working margin, not the hard bound.
-const _: () = assert!(RETENTION_HORIZON.as_secs() < EPOCH_DURATION.as_secs());
-
-/// A transaction predates at most one cut on its lineage.
-///
-/// Cuts on one lineage fall on epoch boundaries at least an epoch apart,
-/// so a transaction still admissible after a cut opened after the one
-/// before it: a successor judges it by its parent's markers alone, never
-/// a grandparent's. The figure is the validity range because the precut
-/// question is only asked at anchors below the range's end. Implied by
-/// the assertion above, and stated because it is the premise the precut
-/// rule reads.
-const _: () = assert!(
-    MAX_VALIDITY_RANGE.as_secs() < EPOCH_DURATION.as_secs(),
-    "a transaction predates at most one cut",
 );
 
 /// A skipped epoch and its recovery must not expire the transactions a

@@ -35,9 +35,13 @@ use hyperscale_jmt::{
 };
 use hyperscale_storage::{ImportCursor, ImportProgress};
 use hyperscale_types::network::request::GetStateRangeRequest;
-use hyperscale_types::network::response::{GetStateRangeResponse, StateRangeChunk};
+use hyperscale_types::network::response::{
+    GetStateRangeResponse, MAX_LEAVES_PER_STATE_RANGE, StateRangeChunk,
+};
 use hyperscale_types::state_key::jmt_value_hash;
-use hyperscale_types::{ShardAnchor, SubstateLeaf};
+use hyperscale_types::{MAX_CELL_VALUE_LEN, ShardAnchor, SubstateLeaf};
+
+use super::state_range_serve::{RESPONSE_BYTES, leaf_weight};
 
 type Jmt = Tree<Blake3Hasher, 1>;
 
@@ -80,7 +84,7 @@ enum SubRangeState {
 }
 
 /// Snap-sync assembly state for one shard bootstrap.
-pub(crate) struct SnapSync {
+pub struct SnapSync {
     anchor: ShardAnchor,
     root_path: NibblePath,
     split_bits: u8,
@@ -241,6 +245,9 @@ impl SnapSync {
         let Some(chunk) = &response.chunk else {
             return StateRangeOutcome::Rejected("boundary unavailable at peer");
         };
+        if chunk.more && !fills_its_page(chunk, self.chunk_limit) {
+            return StateRangeOutcome::Rejected("continuation on a page short of its limit");
+        }
         if let Err(reason) = verify_chunk(
             self.anchor.state_root.as_raw().as_bytes(),
             &self.root_path,
@@ -317,6 +324,24 @@ impl SnapSync {
     }
 }
 
+/// Whether a chunk claiming continuation carried as much as a server
+/// stops at: the leaves asked for, or enough bytes that the next leaf
+/// could have passed the server's budget.
+///
+/// A proof shows a chunk's leaves are the run's first ones, and nothing
+/// about how many a server could have sent; without this a peer could
+/// drip the span a leaf a page and never be wrong.
+fn fills_its_page(chunk: &StateRangeChunk, chunk_limit: u32) -> bool {
+    let limit = (chunk_limit as usize).clamp(1, MAX_LEAVES_PER_STATE_RANGE);
+    let weight = chunk
+        .leaves
+        .iter()
+        .map(|leaf| leaf_weight(leaf.value.len()))
+        .fold(0usize, usize::saturating_add);
+    chunk.leaves.len() >= limit
+        || weight.saturating_add(leaf_weight(MAX_CELL_VALUE_LEN)) > RESPONSE_BYTES
+}
+
 /// Verify one wire chunk against the attested root over
 /// `[start, end]`; on success the chunk's leaves are import-ready
 /// as-is.
@@ -355,7 +380,7 @@ mod tests {
     use hyperscale_types::BlockHeight;
 
     use super::*;
-    use crate::bootstrap::state_range_serve::serve_state_range_request;
+    use crate::serve_state_range_request;
 
     const ENTRIES: u8 = 12;
 
@@ -502,6 +527,30 @@ mod tests {
             sync.on_response(id, &response),
             StateRangeOutcome::Rejected(_)
         ));
+    }
+
+    /// A page claiming continuation short of the limit asked and of the
+    /// server's byte budget is a drip, and is rejected; the honest
+    /// server's own pages pass, as `reconstructs_state_from_two_peers`
+    /// drives them.
+    #[test]
+    fn a_short_page_claiming_more_is_rejected() {
+        let (peer, anchor) = replica();
+
+        let mut sync = SnapSync::new(anchor, NibblePath::empty(), 0, 4);
+        let (id, mut request) = sync.next_requests().pop().expect("one sub-range");
+        // A server answering one leaf where four were asked.
+        request.limit = 1;
+        let response = serve_state_range_request(&peer, &request);
+        assert!(response.chunk.as_ref().is_some_and(|chunk| chunk.more));
+        assert_eq!(
+            sync.on_response(id, &response),
+            StateRangeOutcome::Rejected("continuation on a page short of its limit")
+        );
+
+        let fresh = SimShardStorage::default();
+        assert_eq!(drive(&mut sync, &fresh, |_, _| Arc::clone(&peer)), 0);
+        assert!(sync.is_complete());
     }
 
     /// An unavailable peer re-arms the sub-range instead of wedging it.

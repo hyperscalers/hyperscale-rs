@@ -326,15 +326,16 @@ pub(crate) fn behind_recorded_boundary(
 /// `shard`'s recoveries discarded
 /// ([`RecoveryBinding::discards`](hyperscale_types::RecoveryBinding::discards)).
 ///
-/// Reads the date `qc` carries, as [`contributed_epoch`] does, and not
-/// the header's anchor: a contribution's anchor sits at or below its
-/// certificate's date, so one certified below the band's edge is anchored
-/// below the bridge too.
+/// Reads the committee epoch `qc`'s signers signed, and not the header's
+/// anchor or the certificate's date: the epoch names the committee that
+/// certified the crossing, and one signed below a bridge is a committee
+/// that recovery replaced.
 ///
 /// A recovery's clear leaves the verdict unchanged. A later stamping
 /// widens the band to the newer bridge. The history keeps only its newest
 /// bindings, and the newest covers what an evicted one did: its frontier
-/// is no lower and its bridge is later, and a crossing at or below its
+/// is no lower and its bridge is later, so an epoch below the evicted
+/// bridge is below the newer one, and a crossing at or below its
 /// frontier is behind the recorded boundary.
 ///
 /// The proposer's sourcing, admission and the fold apply the same test.
@@ -345,12 +346,12 @@ pub(crate) fn in_discarded_recovery_band(
     header: &BlockHeader,
     qc: &QuorumCertificate,
 ) -> bool {
-    let windows = state.chain_config.epoch_windows();
-    state.recoveries.get(&shard).is_some_and(|history| {
-        history
-            .iter()
-            .any(|binding| binding.discards(windows, header.height(), qc.weighted_timestamp()))
-    })
+    !qc.is_genesis()
+        && state.recoveries.get(&shard).is_some_and(|history| {
+            history
+                .iter()
+                .any(|binding| binding.discards(header.height(), qc.committee_epoch()))
+        })
 }
 
 /// Whether `block`'s shard contributions are the faithful canonical

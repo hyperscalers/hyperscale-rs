@@ -16,37 +16,40 @@ use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{
     FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment,
 };
+use hyperscale_hbor::from_slice;
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
+use hyperscale_provisions::own_served_entries;
 use hyperscale_scenarios::query::{
-    ChainMentions, ClaimsSection, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership,
-    chain_mentions, claims_sections, declines_naming, reads_record, record_wait, records_naming,
-    retirements_by_holder,
+    ChainMentions, ClaimsSection, CommittedChain, RanAs, absent_record_readings, chain_burn,
+    chain_fate, chain_membership, chain_mentions, claims_sections, declines_naming, reads_record,
+    record_reading_anchor, record_wait, records_naming, retirements_by_holder, served_at,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     BlockServingCap, Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster,
-    MemberEdge, RestartableCluster, ScenarioConfig, grow_and_hold, submission_shards,
+    MemberEdge, ProofMeter, RestartableCluster, ScenarioConfig, grow_and_hold, submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{
     ArchivedChain, CrashKind, EPOCH_MS, ExecutionMode, ProcessingTimes, SimConfig, SimulationRunner,
 };
 use hyperscale_storage::{
-    BoundaryStore, MemberIndex, RowState, ShardChainReader, SubstateStore, Substates,
+    BoundaryStore, MemberIndex, MemberRow, RowState, ShardChainReader, SubstateStore, Substates,
     VersionedStore, answer_route,
 };
 use hyperscale_storage_memory::SimShardStorage;
+use hyperscale_types::network::request::GetStateProofRequest;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
-    ConsensusReceipt, DeclaredRange, Derivation, Epoch, Event, Heard, LocalKey, PrincipalAddr,
-    ReshapeThresholds, ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
-    Verified, WeightedTimestamp, shard_prefix_path,
+    Address, Anchor, BeaconChainConfig, BeaconState, Block, BlockHeader, BlockHeight,
+    CertifiedBlock, ChainOrigin, ConsensusReceipt, DeclaredRange, Derivation, Epoch, Event, Heard,
+    LocalKey, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StandingAnswers, StandingToward,
+    StateRoot, SubstateEntry, SubstateKey, TickLine, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
+    shard_prefix_path,
 };
 
 use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
@@ -123,6 +126,33 @@ pub struct SimCluster {
     /// The beacon epoch this cluster's chain runs, which a [`Budget`]
     /// counts in.
     epoch: Duration,
+    /// Every member's own part against the part a counterpart absorbed.
+    served_parts: ServedParts,
+}
+
+/// The served reads oracle: at each shared tick, the entries the source
+/// reads as its own part are the entries a counterpart absorbed.
+///
+/// It walks the archive, so it reads what the chains committed. A part's
+/// entries travel in the blocks that absorb them, and the source's are
+/// read back out of its store at the line's head height, through the
+/// function the tick reads them with. A store that has since retired the
+/// height leaves that member unread: the walk runs every slice, and a
+/// tick's height is held until it has run.
+#[derive(Default)]
+struct ServedParts {
+    /// The next height to walk, by shard.
+    walked: BTreeMap<ShardId, BlockHeight>,
+    /// What each line running a member says the source read, by source,
+    /// target and transaction.
+    read: BTreeMap<(ShardId, ShardId, TxHash), (BlockHeight, Vec<SubstateEntry>)>,
+    /// What each target's blocks absorbed, by source, target and
+    /// transaction: the height serving it and its entries, ascending.
+    absorbed: BTreeMap<(ShardId, ShardId, TxHash), (BlockHeight, Vec<SubstateEntry>)>,
+    /// The parts held to each other so far.
+    agreed: usize,
+    /// The members those parts were read for, by source and transaction.
+    compared: BTreeSet<(ShardId, TxHash)>,
 }
 
 impl Drop for SimCluster {
@@ -404,6 +434,7 @@ impl SimCluster {
             recorder: MemoryRecorder::new(),
             tuning,
             member_rules: Vec::new(),
+            served_parts: ServedParts::default(),
             one_identity_per_host: args.dedicated_pool_hosts && config.vnodes_per_host == 1,
             epoch: beacon_chain_config.epoch_duration(),
         };
@@ -494,6 +525,27 @@ impl SimCluster {
             seed,
             accounts,
             GenesisPackages::protocol(),
+            false,
+            false,
+            Some(processing),
+        )
+    }
+
+    /// [`Self::with_grown_packages`] with every pool's work taking time
+    /// as `processing` says.
+    #[must_use]
+    pub fn with_grown_packages_and_processing(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+        processing: ProcessingTimes,
+    ) -> Self {
+        Self::grown(
+            config,
+            seed,
+            accounts,
+            packages,
             false,
             false,
             Some(processing),
@@ -629,11 +681,100 @@ impl SimCluster {
             self.runner.run_until(next);
             self.assert_beacon_cadence();
             self.assert_one_identity_per_host();
+            self.hold_served_parts();
             if cond(self) {
                 return true;
             }
         }
         cond(self)
+    }
+
+    /// Walk every chain past where the last walk stopped, and hold each
+    /// member's own part to what its counterpart absorbed.
+    ///
+    /// # Panics
+    ///
+    /// If the two differ, or come from different heights: a shared member
+    /// read other bytes than its counterpart.
+    fn hold_served_parts(&mut self) {
+        let shards: Vec<ShardId> = self.runner.archive().shards().collect();
+        for shard in shards {
+            let chain = self.history(shard);
+            let (tip, first) = (chain.tip(), chain.first().max(BlockHeight::new(1)));
+            let from = self
+                .served_parts
+                .walked
+                .get(&shard)
+                .copied()
+                .unwrap_or(first);
+            let mut height = from;
+            while height <= tip {
+                if let Some(certified) = self.history(shard).block(height) {
+                    self.note_served_parts(shard, certified.block());
+                }
+                height = height.next();
+            }
+            self.served_parts.walked.insert(shard, height);
+        }
+        let read = std::mem::take(&mut self.served_parts.read);
+        for (member, (at, entries)) in read {
+            let Some((served, absorbed)) = self.served_parts.absorbed.get(&member) else {
+                self.served_parts.read.insert(member, (at, entries));
+                continue;
+            };
+            assert_eq!(
+                (at, &entries),
+                (*served, absorbed),
+                "a shared member's own part differs from its counterpart's: {member:?}",
+            );
+            self.served_parts.agreed += 1;
+            self.served_parts.compared.insert((member.0, member.2));
+        }
+    }
+
+    /// Take in what `block` of `shard`'s says of parts: each line running
+    /// a member from its head height, read back from the store that holds
+    /// it, and each part the block absorbed.
+    fn note_served_parts(&mut self, shard: ShardId, block: &Block) {
+        let parts = self
+            .tallest_store(shard)
+            .map_or_else(Vec::new, |store| store.provisions_at(block.height()));
+        for part in parts {
+            let (source, tx) = (part.source_shard(), part.tx_hash());
+            let (height, entries) = self
+                .served_parts
+                .absorbed
+                .entry((source, shard, tx))
+                .or_insert_with(|| (part.block_height(), Vec::new()));
+            *height = part.block_height();
+            entries.extend(part.entries().iter().cloned());
+            entries.sort_by_key(|entry| entry.key);
+        }
+        for line in block.tick_manifest().iter() {
+            let TickLine::Member {
+                tx,
+                holds,
+                awaits,
+                served_at: Some(head),
+                ..
+            } = line
+            else {
+                continue;
+            };
+            let Some(state) = self
+                .tallest_store(shard)
+                .and_then(|store| store.snapshot_held_at(*head))
+            else {
+                continue;
+            };
+            let part = own_served_entries(&state, shard, *tx, holds)
+                .expect("a range a member declares names entries with leaves");
+            for target in awaits.iter() {
+                self.served_parts
+                    .read
+                    .insert((shard, *target, *tx), (*head, part.entries.clone()));
+            }
+        }
     }
 
     /// Run a fault `scenario` with the in-memory recorder scoped, so
@@ -828,6 +969,13 @@ impl SimCluster {
         self.runner.shard_stats(host_index(host), shard)
     }
 
+    /// The cross-shard provision fetch ids `host`'s replica of `shard`
+    /// holds pending, or `None` when the host doesn't carry it.
+    #[must_use]
+    pub fn provision_fetch_pending(&self, host: usize, shard: ShardId) -> Option<usize> {
+        self.runner.provision_fetch_pending(host_index(host), shard)
+    }
+
     /// The header `host`'s copy of `shard` holds certified at `height`.
     #[must_use]
     pub fn certified_header(
@@ -882,11 +1030,8 @@ impl SimCluster {
     /// delayed. A client routes to the committee the beacon names, and
     /// so does this.
     fn submit_at(&mut self, host: NodeIndex, tx: &Transaction) {
-        self.runner.schedule_initial_event(
-            host,
-            Duration::ZERO,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: underived(tx) }),
-        );
+        self.runner
+            .schedule_submission(host, Duration::ZERO, underived(tx));
     }
 
     /// The lowest-indexed host that is up: what the harness reads a
@@ -915,8 +1060,8 @@ impl SimCluster {
 /// cache hit. A host derives what it admits, and on a miss fetches and
 /// keeps the records it lacks, which its own replay of the commit reads
 /// back after a restart.
-fn underived(tx: &Transaction) -> Arc<Transaction> {
-    Arc::new(Transaction::new(tx.body().clone()))
+fn underived(tx: &Transaction) -> Transaction {
+    Transaction::new(tx.body().clone())
 }
 
 /// A portable `0..host_count` host index as the sim's [`NodeIndex`].
@@ -941,22 +1086,18 @@ impl Cluster for SimCluster {
         self.runner.staged_validators()
     }
 
-    fn submit(&mut self, tx: Arc<Transaction>) {
+    fn submit(&mut self, tx: Transaction) {
         let host = self.host_for_tx(&tx).unwrap_or(0);
         self.submit_at(host, &tx);
     }
 
-    fn submit_after(&mut self, delay: Duration, tx: Arc<Transaction>) -> bool {
+    fn submit_after(&mut self, delay: Duration, tx: Transaction) -> bool {
         let host = self.host_for_tx(&tx).unwrap_or(0);
-        self.runner.schedule_initial_event(
-            host,
-            delay,
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: underived(&tx) }),
-        );
+        self.runner.schedule_submission(host, delay, underived(&tx));
         true
     }
 
-    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
+    fn submit_to(&mut self, shard: ShardId, tx: Transaction) {
         let host = self
             .live_committee_hosts(shard)
             .first()
@@ -967,6 +1108,15 @@ impl Cluster for SimCluster {
 
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool {
         self.run_until_polled(budget, SLICE, cond)
+    }
+
+    fn run_polling(
+        &mut self,
+        budget: Budget,
+        poll: Duration,
+        cond: impl Fn(&Self) -> bool,
+    ) -> bool {
+        self.run_until_polled(budget, poll, cond)
     }
 
     fn now(&self) -> Duration {
@@ -1041,6 +1191,18 @@ impl Cluster for SimCluster {
         store.get_entries_at_height(range, store.jmt_height())
     }
 
+    fn entries_at(
+        &self,
+        shard: ShardId,
+        range: DeclaredRange,
+        height: BlockHeight,
+    ) -> Option<Vec<(u128, Vec<u8>)>> {
+        self.live_committee_hosts(shard)
+            .into_iter()
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .find_map(|store| store.get_entries_at_height(range, height))
+    }
+
     fn preview(
         &self,
         shard: ShardId,
@@ -1076,6 +1238,7 @@ impl Cluster for SimCluster {
                     fetched: FetchedCells::default(),
                 },
                 grants,
+                points: None,
             },
         ))
     }
@@ -1095,6 +1258,18 @@ impl Cluster for SimCluster {
                 })
                 .collect()
         })
+    }
+
+    fn receipt(&self, shard: ShardId, tx: TxHash) -> Option<Arc<ConsensusReceipt>> {
+        let store =
+            (0..self.runner.num_hosts()).find_map(|host| self.runner.hosts_shard(host, shard))?;
+        let mut receipts = store.get_consensus_receipts(&tx);
+        assert!(
+            receipts.len() <= 1,
+            "{shard:?} settled {} receipts for {tx:?}",
+            receipts.len(),
+        );
+        receipts.pop()
     }
 
     fn tx_statuses(&self, tx: TxHash) -> Vec<(TransactionStatus, ShardId)> {
@@ -1140,14 +1315,17 @@ impl Cluster for SimCluster {
     }
 
     fn member_rows(&self, shard: ShardId) -> Option<BTreeMap<TxHash, RowState>> {
-        let store = self.tallest_store(shard)?;
         Some(
-            MemberIndex::load(&store.snapshot(), shard)
-                .members
+            self.queued_rows(shard)?
                 .into_iter()
                 .map(|(tx, row)| (tx, row.state))
                 .collect(),
         )
+    }
+
+    fn queued_rows(&self, shard: ShardId) -> Option<BTreeMap<TxHash, MemberRow>> {
+        let store = self.tallest_store(shard)?;
+        Some(MemberIndex::load(&store.snapshot(), shard).members)
     }
 
     fn standing_answers(&self, shard: ShardId) -> Option<StandingAnswers> {
@@ -1220,6 +1398,14 @@ impl Cluster for SimCluster {
         record_wait(&self.history(shard), tx, key)
     }
 
+    fn absent_record_readings(&self, shard: ShardId, key: SubstateKey) -> usize {
+        absent_record_readings(&self.history(shard), key)
+    }
+
+    fn record_reading_anchor(&self, shard: ShardId, key: SubstateKey) -> Option<Anchor> {
+        record_reading_anchor(&self.history(shard), key)
+    }
+
     fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
         declines_naming(&self.history(shard), tx)
     }
@@ -1233,6 +1419,45 @@ impl Cluster for SimCluster {
         Option<(BlockHeight, TransactionDecision)>,
     ) {
         chain_fate(&self.history(shard), tx)
+    }
+
+    fn served_at(&self, source: ShardId, target: ShardId, tx: TxHash) -> Option<BlockHeight> {
+        served_at(&self.history(target), source, tx)
+    }
+
+    fn ran_line(&self, shard: ShardId, tx: TxHash) -> Option<(BlockHeight, Option<BlockHeight>)> {
+        let chain = self.history(shard);
+        let mut height = chain.first().max(BlockHeight::new(1));
+        while height <= chain.tip() {
+            let served = chain.block(height).and_then(|certified| {
+                certified
+                    .block()
+                    .tick_manifest()
+                    .iter()
+                    .find_map(|line| match line {
+                        TickLine::Member {
+                            tx: named,
+                            joins,
+                            served_at,
+                            ..
+                        } if *named == tx && joins.dispatched() => Some(*served_at),
+                        _ => None,
+                    })
+            });
+            if let Some(served) = served {
+                return Some((height, served));
+            }
+            height = height.next();
+        }
+        None
+    }
+
+    fn served_parts_agreed(&self) -> usize {
+        self.served_parts.agreed
+    }
+
+    fn served_part_agreed(&self, shard: ShardId, tx: TxHash) -> bool {
+        self.served_parts.compared.contains(&(shard, tx))
     }
 
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {
@@ -1481,7 +1706,7 @@ impl FaultableCluster for SimCluster {
         (host < self.runner.num_hosts()).then_some(host as usize)
     }
 
-    fn submit_at_host(&mut self, host: usize, tx: Arc<Transaction>) {
+    fn submit_at_host(&mut self, host: usize, tx: Transaction) {
         self.submit_at(host_index(host), &tx);
     }
 
@@ -1521,5 +1746,22 @@ impl FaultableCluster for SimCluster {
 
     fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64 {
         self.recorder.histogram_count(name, label)
+    }
+
+    fn meter_state_proofs(&mut self, meter: &ProofMeter) -> bool {
+        for host in 0..self.host_count() {
+            let meter = meter.clone();
+            let _ = self.rewrite_responses(
+                host,
+                "state_proof.request",
+                Arc::new(move |asked: &[u8], answer: &[u8]| {
+                    if let Ok(request) = from_slice::<GetStateProofRequest>(asked) {
+                        meter.count(host, &request.keys, asked.len(), answer.len());
+                    }
+                    answer.to_vec()
+                }),
+            );
+        }
+        true
     }
 }

@@ -136,6 +136,11 @@ impl ChainArchive {
         self.abandoned.contains(&(host, shard))
     }
 
+    /// The shards the archive holds a chain of.
+    pub fn shards(&self) -> impl Iterator<Item = ShardId> + '_ {
+        self.blocks.keys().copied()
+    }
+
     /// `shard`'s archived chain.
     #[must_use]
     pub fn chain(&self, shard: ShardId) -> ArchivedChain<'_> {

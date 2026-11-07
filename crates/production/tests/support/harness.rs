@@ -30,6 +30,7 @@ use hyperscale_production::testing::Probe;
 use hyperscale_production::{LocalValidator, Node, NodeHandle, shard_data_dir};
 use hyperscale_scenarios::query::{
     RanAs, chain_burn, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
+    served_at,
 };
 use hyperscale_storage::{BeaconChainReader, ShardChainReader, SubstateStore, VersionedStore};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
@@ -618,9 +619,9 @@ impl Harness {
             .map(|(_, state)| state)
     }
 
-    /// Submit a transaction into host `idx`'s process — the production
-    /// analog of the sim's `ProcessScopedInput::SubmitTransaction`. The
-    /// process computes the touched-shard fanout and admits onto every
+    /// Submit a transaction into host `idx`'s process through
+    /// `ProcessIo::submit_transaction`, the path the sim's submissions
+    /// take too. The process computes the touched-shard fanout and admits onto every
     /// hosted shard's mempool, gossiping any it doesn't host. Returns
     /// `false` when the host is down or shutting down. Submit through a host
     /// that runs the transaction's source shard so it admits directly
@@ -633,7 +634,7 @@ impl Harness {
     pub fn submit_transaction(&self, idx: usize, tx: &Transaction) -> bool {
         self.hosts[idx]
             .handle()
-            .is_some_and(|handle| handle.submit(Arc::new(Transaction::new(tx.body().clone()))))
+            .is_some_and(|handle| handle.submit(Transaction::new(tx.body().clone())))
     }
 
     /// The status host `idx`'s process recorded for `hash`, with the
@@ -720,6 +721,19 @@ impl Harness {
         self.read_furthest(shard, |store, height| {
             store.get_entries_at_height(range, height)
         })?
+    }
+
+    /// The committed entries of `range` on `shard` at `height`, off the
+    /// first host whose store still holds that height.
+    pub fn entries_at(
+        &self,
+        shard: ShardId,
+        range: DeclaredRange,
+        height: BlockHeight,
+    ) -> Option<Vec<(u128, Vec<u8>)>> {
+        self.hosts.iter().find_map(|h| {
+            h.read_store(shard, |store| store.get_entries_at_height(range, height))?
+        })
     }
 
     /// The committed substate byte total `shard`'s live store recorded at
@@ -809,6 +823,12 @@ impl Harness {
     ) {
         self.read_any(shard, |store| chain_fate(store, hash))
             .unwrap_or((None, None))
+    }
+
+    /// [`served_at`] over `target`'s live store: the block of `source`'s
+    /// that served it `hash`'s part. `None` if no host serves `target`.
+    pub fn served_at(&self, source: ShardId, target: ShardId, hash: TxHash) -> Option<BlockHeight> {
+        self.read_any(target, |store| served_at(store, source, hash))?
     }
 
     /// [`chain_burn`] over the live store the runner writes to. `None` if

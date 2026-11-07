@@ -1,17 +1,15 @@
 //! The simulation session and its event derivation.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE, NetworkDefinition,
-    NetworkId, PrincipalAddr, Provisions, ReshapeThresholds, ShardId, SharedCertificates,
+    NetworkId, PrincipalAddr, Provision, ReshapeThresholds, ShardId, SharedCertificates,
     StateClaim, TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash,
     ValidatorId, Verifiable, WeightedTimestamp,
 };
@@ -202,23 +200,29 @@ fn settlement_events(
     wt: u64,
     shard: ShardId,
     height: BlockHeight,
-    provisions: &[Arc<Verifiable<Provisions>>],
+    provisions: &[Verifiable<Provision>],
     state_claims: &[StateClaim],
     certificates: &SharedCertificates,
 ) {
-    for bundle in provisions {
-        let bundle = bundle.as_unverified();
-        let delivered: Vec<TxHash> = bundle
-            .transactions()
-            .iter()
-            .filter(|entry| !entry.entries.is_empty())
-            .map(|entry| entry.tx_hash)
-            .collect();
-        if !delivered.is_empty() {
-            events.push(TraceEvent::provisions_verified(
-                wt, bundle, shard, height, delivered,
-            ));
+    // One arc per source block, over the parts that carried state.
+    let mut delivered: BTreeMap<(ShardId, BlockHeight), Vec<TxHash>> = BTreeMap::new();
+    for part in provisions {
+        if !part.entries().is_empty() {
+            delivered
+                .entry((part.source_shard(), part.block_height()))
+                .or_default()
+                .push(part.tx_hash());
         }
+    }
+    for ((source, source_height), txs) in delivered {
+        events.push(TraceEvent::provisions_verified(
+            wt,
+            source,
+            source_height,
+            shard,
+            height,
+            txs,
+        ));
     }
     // A named, valued reading of an owed record is what the fold credits
     // its consumer off.
@@ -551,12 +555,8 @@ impl Session {
             }
         }
         let hash = tx.hash();
-        let tx = Arc::new(tx);
-        self.runner.schedule_initial_event(
-            0,
-            Duration::from_millis(1),
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
-        );
+        self.runner
+            .schedule_submission(0, Duration::from_millis(1), tx);
         self.nonce += 1;
         self.tracked.insert(hash, None);
         self.pending

@@ -25,12 +25,13 @@
 //! that they carry a validator of the beacon derived set; nothing a peer
 //! merely claims widens an audience. A host forwards only what one of its
 //! own handlers accepted, and an item whose handler deferred its verdict to
-//! a check that finishes later travels on only once that check holds up. Each item it does not accept is charged against
-//! its sender at about the work it took, and one that is the sender's fault
-//! (a rejection, not an item this host could not judge) at the cost of a
-//! signature check on top. A sender whose refused items cost more than its
-//! share is cooled down: its gossip streams are stopped unread until the
-//! cooldown lapses.
+//! a check that finishes later travels on only once that check holds up.
+//! Each item it does not accept, but for one it had no room for, is charged
+//! against its sender at about the work it took, and one that is the
+//! sender's fault (a rejection, not an item this host could not judge) at
+//! the cost of a signature check on top. A sender whose refused items cost
+//! more than its share is cooled down: its gossip streams are stopped unread
+//! until the cooldown lapses.
 //!
 //! Discovery rides the same path. Each host announces its signed address
 //! records at an interval, and hands a newly bound peer its own records and
@@ -55,6 +56,7 @@ use hyperscale_metrics::{
     record_network_message_sent,
 };
 use hyperscale_network::compression::{compress, decompress};
+use hyperscale_network::deferred::{DEFER_TIMEOUT, Deferred, Waiting};
 use hyperscale_network::{
     Deferral, HandlerRegistry, RawGossipHandler, RawHostGossipHandler, Verdict, VerdictKey,
 };
@@ -75,7 +77,6 @@ use tracing::{debug, warn};
 
 use crate::address_book::IngestOutcome;
 use crate::cooldown::{Cooldown, Refusal, refused_work};
-use crate::deferred::{Deferred, Waiting};
 use crate::endpoint::IrohAdapter;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::notify::ClassStreams;
@@ -141,10 +142,6 @@ const JUDGED_AT_ONCE_PER_PEER: usize = 4;
 /// Each check runs on this host's own pools, so the bound is on the work a
 /// peer can have queued before the verdicts that cool it down arrive.
 const DEFERRED_PER_PEER: usize = 64;
-
-/// Longest this host waits on a deferred verdict. An item still unsettled
-/// then is dropped as one it could not judge.
-const DEFER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where a gossip item is addressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -721,7 +718,8 @@ impl Fanout {
                         host_handler(payload.clone());
                     }
                     // No handler here judged it.
-                    handler(payload, scope.shard()).unwrap_or(Verdict::Ignore)
+                    handler(payload, scope.shard(), arrival.sender.provenance())
+                        .unwrap_or(Verdict::Ignore)
                 }
             };
             if let Verdict::Defer(deferral) = verdict {
@@ -820,8 +818,8 @@ impl Fanout {
     /// Act on an item's verdict. Only what a handler here accepted is
     /// forwarded: a host that forwards an item it did not judge would
     /// answer to the hosts it reaches for whatever the item turns out to
-    /// be. Anything else is charged against its sender, a rejection as its
-    /// fault.
+    /// be. Anything else but an item this host had no room for is charged
+    /// against its sender, a rejection as its fault.
     fn conclude(&self, arrival: &Arrival, verdict: &Verdict) {
         match verdict {
             Verdict::Accept => {
@@ -840,6 +838,7 @@ impl Fanout {
                     refused_work(arrival.bytes, Refusal::Unjudged),
                 );
             }
+            Verdict::Busy => {}
         }
     }
 

@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
-use hyperscale_storage::RowState;
+use hyperscale_storage::{MemberRow, RowState};
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, ChainOrigin, DeclaredRange, Derivation, Epoch, Event, Heard,
-    PriceTable, ShardId, Signer, StandingAnswers, StandingToward, StateRoot, SubstateKey,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    ValidatorId, WeightedTimestamp,
+    Address, Anchor, BeaconState, BlockHeight, ChainOrigin, ConsensusReceipt, DeclaredRange,
+    Derivation, Epoch, Event, Heard, PriceTable, ShardId, Signer, StandingAnswers, StandingToward,
+    StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
+    TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
 };
 
 use super::Budget;
@@ -65,7 +65,7 @@ pub fn submission_shards(snapshot: &TopologySnapshot, tx: &Transaction) -> Vec<S
 /// advance inside `run_until`.
 pub trait Cluster {
     /// Submit a transaction, routed to whichever host serves its source shard.
-    fn submit(&mut self, tx: Arc<Transaction>);
+    fn submit(&mut self, tx: Transaction);
 
     /// Submit a transaction to a host of `shard`, whatever its source
     /// shard would have been.
@@ -75,7 +75,7 @@ pub trait Cluster {
     /// the producing shard is long past the window it could include the
     /// transaction in and refuses it, where the delivering shard admits
     /// it on the record it consumes still standing.
-    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>);
+    fn submit_to(&mut self, shard: ShardId, tx: Transaction);
 
     /// Runs `f` on a derivation the cluster answers alike to — what a
     /// scenario reads a routed fact off a transaction it built itself
@@ -107,6 +107,18 @@ pub trait Cluster {
     /// Sim drives its logical clock (and pumps reshape); production blocks on a
     /// poll loop while reshape advances organically via the supervisor.
     fn run_until(&mut self, budget: Budget, cond: impl Fn(&Self) -> bool) -> bool;
+
+    /// [`Self::run_until`] reading `cond` every `poll` of the cluster's
+    /// clock where it can, for a state a slower poll would step over.
+    fn run_polling(
+        &mut self,
+        budget: Budget,
+        poll: Duration,
+        cond: impl Fn(&Self) -> bool,
+    ) -> bool {
+        let _ = poll;
+        self.run_until(budget, cond)
+    }
 
     /// Chain time on the cluster's own clock, as Unix time — for building
     /// transaction validity windows. Sim returns its logical clock from the
@@ -195,6 +207,19 @@ pub trait Cluster {
         None
     }
 
+    /// [`entries`](Self::entries) as `shard` committed them at `height`:
+    /// what a part provisioned off that block carries. `None` when no
+    /// hosted store still holds that height.
+    fn entries_at(
+        &self,
+        shard: ShardId,
+        range: DeclaredRange,
+        height: BlockHeight,
+    ) -> Option<Vec<(u128, Vec<u8>)>> {
+        let _ = (shard, range, height);
+        None
+    }
+
     /// What `tx` would move and cost, run against `shard`'s committed tip
     /// without committing anything.
     ///
@@ -218,6 +243,24 @@ pub trait Cluster {
     /// shard for a multi-shard transaction by design. `None` when no
     /// hosted store on `shard` holds the receipt.
     fn events(&self, shard: ShardId, tx: TxHash) -> Option<Vec<Event>> {
+        let _ = (shard, tx);
+        None
+    }
+
+    /// The receipt `shard` settled its member of `tx` under: the writes
+    /// and movements its own projection of the run applies. `None` when
+    /// no hosted store on `shard` holds one.
+    ///
+    /// The same observation seam as [`events`](Self::events): each shard
+    /// a core spans certifies its own projection, so whether two of them
+    /// ran one walk is read off their two receipts and nowhere else.
+    ///
+    /// # Panics
+    ///
+    /// Where a store of `shard` holds more than one receipt for `tx`,
+    /// which a shard running two members of it settles and which no
+    /// scenario asking this one builds.
+    fn receipt(&self, shard: ShardId, tx: TxHash) -> Option<Arc<ConsensusReceipt>> {
         let _ = (shard, tx);
         None
     }
@@ -253,6 +296,14 @@ pub trait Cluster {
     /// as its own is a fact about committed state no status reports, and
     /// so is which member a tick holds while another waits on it.
     fn member_rows(&self, _shard: ShardId) -> Option<BTreeMap<TxHash, RowState>> {
+        None
+    }
+
+    /// `shard`'s member rows whole, as its tallest store holds them:
+    /// each row's place in the queue, its head and its `blocked_at`
+    /// beside its state; `None` where this cluster cannot read state
+    /// entries. An observation seam, like [`Self::member_rows`].
+    fn queued_rows(&self, _shard: ShardId) -> Option<BTreeMap<TxHash, MemberRow>> {
         None
     }
 
@@ -357,6 +408,23 @@ pub trait Cluster {
         None
     }
 
+    /// How many claims of `shard`'s chain read the record at `key`
+    /// absent, or zero where this cluster keeps no chain it walks that
+    /// way.
+    fn absent_record_readings(&self, _shard: ShardId, _key: SubstateKey) -> usize {
+        0
+    }
+
+    /// The anchor of the first claim of `shard`'s chain holding the value
+    /// at `key`, or `None` until one does or where this cluster keeps no
+    /// chain it walks that way.
+    ///
+    /// A push stands at the block that wrote the record, so a reading at
+    /// a later anchor came by a read.
+    fn record_reading_anchor(&self, _shard: ShardId, _key: SubstateKey) -> Option<Anchor> {
+        None
+    }
+
     /// Every crossing decline on `shard`'s chain naming `tx`: the height
     /// each committed at and the record it refuses.
     ///
@@ -378,6 +446,34 @@ pub trait Cluster {
         Option<BlockHeight>,
         Option<(BlockHeight, TransactionDecision)>,
     );
+
+    /// The height of the block of `source`'s that served `target` its
+    /// part of `tx`: the `source_height` of the engagement `target`'s
+    /// chain committed for `(source, tx)`, read off the target since the
+    /// source's row is gone once the transaction settles. `None` until
+    /// the target commits one.
+    fn served_at(&self, source: ShardId, target: ShardId, tx: TxHash) -> Option<BlockHeight>;
+
+    /// The tick of `shard`'s that ran `tx`, and the head height its line
+    /// names. `None` until `shard`'s chain names it to run.
+    fn ran_line(&self, shard: ShardId, tx: TxHash) -> Option<(BlockHeight, Option<BlockHeight>)> {
+        let _ = (shard, tx);
+        None
+    }
+
+    /// How many members' own parts this cluster has held to the part a
+    /// counterpart sharing their verdict absorbed. Zero where it does not
+    /// hold them to it.
+    fn served_parts_agreed(&self) -> usize {
+        0
+    }
+
+    /// Whether this cluster has held `tx`'s member on `shard` to the part
+    /// a counterpart absorbed. False where it does not hold them to it.
+    fn served_part_agreed(&self, shard: ShardId, tx: TxHash) -> bool {
+        let _ = (shard, tx);
+        false
+    }
 
     /// The height at which `shard`'s chain burned `tx`'s price, if it
     /// has: the block carrying the finalization of the member that held
@@ -412,7 +508,7 @@ pub trait Cluster {
     /// whether the delay was kept: a cluster that cannot schedule a
     /// submission makes it at once and says so, so a scenario spreading
     /// its offers can report the arrival it got.
-    fn submit_after(&mut self, delay: Duration, tx: Arc<Transaction>) -> bool {
+    fn submit_after(&mut self, delay: Duration, tx: Transaction) -> bool {
         let _ = delay;
         self.submit(tx);
         false

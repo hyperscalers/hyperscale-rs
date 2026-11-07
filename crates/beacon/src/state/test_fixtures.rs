@@ -356,12 +356,41 @@ pub fn apply_witness_chunk_after(
     fold_witness_chunk(state, shard_n, blocks, payloads)
 }
 
+/// [`apply_witness_chunk`] under a boundary QC whose signers signed
+/// `committee_epoch`: a recovery's fresh committee signs its bridge
+/// window, which the fold reads to tell its crossing from a discarded
+/// branch's.
+pub fn apply_witness_chunk_signed_under(
+    state: &mut BeaconState,
+    shard_n: u64,
+    committee_epoch: Epoch,
+    payloads: Vec<ShardWitnessPayload>,
+) -> SlotEffects {
+    state
+        .boundaries
+        .entry(ShardId::leaf(1, shard_n))
+        .or_insert_with(genesis_boundary);
+    fold_witness_chunk_signed_under(state, shard_n, 0, committee_epoch, payloads)
+}
+
 /// [`apply_witness_chunk_after`] over the boundary records exactly as
 /// `state` holds them.
 pub fn fold_witness_chunk(
     state: &mut BeaconState,
     shard_n: u64,
     blocks: u64,
+    payloads: Vec<ShardWitnessPayload>,
+) -> SlotEffects {
+    fold_witness_chunk_signed_under(state, shard_n, blocks, Epoch::GENESIS, payloads)
+}
+
+/// [`fold_witness_chunk`] under a boundary QC whose signers signed
+/// `committee_epoch`.
+fn fold_witness_chunk_signed_under(
+    state: &mut BeaconState,
+    shard_n: u64,
+    blocks: u64,
+    committee_epoch: Epoch,
     payloads: Vec<ShardWitnessPayload>,
 ) -> SlotEffects {
     let shard = ShardId::leaf(1, shard_n);
@@ -371,7 +400,7 @@ pub fn fold_witness_chunk(
     let height = record.map_or(BlockHeight::new(5), |b| b.height.next());
 
     let block = boundary_chunk_at(shard_n, height, prior, blocks, payloads);
-    fold_blocks(state, dur + 1, vec![block])
+    fold_blocks_signed_under(state, committee_epoch, dur + 1, vec![block])
 }
 
 /// A block of `shard` at `height` whose parent QC carries `anchor_ms` and
@@ -399,6 +428,7 @@ pub fn block_carrying(
         BlockHeight::new(height.saturating_sub(1)),
         BlockHash::ZERO,
         Round::INITIAL,
+        Epoch::GENESIS,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(anchor_ms),
@@ -426,6 +456,16 @@ pub fn fold_blocks(
     certified_ms: u64,
     blocks: Vec<(BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>)>,
 ) -> SlotEffects {
+    fold_blocks_signed_under(state, Epoch::GENESIS, certified_ms, blocks)
+}
+
+/// [`fold_blocks`] under QCs whose signers signed `committee_epoch`.
+fn fold_blocks_signed_under(
+    state: &mut BeaconState,
+    committee_epoch: Epoch,
+    certified_ms: u64,
+    blocks: Vec<(BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>)>,
+) -> SlotEffects {
     let boundary_qcs: BTreeMap<ShardId, Option<QuorumCertificate>> = blocks
         .iter()
         .map(|(header, _, _)| {
@@ -435,6 +475,7 @@ pub fn fold_blocks(
                 header.height(),
                 header.parent_block_hash(),
                 Round::INITIAL,
+                committee_epoch,
                 SignerBitfield::new(4),
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(certified_ms),
@@ -512,6 +553,7 @@ fn boundary_header(
         height.prev().unwrap_or(BlockHeight::GENESIS),
         BlockHash::ZERO,
         Round::INITIAL,
+        Epoch::GENESIS,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(1),

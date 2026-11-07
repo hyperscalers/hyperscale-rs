@@ -17,25 +17,35 @@
 
 mod support;
 
+mod book;
 mod contention;
+mod cutoff;
 mod execution;
 mod faults;
 mod fees;
 mod liveness;
 mod multi_vnode;
+mod payer_cycle;
 mod payer_floor;
 mod pushes;
 mod reshape;
 mod restart;
 mod route;
 mod route_reshape;
+mod served_reads;
 mod straddler;
 mod swarm;
 mod transactions;
 mod venue;
 mod witnesses;
 
+pub use book::{
+    BOOK_SHARD, BOOK_VENUE_SHARD, BookRoute, RouteFill,
+    a_route_whose_venue_never_commits_frees_the_ladder,
+    a_stalled_venue_aborts_its_route_at_the_window, book_route_genesis_accounts,
+};
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
+pub use cutoff::{a_divided_core_pays_out_under_one_clock, cutoff_genesis_accounts};
 pub use execution::{
     STANDING_PAYMENTS, a_consumer_never_committing_declines_a_pushed_record,
     a_delivery_cut_off_past_its_window_is_owed,
@@ -86,10 +96,15 @@ pub use fees::{
 };
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
+pub use payer_cycle::{
+    a_cycle_through_a_payer_core_aborts_at_the_window, payer_cycle_genesis_accounts,
+    sponsored_routes_crossed_through_their_legs_abort_at_the_window,
+};
 pub use payer_floor::{
     Ceiling, PAYER_SHARD, Pair, RoutePayer, Spend, a_payer_publishes_beside_its_unsettled_spend,
     a_payer_spends_beside_its_pending_leg, a_payer_spends_beside_its_routes_pending_core,
-    a_publish_its_packages_shard_refuses_pays_and_ends_its_hold, assert_pair_rule,
+    a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
+    a_whole_members_part_is_served_by_the_block_settling_an_earlier_writer, assert_pair_rule,
     contested_publish_genesis_accounts, pending_leg_genesis_accounts,
     publish_beside_spend_genesis_accounts,
 };
@@ -113,9 +128,16 @@ pub use restart::{
     a_restart_mid_handoff_keeping_its_stores_catches_the_child_up,
 };
 pub use route::{
-    Certificates, CoreLoad, FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport,
-    SECOND_VENUE_SHARD, TRADER_SHARD, a_core_stated_at_a_halt_is_accepted_on_both_venues,
-    a_crossing_the_consumer_refuses_is_declined, a_recovered_venue_keeps_what_its_sibling_accepted,
+    Certificates, ContendedLoad, CoreLoad, FIRST_VENUE_SHARD, HOT_POOL_ADOPT_IF, HotPool,
+    ROUTE_INPUT, ROUTES, RecordReadCost, RouteReport, SECOND_VENUE_SHARD, TRADER_SHARD,
+    a_core_stated_at_a_halt_is_accepted_on_both_venues,
+    a_crossing_the_consumer_refuses_is_declined, a_dead_holder_leaves_room_for_a_lost_record,
+    a_killed_proposer_costs_a_route_no_more_than_a_read,
+    a_lost_record_is_read_inside_twelve_seconds,
+    a_lost_record_on_a_busy_holder_is_read_inside_ten_seconds,
+    a_read_nobody_answers_stands_alone_for_its_key, a_read_that_finds_no_record_yet_reads_again,
+    a_recovered_venue_keeps_what_its_sibling_accepted,
+    a_restart_with_wants_past_the_clock_asks_each_once,
     a_route_a_halting_venue_could_read_is_settled_before_the_halt,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
@@ -127,18 +149,21 @@ pub use route::{
     a_route_whose_held_core_keeps_its_sponsors_hold,
     a_shard_halted_across_an_abandon_window_settles_again,
     a_stall_past_the_finalization_delay_states_every_member_of_its_tick,
+    a_stalled_holder_draws_one_ask_per_key, a_venue_hearing_late_still_loses_the_later_route_fast,
     an_unseen_never_goes_once_its_producers_leg_is_fated,
-    both_venues_read_a_routes_record_inside_the_finalization_delay, core_load_genesis_accounts,
-    core_routes_under_load, crossed_route_genesis_accounts, late_certificate_genesis_accounts,
-    ring_route_genesis_accounts, route_genesis_accounts,
-    routes_held_in_a_ring_wait_for_their_deadline,
+    both_venues_read_a_routes_record_inside_the_finalization_delay,
+    contended_load_genesis_accounts, contended_routes_through_one_pair_under_load,
+    core_load_genesis_accounts, core_routes_under_load, crossed_route_genesis_accounts,
+    hot_pool_genesis_accounts, late_certificate_genesis_accounts,
+    one_lost_height_among_delivered_pushes, read_bound, ring_route_genesis_accounts,
+    route_genesis_accounts, routes_held_in_a_ring_abort_at_the_window,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
-    routes_seated_the_other_way_lose_the_later_to_the_cycle,
+    routes_seated_the_other_way_lose_the_later_to_the_cycle, seat_fetches_on_a_hot_pool,
     standing_answers_level_off_under_sustained_load, stated_venues_hear_each_others_yes_by_asking,
     stated_venues_hear_each_others_yes_by_push,
 };
 pub use route_reshape::{
-    LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN,
+    LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN, a_book_route_reads_its_range_across_a_split,
     a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_within_a_merging_pair_settles_before_the_merge_cuts,
     a_departing_venue_clears_swaps_and_carries_on,
@@ -172,6 +197,14 @@ pub use route_reshape::{
     saturated_reshape_genesis_accounts, second_splitter_genesis_accounts,
     split_train_genesis_accounts,
 };
+pub use served_reads::{
+    a_leg_reserving_a_read_vault_settles_before_the_read,
+    a_member_named_in_its_head_block_reads_one_part,
+    a_reclaim_onto_a_served_till_reads_one_balance_on_both_shards,
+    a_restart_between_head_and_tick_reads_the_same_part,
+    an_owed_credit_onto_a_served_vault_composes, served_reads_genesis_accounts,
+    two_members_reading_what_the_other_reserves_both_settle,
+};
 pub use straddler::{
     a_delivery_is_owed_when_its_deliverer_splits,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
@@ -183,7 +216,7 @@ pub use straddler::{
 };
 pub use support::{
     BlockServingCap, Budget, Cluster, Crash, CrashableCluster, DISCARD, FaultHandle,
-    FaultableCluster, MemberEdge, Nemesis, RestartableCluster, ScenarioConfig, assume,
+    FaultableCluster, MemberEdge, Nemesis, ProofMeter, RestartableCluster, ScenarioConfig, assume,
     committees_on_separate_hosts, conservation, discard, epochs, grow_and_hold, grow_to, query,
     submission_shards, tx, vote_reshape_threshold, wait,
 };
@@ -192,6 +225,7 @@ pub use transactions::livelock_resolves_promptly;
 pub use venue::{
     SWAP_INPUT, SWAPPER_SHARD, SWAPPERS, SpendBesideAbort, StockedVenue, VENUE_SHARD, VenueReport,
     WIDE_VENUE_SHARD, a_held_core_keeps_its_sponsors_hold_until_it_aborts,
+    a_hot_venue_runs_every_swap_where_it_commits,
     a_sponsor_spends_its_balance_beside_its_held_cores_abort,
     a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,

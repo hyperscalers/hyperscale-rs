@@ -14,7 +14,6 @@ mod fetch;
 mod finalization_serve;
 mod local_provision_serve;
 mod provision_serve;
-mod remote_header;
 mod remote_header_serve;
 mod remote_header_sync;
 mod settled_txs_serve;
@@ -22,17 +21,20 @@ mod state_proof_serve;
 
 pub use fetch::{
     FinalizationBinding, FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch,
-    ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch, StateProofBinding,
-    StateProofFetch, VerdictProofBinding, VerdictProofFetch,
+    ProvisionBinding, ProvisionFetch, RecordProofBinding, RecordProofFetch, SettledTxsBinding,
+    SettledTxsFetch, StateProofBinding, StateProofFetch, VerdictProofBinding, VerdictProofFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
-use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
-use hyperscale_types::LocalTimestamp;
+use hyperscale_execution::{MAX_RECORD_ASKS_PER_HOLDER, MAX_VERDICT_ASKS_PER_SIBLING};
+use hyperscale_types::{LocalTimestamp, MAX_TXS_PER_BLOCK};
 pub use local_provision_serve::serve_local_provisions_request;
-pub use provision_serve::serve_provision_request;
-pub use remote_header::RemoteHeaderSyncInput;
-use remote_header::{RemoteHeaderSync, RemoteHeaderSyncOutput};
+pub use provision_serve::{
+    OwedLeaves, Owing, PROVISION_CACHE_BYTES, ServedPart, build_served_parts, outbound_answer,
+    owed_leaves, provision_answer,
+};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
+pub use remote_header_sync::RemoteHeaderSyncInput;
+use remote_header_sync::{RemoteHeaderSync, RemoteHeaderSyncOutput};
 pub use settled_txs_serve::{SettledTxsCache, serve_settled_txs_request};
 pub use state_proof_serve::{serve_cells_request, serve_state_proof_request};
 
@@ -60,6 +62,9 @@ pub struct CrossShardState {
     /// `state_proof` so asks a silent sibling never answers take none of
     /// its places.
     pub(crate) verdict_proof: VerdictProofFetch,
+    /// Fetch of the crossing records consumers here wait on, apart from
+    /// `state_proof` so a backlog of reads takes none of its places.
+    pub(crate) record_proof: RecordProofFetch,
     /// Settled-set fetch against departed shards' terminals (rotates
     /// through the terminal committee).
     pub(crate) settled_txs: SettledTxsFetch,
@@ -69,7 +74,7 @@ pub struct CrossShardState {
 const STATE_PROOF_FETCH: FetchConfig = FetchConfig {
     max_in_flight: 256,
     max_ids_per_request: 64,
-    parallel_chunks_per_tick: 2,
+    chunks_per_dispatch: 2,
 };
 
 /// How many verdict questions one request carries: each expands to
@@ -90,24 +95,37 @@ const VERDICT_REQUESTS_IN_FLIGHT: usize = 4;
 const VERDICT_PROOF_FETCH: FetchConfig = FetchConfig {
     max_in_flight: VERDICT_REQUESTS_IN_FLIGHT * VERDICT_QUESTIONS_PER_REQUEST,
     max_ids_per_request: VERDICT_QUESTIONS_PER_REQUEST,
-    parallel_chunks_per_tick: VERDICT_REQUESTS_IN_FLIGHT,
+    chunks_per_dispatch: VERDICT_REQUESTS_IN_FLIGHT,
 };
 
 const _: () = assert!(VERDICT_QUESTIONS_PER_REQUEST == MAX_VERDICT_ASKS_PER_SIBLING);
+
+/// What the fetch of crossing records may hold in flight: the shape of
+/// the state-proof fetch. At a 300 ms round trip that drains about 850
+/// reads a second, about what a consumer's blocks can carry, so a faster
+/// drain would only queue in what it holds to offer. The asker keeps at
+/// most one request's reads out toward any one holder, so three holders
+/// that never answer leave a place.
+const RECORD_PROOF_FETCH: FetchConfig = STATE_PROOF_FETCH;
+
+const _: () = assert!(RECORD_PROOF_FETCH.max_ids_per_request == MAX_RECORD_ASKS_PER_HOLDER);
 
 impl CrossShardState {
     /// Build cross-shard state for a freshly hosted shard.
     #[must_use]
     pub(crate) fn new(config: &NodeConfig) -> Self {
         Self {
-            remote_header_sync: RemoteHeaderSync::new(remote_header::default_config()),
-            provision: ProvisionFetch::new("provision", config.provision_fetch.clone()),
+            remote_header_sync: RemoteHeaderSync::new(remote_header_sync::default_config()),
+            provision: ProvisionFetch::new(
+                "provision",
+                config.provision_fetch.clamped(MAX_TXS_PER_BLOCK),
+            ),
             finalization: FinalizationFetch::new(
                 "finalization",
                 FetchConfig {
                     max_in_flight: 8,
                     max_ids_per_request: 4,
-                    parallel_chunks_per_tick: 1,
+                    chunks_per_dispatch: 1,
                 },
             ),
             local_provision: LocalProvisionFetch::new(
@@ -115,17 +133,18 @@ impl CrossShardState {
                 FetchConfig {
                     max_in_flight: 64,
                     max_ids_per_request: 16,
-                    parallel_chunks_per_tick: 2,
+                    chunks_per_dispatch: 2,
                 },
             ),
             state_proof: StateProofFetch::new("state_proof", STATE_PROOF_FETCH),
             verdict_proof: VerdictProofFetch::new("verdict_proof", VERDICT_PROOF_FETCH),
+            record_proof: RecordProofFetch::new("record_proof", RECORD_PROOF_FETCH),
             settled_txs: SettledTxsFetch::new(
                 "settled_txs",
                 FetchConfig {
                     max_in_flight: 8,
                     max_ids_per_request: 8,
-                    parallel_chunks_per_tick: 2,
+                    chunks_per_dispatch: 2,
                 },
             ),
         }
@@ -143,6 +162,7 @@ impl CrossShardState {
             || self.local_provision.has_pending()
             || self.state_proof.has_pending()
             || self.verdict_proof.has_pending()
+            || self.record_proof.has_pending()
             || self.settled_txs.has_pending()
     }
 
@@ -166,14 +186,16 @@ mod tests {
 
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        Anchor, BlockHeight, ShardId, StateRoot, VerdictCells, WeightedTimestamp,
+        Anchor, BlockHeight, MAX_TXS_PER_BLOCK, ShardId, StateRoot, SubstateKey, VerdictCells,
+        WeightedTimestamp,
     };
 
     use super::{
-        MAX_VERDICT_ASKS_PER_SIBLING, STATE_PROOF_FETCH, StateProofFetch, VERDICT_PROOF_FETCH,
-        VerdictProofFetch,
+        CrossShardState, MAX_VERDICT_ASKS_PER_SIBLING, ProvisionBinding, RECORD_PROOF_FETCH,
+        STATE_PROOF_FETCH, StateProofFetch, VERDICT_PROOF_FETCH, VerdictProofFetch,
     };
-    use crate::fetch::{Fetch, FetchInput, FetchOutput};
+    use crate::config::NodeConfig;
+    use crate::fetch::{Fetch, FetchConfig, FetchInput, FetchOutput, SolicitedAnswer};
 
     /// `shard`'s header at `height`.
     fn header(shard: ShardId, height: u64) -> Anchor {
@@ -217,6 +239,32 @@ mod tests {
             for FetchOutput::Send { ids, .. } in take(&mut sent) {
                 sent.extend(fetch.handle(FetchInput::Failed { ids }));
             }
+        }
+    }
+
+    /// However wide the configured batch, every chunk the provision fetch
+    /// sends fits the one request it rides in.
+    #[test]
+    fn a_wide_provision_batch_is_clamped_to_one_request() {
+        let config = NodeConfig {
+            provision_fetch: FetchConfig::new(2 * MAX_TXS_PER_BLOCK, 2 * MAX_TXS_PER_BLOCK, 4),
+            ..NodeConfig::default()
+        };
+        let mut state = CrossShardState::new(&config);
+        let (source, target) = (ShardId::leaf(1, 1), ShardId::leaf(1, 0));
+        let indices = 0..=u32::try_from(MAX_TXS_PER_BLOCK).expect("the cap fits a u32");
+        let sent = state.provision.handle(FetchInput::Request {
+            ids: indices
+                .map(|index| (source, target, BlockHeight::new(3), index))
+                .collect(),
+            shard: source,
+            preferred: None,
+            class: None,
+        });
+        assert_eq!(sent.len(), 2);
+        for FetchOutput::Send { ids, .. } in sent {
+            let request = ProvisionBinding::request(&ids);
+            assert!(request.indices.len() <= MAX_TXS_PER_BLOCK);
         }
     }
 
@@ -325,6 +373,41 @@ mod tests {
             vec![asked],
             "the ask toward the healthy sibling goes out once, whole",
         );
+    }
+
+    /// `count` record reads put to `shard` at one header, the nth filed
+    /// nth, and their keys running the other way.
+    fn reads(shard: ShardId, count: u8) -> Vec<(WeightedTimestamp, Anchor, SubstateKey)> {
+        (0..count)
+            .map(|nth| {
+                (
+                    WeightedTimestamp::from_millis(u64::from(nth)),
+                    header(shard, 1),
+                    test_key(u8::MAX - nth),
+                )
+            })
+            .collect()
+    }
+
+    /// Reads dispatch in the order their wants were filed, whatever
+    /// their keys.
+    #[test]
+    fn record_reads_dispatch_oldest_filed_first() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = CrossShardState::new(&NodeConfig::default());
+        let per_request = u8::try_from(RECORD_PROOF_FETCH.max_ids_per_request).expect("small");
+        let asked = reads(shard, per_request + 1);
+        let sent = state.record_proof.handle(FetchInput::Request {
+            ids: asked.iter().rev().copied().collect(),
+            shard,
+            preferred: None,
+            class: None,
+        });
+        let dispatched: Vec<_> = sent
+            .into_iter()
+            .flat_map(|FetchOutput::Send { ids, .. }| ids)
+            .collect();
+        assert_eq!(dispatched, asked, "oldest filed first");
     }
 
     /// One request carries as many questions as expand to no more keys

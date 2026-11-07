@@ -18,6 +18,7 @@ mod tombstones;
 mod tx_store;
 
 pub use coordinator::{
-    DEFAULT_MIN_DWELL_TIME, MempoolConfig, MempoolCoordinator, MempoolMemoryStats,
+    DEFAULT_MAX_PENDING, DEFAULT_MIN_DWELL_TIME, MempoolConfig, MempoolCoordinator,
+    MempoolMemoryStats,
 };
 pub use tx_store::TxStore;

@@ -15,33 +15,37 @@ use hyperscale_hbor::{
     Bytes, Capped, Hash32, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
 };
 use hyperscale_jmt::{
-    Blake3Hasher, Key as JmtKey, LeafValue, MAX_SINGLE_CLAIM_PROOF_BYTES, MemoryStore, MultiProof,
-    NodeKey, Tree,
+    Blake3Hasher, Key as JmtKey, LeafValue, MAX_PROOF_CLAIMS, MAX_SINGLE_CLAIM_PROOF_BYTES,
+    MemoryStore, MultiProof, NodeKey, Tree,
 };
+use hyperscale_types::network::response::{GetLocalProvisionsResponse, LocalProvisionEntry};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass,
     AggregateSignature, Anchor, BLOCK_RESPONSE_INLINE_BYTES, BlockHeader, BlockHeaderParts,
-    BlockHeight, CollectionId, CommittedAt, ConsensusReceipt, Crossings, Deadline, DeclaredKey,
-    DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock, Engagement,
-    ExecutionCertificate, ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash,
-    Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK, MAX_ENGAGEMENTS_PER_BLOCK,
-    MAX_ENVELOPE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
-    MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
+    BlockHeight, CertifiedBlockHeader, CollectionId, CommittedAt, ConsensusReceipt, Crossings,
+    Deadline, DeclaredKey, DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, ElidedCertifiedBlock,
+    Engagement, Epoch, ExecutionCertificate, ExecutionOutcome, Finalization, FinalizationHash,
+    GlobalReceiptHash, Hash, Joins, LeafPath, LocalKey, MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK,
+    MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FETCH_RESPONSE_BYTES,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_MERKLE_PROOF_LEN,
+    MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_PART_BYTES,
+    MAX_PROVISION_PATH_DEPTH, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISION_WEIGHT,
     MAX_PROVISIONS_PER_BLOCK, MAX_STAGED_RECEIPT_BYTES, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES,
-    MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms, MerkleInclusionProof, Movement,
-    ProvisionHash, ProvisionTxRoot, Provisions, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach,
+    MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TX_READ_BYTES, MAX_TXS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms,
+    MerkleInclusionProof, Modes, Movement, Pin, PinKey, Pins, Provision, ProvisionContext,
+    ProvisionHash, ProvisionParts, ProvisionTxRoot, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach,
     Reserves, Role, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES,
     STATE_CLAIM_CELL_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, Settlement,
     ShardId, SignerBitfield, StateClaim, StateRoot, StateWrites, Stated, StatedTerms,
-    StoredReceipt, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
-    TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickHalf, TickId, TickLine,
-    TickManifest, Transaction, TransactionEnvelope, TxHash, TxOutcome, UNSETTLED_TX_BYTES,
-    UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-    evidence_admits_block, receipt_hash_of, shard_prefix_path, staged_yes_bytes,
-    state_claims_admit_block, tick_manifest_admits_block, tick_terms_admit_block,
+    StoredReceipt, SubstateEntry, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES,
+    TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
+    TickHalf, TickId, TickLine, TickManifest, Transaction, TransactionEnvelope, TxHash, TxOutcome,
+    UNSETTLED_TX_BYTES, UnsettledTx, Verifiable, Verify, WeightedTimestamp, WitnessSources,
+    compute_global_receipt_root, evidence_admits_block, receipt_hash_of, shard_prefix_path,
+    staged_yes_bytes, state_claims_admit_block, tick_manifest_admits_block, tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{IntentHash, MAX_CROSSINGS_PER_TX, Mode, Moves, ResourceAddr};
@@ -122,7 +126,7 @@ fn name(seed: u8, routes: usize) -> UnsettledTx {
         committed: CommittedAt {
             height: BlockHeight::new(u64::MAX),
             anchor: WeightedTimestamp::from_millis(u64::MAX / 2),
-            committee_anchor: WeightedTimestamp::from_millis(u64::MAX / 2),
+            committee_epoch: Epoch::new(u64::MAX),
         },
         reach: Capped::new(
             (0..routes)
@@ -441,6 +445,154 @@ fn a_single_cell_claims_p99_is_what_the_budget_is_derived_from() {
             .expect("a claim's proof decodes");
 }
 
+/// The deepest leaf path a part carries.
+fn deepest_path() -> LeafPath {
+    LeafPath {
+        count: u32::MAX,
+        index: u32::MAX - 1,
+        siblings: Capped::new(
+            (0..MAX_PROVISION_PATH_DEPTH)
+                .map(hash_at)
+                .collect::<Vec<_>>(),
+        )
+        .expect("the path cap"),
+    }
+}
+
+/// A part at every width its caps admit fits what a fetch response
+/// leaves it: the proof at its decode cap, the weight cap's keys, values
+/// at the read bytes a declaration may price, and the deepest path.
+///
+/// The values are bounded by the declaration's read bytes, not by the
+/// raw cell cap, because every provision key is a declared target and
+/// every leaf is held to its slot's width at write.
+#[test]
+fn a_part_at_maximal_widths_fits_a_fetch_response() {
+    let encoded = hbor_to_vec(&maximal_part()).expect("a part encodes").len();
+    println!(
+        "maximal part: {encoded} bytes of {MAX_PROVISION_PART_BYTES}, in a response of \
+         {MAX_FETCH_RESPONSE_BYTES}",
+    );
+    assert!(encoded <= MAX_PROVISION_PART_BYTES);
+}
+
+/// A local-provision answer always keeps its first part, with the
+/// source header that part brings, whatever the two weigh. A part at
+/// maximal widths beside the widest header overruns the fetch response
+/// budget by no more than the envelope the frame already reserves for
+/// an answer's last item.
+#[test]
+fn a_lone_maximal_part_and_its_header_fit_the_frame() {
+    let (header, qc) = widest_header();
+    let response = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
+        provision: maximal_part(),
+        source_header: Some(CertifiedBlockHeader::new(header, qc)),
+    }]));
+    let encoded = hbor_to_vec(&response).expect("a response encodes").len();
+    println!(
+        "lone maximal local-provision answer: {encoded} bytes, budget \
+         {MAX_FETCH_RESPONSE_BYTES} plus an envelope's {MAX_ENVELOPE_BYTES}",
+    );
+    assert!(encoded <= MAX_FETCH_RESPONSE_BYTES + MAX_ENVELOPE_BYTES);
+}
+
+/// A part at every width its caps admit.
+fn maximal_part() -> Provision {
+    let value_bytes = usize::try_from(MAX_TX_READ_BYTES).expect("a read budget fits memory");
+    let per_value = value_bytes / MAX_PROVISION_WEIGHT;
+    let entries: Vec<SubstateEntry> = (0..MAX_PROVISION_WEIGHT)
+        .map(|at| {
+            let seed = at.to_le_bytes();
+            let key = SubstateKey {
+                owner: Address::new([0x11; 31], AddressClass::Component),
+                local: LocalKey(Hash::from_bytes(&seed).as_bytes()[..16].try_into().unwrap()),
+            };
+            SubstateEntry::new(key, Some(Bytes::new(vec![0xAB; per_value]).unwrap()))
+        })
+        .collect();
+    Provision::new(ProvisionParts {
+        source_shard: ShardId::leaf(1, 0),
+        target_shard: ShardId::leaf(1, 1),
+        block_height: BlockHeight::new(u64::MAX),
+        source_block_ts: WeightedTimestamp::from_millis(u64::MAX),
+        clock: WeightedTimestamp::from_millis(u64::MAX),
+        tx_hash: TxHash::from(hash_at(0)),
+        entries: Capped::new(entries).expect("the weight cap"),
+        proof: MerkleInclusionProof::new(vec![0x5A; MAX_MERKLE_PROOF_LEN]),
+        leaf: deepest_path(),
+    })
+}
+
+/// One transaction's part at the most cells a proof may claim, every
+/// cell present and then every cell absent, proven against a spread
+/// tree.
+///
+/// An absent cell's claim ends at a leaf for another key or an empty
+/// slot, which encodes wider than a leaf at the key, while its entry
+/// carries no value. The part carrying every declared cell explicitly
+/// verifies and stays within a fetch response either way.
+#[test]
+fn a_part_of_absent_cells_at_the_claim_cap_fits_a_fetch_response() {
+    let shard = ShardId::leaf(1, 0);
+    let (store, root, held) = spread_tree(shard, 2 * MAX_PROOF_CLAIMS, 11);
+    let (_, _, missing) = spread_tree(shard, MAX_PROOF_CLAIMS, 13);
+    let anchor = Anchor {
+        shard,
+        height: BlockHeight::new(1),
+        state_root: root,
+        ts: WeightedTimestamp::from_millis(0),
+    };
+    let bundle_over = |keys: &[SubstateKey], present: bool| {
+        let jmt_keys: Vec<JmtKey> = keys.iter().map(SubstateKey::to_bytes).collect();
+        let proof = Jmt::prove(
+            &store,
+            &NodeKey::new(1, shard_prefix_path(shard)),
+            &jmt_keys,
+        )
+        .expect("every key proves against a held version")
+        .encode();
+        let mut entries: Vec<SubstateEntry> = keys
+            .iter()
+            .map(|key| {
+                let value = present.then(|| Bytes::new(key.to_bytes().to_vec()).unwrap());
+                SubstateEntry::new(*key, value)
+            })
+            .collect();
+        entries.sort_by_key(|entry| entry.key);
+        Provision::new(ProvisionParts {
+            source_shard: shard,
+            target_shard: ShardId::leaf(1, 1),
+            block_height: anchor.height,
+            source_block_ts: anchor.ts,
+            clock: anchor.ts,
+            tx_hash: TxHash::from(hash_at(0)),
+            entries: Capped::new(entries).expect("the claim cap is the weight cap"),
+            proof: MerkleInclusionProof::new(proof),
+            leaf: deepest_path(),
+        })
+    };
+    let present = bundle_over(&held[..MAX_PROOF_CLAIMS], true);
+    let absent = bundle_over(&missing, false);
+    for (label, part) in [("present", &present), ("absent", &absent)] {
+        part.verify(&ProvisionContext { anchor })
+            .unwrap_or_else(|error| panic!("the {label} part verifies: {error}"));
+        let proof = part.proof().as_bytes().len();
+        let encoded = hbor_to_vec(part).expect("a part encodes").len();
+        println!(
+            "{MAX_PROOF_CLAIMS} {label} cells: proof {proof} bytes, part {encoded} bytes, of \
+             {MAX_MERKLE_PROOF_LEN} and {MAX_PROVISION_PART_BYTES}",
+        );
+        assert!(
+            proof <= MAX_MERKLE_PROOF_LEN,
+            "the {label} proof is buildable"
+        );
+        assert!(
+            encoded <= MAX_PROVISION_PART_BYTES,
+            "the {label} part fits a fetch response",
+        );
+    }
+}
+
 /// The budget is what bounds the section, not the name count: the names
 /// the drain's own bound admits, at a reach an ordinary route reaches,
 /// weigh several frames.
@@ -556,10 +708,11 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                 let line = TickLine::Member {
                     staged: 0,
                     tx: widest_tx,
-                    joins: Joins::ExecutesAborted,
+                    joins: Joins::Executes,
                     settlement: Settlement::Awaited,
                     holds: Capped::new((0..holds).map(|at| widest_hold(at, mode)).collect())
                         .expect("a list under the cap"),
+                    pins: Capped::empty(),
                     reach: deepest(holds),
                     awaits: deepest(holds),
                     charge: widest_charge,
@@ -567,6 +720,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                     reserves: widest_reserves(holds),
                     deadline: widest_deadline(),
                     crossings: widest_crossings(crossings),
+                    served_at: Some(BlockHeight::new(u64::MAX)),
                 };
                 let encoded = hbor_to_vec(&line).expect("a member line encodes");
                 assert!(
@@ -612,6 +766,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         joins: Joins::Executes,
         settlement: Settlement::Alone,
         holds: Capped::from_array([hold(0)]),
+        pins: Capped::empty(),
         reach: Capped::empty(),
         awaits: Capped::empty(),
         charge: widest_charge,
@@ -619,12 +774,144 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         reserves: widest_reserves(1),
         deadline: widest_deadline(),
         crossings: widest_crossings(1),
+        served_at: Some(BlockHeight::new(u64::MAX)),
     };
     assert_eq!(
         one.wire_weight(),
         TICK_LINE_BYTES + TICK_HOLD_BYTES + TICK_RESERVE_BYTES + TICK_CROSSING_BYTES,
         "one hold costs one hold, one reserved vault one, and one stated crossing one"
     );
+}
+
+/// A line's flat bytes stand fifteen above a running member's widest terms
+/// holding nothing, its head height among them: the margin every other
+/// list's per-item bytes also carry, and no field rides inside it.
+#[test]
+fn a_bare_lines_bytes_stand_a_fixed_margin_over_its_widest_terms() {
+    let bare = TickLine::Member {
+        staged: u64::MAX,
+        tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
+        joins: Joins::Executes,
+        settlement: Settlement::Awaited,
+        holds: Capped::empty(),
+        pins: Capped::empty(),
+        reach: Capped::empty(),
+        awaits: Capped::empty(),
+        charge: widest_charge(),
+        share: u128::MAX,
+        reserves: Capped::empty(),
+        deadline: widest_deadline(),
+        crossings: Capped::empty(),
+        served_at: Some(BlockHeight::new(u64::MAX)),
+    };
+    assert_eq!(
+        hbor_to_vec(&bare).expect("a member line encodes").len() + 15,
+        TICK_LINE_BYTES,
+    );
+    assert_eq!(bare.wire_weight(), TICK_LINE_BYTES);
+}
+
+/// `count` pins at their widest: distinct keys under every mode bit.
+fn widest_pins(count: usize) -> Pins {
+    Capped::new(
+        (0..count)
+            .map(|at| {
+                let mut key = [0xFF; 16];
+                key[..8].copy_from_slice(&(at as u64).to_be_bytes());
+                Pin {
+                    key: PinKey(key),
+                    modes: Modes(0xFF),
+                }
+            })
+            .collect(),
+    )
+    .expect("a list under the cap")
+}
+
+/// A determined line's weight bounds its encoding at every count of pins
+/// up to a transaction's worth, and a line of one pin costs one pin
+/// more than the bare line.
+#[test]
+fn a_determined_lines_weight_bounds_its_encoding_at_every_pin_count() {
+    for pins in [0usize, 1, 2, 64, MAX_HOLDS_PER_MEMBER] {
+        let line = TickLine::Member {
+            staged: u64::MAX,
+            tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            pins: widest_pins(pins),
+            reach: deepest(pins),
+            awaits: Capped::empty(),
+            charge: widest_charge(),
+            share: u128::MAX,
+            reserves: widest_reserves(pins),
+            deadline: widest_deadline(),
+            crossings: Capped::empty(),
+            served_at: Some(BlockHeight::new(u64::MAX)),
+        };
+        let encoded = hbor_to_vec(&line).expect("a member line encodes");
+        assert!(
+            encoded.len() <= line.wire_weight(),
+            "a determined line of {pins} pins encodes to {} bytes, over the {} its weight claims",
+            encoded.len(),
+            line.wire_weight(),
+        );
+        assert!(tick_manifest_admits_block(line.wire_weight()));
+        if pins == 1 {
+            assert_eq!(
+                line.wire_weight(),
+                TICK_LINE_BYTES + TICK_PIN_BYTES + TICK_REACH_BYTES + TICK_RESERVE_BYTES,
+            );
+        }
+    }
+}
+
+/// A recovery marker at every band count up to its cap decodes to the
+/// marker encoded and weighs what bounds its encoding, and one at its
+/// cap beside a discard for every other line the manifest holds fits
+/// the section's budget.
+#[test]
+fn a_recovery_marker_weighs_what_bounds_its_encoding() {
+    use hyperscale_types::{MAX_RECOVERY_BANDS, RecoveryBand, TICK_BAND_BYTES, TickId};
+
+    for count in 0..=MAX_RECOVERY_BANDS {
+        let marker = TickLine::Recovered {
+            bands: Capped::new(
+                (0..count)
+                    .map(|_| RecoveryBand {
+                        attested_frontier: BlockHeight::new(u64::MAX),
+                        bridge_start: WeightedTimestamp::from_millis(u64::MAX),
+                    })
+                    .collect(),
+            )
+            .expect("a list under the cap"),
+        };
+        let encoded = hbor_to_vec(&marker).expect("a marker encodes");
+        assert_eq!(
+            hbor_from_slice::<TickLine>(&encoded).expect("a marker decodes"),
+            marker,
+        );
+        assert!(
+            encoded.len() <= marker.wire_weight(),
+            "a marker of {count} bands encodes to {}, over its weight {}",
+            encoded.len(),
+            marker.wire_weight(),
+        );
+        assert_eq!(
+            marker.wire_weight(),
+            TICK_LINE_BYTES + count * TICK_BAND_BYTES
+        );
+        if count == MAX_RECOVERY_BANDS {
+            let discard = TickLine::Discard {
+                tick: TickId::new(ShardId::leaf(9, 300), BlockHeight::new(u64::MAX)),
+                cause: DiscardCause::Recovery,
+            };
+            assert!(tick_manifest_admits_block(
+                marker.wire_weight() + (MAX_TICK_LINES_PER_BLOCK - 1) * discard.wire_weight()
+            ));
+        }
+    }
 }
 
 /// An end line decodes to the line encoded, weighs the bare line it is
@@ -686,6 +973,7 @@ fn a_line_at_the_crossings_cap_fits_an_empty_manifest() {
                 .collect(),
         )
         .expect("a list at the cap"),
+        pins: Capped::empty(),
         reach: deepest(MAX_PREFIXES_PER_TX),
         awaits: deepest(MAX_PREFIXES_PER_TX),
         charge: widest_charge(),
@@ -693,6 +981,7 @@ fn a_line_at_the_crossings_cap_fits_an_empty_manifest() {
         reserves: widest_reserves(MAX_HOLDS_PER_MEMBER),
         deadline: widest_deadline(),
         crossings: widest_crossings(MAX_CROSSINGS_PER_TX),
+        served_at: Some(BlockHeight::new(u64::MAX)),
     };
     let encoded = hbor_to_vec(&line).expect("a member line encodes").len();
     assert!(
@@ -824,8 +1113,8 @@ fn a_terms_entry_encodes_under_its_weight() {
 struct ResponseWire {
     header: BlockHeader,
     qc: QuorumCertificate,
-    transactions: Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>,
-    certificates: Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)>,
+    transactions: Vec<(TxHash, Option<Verifiable<Transaction>>)>,
+    certificates: Vec<(FinalizationHash, Option<Verifiable<Finalization>>)>,
     provisions: ProvisionsWire,
     abandonment_records: Vec<AbandonmentRecord>,
     state_claims: Vec<StateClaim>,
@@ -837,7 +1126,7 @@ struct ResponseWire {
 /// The provisions payload of [`ResponseWire`], in both forms.
 #[derive(Hbor)]
 enum ProvisionsWire {
-    Live(Vec<(ProvisionHash, Option<Arc<Verifiable<Provisions>>>)>),
+    Live(Vec<(ProvisionHash, Option<Verifiable<Provision>>)>),
     Sealed {
         hashes: Vec<ProvisionHash>,
         engagements: Vec<Engagement>,
@@ -926,7 +1215,7 @@ fn full_manifest() -> Vec<TickLine> {
     let line = TickLine::Member {
         staged: 0,
         tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
-        joins: Joins::ExecutesAborted,
+        joins: Joins::Executes,
         settlement: Settlement::Awaited,
         holds: Capped::new(
             (0..64)
@@ -934,6 +1223,7 @@ fn full_manifest() -> Vec<TickLine> {
                 .collect(),
         )
         .expect("a list under the cap"),
+        pins: Capped::empty(),
         reach: deepest(64),
         awaits: deepest(64),
         charge: widest_charge(),
@@ -941,6 +1231,7 @@ fn full_manifest() -> Vec<TickLine> {
         reserves: widest_reserves(64),
         deadline: widest_deadline(),
         crossings: widest_crossings(64),
+        served_at: Some(BlockHeight::new(u64::MAX)),
     };
 
     let lines = vec![line.clone(); MAX_TICK_MANIFEST_BYTES / line.wire_weight()];
@@ -985,6 +1276,7 @@ fn widest_header() -> (BlockHeader, QuorumCertificate) {
         header.height(),
         header.parent_block_hash(),
         header.round(),
+        Epoch::new(u64::MAX),
         SignerBitfield::new(0),
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(u64::MAX / 2),
@@ -999,6 +1291,7 @@ fn full_engagements() -> Vec<Engagement> {
             source: ShardId::leaf(63, u64::MAX >> 1),
             tx_hash: TxHash::from(hash_at(at)),
             source_height: BlockHeight::new(u64::MAX),
+            source_anchor: WeightedTimestamp::from_millis(u64::MAX),
         })
         .collect()
 }
@@ -1200,7 +1493,7 @@ fn a_stating_half_of_a_full_tick_encodes_within_the_frame() {
     let half = Finalization::new(
         tick_id,
         TickHalf::Stated,
-        Some(Arc::new(certificate)),
+        Some(certificate),
         Capped::new(receipts).expect("a receipt per outcome"),
     );
     assert_eq!(half.validate_against_certificates(), Ok(()));

@@ -1,23 +1,25 @@
 //! A hosted shard's pinned thread: its [`ShardLoop`], its timers, and the
-//! (timer, callback, shutdown) channels it drains in priority order
-//! (`timer_rx > callback_rx`), publishing the shard's RPC readouts as it
-//! goes.
+//! channels it drains in priority order (timers, then signer changes,
+//! then its two input lanes in turn), publishing the shard's RPC readouts
+//! as it goes.
 //!
-//! [`ShardLoop`]: hyperscale_node::shard::ShardLoop
+//! [`ShardLoop`]: hyperscale_node::ShardLoop
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::{Receiver, Sender, unbounded};
+use crossbeam::channel::{Receiver, Sender, never, unbounded};
 use hex::encode as hex_encode;
 use hyperscale_core::{ParticipationChange, TimerId};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics::set_shard_channel_depths;
 use hyperscale_network_iroh::IrohNetwork;
-use hyperscale_node::shard::{
-    HostEvent, ShardLoop, StepOutput, ThreadShardLoop, TimerOp, TimerOwner, timer_event,
+use hyperscale_node::event::{
+    HostEvent, NETWORK_LANE_CAPACITY, NetworkLaneReceiver, ShardInbox, StepOutput, TimerOp,
+    TimerOwner, network_lane, timer_event,
 };
+use hyperscale_node::{ShardLoop, ThreadShardLoop};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{MAX_UNSETTLED_TXS, ShardId, Signer, TxsInFlight, ValidatorId};
 use tokio::runtime::Handle as TokioHandle;
@@ -40,7 +42,7 @@ pub type ProdShardLoop = ShardLoop<RocksDbShardStorage, IrohNetwork, PooledDispa
 pub struct ShardChannels {
     pub(crate) timer_tx: Sender<HostEvent>,
     pub(crate) timer_rx: Receiver<HostEvent>,
-    pub(crate) callback_rx: Receiver<HostEvent>,
+    pub(crate) inputs: ShardInputs,
     pub(crate) shutdown_tx: Sender<()>,
     pub(crate) shutdown_rx: Receiver<()>,
     pub(crate) control_tx: Sender<ShardControl>,
@@ -58,27 +60,100 @@ pub enum ShardControl {
 }
 
 impl ShardChannels {
-    /// Allocate one shard's channel triple. Returns the callback sender
-    /// alongside — it goes into the process-scoped event-sender maps so
-    /// callbacks, network handlers, and RPC fanout land on the shard's
-    /// thread.
-    pub(crate) fn new() -> (Self, Sender<HostEvent>) {
+    /// Allocate one shard's channels. Returns the shard's inbox alongside
+    /// — it goes into the process-scoped sender map so callbacks, network
+    /// handlers, and RPC fanout land on the shard's thread.
+    pub(crate) fn new() -> (Self, ShardInbox) {
         let (timer_tx, timer_rx) = unbounded();
-        let (callback_tx, callback_rx) = unbounded();
+        let (inputs, inbox) = ShardInputs::new(NETWORK_LANE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = unbounded();
         let (control_tx, control_rx) = unbounded();
         (
             Self {
                 timer_tx,
                 timer_rx,
-                callback_rx,
+                inputs,
                 shutdown_tx,
                 shutdown_rx,
                 control_tx,
                 control_rx,
             },
-            callback_tx,
+            inbox,
         )
+    }
+}
+
+/// The receiving ends of a shard's [`ShardInbox`]: an unbounded internal
+/// lane and a network lane bounded at the capacity it was built with,
+/// each input it gives up leaving its peer's share of it.
+///
+/// The thread takes one input at a time, and while both lanes hold one it
+/// takes them in turn, so neither lane waits on more than one input of
+/// the other's, and each lane's inputs come out in the order they were
+/// pushed.
+pub struct ShardInputs {
+    internal: Receiver<HostEvent>,
+    network: NetworkLaneReceiver,
+    /// Whether the network lane is next when both hold an input.
+    network_next: bool,
+}
+
+/// The lane an input came off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Internal,
+    Network,
+}
+
+impl ShardInputs {
+    fn new(network_capacity: usize) -> (Self, ShardInbox) {
+        let (internal_tx, internal) = unbounded();
+        let (network_tx, network) = network_lane(network_capacity);
+        (
+            Self {
+                internal,
+                network,
+                network_next: false,
+            },
+            ShardInbox::new(internal_tx, network_tx),
+        )
+    }
+
+    /// The next queued input, if either lane holds one.
+    fn try_recv(&mut self) -> Option<HostEvent> {
+        let order = if self.network_next {
+            [Lane::Network, Lane::Internal]
+        } else {
+            [Lane::Internal, Lane::Network]
+        };
+        order.into_iter().find_map(|lane| {
+            let event = match lane {
+                Lane::Internal => self.internal.try_recv().ok(),
+                Lane::Network => self.network.try_recv(),
+            }?;
+            self.took(lane);
+            Some(event)
+        })
+    }
+
+    /// Pass the turn to the other lane once `lane` gave an input.
+    const fn took(&mut self, lane: Lane) {
+        self.network_next = matches!(lane, Lane::Internal);
+    }
+
+    /// Settle what a blocking wait on `lane` returned. A lane whose
+    /// senders are all gone is replaced by one that never fires, so the
+    /// wait does not wake on it again.
+    fn received(&mut self, lane: Lane, event: Option<HostEvent>) -> Option<HostEvent> {
+        if let Some(event) = event {
+            self.took(lane);
+            return Some(event);
+        }
+        match lane {
+            Lane::Internal => self.internal = never(),
+            Lane::Network => self.network.close(),
+        }
+        None
     }
 }
 
@@ -145,7 +220,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct ShardLoopConfig {
     pub(crate) timer_tx: Sender<HostEvent>,
     pub(crate) timer_rx: Receiver<HostEvent>,
-    pub(crate) callback_rx: Receiver<HostEvent>,
+    pub(crate) inputs: ShardInputs,
     pub(crate) shutdown_rx: Receiver<()>,
     /// Signer changes from the supervisor.
     pub(crate) control_rx: Receiver<ShardControl>,
@@ -169,9 +244,10 @@ pub struct ShardLoopConfig {
 /// the shard's shutdown signal fires.
 ///
 /// Priority cascade: `timer_rx` (scheduled view-change / cleanup /
-/// fetch tick fires) before `control_rx` (signer changes) before
-/// `callback_rx` (off-thread results, inbound network deliveries, RPC
-/// fanout). When all are empty the cascade
+/// fetch tick fires) before `control_rx` (signer changes) before the
+/// shard's [`ShardInputs`] (off-thread results, fetch answers and RPC
+/// fanout on the internal lane; inbound peer gossip and notifications on
+/// the network lane), taken in turn. When all are empty the cascade
 /// blocks on `select!` with a timeout drawn from the shard's nearest
 /// batch deadline so the shard wakes precisely when its earliest
 /// expiring batch is due.
@@ -213,7 +289,7 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
                 apply_shard_control(shard_loop, &config, &mut timer_mgr, control);
                 break 'recv None;
             }
-            if let Ok(e) = config.callback_rx.try_recv() {
+            if let Some(e) = config.inputs.try_recv() {
                 break 'recv Some(e);
             }
 
@@ -221,21 +297,25 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
                 .nearest_batch_deadline()
                 .map_or(DEFAULT_TIMEOUT, |deadline| deadline.saturating_sub(now));
 
-            crossbeam::channel::select! {
+            let input = crossbeam::channel::select! {
                 recv(config.shutdown_rx) -> _ => {
                     info!(shard = ?shard, "Shard event loop received shutdown signal (select)");
                     return;
                 }
-                recv(config.timer_rx) -> e => e.ok(),
+                recv(config.timer_rx) -> e => break 'recv e.ok(),
                 recv(config.control_rx) -> control => {
                     if let Ok(control) = control {
                         apply_shard_control(shard_loop, &config, &mut timer_mgr, control);
                     }
-                    None
+                    break 'recv None;
                 }
-                recv(config.callback_rx) -> e => e.ok(),
-                default(timeout) => None,
-            }
+                recv(config.inputs.internal) -> e => (Lane::Internal, e.ok()),
+                recv(config.inputs.network.receiver()) -> e => {
+                    (Lane::Network, e.ok().map(|input| config.inputs.network.take(input)))
+                }
+                default(timeout) => break 'recv None,
+            };
+            config.inputs.received(input.0, input.1)
         };
 
         if let Some(event) = event {
@@ -243,10 +323,6 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
                 HostEvent::Shard(s, input) if s == shard => input,
                 HostEvent::Shard(other, _) => {
                     warn!(received_shard = ?other, this_shard = ?shard, "Dropping cross-shard event");
-                    continue;
-                }
-                HostEvent::Process(_) => {
-                    warn!(shard = ?shard, "Dropping process-scoped event on shard channel");
                     continue;
                 }
                 HostEvent::Beacon(_) => {
@@ -272,7 +348,8 @@ fn drive_shard_loop(shard_loop: &mut ProdShardLoop, mut config: ShardLoopConfig)
             shard_loop.record_prometheus();
             set_shard_channel_depths(
                 shard.inner(),
-                config.callback_rx.len(),
+                config.inputs.internal.len(),
+                config.inputs.network.len(),
                 config.timer_rx.len(),
             );
             update_shard_rpc_state(shard_loop, &config);
@@ -420,4 +497,80 @@ pub fn spawn_shard_loop(
         .name(format!("shard-loop-{}", shard.inner()))
         .spawn(move || run_shard_loop(shard_loop, config))
         .expect("failed to spawn shard-loop thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_network::PeerId;
+    use hyperscale_node::event::{HostEvent, Offer, ShardScopedInput};
+    use hyperscale_types::ShardId;
+
+    use super::ShardInputs;
+
+    /// An input tagged by the shard it names, so the order the lanes give
+    /// inputs back in can be read off.
+    fn input(tag: u64) -> HostEvent {
+        HostEvent::shard(ShardId::leaf(8, tag), ShardScopedInput::FetchTick)
+    }
+
+    fn tag(event: &HostEvent) -> u64 {
+        match event {
+            HostEvent::Shard(shard, _) => shard.path(),
+            HostEvent::Beacon(_) => unreachable!("only shard inputs are pushed"),
+        }
+    }
+
+    const PEER: PeerId = PeerId::new(1);
+    const OTHER: PeerId = PeerId::new(2);
+
+    /// A full network lane refuses a push at once, and takes nothing from
+    /// the internal lane: the thread takes the lanes in turn while both
+    /// hold inputs, each lane in the order it was pushed, and drains the
+    /// internal lane whole once the network lane is empty.
+    #[test]
+    fn a_full_network_lane_refuses_without_holding_back_the_internal_lane() {
+        let (mut inputs, inbox) = ShardInputs::new(2);
+        for tag in 0..4 {
+            inbox
+                .internal()
+                .send(input(tag))
+                .expect("internal lane open");
+        }
+        for tag in 10..12 {
+            assert_eq!(inbox.offer(input(tag), PEER), Offer::Taken);
+        }
+        assert_eq!(
+            inbox.offer(input(12), OTHER),
+            Offer::Full,
+            "a full network lane refuses the push",
+        );
+        inbox
+            .internal()
+            .send(input(4))
+            .expect("the internal lane takes a push past a full network lane");
+
+        let order: Vec<u64> = std::iter::from_fn(|| inputs.try_recv())
+            .map(|event| tag(&event))
+            .collect();
+        assert_eq!(order, vec![0, 10, 1, 11, 2, 3, 4]);
+    }
+
+    /// The thread's drain releases each input from its peer's share: a peer
+    /// refused past its share while it held the lane fills it again once
+    /// the thread has drained it.
+    #[test]
+    fn the_threads_drain_returns_each_peers_share() {
+        let (mut inputs, inbox) = ShardInputs::new(4);
+        for tag in 0..4 {
+            assert_eq!(inbox.offer(input(tag), PEER), Offer::Taken);
+        }
+        assert_eq!(inbox.offer(input(4), OTHER), Offer::Full);
+        assert_eq!(inbox.offer(input(5), PEER), Offer::OverShare);
+
+        assert_eq!(std::iter::from_fn(|| inputs.try_recv()).count(), 4);
+        for tag in 0..2 {
+            assert_eq!(inbox.offer(input(tag), PEER), Offer::Taken);
+            assert_eq!(inbox.offer(input(tag), OTHER), Offer::Taken);
+        }
+    }
 }

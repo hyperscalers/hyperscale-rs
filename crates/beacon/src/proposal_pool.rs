@@ -16,7 +16,6 @@
 //! known. Both get dropped at admission.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use hyperscale_types::{BeaconProposal, Epoch, ValidatorId, Verified};
 
@@ -30,7 +29,7 @@ pub struct BeaconProposalPool {
     /// committee member; subsequent admissions from the same sender
     /// are dropped (first-write wins, mirroring the equivocation
     /// pool's discipline).
-    proposals: BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>,
+    proposals: BTreeMap<ValidatorId, Verified<BeaconProposal>>,
 }
 
 impl BeaconProposalPool {
@@ -62,13 +61,27 @@ impl BeaconProposalPool {
         &mut self,
         from: ValidatorId,
         epoch: Epoch,
-        proposal: Arc<Verified<BeaconProposal>>,
+        proposal: Verified<BeaconProposal>,
     ) -> bool {
         if epoch != self.epoch || self.proposals.contains_key(&from) {
             return false;
         }
         self.proposals.insert(from, proposal);
         true
+    }
+
+    /// Hold `proposal` as `from`'s, in place of any copy already held:
+    /// the copy a committed vector names, which no earlier copy from an
+    /// equivocating `from` may keep out. Ignored for another epoch.
+    pub(crate) fn pin(
+        &mut self,
+        from: ValidatorId,
+        epoch: Epoch,
+        proposal: Verified<BeaconProposal>,
+    ) {
+        if epoch == self.epoch {
+            self.proposals.insert(from, proposal);
+        }
     }
 }
 
@@ -81,7 +94,7 @@ impl BeaconProposalPool {
     }
 
     #[must_use]
-    pub fn get(&self, from: ValidatorId) -> Option<Arc<Verified<BeaconProposal>>> {
+    pub fn get(&self, from: ValidatorId) -> Option<Verified<BeaconProposal>> {
         self.proposals.get(&from).cloned()
     }
 
@@ -107,10 +120,8 @@ mod tests {
 
     use super::*;
 
-    fn proposal(seed: u8) -> Arc<Verified<BeaconProposal>> {
-        Arc::new(Verified::new_unchecked_for_test(BeaconProposal::vrf_only(
-            VrfProof::new([seed; 96]),
-        )))
+    fn proposal(seed: u8) -> Verified<BeaconProposal> {
+        Verified::new_unchecked_for_test(BeaconProposal::vrf_only(VrfProof::new([seed; 96])))
     }
 
     #[test]

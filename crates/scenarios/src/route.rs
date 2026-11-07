@@ -8,23 +8,23 @@
 //! shape whose settlement waits on a certificate from across a shard
 //! boundary — a transfer never does, its recipient claims a bundle.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{self, Display, Formatter, Write};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
-use hyperscale_storage::{FeeTerms, RowState};
+use hyperscale_storage::{FeeTerms, Place, RowState, seat_leaf};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_CLAIMS_BYTES,
     MAX_CLAIMS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_STANDING_ANSWERS,
     MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, PrincipalAddr, REATTESTATION_STEP,
-    ResourceAddr, ShardId, ShardTrie, SubstateKey, TimestampRange, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
-    staged_leaf, verdict_leaf,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, NAMING_WINDOW, PrincipalAddr,
+    REATTESTATION_STEP, RETENTION_HORIZON, ResourceAddr, ShardId, ShardTrie, SubstateKey,
+    TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    WeightedTimestamp, Window, staged_leaf, verdict_leaf,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
@@ -36,7 +36,8 @@ use crate::straddler::{
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::{
-    report_accepted_measures, report_claims_recarried, report_crossing_measures,
+    Crash, CrashableCluster, RestartableCluster, report_accepted_measures, report_claims_recarried,
+    report_crossing_measures,
 };
 use crate::support::query::{
     ChainMentions, ClaimsSection, Readings, assert_reclaimed_leg, await_leg_fated, declared_price,
@@ -46,7 +47,9 @@ use crate::support::tx::{
     build_route_tx, build_sponsored_route_tx, build_swap_tx, build_transfer_tx, validity_around,
 };
 use crate::support::wait::{await_blocks, await_tx_terminal};
-use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
+use crate::support::{
+    Budget, Cluster, FaultHandle, FaultableCluster, ProofMeter, ProofTally, epochs,
+};
 use crate::venue::{
     PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell,
     stand_up_venue, stand_up_venues_on,
@@ -73,10 +76,6 @@ pub const SECOND_TRADER_SHARD: ShardId = ShardId::leaf(2, 3);
 
 /// Where a third venue prices, for a ring of routes through three.
 pub const THIRD_VENUE_SHARD: ShardId = ShardId::leaf(2, 3);
-
-/// Blocks each ring venue commits once the cut lifts, time enough for the
-/// bundles it missed to be fetched and its waiting route made ready.
-const RING_SETTLE_BLOCKS: u64 = 16;
 
 /// The venues of a ring, in its order: each route runs from one venue to
 /// the next, and the last back to the first.
@@ -219,37 +218,14 @@ pub fn a_route_settles_across_two_venues<C: FaultableCluster>(
 /// writes no record into the core, if either venue's chain carries no
 /// reading of it within budget, or if either carried it a finalization
 /// delay or more past its own commit of the route.
-pub fn both_venues_read_a_routes_record_inside_the_finalization_delay<C: Cluster>(
+pub fn both_venues_read_a_routes_record_inside_the_finalization_delay<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
 ) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
-    let (key, account) = &traders[0];
-    let tx = build_route_tx(
-        key,
-        *account,
-        (&first.meta, &second.meta),
-        *PROTOCOL_RESOURCE,
-        ROUTE_INPUT,
-        0,
-        validity_around(c.now()),
-    );
-    let records: Vec<SubstateKey> = records_by_road(
-        &c.with_derivation(|derivation| tx.try_derived(derivation))
-            .expect("a scenario route derives")
-            .legs,
-    )
-    .into_iter()
-    .filter(|(_, road)| *road == RecordRoad::IntoTheCore)
-    .map(|(record, _)| record)
-    .collect();
-    assert!(
-        !records.is_empty(),
-        "a route through two venues writes a record into its core",
-    );
-    let route = Charges::default().submit(c, tx);
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
 
     let waits = |c: &C| -> Vec<(ShardId, Option<Duration>)> {
         [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
@@ -274,6 +250,831 @@ pub fn both_venues_read_a_routes_record_inside_the_finalization_delay<C: Cluster
             waits(c),
         );
     }
+    let asks = c.metric("record_asks", None);
+    assert!(
+        asks <= read_bound(1),
+        "a healthy route's pushes land before any read is armed: {asks} reads",
+    );
+}
+
+/// Submit a route of `trader`'s through `venues`, paying in `amount`, and
+/// hand back its hash and the records it writes into its core.
+fn submit_core_route<C: Cluster>(
+    c: &mut C,
+    (first, second): (&StockedVenue, &StockedVenue),
+    (key, account): &(Ed25519PrivateKey, PrincipalAddr),
+    amount: u128,
+) -> (TxHash, Vec<SubstateKey>) {
+    let tx = build_route_tx(
+        key,
+        *account,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        amount,
+        0,
+        validity_around(c.now()),
+    );
+    let records = core_records(c, &tx);
+    (Charges::default().submit(c, tx), records)
+}
+
+/// The records `tx` writes into its core.
+fn core_records<C: Cluster>(c: &C, tx: &Transaction) -> Vec<SubstateKey> {
+    let records: Vec<SubstateKey> = records_by_road(
+        &c.with_derivation(|derivation| tx.try_derived(derivation))
+            .expect("a scenario route derives")
+            .legs,
+    )
+    .into_iter()
+    .filter(|(_, road)| *road == RecordRoad::IntoTheCore)
+    .map(|(record, _)| record)
+    .collect();
+    assert!(
+        !records.is_empty(),
+        "a route through two venues writes a record into its core",
+    );
+    records
+}
+
+/// Run until `venue`'s chain carries every one of `records` for `route`
+/// and hand back the longest it waited.
+fn await_record_reads<C: Cluster>(
+    c: &mut C,
+    venue: ShardId,
+    route: TxHash,
+    records: &[SubstateKey],
+) -> Duration {
+    let waits = |c: &C| {
+        records
+            .iter()
+            .map(|record| c.record_wait(venue, route, *record))
+            .collect::<Option<Vec<Duration>>>()
+    };
+    assert!(
+        c.run_until(epochs(40), |c| waits(c).is_some()),
+        "{venue:?} must carry a reading of every record of {route:?}",
+    );
+    waits(c)
+        .and_then(|waits| waits.into_iter().max())
+        .expect("every read is in")
+}
+
+/// The longest a route's record may take to reach a venue whose push was
+/// lost, at the latency these scenarios run at, while the holder's chain
+/// carries a load.
+const LOST_RECORD_BOUND: Duration = Duration::from_secs(10);
+
+/// [`LOST_RECORD_BOUND`] on an idle holder: the 5 s cold grace, about
+/// 4.2 s of proven anchor lag at three idle block steps, and the read.
+const IDLE_LOST_RECORD_BOUND: Duration = Duration::from_secs(12);
+
+/// A record lost to one venue on an idle holder is read inside
+/// [`IDLE_LOST_RECORD_BOUND`] of the venue's commit.
+///
+/// The read arms on the holder's clock, well short of the finalization
+/// delay.
+///
+/// Requires disjoint committees, as the cut is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the cut never
+/// fires, or if the record takes longer.
+pub fn a_lost_record_is_read_inside_twelve_seconds<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let lost = isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD);
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let wait = await_record_reads(c, FIRST_VENUE_SHARD, route, &records);
+    assert!(lost.fired() > 0, "the push must actually have been lost");
+    println!("record read: a lost record reached its venue in {wait:?}");
+    assert!(
+        wait < IDLE_LOST_RECORD_BOUND,
+        "a lost record must be read inside {IDLE_LOST_RECORD_BOUND:?}, and took {wait:?}",
+    );
+}
+
+/// How long [`LocalTransfers`] run before a busy holder's route goes in,
+/// so its heights are at the loaded rate from the route's first block.
+const BUSY_HOLDER_LEAD: Duration = Duration::from_secs(3);
+
+/// The holder heights a second under which a chain is not loaded: an idle
+/// chain steps about every 1.3 s, a loaded one about every 0.3 s.
+const LOADED_HEIGHTS_PER_SECOND: f64 = 2.0;
+
+/// A record lost to one venue on a holder carrying transfers throughout
+/// is read inside [`LOST_RECORD_BOUND`] of the venue's commit.
+///
+/// The holder's anchors move at the loaded rate, which takes the idle
+/// block steps out of the proven anchor's lag.
+///
+/// Requires disjoint committees, as the cut is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the cut never
+/// fires, if the holder passes fewer than [`LOADED_HEIGHTS_PER_SECOND`]
+/// while the record is awaited, or if the record takes longer.
+pub fn a_lost_record_on_a_busy_holder_is_read_inside_ten_seconds<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let mut transfers = LocalTransfers {
+        payer: &traders[1],
+        to: traders[2].1,
+        sent: 0,
+    };
+    let underway = c.now() + BUSY_HOLDER_LEAD;
+    transfers.run_until(c, BUSY_HOLDER_LEAD, |c| c.now() >= underway);
+    let lost = isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD);
+    let holder_height = |c: &C| {
+        c.committed_height(TRADER_SHARD)
+            .map_or(0, BlockHeight::inner)
+    };
+    let from_height = holder_height(c);
+    let from = c.now();
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let carried = |c: &C| {
+        records
+            .iter()
+            .map(|record| c.record_wait(FIRST_VENUE_SHARD, route, *record))
+            .collect::<Option<Vec<Duration>>>()
+    };
+    assert!(
+        transfers.run_until(c, MAX_FINALIZATION_DELAY * 2, |c| carried(c).is_some()),
+        "the venue must carry a reading of the record",
+    );
+    let wait = carried(c)
+        .and_then(|waits| waits.into_iter().max())
+        .expect("every read is in");
+    let passed = holder_height(c).saturating_sub(from_height);
+    let rate = f64::from(u32::try_from(passed).expect("a short run"))
+        / c.now().saturating_sub(from).as_secs_f64();
+    assert!(lost.fired() > 0, "the push must actually have been lost");
+    println!(
+        "record read: a lost record reached its venue in {wait:?} on a busy holder, at \
+         {rate:.2} heights a second",
+    );
+    assert!(
+        rate > LOADED_HEIGHTS_PER_SECOND,
+        "the holder must stay loaded while the record is awaited, and passed {rate:.2} heights \
+         a second against {LOADED_HEIGHTS_PER_SECOND}",
+    );
+    assert!(
+        wait < LOST_RECORD_BOUND,
+        "a lost record on a busy holder must be read inside {LOST_RECORD_BOUND:?}, and took \
+         {wait:?}",
+    );
+}
+
+/// What a reread takes past the ladder's next rung: the answer's round
+/// trip, and the block that carries the arrival.
+const REREAD_ALLOWANCE: Duration = Duration::from_secs(2);
+
+/// The ladder's gap in holder heights once `passed` heights have gone by
+/// since a key's first ask: 2 past the first ask, doubling on each rung.
+const fn ladder_gap(passed: u64) -> u64 {
+    let mut gap = 2;
+    let mut rung = gap;
+    while rung <= passed {
+        gap *= 2;
+        rung += gap;
+    }
+    gap
+}
+
+/// How finely a scenario watches for a state only a moment separates
+/// from what follows it, well under a block.
+const FINE_POLL: Duration = Duration::from_millis(50);
+
+/// The gap between [`LocalTransfers`], about a loaded block.
+const LOCAL_TRANSFER_GAP: Duration = Duration::from_millis(300);
+
+/// Transfers between two accounts of one shard, which pass that shard's
+/// heights at the loaded rate and not at an idle block a second.
+struct LocalTransfers<'a> {
+    payer: &'a (Ed25519PrivateKey, PrincipalAddr),
+    to: PrincipalAddr,
+    sent: u128,
+}
+
+impl LocalTransfers<'_> {
+    /// Run `c` with the transfers flowing until `done`, for at most
+    /// `within`. Hands back whether `done` held.
+    fn run_until<C: Cluster>(
+        &mut self,
+        c: &mut C,
+        within: Duration,
+        done: impl Fn(&C) -> bool,
+    ) -> bool {
+        let deadline = c.now() + within;
+        while !done(c) && c.now() < deadline {
+            self.sent += 1;
+            let (key, from) = self.payer;
+            c.submit(build_transfer_tx(
+                key,
+                *from,
+                self.to,
+                self.sent,
+                validity_around(c.now()),
+            ));
+            let next = c.now() + LOCAL_TRANSFER_GAP;
+            let _ = c.run_polling(epochs(1), FINE_POLL, |c| c.now() >= next || done(c));
+        }
+        done(c)
+    }
+}
+
+/// How long a leg's votes are dropped from the first of them, short of
+/// their 8 s retry, so the retry goes through and finishes the leg past
+/// the venue's first read.
+const VOTES_HELD: Duration = Duration::from_millis(7_500);
+
+/// A read that finds no record yet holds nothing and asks again.
+///
+/// The leg's votes are dropped, so the venue's first read comes back
+/// absent, and no block ever carries the absence. What this bounds is the
+/// ladder: the record is carried within one ladder gap of its leg
+/// finalizing, the gap read off the holder heights since the first ask
+/// and timed at the rate the holder passed them, plus
+/// [`REREAD_ALLOWANCE`]. The trader's chain carries transfers throughout,
+/// so those heights pass at the loaded rate. A leg's lateness sets how
+/// far up the ladder it lands, so the wait is not a constant: it grows
+/// with the gap, up to the finalization delay.
+///
+/// Requires disjoint committees, as the cuts are keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if no read went out
+/// while the leg was held, if a block carries an absent reading of the
+/// record, or if the reread takes longer than the ladder's gap and
+/// [`REREAD_ALLOWANCE`].
+pub fn a_read_that_finds_no_record_yet_reads_again<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let mut transfers = LocalTransfers {
+        payer: &traders[1],
+        to: traders[2].1,
+        sent: 0,
+    };
+    let leg_hosts = c.committee_hosts(TRADER_SHARD);
+    let _ = isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD);
+    let held_leg = c.drop_type_between(&leg_hosts, &leg_hosts, "execution.vote");
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let within = MAX_FINALIZATION_DELAY;
+    assert!(
+        transfers.run_until(c, within, |_| held_leg.fired() > 0),
+        "the leg's votes must be held",
+    );
+    let released = c.now() + VOTES_HELD;
+    transfers.run_until(c, within, |c| c.now() >= released);
+    c.clear_drops();
+    let _ = isolate_pushed_readings(c, FIRST_VENUE_SHARD, TRADER_SHARD);
+
+    let written = |c: &C| records.iter().all(|record| stands_at(c, *record));
+    let read_or_written = |c: &C| c.metric("record_asks", None) > 0 || written(c);
+    assert!(
+        transfers.run_until(c, within, read_or_written),
+        "the read must go out or the record stand",
+    );
+    let asked = c.now();
+    let holder_height = |c: &C| {
+        c.committed_height(TRADER_SHARD)
+            .map_or(0, BlockHeight::inner)
+    };
+    let asked_height = holder_height(c);
+    assert!(!written(c), "the read must go out before the record stands");
+    assert!(
+        transfers.run_until(c, within, written),
+        "the leg finalizes past the first read",
+    );
+    let written_height = holder_height(c);
+    let written = c.now();
+    assert!(
+        c.metric("fetch_completed", Some("record_proof")) > 0,
+        "the first read must have come back before the record stood",
+    );
+    assert!(
+        transfers.run_until(c, within, |c| records
+            .iter()
+            .all(|record| c.record_wait(FIRST_VENUE_SHARD, route, *record).is_some())),
+        "the venue must carry a reading of the record",
+    );
+    let waited = c.now().saturating_sub(written);
+    let gap = ladder_gap(written_height.saturating_sub(asked_height));
+    let passed = written_height.saturating_sub(asked_height).max(1);
+    let per_height = written.saturating_sub(asked) / u32::try_from(passed).expect("a short run");
+    let ladder =
+        (per_height * u32::try_from(gap).expect("a short run")).min(MAX_FINALIZATION_DELAY);
+    let bound = ladder + REREAD_ALLOWANCE;
+    println!(
+        "record read: record written {:?} past the first read, {passed} holder heights, ladder \
+         gap {gap} heights at {per_height:?} each is {ladder:?}; carried {waited:?} past the \
+         record, bound {bound:?}",
+        written.saturating_sub(asked),
+    );
+    assert!(
+        waited < bound,
+        "the ladder's next rung must read the record, and it took {waited:?} against {bound:?}",
+    );
+    for record in records {
+        assert_eq!(
+            c.absent_record_readings(FIRST_VENUE_SHARD, record),
+            0,
+            "an absent reading of a wanted record takes no place in a block",
+        );
+    }
+}
+
+/// A held push the read frontier passes costs its key a read, no more.
+///
+/// One venue member alone hears a route's push and proposes nothing, so
+/// no block carries it, and the reads that would answer the route are
+/// cut. A second route's push, a height above, then lands everywhere, and
+/// the block carrying it raises the holder's read frontier over what the
+/// member holds: that push is refused and the member reads again, as a
+/// push landing behind a read would be.
+///
+/// Both venues hear the two routes in the same order, so each places them
+/// alike: heard apart, the venues would hold them in opposite order and
+/// the later hash would lose to the cycle, as a route does.
+///
+/// Requires disjoint committees, as the cut is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if a cut never fires,
+/// if no held push is refused, if either route is not accepted on both
+/// venues, or if either record takes longer than [`LOST_RECORD_BOUND`]
+/// past the reads' return.
+pub fn one_lost_height_among_delivered_pushes<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let member = c
+        .beacon_state()
+        .and_then(|state| {
+            state
+                .shard_consensus_members
+                .get(&FIRST_VENUE_SHARD)
+                .cloned()
+        })
+        .expect("the venue has a consensus committee")[0];
+    let hearing = c.host_of(member).expect("the member is hosted");
+    let others: Vec<usize> = c
+        .committee_hosts(FIRST_VENUE_SHARD)
+        .into_iter()
+        .filter(|host| *host != hearing)
+        .collect();
+    let leg_hosts = c.committee_hosts(TRADER_SHARD);
+    let venues = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD];
+    let lost = [
+        c.drop_type_between(&leg_hosts, &others, "crossing.readings"),
+        isolate_pushed_readings(c, SECOND_VENUE_SHARD, TRADER_SHARD),
+    ];
+    let _ = venues.map(|venue| isolate_state_reads(c, venue, TRADER_SHARD));
+    let _ = c.withhold(&[member], Withheld::Consensus);
+    let (held, held_records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    assert!(
+        c.run_polling(epochs(10), FINE_POLL, |c| held_records
+            .iter()
+            .all(|record| stands_at(c, *record))
+            && lost.iter().all(|cut| cut.fired() > 0)),
+        "the leg finalizes, and its push is lost to all but one member",
+    );
+    c.clear_drops();
+    let _ = venues.map(|venue| isolate_state_reads(c, venue, TRADER_SHARD));
+    let (above, above_records) = submit_core_route(c, (&first, &second), &traders[1], ROUTE_INPUT);
+    let refused = |c: &C| c.metric("fenced_claims_refused", Some("record"));
+    assert!(
+        c.run_polling(epochs(10), FINE_POLL, |c| refused(c) > 0),
+        "the block carrying the push above must refuse the one held below it",
+    );
+    println!("record read: {} held pushes refused", refused(c));
+    let _ = c.withhold(&[member], Withheld::Nothing);
+    c.clear_drops();
+
+    let lifted = c.now();
+    for (route, records) in [(above, &above_records), (held, &held_records)] {
+        for venue in venues {
+            let _ = await_record_reads(c, venue, route, records);
+            let wait = c.now().saturating_sub(lifted);
+            println!("record read: {route:?} on {venue:?} {wait:?} past the reads' return");
+            assert!(
+                wait < LOST_RECORD_BOUND,
+                "{route:?} must be read inside {LOST_RECORD_BOUND:?}, and took {wait:?}",
+            );
+        }
+    }
+    for route in [above, held] {
+        for venue in venues {
+            assert!(
+                c.run_until(epochs(40), |c| accepted_on(c, venue, route)),
+                "{route:?} must be accepted on {venue:?}",
+            );
+        }
+    }
+}
+
+/// The longest a record may take to reach a venue when the block that
+/// should have pushed it lost its proposer: a read, and room for the view
+/// change.
+const KILLED_PROPOSER_BOUND: Duration = Duration::from_secs(12);
+
+/// A crash takes one block's pusher with no type drop in play.
+///
+/// The trader committee's member at `victim` dies as the first record
+/// stands, so when that member's turn is the next the block's push dies
+/// with it. Every route still accepts, and the worst a record pays is a
+/// read.
+///
+/// A trader member's turn cannot be read from here, so a run names one
+/// member and the suite runs each. Hands back whether this run killed the
+/// push: every venue read that record at an anchor past the one a push
+/// stands at, so the read and not the push delivered it.
+///
+/// Requires disjoint committees, so the crash touches only the trader's
+/// shard.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if a route is not
+/// accepted on both venues, or if a record takes longer than
+/// [`KILLED_PROPOSER_BOUND`].
+pub fn a_killed_proposer_costs_a_route_no_more_than_a_read<C>(c: &mut C, victim: usize) -> bool
+where
+    C: FaultableCluster + CrashableCluster,
+{
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let victim = c.committee_hosts(TRADER_SHARD)[victim];
+    let routes: Vec<(TxHash, Vec<SubstateKey>)> = traders
+        .iter()
+        .map(|trader| submit_core_route(c, (&first, &second), trader, ROUTE_INPUT))
+        .collect();
+    let written =
+        |c: &C, records: &[SubstateKey]| records.iter().all(|record| stands_at(c, *record));
+    assert!(
+        c.run_polling(epochs(10), FINE_POLL, |c| routes
+            .iter()
+            .any(|(_, records)| written(c, records))),
+        "a leg finalizes",
+    );
+    let height = c
+        .committed_height(TRADER_SHARD)
+        .expect("the trader's shard runs");
+    let first = routes
+        .iter()
+        .find(|(_, records)| written(c, records))
+        .map(|(_, records)| records.clone())
+        .expect("a leg has finalized");
+    c.crash(victim, Crash::Process, epochs(2));
+
+    let mut longest = Duration::ZERO;
+    for (route, records) in &routes {
+        for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+            longest = longest.max(await_record_reads(c, venue, *route, records));
+            assert!(
+                c.run_until(epochs(40), |c| accepted_on(c, venue, *route)),
+                "{route:?} must be accepted on {venue:?}",
+            );
+        }
+    }
+    let read = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+        .into_iter()
+        .all(|venue| {
+            first.iter().all(|record| {
+                c.record_reading_anchor(venue, *record)
+                    .is_some_and(|anchor| anchor.height > height)
+            })
+        });
+    println!(
+        "record read: the longest record took {longest:?} past a killed proposer; the first \
+         record came by a read: {read}",
+    );
+    assert!(
+        longest < KILLED_PROPOSER_BOUND,
+        "a killed proposer must cost no more than a read, and a record took {longest:?}",
+    );
+    read
+}
+
+/// Well over the record fetch's 256 places, with room for the pushes that
+/// land before the holder dies.
+const DEAD_HOLDER_ROUTES: usize = 300;
+
+/// A holder nobody can reach pins no more of the record fetch than its
+/// share, so a lost record at a healthy holder is still read in time.
+///
+/// More keys are wanted of it than the fetch has places, and a validator
+/// keeps `asks_per_holder` reads open toward it and no more.
+///
+/// Requires a grown four-shard cluster over
+/// [`contended_load_genesis_accounts`] of `traders`.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the dead holder
+/// never reaches more wanted keys than the fetch has places, if the reads
+/// open toward it are over `asks_per_holder` a validator or under half
+/// that, if the cut never fires, or if the record takes longer than
+/// [`IDLE_LOST_RECORD_BOUND`]: the lost record's holder carries this one
+/// route, so it pays an idle holder's stages, the cold grace, the proven
+/// anchor's lag and the read.
+pub fn a_dead_holder_leaves_room_for_a_lost_record<C: FaultableCluster>(
+    c: &mut C,
+    traders: usize,
+    asks_per_holder: usize,
+) {
+    let cast = LoadCast::stand_up(c, DEAD_HOLDER_ROUTES + 1, &traders_on_both_shards(traders));
+    let walked = [BlockHeight::GENESIS, BlockHeight::GENESIS];
+    let mut flight = Flight::over(DEAD_HOLDER_ROUTES + 1, walked);
+    let window = validity_around(c.now());
+    for pair in 0..DEAD_HOLDER_ROUTES {
+        cast.send(
+            c,
+            &mut flight,
+            TradersOn::First,
+            (pair, Heading::Out),
+            window,
+            Duration::ZERO,
+        );
+    }
+    let wanted = |c: &C| {
+        c.metric_quantile_above("wanted_records", None, 1.0, 0.0)
+            .unwrap_or(0.0)
+    };
+    assert!(
+        c.run_until(epochs(4), |c| wanted(c) > 256.0),
+        "more keys must be wanted of the holder than the fetch has places: {}",
+        wanted(c),
+    );
+    let dead = c.committee_hosts(TRADER_SHARD);
+    let others: Vec<usize> = (0..c.host_count())
+        .filter(|host| !dead.contains(host))
+        .collect();
+    c.partition(&dead, &others);
+    // A cut-off holder's clock stands still, so only the finalization
+    // delay arms what is wanted of it.
+    let asked = c.now() + MAX_FINALIZATION_DELAY + Duration::from_secs(4);
+    assert!(
+        c.run_until(epochs(2), |c| c.now() >= asked),
+        "the cluster's clock must pass the finalization delay",
+    );
+    let open = record_reads_open(c);
+    let cap = wide(asks_per_holder) * venue_validators(c);
+    println!("record read: {open} reads stand open toward a dead holder, of {cap} places");
+    assert!(
+        open <= cap,
+        "a dead holder holds {open} reads, past its {cap} places",
+    );
+    assert!(
+        open >= cap / 2,
+        "the dead holder must fill its places, and holds {open} of {cap}",
+    );
+
+    let lost = isolate_pushed_readings(c, FIRST_VENUE_SHARD, SECOND_TRADER_SHARD);
+    let hash = cast.send(
+        c,
+        &mut flight,
+        TradersOn::Second,
+        (DEAD_HOLDER_ROUTES, Heading::Out),
+        window,
+        Duration::ZERO,
+    );
+    let records = core_records(c, &flight.routes[&hash]);
+    let wait = await_record_reads(c, FIRST_VENUE_SHARD, hash, &records);
+    assert!(lost.fired() > 0, "the push must actually have been lost");
+    println!("record read: {wait:?} for a lost record beside a dead holder");
+    assert!(
+        wait < IDLE_LOST_RECORD_BOUND,
+        "a dead holder must leave room for a lost record, which took {wait:?}",
+    );
+    c.heal_all();
+}
+
+/// How many record reads stand open across the cluster.
+fn record_reads_open<C: FaultableCluster>(c: &C) -> u64 {
+    let count = |name| c.metric(name, Some("record_proof"));
+    count("fetch_started").saturating_sub(count("fetch_completed") + count("fetch_abandoned"))
+}
+
+/// How long a holder stalls: past the finalization delay, so everything
+/// in flight arms on the clock.
+const HOLDER_STALL: Duration = Duration::from_secs(26);
+
+/// A holder stalled past the finalization delay draws one read per key
+/// and per validator, however long it stalls, and takes no place from
+/// the other asks.
+///
+/// Requires disjoint committees, as the partition is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if more reads stand
+/// open than there are wants, if no state proof lands past the stall, or
+/// if a route is not accepted once it ends.
+pub fn a_stalled_holder_draws_one_ask_per_key<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let routes: Vec<(TxHash, Vec<SubstateKey>)> = traders
+        .iter()
+        .map(|trader| submit_core_route(c, (&first, &second), trader, ROUTE_INPUT))
+        .collect();
+    let filed = c.now() + Duration::from_secs(2);
+    let _ = c.run_until(epochs(1), |c| c.now() >= filed);
+
+    let stalled = c.committee_hosts(TRADER_SHARD);
+    let others: Vec<usize> = (0..c.host_count())
+        .filter(|host| !stalled.contains(host))
+        .collect();
+    c.partition(&stalled, &others);
+    let keys: usize = routes.iter().map(|(_, records)| records.len()).sum();
+    let venue_validators =
+        c.committee_hosts(FIRST_VENUE_SHARD).len() + c.committee_hosts(SECOND_VENUE_SHARD).len();
+    let wants = u64::try_from(keys * venue_validators).expect("a small count");
+    let resume = c.now() + HOLDER_STALL;
+    let mut most = 0;
+    while c.now() < resume {
+        let next = c.now() + Duration::from_secs(1);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+        most = most.max(record_reads_open(c));
+    }
+    c.heal_all();
+    let proofs = c.metric("fetch_completed", Some("state_proof"));
+    for _ in 0..8 {
+        let next = c.now() + Duration::from_secs(1);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+        most = most.max(record_reads_open(c));
+    }
+    println!("record read: at most {most} reads open of {wants} wants across a stall");
+    assert!(
+        most <= wants,
+        "one read stands for a key, and {most} stood for {wants} wants",
+    );
+    for (route, _) in routes {
+        for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+            assert!(
+                c.run_until(epochs(40), |c| accepted_on(c, venue, route)),
+                "{route:?} must be accepted on {venue:?}",
+            );
+        }
+    }
+    assert!(
+        c.run_until(epochs(10), |c| c
+            .metric("fetch_completed", Some("state_proof"))
+            > proofs),
+        "a state proof must still land past the stall",
+    );
+}
+
+/// Run `c` for `span`, a second at a time, and hand back the most record
+/// reads that stood open at any of them.
+fn most_reads_open<C: FaultableCluster>(c: &mut C, span: Duration) -> u64 {
+    let end = c.now() + span;
+    let mut most = 0;
+    while c.now() < end {
+        let next = c.now() + Duration::from_secs(1);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+        most = most.max(record_reads_open(c));
+    }
+    most
+}
+
+/// One record read a venue validator makes of each of `records`.
+fn wanted_reads<C: FaultableCluster>(c: &C, records: &[SubstateKey]) -> u64 {
+    wide(records.len()) * venue_validators(c)
+}
+
+/// How long past a route's submission a restart comes: its venues have
+/// filed it, and the finalization delay has passed their filing.
+const PAST_THE_CLOCK: Duration = MAX_FINALIZATION_DELAY.saturating_add(Duration::from_secs(6));
+
+/// How long a restarted validator is watched, past the first proven
+/// header of the record's holder it needs to ask at.
+const RESTART_WATCH: Duration = Duration::from_secs(8);
+
+/// A consumer restarted with wants past the finalization delay asks each
+/// of them at first sight, once per key, and its route still accepts.
+///
+/// The restart comes once the wants are past the delay, so the validator
+/// is back at once and holds nothing but what it re-derives. Its own
+/// reads are cut from there, which counts that it asked and leaves its
+/// ids standing. The other validators read on up their ladders, each
+/// read holding nothing as the leg stays held, so what the run bounds is
+/// every validator's one read of each key.
+///
+/// Requires disjoint committees, as the held leg is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the restarted
+/// validator asks nothing, if more reads go out or stand open than there
+/// are wants, or if a route is not accepted.
+pub fn a_restart_with_wants_past_the_clock_asks_each_once<C>(c: &mut C)
+where
+    C: FaultableCluster + RestartableCluster,
+{
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let leg_hosts = c.committee_hosts(TRADER_SHARD);
+    let _ = c.drop_type_between(&leg_hosts, &leg_hosts, "execution.vote");
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let past_the_clock = c.now() + PAST_THE_CLOCK;
+    let _ = c.run_until(epochs(2), |c| c.now() >= past_the_clock);
+
+    let restarted = c.committee_hosts(FIRST_VENUE_SHARD)[0];
+    c.stop_host(restarted, epochs(0));
+    assert!(
+        c.run_until(epochs(1), |c| c.is_up(restarted)),
+        "the validator must come back",
+    );
+    let own_reads = c.drop_type_between(&[restarted], &leg_hosts, "state_proof.request");
+    let asks = c.metric("record_asks", None);
+    let most = most_reads_open(c, RESTART_WATCH);
+    let asked = c.metric("record_asks", None).saturating_sub(asks);
+    let wants = wanted_reads(c, &records);
+    println!(
+        "record read: {asked} asks past a restart, of its own {}, at most {most} reads open of \
+         {wants} wants",
+        own_reads.fired(),
+    );
+    assert!(
+        own_reads.fired() > 0,
+        "the restarted validator must ask what it re-derived",
+    );
+    assert!(
+        asked <= wants + read_bound(1),
+        "one read goes out for a key, and {asked} went out for {wants} wants",
+    );
+    assert!(
+        most > 0 && most <= wants,
+        "one read stands for a key, and {most} stood for {wants} wants",
+    );
+    c.clear_drops();
+    for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            c.run_until(epochs(40), |c| accepted_on(c, venue, route)),
+            "{route:?} must be accepted on {venue:?}",
+        );
+    }
+}
+
+/// A read nobody answers gives its place to the next, as the holder's
+/// anchors move under it.
+///
+/// The venues' reads are cut and the leg stays held with the trader's
+/// headers flowing, so each validator climbs its ladder at moving anchors
+/// and no id ever comes back: each re-ask has to let go of the one before
+/// it. Past the cut the route ends and no read stays open.
+///
+/// Requires disjoint committees, as the held leg is keyed on them.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if no read is cut or
+/// replaced, if more reads stand open than there are wants or any stands
+/// open once the route has ended, or if the route is not accepted.
+pub fn a_read_nobody_answers_stands_alone_for_its_key<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let leg_hosts = c.committee_hosts(TRADER_SHARD);
+    let _ = c.drop_type_between(&leg_hosts, &leg_hosts, "execution.vote");
+    let cut = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+        .map(|venue| c.drop_type_between_members(venue, TRADER_SHARD, "state_proof.request"));
+    let (route, records) = submit_core_route(c, (&first, &second), &traders[0], ROUTE_INPUT);
+    let most = most_reads_open(c, PAST_THE_CLOCK);
+    let wants = wanted_reads(c, &records);
+    let replaced = c.metric("fetch_abandoned", Some("record_proof"));
+    println!("record read: at most {most} reads open of {wants} wants, {replaced} replaced");
+    assert!(
+        cut.iter().all(|cut| cut.fired() > 0),
+        "the reads must have been cut",
+    );
+    assert!(replaced > 0, "a re-ask must let go of the read it replaces");
+    assert!(
+        most <= wants,
+        "one read stands for a key, and {most} stood for {wants} wants",
+    );
+    c.clear_drops();
+    for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {
+        assert!(
+            c.run_until(epochs(40), |c| accepted_on(c, venue, route)),
+            "{route:?} must be accepted on {venue:?}",
+        );
+    }
+    assert!(
+        c.run_until(epochs(1), |c| record_reads_open(c) == 0),
+        "no read outlives its want: {} stand open",
+        record_reads_open(c),
+    );
 }
 
 /// The same route with the certificate channel cut: each venue's
@@ -434,44 +1235,75 @@ fn stated_venues_hear_each_other<C: FaultableCluster>(c: &mut C, road: Road) {
     );
 }
 
-/// Two routes each venue seats in the other's order lose the later of the
-/// two to the cycle, and the other settles, before their deadline.
+/// Two routes each venue heads in the other's order lose only the later
+/// hash, well inside the naming window, and the other accepts on both
+/// venues, conserved.
 ///
 /// Each route's trader sits on a shard of its own, and each venue is cut
 /// off from one trader's record: the second venue from the first route's,
 /// the first venue from the second route's. Every other input flows, so
-/// the first venue seats the first route, the second venue seats the
-/// second, and each holds its venue's reserve while it waits on the other
-/// venue's certificate — which neither can produce, since each refuses
-/// the other route behind the one it holds. The venue where the later
-/// route in hash order waits reads the other venue's seats, aborts that
-/// route on the reading, and its abort settles it on both venues, which
-/// frees the earlier route to run where it waited. Then the cut lifts.
+/// the first venue places the first route and makes it head, the second
+/// venue the second, and neither can run: a venue serves the route it
+/// heads to the other only from the block that makes it head there,
+/// where it is not yet placed. The cuts lift, each venue places the other
+/// route behind its head, and each head refuses it and takes a clock.
+/// Each venue then asks the other about its head and the route behind
+/// it, and reads the cycle off the other's seats: the route waiting
+/// there is seated, its head committed and unseated. Both name the later
+/// hash, aborting it unnamed where it waits and where it heads, by half
+/// a naming window past the later refusal; the earlier hash heads on the
+/// venue it waited on, is served and accepts on both.
 ///
 /// Requires disjoint committees, as the cut is keyed on the hosts.
 ///
 /// # Panics
 ///
 /// Panics if either venue misses its budget standing up, if the cut never
-/// fires, if the venues do not seat the routes in opposite order, if
-/// either route is still unresolved at the deadline, if any route but
-/// the later aborts or the earlier does not accept, if no block aborts a
-/// proven victim, or if either side of the pair is not conserved.
+/// fires, if the venues do not head the routes in opposite order, if a
+/// block proves anything while the cuts stand, if the later route does
+/// not leave both venues unnamed within half a naming window of the
+/// later refusal or the earlier one does not accept on both in that
+/// time, if no block proves the cycle or a head leaves at its window, or
+/// if either side of the pair is not conserved.
 pub fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle<C: FaultableCluster>(c: &mut C) {
-    crossed_routes(c, Seating::AsSubmitted);
+    crossed_routes(c, Seating::AsSubmitted, Lift::Together);
 }
 
-/// The same cycle with each venue seating the other's route.
+/// The same cycle with each venue heading the other's route.
 ///
 /// As [`routes_seated_in_opposite_order_lose_the_later_to_the_cycle`],
-/// but the later route now waits on the other venue, so the other venue
-/// reads the seats and aborts it.
+/// with the venues heading the routes the other way.
 ///
 /// # Panics
 ///
 /// As [`routes_seated_in_opposite_order_lose_the_later_to_the_cycle`].
 pub fn routes_seated_the_other_way_lose_the_later_to_the_cycle<C: FaultableCluster>(c: &mut C) {
-    crossed_routes(c, Seating::Swapped);
+    crossed_routes(c, Seating::Swapped, Lift::Together);
+}
+
+/// The crossed routes with one venue hearing late: the later route still
+/// loses fast on both.
+///
+/// Only the cut on the venue where the later route waits lifts. That
+/// venue places it behind its head, proves the cycle off the other's
+/// seats and aborts it, which deletes its row there and with it the
+/// cycle reading the other venue would need. The other cut lifts only
+/// once the route has left the first venue. The other venue then places
+/// the earlier route behind the later, its head, and reads the later's
+/// leaving off the first venue: verdict leaf and row gone, committed
+/// marker standing. It aborts the later route unnamed, and the earlier
+/// heads, is served and accepts on both venues, all within half a naming
+/// window of the second lift. Without the leaving the later route would
+/// hold its head until its window closed.
+///
+/// Requires disjoint committees, as the cut is keyed on the hosts.
+///
+/// # Panics
+///
+/// As [`routes_seated_in_opposite_order_lose_the_later_to_the_cycle`],
+/// the bound running from the second lift.
+pub fn a_venue_hearing_late_still_loses_the_later_route_fast<C: FaultableCluster>(c: &mut C) {
+    crossed_routes(c, Seating::AsSubmitted, Lift::VictimsWaitingVenueFirst);
 }
 
 /// Which route each venue seats in [`crossed_routes`].
@@ -483,9 +1315,20 @@ enum Seating {
     Swapped,
 }
 
-/// Two routes seated in opposite order on the two venues as `seating`
-/// says, the cycle between them resolved by its later route's abort.
-fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
+/// When the cuts of [`crossed_routes`] lift.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lift {
+    /// Both at once.
+    Together,
+    /// The cut on the venue where the later route waits first, and the
+    /// other once that route has left that venue.
+    VictimsWaitingVenueFirst,
+}
+
+/// Two routes headed in opposite order on the two venues as `seating`
+/// says, the cuts lifting as `lift` says, the cycle between them ended by
+/// a wound of the later hash.
+fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating, lift: Lift) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
@@ -524,94 +1367,377 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
         Seating::Swapped => [routes[1], routes[0]],
     };
     let proven = c.metric("hold_inversions_proven", None);
-
-    // The venue holding the later route keeps it seated, the earlier one
-    // standing committed and unseated beside it, until the cycle resolves.
-    // The other venue's half lasts only from its seat to the abort, which
-    // can fall between two polls, so it is read off the committed proof
-    // instead: a victim is named only on a reading of the cycle.
-    let later = held_first.max(held_second);
-    let (victim_venue, earlier) = if later == held_first {
-        (FIRST_VENUE_SHARD, held_second)
-    } else {
-        (SECOND_VENUE_SHARD, held_first)
+    let windowed = c.metric("heads_windowed", None);
+    let row_on = |c: &C, venue: ShardId, route: TxHash| {
+        c.queued_rows(venue)
+            .and_then(|rows| rows.get(&route).cloned())
     };
+    let heads = [
+        (FIRST_VENUE_SHARD, held_first, held_second),
+        (SECOND_VENUE_SHARD, held_second, held_first),
+    ];
+    let [victim, survivor] = if routes[0] > routes[1] {
+        routes
+    } else {
+        [routes[1], routes[0]]
+    };
+    // The later route waits where the earlier heads.
+    let (waits_at, heads_at) = if held_first == survivor {
+        (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD)
+    } else {
+        (SECOND_VENUE_SHARD, FIRST_VENUE_SHARD)
+    };
+    let venues = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD];
+
+    // While the cut stands each venue heads the route whose record it
+    // heard, and the other route is not placed there.
     assert!(
         c.run_until(epochs(8), |c| {
-            c.member_rows(victim_venue).is_some_and(|rows| {
-                matches!(
-                    rows.get(&later),
-                    Some(RowState::InFlight { .. } | RowState::Stated { .. })
-                ) && rows.get(&earlier) == Some(&RowState::Pending)
-            })
+            cut.iter().all(|handle| handle.fired() > 0)
+                && heads.iter().all(|&(venue, own, other)| {
+                    row_on(c, venue, own)
+                        .is_some_and(|row| row.state == RowState::Pending && row.head.is_some())
+                        && row_on(c, venue, other).is_none_or(|row| row.queued.is_none())
+                })
         }),
-        "the venue that heard the later route's record must seat it, and hold it",
+        "each venue must head the route whose record it heard, the other unplaced there",
     );
-    assert!(
-        c.run_until(epochs(8), |c| c.metric("hold_inversions_proven", None)
-            > proven),
-        "the other venue must seat the earlier route and prove the cycle off the first's seats",
+    assert_eq!(
+        c.metric("hold_inversions_proven", None),
+        proven,
+        "no venue seats the route the other heads while the cuts stand, so nothing is proven",
     );
-    assert!(
-        cut.iter().all(|handle| handle.fired() > 0),
-        "each venue must actually have been cut off from one route's record",
-    );
-    c.clear_drops();
 
-    let resolved = c.run_until(epochs(8), |c| {
-        routes
-            .iter()
-            .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
-    });
-    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
-    assert!(
-        resolved && WeightedTimestamp::ZERO.plus(c.now()) < deadline,
-        "the cycle must resolve before the deadline: {:?}",
-        routes.map(|hash| c.tx_status(hash)),
+    let late_cut = if heads_at == SECOND_VENUE_SHARD {
+        (SECOND_VENUE_SHARD, first_hears)
+    } else {
+        (FIRST_VENUE_SHARD, second_hears)
+    };
+    let (start, proven) = lift_crossed_cuts(c, lift, &heads, (victim, waits_at), late_cut, proven);
+    let bound = start.plus(NAMING_WINDOW / 2);
+    let gone = the_later_leaves_both_venues_by(c, victim, &venues, bound);
+    let accepted = the_earlier_accepts_on_both_venues_by(c, survivor, &venues, bound);
+    let since = |at: WeightedTimestamp| at.as_millis().saturating_sub(start.as_millis());
+    println!(
+        "crossed routes, lifted {}: from {start:?}, the later gone from {:?} at +{:?} ms, the \
+         earlier accepted at +{:?} ms, against a window of {} ms",
+        match lift {
+            Lift::Together => "together",
+            Lift::VictimsWaitingVenueFirst => "the waiting venue first",
+        },
+        venues,
+        gone.iter().map(|at| since(*at)).collect::<Vec<_>>(),
+        accepted.iter().map(|at| since(*at)).collect::<Vec<_>>(),
+        NAMING_WINDOW.as_millis(),
     );
-    for hash in routes {
-        let expected = if hash == later {
-            TransactionDecision::Aborted
-        } else {
-            TransactionDecision::Accept
-        };
-        let status = c.tx_status(hash);
-        assert_eq!(
-            status,
-            Some(TransactionStatus::Completed(expected)),
-            "the later route in hash order is the victim, and the earlier settles",
-        );
-    }
-    protocol_resource.assert_settles_within(c, &charges, epochs(8), "crossed holds");
+
+    the_cycle_ends_by_a_wound(c, [victim, survivor], &venues, (proven, windowed));
+    the_later_comes_home_by(c, &protocol_resource, &charges, validity);
     units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
 }
 
-/// Three routes held in a ring of three venues wait for their deadline.
+/// Assert the later route's input is home on the clock its `validity` sets.
+///
+/// It comes home off its validity end, however early the cycle ended:
+/// past one horizon, inside two epochs. The wait is held to that clock and
+/// not to one running from the wound.
+fn the_later_comes_home_by<C: FaultableCluster>(
+    c: &mut C,
+    world: &World,
+    charges: &Charges,
+    validity: TimestampRange,
+) {
+    let validity_end = Duration::from_millis(validity.end_timestamp_exclusive.as_millis());
+    let epoch =
+        Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch length"));
+    let deadline = validity_end + RETENTION_HORIZON + epoch * 2;
+    let _ = c.run_until(epochs(40), |c| {
+        c.now() >= deadline || world.settles(c, charges.burned(c))
+    });
+    let home = c.now();
+    println!(
+        "crossed routes: home at {home:?}, {:?} past the validity end {validity_end:?}",
+        home.saturating_sub(validity_end),
+    );
+    assert!(
+        home < deadline,
+        "the later route's input must be home by {deadline:?} on the clock, and it is {home:?}",
+    );
+    world.assert_settles_within(c, charges, epochs(1), "crossed holds");
+}
+
+/// Assert `victim` aborts and `survivor` accepts, no tick on `venues`
+/// having named it to run, a block having proven its abort on each venue
+/// and no head having left at its window: `proven` is the count of
+/// `hold_inversions_proven` short of the second venue's proof, and
+/// `windowed` is `heads_windowed` before.
+fn the_cycle_ends_by_a_wound<C: FaultableCluster>(
+    c: &mut C,
+    [victim, survivor]: [TxHash; 2],
+    venues: &[ShardId],
+    (proven, windowed): (u64, u64),
+) {
+    let resolved = c.run_until(epochs(8), |c| {
+        [victim, survivor]
+            .iter()
+            .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
+    });
+    assert!(
+        resolved,
+        "both routes must resolve: {:?}",
+        [victim, survivor].map(|hash| c.tx_status(hash)),
+    );
+    assert_eq!(
+        c.tx_status(victim),
+        Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
+        "the later route aborts",
+    );
+    assert_eq!(
+        c.tx_status(survivor),
+        Some(TransactionStatus::Completed(TransactionDecision::Accept)),
+        "the earlier route accepts",
+    );
+    for &venue in venues {
+        assert_eq!(
+            named_to_run(c, venue, victim),
+            Vec::new(),
+            "no tick on {venue:?} names the later route to run",
+        );
+    }
+    assert!(
+        c.metric("hold_inversions_proven", None) > proven,
+        "a block on the second venue proves the later route's abort",
+    );
+    assert_eq!(
+        c.metric("heads_windowed", None),
+        windowed,
+        "no head leaves at its naming window",
+    );
+}
+
+/// The heights on `venue`'s chain of the lines naming `tx` to run, where
+/// the cluster keeps a chain it walks. An aborting line is not among them.
+fn named_to_run<C: Cluster>(c: &C, venue: ShardId, tx: TxHash) -> Vec<(TxHash, BlockHeight)> {
+    c.chain_mentions(venue, BlockHeight::new(1), &BTreeSet::from([tx]))
+        .map_or_else(Vec::new, |mentions| mentions.run)
+}
+
+/// Lift the cuts of [`crossed_routes`] as `lift` says, and return the
+/// clock the later route's bound runs from, the later of the two heads'
+/// refusals where both lift together and the second lift otherwise, with
+/// a count of `hold_inversions_proven` that only the second venue's
+/// abort of it can pass, `proven` being the count before.
+///
+/// Each of `heads` is a venue, the route it heads and the route it holds
+/// behind. `victim` waits at `waits_at`; `late_cut`, the venue and the
+/// producer it is cut off from, stands until the victim has left there.
+fn lift_crossed_cuts<C: FaultableCluster>(
+    c: &mut C,
+    lift: Lift,
+    heads: &[(ShardId, TxHash, TxHash); 2],
+    (victim, waits_at): (TxHash, ShardId),
+    (late_venue, late_producer): (ShardId, ShardId),
+    proven: u64,
+) -> (WeightedTimestamp, u64) {
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let row_on = |c: &C, venue: ShardId, route: TxHash| {
+        c.queued_rows(venue)
+            .and_then(|rows| rows.get(&route).cloned())
+    };
+    // Once a venue hears both records it places the other route behind
+    // its head, which refuses it and takes the clock of that block: a head
+    // refusing nobody while the cuts stood. Seen venue by venue, since the
+    // wound can take the later route's row from one venue before the
+    // other has placed. A poll is a second of cluster clock, and a head
+    // can be placed against and wounded inside one; a venue whose head is
+    // first seen already gone takes that poll's clock, which is past its
+    // refusal.
+    let refused: RefCell<BTreeMap<ShardId, WeightedTimestamp>> = RefCell::new(BTreeMap::new());
+    let placed = |c: &C, on: &[ShardId]| {
+        for &(venue, own, _) in heads {
+            let head = row_on(c, venue, own)
+                .filter(|row| row.state == RowState::Pending && row.head.is_some());
+            let seen = match head {
+                Some(row) => row.blocked_at,
+                None => Some(clock(c)),
+            };
+            if on.contains(&venue)
+                && let Some(seen) = seen
+            {
+                refused.borrow_mut().entry(venue).or_insert(seen);
+            }
+        }
+        on.iter().all(|venue| refused.borrow().contains_key(venue))
+    };
+    c.clear_drops();
+    match lift {
+        Lift::Together => {
+            let venues = heads.map(|(venue, _, _)| venue);
+            assert!(
+                c.run_until(epochs(8), |c| placed(c, &venues)),
+                "each venue must hold the other route behind its head, refusing it: refused \
+                 {:?}, rows {:?}",
+                refused.borrow(),
+                heads.map(|(venue, own, other)| (
+                    venue,
+                    row_on(c, venue, own).map(|row| (row.state, row.head, row.blocked_at)),
+                    row_on(c, venue, other).map(|row| (row.state, row.queued, row.head)),
+                )),
+            );
+            let later = refused.borrow().values().max().copied();
+            (later.expect("both venues refused"), proven + 1)
+        }
+        Lift::VictimsWaitingVenueFirst => {
+            let _standing = isolate_crossing_intake(c, late_venue, late_producer);
+            assert!(
+                c.run_until(epochs(8), |c| placed(c, &[waits_at])),
+                "the venue hearing first must hold the later route behind its head",
+            );
+            // Its row gone, not only aborted: an aborted row standing
+            // unseated until its tick settles still reads as the cycle.
+            assert!(
+                c.run_until(epochs(8), |c| row_on(c, waits_at, victim).is_none()),
+                "the later route's row must leave the venue where it waits",
+            );
+            let first_refused = refused.borrow()[&waits_at];
+            assert!(
+                clock(c) <= first_refused.plus(NAMING_WINDOW / 2),
+                "the venue hearing first must wound the later route off the other's seats: \
+                 refused at {first_refused:?}, gone by {:?}",
+                clock(c),
+            );
+            // A dozen heights on, three seat asks apart, so no anchor the
+            // venue hearing late asks at still holds the row.
+            assert!(
+                await_blocks(c, waits_at, 12, epochs(8)),
+                "the venue where the later route waited must keep committing",
+            );
+            assert!(
+                row_on(c, late_venue, victim)
+                    .is_some_and(|row| row.state == RowState::Pending && row.head.is_some()),
+                "the later route must still head the venue hearing late",
+            );
+            // Read with the row gone from the first venue, which so names
+            // no further abort of it, and still standing on the late one.
+            let first_venue_proved = c.metric("hold_inversions_proven", None);
+            assert!(
+                first_venue_proved > proven,
+                "a block on the venue hearing first proves the cycle",
+            );
+            c.clear_drops();
+            (clock(c), first_venue_proved)
+        }
+    }
+}
+
+/// Assert `route` accepts on each of `venues` by `bound`, and return when
+/// each chain was first seen holding the accept.
+fn the_earlier_accepts_on_both_venues_by<C: Cluster>(
+    c: &mut C,
+    route: TxHash,
+    venues: &[ShardId],
+    bound: WeightedTimestamp,
+) -> Vec<WeightedTimestamp> {
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let accepted: RefCell<BTreeMap<ShardId, WeightedTimestamp>> = RefCell::new(BTreeMap::new());
+    let all_accepted = c.run_until(epochs(8), |c| {
+        for &venue in venues {
+            if matches!(
+                c.chain_fate(venue, route).1,
+                Some((_, TransactionDecision::Accept))
+            ) {
+                accepted
+                    .borrow_mut()
+                    .entry(venue)
+                    .or_insert_with(|| clock(c));
+            }
+        }
+        accepted.borrow().len() == venues.len()
+    });
+    assert!(
+        all_accepted,
+        "the earlier route must accept on every venue: {:?}",
+        venues
+            .iter()
+            .map(|venue| c.chain_fate(*venue, route))
+            .collect::<Vec<_>>(),
+    );
+    let accepted = accepted.into_inner();
+    for venue in venues {
+        let at = accepted[venue];
+        assert!(
+            at <= bound,
+            "the earlier route must accept on {venue:?} by {bound:?}: accepted at {at:?}",
+        );
+    }
+    venues.iter().map(|venue| accepted[venue]).collect()
+}
+
+/// Assert `route` leaves each of `venues` by `bound`, and return when it
+/// was first seen gone from each.
+fn the_later_leaves_both_venues_by<C: Cluster>(
+    c: &mut C,
+    route: TxHash,
+    venues: &[ShardId],
+    bound: WeightedTimestamp,
+) -> Vec<WeightedTimestamp> {
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let left: RefCell<BTreeMap<ShardId, WeightedTimestamp>> = RefCell::new(BTreeMap::new());
+    let all_left = c.run_until(epochs(8), |c| {
+        for &venue in venues {
+            let waits = c.queued_rows(venue).is_some_and(|rows| {
+                rows.get(&route)
+                    .is_some_and(|row| row.state == RowState::Pending)
+            });
+            if !waits {
+                left.borrow_mut().entry(venue).or_insert_with(|| clock(c));
+            }
+        }
+        left.borrow().len() == venues.len()
+    });
+    assert!(all_left, "the later route must leave every venue");
+    let left = left.into_inner();
+    for venue in venues {
+        let gone = left[venue];
+        assert!(
+            gone <= bound,
+            "the later route must leave {venue:?} by {bound:?}: gone at {gone:?}",
+        );
+    }
+    venues.iter().map(|venue| left[venue]).collect()
+}
+
+/// Three routes held in a ring of three venues abort at their naming
+/// windows.
 ///
 /// Each route runs from one venue to the next round the ring, its trader
-/// on its first venue's shard, so it reaches its two venues and nothing
-/// else. It commits on its first venue and reaches its second by that
-/// venue's bundle, and is ready on a venue once the other venue's bundle
-/// for it arrives. The bundles a venue's successor in the ring sends back
-/// speak for one route alone, the one the venue runs first, so cutting
-/// each venue off from them leaves every venue ready for the route
-/// arriving from its predecessor and nothing else. Each seats that route
-/// and holds its reserve while it waits on the venue before it, which
-/// refuses it behind the route that venue holds. No two of
-/// the routes await a shard in common, so no venue can read the cycle off
-/// one counterpart's seats: the ring stands until the deadline aborts all
-/// three. This pins the bound a longer cycle is left to.
+/// on its first venue's shard, so it pays there and is placed there at
+/// its commit, and reaches its second venue by that venue's bundle. A
+/// venue's successor serves it a route's part only from the block that
+/// makes the route head there, which it never is while the successor's
+/// own route heads, and each venue is cut off from its successor's
+/// bundles besides: every route stands head and unready on its first
+/// venue. Each venue commits the route arriving from its predecessor only
+/// once the predecessor's bundle lands, which places it behind the
+/// venue's own route on the venue's reserve: each venue's own route
+/// refuses its predecessor's route there, and takes the clock of the
+/// block that first shows it. No two of the routes await a shard in
+/// common and none is named, so no venue can read the cycle off one
+/// counterpart's seats: each route is aborted unnamed on its first venue
+/// once its naming window closes, short of its deadline, and its payer
+/// pays its charge.
 ///
 /// Requires disjoint committees, as the cut is keyed on the hosts.
 ///
 /// # Panics
 ///
 /// Panics if a venue misses its budget standing up, if the cut never
-/// fires, if the venues do not seat the routes round the ring, if a venue
-/// stops committing once the cut lifts, if any route resolves before the
-/// deadline or does not abort after it, if a block aborts any as a proven
-/// victim or counts a contention, or if either side is not conserved.
-pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mut C) {
+/// fires, if the venues do not place the routes round the ring, if any
+/// route runs on its first venue, is not aborted there within its naming
+/// window of its first refusal, or resolves otherwise than aborted before
+/// its deadline, if a block aborts any as a proven victim or counts a
+/// contention, or if either side is not conserved.
+pub fn routes_held_in_a_ring_abort_at_the_window<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let venues = RING.map(|venue| stand_up_venue(c, venue, &mut taken));
     let traders = ring_traders(&mut taken);
@@ -652,73 +1778,52 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
         })
         .collect();
     let proven = c.metric("hold_inversions_proven", None);
+    let contended = c.metric("hold_contentions", None);
+    let windowed = c.metric("heads_windowed", None);
 
-    // Each venue holds the route arriving from the venue before it, and
-    // the route it runs first stands committed and unseated beside it.
-    let ring_holds = |c: &C| {
+    // Each venue holds its own route head, unnamed and refusing, and the
+    // route arriving from the venue before it placed behind it.
+    let ring_stands = |c: &C| {
         (0..RING.len()).all(|at| {
-            c.member_rows(RING[at]).is_some_and(|rows| {
-                matches!(
-                    rows.get(&routes[prev(at)]),
-                    Some(RowState::InFlight { .. } | RowState::Stated { .. })
-                ) && rows.get(&routes[at]) == Some(&RowState::Pending)
+            c.queued_rows(RING[at]).is_some_and(|rows| {
+                let own = rows.get(&routes[at]);
+                let arriving = rows.get(&routes[prev(at)]);
+                own.is_some_and(|row| {
+                    row.state == RowState::Pending && row.head.is_some() && row.blocked_at.is_some()
+                }) && arriving.is_some_and(|row| {
+                    row.state == RowState::Pending && row.queued.is_some() && row.head.is_none()
+                })
             })
         })
     };
     assert!(
-        c.run_until(epochs(8), ring_holds),
-        "each venue must seat the route arriving from the venue before it, and hold it",
+        c.run_until(epochs(8), |c| ring_stands(c)),
+        "each venue must place its own route head, refusing the route arriving from the venue \
+         before it",
     );
-    // The bundle a venue's successor sends back goes out once the
-    // successor holds the route, which may be after the ring first reads
-    // held.
+    let heads: Vec<(ShardId, TxHash)> = RING.iter().copied().zip(routes.iter().copied()).collect();
+    each_leaves_its_head_at_its_window(
+        c,
+        &heads,
+        Deadline::of(validity.end_timestamp_exclusive).at(),
+    );
+
+    each_aborts_unnamed(c, &heads);
     assert!(
-        c.run_until(epochs(2), |c| ring_holds(c)
-            && cut.iter().all(|handle| handle.fired() > 0)),
+        cut.iter().all(|handle| handle.fired() > 0),
         "each venue must actually have been cut off from its successor's bundles",
     );
-
-    // Lifted: each venue's bundles come back and its waiting route is
-    // ready, and refused. No two routes await a shard in common, so the
-    // contention count, which pairs members that do, sees none of it.
-    let contended = c.metric("hold_contentions", None);
     c.clear_drops();
-    for venue in RING {
-        assert!(
-            await_blocks(c, venue, RING_SETTLE_BLOCKS, epochs(2)),
-            "venue {venue} must keep committing once the cut lifts",
-        );
-    }
-
-    // Read short of the deadline: past it each venue aborts its waiting
-    // route, and the first poll there can already see one gone. Nothing
-    // else moves a ring, so standing just short of it is standing to it.
-    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
-    let short_of = deadline.minus(Duration::from_secs(2));
-    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
-    c.run_until(epochs(8), |c| clock(c) >= short_of || !ring_holds(c));
-    assert!(
-        clock(c) >= short_of && clock(c) < deadline && ring_holds(c),
-        "the ring must stand to the deadline: no venue reads it off one counterpart",
-    );
-
-    let resolved = c.run_until(epochs(8), |c| {
-        routes
-            .iter()
-            .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
-    });
-    assert!(resolved, "the deadline must resolve every route");
-    for hash in &routes {
-        assert_eq!(
-            c.tx_status(*hash),
-            Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
-            "a route held in the ring to its deadline aborts",
-        );
-    }
     assert_eq!(
         c.metric("hold_inversions_proven", None),
         proven,
         "no block can prove a ring off one counterpart's seats",
+    );
+    // Counted per block built, so a round that fails and is built again
+    // counts its window twice.
+    assert!(
+        c.metric("heads_windowed", None) >= windowed + 3,
+        "each route leaves its head at its window",
     );
     assert_eq!(
         c.metric("hold_contentions", None),
@@ -727,6 +1832,78 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
     );
     protocol_resource.assert_settles_within(c, &charges, epochs(8), "a ring of holds");
     units.assert_settles_within(c, &Charges::default(), epochs(8), "a ring of holds");
+}
+
+/// Assert each of `heads`, a route and the venue it headed, aborts with no
+/// tick there having named it to run.
+fn each_aborts_unnamed<C: Cluster>(c: &mut C, heads: &[(ShardId, TxHash)]) {
+    let resolved = c.run_until(epochs(8), |c| {
+        heads
+            .iter()
+            .all(|(_, route)| c.tx_status(*route).is_some_and(|status| status.is_final()))
+    });
+    assert!(resolved, "the windows must resolve every route");
+    for &(venue, route) in heads {
+        assert_eq!(
+            c.tx_status(route),
+            Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
+            "a route held in the ring aborts at its window",
+        );
+        assert_eq!(
+            named_to_run(c, venue, route),
+            Vec::new(),
+            "no tick on {venue:?} names the route it held to run",
+        );
+    }
+}
+
+/// Assert each of `heads`, a route standing head on its venue with a
+/// refusal clock, leaves that venue by an abort named at its naming
+/// window, short of `deadline`.
+fn each_leaves_its_head_at_its_window<C: Cluster>(
+    c: &mut C,
+    heads: &[(ShardId, TxHash)],
+    deadline: WeightedTimestamp,
+) {
+    let refused: Vec<WeightedTimestamp> = heads
+        .iter()
+        .map(|&(venue, route)| {
+            c.queued_rows(venue)
+                .and_then(|rows| rows.get(&route).and_then(|row| row.blocked_at))
+                .expect("the head stands refusing")
+        })
+        .collect();
+    // Each route leaves its venue by the window's abort, its row there
+    // gone or let go of; the time each is first seen gone is when it
+    // left.
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    let left: RefCell<BTreeMap<usize, WeightedTimestamp>> = RefCell::new(BTreeMap::new());
+    let all_left = c.run_until(epochs(8), |c| {
+        for (at, &(venue, route)) in heads.iter().enumerate() {
+            let waits = c.queued_rows(venue).is_some_and(|rows| {
+                rows.get(&route)
+                    .is_some_and(|row| row.state == RowState::Pending)
+            });
+            if !waits {
+                left.borrow_mut().entry(at).or_insert_with(|| clock(c));
+            }
+        }
+        left.borrow().len() == heads.len()
+    });
+    assert!(all_left, "every route must leave the venue it heads");
+    // A window closes at an anchor; the abort is named in the block
+    // anchored there and folds a block or two later.
+    let slack = Duration::from_secs(4);
+    for (at, gone) in left.into_inner() {
+        let (venue, _) = heads[at];
+        let closes = refused[at].plus(NAMING_WINDOW);
+        assert!(
+            gone >= closes && gone <= closes.plus(slack) && gone < deadline,
+            "route {at} must leave {venue:?} at its naming window: refused at {:?}, the window \
+             closing at {closes:?}, gone at {gone:?}, its deadline {deadline:?}",
+            refused[at],
+        );
+    }
 }
 
 /// One route with the venues cut off from each other across the
@@ -949,7 +2126,7 @@ pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster
     let local_transfer = |c: &mut C, amount: u128| {
         let tx = build_transfer_tx(&payer_key, payer, caller, amount, validity_around(c.now()));
         let hash = tx.hash();
-        c.submit(Arc::new(tx));
+        c.submit(tx);
         hash
     };
 
@@ -978,7 +2155,7 @@ pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster
         validity_around(c.now()),
     );
     let route_hash = route.hash();
-    c.submit(Arc::new(route));
+    c.submit(route);
     assert!(
         c.run_until(epochs(8), |c| matches!(
             row(c, route_hash),
@@ -999,7 +2176,7 @@ pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster
         validity,
     );
     let swap_hash = swap.hash();
-    c.submit(Arc::new(swap));
+    c.submit(swap);
     assert!(
         c.run_until(epochs(2), |c| row(c, swap_hash) == Some(RowState::Pending)),
         "the swap must commit and wait behind the held reserves; its row stands {:?}",
@@ -2442,7 +3619,7 @@ impl VenueLoad {
             let (key, from, to) = &pairs[self.round % LOAD_PAIRS];
             let tx = build_transfer_tx(key, *from, *to, 1, validity_around(c.now()));
             *last = Some(tx.hash());
-            c.submit(Arc::new(tx));
+            c.submit(tx);
         }
         self.round += 1;
     }
@@ -2782,7 +3959,7 @@ fn route_held_past_a_certificates_life<C: FaultableCluster>(c: &mut C, late: Lat
         validity_around(c.now()),
     );
     let swap_hash = swap.hash();
-    c.submit(Arc::new(swap));
+    c.submit(swap);
     load.run(c, epoch * 8, |c| {
         c.tx_status(swap_hash)
             .is_some_and(|status| status.is_final())
@@ -2846,7 +4023,7 @@ fn hold_past_a_certificates_life<C: FaultableCluster>(
     c.with_derivation(|derivation| route.try_declared(derivation))
         .expect("a scenario route declares its terms");
     let closes = Window::Stating.of(Deadline::of_transaction(&route)).end;
-    c.submit(Arc::new(route));
+    c.submit(route);
 
     let stated =
         |c: &C, venue: ShardId| matches!(row_on(c, venue, hash), Some(RowState::Stated { .. }));
@@ -3165,6 +4342,25 @@ const LOAD_SHARDS: [(&str, ShardId); 3] = [
 /// what [`core_routes_under_load`] has it do.
 #[must_use]
 pub fn core_load_genesis_accounts(traders: usize) -> Vec<(PrincipalAddr, u128)> {
+    load_genesis_accounts(&[(TRADER_SHARD, traders)])
+}
+
+/// A provider on each venue shard and `traders` traders dealt evenly
+/// between the two trader shards, each funded for what
+/// [`contended_routes_through_one_pair_under_load`] has it do.
+#[must_use]
+pub fn contended_load_genesis_accounts(traders: usize) -> Vec<(PrincipalAddr, u128)> {
+    load_genesis_accounts(&traders_on_both_shards(traders))
+}
+
+/// [`core_load_genesis_accounts`] of the traders a hot pool deals its
+/// routes among.
+#[must_use]
+pub fn hot_pool_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    core_load_genesis_accounts(HOT_POOL_TRADERS)
+}
+
+fn load_genesis_accounts(traders: &[(ShardId, usize)]) -> Vec<(PrincipalAddr, u128)> {
     let mut taken = Vec::new();
     let mut accounts = vec![
         (
@@ -3179,14 +4375,28 @@ pub fn core_load_genesis_accounts(traders: usize) -> Vec<(PrincipalAddr, u128)> 
     accounts.extend(
         load_traders(traders, &mut taken)
             .into_iter()
+            .flatten()
             .map(|(_, account)| (account, LOAD_TRADER_FUNDING)),
     );
     accounts
 }
 
-fn load_traders(count: usize, taken: &mut Vec<u8>) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
-    (0..count)
-        .map(|_| grind_onto(TRADER_SHARD, taken))
+/// `traders` dealt evenly between the two trader shards.
+const fn traders_on_both_shards(traders: usize) -> [(ShardId, usize); 2] {
+    [
+        (TRADER_SHARD, traders / 2),
+        (SECOND_TRADER_SHARD, traders - traders / 2),
+    ]
+}
+
+/// The traders ground onto each shard of `shards`, in its order.
+fn load_traders(
+    shards: &[(ShardId, usize)],
+    taken: &mut Vec<u8>,
+) -> Vec<Vec<(Ed25519PrivateKey, PrincipalAddr)>> {
+    shards
+        .iter()
+        .map(|&(shard, count)| (0..count).map(|_| grind_onto(shard, taken)).collect())
         .collect()
 }
 
@@ -3282,8 +4492,13 @@ impl Display for CoreLoadSample {
 }
 
 /// The fetches a load's readings ride: a row's ask of its sibling's
-/// verdict cells and a consumer's read of a crossing's cells.
-const LOAD_FETCHES: &[Option<&str>] = &[Some("verdict_proof"), Some("state_proof")];
+/// verdict cells, the seat, ledger and boundary asks, and a consumer's
+/// read of a crossing's record.
+const LOAD_FETCHES: &[Option<&str>] = &[
+    Some("verdict_proof"),
+    Some("state_proof"),
+    Some("record_proof"),
+];
 
 /// Every counter a load's report reads, with the labels it reads each
 /// under.
@@ -3308,6 +4523,7 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
             Some("below_floor"),
             Some("anchor_disagrees"),
             Some("evicted"),
+            Some("outlasted"),
             Some("departed"),
             Some("retired"),
             Some("unhosted"),
@@ -3325,6 +4541,7 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
     ("block_commit_deferred", &[None]),
     ("hold_contentions", &[None]),
     ("hold_inversions_proven", &[None]),
+    ("heads_windowed", &[None]),
     ("transactions_aborted", &[None]),
     ("unresolvable_txs", &[None]),
     ("expected_tx_dropped", &[None]),
@@ -3332,6 +4549,8 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
     ("fetch_completed", LOAD_FETCHES),
     ("fetch_abandoned", LOAD_FETCHES),
     ("fetch_retried", LOAD_FETCHES),
+    // Counted by the server under the wire request's name, which a record
+    // read shares with every other state proof.
     ("fetch_items_sent", &[Some("state_proof")]),
     ("fetch_responses_refused", LOAD_FETCHES),
 ];
@@ -3432,7 +4651,7 @@ fn blocks_between(from: Option<BlockHeight>, to: Option<BlockHeight>) -> Option<
 /// The routes of a load: every one offered, the ones still out, and the
 /// pairs free to take another.
 struct Flight {
-    routes: BTreeMap<TxHash, Arc<Transaction>>,
+    routes: BTreeMap<TxHash, Transaction>,
     /// Each route still out, with the pair it runs through.
     flying: BTreeMap<TxHash, usize>,
     free: VecDeque<usize>,
@@ -3510,11 +4729,11 @@ impl Flight {
         }
         let Self {
             flying,
-            free,
             decided,
             lives,
             ..
         } = self;
+        let mut landed = BTreeSet::new();
         flying.retain(|hash, pair| {
             let Some([first, second]) = lives.get(hash) else {
                 return true;
@@ -3524,9 +4743,19 @@ impl Flight {
             };
             let accepted = TransactionDecision::Accept;
             decided.insert(*hash, if first == accepted { second } else { first });
-            free.push_back(*pair);
+            landed.insert(*pair);
             false
         });
+        self.give_back(landed);
+    }
+
+    /// Free each of `pairs` no route still out runs through.
+    fn give_back(&mut self, pairs: BTreeSet<usize>) {
+        for pair in pairs {
+            if !self.flying.values().any(|out| *out == pair) {
+                self.free.push_back(pair);
+            }
+        }
     }
 
     /// Run the cluster's clock a second on and read the load, printing
@@ -3550,11 +4779,11 @@ impl Flight {
         let Self {
             routes,
             flying,
-            free,
             lives,
             lapsed,
             ..
         } = self;
+        let mut given_up = BTreeSet::new();
         flying.retain(|hash, pair| {
             let carried = lives
                 .get(hash)
@@ -3570,9 +4799,10 @@ impl Flight {
                 return true;
             }
             *lapsed += 1;
-            free.push_back(*pair);
+            given_up.insert(*pair);
             false
         });
+        self.give_back(given_up);
     }
 
     /// How many of the routes the venue shards decided as `wanted`.
@@ -3604,16 +4834,17 @@ fn walked<C: Cluster>(
 struct LoadCast {
     firsts: Vec<StockedVenue>,
     seconds: Vec<StockedVenue>,
-    traders: Vec<(Ed25519PrivateKey, PrincipalAddr)>,
+    /// The traders on each shard they were ground onto.
+    traders: Vec<Vec<(Ed25519PrivateKey, PrincipalAddr)>>,
 }
 
 impl LoadCast {
-    fn stand_up<C: Cluster>(c: &mut C, load: CoreLoad) -> Self {
+    fn stand_up<C: Cluster>(c: &mut C, pairs: usize, traders: &[(ShardId, usize)]) -> Self {
         let mut taken = Vec::new();
         let mut venues = stand_up_venues_on(
             c,
             &[FIRST_VENUE_SHARD, SECOND_VENUE_SHARD],
-            load.pairs,
+            pairs,
             &mut taken,
         );
         let seconds = venues.pop().expect("the second shard's venues");
@@ -3621,7 +4852,7 @@ impl LoadCast {
         Self {
             firsts,
             seconds,
-            traders: load_traders(load.traders, &mut taken),
+            traders: load_traders(traders, &mut taken),
         }
     }
 
@@ -3631,7 +4862,10 @@ impl LoadCast {
         World::open(
             c,
             resource,
-            accounts(&self.traders).map(PrincipalAddr::address),
+            self.traders
+                .iter()
+                .flat_map(|traders| accounts(traders))
+                .map(PrincipalAddr::address),
             self.firsts
                 .iter()
                 .chain(&self.seconds)
@@ -3652,35 +4886,144 @@ impl LoadCast {
                 flight.short += 1;
                 continue;
             };
-            let nth = flight.routes.len();
-            let (key, trader) = &self.traders[nth % self.traders.len()];
-            let route = Arc::new(build_route_tx(
-                key,
-                *trader,
-                (&self.firsts[pair].meta, &self.seconds[pair].meta),
-                *PROTOCOL_RESOURCE,
-                ROUTE_INPUT + u128::try_from(nth).expect("a count of routes"),
-                0,
-                window,
-            ));
             let after = step * u32::try_from(slot).unwrap_or(u32::MAX);
-            flight.spread &= c.submit_after(after, Arc::clone(&route));
-            flight.flying.insert(route.hash(), pair);
-            flight.routes.insert(route.hash(), route);
+            self.send(
+                c,
+                flight,
+                TradersOn::First,
+                (pair, Heading::Out),
+                window,
+                after,
+            );
         }
+    }
+
+    /// Offer the coming second's `load.twins_per_second` twins through
+    /// pairs standing free, the nth of them that far through the second:
+    /// a route each way through one pair, at one instant, from a trader
+    /// on each trader shard.
+    fn offer_twins<C: Cluster>(
+        &self,
+        c: &mut C,
+        load: ContendedLoad,
+        flight: &mut Flight,
+        twins: &mut Vec<Twin>,
+    ) {
+        let window = validity_around(c.now());
+        let step = Duration::from_secs(1)
+            / u32::try_from(load.twins_per_second.max(1)).unwrap_or(u32::MAX);
+        for slot in 0..load.twins_per_second {
+            let Some(pair) = flight.free.pop_front() else {
+                flight.short += 1;
+                continue;
+            };
+            let after = step * u32::try_from(slot).unwrap_or(u32::MAX);
+            let routes = [
+                self.send(
+                    c,
+                    flight,
+                    TradersOn::First,
+                    (pair, Heading::Out),
+                    window,
+                    after,
+                ),
+                self.send(
+                    c,
+                    flight,
+                    TradersOn::Second,
+                    (pair, Heading::Back),
+                    window,
+                    after,
+                ),
+            ];
+            twins.push(Twin {
+                routes,
+                offered: c.now() + after,
+            });
+        }
+    }
+
+    /// Top `flight` up towards `pool.routes` routes out through the one
+    /// pair, by at most [`HOT_POOL_ARRIVALS`] this second.
+    fn offer_hot<C: Cluster>(&self, c: &mut C, pool: HotPool, flight: &mut Flight) {
+        let window = validity_around(c.now());
+        let missing = pool.routes.saturating_sub(flight.flying.len());
+        for _ in 0..missing.min(HOT_POOL_ARRIVALS) {
+            self.send(
+                c,
+                flight,
+                TradersOn::First,
+                (0, Heading::Out),
+                window,
+                Duration::ZERO,
+            );
+        }
+    }
+
+    /// Build the next route, send it through `pair` as `heading` says from
+    /// the next of `traders` once `after` has passed, and put it in the
+    /// air, its amount its own so no two are one transaction.
+    fn send<C: Cluster>(
+        &self,
+        c: &mut C,
+        flight: &mut Flight,
+        traders: TradersOn,
+        (pair, heading): (usize, Heading),
+        window: TimestampRange,
+        after: Duration,
+    ) -> TxHash {
+        let nth = flight.routes.len();
+        let dealt = &self.traders[traders as usize];
+        let (key, trader) = &dealt[nth % dealt.len()];
+        let (first, second) = (&self.firsts[pair].meta, &self.seconds[pair].meta);
+        let route = build_route_tx(
+            key,
+            *trader,
+            match heading {
+                Heading::Out => (first, second),
+                Heading::Back => (second, first),
+            },
+            *PROTOCOL_RESOURCE,
+            ROUTE_INPUT + u128::try_from(nth).expect("a count of routes"),
+            0,
+            window,
+        );
+        let hash = route.hash();
+        flight.spread &= c.submit_after(after, route.clone());
+        flight.flying.insert(hash, pair);
+        flight.routes.insert(hash, route);
+        hash
     }
 }
 
+/// Which of a load's trader shards a route's trader is dealt from.
+#[derive(Clone, Copy)]
+enum TradersOn {
+    First,
+    Second,
+}
+
+/// Which way a route runs through its pair.
+#[derive(Clone, Copy)]
+enum Heading {
+    /// The first shard's venue, then the second's.
+    Out,
+    /// The second shard's venue, then the first's.
+    Back,
+}
+
 /// What the routes of `flight` a chain has charged burned between them:
-/// each one decided other than by an abort, and each one the traders'
-/// chain carries the burn or the fate of from `from` up.
-fn load_burned<C: Cluster>(c: &C, flight: &Flight, from: BlockHeight) -> u128 {
+/// each one decided other than by an abort, and each one its trader's
+/// chain carries the burn or the fate of. `from` is each trader shard
+/// and the height its chain is walked from.
+fn load_burned<C: Cluster>(c: &C, flight: &Flight, from: &[(ShardId, BlockHeight)]) -> u128 {
     let hashes: BTreeSet<TxHash> = flight.routes.keys().copied().collect();
-    let mentions = walked(c, TRADER_SHARD, from, &hashes);
-    let on_the_payers_chain: BTreeSet<TxHash> = mentions
-        .burned
-        .into_iter()
-        .chain(mentions.fated)
+    let on_the_payers_chain: BTreeSet<TxHash> = from
+        .iter()
+        .flat_map(|&(shard, height)| {
+            let mentions = walked(c, shard, height, &hashes);
+            mentions.burned.into_iter().chain(mentions.fated)
+        })
         .map(|(tx, _)| tx)
         .collect();
     flight
@@ -3698,16 +5041,18 @@ fn load_burned<C: Cluster>(c: &C, flight: &Flight, from: BlockHeight) -> u128 {
 }
 
 /// Drive until both sides of the load's pair settle against what its
-/// routes burned, hold them there a few blocks, and read each side:
-/// what it held before, what it holds, and what was burned of it.
+/// routes burned, for up to `settle_within`, hold them there a few
+/// blocks, and read each side: what it held before, what it holds, and
+/// what was burned of it.
 fn load_conserved<C: Cluster>(
     c: &mut C,
     flight: &Flight,
-    from: BlockHeight,
+    from: &[(ShardId, BlockHeight)],
+    settle_within: Duration,
     protocol_resource: &World,
     units: &World,
 ) -> [(&'static str, u128, u128, u128); 2] {
-    let settle_by = c.now() + LOAD_DRAIN;
+    let settle_by = c.now() + settle_within;
     let settled =
         |c: &C| protocol_resource.settles(c, load_burned(c, flight, from)) && units.settles(c, 0);
     while !settled(c) && c.now() < settle_by {
@@ -3725,6 +5070,19 @@ fn load_conserved<C: Cluster>(
         ),
         ("units", units.before(), units.held(c), 0),
     ]
+}
+
+/// Assert each side [`load_conserved`] read holds what it held before,
+/// less what was burned of it.
+fn assert_load_conserved(conserved: [(&'static str, u128, u128, u128); 2]) {
+    for (side, before, held, burned) in conserved {
+        assert_eq!(
+            held + burned,
+            before,
+            "the load's {side} must be conserved: held {held} and burned {burned} against \
+             {before} before",
+        );
+    }
 }
 
 /// Many routes at once, each a core member on both venue shards and none
@@ -3768,9 +5126,9 @@ fn load_conserved<C: Cluster>(
 /// never fires, if either side of the pair is not conserved, if a route
 /// is still undecided once its window and the drain have passed, or if
 /// any route is not accepted.
-pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
+pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) -> RecordReadCost {
     let wall = Instant::now();
-    let cast = LoadCast::stand_up(c, load);
+    let cast = LoadCast::stand_up(c, load.pairs, &[(TRADER_SHARD, load.traders)]);
     let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
     let units = cast.world(c, cast.firsts[0].unit);
     println!(
@@ -3793,9 +5151,11 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
         ],
     };
     let mut flight = Flight::over(load.pairs, [opened_at[0], opened_at[1]]);
+    let mut cold = ColdAsks::from(opened);
     while c.now() < opened + load.duration {
         cast.offer(c, load, &mut flight);
         flight.tick(c, "offering");
+        cold.read(c);
     }
     assert!(
         cuts.iter().all(|cut| cut.fired() > 0),
@@ -3809,7 +5169,8 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
     while !flight.flying.is_empty() && c.now() < closed + LOAD_DRAIN {
         flight.tick(c, "draining");
     }
-    let conserved = load_conserved(c, &flight, opened_at[2], &protocol_resource, &units);
+    let payers = [(TRADER_SHARD, opened_at[2])];
+    let conserved = load_conserved(c, &flight, &payers, LOAD_DRAIN, &protocol_resource, &units);
     let after = LoadCounters::read(c);
 
     CoreLoadRun {
@@ -3826,15 +5187,10 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
         wall: [wall.elapsed(), offering],
     }
     .report(c);
+    let reads = RecordReadCost::read(c, flight.routes.len(), cold, [&before, &after]);
+    reads.report();
 
-    for (side, before, held, burned) in conserved {
-        assert_eq!(
-            held + burned,
-            before,
-            "the load's {side} must be conserved: held {held} and burned {burned} against \
-             {before} before",
-        );
-    }
+    assert_load_conserved(conserved);
     assert!(
         flight.flying.is_empty(),
         "{} of {} routes were still undecided {LOAD_DRAIN:?} past the last offer, the first \
@@ -3857,6 +5213,778 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
             .iter()
             .find(|(_, decision)| **decision != TransactionDecision::Accept),
     );
+    reads
+}
+
+/// How long a load runs before its asks count: it stands up only venue
+/// shards, so the trader's shard has pushed nothing and every key of its
+/// runs at the grace's floor until the first pushes land.
+const COLD_START: Duration = Duration::from_secs(15);
+
+/// `record_asks` as it stood [`COLD_START`] into an offering.
+#[derive(Debug, Clone, Copy)]
+struct ColdAsks {
+    until: Duration,
+    read: Option<u64>,
+}
+
+impl ColdAsks {
+    fn from(opened: Duration) -> Self {
+        Self {
+            until: opened + COLD_START,
+            read: None,
+        }
+    }
+
+    /// Take the reading if the cold start has passed and none is taken.
+    fn read<C: FaultableCluster>(&mut self, c: &C) {
+        if c.now() >= self.until {
+            self.read
+                .get_or_insert_with(|| c.metric("record_asks", None));
+        }
+    }
+}
+
+/// The most record reads a healthy load of `routes` may draw: one late
+/// key, two ladder rounds at four validators, plus the same per hundred
+/// routes.
+#[must_use]
+pub const fn read_bound(routes: usize) -> u64 {
+    8 * (1 + routes as u64 / 100)
+}
+
+/// The largest load offered short of the row held to twice [`read_bound`].
+const SINGLE_BOUND_ROUTES: usize = 1_000;
+
+/// The record reads a load's row allows: [`read_bound`], and twice that
+/// on the largest load, whose tail outruns the grace at 250 ms.
+const fn row_read_bound(routes: usize) -> u64 {
+    if routes > SINGLE_BOUND_ROUTES {
+        2 * read_bound(routes)
+    } else {
+        read_bound(routes)
+    }
+}
+
+/// What a load's record reads came to.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordReadCost {
+    /// The routes offered.
+    pub routes: usize,
+    /// Reads put in the first [`COLD_START`] of the offering.
+    pub cold: u64,
+    /// Reads put from then to the end of the run.
+    pub delta: u64,
+    /// Every read of the run.
+    pub asks: u64,
+    /// The largest span a kept push took, in milliseconds, an eighth
+    /// above the truth at most.
+    pub largest_span_ms: f64,
+    /// The median span, as closely.
+    pub median_span_ms: f64,
+    /// The median grace derived over the run, in milliseconds, and the
+    /// largest.
+    pub grace_ms: [f64; 2],
+}
+
+impl RecordReadCost {
+    /// What the reads between `before` and `after` came to.
+    fn read<C: FaultableCluster>(
+        c: &C,
+        routes: usize,
+        cold: ColdAsks,
+        [before, after]: [&LoadCounters; 2],
+    ) -> Self {
+        let asks = after.since(before, "record_asks", None);
+        let cold = cold.read.map_or(asks, |at| {
+            at.saturating_sub(before.since(&LoadCounters::default(), "record_asks", None))
+        });
+        let quantile = |name, q| {
+            c.metric_quantile_above(name, None, q, f64::NEG_INFINITY)
+                .unwrap_or(0.0)
+        };
+        Self {
+            routes,
+            cold,
+            delta: asks.saturating_sub(cold),
+            asks,
+            largest_span_ms: quantile("record_push_span", 1.0),
+            median_span_ms: quantile("record_push_span", 0.5),
+            grace_ms: [
+                quantile("record_push_grace", 0.5),
+                quantile("record_push_grace", 1.0),
+            ],
+        }
+    }
+
+    fn report(&self) {
+        println!(
+            "core load [6 record reads]: {} routes, record_asks {} in the first {COLD_START:?} \
+             and {} after, bound {}; push span median {:.0}ms, largest {:.0}ms; grace median \
+             {:.0}ms, largest {:.0}ms",
+            self.routes,
+            self.cold,
+            self.delta,
+            row_read_bound(self.routes),
+            self.median_span_ms,
+            self.largest_span_ms,
+            self.grace_ms[0],
+            self.grace_ms[1],
+        );
+    }
+}
+
+/// Epochs an aborted route's input gets to come home to its trader, as
+/// [`crossed_routes`] gives it: [`LOAD_DRAIN`] can be a single epoch, which
+/// is too short for it.
+const ABORT_REFUND_EPOCHS: u32 = 8;
+
+/// The message a block's crossing readings are pushed in.
+const CROSSING_READINGS: &str = "crossing.readings";
+
+/// A load of twins: two routes offered at one instant through one venue
+/// pair, each way round.
+#[derive(Debug, Clone, Copy)]
+pub struct ContendedLoad {
+    /// The venue pairs, one twin through each at a time.
+    pub pairs: usize,
+    /// The traders the routes are dealt among, half on each trader shard.
+    pub traders: usize,
+    /// The twins offered each second of the cluster's clock, spread evenly
+    /// across it, as far as pairs stand free to take them.
+    pub twins_per_second: usize,
+    /// How long the load is offered for.
+    pub duration: Duration,
+    /// The share of crossing readings dropped while it is, which skews
+    /// each venue's arrivals so the twins invert.
+    pub record_loss: f64,
+}
+
+/// Two routes offered at one instant through one venue pair.
+#[derive(Debug, Clone, Copy)]
+struct Twin {
+    routes: [TxHash; 2],
+    offered: Duration,
+}
+
+/// What each route's rows on the venue shards were seen to do.
+#[derive(Debug, Default)]
+struct PlacesSeen {
+    /// Where each route was first seen placed on each venue shard.
+    places: BTreeMap<TxHash, [Option<Place>; 2]>,
+    /// When each route, on each venue shard, first refused someone.
+    refusals: BTreeMap<TxHash, [Option<WeightedTimestamp>; 2]>,
+}
+
+impl PlacesSeen {
+    /// Note where each venue shard's queue holds each route out.
+    fn read<C: Cluster>(&mut self, c: &C, flight: &Flight) {
+        let now = WeightedTimestamp::ZERO.plus(c.now());
+        for (venue, shard) in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+            .into_iter()
+            .enumerate()
+        {
+            let rows = c
+                .queued_rows(shard)
+                .expect("the harness reads a venue shard's queue");
+            for route in flight.flying.keys() {
+                let seen = self.places.entry(*route).or_default();
+                let refused = self.refusals.entry(*route).or_default();
+                match rows.get(route) {
+                    Some(row) => {
+                        if let Some(place) = row.queued {
+                            seen[venue].get_or_insert(place);
+                        }
+                        if let Some(at) = row.blocked_at {
+                            refused[venue].get_or_insert(at);
+                        }
+                    }
+                    // A poll is a second of cluster clock, and a row can be
+                    // placed against and wounded inside one: a placed row
+                    // first seen gone takes that poll's clock, which is
+                    // past its refusal.
+                    None if seen[venue].is_some() => {
+                        refused[venue].get_or_insert(now);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// Whether the venues placed the twin in opposite order; `None` where
+    /// either place went unseen.
+    fn inverted(&self, [a, b]: [TxHash; 2]) -> Option<bool> {
+        let (a, b) = (self.places.get(&a)?, self.places.get(&b)?);
+        let first = a[0]?.cmp(&b[0]?);
+        let second = a[1]?.cmp(&b[1]?);
+        Some(first != second)
+    }
+
+    /// The later of the refusals the twin's two heads made, each venue's
+    /// head the route it placed first; `None` where one went unseen.
+    fn later_refusal(&self, [a, b]: [TxHash; 2]) -> Option<WeightedTimestamp> {
+        let (places, refusals) = (
+            [self.places.get(&a)?, self.places.get(&b)?],
+            [self.refusals.get(&a)?, self.refusals.get(&b)?],
+        );
+        let refusal = |venue: usize| {
+            let head = usize::from(places[1][venue]? < places[0][venue]?);
+            refusals[head][venue]
+        };
+        Some(refusal(0)?.max(refusal(1)?))
+    }
+}
+
+/// The millisecond of the cluster's clock `route` had settled on both
+/// venue chains by; `None` until it has.
+fn settled_ms<C: Cluster>(c: &C, flight: &Flight, route: TxHash) -> Option<u64> {
+    let [first, second] = flight.lives.get(&route)?;
+    let clock = |shard, life: &MemberLife| {
+        c.committed_clock(shard, life.settled_at()?)
+            .map(WeightedTimestamp::as_millis)
+    };
+    Some(clock(FIRST_VENUE_SHARD, first)?.max(clock(SECOND_VENUE_SHARD, second)?))
+}
+
+/// What became of one twin.
+struct TwinOutcome {
+    /// Whether the venues placed it in opposite order, where that was
+    /// seen.
+    inverted: Option<bool>,
+    /// The routes that aborted.
+    aborted: Vec<TxHash>,
+    /// How long each route took from its offer to both venue chains
+    /// settling it, by route.
+    resolved: [(TxHash, Option<usize>); 2],
+    /// How long a twin that lost a route took from the later of its heads'
+    /// refusals to both venue chains settling the survivor, in
+    /// milliseconds, where those were seen.
+    since_refusal: Option<usize>,
+}
+
+impl TwinOutcome {
+    fn read<C: Cluster>(c: &C, flight: &Flight, places: &PlacesSeen, twin: &Twin) -> Self {
+        let resolved = twin.routes.map(|route| {
+            let offered = u64::try_from(twin.offered.as_millis()).unwrap_or(u64::MAX);
+            let took = settled_ms(c, flight, route)
+                .and_then(|at| usize::try_from(at.saturating_sub(offered)).ok());
+            (route, took)
+        });
+        let aborted: Vec<TxHash> = twin
+            .routes
+            .into_iter()
+            .filter(|route| flight.decided.get(route) == Some(&TransactionDecision::Aborted))
+            .collect();
+        let survivor = twin
+            .routes
+            .into_iter()
+            .find(|route| !aborted.contains(route))
+            .filter(|_| !aborted.is_empty());
+        let since_refusal = survivor.and_then(|survivor| {
+            let refused = places.later_refusal(twin.routes)?.as_millis();
+            usize::try_from(settled_ms(c, flight, survivor)?.saturating_sub(refused)).ok()
+        });
+        Self {
+            inverted: places.inverted(twin.routes),
+            aborted,
+            resolved,
+            since_refusal,
+        }
+    }
+
+    /// How long each route `keep` picks took to resolve.
+    fn times(&self, keep: impl Fn(&TxHash) -> bool) -> impl Iterator<Item = usize> + '_ {
+        let keep = self
+            .resolved
+            .map(|(route, took)| took.filter(|_| keep(&route)));
+        keep.into_iter().flatten()
+    }
+}
+
+/// `values`, in milliseconds, as their median and 99th percentile.
+fn ms_quantiles(mut values: Vec<usize>) -> String {
+    format!(
+        "p50 {} ms, p99 {} ms (of {})",
+        quantile(&mut values, 500),
+        quantile(&mut values, 990),
+        values.len(),
+    )
+}
+
+/// The aborts that came at a route's own deadline: each route the venues
+/// aborted whose settling was at or past the end of its signed validity.
+fn deadline_aborts<C: Cluster>(c: &C, flight: &Flight) -> usize {
+    flight
+        .decided
+        .iter()
+        .filter(|(_, decision)| **decision == TransactionDecision::Aborted)
+        .filter(|(route, _)| {
+            let deadline = flight.routes[*route]
+                .validity_range()
+                .end_timestamp_exclusive
+                .as_millis();
+            settled_ms(c, flight, **route).is_none_or(|at| at >= deadline)
+        })
+        .count()
+}
+
+/// Print `tally`, the seat fetches of a run, for the `blocks` the venue
+/// chains committed over it and the `askers` that fetched them.
+fn report_seat_fetches(label: &str, tally: ProofTally, blocks: u64, askers: u64) {
+    println!(
+        "{label} [seat fetches, requests naming a route's seat leaf, answered by every host]: \
+         {} fetches of {} cells, {} bytes asked and {} answered; {} fetches a venue block over \
+         {blocks} blocks, {} a validator's venue block over {askers} validators",
+        tally.answers,
+        tally.cells,
+        tally.asked_bytes,
+        tally.answer_bytes,
+        mean(tally.answers, blocks),
+        mean(tally.answers, blocks.saturating_mul(askers)),
+    );
+}
+
+/// The blocks both venue chains committed from `opened` to `settled`, each
+/// a height for every one of [`LOAD_SHARDS`].
+fn venue_blocks(
+    opened: [BlockHeight; LOAD_SHARDS.len()],
+    settled: [BlockHeight; LOAD_SHARDS.len()],
+) -> u64 {
+    (0..2)
+        .map(|venue| settled[venue].inner().saturating_sub(opened[venue].inner()) + 1)
+        .sum()
+}
+
+/// How many venue validators ask seat questions: each venue shard's
+/// committee asks the other.
+fn venue_validators<C: FaultableCluster>(c: &C) -> u64 {
+    [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+        .into_iter()
+        .map(|shard| wide(c.committee_hosts(shard).len()))
+        .sum()
+}
+
+/// Watch the seat leaf of every route out, on both venue shards.
+fn watch_seats(meter: &ProofMeter, flight: &Flight) {
+    meter.watch(flight.flying.keys().flat_map(|route| {
+        [
+            seat_leaf(FIRST_VENUE_SHARD, *route),
+            seat_leaf(SECOND_VENUE_SHARD, *route),
+        ]
+    }));
+}
+
+/// Twins through one venue pair lose only the later hash, and only when
+/// the venues place them in opposite order.
+///
+/// Each second `load.twins_per_second` twins are offered through pairs
+/// standing free: one route from a trader on [`TRADER_SHARD`] through the
+/// first shard's venue and then the second's, and one from a trader on
+/// [`SECOND_TRADER_SHARD`] the other way round. A pair takes another twin
+/// only once both routes have settled on both venue chains, so a route
+/// contends with its twin alone. Dropping `load.record_loss` of the
+/// crossing readings while the load is offered skews what each venue
+/// hears first, so some twins place in opposite order; re-pushes and
+/// answers to asks recover the drops.
+///
+/// On top of what [`core_routes_under_load`] reports, the run reports the
+/// twins, how many the venues placed in opposite order as read off their
+/// queues, the abort fraction, p50 and p99 time to resolve for the twins
+/// the venues agreed on, for the survivors of inverted twins and for
+/// their victims, the wounds and windows, and the seat fetches a venue
+/// block.
+///
+/// Requires a grown four-shard cluster over
+/// [`contended_load_genesis_accounts`] of `load.traders`, on committees
+/// that share no host, one that walks its shards' chains.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if either side of the
+/// pair is not conserved, if a route is still undecided past the drain, if
+/// a head leaves at its window or a route aborts at its deadline, if both
+/// routes of a twin abort, if an aborted route is not the later of its
+/// twin or its twin does not accept, if the aborted outnumber the twins
+/// seen inverted, if no twin inverts, or if the p99 survivor resolves half
+/// a naming window past the later of its heads' refusals.
+pub fn contended_routes_through_one_pair_under_load<C: FaultableCluster>(
+    c: &mut C,
+    load: ContendedLoad,
+) {
+    let wall = Instant::now();
+    let cast = LoadCast::stand_up(c, load.pairs, &traders_on_both_shards(load.traders));
+    let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
+    let units = cast.world(c, cast.firsts[0].unit);
+    let height = |c: &C, shard: ShardId| c.committed_height(shard).unwrap_or(BlockHeight::GENESIS);
+    let opened_at = LOAD_SHARDS.map(|(_, shard)| height(c, shard).next());
+    let payers = [
+        (TRADER_SHARD, opened_at[2]),
+        (SECOND_TRADER_SHARD, height(c, SECOND_TRADER_SHARD).next()),
+    ];
+    let opened = c.now();
+    let before = LoadCounters::read(c);
+    let offering = Instant::now();
+    let meter = ProofMeter::default();
+    let metered = c.meter_state_proofs(&meter);
+    let lost = c.drop_type_with_probability(CROSSING_READINGS, load.record_loss);
+    let mut flight = Flight::over(load.pairs, [opened_at[0], opened_at[1]]);
+    let mut twins = Vec::new();
+    let mut places = PlacesSeen::default();
+    let mut cold = ColdAsks::from(opened);
+    while c.now() < opened + load.duration {
+        cast.offer_twins(c, load, &mut flight, &mut twins);
+        watch_seats(&meter, &flight);
+        flight.tick(c, "offering");
+        places.read(c, &flight);
+        cold.read(c);
+    }
+    let dropped = lost.fired();
+    c.clear_drops();
+    c.meter_state_proofs(&meter);
+    let closed_at = LOAD_SHARDS.map(|(_, shard)| height(c, shard));
+    let closed = c.now();
+    let offering = offering.elapsed();
+    let offered = flight.samples.len();
+    while !flight.flying.is_empty() && c.now() < closed + LOAD_DRAIN {
+        flight.tick(c, "draining");
+        places.read(c, &flight);
+    }
+    let epoch =
+        Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch length"));
+    let refund_within = epoch * ABORT_REFUND_EPOCHS;
+    let conserved = load_conserved(
+        c,
+        &flight,
+        &payers,
+        refund_within,
+        &protocol_resource,
+        &units,
+    );
+    let after = LoadCounters::read(c);
+    let heights = [
+        opened_at,
+        closed_at,
+        LOAD_SHARDS.map(|(_, shard)| height(c, shard)),
+    ];
+
+    CoreLoadRun {
+        load: CoreLoad {
+            pairs: load.pairs,
+            traders: load.traders,
+            routes_per_second: load.twins_per_second * 2,
+            duration: load.duration,
+            certificates: Certificates::Flow,
+        },
+        flight: &flight,
+        offered,
+        window: [opened, closed],
+        heights,
+        counters: [&before, &after],
+        wall: [wall.elapsed(), offering],
+    }
+    .report(c);
+
+    RecordReadCost::read(c, flight.routes.len(), cold, [&before, &after]).report();
+
+    let label = "contended load";
+    let read = TwinsRead::over(c, &flight, &places, &twins);
+    read.report(label, &flight, dropped);
+    let delta = |name| after.since(&before, name, None);
+    let windowed = delta("heads_windowed");
+    let deadlines = deadline_aborts(c, &flight);
+    println!(
+        "{label} [wounds and windows, summed over replicas]: hold_inversions_proven {}, \
+         heads_windowed {windowed}; deadline aborts {deadlines}",
+        delta("hold_inversions_proven"),
+    );
+    if metered {
+        let blocks = venue_blocks(opened_at, heights[2]);
+        report_seat_fetches(label, meter.total(), blocks, venue_validators(c));
+    }
+
+    assert_load_conserved(conserved);
+    assert!(
+        flight.flying.is_empty(),
+        "{} of {} routes were still undecided {LOAD_DRAIN:?} past the last offer",
+        flight.flying.len(),
+        flight.routes.len(),
+    );
+    assert_eq!(windowed, 0, "no head leaves at its naming window");
+    assert_eq!(deadlines, 0, "no route aborts at its deadline");
+    read.assert_the_later_hash_lost(&flight);
+    read.assert_survivors_resolved_in_time();
+}
+
+/// The twins of a contended load, read once they have settled.
+struct TwinsRead<'a> {
+    twins: &'a [Twin],
+    outcomes: Vec<TwinOutcome>,
+    /// The twins the venues placed in opposite order.
+    inverted: usize,
+    /// The twins with a place unseen on either venue.
+    unread: usize,
+    /// How long, in milliseconds, each route of a twin the venues placed
+    /// alike took to resolve.
+    uninverted: Vec<usize>,
+    /// How long each route of an inverted twin that did not abort took.
+    survivors: Vec<usize>,
+    /// How long each aborted route took.
+    victims: Vec<usize>,
+    /// How long each twin that lost a route took from the later of its
+    /// heads' refusals to settling its survivor.
+    since_refusal: Vec<usize>,
+}
+
+impl<'a> TwinsRead<'a> {
+    fn over<C: Cluster>(c: &C, flight: &Flight, places: &PlacesSeen, twins: &'a [Twin]) -> Self {
+        let outcomes: Vec<TwinOutcome> = twins
+            .iter()
+            .map(|twin| TwinOutcome::read(c, flight, places, twin))
+            .collect();
+        let count = |wanted: Option<bool>| {
+            outcomes
+                .iter()
+                .filter(|twin| twin.inverted == wanted)
+                .count()
+        };
+        let times = |split: &dyn Fn(&TwinOutcome, &TxHash) -> bool| -> Vec<usize> {
+            outcomes
+                .iter()
+                .flat_map(|twin| twin.times(|route| split(twin, route)).collect::<Vec<_>>())
+                .collect()
+        };
+        let uninverted = times(&|twin, _| twin.inverted == Some(false));
+        let survivors = times(&|twin, route| {
+            (twin.inverted == Some(true) || !twin.aborted.is_empty())
+                && !twin.aborted.contains(route)
+        });
+        let victims = times(&|twin, route| twin.aborted.contains(route));
+        let since_refusal = outcomes
+            .iter()
+            .filter_map(|twin| twin.since_refusal)
+            .collect();
+        Self {
+            twins,
+            inverted: count(Some(true)),
+            unread: count(None),
+            uninverted,
+            survivors,
+            victims,
+            since_refusal,
+            outcomes,
+        }
+    }
+
+    fn report(&self, label: &str, flight: &Flight, dropped: u64) {
+        let aborted = flight.decided_as(TransactionDecision::Aborted);
+        let decided = flight.decided.len();
+        println!(
+            "{label} [twins]: {} offered, {} offers short of a free pair; {} placed in opposite \
+             order, {} with a place unseen; {dropped} crossing readings dropped",
+            self.twins.len(),
+            flight.short,
+            self.inverted,
+            self.unread,
+        );
+        println!(
+            "{label} [aborts]: {aborted} of {decided} decided, {}",
+            percent(wide(aborted), wide(decided)),
+        );
+        println!(
+            "{label} [time to resolve, offer to both venue chains settled]: uninverted {}; \
+             survivors of inverted twins {}; victims {}",
+            ms_quantiles(self.uninverted.clone()),
+            ms_quantiles(self.survivors.clone()),
+            ms_quantiles(self.victims.clone()),
+        );
+        println!(
+            "{label} [survivors, the later refusal to both venue chains settled]: {}",
+            ms_quantiles(self.since_refusal.clone()),
+        );
+    }
+
+    /// Assert each twin lost at most one route, the later hash, and that
+    /// an inversion accounts for every abort and the load inverted one.
+    fn assert_the_later_hash_lost(&self, flight: &Flight) {
+        for (twin, outcome) in self.twins.iter().zip(&self.outcomes) {
+            let [a, b] = twin.routes;
+            match outcome.aborted.as_slice() {
+                [] => {}
+                [victim] => {
+                    let survivor = if *victim == a { b } else { a };
+                    assert_eq!(
+                        *victim,
+                        a.max(b),
+                        "the route a twin loses is the later hash: {twin:?}",
+                    );
+                    assert_eq!(
+                        flight.decided.get(&survivor),
+                        Some(&TransactionDecision::Accept),
+                        "the twin of an aborted route accepts: {twin:?}",
+                    );
+                }
+                both => panic!("at most one route of a twin aborts: {twin:?} lost {both:?}"),
+            }
+        }
+        let aborted = flight.decided_as(TransactionDecision::Aborted);
+        assert!(
+            aborted <= self.inverted + self.unread,
+            "every abort comes of an inversion: {aborted} aborted, {} twins seen inverted, {} \
+             unseen",
+            self.inverted,
+            self.unread,
+        );
+        assert!(
+            self.inverted > 0,
+            "the load must invert a twin, or it measures nothing: raise record_loss",
+        );
+    }
+
+    /// Assert the p99 survivor resolved within half a naming window of the
+    /// later of its heads' refusals.
+    fn assert_survivors_resolved_in_time(&self) {
+        let mut since_refusal = self.since_refusal.clone();
+        let since_refusal = Duration::from_millis(wide(quantile(&mut since_refusal, 990)));
+        assert!(
+            since_refusal < NAMING_WINDOW / 2,
+            "the p99 survivor resolved {since_refusal:?} past the later refusal, past half a \
+             naming window",
+        );
+    }
+}
+
+/// The traders a hot pool's routes are dealt among.
+const HOT_POOL_TRADERS: usize = 32;
+
+/// How many routes a hot pool offers a second as it fills.
+const HOT_POOL_ARRIVALS: usize = 100;
+
+/// The share of its routes, in percent, a hot pool must have waiting
+/// behind a head before its seat fetches are priced.
+const HOT_POOL_STANDING_PERCENT: usize = 75;
+
+/// The seat fetch bytes a validator may spend a second on a hot pool of
+/// 500 waiting routes before a capped ask backoff has to replace the
+/// fixed ask gap.
+pub const HOT_POOL_ADOPT_IF: u64 = 200_000;
+
+/// Many routes in one direction through one venue pair, so about
+/// `routes` rows wait behind each head on the shared pool.
+#[derive(Debug, Clone, Copy)]
+pub struct HotPool {
+    /// The routes kept out at once.
+    pub routes: usize,
+    /// How long they are kept out for.
+    pub duration: Duration,
+}
+
+/// The rows waiting behind a head on `shard`.
+fn waiting_rows<C: Cluster>(c: &C, shard: ShardId) -> usize {
+    c.queued_rows(shard)
+        .expect("the harness reads a venue shard's queue")
+        .values()
+        .filter(|row| row.state == RowState::Pending && row.queued.is_some() && row.head.is_none())
+        .count()
+}
+
+/// What seat questions cost on a hot pool, from
+/// [`HOT_POOL_STANDING_PERCENT`] of its routes waiting to its end.
+///
+/// `pool.routes` routes are kept out through one venue pair for
+/// `pool.duration`, the pool filling at [`HOT_POOL_ARRIVALS`] a second,
+/// and nothing here waits for them to settle: only one runs through a pair
+/// at a time, and the shape is the queue, not the throughput.
+///
+/// The run reports the rows waiting, the seat cells and seat fetch bytes
+/// per validator per second, and the answer bytes per second served by
+/// the busiest venue validator and the mean one, and returns seat fetch
+/// bytes per validator per second.
+///
+/// Requires a grown four-shard cluster over
+/// [`hot_pool_genesis_accounts`], on committees that share no host, one
+/// that walks its shards' chains and meters state proofs.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the harness cannot
+/// meter a state proof, or if the rows waiting never reach
+/// [`HOT_POOL_STANDING_PERCENT`] of `pool.routes`.
+pub fn seat_fetches_on_a_hot_pool<C: FaultableCluster>(c: &mut C, pool: HotPool) -> u64 {
+    let label = "hot pool";
+    let cast = LoadCast::stand_up(c, 1, &[(TRADER_SHARD, HOT_POOL_TRADERS)]);
+    let height = |c: &C, shard: ShardId| c.committed_height(shard).unwrap_or(BlockHeight::GENESIS);
+    let walked = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD].map(|shard| height(c, shard).next());
+    let meter = ProofMeter::default();
+    assert!(
+        c.meter_state_proofs(&meter),
+        "a hot pool is priced off a metered harness",
+    );
+    let mut flight = Flight::over(1, walked);
+    let opened = c.now();
+    let mut waiting = Vec::new();
+    let mut standing = None;
+    while c.now() < opened + pool.duration {
+        cast.offer_hot(c, pool, &mut flight);
+        watch_seats(&meter, &flight);
+        flight.tick(c, label);
+        flight.lapse(c);
+        let behind = waiting_rows(c, FIRST_VENUE_SHARD).min(waiting_rows(c, SECOND_VENUE_SHARD));
+        waiting.push(behind);
+        if standing.is_none() && behind * 100 >= pool.routes * HOT_POOL_STANDING_PERCENT {
+            let venue_heights = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD].map(|s| height(c, s));
+            standing = Some((c.now(), meter.served(), venue_heights));
+        }
+    }
+    let (from, earlier, venue_heights) = standing.unwrap_or_else(|| {
+        panic!(
+            "the rows waiting on the pool never reached {HOT_POOL_STANDING_PERCENT}% of {}: {}",
+            pool.routes,
+            spread(waiting.clone()),
+        )
+    });
+    let seconds = c.now().saturating_sub(from).as_secs().max(1);
+    let served: Vec<ProofTally> = meter
+        .served()
+        .into_iter()
+        .map(|(host, tally)| tally.since(earlier.get(&host).copied().unwrap_or_default()))
+        .collect();
+    let total = served
+        .iter()
+        .copied()
+        .fold(ProofTally::default(), ProofTally::plus);
+    let askers = venue_validators(c).max(1);
+    let per_second = |count: u64| count / seconds;
+    let fetched = per_second((total.asked_bytes + total.answer_bytes) / askers);
+    let most_served = per_second(
+        served
+            .iter()
+            .map(|tally| tally.answer_bytes)
+            .max()
+            .unwrap_or(0),
+    );
+    let blocks: u64 = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+        .into_iter()
+        .zip(venue_heights)
+        .map(|(shard, from)| height(c, shard).inner().saturating_sub(from.inner()))
+        .sum();
+    println!(
+        "{label} [rows waiting behind a head, read each second, the lesser venue]: {}; {} routes \
+         offered, {} settled, {} lapsed",
+        spread(waiting),
+        flight.routes.len(),
+        flight.decided.len(),
+        flight.lapsed,
+    );
+    report_seat_fetches(label, total, blocks, askers);
+    println!(
+        "{label} [seat fetches over the {seconds} s standing]: {} cells and {fetched} bytes a \
+         validator a second against {HOT_POOL_ADOPT_IF}; answers served, {} bytes a second the \
+         mean venue validator, {most_served} the busiest",
+        per_second(total.cells / askers),
+        per_second(total.answer_bytes / askers),
+    );
+    fetched
 }
 
 /// How near its cap a sustained load reads a pair as standing at the
@@ -3919,7 +6047,7 @@ pub fn standing_answers_level_off_under_sustained_load<C: FaultableCluster>(
     load: CoreLoad,
 ) {
     let label = "standing answers level off";
-    let cast = LoadCast::stand_up(c, load);
+    let cast = LoadCast::stand_up(c, load.pairs, &[(TRADER_SHARD, load.traders)]);
     let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
     let units = cast.world(c, cast.firsts[0].unit);
     let epoch =
@@ -3976,16 +6104,10 @@ pub fn standing_answers_level_off_under_sustained_load<C: FaultableCluster>(
         "{label}: no load shard stands an answer {:?} past the last offer",
         c.now().saturating_sub(closed),
     );
-    let conserved = load_conserved(c, &flight, opened_at[2], &protocol_resource, &units);
+    let payers = [(TRADER_SHARD, opened_at[2])];
+    let conserved = load_conserved(c, &flight, &payers, LOAD_DRAIN, &protocol_resource, &units);
     standing_within_the_answer_caps(c);
-    for (side, before, held, burned) in conserved {
-        assert_eq!(
-            held + burned,
-            before,
-            "the load's {side} must be conserved: held {held} and burned {burned} against \
-             {before} before",
-        );
-    }
+    assert_load_conserved(conserved);
     assert!(
         flight.flying.is_empty(),
         "{} of {} routes were still out {LOAD_DRAIN:?} past the last offer",
@@ -4484,6 +6606,7 @@ impl CoreLoadRun<'_> {
                 "block_commit_deferred",
                 "hold_contentions",
                 "hold_inversions_proven",
+                "heads_windowed",
                 "transactions_aborted",
                 "unresolvable_txs",
                 "expected_tx_dropped",
@@ -4501,10 +6624,8 @@ impl CoreLoadRun<'_> {
             ],
         );
         println!(
-            "core load [7 computed]: a verdict ask is served as a state proof, so its answers \
-             are counted in fetch_items_sent{{state_proof}} with the record reads' and under no \
-             label of their own; no counter tells a verdict reading that arrived by push from \
-             one that was asked for"
+            "core load [7 computed]: no counter tells a verdict reading that arrived by push \
+             from one that was asked for"
         );
     }
 

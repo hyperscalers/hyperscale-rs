@@ -14,8 +14,6 @@
 //!
 //! Errors are returned as human-readable strings so the caller can log a
 //! single diagnostic line at the rejection site.
-use std::sync::Arc;
-
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, DeclaredWork, LocalTimestamp, MAX_ROUND_GAP,
     MAX_TICK_STAGED_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId,
@@ -26,7 +24,7 @@ use hyperscale_types::{
 use crate::admission::{
     Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, StateClaimsFold, StateClaimsSection, TransactionsFold,
-    TransactionsSection, admit_all, unwrapped,
+    TransactionsSection, admit_all,
 };
 use crate::tick_members::{run_by, states_entry};
 
@@ -413,19 +411,19 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     admit_all::<ProvisionsSection>(
         ctx,
         &mut provisions,
-        block.provisions().iter().map(unwrapped),
+        block.provisions().iter().map(Verifiable::as_unverified),
     )?;
     let mut transactions = TransactionsFold::beside(&provisions);
     admit_all::<TransactionsSection<'_>>(
         ctx,
         &mut transactions,
-        block.transactions().iter().map(unwrapped),
+        block.transactions().iter().map(Verifiable::as_unverified),
     )?;
     let mut finalizations = FinalizationsFold::from(ctx);
     admit_all::<FinalizationsSection>(
         ctx,
         &mut finalizations,
-        block.certificates().iter().map(unwrapped),
+        block.certificates().iter().map(Verifiable::as_unverified),
     )?;
     let mut records = RecordsFold::after(&finalizations);
     admit_all::<RecordsSection<'_>>(ctx, &mut records, block.abandonment_records())?;
@@ -463,7 +461,10 @@ pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
         .iter()
         .filter_map(|line| match line {
             TickLine::Member { staged, .. } => Some(*staged),
-            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+            TickLine::Fate { .. }
+            | TickLine::Discard { .. }
+            | TickLine::End { .. }
+            | TickLine::Recovered { .. } => None,
         })
         .fold(0u64, u64::saturating_add);
     if staged > MAX_TICK_STAGED_BYTES {
@@ -573,7 +574,7 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
     // chain up to its parent.
     if let Some(line) = block.tick_manifest().iter().find(|line| match line {
         TickLine::Fate { .. } | TickLine::End { .. } => false,
-        TickLine::Member { .. } | TickLine::Discard { .. } => true,
+        TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::Recovered { .. } => true,
     }) {
         return Err(format!(
             "coast block past the terminal window carries tick lines other than fates and ends: {line:?}"
@@ -602,7 +603,7 @@ fn validate_transactions_verified(block: &Block) -> Result<(), String> {
 
 /// Verify that a list of transactions is sorted by hash in strict ascending
 /// order. `section` is used in the error message for diagnostics.
-fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Result<(), String> {
+fn verify_hash_sorted(txs: &[Verifiable<Transaction>], section: &str) -> Result<(), String> {
     for window in txs.windows(2) {
         if window[0].hash() >= window[1].hash() {
             return Err(format!(
@@ -619,11 +620,12 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 #[cfg(test)]
 pub mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::{
-        CommittedSets, awaited_core, member_lines, member_of, staged_past_cap,
+        CommittedSets, Crossing, Naming, awaited_core, member_lines, member_of, staged_past_cap,
     };
     use hyperscale_hbor::{Capped, from_slice, to_vec};
     use hyperscale_storage::test_helpers::{
@@ -649,15 +651,15 @@ pub mod tests {
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_TERMS_BYTES,
         MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MemberTerms,
         MerkleInclusionProof, NetworkDefinition, Owes, PriceTable, PrincipalAddr,
-        ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate,
-        RETENTION_HORIZON, Reshaping, Round, RoutePrefix, SectionRoots, SetRoot, Settlement,
-        ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot,
-        StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickId, TickManifest,
-        TickManifestRoot, Timeout, TimeoutCertificate, TimestampRange, TopologySchedule,
-        Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, UnsettledTx,
-        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, Verify, VoteCount,
-        WeightedTimestamp, Window, WitnessSources, claims_admit_block, receipt_hash_of,
-        state_claims_admit_block, test_utils, verdict_leaf,
+        ProposerTimestamp, Provision, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON,
+        Reshaping, Round, RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId, ShardLoad,
+        Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites, StatedTerms,
+        StoredReceipt, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
+        TimeoutCertificate, TimestampRange, TopologySchedule, Transaction, TransactionDecision,
+        TransactionEnvelope, TxHash, TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo,
+        ValidatorSet, Verifiable, Verified, Verify, VoteCount, WeightedTimestamp, Window,
+        WitnessSources, claims_admit_block, receipt_hash_of, state_claims_admit_block, test_utils,
+        verdict_leaf,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
 
@@ -669,7 +671,9 @@ pub mod tests {
     };
     use crate::commit_dedup::CommitDedupIndex;
     use crate::precut::Precut;
-    use crate::proposal::{Prefilter, select_finalizations, select_transactions};
+    use crate::proposal::{
+        Prefilter, select_finalizations, select_provisions, select_transactions,
+    };
 
     /// The body root check the vote path dispatches, run in place, and
     /// the tick manifest's budget beside it.
@@ -761,6 +765,10 @@ pub mod tests {
             covered: false,
             executed: !matches!(state, RowState::Pending),
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
+            orphaned: false,
         }
     }
 
@@ -894,7 +902,7 @@ pub mod tests {
         Finalization::new(
             tick_id,
             TickHalf::Stated,
-            Some(Arc::new(certificate)),
+            Some(certificate),
             Capped::new(receipts).expect("a list written out in a test"),
         )
     }
@@ -911,9 +919,9 @@ pub mod tests {
 
     /// `against` after a block at height 3 carrying `halves` commits.
     fn after_committing(mut against: Against, halves: &[&Finalization]) -> Against {
-        let certificates: Vec<Arc<Verifiable<Finalization>>> = halves
+        let certificates: Vec<Verifiable<Finalization>> = halves
             .iter()
-            .map(|fw| Arc::new(Verifiable::from((*fw).clone())))
+            .map(|fw| Verifiable::from((*fw).clone()))
             .collect();
         against.members.advance(&MemberInputs::deriving(
             ShardId::ROOT,
@@ -1185,14 +1193,14 @@ pub mod tests {
             TxHash::from(Hash::from_bytes(b"an accepted core")),
             TxHash::from(Hash::from_bytes(b"a refused core")),
         );
-        let stating = Arc::new(stating_at(
+        let stating = stating_at(
             2,
             vec![
                 core_outcome(accepted, succeeded(), 30),
                 core_outcome(refused, ExecutionOutcome::Failed, 12),
             ],
-        ));
-        let legs = Arc::new(legs_naming(&[accepted]));
+        );
+        let legs = legs_naming(&[accepted]);
         assert_eq!(legs.tx_hashes().collect::<Vec<_>>(), [accepted]);
         let fees_after = |blocks: &[&Block]| {
             blocks
@@ -1203,8 +1211,7 @@ pub mod tests {
                 )
                 .cumulative_fees
         };
-        let stating_block =
-            block_with_certificates(BlockHeight::new(3), vec![Arc::clone(&stating)]);
+        let stating_block = block_with_certificates(BlockHeight::new(3), vec![stating.clone()]);
         let legs_block = block_with_certificates(BlockHeight::new(4), vec![legs]);
         assert_eq!(
             stating_block.charged(),
@@ -1228,10 +1235,10 @@ pub mod tests {
         let row = &stated.members.members[&accepted];
         assert!(matches!(row.state, RowState::Stated { .. }));
         assert_eq!(row.share, 0, "the stating half counted it");
-        let aborting = Arc::new(stating_at(
+        let aborting = stating_at(
             9,
             vec![core_outcome(accepted, ExecutionOutcome::Aborted, row.share)],
-        ));
+        );
         let abort_block = block_with_certificates(BlockHeight::new(5), vec![aborting]);
         assert_eq!(abort_block.charged(), 0);
         assert_eq!(
@@ -1588,6 +1595,7 @@ pub mod tests {
             BlockHeight::new(reported),
             BlockHash::ZERO,
             Round::new(reported),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -1686,6 +1694,7 @@ pub mod tests {
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(weighted_ms),
@@ -1816,6 +1825,7 @@ pub mod tests {
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
+            Epoch::GENESIS,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(weighted_ms),
@@ -1987,7 +1997,7 @@ pub mod tests {
 
     fn block_with_transactions(
         height: BlockHeight,
-        transactions: Vec<Arc<Verifiable<Transaction>>>,
+        transactions: Vec<Verifiable<Transaction>>,
     ) -> Block {
         Block::Live {
             header: header_at_height(height, 100_000),
@@ -2028,13 +2038,13 @@ pub mod tests {
         let cells = MAX_INTENTS + 1;
         let full = 3;
         let composed = |seed: u32| {
-            Arc::new(Verifiable::from(test_utils::stub_transaction_binding(
+            Verifiable::from(test_utils::stub_transaction_binding(
                 seed,
                 MAX_INTENTS - 1,
                 test_utils::test_validity_range(),
-            )))
+            ))
         };
-        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..full)
+        let mut txs: Vec<Verifiable<Transaction>> = (0..full)
             .map(|i| composed(u32::try_from(i).expect("fewer than u32 transactions")))
             .collect();
         let against = plain();
@@ -2048,7 +2058,7 @@ pub mod tests {
         admit_all::<TransactionsSection<'_>>(
             &against.ctx(),
             &mut at_cap,
-            txs.iter().map(unwrapped),
+            txs.iter().map(Verifiable::as_unverified),
         )
         .expect("a block at the cap is admitted");
         assert_eq!(at_cap.sweepable, MAX_SWEEPABLE_CREATED_PER_BLOCK);
@@ -2057,7 +2067,7 @@ pub mod tests {
         let err = admit_all::<TransactionsSection<'_>>(
             &against.ctx(),
             &mut near_cap(),
-            txs.iter().map(unwrapped),
+            txs.iter().map(Verifiable::as_unverified),
         )
         .expect_err("past the cap is refused");
         assert!(err.contains("sweepable cells"), "{err}");
@@ -2079,7 +2089,7 @@ pub mod tests {
         let (payer_shard, recipient_shard) = ShardId::ROOT.children();
         let payer = PrincipalAddr::new([0x10; 31]);
         let recipient = Address::new([0x90; 31], AddressClass::Component);
-        let transfer = Arc::new(Verifiable::from(
+        let transfer = Verifiable::from(
             test_utils::stub_transaction(
                 payer,
                 &[payer.address(), recipient],
@@ -2093,7 +2103,7 @@ pub mod tests {
                     test_utils::leg_shape(recipient, LegRole::Outbound, &[(0, 0)]),
                 ],
             ),
-        ));
+        );
         let on = |local: ShardId| {
             let mut against = Against::window(TopologySnapshot::new(
                 NetworkDefinition::simulator(),
@@ -2105,7 +2115,7 @@ pub mod tests {
             admit_all::<TransactionsSection<'_>>(
                 &against.ctx(),
                 &mut TransactionsFold::beside(&provisions),
-                std::iter::once(&transfer).map(unwrapped),
+                std::iter::once(&transfer).map(Verifiable::as_unverified),
             )
         };
 
@@ -2441,6 +2451,7 @@ pub mod tests {
                     declared: Capped::empty(),
                     engages: Capped::empty(),
                     waits: false,
+                    unarrived: Capped::empty(),
                 }),
                 ..member_row(tx, RowState::Pending)
             };
@@ -2530,6 +2541,7 @@ pub mod tests {
                     declared: Capped::empty(),
                     engages: Capped::empty(),
                     waits: false,
+                    unarrived: Capped::empty(),
                 }),
                 ..member_row(tx, RowState::Pending)
             },
@@ -2666,6 +2678,7 @@ pub mod tests {
                     declared: Capped::empty(),
                     engages: Capped::empty(),
                     waits: false,
+                    unarrived: Capped::empty(),
                 }),
                 ..member_row(tx, RowState::Pending)
             };
@@ -2856,6 +2869,7 @@ pub mod tests {
                 joins: Joins::Aborted,
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
+                pins: Capped::empty(),
                 reach: Capped::from_array([near]),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
@@ -2863,6 +2877,7 @@ pub mod tests {
                 reserves: Capped::empty(),
                 deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
                 crossings: Capped::empty(),
+                served_at: None,
             }])),
             ..MemberInputs::still(against.local_shard)
         };
@@ -2890,7 +2905,6 @@ pub mod tests {
     /// hold it to no clock: the first block names their aborts.
     #[test]
     fn released_rows_leave_the_count_and_the_drain_from_their_deadline() {
-        use hyperscale_engine::tick_select::{CommittedSets, member_lines};
         use hyperscale_storage::SettledHalf;
         use hyperscale_types::{Evidence, TickHalf};
 
@@ -2911,12 +2925,14 @@ pub mod tests {
         }
         let named = |rows: &MemberIndex, anchor: WeightedTimestamp| {
             let (lines, missing, _) = member_lines(
-                rows,
-                anchor,
-                &CommittedSets::default(),
-                &|_, _| Evidence::Live { terminating: false },
-                false,
-                &BTreeSet::new(),
+                Naming {
+                    rows,
+                    anchor,
+                    inputs: &CommittedSets::default(),
+                    evidence: &|_, _| Evidence::Live { terminating: false },
+                    crossing: &Crossing::None,
+                    wounded: &BTreeSet::new(),
+                },
                 &BTreeMap::new(),
             );
             assert!(missing.is_empty());
@@ -2967,12 +2983,9 @@ pub mod tests {
 
     /// `transactions` in hash order, as a block carries them and a ready
     /// set offers them.
-    fn in_hash_order(mut transactions: Vec<Transaction>) -> Vec<Arc<Verifiable<Transaction>>> {
+    fn in_hash_order(mut transactions: Vec<Transaction>) -> Vec<Verifiable<Transaction>> {
         transactions.sort_by_key(Transaction::hash);
-        transactions
-            .into_iter()
-            .map(|tx| Arc::new(Verifiable::from(tx)))
-            .collect()
+        transactions.into_iter().map(Verifiable::from).collect()
     }
 
     /// A voter refuses a block carrying one transaction more toward a
@@ -3002,10 +3015,10 @@ pub mod tests {
         stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD - 1);
         let toward_near = [awaiting(0x10, 0x50), awaiting(0x11, 0x51)];
         let others = [awaiting(0x12, 0x90), awaiting(0x13, 0x13)];
-        let ready: Vec<Arc<Verified<Transaction>>> =
+        let ready: Vec<Verified<Transaction>> =
             in_hash_order(toward_near.iter().chain(&others).cloned().collect())
                 .into_iter()
-                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.as_unverified().clone())))
+                .map(|tx| Verified::new_unchecked_for_test(tx.as_unverified().clone()))
                 .collect();
 
         let ctx = against.ctx();
@@ -3033,7 +3046,7 @@ pub mod tests {
 
         let carried = selected
             .iter()
-            .map(|tx| Arc::new(Verifiable::from(tx.as_ref().as_ref().clone())))
+            .map(|tx| Verifiable::from(tx.as_ref().clone()))
             .collect();
         assert_eq!(
             admit(
@@ -3459,7 +3472,7 @@ pub mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(1),
                 anchor: WeightedTimestamp::ZERO,
-                committee_anchor: WeightedTimestamp::ZERO,
+                committee_epoch: Epoch::GENESIS,
             },
             reach: Capped::from_array([route(0x00), route(0xC0)]),
         }
@@ -3605,7 +3618,7 @@ pub mod tests {
         for epoch in 6..=20u64 {
             deep.insert(Epoch::new(epoch), Arc::clone(&dropped));
         }
-        deep.set_head(Arc::clone(&dropped));
+        deep.set_head(Epoch::new(20), Arc::clone(&dropped));
         let mut shallow = deep.clone();
         shallow.evict_below(Epoch::new(6));
 
@@ -3771,7 +3784,7 @@ pub mod tests {
                 .charging(charged),
             ],
         );
-        let block = block_with_certificates(BlockHeight::new(1), vec![Arc::new(aborted)]);
+        let block = block_with_certificates(BlockHeight::new(1), vec![aborted]);
         assert_eq!(
             block.charged(),
             charged * 2,
@@ -3785,11 +3798,11 @@ pub mod tests {
         assert!(err.contains("cumulative fees"), "{err}");
     }
 
-    fn tx(seed: u8) -> Arc<Verifiable<Transaction>> {
-        Arc::new(Verifiable::from(test_utils::test_transaction(seed)))
+    fn tx(seed: u8) -> Verifiable<Transaction> {
+        Verifiable::from(test_utils::test_transaction(seed))
     }
 
-    fn sorted_txs(seeds: &[u8]) -> Vec<Arc<Verifiable<Transaction>>> {
+    fn sorted_txs(seeds: &[u8]) -> Vec<Verifiable<Transaction>> {
         let mut txs: Vec<_> = seeds.iter().map(|&s| tx(s)).collect();
         txs.sort_by_key(|t| t.hash());
         txs
@@ -3853,11 +3866,9 @@ pub mod tests {
     // validate_no_duplicate_certificates
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn block_with_certificates(height: BlockHeight, certificates: Vec<Arc<Finalization>>) -> Block {
-        let wrapped: Vec<Arc<Verifiable<Finalization>>> = certificates
-            .into_iter()
-            .map(|fw| Arc::new((*fw).clone().into()))
-            .collect();
+    fn block_with_certificates(height: BlockHeight, certificates: Vec<Finalization>) -> Block {
+        let wrapped: Vec<Verifiable<Finalization>> =
+            certificates.into_iter().map(Verifiable::from).collect();
         Block::Live {
             header: header_at_height(height, 100_000),
             transactions: Arc::new(Capped::empty()),
@@ -3871,24 +3882,24 @@ pub mod tests {
         }
     }
 
-    fn finalization_at(height: u64) -> Arc<Finalization> {
-        Arc::new(make_finalization(
+    fn finalization_at(height: u64) -> Finalization {
+        make_finalization(
             BlockHeight::new(height),
             TxHash::from(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
             )),
             TransactionDecision::Accept,
-        ))
+        )
     }
 
     /// A finalization over `tx_hash`, on a tick distinct from any other
     /// built at the same height — the shape a second verdict takes.
-    fn finalization_over(height: u64, tx_hash: TxHash) -> Arc<Finalization> {
-        Arc::new(make_finalization(
+    fn finalization_over(height: u64, tx_hash: TxHash) -> Finalization {
+        make_finalization(
             BlockHeight::new(height),
             tx_hash,
             TransactionDecision::Aborted,
-        ))
+        )
     }
 
     /// The shard [`after_departures`] admits as, whose ticks its blocks
@@ -3898,25 +3909,25 @@ pub mod tests {
     }
 
     /// [`finalization_at`] for a tick of [`survivor`].
-    fn survivor_finalization_at(height: u64) -> Arc<Finalization> {
-        Arc::new(make_finalization_on(
+    fn survivor_finalization_at(height: u64) -> Finalization {
+        make_finalization_on(
             survivor(),
             BlockHeight::new(height),
             TxHash::from(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
             )),
             TransactionDecision::Accept,
-        ))
+        )
     }
 
     /// [`finalization_over`] for a tick of [`survivor`].
-    fn survivor_finalization_over(height: u64, tx_hash: TxHash) -> Arc<Finalization> {
-        Arc::new(make_finalization_on(
+    fn survivor_finalization_over(height: u64, tx_hash: TxHash) -> Finalization {
+        make_finalization_on(
             survivor(),
             BlockHeight::new(height),
             tx_hash,
             TransactionDecision::Aborted,
-        ))
+        )
     }
 
     fn no_resolutions(block: &Block, dedup_index: CommitDedupIndex) -> Result<(), String> {
@@ -3944,10 +3955,9 @@ pub mod tests {
     #[test]
     fn validate_no_duplicate_resolutions_rejects_retention_dup() {
         let fw = survivor_finalization_at(1);
-        let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
+        let block = block_with_certificates(BlockHeight::new(6), vec![fw.clone()]);
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index
-            .register_committed_certs(&[Arc::new((*fw).clone().into())], WeightedTimestamp::ZERO);
+        dedup_index.register_committed_certs(&[fw.into()], WeightedTimestamp::ZERO);
         let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
@@ -3960,16 +3970,15 @@ pub mod tests {
     /// — it resolves none — so identity is the only thing that can.
     #[test]
     fn a_committed_certificate_deciding_nothing_cannot_ride_a_second_block() {
-        let fw = Arc::new(make_leg_finalization_on(
+        let fw = make_leg_finalization_on(
             survivor(),
             BlockHeight::new(1),
             TxHash::from(Hash::from_bytes(b"retired")),
-        ));
+        );
         assert_eq!(fw.deciding_tx_hashes().count(), 0);
-        let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
+        let block = block_with_certificates(BlockHeight::new(6), vec![fw.clone()]);
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index
-            .register_committed_certs(&[Arc::new((*fw).clone().into())], WeightedTimestamp::ZERO);
+        dedup_index.register_committed_certs(&[fw.into()], WeightedTimestamp::ZERO);
         let err = no_resolutions(&block, dedup_index).unwrap_err();
         assert!(
             err.contains("was already committed within its retention window"),
@@ -3989,10 +3998,7 @@ pub mod tests {
             .next()
             .expect("a tick names its members");
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(
-            &[Arc::new((*settled).clone().into())],
-            WeightedTimestamp::ZERO,
-        );
+        dedup_index.register_committed_certs(&[settled.clone().into()], WeightedTimestamp::ZERO);
 
         let abandoned = survivor_finalization_over(9, tx_hash);
         assert_ne!(abandoned.tick_id(), settled.tick_id());
@@ -4018,10 +4024,7 @@ pub mod tests {
             .next()
             .expect("a tick names its members");
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(
-            &[Arc::new((*settled).clone().into())],
-            WeightedTimestamp::ZERO,
-        );
+        dedup_index.register_committed_certs(&[settled.into()], WeightedTimestamp::ZERO);
 
         let block = block_with_verdicts(
             vec![AbandonmentRecord::new(
@@ -4050,7 +4053,7 @@ pub mod tests {
         let block = Block::Live {
             header: header_at_height(BlockHeight::new(6), 100_000),
             transactions: Arc::new(Capped::empty()),
-            certificates: Arc::new(Capped::from_array([Arc::new((*settled).clone().into())])),
+            certificates: Arc::new(Capped::from_array([settled.into()])),
             provisions: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
@@ -4166,12 +4169,12 @@ pub mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             );
-            Arc::new(Verifiable::from(Finalization::new(
+            Verifiable::from(Finalization::new(
                 tick_id,
                 half,
-                Some(Arc::new(ec)),
+                Some(ec),
                 Capped::new(receipts).expect("a list written out in a test"),
-            )))
+            ))
         };
         let certificates: Vec<_> = determined
             .iter()
@@ -4352,17 +4355,17 @@ pub mod tests {
     fn a_later_write_is_not_erased_by_an_earlier_determined_half() {
         let cell = state_key(7, 1);
         let stating = |value: u8| make_state_writes(7, 1, vec![value]);
-        let earlier = Arc::new(test_utils::make_finalization_leaving(
+        let earlier = test_utils::make_finalization_leaving(
             BlockHeight::new(4),
             TxHash::from(Hash::from_bytes(b"earlier writer")),
             stating(4),
-        ));
+        );
         let member = TxHash::from(Hash::from_bytes(b"later writer"));
-        let later = Arc::new(legs_leaving(5, member, stating(5)));
-        let carrying = |halves: &[&Arc<Finalization>]| {
+        let later = legs_leaving(5, member, stating(5));
+        let carrying = |halves: &[&Finalization]| {
             block_with_certificates(
                 BlockHeight::new(1),
-                halves.iter().copied().map(Arc::clone).collect(),
+                halves.iter().copied().cloned().collect(),
             )
         };
 
@@ -4435,7 +4438,7 @@ pub mod tests {
         let offered = |determined: &[u64], legs: &[u64]| {
             block_settling(determined, legs).certificates().to_vec()
         };
-        let halves = |selected: &[Arc<Verifiable<Finalization>>]| -> Vec<(u64, bool)> {
+        let halves = |selected: &[Verifiable<Finalization>]| -> Vec<(u64, bool)> {
             selected
                 .iter()
                 .map(|fw| (fw.tick_id().block_height().inner(), fw.is_determined()))
@@ -4451,8 +4454,12 @@ pub mod tests {
         assert_eq!(halves(&selected), [(4, true), (4, false), (6, true)]);
         let mut voter = FinalizationsFold::from(&ctx);
         assert!(
-            admit_all::<FinalizationsSection>(&ctx, &mut voter, selected.iter().map(unwrapped))
-                .is_ok()
+            admit_all::<FinalizationsSection>(
+                &ctx,
+                &mut voter,
+                selected.iter().map(Verifiable::as_unverified),
+            )
+            .is_ok()
         );
 
         // A voter owing a tick the proposer's rows did not name refuses
@@ -4467,8 +4474,12 @@ pub mod tests {
         assert_eq!(halves(&selected), [(5, false)]);
         let mut voter = FinalizationsFold::from(&ctx);
         assert!(
-            admit_all::<FinalizationsSection>(&ctx, &mut voter, selected.iter().map(unwrapped))
-                .is_err()
+            admit_all::<FinalizationsSection>(
+                &ctx,
+                &mut voter,
+                selected.iter().map(Verifiable::as_unverified),
+            )
+            .is_err()
         );
     }
 
@@ -4525,7 +4536,7 @@ pub mod tests {
         Finalization::new(
             tick_id,
             TickHalf::Determined,
-            Some(Arc::new(projected)),
+            Some(projected),
             Capped::new(receipts).expect("a list written out in a test"),
         )
     }
@@ -4610,7 +4621,7 @@ pub mod tests {
         let carrying = |kept: &[TxHash]| {
             block_with_certificates(
                 BlockHeight::new(3),
-                vec![Arc::new(determined_projected(outcomes(), kept))],
+                vec![determined_projected(outcomes(), kept)],
             )
         };
         let against = holding_alone(&[first, second]);
@@ -4692,12 +4703,7 @@ pub mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let none = Finalization::new(
-            tick_id,
-            TickHalf::Determined,
-            Some(Arc::new(empty)),
-            Capped::empty(),
-        );
+        let none = Finalization::new(tick_id, TickHalf::Determined, Some(empty), Capped::empty());
         let err = settles(&holding_alone(&[]), &none).unwrap_err();
         assert!(err.contains("settles no member of tick 2"), "{err}");
     }
@@ -4858,12 +4864,14 @@ pub mod tests {
         };
         let anchor = WeightedTimestamp::from_millis(2_000);
         let (lines, missing, _) = member_lines(
-            &rows,
-            anchor,
-            &arrived,
-            &|_, _| Evidence::Live { terminating: false },
-            false,
-            &BTreeSet::new(),
+            Naming {
+                rows: &rows,
+                anchor,
+                inputs: &arrived,
+                evidence: &|_, _| Evidence::Live { terminating: false },
+                crossing: &Crossing::None,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert!(missing.is_empty());
@@ -4897,12 +4905,14 @@ pub mod tests {
         anchor: WeightedTimestamp,
     ) -> MemberIndex {
         let (lines, missing, _) = member_lines(
-            &rows,
-            anchor,
-            arrived,
-            &|_, _| Evidence::Live { terminating: false },
-            true,
-            &BTreeSet::new(),
+            Naming {
+                rows: &rows,
+                anchor,
+                inputs: arrived,
+                evidence: &|_, _| Evidence::Live { terminating: false },
+                crossing: &Crossing::Discards,
+                wounded: &BTreeSet::new(),
+            },
             &BTreeMap::new(),
         );
         assert!(missing.is_empty());
@@ -4972,12 +4982,14 @@ pub mod tests {
                         Evidence::Unknown,
                     ] {
                         let (lines, _, _) = member_lines(
-                            rows,
-                            anchor,
-                            arrived,
-                            &|_, _| said,
-                            false,
-                            &BTreeSet::new(),
+                            Naming {
+                                rows,
+                                anchor,
+                                inputs: arrived,
+                                evidence: &|_, _| said,
+                                crossing: &Crossing::None,
+                                wounded: &BTreeSet::new(),
+                            },
                             &BTreeMap::new(),
                         );
                         let unstated = rows.members[&tx].state == in_flight(2, Settlement::Shared)
@@ -5179,12 +5191,18 @@ pub mod tests {
             ] {
                 for recovery in [false, true] {
                     let (lines, missing, _) = member_lines(
-                        rows,
-                        anchor,
-                        arrived,
-                        &|_, _| said,
-                        recovery,
-                        &BTreeSet::new(),
+                        Naming {
+                            rows,
+                            anchor,
+                            inputs: arrived,
+                            evidence: &|_, _| said,
+                            crossing: &if recovery {
+                                Crossing::Discards
+                            } else {
+                                Crossing::None
+                            },
+                            wounded: &BTreeSet::new(),
+                        },
                         &BTreeMap::new(),
                     );
                     let fated = match settlement {
@@ -5314,16 +5332,11 @@ pub mod tests {
     /// the shallow tier over-admits per item rather than stalling.
     #[test]
     fn a_shallow_committee_still_commits() {
-        let bundle = Provisions::new(
+        let bundle = Provision::dummy(
             ShardId::leaf(1, 1),
             ShardId::ROOT,
             BlockHeight::new(3),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"carried before")),
-                Capped::empty(),
-            )]),
+            TxHash::from(Hash::from_bytes(b"carried before")),
         );
         let fresh = plain();
         assert!(!fresh.dedup.is_complete(fresh.anchor));
@@ -5388,11 +5401,9 @@ pub mod tests {
     // validate_no_duplicate_provisions
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn block_with_provisions(height: BlockHeight, provisions: Vec<Arc<Provisions>>) -> Block {
-        let wrapped: Vec<Arc<Verifiable<Provisions>>> = provisions
-            .into_iter()
-            .map(|p| Arc::new((*p).clone().into()))
-            .collect();
+    fn block_with_provisions(height: BlockHeight, provisions: Vec<Provision>) -> Block {
+        let wrapped: Vec<Verifiable<Provision>> =
+            provisions.into_iter().map(Verifiable::from).collect();
         Block::Live {
             header: header_at_height(height, 100_000),
             transactions: Arc::new(Capped::empty()),
@@ -5406,16 +5417,13 @@ pub mod tests {
         }
     }
 
-    fn provisions_with_seed(seed: u8) -> Arc<Provisions> {
-        let tx_hash = TxHash::from(Hash::from_bytes(&[seed; 32]));
-        Arc::new(Provisions::new(
+    fn provisions_with_seed(seed: u8) -> Provision {
+        Provision::dummy(
             ShardId::leaf(1, 0),
             ShardId::leaf(1, 1),
             BlockHeight::new(u64::from(seed)),
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-        ))
+            TxHash::from(Hash::from_bytes(&[seed; 32])),
+        )
     }
 
     #[test]
@@ -5428,6 +5436,19 @@ pub mod tests {
     fn validate_no_duplicate_provisions_accepts_unique() {
         let block = block_with_provisions(BlockHeight::new(5), vec![provisions_with_seed(1)]);
         assert!(admit(&plain(), &block).is_ok());
+    }
+
+    /// A block naming one part twice is refused: each copy would count
+    /// toward the block's cap and crowd out a part it owes.
+    #[test]
+    fn validate_no_duplicate_provisions_rejects_a_part_named_twice() {
+        let p = provisions_with_seed(1);
+        let block = block_with_provisions(
+            BlockHeight::new(6),
+            vec![p.clone(), provisions_with_seed(2), p],
+        );
+        let err = admit(&plain(), &block).unwrap_err();
+        assert!(err.contains("already named in this block"), "{err}");
     }
 
     #[test]
@@ -5444,7 +5465,7 @@ pub mod tests {
     #[test]
     fn validate_no_duplicate_provisions_rejects_retention_dup() {
         let p = provisions_with_seed(1);
-        let block = block_with_provisions(BlockHeight::new(6), vec![Arc::clone(&p)]);
+        let block = block_with_provisions(BlockHeight::new(6), vec![p.clone()]);
         let against = plain();
         against
             .dedup
@@ -5517,13 +5538,11 @@ pub mod tests {
     // validate_transactions_verified / validate_block_for_vote verified-arm
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn verified_tx(seed: u8) -> Arc<Verifiable<Transaction>> {
-        Arc::new(Verifiable::from(test_utils::verified_test_transaction(
-            seed,
-        )))
+    fn verified_tx(seed: u8) -> Verifiable<Transaction> {
+        Verifiable::from(test_utils::verified_test_transaction(seed))
     }
 
-    fn sorted_verified_txs(seeds: &[u8]) -> Vec<Arc<Verifiable<Transaction>>> {
+    fn sorted_verified_txs(seeds: &[u8]) -> Vec<Verifiable<Transaction>> {
         let mut txs: Vec<_> = seeds.iter().map(|&s| verified_tx(s)).collect();
         txs.sort_by_key(|t| t.hash());
         txs
@@ -5596,15 +5615,15 @@ pub mod tests {
 
     /// A signed stub transaction whose derived owners are exactly
     /// `owners`, paying from `payer`, wrapped verified for block content.
-    fn stub_tx(payer: PrincipalAddr, owners: &[Address]) -> Arc<Verifiable<Transaction>> {
+    fn stub_tx(payer: PrincipalAddr, owners: &[Address]) -> Verifiable<Transaction> {
         test_utils::install_stub_protocol_statics();
         let validity = TimestampRange::new(
             WeightedTimestamp::ZERO,
             WeightedTimestamp::from_millis(100_000),
         );
-        Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+        Verifiable::from(Verified::new_unchecked_for_test(
             test_utils::stub_transaction(payer, owners, 1_000, validity),
-        )))
+        ))
     }
 
     /// Admission at `local` under `topo`, with nothing committed.
@@ -5621,12 +5640,12 @@ pub mod tests {
     }
 
     fn block_with_tx(
-        tx: &Arc<Verifiable<Transaction>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
+        tx: &Verifiable<Transaction>,
+        provisions: Vec<Verifiable<Provision>>,
     ) -> Block {
         Block::Live {
             header: header_at_height(BlockHeight::new(1), 100_000),
-            transactions: Arc::new(Capped::from_array([Arc::clone(tx)])),
+            transactions: Arc::new(Capped::from_array([tx.clone()])),
             certificates: Arc::new(Capped::empty()),
             provisions: Arc::new(Capped::new(provisions).expect("a list written out in a test")),
             witness_sources: Arc::new(WitnessSources::empty()),
@@ -5654,18 +5673,11 @@ pub mod tests {
         assert!(err.contains("payer bundle"), "{err}");
 
         // The payer's empty-entry bundle in the same block: engaged.
-        let bundle: Arc<Verifiable<Provisions>> = Arc::new(
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                ShardId::leaf(1, 1),
-                local,
-                BlockHeight::new(1),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-            ))
-            .into(),
-        );
-        let paired = block_with_tx(&tx, vec![Arc::clone(&bundle)]);
+        let bundle: Verifiable<Provision> = Verified::<Provision>::new_unchecked_for_test(
+            Provision::dummy(ShardId::leaf(1, 1), local, BlockHeight::new(1), tx_hash),
+        )
+        .into();
+        let paired = block_with_tx(&tx, vec![bundle]);
         assert!(admit(&engaged(&topo, local), &paired).is_ok());
 
         // A bundle an earlier block committed, registered through that
@@ -5686,17 +5698,10 @@ pub mod tests {
         assert!(admit(&engaged_with(&topo, local, dedup), &bare).is_ok());
 
         // A bundle from the wrong source shard is not engagement evidence.
-        let wrong_source: Arc<Verifiable<Provisions>> = Arc::new(
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                local,
-                ShardId::leaf(1, 1),
-                BlockHeight::new(1),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-            ))
-            .into(),
-        );
+        let wrong_source: Verifiable<Provision> = Verified::<Provision>::new_unchecked_for_test(
+            Provision::dummy(local, ShardId::leaf(1, 1), BlockHeight::new(1), tx_hash),
+        )
+        .into();
         let mispaired = block_with_tx(&tx, vec![wrong_source]);
         let err = admit(&engaged(&topo, local), &mispaired).unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
@@ -5709,18 +5714,14 @@ pub mod tests {
         local: ShardId,
         height: u64,
         tx_hash: TxHash,
-    ) -> Arc<Verifiable<Provisions>> {
-        Arc::new(
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                payer,
-                local,
-                BlockHeight::new(height),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-            ))
-            .into(),
-        )
+    ) -> Verifiable<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::dummy(
+            payer,
+            local,
+            BlockHeight::new(height),
+            tx_hash,
+        ))
+        .into()
     }
 
     /// A committed payer entry engages only while its committing anchor
@@ -5800,6 +5801,385 @@ pub mod tests {
         )
         .unwrap_err();
         assert!(err.contains("payer bundle"), "{err}");
+    }
+
+    /// A row's engagement reads the recovery exclusion alike whether the
+    /// batch rides the block itself, a pending ancestor, or a committed
+    /// block: once the source's recovery completes, a batch from its band
+    /// engages nothing on any of the three, while one from the fresh
+    /// chain or from below the frontier engages on all three. A voter
+    /// that has committed the ancestor and one that has not judge the
+    /// block alike.
+    #[test]
+    fn a_completed_recovery_band_engages_nothing_above_the_committed_tip() {
+        use hyperscale_types::RecoveryBinding;
+
+        use crate::tick_members::{Ancestry, OwnContent, committed_sets};
+
+        let local = ShardId::leaf(1, 0);
+        let source = ShardId::leaf(1, 1);
+        let windows = EpochWindows::new(0, 1_000);
+        let completed = TestCommittee::new(4, 42)
+            .topology_snapshot(2)
+            .with_recoveries(BTreeMap::from([(
+                source,
+                vec![RecoveryBinding {
+                    rotated_at: Epoch::new(2),
+                    attested_frontier: BlockHeight::new(5),
+                    completed: true,
+                }],
+            )]));
+        let schedule = TopologySchedule::new(windows, Epoch::new(4), Arc::new(completed.clone()));
+        let anchor = WeightedTimestamp::from_millis(4_000);
+
+        let tx_hash = TxHash::from(Hash::from_bytes(b"engaged by the band"));
+        let mut rows = MemberIndex::empty(local);
+        rows.members.insert(
+            tx_hash,
+            MemberRow {
+                waiting: Some(Waiting {
+                    staged: 0,
+                    leg: false,
+                    settlement: Settlement::Alone,
+                    declared: Capped::empty(),
+                    engages: Capped::from_array([source]),
+                    waits: false,
+                    unarrived: Capped::empty(),
+                }),
+                ..member_row(tx_hash, RowState::Pending)
+            },
+        );
+        let carrying = |height: u64, source_anchor: u64| -> Block {
+            let batch: Verifiable<Provision> =
+                Verified::<Provision>::new_unchecked_for_test(Provision::dummy_at(
+                    source,
+                    local,
+                    BlockHeight::new(height),
+                    WeightedTimestamp::from_millis(source_anchor),
+                    tx_hash,
+                ))
+                .into();
+            Block::Live {
+                header: header_at_height(BlockHeight::new(2), 100_000),
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::from_array([batch])),
+                witness_sources: Arc::new(WitnessSources::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
+            }
+        };
+        let engages = |block: &Block| {
+            let judged = |ancestry: &Ancestry, own: &OwnContent, dedup: &CommitDedupIndex| {
+                committed_sets(&rows, ancestry, own, dedup, anchor, &completed, &schedule)
+                    .engaged
+                    .contains(&(source, tx_hash))
+            };
+            let bare = Ancestry::over(&rows, std::iter::empty(), windows);
+            let mut committed = CommitDedupIndex::new();
+            committed.register_committed_engagements(
+                &block.engagements(),
+                WeightedTimestamp::from_millis(3_500),
+            );
+            [
+                judged(
+                    &bare,
+                    &OwnContent::of(
+                        block.engagements().iter().copied().collect(),
+                        BTreeSet::new(),
+                    ),
+                    &CommitDedupIndex::new(),
+                ),
+                judged(
+                    &Ancestry::over(&rows, [block], windows),
+                    &OwnContent::default(),
+                    &CommitDedupIndex::new(),
+                ),
+                judged(&bare, &OwnContent::default(), &committed),
+            ]
+        };
+
+        assert_eq!(
+            engages(&carrying(9, 1_500)),
+            [false; 3],
+            "a batch from the band engages nothing once the recovery completes"
+        );
+        assert_eq!(engages(&carrying(9, 3_000)), [true; 3]);
+        assert_eq!(engages(&carrying(4, 1_500)), [true; 3]);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // One source block per transaction
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// The payer shard of [`TwoBlocks`] and the shard admitting its parts.
+    const TWO_BLOCKS_PAYER: ShardId = ShardId::leaf(1, 1);
+    const TWO_BLOCKS_LOCAL: ShardId = ShardId::leaf(1, 0);
+
+    /// A transaction the payer commits in two blocks across a recovery
+    /// recorded for it, rotated at epoch 20 on a 1,000 ms grid above a
+    /// frontier of 1, so the bridge is epoch 21: `first` at height 7
+    /// anchored below the bridge, `second` at height 9 anchored past it.
+    struct TwoBlocks {
+        tx: Verifiable<Transaction>,
+        first: Verifiable<Provision>,
+        second: Verifiable<Provision>,
+    }
+
+    /// The admitting block's own anchor, past the bridge.
+    const TWO_BLOCKS_ANCHOR_MS: u64 = 22_000;
+
+    impl TwoBlocks {
+        fn new() -> Self {
+            let tx = stub_tx(
+                test_principal(0x81),
+                &[
+                    test_principal(0x01).address(),
+                    test_principal(0x81).address(),
+                ],
+            );
+            let first = payer_part_at(7, 20_500, tx.hash());
+            let second = payer_part_at(9, 21_500, tx.hash());
+            Self { tx, first, second }
+        }
+
+        /// Admission at [`TWO_BLOCKS_ANCHOR_MS`] over `dedup`, with the
+        /// payer's recovery recorded as completed or not recorded at
+        /// all.
+        fn against(recorded: bool, dedup: CommitDedupIndex) -> Against {
+            use hyperscale_types::RecoveryBinding;
+
+            let mut snapshot = TestCommittee::new(4, 42).topology_snapshot(2);
+            if recorded {
+                snapshot = snapshot.with_recoveries(BTreeMap::from([(
+                    TWO_BLOCKS_PAYER,
+                    vec![RecoveryBinding {
+                        rotated_at: Epoch::new(20),
+                        attested_frontier: BlockHeight::new(1),
+                        completed: true,
+                    }],
+                )]));
+            }
+            let mut schedule = TopologySchedule::new(
+                EpochWindows::new(0, 1_000),
+                Epoch::GENESIS,
+                Arc::new(snapshot.clone()),
+            );
+            for epoch in 1..=60 {
+                schedule.insert(Epoch::new(epoch), Arc::new(snapshot.clone()));
+            }
+            let mut against = Against::schedule(snapshot, schedule);
+            against.local_shard = TWO_BLOCKS_LOCAL;
+            against.dedup = dedup;
+            against.anchor = WeightedTimestamp::from_millis(TWO_BLOCKS_ANCHOR_MS);
+            against
+        }
+
+        /// A dedup index holding `part` committed by a block anchored
+        /// just after it.
+        fn committed(&self, part: &Verifiable<Provision>) -> CommitDedupIndex {
+            let mut dedup = CommitDedupIndex::new();
+            dedup.register_committed_engagements(
+                &block_with_tx(&self.tx, vec![part.clone()]).engagements(),
+                part.source_block_ts().plus(Duration::from_millis(100)),
+            );
+            dedup
+        }
+
+        /// What a voter says of a block carrying `parts` beside the
+        /// transaction, and what a proposer selects of `parts` offered
+        /// in that order.
+        fn judged(
+            &self,
+            against: &Against,
+            parts: &[&Verifiable<Provision>],
+        ) -> (Result<(), String>, Vec<Verifiable<Provision>>) {
+            let parts: Vec<Verifiable<Provision>> = parts.iter().map(|&p| p.clone()).collect();
+            let voted = admit(against, &block_with_tx(&self.tx, parts.clone()));
+            let selected = select_provisions(&against.ctx(), &mut ProvisionsFold::default(), parts);
+            (voted, selected)
+        }
+    }
+
+    /// The payer's empty part for `tx_hash`, read off its block at
+    /// `height` anchored at `anchor_ms`.
+    fn payer_part_at(height: u64, anchor_ms: u64, tx_hash: TxHash) -> Verifiable<Provision> {
+        Verified::<Provision>::new_unchecked_for_test(Provision::dummy_at(
+            TWO_BLOCKS_PAYER,
+            TWO_BLOCKS_LOCAL,
+            BlockHeight::new(height),
+            WeightedTimestamp::from_millis(anchor_ms),
+            tx_hash,
+        ))
+        .into()
+    }
+
+    fn refused_for_standing(voted: &Result<(), String>) -> bool {
+        voted
+            .as_ref()
+            .is_err_and(|err| err.contains("which still stands"))
+    }
+
+    fn refused_as_orphaned(voted: &Result<(), String>) -> bool {
+        voted
+            .as_ref()
+            .is_err_and(|err| err.contains("anchored below a recovery's bridge"))
+    }
+
+    /// With the first block committed, the second's part is admitted
+    /// once the anchor records the recovery that orphans the first.
+    #[test]
+    fn a_second_source_block_replaces_one_a_completed_recovery_orphans() {
+        let two = TwoBlocks::new();
+        let (voted, selected) = two.judged(
+            &TwoBlocks::against(true, two.committed(&two.first)),
+            &[&two.second],
+        );
+        assert_eq!(voted, Ok(()));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hash(), two.second.hash());
+    }
+
+    /// The second block's part offered before the anchor records any
+    /// recovery is refused, and stays offerable: under an anchor that
+    /// records the completed recovery the same part is admitted.
+    #[test]
+    fn a_second_source_block_waits_for_an_anchor_that_records_the_recovery() {
+        let two = TwoBlocks::new();
+        let (voted, selected) = two.judged(
+            &TwoBlocks::against(false, two.committed(&two.first)),
+            &[&two.second],
+        );
+        assert!(refused_for_standing(&voted), "{voted:?}");
+        assert!(selected.is_empty());
+
+        let (voted, selected) = two.judged(
+            &TwoBlocks::against(true, two.committed(&two.first)),
+            &[&two.second],
+        );
+        assert_eq!(voted, Ok(()));
+        assert_eq!(selected.len(), 1);
+    }
+
+    /// The first block's part offered once the recovery has completed,
+    /// with nothing held, is refused as orphaned on its own.
+    #[test]
+    fn an_orphaned_first_block_is_refused_with_nothing_held() {
+        let two = TwoBlocks::new();
+        let (voted, selected) = two.judged(
+            &TwoBlocks::against(true, CommitDedupIndex::new()),
+            &[&two.first],
+        );
+        assert!(refused_as_orphaned(&voted), "{voted:?}");
+        assert!(selected.is_empty());
+    }
+
+    /// With the second block's part in a QC-chain ancestor, the first
+    /// block's part is refused in the child, whether or not the anchor
+    /// records the recovery.
+    #[test]
+    fn a_first_block_is_refused_below_an_ancestor_holding_the_second() {
+        let two = TwoBlocks::new();
+        for recorded in [false, true] {
+            let mut against = TwoBlocks::against(recorded, CommitDedupIndex::new());
+            against.chain.engaged = BTreeMap::from([(
+                Engagement::of_part(&two.second),
+                against.anchor.plus(RETENTION_HORIZON),
+            )]);
+            let (voted, selected) = two.judged(&against, &[&two.first]);
+            if recorded {
+                assert!(refused_as_orphaned(&voted), "{voted:?}");
+            } else {
+                assert!(refused_for_standing(&voted), "{voted:?}");
+            }
+            assert!(selected.is_empty(), "recorded {recorded}");
+        }
+    }
+
+    /// With the first block's part in a QC-chain ancestor, the second's
+    /// part is admitted in the child once the anchor records the
+    /// recovery that orphans the first.
+    #[test]
+    fn a_second_source_block_is_admitted_below_an_ancestor_holding_an_orphaned_first() {
+        let two = TwoBlocks::new();
+        let mut against = TwoBlocks::against(true, CommitDedupIndex::new());
+        against.chain.engaged = BTreeMap::from([(
+            Engagement::of_part(&two.first),
+            against.anchor.plus(RETENTION_HORIZON),
+        )]);
+        let (voted, selected) = two.judged(&against, &[&two.second]);
+        assert_eq!(voted, Ok(()));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].hash(), two.second.hash());
+    }
+
+    /// A held engagement lets go at its carrying block's anchor plus the
+    /// retention horizon whether a voter reads it off the QC chain or has
+    /// committed the carrying block, so voters at different committed
+    /// tips answer alike on both sides of the deadline.
+    #[test]
+    fn a_held_engagement_lets_go_at_one_deadline_committed_or_not() {
+        let two = TwoBlocks::new();
+        let carried_at = two.first.source_block_ts().plus(Duration::from_millis(100));
+        let deadline = carried_at.plus(RETENTION_HORIZON);
+        let snapshot = TestCommittee::new(4, 42).topology_snapshot(2);
+        let admitted = |committed: bool, anchor: WeightedTimestamp| {
+            let mut against = Against::window(snapshot.clone());
+            against.local_shard = TWO_BLOCKS_LOCAL;
+            against.anchor = anchor;
+            if committed {
+                against.dedup = two.committed(&two.first);
+            } else {
+                against.chain.engaged =
+                    BTreeMap::from([(Engagement::of_part(&two.first), deadline)]);
+            }
+            select_provisions(
+                &against.ctx(),
+                &mut ProvisionsFold::default(),
+                vec![two.second.clone()],
+            )
+            .len()
+        };
+        let before = WeightedTimestamp::from_millis(deadline.as_millis() - 1);
+        for committed in [false, true] {
+            assert_eq!(admitted(committed, before), 0, "committed {committed}");
+            assert_eq!(admitted(committed, deadline), 1, "committed {committed}");
+        }
+    }
+
+    /// Two blocks' parts for one transaction in one block: whichever is
+    /// folded second is refused.
+    #[test]
+    fn two_source_blocks_in_one_block_admit_only_the_first_folded() {
+        let two = TwoBlocks::new();
+        let against = TwoBlocks::against(false, CommitDedupIndex::new());
+        for (earlier, later) in [(&two.first, &two.second), (&two.second, &two.first)] {
+            let (voted, selected) = two.judged(&against, &[earlier, later]);
+            assert!(refused_for_standing(&voted), "{voted:?}");
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].hash(), earlier.hash());
+        }
+    }
+
+    /// A second block is refused where the recovery recorded does not
+    /// orphan the first: one at or below the frontier, or one anchored
+    /// past the bridge.
+    #[test]
+    fn a_second_source_block_is_refused_while_the_first_stands() {
+        let two = TwoBlocks::new();
+        for first in [
+            payer_part_at(1, 20_500, two.tx.hash()),
+            payer_part_at(7, 21_200, two.tx.hash()),
+        ] {
+            let (voted, selected) = two.judged(
+                &TwoBlocks::against(true, two.committed(&first)),
+                &[&two.second],
+            );
+            assert!(refused_for_standing(&voted), "{voted:?}");
+            assert!(selected.is_empty());
+        }
     }
 
     /// The header's body root commits what the block's provisions name:
@@ -5949,16 +6329,16 @@ pub mod tests {
     }
 
     /// `count` verified transactions in hash order, each its own payer's.
-    fn transactions_in_order(count: usize) -> Vec<Arc<Verifiable<Transaction>>> {
-        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..count)
+    fn transactions_in_order(count: usize) -> Vec<Verifiable<Transaction>> {
+        let mut txs: Vec<Verifiable<Transaction>> = (0..count)
             .map(|seed| {
-                Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+                Verifiable::from(Verified::new_unchecked_for_test(
                     test_utils::stub_transaction_binding(
                         u32::try_from(seed).expect("fewer than u32 transactions"),
                         0,
                         test_utils::test_validity_range(),
                     ),
-                )))
+                ))
             })
             .collect();
         txs.sort_by_key(|tx| tx.hash());
@@ -6024,6 +6404,7 @@ pub mod tests {
             joins,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(0),
@@ -6031,6 +6412,7 @@ pub mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -6100,7 +6482,7 @@ pub mod tests {
     /// A block of `txs` stating stub terms for each of `entries`, every
     /// entry's crossings cleared unless `crossings`, beside `lines`.
     fn carrying_terms(
-        txs: &[Arc<Verifiable<Transaction>>],
+        txs: &[Verifiable<Transaction>],
         entries: Vec<TxHash>,
         crossings: bool,
         lines: Vec<TickLine>,
@@ -6144,7 +6526,7 @@ pub mod tests {
         assert!(
             validate_terms_section(&carrying(
                 vec![first, third],
-                vec![joining(second, Joins::ExecutesAborted)],
+                vec![joining(second, Joins::Executes)],
             ))
             .is_ok()
         );
@@ -6172,22 +6554,13 @@ pub mod tests {
     fn a_block_stating_crossing_terms_for_a_member_it_runs_is_admitted() {
         let txs = transactions_in_order(3);
         let [first, second, third] = [txs[0].hash(), txs[1].hash(), txs[2].hash()];
-        for runs in [Joins::Executes, Joins::ExecutesAborted] {
+        for entries in [vec![first, second, third], vec![first, third]] {
             assert_eq!(
                 validate_terms_section(&carrying_terms(
                     &txs,
-                    vec![first, second, third],
+                    entries,
                     true,
-                    vec![joining(second, runs)],
-                )),
-                Ok(())
-            );
-            assert_eq!(
-                validate_terms_section(&carrying_terms(
-                    &txs,
-                    vec![first, third],
-                    true,
-                    vec![joining(second, runs)],
+                    vec![joining(second, Joins::Executes)],
                 )),
                 Ok(())
             );
@@ -6363,17 +6736,10 @@ pub mod tests {
         // bundle in hand: carried. What the ceiling covers is not this
         // chain's question, and asking it here is what would fork the
         // two verdicts across a fold.
-        let bundle: Arc<Verifiable<Provisions>> = Arc::new(
-            Verified::<Provisions>::new_unchecked_for_test(Provisions::new(
-                payer_shard,
-                local,
-                BlockHeight::new(1),
-                WeightedTimestamp::ZERO,
-                MerkleInclusionProof::dummy(),
-                Capped::from_array([ProvisionEntry::new(tx_hash, Capped::empty())]),
-            ))
-            .into(),
-        );
+        let bundle: Verifiable<Provision> = Verified::<Provision>::new_unchecked_for_test(
+            Provision::dummy(payer_shard, local, BlockHeight::new(1), tx_hash),
+        )
+        .into();
         assert!(admit(&engaged(&topo, local), &block_with_tx(&tx, vec![bundle])).is_ok());
     }
 

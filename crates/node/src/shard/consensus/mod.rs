@@ -2,29 +2,28 @@
 //!
 //! Colocates everything block-consensus the shard driver touches: the
 //! per-shard [`ConsensusState`] (block-sync FSM + certified-header
-//! verification batch), the block-sync FSM [`binding`](block), its inbound
-//! [`serve`](block_serve) responder, the `impl ShardLoop` [`glue`](block_sync)
-//! that drives fetches and delivers synced blocks to consensus, and the
+//! verification batch), the block-sync FSM binding and the `impl ShardLoop`
+//! glue that drives its fetches and delivers synced blocks to consensus
+//! ([`block_sync`]), its inbound [`serve`](block_serve) responder, and the
 //! certified-header [`gossip`] handler that feeds cross-shard provisioning.
 
-mod block;
 mod block_serve;
 mod block_sync;
 mod gossip;
-mod proposal;
+mod proposal_fetch;
 
 use std::sync::Arc;
 
-pub use block::{
+pub use block_serve::serve_block_request;
+pub use block_sync::{
     BlockSync, BlockSyncConfig, BlockSyncInput, BlockSyncOutput, BlockSyncStateKind,
     BlockSyncStatus,
 };
-pub use block_serve::serve_block_request;
 use hyperscale_types::{
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, LocalTimestamp, ValidatorId,
     Verifiable,
 };
-pub use proposal::{ProposalBinding, ProposalFetch, ProposalStore};
+pub use proposal_fetch::{ProposalBinding, ProposalFetch, ProposalStore};
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
@@ -38,7 +37,7 @@ use crate::config::NodeConfig;
 /// `Verifiable::Verified` so the flush step can fast-path them past the
 /// sender-signature batch.
 pub type CertifiedHeaderVerificationItem = (
-    Arc<Verifiable<CertifiedBlockHeader>>,
+    Verifiable<CertifiedBlockHeader>,
     ValidatorId,
     ConsensusPublicKey,
     ConsensusSignature,
@@ -93,7 +92,7 @@ impl ConsensusState {
     }
 
     /// Drive the block-sync FSM's periodic tick. Returns the outputs the
-    /// I/O loop should dispatch (block fetches, deliveries, sync-complete).
+    /// shard's loop should dispatch (block fetches, deliveries, sync-complete).
     pub(crate) fn block_tick(&mut self, now: LocalTimestamp) -> Vec<BlockSyncOutput> {
         self.block_sync.handle(BlockSyncInput::Tick { now })
     }

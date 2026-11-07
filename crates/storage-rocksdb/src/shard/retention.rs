@@ -27,9 +27,8 @@ impl RocksDbShardStorage {
         read_retention_floor(&*self.db)
     }
 
-    /// Date `version` with the weighted timestamp of the QC that
-    /// certified it, and move the floor past what that retires
-    /// ([`retire_dated`]).
+    /// Date `version` with its header's anchor, and move the floor past
+    /// what that retires ([`retire_dated`]).
     ///
     /// Written into the batch that advances the tree, so a version is
     /// dated atomically with the state it commits: a date with no tree at
@@ -50,10 +49,14 @@ impl RocksDbShardStorage {
         let handle = VersionTimeCf::handle(&cf);
         typed_cf::batch_put::<VersionTimeCf>(batch, handle, &version, &tip_ts.as_millis());
         let floor = read_retention_floor(&*self.db);
+        // The clock first: it publishes last, so this reads the height
+        // that went with it or a later one.
+        let clock = self.retention_clock.load(Ordering::Acquire);
         let retired = retire_dated(
             floor,
             version,
             self.retention_hold.load(Ordering::Relaxed),
+            WeightedTimestamp::from_millis(clock),
             tip_ts,
             typed_cf::iter_from::<VersionTimeCf>(&self.db, handle, &floor),
         );

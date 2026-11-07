@@ -80,6 +80,40 @@ pub fn compute_merkle_root_with_proof(hashes: &[Hash], index: usize) -> (Hash, V
     (level[0], siblings, u32::try_from(index).unwrap_or(u32::MAX))
 }
 
+/// Every leaf's sibling path in the tree [`compute_merkle_root`] builds,
+/// in leaf order, each leaf level upward.
+///
+/// Builds the levels once and reads each path off them, where a call of
+/// [`compute_merkle_root_with_proof`] per leaf rebuilds the tree each
+/// time. Empty for an empty list.
+#[must_use]
+pub fn merkle_paths(hashes: &[Hash]) -> Vec<Vec<Hash>> {
+    if hashes.is_empty() {
+        return Vec::new();
+    }
+    let padded_len = hashes.len().next_power_of_two();
+    let mut level: Vec<Hash> = Vec::with_capacity(padded_len);
+    level.extend_from_slice(hashes);
+    level.resize(padded_len, Hash::ZERO);
+
+    let depth = padded_len.trailing_zeros() as usize;
+    let mut paths: Vec<Vec<Hash>> = vec![Vec::with_capacity(depth); hashes.len()];
+    let mut shift = 0;
+    while level.len() > 1 {
+        for (leaf, path) in paths.iter_mut().enumerate() {
+            path.push(level[(leaf >> shift) ^ 1]);
+        }
+        level = level
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[left, right]| Hash::from_parts(&[left.as_bytes(), right.as_bytes()]))
+            .collect();
+        shift += 1;
+    }
+    paths
+}
+
 /// Zero-subtree hashes indexed by height: `Z[0]` is `Hash::ZERO` and
 /// `Z[h + 1]` is the parent of two `Z[h]`.
 ///
@@ -802,6 +836,22 @@ mod tests {
                 &siblings,
                 leaf_index
             ));
+        }
+    }
+
+    /// One build of the levels reads every leaf's path, and each is the
+    /// path the per-leaf proof rebuilds the tree for.
+    #[test]
+    fn every_path_agrees_with_the_per_leaf_proof() {
+        assert!(merkle_paths(&[]).is_empty());
+        for n in 1..=17u8 {
+            let hashes: Vec<Hash> = (0..n).map(|i| Hash::from_bytes(&[i])).collect();
+            let paths = merkle_paths(&hashes);
+            assert_eq!(paths.len(), hashes.len());
+            for (index, path) in paths.iter().enumerate() {
+                let (_, siblings, _) = compute_merkle_root_with_proof(&hashes, index);
+                assert_eq!(path, &siblings, "leaf {index} of {n}");
+            }
         }
     }
 

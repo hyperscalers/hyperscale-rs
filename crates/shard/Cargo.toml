@@ -12,6 +12,7 @@ hyperscale-hbor.workspace = true
 hyperscale-jmt.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-network.workspace = true
+hyperscale-provisions.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 # The record cell a block's declines carry, whose terms say whether a

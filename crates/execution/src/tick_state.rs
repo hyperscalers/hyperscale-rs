@@ -39,7 +39,6 @@
 //! chain builds it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::legs::Member;
@@ -229,15 +228,10 @@ struct Seat {
     /// Dispatched to the engine and still owing a result. A tick is
     /// votable once no seat is.
     awaiting_result: bool,
-    /// Attested `Aborted` whatever its execution said: a payer's leg
-    /// whose counterparts never engaged, or a member past its own
-    /// deadline that never ran.
-    aborted: bool,
     /// This tick *is* the member's abandonment — it was seated past the
-    /// window that bounds it, running nothing. Kept apart from
-    /// [`Self::aborted`], which a member that ran can also carry, because
-    /// what it answers is whether abandoning the member again would
-    /// discard the abort already waiting to be certified.
+    /// window that bounds it, running nothing, and attests it `Aborted`.
+    /// It also answers whether abandoning the member again would discard
+    /// the abort already waiting to be certified.
     abandons: bool,
     /// The engine's outcome.
     result: Option<ExecutionOutcome>,
@@ -268,7 +262,6 @@ impl Seat {
             membership,
             charged,
             awaiting_result: joins.dispatched(),
-            aborted: joins.aborts(),
             abandons: matches!(joins, Joins::Aborted),
             result: None,
             receipt: None,
@@ -350,7 +343,7 @@ pub struct TickState {
     overdue_warned: bool,
     /// Copies of this tick's own certificate: the first to arrive, and a
     /// complete one where the first is not.
-    execution_certificates: Vec<Arc<Verified<ExecutionCertificate>>>,
+    execution_certificates: Vec<Verified<ExecutionCertificate>>,
 }
 
 impl TickState {
@@ -584,7 +577,7 @@ impl TickState {
     /// it — so the first match is not necessarily the complete one. Projecting a half needs sibling
     /// nodes from the whole receipt tree, which only the complete copy
     /// carries, and a shard sends its own peers exactly that.
-    fn local_certificate(&self) -> Option<&Arc<Verified<ExecutionCertificate>>> {
+    fn local_certificate(&self) -> Option<&Verified<ExecutionCertificate>> {
         self.execution_certificates
             .iter()
             .filter(|ec| ec.tick_id() == &self.tick_id)
@@ -749,7 +742,7 @@ impl TickState {
                     .seats
                     .get(tx_hash)
                     .expect("a tick seats every member it names");
-                let outcome = if seat.aborted {
+                let outcome = if seat.abandons {
                     ExecutionOutcome::Aborted
                 } else {
                     seat.result
@@ -806,7 +799,7 @@ impl TickState {
     ///
     /// Readiness is the caller's next question — the certificate can
     /// make either half settleable, or neither.
-    pub fn add_execution_certificate(&mut self, ec: Arc<Verified<ExecutionCertificate>>) {
+    pub fn add_execution_certificate(&mut self, ec: Verified<ExecutionCertificate>) {
         if ec.tick_id() != &self.tick_id {
             return;
         }
@@ -831,7 +824,7 @@ impl TickState {
     /// copy's, so reconciliation and readiness stand as they
     /// are; only the certificate a half is built from changes, to the one
     /// verifiers still resolve a committee for.
-    pub fn adopt_later_certificate(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> bool {
+    pub fn adopt_later_certificate(&mut self, ec: &Verified<ExecutionCertificate>) -> bool {
         if ec.tick_id() != &self.tick_id || !ec.is_complete() {
             return false;
         }
@@ -849,7 +842,7 @@ impl TickState {
         {
             return false;
         }
-        *held = Arc::clone(ec);
+        *held = ec.clone();
         true
     }
 
@@ -1142,7 +1135,7 @@ impl TickState {
             local_ec_emitted = self.local_ec_emitted,
             local_receipts_ready,
             execution_results = self.seats.values().filter(|seat| seat.result.is_some()).count(),
-            aborted = self.seats.values().filter(|seat| seat.aborted).count(),
+            aborted = self.seats.values().filter(|seat| seat.abandons).count(),
             ecs_collected = self.execution_certificates.len(),
             determined_ready = self.determined_ready(),
             stating_ready = self.stating_ready(),
@@ -1284,6 +1277,8 @@ impl TickState {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use hyperscale_engine::legs::Classified;
     use hyperscale_types::{
         AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, REATTESTATION_STEP,
@@ -1319,7 +1314,7 @@ mod tests {
             tick
         };
         let mut emitted = holding();
-        emitted.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        emitted.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::ZERO,
@@ -1331,7 +1326,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         assert!(emitted.local_ec_emitted());
         let mut pending = holding();
         assert!(!pending.local_ec_emitted());
@@ -1462,7 +1457,7 @@ mod tests {
             tick.record_receipt(receipt(tx_hash));
         }
         let (_, root, outcomes) = tick.build_vote_data().expect("every member came back");
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
@@ -1471,7 +1466,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         (tick, determined, leg)
     }
 
@@ -1515,7 +1510,7 @@ mod tests {
         // Only the leg's receipt lands.
         tick.record_receipt(receipt(leg));
         let (_, root, outcomes) = tick.build_vote_data().expect("every member came back");
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
@@ -1524,8 +1519,8 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        ));
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 TickId::new(shard(1), BlockHeight::new(4)),
                 WeightedTimestamp::from_millis(1_000),
@@ -1540,7 +1535,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
 
         assert!(
             !tick.determined_ready(),
@@ -1668,7 +1663,7 @@ mod tests {
                     .expect("seated above")
                     .refusal_receipt = None;
             }
-            tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            tick.add_execution_certificate(Verified::new_unchecked_for_test(
                 ExecutionCertificate::new(
                     *tick.tick_id(),
                     tick.vote_anchor_ts(),
@@ -1677,7 +1672,7 @@ mod tests {
                     AggregateSignature::ZERO,
                     SignerBitfield::new(4),
                 ),
-            )));
+            ));
             tick
         };
 
@@ -1745,7 +1740,7 @@ mod tests {
         assert!(tick.determined_members().is_empty());
         let (_, root, outcomes) = tick.build_vote_data().expect("an abort waits on no engine");
         assert!(outcomes[0].is_aborted());
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
@@ -1754,7 +1749,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
 
         assert!(!tick.has_spoken(), "the tick has yet to state the abort");
         let half = tick
@@ -1819,7 +1814,7 @@ mod tests {
     fn a_replica_that_did_not_vote_the_tick_states_nothing() {
         let local = shard(0);
         let (voter, near, far) = two_leg_tick();
-        let certificate = Arc::clone(voter.local_certificate().expect("certified"));
+        let certificate = voter.local_certificate().expect("certified").clone();
         let succeeded = ExecutionOutcome::Succeeded {
             receipt_hash: effects_hash(),
         };
@@ -1851,7 +1846,7 @@ mod tests {
         let mut subset = seating(&[near]);
         subset.record_execution_result(near, succeeded.clone());
         subset.record_receipt(receipt(near));
-        subset.add_execution_certificate(Arc::clone(&certificate));
+        subset.add_execution_certificate(certificate.clone());
         states_nothing(&mut subset, "a strict subset, unvoted");
 
         let mut disagreeing = seating(&[near]);
@@ -1860,7 +1855,7 @@ mod tests {
         disagreeing
             .build_vote_data()
             .expect("its one seat came back");
-        disagreeing.add_execution_certificate(Arc::clone(&certificate));
+        disagreeing.add_execution_certificate(certificate.clone());
         states_nothing(&mut disagreeing, "a strict subset, voted on another root");
 
         let mut idle = seating(&[near, far]);
@@ -1914,15 +1909,15 @@ mod tests {
             voter.record_receipt(receipt(tx_hash));
         }
         let (_, root, outcomes) = voter.build_vote_data().expect("every member came back");
-        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let certificate = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             *voter.tick_id(),
             voter.vote_anchor_ts(),
             root,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )));
-        voter.add_execution_certificate(Arc::clone(&certificate));
+        ));
+        voter.add_execution_certificate(certificate.clone());
         let whole = voter
             .take_determined_finalization()
             .expect("the voter settles its determined half");
@@ -1933,7 +1928,7 @@ mod tests {
 
         let mut subset = seating(&[aborted, shared]);
         assert!(!subset.can_emit_vote(), "its one run seat never came back");
-        subset.add_execution_certificate(Arc::clone(&certificate));
+        subset.add_execution_certificate(certificate.clone());
         assert!(subset.local_ec_emitted() && !subset.is_locally_divergent());
         let half = subset.take_determined_finalization();
         assert_eq!(
@@ -2005,15 +2000,15 @@ mod tests {
         );
         voter.record_receipt(receipt(shared));
         let (_, root, outcomes) = voter.build_vote_data().expect("every member came back");
-        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        let certificate = Verified::new_unchecked_for_test(ExecutionCertificate::new(
             *voter.tick_id(),
             voter.vote_anchor_ts(),
             root,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )));
-        voter.add_execution_certificate(Arc::clone(&certificate));
+        ));
+        voter.add_execution_certificate(certificate.clone());
         let whole = voter
             .take_determined_finalization()
             .expect("the voter settles its determined half");
@@ -2053,7 +2048,7 @@ mod tests {
             );
         }
         let (_, root, outcomes) = tick.build_vote_data().expect("an abort waits on no engine");
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
@@ -2062,7 +2057,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         let half = tick
             .take_determined_finalization()
             .expect("a replica that voted the tick settles it");
@@ -2097,7 +2092,7 @@ mod tests {
             tick.record_receipt(receipt(tx_hash));
         }
         let (_, root, outcomes) = tick.build_vote_data().expect("every member came back");
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
@@ -2106,14 +2101,14 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         (tick, near, far)
     }
 
     /// `shard(1)`'s certificate of its tick at `height`, attesting
     /// `tx_hash` succeeded there awaiting `shard(0)`.
-    fn counterpart(height: u64, tx_hash: TxHash) -> Arc<Verified<ExecutionCertificate>> {
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+    fn counterpart(height: u64, tx_hash: TxHash) -> Verified<ExecutionCertificate> {
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             TickId::new(shard(1), BlockHeight::new(height)),
             WeightedTimestamp::from_millis(1_000),
             GlobalReceiptRoot::ZERO,
@@ -2126,7 +2121,7 @@ mod tests {
             .awaiting([shard(0)])]),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )))
+        ))
     }
 
     /// A tick with nothing but single-shard members has no legs half at
@@ -2153,7 +2148,7 @@ mod tests {
         );
         tick.record_receipt(receipt(tx(1)));
         let (_, root, outcomes) = tick.build_vote_data().expect("came back");
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
@@ -2162,7 +2157,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
 
         assert!(tick.take_determined_finalization().is_some());
         assert!(tick.leg_members().is_empty());
@@ -2342,7 +2337,7 @@ mod tests {
 
         // The venue's refusal lands before this shard's own certificate.
         // It is not the leg's verdict.
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 TickId::new(venue, BlockHeight::new(1)),
                 WeightedTimestamp::from_millis(1_000),
@@ -2351,7 +2346,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         assert!(
             !tick.determined_ready(),
             "nothing settles before the local certificate"
@@ -2361,7 +2356,7 @@ mod tests {
             "another shard's certificate is not held"
         );
 
-        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+        tick.add_execution_certificate(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
                 *tick.tick_id(),
                 tick.vote_anchor_ts(),
@@ -2370,7 +2365,7 @@ mod tests {
                 AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             ),
-        )));
+        ));
         let half = tick
             .take_determined_finalization()
             .expect("the local certificate is all it needed");

@@ -19,6 +19,7 @@ use hyperscale_storage::tree::Jmt;
 use hyperscale_storage::{AdoptSource, Adoption, Subtree, Vintage, adopt_plan, key_under_prefix};
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified,
+    WeightedTimestamp,
 };
 use im::OrdSet;
 
@@ -52,16 +53,35 @@ impl SimShardStorage {
     }
 
     /// Install a reshape successor's derived `genesis` as this store's
-    /// chain origin and committed tip: [`adopt_plan`] decided over this
-    /// store's vintage, then applied — the same decision the production
-    /// backend applies, so the two harnesses cannot diverge on what an
-    /// adoption admits.
+    /// chain origin and committed tip, then evict every pin beneath the
+    /// genesis: the predecessor's boundaries, which the production
+    /// backend's adoption evicts on the same rule.
     ///
     /// # Errors
     ///
     /// What [`adopt_plan`] refused, or a store that cannot yield the
     /// subtree it named.
     pub(crate) fn adopt_genesis(
+        &self,
+        origin: ChainOrigin,
+        genesis: &Block,
+        source: AdoptSource,
+    ) -> Result<StateRoot, String> {
+        let adopted = self.apply_adoption(origin, genesis, source)?;
+        crash_point::write();
+        let mut pins = write_or_recover(&self.boundary_pins);
+        let beneath: Vec<_> = pins.range(..origin.genesis_height).copied().collect();
+        for height in beneath {
+            pins.remove(&height);
+        }
+        drop(pins);
+        Ok(adopted)
+    }
+
+    /// [`adopt_plan`] decided over this store's vintage, then applied —
+    /// the same decision the production backend applies, so the two
+    /// harnesses cannot diverge on what an adoption admits.
+    fn apply_adoption(
         &self,
         origin: ChainOrigin,
         genesis: &Block,
@@ -104,9 +124,10 @@ impl SimShardStorage {
         // A child's history begins here, and its genesis QC carries the
         // chain origin's anchor: dating it is what puts the floor at the
         // adoption rather than below everything the parent held. The hold
-        // goes with it — every reader that named a version beneath the
-        // adoption belonged to the chain this one replaces.
+        // and its clock go with it — every reader that named a version
+        // beneath the adoption belonged to the chain this one replaces.
         shared.retention_hold = u64::MAX;
+        shared.retention_clock = WeightedTimestamp::MAX;
         let floor = shared.advance_retention_floor(
             origin.genesis_height.inner(),
             pair.qc_verified().weighted_timestamp(),

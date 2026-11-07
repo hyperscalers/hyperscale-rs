@@ -39,8 +39,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, LocalKey,
-        RoutePrefix, ShardId, SubstateKey, TxHash, UnsettledTx, WeightedTimestamp,
+        AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Epoch, Hash,
+        LocalKey, RoutePrefix, ShardId, SubstateKey, TxHash, UnsettledTx, WeightedTimestamp,
     };
 
     fn tx(seed: u8) -> UnsettledTx {
@@ -58,7 +58,7 @@ mod tests {
             committed: CommittedAt {
                 height: BlockHeight::new(3),
                 anchor: WeightedTimestamp::from_millis(100),
-                committee_anchor: WeightedTimestamp::from_millis(100),
+                committee_epoch: Epoch::GENESIS,
             },
             reach: Capped::from_array([RoutePrefix::of(Address::new(
                 [seed; 31],

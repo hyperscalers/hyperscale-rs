@@ -7,13 +7,14 @@
 //! ancestor's content, and so read one input.
 
 use std::collections::{BTreeSet, HashSet};
-use std::sync::Arc;
 
 use hyperscale_engine::tick_select::{
-    CommittedSets, Judged, ManifestBudget, SiblingViews, Unlicensed, accepting, ends_stand,
-    legs_stand, terms_of,
+    CommittedSets, Crossing, Judged, ManifestBudget, SiblingViews, Unlicensed, accepting,
+    ends_stand, legs_stand, terms_of,
 };
-use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, record_arrivals};
+use hyperscale_storage::{
+    MemberIndex, MemberInputs, MemberRow, MemberSections, RowState, record_arrivals,
+};
 use hyperscale_types::{
     Block, BlockHeight, Engagement, EpochWindows, Finalization, MemberTerms, Reshaping, Settlement,
     ShardId, SiblingView, Source, StatedTerms, SubstateKey, TickHalf, TickLine, TopologySchedule,
@@ -39,6 +40,50 @@ pub fn derived_terms<'a>(
             terms: terms_of(tx, committee, local),
         })
         .collect()
+}
+
+/// What a block's content is folded under ahead of its lines, as its
+/// proposer names them and every voter judges them: one builder, so the
+/// content a block's lines are named over and judged over is derived
+/// and marked in one place.
+#[derive(Clone, Copy)]
+pub struct BlockContent<'a> {
+    /// The committing chain.
+    pub shard: ShardId,
+    /// The block's height.
+    pub height: BlockHeight,
+    /// The block's parent-QC clock.
+    pub anchor: WeightedTimestamp,
+    /// The epoch grid the claims' anchors are marked on.
+    pub windows: EpochWindows,
+    /// The committee the block's transactions are classified under.
+    pub committee: &'a TopologySnapshot,
+    /// What the block does across a recovery's bridge: its marker, where
+    /// it carries one, is the content's one line.
+    pub crossing: &'a Crossing,
+}
+
+impl BlockContent<'_> {
+    /// What a block of `transactions` and `sections` writes before any
+    /// line of it is named: each transaction on the terms derived for it
+    /// under the block's committee, and the block's recovery marker as
+    /// its one line, so a fold of the content orphans what the block's
+    /// does.
+    pub fn inputs<'t, I>(&self, transactions: I, sections: MemberSections<'_>) -> MemberInputs
+    where
+        I: IntoIterator<Item = &'t Transaction> + Clone,
+    {
+        MemberInputs::deriving(
+            self.shard,
+            self.height,
+            self.anchor,
+            transactions.clone(),
+            sections,
+            self.windows,
+            derived_terms(self.committee, self.shard, transactions),
+        )
+        .marked(self.crossing.marker().cloned())
+    }
 }
 
 /// The terms section of a block whose transactions derive `derived` and
@@ -67,7 +112,10 @@ pub fn run_by(lines: &[TickLine]) -> BTreeSet<TxHash> {
         .iter()
         .filter_map(|line| match line {
             TickLine::Member { tx, joins, .. } => joins.dispatched().then_some(*tx),
-            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
+            TickLine::Fate { .. }
+            | TickLine::Discard { .. }
+            | TickLine::End { .. }
+            | TickLine::Recovered { .. } => None,
         })
         .collect()
 }
@@ -78,7 +126,7 @@ pub fn run_by(lines: &[TickLine]) -> BTreeSet<TxHash> {
 pub struct Ancestry {
     /// Tick membership at the parent.
     pub rows: MemberIndex,
-    engaged: BTreeSet<(ShardId, TxHash)>,
+    engaged: BTreeSet<Engagement>,
     arrived: Vec<(SubstateKey, TxHash, BlockHeight)>,
 }
 
@@ -96,12 +144,7 @@ impl Ancestry {
         let mut arrived = Vec::new();
         for block in ancestors {
             rows.advance(&MemberInputs::of(block, windows));
-            engaged.extend(
-                block
-                    .engagements()
-                    .iter()
-                    .map(|engagement| (engagement.source, engagement.tx_hash)),
-            );
+            engaged.extend(block.engagements().iter().copied());
             arrived.extend(
                 record_arrivals(block.state_claims())
                     .into_iter()
@@ -120,21 +163,18 @@ impl Ancestry {
 /// records its claims read.
 #[derive(Debug, Default)]
 pub struct OwnContent {
-    engaged: BTreeSet<(ShardId, TxHash)>,
+    engaged: BTreeSet<Engagement>,
     arrived: BTreeSet<(SubstateKey, TxHash)>,
 }
 
 impl OwnContent {
     /// What `engagements` and `claims_read` add.
-    pub fn of(
-        engagements: &BTreeSet<Engagement>,
+    pub const fn of(
+        engagements: BTreeSet<Engagement>,
         claims_read: BTreeSet<(SubstateKey, TxHash)>,
     ) -> Self {
         Self {
-            engaged: engagements
-                .iter()
-                .map(|engagement| (engagement.source, engagement.tx_hash))
-                .collect(),
+            engaged: engagements,
             arrived: claims_read,
         }
     }
@@ -186,7 +226,10 @@ pub fn ends_licensed(
         .iter()
         .filter_map(|line| match line {
             TickLine::End { tx } => Some(*tx),
-            TickLine::Member { .. } | TickLine::Fate { .. } | TickLine::Discard { .. } => None,
+            TickLine::Member { .. }
+            | TickLine::Fate { .. }
+            | TickLine::Discard { .. }
+            | TickLine::Recovered { .. } => None,
         })
         .collect();
     ends_stand(&ended, rows, parent, views, budget).map_err(|unlicensed| match unlicensed {
@@ -209,7 +252,7 @@ pub fn ends_licensed(
 pub fn legs_licensed(
     parent: &MemberIndex,
     pending: &MemberInputs,
-    certificates: &[Arc<Verifiable<Finalization>>],
+    certificates: &[Verifiable<Finalization>],
     views: &SiblingViews,
 ) -> Result<(), Withheld> {
     let legs: Vec<TxHash> = certificates
@@ -233,8 +276,8 @@ pub fn legs_licensed(
 /// among them it cut, which no other replica holds and which voters
 /// fetch.
 pub struct OfferedLegs {
-    pub offered: Vec<Arc<Verifiable<Finalization>>>,
-    pub cut: Vec<Arc<Verifiable<Finalization>>>,
+    pub offered: Vec<Verifiable<Finalization>>,
+    pub cut: Vec<Verifiable<Finalization>>,
 }
 
 /// `finalizations` as a proposer offers them in a block over `parent`'s
@@ -244,7 +287,7 @@ pub struct OfferedLegs {
 /// name this replica cannot judge is cut too: a voter lacking what it
 /// turns on would defer the block.
 pub fn legs_that_stand(
-    finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    finalizations: Vec<Verifiable<Finalization>>,
     parent: &MemberIndex,
     pending: &MemberInputs,
     views: &SiblingViews,
@@ -268,8 +311,8 @@ pub fn legs_that_stand(
             if kept.is_empty() {
                 return None;
             }
-            let narrowed = Arc::new(Verifiable::from(fw.as_unverified().clone().naming(&kept)));
-            cut.push(Arc::clone(&narrowed));
+            let narrowed = Verifiable::from(fw.as_unverified().clone().naming(&kept));
+            cut.push(narrowed.clone());
             Some(narrowed)
         })
         .collect();
@@ -362,9 +405,11 @@ pub fn committed_sets(
         }
         let judged = Judged::of_row(row);
         for source in judged.sources() {
-            let engaged = own.engaged.contains(&(source, row.tx))
-                || ancestry.engaged.contains(&(source, row.tx))
-                || dedup.engaged(source, row.tx, anchor, committee);
+            let engaged =
+                [&own.engaged, &ancestry.engaged].into_iter().any(|riding| {
+                    Engagement::of_pair(riding, source, row.tx)
+                        .any(|engagement| engagement.stands_under(committee, schedule.windows()))
+                }) || dedup.engaged(source, row.tx, anchor, committee, schedule.windows());
             if engaged {
                 sets.engaged.insert((source, row.tx));
             }
@@ -402,6 +447,7 @@ mod tests {
             joins,
             settlement: Settlement::Alone,
             holds: Capped::empty(),
+            pins: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(seed),
@@ -409,6 +455,7 @@ mod tests {
             reserves: Capped::empty(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
             crossings: Capped::empty(),
+            served_at: None,
         }
     }
 
@@ -436,7 +483,7 @@ mod tests {
             line(3, Joins::Executes),
             line(4, Joins::Executes),
             line(5, Joins::Aborted),
-            line(6, Joins::ExecutesAborted),
+            line(6, Joins::Executes),
         ];
         let kept: Vec<TxHash> = stated_terms(derived, &lines)
             .into_iter()

@@ -16,11 +16,9 @@ mod support;
 
 use std::env;
 use std::process::Command;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hex::encode;
-use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::tx::{
     build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, genesis_accounts, recipient,
     sender, validity_around,
@@ -94,11 +92,7 @@ fn run_once(seed: u64, install_faults: impl FnOnce(&mut SimulationRunner)) -> Ru
             100,
             validity_around(runner.chain_now()),
         );
-        runner.schedule_initial_event(
-            0,
-            Duration::from_millis(delay_ms),
-            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
-        );
+        runner.schedule_submission(0, Duration::from_millis(delay_ms), tx);
     }
     runner.run_until(Duration::from_secs(10));
 
@@ -254,7 +248,7 @@ fn grow_and_transfer(seed: u64) -> (Vec<BlockHeight>, u64, u64, [u8; 32]) {
 
     let tx = build_transfer_tx(&payer, from, to, 500, validity_around(cluster.now()));
     let tx_hash = tx.hash();
-    cluster.submit(Arc::new(tx));
+    cluster.submit(tx);
     // Advance to the same deterministic point in both runs — settlement, or
     // the budget cap if it never settles; either is identical per seed.
     cluster.run_until(epochs(4), |c| {

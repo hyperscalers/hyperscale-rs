@@ -2,29 +2,29 @@
 //! the shared tokio runtime.
 //!
 //! Each shard's thread owns its own [`ShardLoop`], its own
-//! `ProdTimerManager`, and a (timer, callback, shutdown) channel triple
-//! drained in priority order (`timer_rx > callback_rx`). Process-scoped
+//! `ProdTimerManager`, and its timer, input and shutdown channels,
+//! drained timers first. Process-scoped
 //! resources (`Arc<ProcessIo>`: network adapter, dispatch pool, tx
 //! validator, topology snapshot) are cloned across every shard thread.
 //!
 //! The tokio runtime handles the iroh transport, the RPC server (which invokes the
 //! [`TxSubmissionSender`] closure synchronously), the per-shard
 //! `ProdTimerManager`s' `sleep` tasks, and the per-host metrics + GC
-//! tick. Inbound network messages and dispatch callbacks land on the
-//! addressed shard's callback channel; RPC submissions fan out via
-//! [`ProcessIo::compute_submit_fanout`] into the relevant shards'
-//! callback channels.
+//! tick. Inbound network messages land on the addressed shard's bounded
+//! network lane and dispatch callbacks on its internal lane; RPC
+//! submissions fan out via [`ProcessIo::submit_transaction`] into the
+//! relevant shards' internal lanes.
 //!
-//! [`ShardLoop`]: hyperscale_node::shard::ShardLoop
+//! [`ShardLoop`]: hyperscale_node::ShardLoop
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
-//! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
+//! [`ProcessIo::submit_transaction`]: hyperscale_node::ProcessIo::submit_transaction
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::{Sender, unbounded};
+use crossbeam::channel::unbounded;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_core::ParticipationChange;
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
@@ -38,10 +38,11 @@ use hyperscale_metrics_prometheus::install;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_network_iroh::{IrohAdapter, IrohConfig, IrohNetwork, NetworkError};
 use hyperscale_node::bootstrap::EngineBootstrap;
-use hyperscale_node::shard::HostEvent;
-use hyperscale_node::startup::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
+use hyperscale_node::event::{HostEvent, ShardInbox};
+use hyperscale_node::seating::{ShardSigners, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::{
-    HostedChain, NodeConfig, NodeHost, ReplicaConfig, SharedTopologySnapshot, TxStatusCache,
+    HostResources, HostedChain, NodeConfig, NodeHost, ReplicaConfig, SharedTopologySnapshot,
+    TxStatusCache,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -514,16 +515,15 @@ impl ProductionRunnerBuilder {
         }
         let local_shards = local_shards;
 
-        // Build one (timer / callback / shutdown) channel triple per
-        // hosted shard so the per-shard event senders inside `ProcessIo`
-        // can point at each shard's own callback channel. `ShardChannels`
-        // carries both ends; the supervisor keeps the shutdown/callback
-        // senders alive for the shard's lifetime.
+        // Build each hosted shard's channels so the per-shard inboxes
+        // inside `ProcessIo` point at that shard's own input lanes.
+        // `ShardChannels` carries the receiving ends; the supervisor keeps
+        // the shutdown sender alive for the shard's lifetime.
         let mut shard_channels: BTreeMap<ShardId, ShardChannels> = BTreeMap::new();
-        let mut shard_callback_txs: BTreeMap<ShardId, Sender<HostEvent>> = BTreeMap::new();
+        let mut shard_inboxes: BTreeMap<ShardId, ShardInbox> = BTreeMap::new();
         for shard in &local_shards {
-            let (channels, callback_tx) = ShardChannels::new();
-            shard_callback_txs.insert(*shard, callback_tx);
+            let (channels, inbox) = ShardChannels::new();
+            shard_inboxes.insert(*shard, inbox);
             shard_channels.insert(*shard, channels);
         }
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -538,6 +538,9 @@ impl ProductionRunnerBuilder {
                 storage: (*storages[&shard]).clone(),
                 recovered: &resumed[&shard],
                 signers,
+                inbox: shard_inboxes
+                    .remove(&shard)
+                    .expect("every seated shard is hosted"),
             })
             .collect();
         let identities: Vec<(ValidatorId, Arc<dyn Signer>)> = bind_vnodes.clone();
@@ -552,30 +555,23 @@ impl ProductionRunnerBuilder {
             verifier: Arc::new(BlsVerifier),
         })?;
 
-        // Each shard's `shard_event_senders` entry points at that
-        // shard's own pinned-thread callback channel — callbacks,
-        // network handlers, and RPC fanout for that shard land on its
-        // thread directly.
-        let shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>> = shard_callback_txs
-            .iter()
-            .map(|(s, tx)| (*s, tx.clone()))
-            .collect();
         // Beacon channel for the host's beacon loop: beacon gossip, what
         // the replicas report, and the loop's own continuations and fetch
         // answers arrive on it; the supervisor hands the receiver to the
         // beacon thread.
         let (beacon_event_tx, beacon_event_rx) = unbounded::<HostEvent>();
         let host = NodeHost::new(
-            replica_config,
+            &replica_config,
+            HostResources {
+                beacon_storage: self.beacon_storage,
+                executor,
+                network,
+                dispatch: (*dispatch).clone(),
+                beacon_event_sender: beacon_event_tx,
+                topology_snapshot: topology_snapshot.clone(),
+            },
             chains,
             identities,
-            self.beacon_storage,
-            executor,
-            network,
-            (*dispatch).clone(),
-            shard_event_senders,
-            beacon_event_tx,
-            topology_snapshot.clone(),
             NodeConfig::default(),
             now,
         );
@@ -639,7 +635,7 @@ impl ProductionRunnerBuilder {
 /// handles async I/O routing, RPC transaction submission, sync/fetch
 /// management, and the per-host metrics + GC tick.
 ///
-/// [`ShardLoop`]: hyperscale_node::shard::ShardLoop
+/// [`ShardLoop`]: hyperscale_node::ShardLoop
 pub struct ProductionRunner {
     /// The composed [`NodeHost`], wrapped in `Option` because it's
     /// decomposed via `into_parts()` and moved onto the per-shard
@@ -773,15 +769,15 @@ impl ProductionRunner {
     /// Build a transaction-submission closure for RPC handlers.
     ///
     /// The closure captures `Arc<ProcessIo>` plus the per-shard event
-    /// senders; each invocation reads the lock-free topology snapshot,
-    /// computes the touched-shard fanout via
-    /// [`ProcessIo::compute_submit_fanout`], and pushes the resulting
-    /// `AdmitTransaction` / `AdmitAndGossipTransaction` /
+    /// senders; each invocation routes through
+    /// [`ProcessIo::submit_transaction`], which reads the lock-free
+    /// topology snapshot, computes the touched-shard fanout, and pushes
+    /// the resulting `AdmitTransaction` / `AdmitAndGossipTransaction` /
     /// `GossipTransaction` envelopes onto the relevant per-shard
-    /// channels. Returns `true` on success, `false` only when every
-    /// per-shard channel is closed (shutdown).
+    /// channels. Returns `false` on a closed channel (shutdown) or an
+    /// envelope that derives no routing.
     ///
-    /// [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
+    /// [`ProcessIo::submit_transaction`]: hyperscale_node::ProcessIo::submit_transaction
     /// # Panics
     ///
     /// Panics if `run()` has already consumed the host. The closure
@@ -795,7 +791,7 @@ impl ProductionRunner {
                 .expect("host must exist for tx_submission_sender")
                 .process(),
         );
-        Arc::new(move |routable: Arc<Transaction>| process.submit_transaction(&routable))
+        Arc::new(move |routable: Transaction| process.submit_transaction(&routable))
     }
 
     /// A closure that asks a hosted shard what a transaction would do.
@@ -930,13 +926,12 @@ impl ProductionRunner {
                     }
                 }
                 _ = reshape_tick.tick() => {
-                    supervisor.reconcile_teardown();
-                    // Drive the reshape duties before reconciling joins: discovery
+                    // Drive the reshape duties before reconciling seats: discovery
                     // marks a reshape-seated shard as in-flight this same tick, so
                     // the join backstop skips it rather than racing a redundant
                     // snap-sync against the orchestrator's seat.
                     supervisor.reshape_tick();
-                    supervisor.reconcile_joins();
+                    supervisor.reconcile_seats();
                 }
             }
         }
@@ -952,19 +947,16 @@ impl ProductionRunner {
         outcome
     }
 
-    /// Start the pinned threads: wire the inbound handlers, resume each
+    /// Start the pinned threads: resume each
     /// hosted shard on its own thread, start the beacon thread, and join
     /// the seats whose store opened fresh. Returns the supervisor that
     /// owns the threads and the receiver that hears the beacon thread end.
     fn start_threads(&mut self) -> (ShardSupervisor, oneshot::Receiver<()>) {
-        // ── 1. Wire the inbound handlers while NodeHost still owns the loops.
-        let mut host = self
+        // ── 1. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
+        let host = self
             .host
             .take()
             .expect("host already taken (run called twice?)");
-        host.register_inbound_handlers();
-
-        // ── 2. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
         let (_process, shards, beacon) = host.into_parts();
 
         let mut shard_channels = self
@@ -972,7 +964,7 @@ impl ProductionRunner {
             .take()
             .expect("shard_channels already taken");
 
-        // ── 3. Resume each hosted shard from its recovered state on its own
+        // ── 2. Resume each hosted shard from its recovered state on its own
         // pinned thread, recorded in the supervisor so runtime membership
         // commands can stop them.
         let mut supervisor = self.supervisor.take().expect("supervisor already taken");

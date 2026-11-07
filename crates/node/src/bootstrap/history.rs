@@ -17,6 +17,12 @@
 //! and it descends from an attested point, so a serving peer has no room
 //! to substitute a fork.
 //!
+//! The QC a block is recorded with is the line's too, never the peer's:
+//! the parent QC its child's header carries, or for the anchor block the
+//! anchor QC the import seated. A QC states the epoch its signers signed,
+//! which the folds classify the block under, and the hash line pins that
+//! only through the child's header.
+//!
 //! Sans-io, like the assemblers beside it: this emits block fetches and
 //! hands back verified blocks; the driver owns transport, peer rotation
 //! and the writes.
@@ -25,7 +31,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 use hyperscale_types::network::response::GetBlockResponse;
-use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, ShardAnchor, WeightedTimestamp};
+use hyperscale_types::{
+    BlockHash, BlockHeight, CertifiedBlock, QuorumCertificate, ShardAnchor, WeightedTimestamp,
+};
 
 /// How many heights the walk keeps in flight at once.
 ///
@@ -52,11 +60,18 @@ pub enum HistoryOutcome {
 
 /// The walk down from a boundary anchor.
 #[derive(Debug)]
-pub(crate) struct HistoryBackfill {
+pub struct HistoryBackfill {
     /// The highest height not yet on the hash line.
     next: BlockHeight,
     /// The hash the block at [`Self::next`] must have.
     expected: BlockHash,
+    /// The QC the block at [`Self::next`] is recorded with: the anchor
+    /// QC the import seated for the anchor block, and below it the
+    /// parent QC its child's header carries, which that header's hash
+    /// pins. A serving peer pairs each block with a QC of its own
+    /// choosing, and a QC states the epoch its signers signed, which no
+    /// hash line reaches; so the peer's copy is never the one kept.
+    certifying: QuorumCertificate,
     /// Weighted-time floor: the walk ends on the first block whose own
     /// parent-QC anchor falls below it, that block included. The folds
     /// read the block they stop below, so it has to be here.
@@ -84,17 +99,24 @@ pub(crate) struct HistoryBackfill {
 }
 
 impl HistoryBackfill {
-    /// Walk down from `anchor` until the chain's own timestamps fall
-    /// below `floor`.
+    /// Walk down from `anchor`, certified by `anchor_qc`, until the
+    /// chain's own timestamps fall below `floor`.
     ///
     /// Starts at the anchor's own height rather than below it: the
     /// boundary import seats that block's header and no manifest, so the
     /// first row a fold asks for is already one the store cannot answer.
+    /// `anchor_qc` is the copy the import seated beside that header,
+    /// which the shard verifies before adopting.
     #[must_use]
-    pub(crate) const fn new(anchor: &ShardAnchor, floor: WeightedTimestamp) -> Self {
+    pub(crate) const fn new(
+        anchor: &ShardAnchor,
+        anchor_qc: QuorumCertificate,
+        floor: WeightedTimestamp,
+    ) -> Self {
         Self {
             next: anchor.height,
             expected: anchor.block_hash,
+            certifying: anchor_qc,
             floor,
             reach: anchor.height,
             reach_cutoff: floor,
@@ -169,7 +191,9 @@ impl HistoryBackfill {
     /// at or below [`Self::next`] until the line records it. Until then a
     /// floor above the line is no store's floor and is rejected; one at
     /// or beneath it may be true of a height the window asked for early,
-    /// and decides nothing yet. Either way the height re-arms.
+    /// and decides nothing yet. Either way the height re-arms. A floor at
+    /// or below the height asked is no store's answer for it, and is
+    /// rejected.
     pub(crate) fn on_response(
         &mut self,
         height: BlockHeight,
@@ -191,6 +215,13 @@ impl HistoryBackfill {
                 self.finish();
             }
             return HistoryOutcome::Accepted;
+        }
+        // A server answers with its floor only for a height beneath it,
+        // so a floor at or below the height asked settles nothing and is
+        // no honest answer.
+        if let GetBlockResponse::BelowFloor { .. } = response {
+            self.on_failure(height);
+            return HistoryOutcome::Rejected("chain floor claimed at or below the height asked");
         }
         let Some(elided) = response.block() else {
             self.on_failure(height);
@@ -239,7 +270,17 @@ impl HistoryBackfill {
                 self.asked.remove(&self.next);
                 return HistoryOutcome::Rejected("block is not the one its child names as parent");
             }
+            // The served QC is dropped for the pinned one. A pinned QC
+            // over some other block is a line no honest chain draws, and
+            // nothing at or beneath it can be recorded with a QC the line
+            // pins, so the walk ends there.
+            let (block, _served) = certified.into_parts();
+            let Ok(certified) = CertifiedBlock::new_checked(block, self.certifying.clone()) else {
+                self.done = true;
+                break;
+            };
             let header = certified.block().header();
+            self.certifying = header.parent_qc().clone();
             // Two ends, and either is the bottom. The floor is the one
             // the folds test, and it reads the block it stops below, so
             // that block is recorded before the walk stops; a reach set
@@ -289,8 +330,9 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeaderParts,
-        ChainOrigin, ElidedCertifiedBlock, Inventory, ProposerTimestamp, QuorumCertificate, Round,
-        ShardId, SignerBitfield, StateRoot, ValidatorId, Verifiable, Verified, WitnessSources,
+        ChainOrigin, ElidedCertifiedBlock, Epoch, Inventory, ProposerTimestamp, QuorumCertificate,
+        Round, ShardId, SignerBitfield, StateRoot, ValidatorId, Verifiable, Verified,
+        WitnessSources,
     };
 
     use super::*;
@@ -300,20 +342,26 @@ mod tests {
     /// A QC over `block_hash` with a signer set, so it is not the
     /// structural genesis the walk stops at.
     fn real_qc(block_hash: BlockHash, wt_ms: u64) -> Verified<QuorumCertificate> {
+        Verified::new_unchecked_for_test(qc_stating(block_hash, wt_ms, Epoch::GENESIS))
+    }
+
+    /// A three-signer QC over `block_hash` stating `epoch`.
+    fn qc_stating(block_hash: BlockHash, wt_ms: u64, epoch: Epoch) -> QuorumCertificate {
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        Verified::new_unchecked_for_test(QuorumCertificate::new(
+        QuorumCertificate::new(
             block_hash,
             SHARD,
             BlockHeight::GENESIS,
             BlockHash::ZERO,
             Round::new(1),
+            epoch,
             signers,
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(wt_ms),
-        ))
+        )
     }
 
     /// A chain of `len` blocks rising to height `len`, each naming the
@@ -376,14 +424,28 @@ mod tests {
         }
     }
 
+    /// The walk down from `top`, certified by its own QC.
+    fn walk_over(top: &CertifiedBlock, floor: WeightedTimestamp) -> HistoryBackfill {
+        HistoryBackfill::new(&anchor_over(top), top.qc().clone(), floor)
+    }
+
     fn answer(chain: &[CertifiedBlock], height: BlockHeight) -> GetBlockResponse {
+        answer_with(chain, height, |certified| certified.qc().clone())
+    }
+
+    /// [`answer`] pairing each block with the QC `qc_for` picks for it.
+    fn answer_with(
+        chain: &[CertifiedBlock],
+        height: BlockHeight,
+        qc_for: impl Fn(&CertifiedBlock) -> QuorumCertificate,
+    ) -> GetBlockResponse {
         chain
             .iter()
             .find(|c| c.height() == height)
             .map_or_else(GetBlockResponse::not_found, |c| {
                 GetBlockResponse::found(ElidedCertifiedBlock::elide(
                     c.block(),
-                    c.qc().clone(),
+                    qc_for(c),
                     &Inventory::empty(),
                 ))
             })
@@ -421,10 +483,54 @@ mod tests {
     fn the_walk_records_the_block_it_stops_below() {
         let chain = chain(10);
         let top = chain.last().expect("a chain of ten");
-        let mut walk =
-            HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::from_millis(8_000));
+        let mut walk = walk_over(top, WeightedTimestamp::from_millis(8_000));
         let recorded = run(&mut walk, |h| answer(&chain, h));
         assert_eq!(recorded, vec![10, 9, 8, 7]);
+    }
+
+    /// Each block is recorded with the QC its child's header pins, and
+    /// the anchor block with the anchor QC the walk was handed, whatever
+    /// QC the server paired it with: one stating another epoch never
+    /// reaches the store.
+    #[test]
+    fn a_block_is_recorded_with_the_qc_its_child_pins() {
+        let chain = chain(5);
+        let top = chain.last().expect("a chain of five");
+        let mut walk = walk_over(top, WeightedTimestamp::ZERO);
+        let forged = Epoch::new(9);
+        let mut recorded = Vec::new();
+        for _ in 0..100 {
+            if walk.is_complete() {
+                break;
+            }
+            for request in walk.next_requests() {
+                let response = answer_with(&chain, request.height, |certified| {
+                    qc_stating(
+                        certified.hash(),
+                        certified.qc().weighted_timestamp().as_millis(),
+                        forged,
+                    )
+                });
+                if let HistoryOutcome::Verified(blocks) =
+                    walk.on_response(request.height, &response)
+                {
+                    recorded.extend(blocks);
+                }
+            }
+        }
+        assert!(walk.is_complete());
+        assert_eq!(recorded.len(), chain.len());
+        for certified in &recorded {
+            let pinned = chain
+                .iter()
+                .find(|block| block.height() == certified.height().next())
+                .map_or_else(
+                    || top.qc().clone(),
+                    |child| child.block().header().parent_qc().clone(),
+                );
+            assert_eq!(certified.qc(), &pinned, "height {}", certified.height());
+            assert_ne!(certified.qc().committee_epoch(), forged);
+        }
     }
 
     /// A reach below the floor carries the walk on down to it, and no
@@ -437,12 +543,12 @@ mod tests {
         let top = chain.last().expect("a chain of ten");
         let floor = WeightedTimestamp::from_millis(8_000);
 
-        let mut walk = HistoryBackfill::new(&anchor_over(top), floor);
+        let mut walk = walk_over(top, floor);
         walk.reach_down_to(BlockHeight::new(4), WeightedTimestamp::ZERO);
         let recorded = run(&mut walk, |h| answer(&chain, h));
         assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5, 4]);
 
-        let mut walk = HistoryBackfill::new(&anchor_over(top), floor);
+        let mut walk = walk_over(top, floor);
         walk.reach_down_to(BlockHeight::new(4), WeightedTimestamp::from_millis(6_000));
         let recorded = run(&mut walk, |h| answer(&chain, h));
         assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5]);
@@ -455,7 +561,7 @@ mod tests {
     fn the_walk_ends_at_the_bottom_of_the_chain() {
         let chain = chain(4);
         let top = chain.last().expect("a chain of four");
-        let mut walk = HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::ZERO);
+        let mut walk = walk_over(top, WeightedTimestamp::ZERO);
         let recorded = run(&mut walk, |h| answer(&chain, h));
         assert_eq!(recorded, vec![4, 3, 2, 1]);
     }
@@ -470,7 +576,7 @@ mod tests {
         // shares no hash with the one the anchor names.
         let fork = chain_from(6, 1);
         let top = chain.last().expect("a chain of six");
-        let mut walk = HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::ZERO);
+        let mut walk = walk_over(top, WeightedTimestamp::ZERO);
 
         // The top block is on the line; the one below it is answered
         // from a chain that shares no hashes.
@@ -497,8 +603,7 @@ mod tests {
     fn the_walk_past_its_floor_ends_at_the_peers_chain_floor() {
         let chain = chain(10);
         let top = chain.last().expect("a chain of ten");
-        let mut walk =
-            HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::from_millis(8_000));
+        let mut walk = walk_over(top, WeightedTimestamp::from_millis(8_000));
         walk.reach_down_to(BlockHeight::new(2), WeightedTimestamp::ZERO);
         let floor = BlockHeight::new(5);
         let recorded = run(&mut walk, |h| {
@@ -522,8 +627,7 @@ mod tests {
     fn a_chain_floor_claimed_above_the_history_floor_does_not_end_the_walk() {
         let chain = chain(10);
         let top = chain.last().expect("a chain of ten");
-        let mut walk =
-            HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::from_millis(8_000));
+        let mut walk = walk_over(top, WeightedTimestamp::from_millis(8_000));
         walk.reach_down_to(BlockHeight::new(2), WeightedTimestamp::ZERO);
         assert_eq!(walk.next_requests().len(), 11);
 
@@ -563,13 +667,40 @@ mod tests {
         assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5, 4, 3, 2]);
     }
 
+    /// A chain floor at or below the height asked is no honest answer: a
+    /// server answers with its floor only beneath it. It is rejected and
+    /// the height re-arms.
+    #[test]
+    fn a_chain_floor_at_the_height_asked_is_rejected() {
+        let chain = chain(3);
+        let top = chain.last().expect("a chain of three");
+        let mut walk = walk_over(top, WeightedTimestamp::ZERO);
+        assert!(!walk.next_requests().is_empty());
+        for floor in [3, 1] {
+            assert_eq!(
+                walk.on_response(
+                    BlockHeight::new(3),
+                    &GetBlockResponse::below_floor(BlockHeight::new(floor)),
+                ),
+                HistoryOutcome::Rejected("chain floor claimed at or below the height asked"),
+            );
+        }
+        assert_eq!(
+            walk.next_requests()
+                .iter()
+                .map(|request| request.height.inner())
+                .collect::<Vec<_>>(),
+            vec![3],
+        );
+    }
+
     /// A height nobody can answer for re-arms rather than ending the
     /// walk: the peer may simply not hold it.
     #[test]
     fn an_unanswered_height_rearms() {
         let chain = chain(3);
         let top = chain.last().expect("a chain of three");
-        let mut walk = HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::ZERO);
+        let mut walk = walk_over(top, WeightedTimestamp::ZERO);
         assert_eq!(
             walk.on_response(BlockHeight::new(3), &GetBlockResponse::not_found()),
             HistoryOutcome::Accepted,

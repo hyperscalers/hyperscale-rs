@@ -267,7 +267,7 @@ impl SimShardStorage {
             .map(|(_, payload)| payload.leaf_hash())
             .collect();
         let chain_origin = c.chain_origin;
-        let retained_provisions = c.provisions.values().map(Arc::clone).collect();
+        let retained_provisions = c.provisions.values().cloned().collect();
         drop(c);
 
         RecoveredState {

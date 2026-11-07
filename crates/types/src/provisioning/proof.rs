@@ -4,7 +4,7 @@ use hyperscale_hbor::{Bytes, Hbor};
 use hyperscale_jmt::{Blake3Hasher, ClaimTermination, MultiProof, ProofError, Tree, ValueHash};
 use thiserror::Error;
 
-use crate::{MAX_MERKLE_PROOF_LEN, ShardId, StateRoot, SubstateKey, shard_prefix_path};
+use crate::{Anchor, MAX_MERKLE_PROOF_LEN, ShardId, StateRoot, SubstateKey, shard_prefix_path};
 
 /// Merkle multiproof authenticating substates' presence in, or absence
 /// from, the JMT state tree.
@@ -72,6 +72,69 @@ pub enum StateProofError {
     /// A reading stated beside the proof is not what the proof says.
     #[error("state proof disagrees with the reading stated for a key")]
     ReadingMismatch,
+    /// The proof is not the one its own keys restrict it to: bytes a
+    /// fresh proof over those keys would not carry, which a cut of the
+    /// claim would then fail to keep.
+    #[error("state proof is not the proof its own keys restrict it to")]
+    Noncanonical,
+}
+
+/// A state proof read back against an anchor's root.
+///
+/// It reconstructs the root and claims every key asked, each with what
+/// it says of the key. Only [`Self::check`] builds one, so whoever holds
+/// it holds that reading and need not read the proof again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedStateProof {
+    anchor: Anchor,
+    keys: Vec<SubstateKey>,
+    proof: MerkleInclusionProof,
+    inclusions: Vec<(SubstateKey, Inclusion)>,
+}
+
+impl CheckedStateProof {
+    /// Read `proof` back against `anchor`'s root for `keys`.
+    ///
+    /// # Errors
+    ///
+    /// As [`MerkleInclusionProof::inclusions`] refuses the proof.
+    pub fn check(
+        anchor: Anchor,
+        keys: Vec<SubstateKey>,
+        proof: MerkleInclusionProof,
+    ) -> Result<Self, StateProofError> {
+        let inclusions = proof.inclusions(anchor.state_root, anchor.shard, &keys)?;
+        Ok(Self {
+            anchor,
+            keys,
+            proof,
+            inclusions,
+        })
+    }
+
+    /// The state the proof was read against.
+    #[must_use]
+    pub const fn anchor(&self) -> Anchor {
+        self.anchor
+    }
+
+    /// The keys the proof was asked about, in the order asked.
+    #[must_use]
+    pub fn keys(&self) -> &[SubstateKey] {
+        &self.keys
+    }
+
+    /// The proof as it arrived.
+    #[must_use]
+    pub const fn proof(&self) -> &MerkleInclusionProof {
+        &self.proof
+    }
+
+    /// Each asked key with what the proof says of it, in the order asked.
+    #[must_use]
+    pub fn inclusions(&self) -> &[(SubstateKey, Inclusion)] {
+        &self.inclusions
+    }
 }
 
 impl MerkleInclusionProof {
@@ -112,17 +175,42 @@ impl MerkleInclusionProof {
         shard: ShardId,
         keys: &[SubstateKey],
     ) -> Result<Vec<(SubstateKey, Inclusion)>, StateProofError> {
+        self.claimed_inclusions(root, shard, keys)?
+            .into_iter()
+            .map(|(key, inclusion)| Ok((key, inclusion.ok_or(StateProofError::MissingClaim)?)))
+            .collect()
+    }
+
+    /// [`Self::inclusions`], reading a key the proof does not claim as
+    /// `None` rather than refusing the proof over it.
+    ///
+    /// For an answer whose proof may or may not reach a key: the root is
+    /// reconstructed from every claim the proof carries, so a claim this
+    /// reads is attested whether or not it was the one asked about, and
+    /// a key with no claim is one the proof says nothing about.
+    ///
+    /// # Errors
+    ///
+    /// As [`StateProofError`] lists them, short of `MissingClaim`.
+    pub fn claimed_inclusions(
+        &self,
+        root: StateRoot,
+        shard: ShardId,
+        keys: &[SubstateKey],
+    ) -> Result<Vec<(SubstateKey, Option<Inclusion>)>, StateProofError> {
         let proof = MultiProof::decode(self.as_bytes()).map_err(|_| StateProofError::Malformed)?;
         let mut expected = Vec::with_capacity(keys.len());
         let mut inclusions = Vec::with_capacity(keys.len());
         for key in keys {
             let jmt_key = key.to_bytes();
-            let claim = proof
+            let Ok(at) = proof
                 .claims
                 .binary_search_by_key(&jmt_key, |claim| claim.key)
-                .ok()
-                .map(|at| &proof.claims[at])
-                .ok_or(StateProofError::MissingClaim)?;
+            else {
+                inclusions.push((*key, None));
+                continue;
+            };
+            let claim = &proof.claims[at];
             let inclusion = match claim.termination {
                 // `value_hash` is `Some` exactly for a matched leaf, and
                 // a `Leaf` claim without one would reconstruct as an
@@ -135,7 +223,7 @@ impl MerkleInclusionProof {
                 }
             };
             expected.push((jmt_key, inclusion.value_hash()));
-            inclusions.push((*key, inclusion));
+            inclusions.push((*key, Some(inclusion)));
         }
         let root_bytes: [u8; 32] = *root.as_raw().as_bytes();
         <Tree<Blake3Hasher, 1>>::verify(&proof, root_bytes, &shard_prefix_path(shard), &expected)
@@ -238,6 +326,8 @@ mod tests {
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
     use hyperscale_jmt::{Key as JmtKey, LeafValue, MemoryStore, NodeKey};
+    use proptest::collection::vec;
+    use proptest::prelude::*;
 
     use super::*;
     use crate::state_key::jmt_value_hash;
@@ -287,6 +377,29 @@ mod tests {
                 (missing, Inclusion::Absent),
                 (held, Inclusion::Present(held_hash)),
             ]
+        );
+    }
+
+    /// A key the proof does not claim reads back `None` beside the ones
+    /// it does, where [`MerkleInclusionProof::inclusions`] refuses the
+    /// proof over it.
+    #[test]
+    fn claimed_inclusions_read_an_unclaimed_key_as_none() {
+        let (held, unclaimed) = (test_key(1), test_key(3));
+        let (root, proof) = tree_and_proof(&[held], &[held]);
+        let held_hash = jmt_value_hash(held.to_bytes().as_ref());
+        assert_eq!(
+            proof
+                .claimed_inclusions(root, ShardId::ROOT, &[unclaimed, held])
+                .unwrap(),
+            vec![
+                (unclaimed, None),
+                (held, Some(Inclusion::Present(held_hash))),
+            ]
+        );
+        assert_eq!(
+            proof.inclusions(root, ShardId::ROOT, &[unclaimed, held]),
+            Err(StateProofError::MissingClaim)
         );
     }
 
@@ -433,6 +546,69 @@ mod tests {
             MerkleInclusionProof::new(vec![0xff; 8]).restrict(&[held]),
             Err(StateProofError::Malformed)
         );
+    }
+
+    /// A key of a small space: four owners, two pairs sharing their
+    /// leading bits, and four local halves, so lookups end beside one
+    /// another at empty slots and at divergent leaves alike.
+    fn spaced((owner, local): (u8, u8)) -> SubstateKey {
+        let first = [0x10, 0x11, 0x90, 0x91][usize::from(owner % 4)];
+        SubstateKey {
+            owner: Address::new([first; 31], AddressClass::Component),
+            local: LocalKey([local % 4; 16]),
+        }
+    }
+
+    fn spaced_all(drawn: &[(u8, u8)]) -> Vec<SubstateKey> {
+        let mut keys: Vec<SubstateKey> = drawn.iter().copied().map(spaced).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    proptest! {
+        /// A proof that verifies over its keys, whether proven over them
+        /// at once or joined from two proofs over halves of them, is the
+        /// proof its keys restrict it to, and restricts to every
+        /// nonempty subset of them as a fresh proof over that subset
+        /// would read, byte for byte.
+        #[test]
+        fn a_verified_proof_restricts_to_every_nonempty_subset(
+            present in vec((0u8..4, 0u8..4), 1..8),
+            asked in vec((0u8..4, 0u8..4), 1..7),
+            split in any::<u8>(),
+        ) {
+            let present = spaced_all(&present);
+            let asked = spaced_all(&asked);
+            let (root, whole) = tree_and_proof(&present, &asked);
+            let at = usize::from(split) % asked.len();
+            let joined = if at == 0 {
+                whole.clone()
+            } else {
+                let (left, right) = asked.split_at(at);
+                MerkleInclusionProof::union([
+                    &tree_and_proof(&present, left).1,
+                    &tree_and_proof(&present, right).1,
+                ])
+                .expect("two proofs over one root join")
+            };
+            prop_assert_eq!(&joined, &whole);
+            prop_assert!(whole.exact_inclusions(root, ShardId::ROOT, &asked).is_ok());
+            prop_assert_eq!(whole.restrict(&asked), Ok(whole.clone()));
+            for mask in 1u32..(1 << asked.len()) {
+                let subset: Vec<SubstateKey> = asked
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, _)| mask & (1 << at) != 0)
+                    .map(|(_, key)| *key)
+                    .collect();
+                let cut = whole.restrict(&subset).expect("a verified proof restricts");
+                prop_assert_eq!(&cut, &tree_and_proof(&present, &subset).1);
+                prop_assert!(cut.exact_inclusions(root, ShardId::ROOT, &subset).is_ok());
+                let again = cut.restrict(&subset);
+                prop_assert_eq!(again.as_ref(), Ok(&cut));
+            }
+        }
     }
 
     #[test]

@@ -3,8 +3,7 @@
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
-    BlockHeader, MAX_WITNESSES_PER_FETCH, MessageClass, NetworkMessage, QuorumCertificate,
-    ShardWitnessPayload,
+    BlockHeader, MAX_WITNESSES_PER_FETCH, MessageClass, NetworkMessage, ShardWitnessPayload,
 };
 
 /// One page of a shard's beacon-witness history at a boundary anchor.
@@ -25,6 +24,9 @@ use crate::{
 /// `header.beacon_witness_root()` with exactly
 /// `header.beacon_witness_leaf_count()` entries. Individual pages
 /// carry no proof — a mismatch at final assembly restarts the fetch.
+///
+/// No QC rides it: the anchor's QC is the one the beacon attested, or,
+/// for a seeded successor's genesis, the one its header determines.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct WitnessHistoryChunk {
     /// The boundary block's header. Hash-bound to the anchor; its
@@ -33,13 +35,6 @@ pub struct WitnessHistoryChunk {
     /// `parent_qc` carries the committee-anchor weighted timestamp the
     /// joiner seeds its recovered state with.
     pub header: BlockHeader,
-    /// The QC certifying the boundary block — the parent QC the joiner's
-    /// first block past the anchor extends. The joiner binds it
-    /// structurally (it must certify the anchor `block_hash`, which pins
-    /// every certified field through the vote message) but cannot check
-    /// the aggregate signature here; the shard coordinator verifies it
-    /// against its resolved committee before adopting it as `latest_qc`.
-    pub qc: QuorumCertificate,
     /// Leaf payloads from the requested `start_index`, in leaf-index
     /// order.
     pub payloads: Capped<Vec<ShardWitnessPayload>, MAX_WITNESSES_PER_FETCH>,
@@ -76,9 +71,8 @@ mod tests {
     use super::*;
     use crate::test_utils::test_pool;
     use crate::{
-        AggregateSignature, BeaconWitnessLeafCount, BlockHash, BlockHeaderParts, BlockHeight,
-        ChainOrigin, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield,
-        Stake, WeightedTimestamp,
+        BeaconWitnessLeafCount, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin, Hash,
+        ProposerTimestamp, QuorumCertificate, ShardId, Stake, WeightedTimestamp,
     };
 
     fn make_header() -> BlockHeader {
@@ -107,21 +101,9 @@ mod tests {
 
     #[test]
     fn test_hbor_roundtrip_chunk() {
-        let header = make_header();
-        let qc = QuorumCertificate::new(
-            header.hash(),
-            ShardId::ROOT,
-            header.height(),
-            header.parent_block_hash(),
-            Round::INITIAL,
-            SignerBitfield::new(4),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::ZERO,
-        );
         let response = GetWitnessHistoryResponse {
             history: Some(WitnessHistoryChunk {
-                header,
-                qc,
+                header: make_header(),
                 payloads: Capped::from_array([
                     ShardWitnessPayload::StakeDeposit {
                         pool_id: test_pool(1),

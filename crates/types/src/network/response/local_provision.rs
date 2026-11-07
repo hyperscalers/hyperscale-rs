@@ -1,14 +1,12 @@
 //! Local provisions fetch response (intra-shard DA).
 
-use std::sync::Arc;
-
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
-    CertifiedBlockHeader, MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage, Provisions,
+    CertifiedBlockHeader, MAX_PROVISIONS_PER_BLOCK, MessageClass, NetworkMessage, Provision,
 };
 
-/// One returned batch plus the source-shard header that proved its
+/// One returned part plus the source-shard header that proved its
 /// provisions root.
 ///
 /// The follower fetching a local provision is reacting to the block
@@ -20,30 +18,32 @@ use crate::{
 /// the receiver verify and admit in one shot, skipping the pipeline
 /// buffer entirely.
 ///
-/// `source_header` is `Option` so a responder that has GC'd the header
-/// after admitting the batch can still serve the blob — the receiver
-/// gracefully falls back to the buffered path (which now correctly
-/// fails out on terminal drops).
+/// A response carries each source block's header once, with the first
+/// of that block's parts; the block's later parts carry `None`. A
+/// responder that has retired the header after admitting the part
+/// still serves it without one, and the receiver falls back to the
+/// buffered path.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct LocalProvisionEntry {
-    /// The provisions batch.
-    pub provisions: Arc<Provisions>,
-    /// The source-shard certified header at `provisions.block_height()`,
-    /// if the responder still has it.
-    pub source_header: Option<Arc<CertifiedBlockHeader>>,
+    /// The part.
+    pub provision: Provision,
+    /// The source-shard certified header at `provision.block_height()`,
+    /// on the response's first part of that block, if the responder
+    /// still has it.
+    pub source_header: Option<CertifiedBlockHeader>,
 }
 
 /// Response to a local provisions fetch request.
 ///
-/// `entries` holds the batches the responder has plus the matching source
-/// header for each. The requester knows the hashes it asked for, so missing
-/// hashes are computed client-side as `requested - returned`; the wire
-/// format does not duplicate that diff.
+/// `entries` holds the parts the responder has, as many as a fetch
+/// response's budget carries, with one source header per source block.
+/// The requester knows the hashes it asked for, so missing hashes are
+/// computed client-side as `requested - returned` and asked again; the
+/// wire format does not duplicate that diff.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetLocalProvisionsResponse {
-    /// Provision batches the responder had locally, each paired with the
-    /// source-shard header that proved its provisions root (when still
-    /// retained).
+    /// Parts the responder had locally, the first of each source block
+    /// carrying the header that proves its leaf (when still retained).
     ///
     /// Capped at [`MAX_PROVISIONS_PER_BLOCK`] — the natural ceiling since a
     /// single block can't reference more provisions than this, and the fetch
@@ -90,7 +90,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::AggregateSignature;
+    use crate::{AggregateSignature, Epoch};
 
     #[test]
     fn test_empty_response() {
@@ -110,24 +110,19 @@ mod tests {
     fn entry_with_bundled_header_roundtrips() {
         use crate::{
             BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlockHeader,
-            ChainOrigin, Hash, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,
-            QuorumCertificate, Round, ShardId, SignerBitfield, TxHash, WeightedTimestamp,
+            ChainOrigin, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardId,
+            SignerBitfield, TxHash, WeightedTimestamp,
         };
 
         let source_shard = ShardId::leaf(1, 1);
         let target_shard = ShardId::leaf(1, 0);
         let source_height = BlockHeight::new(7);
-        let provisions = Arc::new(Provisions::new(
+        let provision = Provision::dummy(
             source_shard,
             target_shard,
             source_height,
-            WeightedTimestamp::ZERO,
-            MerkleInclusionProof::dummy(),
-            Capped::from_array([ProvisionEntry::new(
-                TxHash::from(Hash::from_bytes(b"tx")),
-                Capped::empty(),
-            )]),
-        ));
+            TxHash::from(Hash::from_bytes(b"tx")),
+        );
         let header = BlockHeader::new(BlockHeaderParts {
             shard_id: source_shard,
             height: source_height,
@@ -148,20 +143,21 @@ mod tests {
             source_height,
             BlockHash::ZERO,
             Round::INITIAL,
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
-        let source_header = Arc::new(CertifiedBlockHeader::new(header, qc));
+        let source_header = CertifiedBlockHeader::new(header, qc);
 
         let original = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
-            provisions: Arc::clone(&provisions),
-            source_header: Some(Arc::clone(&source_header)),
+            provision: provision.clone(),
+            source_header: Some(source_header.clone()),
         }]));
         let bytes = hbor_to_vec(&original).unwrap();
         let decoded: GetLocalProvisionsResponse = hbor_from_slice(&bytes).unwrap();
         assert_eq!(decoded.entries.len(), 1);
-        assert_eq!(decoded.entries[0].provisions.hash(), provisions.hash());
+        assert_eq!(decoded.entries[0].provision.hash(), provision.hash());
         let decoded_header = decoded.entries[0]
             .source_header
             .as_ref()
@@ -173,7 +169,7 @@ mod tests {
 
         // Same shape with `None` header — the responder GC'd it after admit.
         let stripped = GetLocalProvisionsResponse::new(Capped::from_array([LocalProvisionEntry {
-            provisions: Arc::clone(&provisions),
+            provision,
             source_header: None,
         }]));
         let bytes = hbor_to_vec(&stripped).unwrap();

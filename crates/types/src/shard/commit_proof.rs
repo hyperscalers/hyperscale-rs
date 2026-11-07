@@ -176,7 +176,7 @@ impl CommitProof {
     /// `None` when the proof carries no parent (see
     /// [`Self::certified_parent`]).
     #[must_use]
-    pub(crate) fn certified_committee_anchor(&self) -> Option<WeightedTimestamp> {
+    pub(crate) fn committee_anchor_of_certified(&self) -> Option<WeightedTimestamp> {
         Some(
             self.certified_parent
                 .as_ref()?
@@ -187,15 +187,15 @@ impl CommitProof {
 
     /// Anchor selecting the committee that signed [`Self::child`]'s QC — the
     /// certified block's own anchor, one hop up from
-    /// [`Self::certified_committee_anchor`].
+    /// [`Self::committee_anchor_of_certified`].
     #[must_use]
-    pub(crate) fn child_committee_anchor(&self) -> WeightedTimestamp {
+    pub(crate) fn committee_anchor_of_child(&self) -> WeightedTimestamp {
         self.certified.header().parent_qc().weighted_timestamp()
     }
 
     /// The shard this proof is on.
     #[must_use]
-    pub const fn shard(&self) -> ShardId {
+    pub fn shard(&self) -> ShardId {
         self.certified.shard_id()
     }
 
@@ -328,7 +328,7 @@ impl CommitProof {
     }
 
     /// Verify both member QCs against their resolved committees.
-    /// `committees` is `[certified_committee, child_committee]`.
+    /// `committees` is the certified block's committee, then the child's.
     pub(crate) fn verify_qcs(
         &self,
         verifier: &dyn Verifier,

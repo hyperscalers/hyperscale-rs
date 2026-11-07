@@ -25,14 +25,12 @@
 //! the network worker thread are wait-free in the common case and never
 //! contend with the single state-machine writer.
 
-use std::sync::Arc;
-
 use hyperscale_types::{BloomFilter, DEFAULT_FPR, Transaction, TxHash, Verified};
 use papaya::HashMap;
 
 /// Shared content-addressed store of [`Transaction`] bodies.
 ///
-/// Bodies are stored as `Arc<Verified<Transaction>>`; admission to
+/// Bodies are stored as `Verified<Transaction>`; admission to
 /// the store is gated by the standard `Verify` predicate (gossip / RPC /
 /// fetch all run through the validation pipeline), and re-population from
 /// committed blocks goes through
@@ -43,7 +41,7 @@ use papaya::HashMap;
 /// reads bodies; writes (insert on validation, evict on retention sweep)
 /// are infrequent and single-threaded (state machine).
 pub struct TxStore {
-    inner: HashMap<TxHash, Arc<Verified<Transaction>>>,
+    inner: HashMap<TxHash, Verified<Transaction>>,
 }
 
 impl TxStore {
@@ -56,27 +54,27 @@ impl TxStore {
     }
 
     /// Insert a transaction body. Idempotent: re-inserting the same hash is
-    /// a no-op (the existing `Arc` is preserved so callers holding clones
-    /// keep pointing at the same allocation).
-    pub(crate) fn insert(&self, tx: Arc<Verified<Transaction>>) {
+    /// a no-op (the held body is kept, so callers holding clones keep
+    /// sharing it).
+    pub(crate) fn insert(&self, tx: Verified<Transaction>) {
         let hash = tx.hash();
         self.inner.pin().get_or_insert_with(hash, || tx);
     }
 
     /// Look up a transaction body by hash.
     #[must_use]
-    pub fn get(&self, hash: &TxHash) -> Option<Arc<Verified<Transaction>>> {
+    pub fn get(&self, hash: &TxHash) -> Option<Verified<Transaction>> {
         self.inner.pin().get(hash).cloned()
     }
 
     /// Bulk lookup. Returns `(hash, body)` pairs for those found; missing
     /// hashes are skipped (caller decides fallback policy).
     #[must_use]
-    pub fn get_batch(&self, hashes: &[TxHash]) -> Vec<(TxHash, Arc<Verified<Transaction>>)> {
+    pub fn get_batch(&self, hashes: &[TxHash]) -> Vec<(TxHash, Verified<Transaction>)> {
         let g = self.inner.pin();
         hashes
             .iter()
-            .filter_map(|h| g.get(h).map(|tx| (*h, Arc::clone(tx))))
+            .filter_map(|h| g.get(h).map(|tx| (*h, tx.clone())))
             .collect()
     }
 
@@ -140,8 +138,8 @@ mod tests {
 
     use super::*;
 
-    fn tx(seed: u8) -> Arc<Verified<Transaction>> {
-        Arc::new(verified_test_transaction(seed))
+    fn tx(seed: u8) -> Verified<Transaction> {
+        verified_test_transaction(seed)
     }
 
     #[test]
@@ -149,7 +147,7 @@ mod tests {
         let store = TxStore::new();
         let t = tx(1);
         let hash = t.hash();
-        store.insert(Arc::clone(&t));
+        store.insert(t);
         assert_eq!(store.get(&hash).map(|a| a.hash()), Some(hash));
     }
 
@@ -157,8 +155,8 @@ mod tests {
     fn insert_is_idempotent() {
         let store = TxStore::new();
         let t = tx(1);
-        store.insert(Arc::clone(&t));
-        store.insert(Arc::clone(&t));
+        store.insert(t.clone());
+        store.insert(t);
         assert_eq!(store.len(), 1);
     }
 
@@ -168,8 +166,8 @@ mod tests {
         let a = tx(1);
         let b = tx(2);
         let missing = tx(99).hash();
-        store.insert(Arc::clone(&a));
-        store.insert(Arc::clone(&b));
+        store.insert(a.clone());
+        store.insert(b.clone());
         let got = store.get_batch(&[a.hash(), missing, b.hash()]);
         assert_eq!(got.len(), 2);
     }
@@ -179,8 +177,8 @@ mod tests {
         let store = TxStore::new();
         let a = tx(1);
         let b = tx(2);
-        store.insert(Arc::clone(&a));
-        store.insert(Arc::clone(&b));
+        store.insert(a.clone());
+        store.insert(b.clone());
         let removed = store.evict([a.hash()]);
         assert_eq!(removed, 1);
         assert!(!store.contains(&a.hash()));
@@ -192,7 +190,7 @@ mod tests {
         let store = TxStore::new();
         let txs: Vec<_> = (0..10).map(tx).collect();
         for t in &txs {
-            store.insert(Arc::clone(t));
+            store.insert(t.clone());
         }
         let bf = store.tx_bloom_snapshot().unwrap();
         for t in &txs {

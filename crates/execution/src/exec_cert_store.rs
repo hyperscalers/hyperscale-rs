@@ -22,15 +22,13 @@
 //! [`ExecutionCertificate`]: hyperscale_types::ExecutionCertificate
 //! [`ExecutionCoordinator::remove_finalization`]: crate::ExecutionCoordinator::remove_finalization
 
-use std::sync::Arc;
-
 use hyperscale_types::{ExecutionCertificate, TickId, Verified};
 use papaya::HashMap;
 
 /// Shared store of aggregated [`ExecutionCertificate`]s awaiting block
 /// commit, by tick.
 pub struct ExecCertStore {
-    inner: HashMap<TickId, Arc<Verified<ExecutionCertificate>>>,
+    inner: HashMap<TickId, Verified<ExecutionCertificate>>,
 }
 
 impl ExecCertStore {
@@ -43,8 +41,8 @@ impl ExecCertStore {
     }
 
     /// Insert a verified execution certificate. Idempotent: re-inserting
-    /// the same `TickId` is a no-op (the existing `Arc` is preserved so
-    /// callers holding clones keep pointing at the same allocation).
+    /// the same `TickId` is a no-op (the held certificate is kept, so
+    /// callers holding clones keep sharing its body).
     ///
     /// A no-op for a wider copy of a held tick too. The writer is single,
     /// so the check and the insert do not race.
@@ -54,7 +52,7 @@ impl ExecCertStore {
     /// verifier resolves a certificate's committee at its own anchor and
     /// stops resolving an old one once that window is evicted, so the
     /// later copy is the one still worth serving.
-    pub fn insert(&self, cert: Arc<Verified<ExecutionCertificate>>) {
+    pub fn insert(&self, cert: Verified<ExecutionCertificate>) {
         let tick_id = *cert.tick_id();
         let inner = self.inner.pin();
         if let Some(held) = inner.get(&tick_id) {
@@ -70,7 +68,7 @@ impl ExecCertStore {
 
     /// Look up a verified execution certificate by `TickId`.
     #[must_use]
-    pub(crate) fn get(&self, tick_id: &TickId) -> Option<Arc<Verified<ExecutionCertificate>>> {
+    pub(crate) fn get(&self, tick_id: &TickId) -> Option<Verified<ExecutionCertificate>> {
         self.inner.pin().get(tick_id).cloned()
     }
 
@@ -109,7 +107,7 @@ mod tests {
 
     use super::*;
 
-    fn cert(block_height: u64) -> Arc<Verified<ExecutionCertificate>> {
+    fn cert(block_height: u64) -> Verified<ExecutionCertificate> {
         anchored(block_height, WeightedTimestamp::ZERO, vec![])
     }
 
@@ -118,16 +116,16 @@ mod tests {
         block_height: u64,
         anchor: WeightedTimestamp,
         outcomes: Vec<TxOutcome>,
-    ) -> Arc<Verified<ExecutionCertificate>> {
+    ) -> Verified<ExecutionCertificate> {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(block_height));
-        Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+        Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
             anchor,
             GlobalReceiptRoot::ZERO,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
-        )))
+        ))
     }
 
     fn tx(seed: u8) -> TxHash {
@@ -146,13 +144,13 @@ mod tests {
         let outcomes = vec![outcome(tx(1), Role::Core)];
         let first = anchored(1, WeightedTimestamp::from_millis(10), outcomes.clone());
         let later = anchored(1, WeightedTimestamp::from_millis(500), outcomes);
-        store.insert(Arc::clone(&first));
-        store.insert(Arc::clone(&later));
+        store.insert(first.clone());
+        store.insert(later);
         let held =
             |store: &ExecCertStore| store.get(first.tick_id()).map(|cert| cert.vote_anchor_ts());
         assert_eq!(held(&store), Some(WeightedTimestamp::from_millis(500)));
 
-        store.insert(Arc::clone(&first));
+        store.insert(first.clone());
         assert_eq!(held(&store), Some(WeightedTimestamp::from_millis(500)));
     }
 
@@ -161,7 +159,7 @@ mod tests {
         let store = ExecCertStore::new();
         let c = cert(1);
         let id = *c.tick_id();
-        store.insert(Arc::clone(&c));
+        store.insert(c);
         assert_eq!(store.get(&id).map(|a| *a.tick_id()), Some(id));
     }
 
@@ -169,8 +167,8 @@ mod tests {
     fn insert_is_idempotent() {
         let store = ExecCertStore::new();
         let c = cert(1);
-        store.insert(Arc::clone(&c));
-        store.insert(Arc::clone(&c));
+        store.insert(c.clone());
+        store.insert(c);
         assert_eq!(store.len(), 1);
     }
 
@@ -179,8 +177,8 @@ mod tests {
         let store = ExecCertStore::new();
         let a = cert(1);
         let b = cert(2);
-        store.insert(Arc::clone(&a));
-        store.insert(Arc::clone(&b));
+        store.insert(a.clone());
+        store.insert(b.clone());
         store.evict(a.tick_id());
         assert!(store.get(a.tick_id()).is_none());
         assert!(store.get(b.tick_id()).is_some());

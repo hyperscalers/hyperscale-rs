@@ -426,13 +426,13 @@ impl Cluster for ProdCluster {
         self.inner.with_derivation(f)
     }
 
-    fn submit(&mut self, tx: Arc<Transaction>) {
+    fn submit(&mut self, tx: Transaction) {
         if let Some(host) = self.host_for_tx(&tx).or_else(|| self.inner.live_host()) {
             self.inner.submit_transaction(host, &tx);
         }
     }
 
-    fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
+    fn submit_to(&mut self, shard: ShardId, tx: Transaction) {
         let first = self.committee_hosts(shard).first().copied();
         if let Some(host) = first.or_else(|| self.inner.live_host()) {
             self.inner.submit_transaction(host, &tx);
@@ -523,6 +523,15 @@ impl Cluster for ProdCluster {
         self.inner.entries(shard, range)
     }
 
+    fn entries_at(
+        &self,
+        shard: ShardId,
+        range: DeclaredRange,
+        height: BlockHeight,
+    ) -> Option<Vec<(u128, Vec<u8>)>> {
+        self.inner.entries_at(shard, range, height)
+    }
+
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {
         self.inner.ran(shard, tx)
     }
@@ -548,6 +557,10 @@ impl Cluster for ProdCluster {
         Option<(BlockHeight, TransactionDecision)>,
     ) {
         self.inner.chain_fate(shard, tx)
+    }
+
+    fn served_at(&self, source: ShardId, target: ShardId, tx: TxHash) -> Option<BlockHeight> {
+        self.inner.served_at(source, target, tx)
     }
 
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {
@@ -731,7 +744,7 @@ impl FaultableCluster for ProdCluster {
         self.inner.host_of(validator)
     }
 
-    fn submit_at_host(&mut self, host: usize, tx: Arc<Transaction>) {
+    fn submit_at_host(&mut self, host: usize, tx: Transaction) {
         self.inner.submit_transaction(host, &tx);
     }
 

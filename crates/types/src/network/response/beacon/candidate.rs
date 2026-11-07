@@ -1,7 +1,5 @@
 //! Candidate fetch response.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 
 use crate::{CandidateBeaconBlock, MessageClass, NetworkMessage, Verifiable};
@@ -14,13 +12,13 @@ use crate::{CandidateBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetBeaconCandidateResponse {
     /// The candidate, if the responder held it.
-    pub candidate: Option<Arc<Verifiable<CandidateBeaconBlock>>>,
+    pub candidate: Option<Verifiable<CandidateBeaconBlock>>,
 }
 
 impl GetBeaconCandidateResponse {
     /// Build a response from an optional candidate.
     #[must_use]
-    pub const fn new(candidate: Option<Arc<Verifiable<CandidateBeaconBlock>>>) -> Self {
+    pub const fn new(candidate: Option<Verifiable<CandidateBeaconBlock>>) -> Self {
         Self { candidate }
     }
 

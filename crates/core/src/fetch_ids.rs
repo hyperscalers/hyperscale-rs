@@ -1,27 +1,27 @@
 //! The ids of one fetch family, in one shape.
 //!
 //! Every payload the unified fetch protocols address has its own id type,
-//! and three messages carry a batch of them: a coordinator cancelling ids
-//! it no longer wants ([`crate::Action::AbandonFetch`]), and the node's
-//! own response boundary releasing ids a peer failed to answer or
-//! answered in full. All three name the same `(binding, Vec<Id>)` pair,
-//! so one enum spells it and one dispatcher routes it to the binding's
-//! state machine.
+//! and two kinds of message carry a batch of them: an owner cancelling ids
+//! it no longer wants ([`crate::Action::AbandonFetch`],
+//! [`crate::FoldAction::AbandonFetch`],
+//! [`crate::BeaconAction::AbandonFetch`]), and the node's own response
+//! boundary releasing ids a peer failed to answer or answered in full.
+//! Each names the same `(binding, Vec<Id>)` pair, so one enum per
+//! loop spells it and that loop's one dispatcher routes it to the
+//! binding's state machine.
 
 use hyperscale_types::{
     Address, Anchor, BeaconBlockHash, BlockHash, BlockHeight, Epoch, FinalizationHash, Hash,
     LeafIndex, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId,
-    VerdictCells,
+    VerdictCells, WeightedTimestamp,
 };
 
-/// A batch of ids under the binding that fetches them, keyed exactly as
-/// that binding's state machine is.
+/// A batch of ids under the shard-loop binding that fetches them, keyed
+/// exactly as that binding's state machine is.
 ///
 /// One variant per binding, which is not quite one per
-/// [`crate::FetchRequest`]: a payload the node fetches without a request
-/// variant of its own — a package artifact, an instance record — still
-/// has ids to release, and so still has a variant here, under
-/// [`BeaconFetchIds`] when the host's beacon loop is what fetches it.
+/// [`crate::FetchRequest`]. The fetches the host's beacon loop drives
+/// are [`BeaconFetchIds`]: no shard loop can be handed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchIds {
     /// Transactions by hash.
@@ -30,30 +30,35 @@ pub enum FetchIds {
     LocalProvisions(Vec<ProvisionHash>),
     /// Finalizations by identity.
     Finalizations(Vec<FinalizationHash>),
-    /// Cross-shard provision scopes as `(source_shard, target_shard,
-    /// block_height)` — the requester's own shard is the target.
-    RemoteProvisions(Vec<(ShardId, ShardId, BlockHeight)>),
+    /// Cross-shard provision parts as `(source_shard, target_shard,
+    /// block_height, leaf_index)` — the requester's own shard is the
+    /// target.
+    RemoteProvisions(Vec<(ShardId, ShardId, BlockHeight, u32)>),
     /// State-proof probes as `(anchor, key)`.
     StateProofs(Vec<(Anchor, SubstateKey)>),
     /// Verdict questions as `(anchor, cells)`: the three cells one
     /// question reads on a sibling, asked together so an answer holds
     /// each question whole. Fetched apart from [`Self::StateProofs`], so
-    /// one that never returns holds no place a record, seat or sibling
-    /// probe needs.
+    /// one that never returns holds no place a seat or sibling probe
+    /// needs.
     VerdictProofs(Vec<(Anchor, VerdictCells)>),
+    /// Crossing record reads as `(filed_at, anchor, key)`: the committed
+    /// clock the want was filed at, so the oldest wants go first, and
+    /// the proven anchor and record key the read asks. Fetched apart
+    /// from [`Self::StateProofs`], so a backlog of them holds no place a
+    /// seat, ledger or boundary ask needs.
+    RecordProofs(Vec<(WeightedTimestamp, Anchor, SubstateKey)>),
     /// Departed shards' settled sets, by the terminal each is checked
     /// against.
     SettledTxs(Vec<TerminalEvidence>),
     /// Block proposals a committee member's vote named and this replica
     /// never received, by block hash.
     Proposals(Vec<BlockHash>),
-    /// The fetches the host's beacon loop drives. No replica emits them.
-    Beacon(BeaconFetchIds),
 }
 
 /// The ids of the fetches the host's beacon loop drives: for its fold and
 /// its participants, and the records and code every loop on the host
-/// shares.
+/// shares. The beacon loop's counterpart of [`FetchIds`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeaconFetchIds {
     /// Missing beacon proposals as `(epoch, validator)`.

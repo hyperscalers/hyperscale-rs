@@ -13,10 +13,11 @@ use hyperscale_vm_types::PriceTable;
 
 use crate::{
     Address, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey,
-    DeclaredKey, Epoch, EpochWindows, NetworkDefinition, NetworkParams, QuorumCertificate,
-    RecoveryBinding, RecoveryCause, ReshapeKind, ReshapeThresholds, Round, SeedRing,
-    SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
-    ValidatorSet, VoteCount, WeightedTimestamp,
+    DeclaredKey, Epoch, EpochWindows, MIN_EPOCH_DURATION, NetworkDefinition, NetworkParams,
+    QuorumCertificate, RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ReshapeKind,
+    ReshapeThresholds, Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie,
+    StateRoot, TERMINAL_EVIDENCE_EPOCHS, Transaction, ValidatorId, ValidatorSet, VoteCount,
+    WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -976,6 +977,14 @@ impl TopologySnapshot {
         anchor_wt: WeightedTimestamp,
         height: BlockHeight,
     ) -> bool {
+        // A binding leaves with its shard's terminal evidence, so that
+        // must outlast every transaction whose work the binding orphans.
+        const {
+            assert!(
+                TERMINAL_EVIDENCE_EPOCHS * MIN_EPOCH_DURATION.as_secs()
+                    > RETENTION_HORIZON.as_secs()
+            );
+        };
         self.recovery_bindings(shard)
             .any(|binding| binding.orphans(windows, height, anchor_wt))
     }
@@ -1019,11 +1028,7 @@ impl TopologySnapshot {
         let history = self.recoveries(shard);
         let unstamped = self.pending_recoveries.get(&shard).and_then(|pending| {
             (history.last().map(|binding| binding.rotated_at) != Some(pending.rotated_at))
-                .then_some(RecoveryBinding {
-                    rotated_at: pending.rotated_at,
-                    attested_frontier: pending.attested_frontier,
-                    completed: false,
-                })
+                .then_some(pending.binding())
         });
         history.iter().copied().chain(unstamped)
     }
@@ -1329,6 +1334,7 @@ impl TopologySnapshot {
     /// Each shard executes the whole transaction, so every touched shard
     /// needs every input substate it doesn't own locally — reads and
     /// writes participate symmetrically here.
+    #[must_use]
     pub fn all_shards_for_transaction(&self, tx: &Transaction) -> Vec<ShardId> {
         tx.routing()
             .all_prefixes()
@@ -1340,17 +1346,20 @@ impl TopologySnapshot {
     }
 
     /// Check if a transaction is cross-shard.
+    #[must_use]
     pub fn is_cross_shard_transaction(&self, tx: &Transaction) -> bool {
         self.all_shards_for_transaction(tx).len() > 1
     }
 
     /// Check if a transaction is single-shard.
+    #[must_use]
     pub fn is_single_shard_transaction(&self, tx: &Transaction) -> bool {
         self.all_shards_for_transaction(tx).len() <= 1
     }
 
     /// Check if `shard` is involved in `tx`'s consensus path — i.e. owns at
     /// least one of `tx`'s declared writes.
+    #[must_use]
     pub fn involves_shard_for_consensus(&self, shard: ShardId, tx: &Transaction) -> bool {
         tx.routing()
             .write_prefixes
@@ -1359,6 +1368,7 @@ impl TopologySnapshot {
     }
 
     /// Check if `shard` is involved in `tx` at all (reads or writes).
+    #[must_use]
     pub fn involves_shard(&self, shard: ShardId, tx: &Transaction) -> bool {
         tx.routing()
             .all_prefixes()

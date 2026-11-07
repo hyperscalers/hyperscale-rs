@@ -3,7 +3,7 @@
 //! This module defines the storage abstraction used by runners to persist
 //! substate state.
 
-use hyperscale_types::{BlockHeight, DeclaredRange, StateRoot, SubstateKey};
+use hyperscale_types::{BlockHeight, DeclaredRange, StateRoot, SubstateKey, WeightedTimestamp};
 
 use crate::Substates;
 
@@ -134,12 +134,21 @@ pub trait SubstateStore: Substates + Send + Sync + 'static {
 /// construction — below the retention floor the history log has been
 /// collected, and an internal caller asking there is a DA-assumption
 /// bug, not a case to degrade through.
+///
+/// The floor is judged once, when the snapshot is taken. From then on
+/// the snapshot owns its version: it answers as of `height` for as long
+/// as it lives, however far retention moves past `height` meanwhile. A
+/// reader that may outlive a raise of the floor keeps the snapshot it
+/// took rather than taking another.
 pub trait VersionedStore: SubstateStore {
+    /// A snapshot at one version, owning its hold on the store's history.
+    type Versioned: Anchored + Send + Sync + 'static;
+
     /// The snapshot at `height`, or `None` when this store does not hold
     /// that height: above its tip, or below its retention floor. Tip and
     /// floor are read together, so the answer is one store's at one
     /// instant.
-    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>>;
+    fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Versioned>;
 
     /// Create a snapshot anchored at `height`, which must be at or above
     /// the retention floor; above the tip the snapshot reads the tip.
@@ -147,10 +156,12 @@ pub trait VersionedStore: SubstateStore {
     /// # Panics
     ///
     /// If `height` is below the retention floor.
-    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_>;
+    fn snapshot_at(&self, height: BlockHeight) -> Self::Versioned;
 
     /// Hold history at `height`: the oldest version this node's own
-    /// readers still name, which the retention floor may not pass.
+    /// readers still name, which the retention floor may not pass. And
+    /// measure the horizon from no later than `clock`, the anchor of the
+    /// last block this node has seated.
     ///
     /// The horizon answers what a *counterpart* is licensed to ask for,
     /// and it is measured against the tip's clock — which a halted
@@ -161,10 +172,19 @@ pub trait VersionedStore: SubstateStore {
     /// what they name, and there is one publisher — the tick chain,
     /// which already refuses to evict a fold below the same number.
     ///
+    /// The clock covers what the hold cannot: a block seated after the
+    /// last publication may name a height below it, and a write can
+    /// outrun the seating. Such a block's anchor is at or past `clock`,
+    /// and a height it names lies within the horizon of its anchor, so
+    /// it lies within the horizon of `clock` too.
+    ///
+    /// The two go together, the height first, so a reader that sees a
+    /// clock sees the height published with it or a later one.
+    ///
     /// Not persisted: a restarted node's readers start where its store
     /// does, and a hold outliving the reader that took it would retain
     /// history nothing reads.
-    fn hold_retention_at(&self, height: BlockHeight);
+    fn hold_retention_at(&self, height: BlockHeight, clock: WeightedTimestamp);
 
     /// Committed substate byte total after the commit at `height`,
     /// or `None` if no commit at that height recorded one (never

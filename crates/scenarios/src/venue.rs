@@ -15,9 +15,8 @@
 //! resource the venue can price.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::slice;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
@@ -383,7 +382,7 @@ fn all_accepted<C: Cluster>(c: &mut C, txs: Vec<Transaction>, context: &str) {
         .into_iter()
         .map(|tx| {
             let hash = tx.hash();
-            c.submit(Arc::new(tx));
+            c.submit(tx);
             hash
         })
         .collect();
@@ -418,7 +417,7 @@ const APPLIED_WITHIN_BLOCKS: u64 = 8;
 /// Submit `tx` and hold the run to its acceptance.
 pub fn accepted<C: Cluster>(c: &mut C, tx: Transaction, context: &str) {
     let hash = tx.hash();
-    c.submit(Arc::new(tx));
+    c.submit(tx);
     let status = await_tx_terminal(c, hash, epochs(12));
     assert!(
         matches!(
@@ -616,13 +615,20 @@ pub fn a_swap_by_a_caller_on_the_venues_shard_runs_whole<C: Cluster>(c: &mut C, 
     let worlds = venue_worlds(c, &venue, [caller]);
     let mut charges = Charges::default();
 
-    let status = terminal(c, &mut charges, swap, budget);
+    let hash = charges.submit(c, swap);
+    let status = await_tx_terminal(c, hash, budget);
     assert!(
         matches!(
             status,
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
         "a swap on the venue's own shard must accept; status = {status:?}",
+    );
+    // The status is reported once consensus commits the deciding block;
+    // the stores this reads catch up when that block is persisted.
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(VENUE_SHARD, hash).1.is_some()),
+        "the block deciding the swap must reach the venue shard's stored chain",
     );
     assert!(
         held(c, caller.address(), venue.unit) > 0,
@@ -914,6 +920,17 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
     caller_shards: &[ShardId],
     budget: Budget,
 ) -> VenueReport {
+    hot_venue_queue(c, venue_shard, caller_shards, budget).0
+}
+
+/// [`hot_venue_clears_swaps_on`], beside the swaps it ran and the venue
+/// shard's height when the queue opened.
+fn hot_venue_queue<C: Cluster>(
+    c: &mut C,
+    venue_shard: ShardId,
+    caller_shards: &[ShardId],
+    budget: Budget,
+) -> (VenueReport, Vec<TxHash>, BlockHeight) {
     assert!(
         c.serves_shard(venue_shard)
             && caller_shards
@@ -950,6 +967,49 @@ pub fn hot_venue_clears_swaps_on<C: Cluster>(
 
     let report = settle_swaps(c, &submissions, (start, opened), venue_shard, budget);
     assert_pair_conserved(c, &worlds, &charges, budget, "a hot venue's queue");
+    (report, submissions, opened)
+}
+
+/// Every cross-shard swap on a hot venue is named to run on the venue's
+/// shard in the first block that has both committed it and read the
+/// record its caller's leg escrows.
+///
+/// A taker paying from another shard is a divided transaction whose one
+/// core sits on the venue's shard and shares its verdict with nobody: it
+/// takes no shared place, waits on no determined member's tick, and pins
+/// its cells only once named. So nothing in the queue holds a swap back:
+/// each runs as soon as it is ready, as its committed inputs alone say.
+///
+/// # Panics
+///
+/// As [`hot_venue_clears_swaps`], and if any swap's core is named to run
+/// on the venue's shard other than once, in that first ready block.
+pub fn a_hot_venue_runs_every_swap_where_it_commits<C: Cluster>(
+    c: &mut C,
+    budget: Budget,
+) -> VenueReport {
+    let (report, swaps, opened) = hot_venue_queue(c, VENUE_SHARD, &[SWAPPER_SHARD], budget);
+    let swaps: BTreeSet<TxHash> = swaps.into_iter().collect();
+    let mentions = c
+        .chain_mentions(VENUE_SHARD, opened, &swaps)
+        .expect("the venue's chain is walked");
+    let heights = |of: &[(TxHash, BlockHeight)], swap: &TxHash| -> Vec<BlockHeight> {
+        of.iter()
+            .filter(|(tx, _)| tx == swap)
+            .map(|(_, height)| *height)
+            .collect()
+    };
+    for swap in &swaps {
+        let committed = heights(&mentions.committed, swap);
+        let arrived = heights(&mentions.arrived, swap);
+        let run = heights(&mentions.run, swap);
+        let ready = committed.iter().chain(&arrived).max().copied();
+        assert!(
+            committed.len() == 1 && run.len() == 1 && run.first().copied() == ready,
+            "swap {swap:?} must be named to run on the venue's shard in the first block it is \
+             ready in: committed at {committed:?}, its record read at {arrived:?}, run at {run:?}",
+        );
+    }
     report
 }
 

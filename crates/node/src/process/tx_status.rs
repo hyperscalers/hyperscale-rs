@@ -94,12 +94,6 @@ impl TxStatusCache {
     pub(crate) fn len(&self) -> usize {
         self.cache.len()
     }
-
-    /// Whether the cache holds no entries.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.cache.is_empty()
-    }
 }
 
 impl Default for TxStatusCache {

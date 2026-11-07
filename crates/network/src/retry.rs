@@ -274,6 +274,15 @@ impl<P: Ord + Copy> PeerHealthBook<P> {
         }
     }
 
+    /// How far `peer` is distrusted at `now`, from 0 to 1, for answers
+    /// that held up to nothing (see [`Self::record_invalid`]).
+    #[must_use]
+    pub fn distrust(&self, peer: P, now: Duration) -> f64 {
+        self.peers
+            .get(&peer)
+            .map_or(0.0, |health| health.distrust_at(now))
+    }
+
     /// `peer`'s RTT estimate, or `None` while it has never answered: the
     /// seeded estimate is not an observation.
     #[must_use]

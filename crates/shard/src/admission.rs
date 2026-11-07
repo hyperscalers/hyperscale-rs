@@ -18,10 +18,9 @@
 //! recomputes — a root, a validity window, a reservation — is the
 //! pipeline's.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::marker::PhantomData;
 use std::ops::Bound;
-use std::sync::Arc;
 
 use hyperscale_engine::tick_select::{
     awaited_core, crossings_consumed, member_of, staged_past_cap,
@@ -32,11 +31,11 @@ use hyperscale_types::{
     Finalization, FinalizationHash, MAX_CLAIMS_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_OWED_TOWARD_SHARD,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STAGED_RECEIPT_BYTES, MAX_STANDING_TOWARD_SHARD,
-    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
-    Provisions, Reshaping, Settlement, ShardId, ShardTrie, StandingToward, StateClaim, SubstateKey,
-    TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, Verifiable,
-    WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction, claims_admit_block,
-    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Provision,
+    ProvisionHash, RETENTION_HORIZON, Reshaping, Settlement, ShardId, ShardTrie, StandingToward,
+    StateClaim, SubstateKey, TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    TxOutcome, WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
+    claims_admit_block, evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -49,17 +48,24 @@ use crate::commit_dedup::CommitDedupIndex;
 /// Transactions, provisions and certificate identities are read off each
 /// ancestor's manifest, which names them whether or not the body has
 /// assembled here; the transactions those certificates decide are read
-/// off the finalizations themselves, so an ancestor whose finalizations
-/// this node is still fetching contributes none — a node that
-/// under-reports can only fail to refuse, and the rule needs a quorum of
-/// enforcers rather than every node. The just-committed block is
-/// covered by the [`CommitDedupIndex`] instead.
+/// off the finalizations themselves, and engagements off the parts
+/// themselves, so an ancestor whose finalizations or parts this node is
+/// still fetching contributes none of them — a node that under-reports
+/// can only fail to refuse, and the rule needs a quorum of enforcers
+/// rather than every node. The just-committed block is covered by the
+/// [`CommitDedupIndex`] instead.
 #[derive(Debug, Default)]
 pub(crate) struct QcChainSets {
     /// Transactions an ancestor carries.
     pub(crate) txs: HashSet<TxHash>,
     /// Provision batches an ancestor carries.
     pub(crate) provisions: HashSet<ProvisionHash>,
+    /// What an ancestor's provisions engage, a sealed ancestor's kept
+    /// list included, each until the ancestor's anchor plus
+    /// [`RETENTION_HORIZON`]: the deadline the dedup index gives it once
+    /// the ancestor commits, so a voter that has committed the ancestor
+    /// and one that has not let go of it at the same anchor.
+    pub(crate) engaged: BTreeMap<Engagement, WeightedTimestamp>,
     /// Transactions an ancestor's finalizations decided.
     pub(crate) resolved: HashSet<TxHash>,
     /// Finalizations an ancestor carries.
@@ -84,6 +90,10 @@ impl QcChainSets {
             if header.height() <= chain.committed_height() {
                 break;
             }
+            let deadline = header
+                .parent_qc()
+                .weighted_timestamp()
+                .plus(RETENTION_HORIZON);
             // A pending block carries its manifest before its body
             // assembles, which is the whole point of reading it there;
             // a certified one carries the body and nothing else.
@@ -92,6 +102,7 @@ impl QcChainSets {
                 sets.txs.extend(manifest.tx_hashes().iter().copied());
                 sets.provisions
                     .extend(manifest.provision_hashes().iter().copied());
+                sets.engage(pending.engagements(), deadline);
                 sets.finalizations
                     .extend(manifest.cert_ids().iter().copied());
                 for fw in pending.finalizations() {
@@ -101,6 +112,7 @@ impl QcChainSets {
                 sets.txs
                     .extend(block.transactions().iter().map(|tx| tx.hash()));
                 sets.provisions.extend(block.provision_hashes());
+                sets.engage(block.engagements().iter().copied(), deadline);
                 for fw in block.certificates().iter() {
                     sets.finalizations.insert(fw.receipt_hash());
                     sets.resolved.extend(fw.deciding_tx_hashes());
@@ -109,6 +121,36 @@ impl QcChainSets {
             current_hash = header.parent_block_hash();
         }
         sets
+    }
+
+    /// Hold `engagements` until `deadline`, keeping the earlier deadline
+    /// of an entry two ancestors carry, as the dedup index keeps the
+    /// first block to commit it.
+    fn engage(
+        &mut self,
+        engagements: impl IntoIterator<Item = Engagement>,
+        deadline: WeightedTimestamp,
+    ) {
+        for engagement in engagements {
+            self.engaged
+                .entry(engagement)
+                .and_modify(|held| *held = (*held).min(deadline))
+                .or_insert(deadline);
+        }
+    }
+
+    /// Every engagement of `tx_hash` from `source` an ancestor carries
+    /// whose deadline is past `at`.
+    pub(crate) fn engaged_live(
+        &self,
+        source: ShardId,
+        tx_hash: TxHash,
+        at: WeightedTimestamp,
+    ) -> impl Iterator<Item = Engagement> + '_ {
+        self.engaged
+            .range(Engagement::pair_range(source, tx_hash))
+            .filter(move |(_, deadline)| **deadline > at)
+            .map(|(engagement, _)| *engagement)
     }
 }
 
@@ -199,38 +241,58 @@ pub(crate) struct ProvisionsFold {
     /// What the admitted batches engage — what the transactions section
     /// reads to engage a cross-shard transaction in the same block.
     pub(crate) engaged: BTreeSet<Engagement>,
+    /// The admitted parts, each named once.
+    admitted: HashSet<ProvisionHash>,
 }
 
 impl ProvisionsFold {
     /// Whether an admitted batch from `source` names `tx_hash`, at any
     /// source height.
     pub(crate) fn engages(&self, source: ShardId, tx_hash: TxHash) -> bool {
-        let at = |source_height| Engagement {
-            source,
-            tx_hash,
-            source_height,
-        };
-        self.engaged
-            .range(at(BlockHeight::GENESIS)..=at(BlockHeight::new(u64::MAX)))
+        Engagement::of_pair(&self.engaged, source, tx_hash)
             .next()
             .is_some()
     }
 }
 
 impl Section for ProvisionsSection {
-    type Item = Provisions;
+    type Item = Provision;
     type Fold = ProvisionsFold;
 
-    /// A batch the chain does not already carry, from a shard whose
+    /// A batch named once in the block and not already carried by the
+    /// chain, from a shard whose
     /// recovery does not fence it, within the block's transaction cap.
     ///
     /// Content from a recovering shard above its attested frontier is
-    /// refused network-wide, and folding the check into admission keeps
+    /// refused network-wide, and so, once the recovery completes, is a
+    /// batch from its band, above the frontier and anchored below the
+    /// bridge, whose ticks the recovered chain lets go of at its
+    /// crossing block, a halt recovery's harvested tail included.
+    ///
+    /// **One source block per transaction.** A batch is refused while
+    /// the chain holds its transaction from another block of the same
+    /// source that still stands under the block's anchor
+    /// ([`Engagement::stands_under`]): committed, in a QC-chain ancestor,
+    /// or earlier in this block. A recovery can let go of the block that
+    /// committed a transaction and the recovered chain commit it again,
+    /// and only then is the second block's batch admitted. Anchors only
+    /// grow along the chain and what a snapshot records only grows with
+    /// its anchor, so a second block reaches commit only after the first
+    /// is orphaned, and the second is the one that stands. A second
+    /// block's batch offered before the anchor knows the recovery stays
+    /// queued for a later block.
+    ///
+    /// Folding the checks into admission keeps
     /// every replica's verdict a pure function of the block's own
     /// anchor: a block anchored before the recovery folded resolves a
     /// snapshot without the record and stays valid.
-    fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, batch: &Provisions) -> Result<(), String> {
+    fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, batch: &Provision) -> Result<(), String> {
         let provision_hash = batch.hash();
+        if fold.admitted.contains(&provision_hash) {
+            return Err(format!(
+                "provisions batch {provision_hash:?} already named in this block"
+            ));
+        }
         if ctx.chain.provisions.contains(&provision_hash) {
             return Err(format!(
                 "provisions batch {provision_hash:?} already in QC chain ancestor"
@@ -251,7 +313,38 @@ impl Section for ProvisionsSection {
                  the attested frontier"
             ));
         }
-        let tx_count = fold.tx_count.saturating_add(batch.transactions().len());
+        if ctx.snapshot.recovery_orphaned(
+            ctx.windows,
+            source_shard,
+            batch.source_block_ts(),
+            batch.block_height(),
+        ) {
+            return Err(format!(
+                "provisions batch {provision_hash:?} from {source_shard:?} anchored below a \
+                 recovery's bridge above its frontier"
+            ));
+        }
+        let engagement = Engagement::of_part(batch);
+        let tx_hash = engagement.tx_hash;
+        let other = ctx
+            .dedup
+            .standing(source_shard, tx_hash, ctx.anchor, ctx.snapshot, ctx.windows)
+            .chain(
+                ctx.chain
+                    .engaged_live(source_shard, tx_hash, ctx.anchor)
+                    .chain(Engagement::of_pair(&fold.engaged, source_shard, tx_hash).copied())
+                    .filter(|held| held.stands_under(ctx.snapshot, ctx.windows)),
+            )
+            .find(|held| *held != engagement);
+        if let Some(held) = other {
+            return Err(format!(
+                "provisions batch {provision_hash:?} from {source_shard:?} at height {:?} \
+                 while the chain holds {tx_hash} from its block at height {:?}, which still \
+                 stands",
+                engagement.source_height, held.source_height,
+            ));
+        }
+        let tx_count = fold.tx_count.saturating_add(1);
         if tx_count > MAX_ENGAGEMENTS_PER_BLOCK {
             return Err(format!(
                 "provisions batch {provision_hash:?} carries the block past \
@@ -259,7 +352,8 @@ impl Section for ProvisionsSection {
             ));
         }
         fold.tx_count = tx_count;
-        fold.engaged.extend(Engagement::of_batch(batch));
+        fold.engaged.insert(engagement);
+        fold.admitted.insert(provision_hash);
         Ok(())
     }
 }
@@ -460,7 +554,7 @@ impl<'p> Section for TransactionsSection<'p> {
             && !fold.provisions.engages(payer_shard, tx_hash)
             && !ctx
                 .dedup
-                .engaged(payer_shard, tx_hash, ctx.anchor, ctx.snapshot)
+                .engaged(payer_shard, tx_hash, ctx.anchor, ctx.snapshot, ctx.windows)
         {
             return Err(format!(
                 "cross-shard VM transaction {tx_hash} lacks its payer bundle from \
@@ -1033,6 +1127,8 @@ pub fn admit_finalization_over(
     frontier: BlockHeight,
     fw: &Finalization,
 ) -> Result<(), String> {
+    use std::sync::Arc;
+
     use hyperscale_types::{Epoch, StateRoot, WindowLookup};
 
     let schedule = TopologySchedule::new(
@@ -1621,11 +1717,6 @@ pub(crate) fn admit_each<S: Section, T>(
     (kept, refused)
 }
 
-/// The shared shape of a section's items behind an `Arc<Verifiable<_>>`.
-pub(crate) fn unwrapped<T>(item: &Arc<Verifiable<T>>) -> &T {
-    item
-}
-
 #[cfg(test)]
 pub(crate) mod fixtures {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1651,7 +1742,7 @@ pub(crate) mod fixtures {
     pub fn hold_settled(
         members: &mut MemberIndex,
         local: ShardId,
-        certificates: &[Arc<Verifiable<Finalization>>],
+        certificates: &[Verifiable<Finalization>],
     ) {
         for fw in certificates {
             let fw = fw.as_unverified();
@@ -1693,6 +1784,10 @@ pub(crate) mod fixtures {
                     covered: false,
                     executed: true,
                     hearing: Capped::empty(),
+                    queued: None,
+                    head: None,
+                    blocked_at: None,
+                    orphaned: false,
                 };
                 members.members.insert(tx, row);
                 let held = members.ticks.entry(tick).or_insert(TickRow {
@@ -1727,7 +1822,7 @@ pub(crate) mod fixtures {
     impl Against {
         /// This admission holding the rows [`hold_settled`] writes for
         /// `certificates`.
-        pub fn holding_settled(&mut self, certificates: &[Arc<Verifiable<Finalization>>]) {
+        pub fn holding_settled(&mut self, certificates: &[Verifiable<Finalization>]) {
             hold_settled(&mut self.members, self.local_shard, certificates);
         }
 
@@ -1847,7 +1942,7 @@ pub(crate) mod fixtures {
         for epoch in 1..=20u64 {
             sched.insert(Epoch::new(epoch), Arc::clone(&after));
         }
-        sched.set_head(after);
+        sched.set_head(Epoch::new(20), after);
         sched
     }
 }
@@ -1866,15 +1961,15 @@ mod state_claim_tests {
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, Deadline, Epoch, EpochWindows,
         GlobalReceiptHash, Hash, Inclusion, MerkleInclusionProof, NetworkDefinition, Owes,
-        RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ShardId, ShardRecovery, StateClaim,
-        Stated, SubstateKey, TopologySchedule, TopologySnapshot, TxHash, ValidatorSet,
+        Provision, RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ShardId, ShardRecovery,
+        StateClaim, Stated, SubstateKey, TopologySchedule, TopologySnapshot, TxHash, ValidatorSet,
         WeightedTimestamp, verdict_leaf,
     };
     use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, ProtocolHasher, Terms};
     use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
     use super::fixtures::{Against, DEPARTURE_CUT_MS, departures};
-    use super::{Section, StateClaimsFold, StateClaimsSection};
+    use super::{ProvisionsFold, ProvisionsSection, Section, StateClaimsFold, StateClaimsSection};
 
     const PRODUCER: ShardId = ShardId::leaf(1, 0);
 
@@ -2474,6 +2569,49 @@ mod state_claim_tests {
         }
     }
 
+    /// A provision batch from the counterpart's block at `height`
+    /// anchored at `anchor_ms`, naming one transaction.
+    fn batch_at(counterpart: ShardId, local: ShardId, height: u64, anchor_ms: u64) -> Provision {
+        Provision::dummy_at(
+            counterpart,
+            local,
+            BlockHeight::new(height),
+            WeightedTimestamp::from_millis(anchor_ms),
+            TxHash::from(Hash::from_bytes(b"provisioned")),
+        )
+    }
+
+    /// Once the counterpart's recovery record has cleared, a provision
+    /// batch from a block its recovery let go of is refused, a harvested
+    /// block above the frontier and a coast block alike, both anchored
+    /// below the bridge; while the recovery is pending the frontier
+    /// refuses them already. A batch at the frontier and one at a fresh
+    /// block anchored past the bridge are admitted once it clears.
+    #[test]
+    fn a_batch_from_a_recovery_band_is_refused_after_the_record_clears() {
+        let block = WeightedTimestamp::from_millis(30_000);
+        for pending in [true, false] {
+            let (against, counterpart) = beside_a_recovered_counterpart(block, pending);
+            let admit_batch = |height, anchor_ms| {
+                ProvisionsSection::admit(
+                    &against.ctx(),
+                    &mut ProvisionsFold::default(),
+                    &batch_at(counterpart, against.local_shard, height, anchor_ms),
+                )
+            };
+            for (label, height, anchor_ms) in [("harvested", 10, 3_000), ("coast", 12, 20_900)] {
+                assert!(
+                    admit_batch(height, anchor_ms).is_err(),
+                    "pending {pending}: a {label} block",
+                );
+            }
+            assert_eq!(admit_batch(RECOVERED_FRONTIER, 2_500), Ok(()));
+            if !pending {
+                assert_eq!(admit_batch(13, 21_100), Ok(()));
+            }
+        }
+    }
+
     /// A recovered shard's first boundary is the bridge block its crossing
     /// folds at: anchored below the bridge, at a height above the
     /// frontier, inside the recovery's band. A boundary claim there is
@@ -2535,7 +2673,7 @@ mod state_claim_tests {
             let snapshot = if epoch < LATER_LIFE { &earlier } else { &later };
             schedule.insert(Epoch::new(epoch), Arc::clone(snapshot));
         }
-        schedule.set_head(Arc::clone(&later));
+        schedule.set_head(Epoch::new(20), Arc::clone(&later));
         let mut against = Against::schedule((*later).clone(), schedule);
         against.local_shard = local;
         against.anchor = WeightedTimestamp::from_millis(10_000);
@@ -2567,6 +2705,10 @@ mod state_claim_tests {
             covered: false,
             executed: true,
             hearing: Capped::empty(),
+            queued: None,
+            head: None,
+            blocked_at: None,
+            orphaned: false,
         }
     }
 

@@ -1,7 +1,5 @@
 //! Beacon block gap-fill sync response.
 
-use std::sync::Arc;
-
 use hyperscale_hbor::Hbor;
 
 use crate::{CertifiedBeaconBlock, MessageClass, NetworkMessage, Verifiable};
@@ -17,19 +15,19 @@ use crate::{CertifiedBeaconBlock, MessageClass, NetworkMessage, Verifiable};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetBeaconBlockResponse {
     /// The committed block, if the responder had it.
-    pub block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>,
+    pub block: Option<Verifiable<CertifiedBeaconBlock>>,
 }
 
 impl GetBeaconBlockResponse {
     /// Build a response from an optional block.
     #[must_use]
-    pub const fn new(block: Option<Arc<Verifiable<CertifiedBeaconBlock>>>) -> Self {
+    pub const fn new(block: Option<Verifiable<CertifiedBeaconBlock>>) -> Self {
         Self { block }
     }
 
     /// Found response — the responder had the block.
     #[must_use]
-    pub const fn found(block: Arc<Verifiable<CertifiedBeaconBlock>>) -> Self {
+    pub const fn found(block: Verifiable<CertifiedBeaconBlock>) -> Self {
         Self { block: Some(block) }
     }
 
@@ -60,7 +58,7 @@ mod tests {
         RatifyRound, SignerBitfield,
     };
 
-    fn sample_block() -> Arc<Verifiable<CertifiedBeaconBlock>> {
+    fn sample_block() -> Verifiable<CertifiedBeaconBlock> {
         let block = BeaconBlock::skip(
             Epoch::new(5),
             BeaconBlockHash::from_raw(Hash::from_bytes(b"prev")),
@@ -73,10 +71,10 @@ mod tests {
             SignerBitfield::new(4),
             AggregateSignature::new([0u8; 96]),
         );
-        Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
+        Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,
             BeaconCert::Skip(cert),
-        )))
+        ))
     }
 
     #[test]

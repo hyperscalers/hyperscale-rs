@@ -9,7 +9,6 @@
 //! registers the pool extras genesis held back, and checks the topology held.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::account_address;
@@ -291,7 +290,7 @@ fn land<C: Cluster>(
     what: &str,
 ) {
     for _ in 0..STAGE_ATTEMPTS {
-        c.submit(Arc::new(build(c.now())));
+        c.submit(build(c.now()));
         if c.run_until(epochs(STAGE_WINDOW_EPOCHS), &folded) {
             return;
         }
@@ -357,7 +356,7 @@ pub fn vote_params(
             activate_at,
             validity_around(c.now()),
         );
-        c.submit(Arc::new(vote));
+        c.submit(vote);
         if c.run_until(epochs(VOTE_WINDOW_EPOCHS), |c| {
             c.beacon_state().is_some_and(|state| applied(&state.params))
         }) {

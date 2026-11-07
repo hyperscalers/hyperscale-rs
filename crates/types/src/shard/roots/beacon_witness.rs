@@ -90,7 +90,8 @@ pub struct BeaconWitnessRootContext<'a> {
     /// caller: the kind and admission the block's committee window names
     /// the shard draining under, and whether the rows at the block's
     /// parent are quiet. `None` where that window names no draining for
-    /// the shard, or the parent sits in a recovery's suffix band. Read
+    /// the shard, or the parent was certified by a committee a recovery
+    /// replaced. Read
     /// before the byte total and without it, so a draining shard asserts
     /// whatever its load and whatever the thresholds.
     pub settling: Option<(ReshapeKind, Settling)>,
@@ -302,9 +303,9 @@ pub fn derive_reshape_trigger(
 /// `quiet`, whether no row at the block's parent hears.
 ///
 /// `None` where the window names no draining for the shard, and `banded`
-/// and `quiet` are not read then; or where the parent lies in a
-/// recovery's suffix band (`banded`), whose rows are QC-attested history
-/// a replica may not have folded, and `quiet` is not read.
+/// and `quiet` are not read then; or where the parent was certified by a
+/// committee a recovery replaced (`banded`), whose rows are QC-attested
+/// history a replica may not have folded, and `quiet` is not read.
 ///
 /// A latch shows in every window after the one it first shows in until
 /// its record clears, and a block's own anchor is never earlier than its
@@ -1254,11 +1255,11 @@ mod tests {
         }
     }
 
-    /// A block whose parent sits in a recovery's suffix band asserts no
-    /// trigger, draining or not: its settling is not read, and its byte
-    /// total is out of play.
+    /// A block whose parent a committee a recovery replaced certified
+    /// asserts no trigger, draining or not: its settling is not read, and
+    /// its byte total is out of play.
     #[test]
-    fn a_suffix_band_block_asserts_no_trigger() {
+    fn a_block_over_a_replaced_committees_parent_asserts_no_trigger() {
         let shard = ShardId::leaf(1, 0);
         let draining =
             snapshot_with_base(shard, 0).with_draining(BTreeMap::from([(shard, Epoch::new(2))]));

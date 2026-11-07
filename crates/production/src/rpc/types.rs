@@ -139,6 +139,29 @@ pub struct PreviewTransactionResponse {
     /// fee on the trap. A composer that watches these can tell a fresh
     /// answer from an old one; without them it cannot.
     pub(crate) anchors: BTreeMap<String, u64>,
+    /// The collection intervals the run read on another node's word that
+    /// they leave nothing out.
+    ///
+    /// Each entry such an interval returned is proven, but not that the
+    /// interval is whole: a server can omit entries and the run reads
+    /// the gap as empty. A composer that will not rest a signature on a
+    /// server's completeness asks another node for these, or does not
+    /// sign. Empty when every read was proven.
+    pub(crate) unproven_intervals: Vec<UnprovenIntervalJson>,
+}
+
+/// One declared interval whose answer is not proven whole.
+#[derive(Debug, Serialize)]
+pub struct UnprovenIntervalJson {
+    /// The collection's owner, hex-encoded.
+    pub(crate) owner: String,
+    /// The collection, hex-encoded.
+    pub(crate) collection: String,
+    /// The first order, inclusive, as a decimal string: a `u128` does not
+    /// survive a JSON number.
+    pub(crate) lo: String,
+    /// The last order, inclusive, as a decimal string.
+    pub(crate) hi: String,
 }
 
 /// Generic error response.

@@ -17,7 +17,7 @@ use hyperscale_storage::{
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, EntryKey, Finalization, FinalizationHash,
-    GlobalReceiptHash, Hash, ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters,
+    GlobalReceiptHash, Hash, Provision, ProvisionHash, QuorumCertificate, SafeVoteRegisters,
     SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash,
     ValidatorId, Verified, WeightedTimestamp,
 };
@@ -71,8 +71,8 @@ pub struct SharedState {
     /// Per-write prior-value entries for the entry index, mirroring
     /// `state_history` row for row.
     pub(crate) entries_history: EntryHistory,
-    /// Each version's weighted timestamp, from the floor on; what
-    /// [`retire_dated`] reads.
+    /// Each version's anchor, from the floor on; what [`retire_dated`]
+    /// reads.
     pub(crate) version_time: OrdMap<u64, u64>,
     /// The oldest version historical reads are answered at.
     pub(crate) retention_floor: u64,
@@ -88,6 +88,9 @@ pub struct SharedState {
     /// The oldest version this node's own readers still name;
     /// `u64::MAX` until one holds. The floor never passes it.
     pub(crate) retention_hold: u64,
+    /// The anchor that hold was published under, which bounds the tip's
+    /// clock for the cutoff; [`WeightedTimestamp::MAX`] until one holds.
+    pub(crate) retention_clock: WeightedTimestamp,
     /// Committed substate byte total per version, written in
     /// lockstep with each applied snapshot. Consensus-critical:
     /// shard-witness derivation reads it, so it must be identical on
@@ -110,8 +113,9 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Date `version` and move the floor past what that retires
-    /// ([`retire_dated`]). Returns the floor this commit establishes.
+    /// Date `version` with its header's anchor and move the floor past
+    /// what that retires ([`retire_dated`]). Returns the floor this commit
+    /// establishes.
     pub(crate) fn advance_retention_floor(
         &mut self,
         version: u64,
@@ -122,6 +126,7 @@ impl SharedState {
             self.retention_floor,
             version,
             self.retention_hold,
+            self.retention_clock,
             tip_ts,
             self.version_time
                 .range(self.retention_floor..)
@@ -220,6 +225,7 @@ impl SharedState {
             holding_pins: OrdSet::new(),
             retention_floor: 0,
             retention_hold: u64::MAX,
+            retention_clock: WeightedTimestamp::MAX,
             substate_bytes: OrdMap::new(),
             package_artifacts: OrdMap::new(),
             sweep_index: SweepRows::default(),
@@ -327,7 +333,7 @@ pub struct ConsensusState {
     /// Certified headers held without their blocks: the anchor a
     /// snap-sync imported, kept so this store serves the next joiner's
     /// witness history as one that committed the block would.
-    pub(crate) boundary_headers: OrdMap<BlockHeight, Arc<CertifiedBlockHeader>>,
+    pub(crate) boundary_headers: OrdMap<BlockHeight, CertifiedBlockHeader>,
     /// Committed height.
     pub(crate) committed_height: BlockHeight,
     /// Committed block hash.
@@ -349,7 +355,7 @@ pub struct ConsensusState {
     /// Provision bodies keyed by their committing height and hash.
     /// Mirrors the production `provisions` CF: a stored block keeps only
     /// the hashes, so this is what a replay reads the bodies back from.
-    pub(crate) provisions: OrdMap<(BlockHeight, ProvisionHash), Arc<Provisions>>,
+    pub(crate) provisions: OrdMap<(BlockHeight, ProvisionHash), Provision>,
     /// The origin a reshape successor's adopted store records, where
     /// recovery must reconstruct the continued height line and clock.
     /// `None` for a chain born at network genesis.
@@ -424,10 +430,8 @@ impl ConsensusState {
             }
         }
         for bundle in block.provisions() {
-            self.provisions.insert(
-                (height, bundle.hash()),
-                Arc::new(bundle.as_unverified().clone()),
-            );
+            self.provisions
+                .insert((height, bundle.hash()), bundle.as_unverified().clone());
         }
     }
 

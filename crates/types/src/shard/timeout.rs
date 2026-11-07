@@ -245,7 +245,9 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
-    use crate::{AggregateSignature, BlockHash, BlockHeight, SignerBitfield, WeightedTimestamp};
+    use crate::{
+        AggregateSignature, BlockHash, BlockHeight, Epoch, SignerBitfield, WeightedTimestamp,
+    };
 
     const SHARD: ShardId = ShardId::ROOT;
 
@@ -256,6 +258,7 @@ mod tests {
             BlockHeight::new(round),
             BlockHash::ZERO,
             Round::new(round),
+            Epoch::GENESIS,
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

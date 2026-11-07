@@ -560,9 +560,9 @@ module halt_wallclock_watermark {
 //
 // Code anchors:
 //   - Bridge + resolution: crates/types/src/topology/schedule.rs
-//     `recovery_bridge` (= rotated_at + 1), `lookup_for_shard_live`
+//     `recovery_bridge` (= rotated_at + 1), `live_committee`
 //     (anchor below the bridge resolves the fresh committee),
-//     `lookup_for_shard_certified` (re-bind iff the anchor sits below the
+//     `certified_committee` (re-bind iff the anchor sits below the
 //     bridge AND the certificate's window lands at or past the window
 //     before it; the halted suffix fails the second conjunct and resolves
 //     its own windows). A replica that has not folded the recovery
@@ -657,7 +657,7 @@ module recovery_bridge {
   // Every certificate ever formed.
   var certified: Set[Qc]
 
-  // `lookup_for_shard_certified` at a replica that folded the recovery.
+  // `certified_committee` at a replica that folded the recovery.
   pure def resolvesFreshAtFolded(q: Qc): bool =
     (q.anchor < BRIDGE and q.qcw + 1 >= BRIDGE) or q.anchor >= BRIDGE
 

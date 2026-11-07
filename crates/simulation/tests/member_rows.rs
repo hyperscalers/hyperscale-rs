@@ -9,7 +9,6 @@
 //! in flight in the tick its row names.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_scenarios::tx::{account_routing_to, build_transfer_tx, validity_around};
@@ -170,7 +169,7 @@ fn a_coordinators_rows_are_its_stores() {
             u128::from(nonce) + 1,
             validity_around(cluster.now()),
         );
-        cluster.submit(Arc::new(transfer));
+        cluster.submit(transfer);
         for _ in 0..8 {
             let next = cluster.runner().now() + SPACING / 8;
             cluster.runner_mut().run_until(next);
