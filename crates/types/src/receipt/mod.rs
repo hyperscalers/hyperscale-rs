@@ -11,11 +11,13 @@
 //! certificates sign: the executing shard's own attestation. A batch
 //! with cross-shard members hashes the shard-projected delta, and the
 //! fee burn is a payer-shard write, so participants certify per-shard
-//! hashes and no verifier compares them across shards — agreement is
-//! outcome-level, settlement combines verdicts. The event root is per
-//! shard on the same terms: it covers the events this shard's own
-//! emitters produced, which is what it stores. A shard that ran only
-//! its own legs of a transaction could not attest a union anyway.
+//! hashes and no verifier compares those across shards. The event root
+//! is per shard on the same terms: it covers the events this shard's
+//! own emitters produced, which is what it stores. A shard that ran
+//! only its own legs of a transaction could not attest a union anyway.
+//! The one term a member's shards share is `effects`, the digest of its
+//! whole run, bound under the hash on a stated yes and carried nowhere
+//! else: a counterpart holds this shard to it.
 //! Per-shard state correctness is enforced by `state_root` in the block
 //! header, with per-tx attribution via the local receipts section of its
 //! body root (`ConsensusReceipt::local_receipt_hash`).

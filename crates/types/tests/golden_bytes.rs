@@ -5,10 +5,11 @@
 use hex::encode as hex_encode;
 use hyperscale_hbor::{Capped, HborEncode, to_vec as hbor_to_vec};
 use hyperscale_types::{
-    AggregateSignature, BlockHash, BlockHeight, BlockVote, ConsensusPublicKey, ConsensusSignature,
-    Epoch, Hash, PcCompactVote, PcQc1, PcValueElement, PcVector, PositionalBundle,
-    ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield, ValidatorId,
-    ValidatorInfo, WeightedTimestamp,
+    AggregateSignature, BlockHash, BlockHeight, BlockVote, ConsensusPublicKey, ConsensusReceipt,
+    ConsensusSignature, EffectsDigest, Epoch, EventRoot, FAILED_RECEIPT_HASH, GlobalReceiptHash,
+    Hash, PcCompactVote, PcQc1, PcValueElement, PcVector, PositionalBundle, ProposerTimestamp,
+    QuorumCertificate, Round, ShardId, SignerBitfield, StateWrites, ValidatorId, ValidatorInfo,
+    WeightedTimestamp, effects_digest,
 };
 
 fn assert_golden<T: HborEncode>(value: &T, expected_hex: &str, label: &str) {
@@ -40,6 +41,39 @@ fn quorum_certificate_golden_bytes() {
         WeightedTimestamp::from_millis(1_700_000_000_123),
     );
     assert_golden(&qc, EXPECTED_QC, "QuorumCertificate");
+}
+
+/// A success carrying nothing but `effects`.
+fn golden_receipt(effects: Option<EffectsDigest>) -> ConsensusReceipt {
+    ConsensusReceipt::Succeeded {
+        receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"golden-receipt")),
+        writes: StateWrites::default(),
+        beacon_witness_events: Capped::empty(),
+        events: Capped::empty(),
+        effects,
+    }
+}
+
+#[test]
+fn consensus_receipt_golden_bytes() {
+    assert_golden(
+        &golden_receipt(None),
+        EXPECTED_RECEIPT_UNDIGESTED,
+        "ConsensusReceipt without a digest",
+    );
+    assert_golden(
+        &golden_receipt(Some(effects_digest(
+            &StateWrites::default(),
+            EventRoot::ZERO,
+        ))),
+        EXPECTED_RECEIPT_DIGESTED,
+        "ConsensusReceipt with a digest",
+    );
+    assert_eq!(
+        hex_encode(FAILED_RECEIPT_HASH.as_raw().as_bytes()),
+        EXPECTED_FAILED_RECEIPT_HASH,
+        "FAILED_RECEIPT_HASH drifted from the golden bytes",
+    );
 }
 
 #[test]
@@ -83,6 +117,11 @@ fn pc_qc1_golden_bytes() {
     assert_golden(&qc1, EXPECTED_PC_QC1, "PcQc1");
 }
 
+const EXPECTED_RECEIPT_UNDIGESTED: &str =
+    "00d784cf810b9f5ce2a7bd2a82871b99de634115a2c12181ea1bd5edac104362fb000000000000";
+const EXPECTED_RECEIPT_DIGESTED: &str = "00d784cf810b9f5ce2a7bd2a82871b99de634115a2c12181ea1bd5edac104362fb000000000001e33ac9c04ddab6a393632dee8b124dca8d89acbc75a1d5aba62b913bf06f3433";
+const EXPECTED_FAILED_RECEIPT_HASH: &str =
+    "b514c810e69b9b7144b79bceb4574254de96d7b21f6efa9d7f20ef6be9e503c1";
 const EXPECTED_QC: &str = "e7c8d8fecb84404480148f65172ce95b9984e1ec56f84494e6ad90391dc36cd70200000002000000000000002a000000000000002356d22ed37a6538fc945a8e30ea532612029962653bf993560b365ae3fe594c03000000000000000900000000000000010504002222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222227b68e5cf8b010000";
 const EXPECTED_BLOCK_VOTE: &str = "b3e13454f2b0dab7471e3e5db927fd492e114b13595a462f5a4c066bd516783b0100000001000000000000000700000000000000010000000000000009000000000000000500000000000000333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333c869e5cf8b010000";
 const EXPECTED_VALIDATOR_INFO: &str = "0900000000000000444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444";

@@ -35,7 +35,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     Composed, Hash32, InstanceMeta, IntentHeader, IntentTree, SlotId, Value, child_key,
-    collection_id, holdings_collection, order_key,
+    collection_id, fee_hold_key, holdings_collection, order_key,
 };
 use hyperscale_vm_fixtures::book::{self, FILL_CAP};
 use hyperscale_vm_fixtures::{book_package_hash, lottery, lottery_package_hash};
@@ -984,10 +984,20 @@ fn a_served_key_absent_at_the_head_reads_absent_without_provisions() {
 /// The part the shard holding the book serves `tx`, out of `state`: the
 /// declared cells and each declared range's lift under the book.
 fn remote_part(state: &SimShardStorage, tx: &Verified<Transaction>) -> Arc<Vec<SubstateEntry>> {
-    let owner = Address::from(book_addr());
+    let book = Address::from(book_addr());
+    part_under(state, tx, |owner| owner == book)
+}
+
+/// The part of `tx`'s declaration under the owners `served` picks, out
+/// of `state`.
+fn part_under(
+    state: &SimShardStorage,
+    tx: &Verified<Transaction>,
+    served: impl Fn(Address) -> bool,
+) -> Arc<Vec<SubstateEntry>> {
     let mut keys = BTreeSet::new();
     for (declared, _) in &tx.routing().declared_modes {
-        if declared.owner() != owner {
+        if !served(declared.owner()) {
             continue;
         }
         keys.extend(declared.cell());
@@ -1116,6 +1126,69 @@ fn a_group_mates_remote_write_does_not_reach_a_members_part() {
             "each walk reads the whole page of its own part",
         );
     }
+}
+
+/// One fill run where its payer's vault stands and where its book does,
+/// each shard handed what the other holds: the two write different
+/// slices, the burn on the payer's alone, and state one digest. Withheld
+/// credits stand on both, as on every member a counterpart can refuse.
+#[test]
+fn a_fill_digests_alike_on_its_payers_shard_and_on_the_books() {
+    let executor = Executor::with_genesis(&[], &lottery_packages(), ExecutionMode::Serial);
+    let storage = sealed_book(&executor, 1);
+    let trie = ShardTrie::uniform_from_count(2);
+    let payers = trie.shard_for_prefix(principal(SETTLER).address());
+    let books = trie.shard_for_prefix(Address::from(book_addr()));
+    assert_ne!(payers, books, "the fill crosses to the book's shard");
+
+    let tx = filling_asks(1);
+    tx.try_derived(executor.derivation().as_ref())
+        .expect("a fixture transaction derives");
+    let tx = Verified::<Transaction>::from_persisted(tx);
+    let chain = TickChain::new(Arc::new(storage.clone()));
+    let snapshot = Arc::new(chain.view_at(storage.jmt_height()).snapshot());
+    let book = Address::from(book_addr());
+    let run = |local: ShardId| {
+        let ctx = TickBatchContext {
+            local_shard: local,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
+            points: Some(Arc::clone(&snapshot) as Arc<dyn PointReads>),
+        };
+        let part = part_under(&storage, &tx, |owner| (owner == book) == (local == payers));
+        let member = Member::of(Classified::whole(), local, BTreeSet::from([payers, books]));
+        let input = fill_input(&tx, std::slice::from_ref(&part), ctx.tick_ts, member);
+        executor
+            .execute_tick_batch(&ctx, &*snapshot, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
+    };
+
+    let (on_payers, on_books) = (run(payers), run(books));
+    let hold = fee_hold_key(
+        &ProtocolHasher,
+        vault_key(principal(SETTLER), *PROTOCOL_RESOURCE),
+        tx.hash(),
+    );
+    let released = |run: &ExecutedTx| {
+        run.consensus
+            .writes()
+            .is_some_and(|writes| writes.cells.contains_key(&hold))
+    };
+    assert_eq!(stated_digest(&on_payers), stated_digest(&on_books));
+    assert_ne!(
+        on_payers.consensus.receipt_hash(),
+        on_books.consensus.receipt_hash(),
+        "each shard attests its own slice",
+    );
+    assert!(
+        released(&on_payers),
+        "the payer's shard ends the fee's hold"
+    );
+    assert!(!released(&on_books), "and the book's holds no part of it");
 }
 
 /// A walk that removes every ask its page shows stops at the page: the
