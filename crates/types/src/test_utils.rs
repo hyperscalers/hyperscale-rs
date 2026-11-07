@@ -23,16 +23,17 @@ use crate::{
     AbortCharge, AggregateSignature, Anchor, Attested, Block, BlockHash, BlockHeader,
     BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVoteMessage, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt,
-    ConsensusSignature, Deadline, DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt,
-    Epoch, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins,
-    MemberTerms, MerkleInclusionProof, NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp,
-    ProtocolStatics, QuorumCertificate, Role, Round, Routing, SectionRoots, SettledTxsRoot,
-    Settlement, ShardForkProof, ShardId, ShardLoad, SignerBitfield, SplitChildRoots, StakePoolId,
-    StateClaim, StateRoot, StateWrites, StatedTerms, StoredReceipt, TickHalf, TickId, TickLine,
-    TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision,
-    TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, VrfProof, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-    install_protocol_statics, protocol_statics_installed, signed_bytes,
+    ConsensusSignature, Deadline, DeclaredKey, Derivation, DerivationError, Derived, EffectsDigest,
+    EnvelopeExt, Epoch, EventRoot, ExecutionCertificate, ExecutionOutcome, Finalization,
+    GlobalReceiptHash, Hash, Joins, MemberTerms, MerkleInclusionProof, NetworkDefinition,
+    NetworkId, PriceTable, ProposerTimestamp, ProtocolStatics, QuorumCertificate, Role, Round,
+    Routing, SectionRoots, SettledTxsRoot, Settlement, ShardForkProof, ShardId, ShardLoad,
+    SignerBitfield, SplitChildRoots, StakePoolId, StateClaim, StateRoot, StateWrites, StatedTerms,
+    StoredReceipt, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verifiable, Verified, VrfProof, WeightedTimestamp, WitnessSources,
+    compute_global_receipt_root, effects_digest, install_protocol_statics,
+    protocol_statics_installed, signed_bytes,
 };
 
 /// A stake pool for tests, at a component address `n` alone fixes.
@@ -1312,6 +1313,21 @@ fn finalization_on(
         TickHalf::Determined,
         Some(ec),
         Capped::from_array([]),
+    )
+}
+
+/// A digest a run could state: what a stated fixture's yes carries.
+#[must_use]
+pub fn stub_effects() -> EffectsDigest {
+    effects_of_seed(0)
+}
+
+/// [`stub_effects`] for a run `seed` tells apart from another's.
+#[must_use]
+pub fn effects_of_seed(seed: u8) -> EffectsDigest {
+    effects_digest(
+        &StateWrites::default(),
+        EventRoot::from_raw(Hash::from_bytes(&[seed])),
     )
 }
 

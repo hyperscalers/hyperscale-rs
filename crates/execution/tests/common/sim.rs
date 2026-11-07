@@ -55,7 +55,7 @@ use hyperscale_types::{
     ShardTrie, SignerBitfield, StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateKey,
     TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
     ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
-    encode_amount, read_amount, shard_prefix_path, writes_root,
+    effects_digest, encode_amount, read_amount, shard_prefix_path, writes_root,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -1226,12 +1226,16 @@ fn stub_execute(
         movements,
         entries: BTreeMap::new(),
     };
+    // What a counterpart can hold this member to: a digest of the
+    // transaction alone, which every shard running it derives alike.
+    let effects = abortable
+        .then(|| effects_digest(&StateWrites::default(), EventRoot::from_raw(tx_hash.into())));
     let receipt_hash = GlobalReceipt::new(
         true,
         EventRoot::ZERO,
         BeaconWitnessRoot::ZERO,
         writes_root(&writes),
-        EffectsDigest::ZERO,
+        effects.unwrap_or(EffectsDigest::ZERO),
     )
     .receipt_hash();
     let mut executed = ExecutedTx::new(
@@ -1240,7 +1244,7 @@ fn stub_execute(
             receipt_hash,
             writes,
             beacon_witness_events: Capped::empty(),
-            effects: None,
+            effects,
             events: Capped::empty(),
         },
         ExecutionMetadata::empty(),

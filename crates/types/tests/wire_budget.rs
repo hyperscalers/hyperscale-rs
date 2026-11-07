@@ -25,27 +25,28 @@ use hyperscale_types::{
     AggregateSignature, Anchor, BLOCK_RESPONSE_INLINE_BYTES, BlockHeader, BlockHeaderParts,
     BlockHeight, CertifiedBlockHeader, CollectionId, CommittedAt, ConsensusReceipt, Crossings,
     Deadline, DeclaredKey, DeclaredRange, DiscardCause, ENGAGEMENT_BYTES, EffectsDigest,
-    ElidedCertifiedBlock, Engagement, Epoch, ExecutionCertificate, ExecutionOutcome, Finalization,
-    FinalizationHash, GlobalReceiptHash, Hash, Joins, LeafPath, LocalKey, MAX_ARTIFACT_BYTES,
-    MAX_CLAIMS_PER_BLOCK, MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FETCH_RESPONSE_BYTES,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_MERKLE_PROOF_LEN,
-    MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_PART_BYTES,
-    MAX_PROVISION_PATH_DEPTH, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISION_WEIGHT,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STAGED_RECEIPT_BYTES, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES,
-    MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TX_READ_BYTES, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms,
-    MerkleInclusionProof, Modes, Movement, Pin, PinKey, Pins, Provision, ProvisionContext,
-    ProvisionHash, ProvisionParts, ProvisionTxRoot, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach,
-    Reserves, Role, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES,
-    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, Settlement,
-    ShardId, SignerBitfield, StateClaim, StateRoot, StateWrites, Stated, StatedTerms,
-    StoredReceipt, SubstateEntry, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES,
+    ElidedCertifiedBlock, Engagement, Epoch, EventRoot, ExecutionCertificate, ExecutionOutcome,
+    Finalization, FinalizationHash, GlobalReceiptHash, Hash, Joins, LeafPath, LocalKey,
+    MAX_ARTIFACT_BYTES, MAX_CLAIMS_PER_BLOCK, MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES,
+    MAX_FETCH_RESPONSE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES,
+    MAX_HOLDS_PER_MEMBER, MAX_MERKLE_PROOF_LEN, MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_PROVISION_PART_BYTES, MAX_PROVISION_PATH_DEPTH, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISION_WEIGHT, MAX_PROVISIONS_PER_BLOCK, MAX_STAGED_RECEIPT_BYTES,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK,
+    MAX_TICK_MANIFEST_BYTES, MAX_TICK_STAGED_BYTES, MAX_TICK_TERMS_BYTES, MAX_TX_READ_BYTES,
+    MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES,
+    MemberTerms, MerkleInclusionProof, Modes, Movement, Pin, PinKey, Pins, Provision,
+    ProvisionContext, ProvisionHash, ProvisionParts, ProvisionTxRoot, QuorumCertificate,
+    ROUTE_PREFIX_BYTES, Reach, Reserves, Role, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES,
+    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM,
+    SchemeId, Settlement, ShardId, SignerBitfield, StateClaim, StateRoot, StateWrites, Stated,
+    StatedTerms, StoredReceipt, SubstateEntry, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES,
     TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
     TickHalf, TickId, TickLine, TickManifest, Transaction, TransactionEnvelope, TxHash, TxOutcome,
     UNSETTLED_TX_BYTES, UnsettledTx, Verifiable, Verify, WeightedTimestamp, WitnessSources,
-    compute_global_receipt_root, evidence_admits_block, receipt_hash_of, shard_prefix_path,
-    staged_yes_bytes, state_claims_admit_block, tick_manifest_admits_block, tick_terms_admit_block,
+    compute_global_receipt_root, effects_digest, evidence_admits_block, receipt_hash_of,
+    shard_prefix_path, staged_yes_bytes, state_claims_admit_block, tick_manifest_admits_block,
+    tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{IntentHash, MAX_CROSSINGS_PER_TX, Mode, Moves, ResourceAddr};
@@ -1369,6 +1370,11 @@ fn a_block_response_with_a_full_terms_section_fits_the_frame() {
     }
 }
 
+/// A digest a run could state.
+fn a_digest() -> EffectsDigest {
+    effects_digest(&StateWrites::default(), EventRoot::ZERO)
+}
+
 /// `seed`'s effects receipt, writing one cell `width` bytes wide and
 /// stating the hash its content recomputes to.
 fn effects(seed: u32, width: usize) -> StoredReceipt {
@@ -1388,7 +1394,7 @@ fn effects(seed: u32, width: usize) -> StoredReceipt {
         receipt_hash: GlobalReceiptHash::ZERO,
         writes,
         beacon_witness_events: Capped::empty(),
-        effects: Some(EffectsDigest::ZERO),
+        effects: Some(a_digest()),
         events: Capped::empty(),
     };
     let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -1401,7 +1407,7 @@ fn effects(seed: u32, width: usize) -> StoredReceipt {
             receipt_hash,
             writes,
             beacon_witness_events: Capped::empty(),
-            effects: Some(EffectsDigest::ZERO),
+            effects: Some(a_digest()),
             events: Capped::empty(),
         }),
     )

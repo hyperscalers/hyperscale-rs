@@ -42,10 +42,11 @@ mod tests {
         Capped, DecodeError, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
 
+    use crate::test_utils::stub_effects;
     use crate::{
-        AggregateSignature, BlockHeight, ConsensusReceipt, EffectsDigest, ExecutionCertificate,
-        ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield, StateWrites,
+        AggregateSignature, BlockHeight, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome,
+        Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+        RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield, StateWrites,
         StoredReceipt, TickHalf, TickId, TxHash, TxOutcome, ValidatorId, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, receipt_hash_of,
         tick_leader, tx_outcome_leaf, verify_merkle_inclusion,
@@ -303,11 +304,12 @@ mod tests {
                     "{half:?} refused: {err:?}",
                 );
             }
+            let digest = (half == TickHalf::Stated).then(stub_effects);
             let effects = ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
-                effects: Some(EffectsDigest::ZERO),
+                effects: digest,
                 events: Capped::empty(),
             };
             let receipt_hash = receipt_hash_of(&effects, true).expect("a projected success");
@@ -328,7 +330,7 @@ mod tests {
                         receipt_hash,
                         writes: StateWrites::default(),
                         beacon_witness_events: Capped::empty(),
-                        effects: Some(EffectsDigest::ZERO),
+                        effects: digest,
                         events: Capped::empty(),
                     }),
                 )]),

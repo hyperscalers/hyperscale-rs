@@ -1280,9 +1280,10 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_engine::legs::Classified;
+    use hyperscale_types::test_utils::stub_effects;
     use hyperscale_types::{
-        AggregateSignature, ConsensusReceipt, EffectsDigest, GlobalReceiptHash, Hash,
-        REATTESTATION_STEP, SignerBitfield, StateWrites, receipt_hash_of,
+        AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, REATTESTATION_STEP,
+        SignerBitfield, StateWrites, receipt_hash_of,
     };
 
     use super::*;
@@ -1401,7 +1402,7 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
-                effects: Some(EffectsDigest::ZERO),
+                effects: Some(stub_effects()),
                 events: Capped::empty(),
             },
             true,
@@ -1417,7 +1418,21 @@ mod tests {
                 #[allow(clippy::default_trait_access)]
                 writes: Default::default(),
                 beacon_witness_events: Capped::empty(),
-                effects: Some(EffectsDigest::ZERO),
+                effects: Some(stub_effects()),
+                events: Capped::empty(),
+            }),
+        }
+    }
+
+    /// `tx_hash`'s refusal receipt, which nothing holds to a digest.
+    fn refusal_of(tx_hash: TxHash) -> StoredReceipt {
+        StoredReceipt {
+            tx_hash,
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: effects_hash(),
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                effects: None,
                 events: Capped::empty(),
             }),
         }
@@ -1634,7 +1649,7 @@ mod tests {
     fn a_member_refused_locally_settles_in_its_stating_block() {
         let local = shard(0);
         let (accepted, refused) = (tx(1), tx(2));
-        let refusal = receipt(refused);
+        let refusal = refusal_of(refused);
         let running = |holds_refusal: bool| {
             let mut tick = TickState::new(
                 TickId::new(local, BlockHeight::new(1)),
@@ -1737,7 +1752,7 @@ mod tests {
             7,
             Joins::Aborted,
         );
-        let charge = receipt(aborted);
+        let charge = refusal_of(aborted);
         tick.record_refusal_receipt(charge.clone());
         assert!(tick.determined_members().is_empty());
         let (_, root, outcomes) = tick.build_vote_data().expect("an abort waits on no engine");
@@ -1983,7 +1998,7 @@ mod tests {
                 5,
                 Joins::Aborted,
             );
-            tick.record_refusal_receipt(receipt(aborted));
+            tick.record_refusal_receipt(refusal_of(aborted));
             tick.admit(
                 shared,
                 Membership::whole(BTreeSet::from([local, shard(1)])),

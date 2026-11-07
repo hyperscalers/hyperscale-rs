@@ -244,10 +244,10 @@ mod tests {
     use hyperscale_hbor::Capped;
 
     use super::*;
-    use crate::test_utils::{make_live_block, rebound, stating_half_on};
+    use crate::test_utils::{make_live_block, rebound, stating_half_on, stub_effects};
     use crate::{
-        BlockHeight, ConsensusReceipt, EffectsDigest, ExecutionOutcome, Finalization,
-        GlobalReceiptHash, Role, ShardId, StateWrites, TxOutcome, ValidatorId, receipt_hash_of,
+        BlockHeight, ConsensusReceipt, ExecutionOutcome, Finalization, GlobalReceiptHash, Role,
+        ShardId, StateWrites, TxOutcome, ValidatorId, receipt_hash_of,
     };
 
     /// A body carrying a stating half is bound to its header with the
@@ -262,7 +262,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
-            effects: Some(EffectsDigest::ZERO),
+            effects: Some(stub_effects()),
             events: Capped::empty(),
         };
         let effects = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -290,7 +290,7 @@ mod tests {
                 receipt_hash: effects,
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
-                effects: Some(EffectsDigest::ZERO),
+                effects: Some(stub_effects()),
                 events: Capped::empty(),
             }),
         );

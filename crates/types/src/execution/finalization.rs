@@ -14,11 +14,11 @@ use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
 use crate::{
-    ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
-    ExecutionCertificateVerifyError, ExecutionOutcome, FAILED_RECEIPT_HASH, FinalizationHash,
-    GlobalReceiptHash, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON,
-    StoredReceipt, TickId, TransactionDecision, TxHash, TxOutcome, TxResolution, Verifiable,
-    Verified, Verify, WeightedTimestamp, receipt_hash_of,
+    ConsensusPublicKey, ConsensusReceipt, EffectsDigest, ExecutionCertificate,
+    ExecutionCertificateContext, ExecutionCertificateVerifyError, ExecutionOutcome,
+    FAILED_RECEIPT_HASH, FinalizationHash, GlobalReceiptHash, Hash, MAX_TXS_PER_BLOCK,
+    NetworkDefinition, RETENTION_HORIZON, StoredReceipt, TickId, TransactionDecision, TxHash,
+    TxOutcome, TxResolution, Verifiable, Verified, Verify, WeightedTimestamp, receipt_hash_of,
 };
 
 /// Which half of its tick a finalization settles.
@@ -171,9 +171,14 @@ fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
 /// Whether `receipt` is an effects receipt under `hash` whose content
 /// recomputes to it under the shard's own locality, which a member a
 /// sibling shares the verdict on always runs under, and which states a
-/// digest because that sibling holds it to one.
+/// digest because that sibling holds it to one. A digest is a tagged
+/// hash, so [`EffectsDigest::ZERO`] is no run's: it is what the receipt
+/// hash reads for a receipt carrying none.
 fn effects_under(receipt: &StoredReceipt, hash: GlobalReceiptHash) -> bool {
-    receipt.consensus.effects().is_some()
+    receipt
+        .consensus
+        .effects()
+        .is_some_and(|digest| digest != EffectsDigest::ZERO)
         && receipt.consensus.receipt_hash() == hash
         && receipt_hash_of(&receipt.consensus, true) == Some(hash)
 }
@@ -291,6 +296,12 @@ pub enum ReceiptValidationError {
         expected: GlobalReceiptHash,
         /// `receipt_hash` carried by the stored receipt.
         actual: GlobalReceiptHash,
+    },
+    /// A settling receipt carries a digest. Nothing hashes one there, so
+    /// its bytes would be whatever the block's server chose.
+    StrayDigest {
+        /// Hash of the tx.
+        tx_hash: TxHash,
     },
     /// More receipts than non-aborted outcomes.
     ExtraReceipt {
@@ -494,6 +505,9 @@ impl Finalization {
                 }
                 None => return Err(ReceiptValidationError::MissingReceipt { tx_hash }),
             };
+            if receipt.is_some_and(|receipt| receipt.consensus.effects().is_some()) {
+                return Err(ReceiptValidationError::StrayDigest { tx_hash });
+            }
             match (expected, receipt.map(|receipt| receipt.consensus.as_ref())) {
                 (
                     Some(expected),
@@ -1200,48 +1214,127 @@ mod tests {
     use hyperscale_hbor::from_slice;
 
     use super::*;
+    use crate::test_utils::{effects_of_seed, stub_effects};
     use crate::{
-        Address, AddressClass, AggregateSignature, BlockHeight, EffectsDigest, ExecutionVote, Hash,
-        LocalKey, Role, ShardId, SignerBitfield, StateWrites, SubstateKey, ValidatorId,
-        WeightedTimestamp, compute_global_receipt_root,
+        Address, AddressClass, AggregateSignature, BlockHeight, ExecutionVote, Hash, LocalKey,
+        Role, ShardId, SignerBitfield, StateWrites, SubstateKey, ValidatorId, WeightedTimestamp,
+        compute_global_receipt_root,
     };
 
-    /// A stated yes without a digest gives a sibling nothing to read it
-    /// against, however well its hash recomputes.
-    #[test]
-    fn a_stating_half_refuses_a_yes_without_a_digest() {
+    /// `tx`'s effects receipt carrying `effects`, under the hash its
+    /// content recomputes to.
+    fn digesting(tx: TxHash, effects: Option<EffectsDigest>) -> StoredReceipt {
         let unhashed = ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
-            effects: None,
+            effects,
             events: Capped::empty(),
         };
-        let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
-        let undigested = StoredReceipt {
-            tx_hash: TxHash::from(Hash::from_bytes(b"undigested")),
+        StoredReceipt {
+            tx_hash: tx,
             consensus: Arc::new(ConsensusReceipt::Succeeded {
-                receipt_hash,
+                receipt_hash: receipt_hash_of(&unhashed, true).expect("a projected success"),
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
-                effects: None,
+                effects,
                 events: Capped::empty(),
             }),
-        };
-        assert!(effects_under(
-            &StoredReceipt {
-                tx_hash: undigested.tx_hash,
-                consensus: Arc::new(ConsensusReceipt::Succeeded {
-                    receipt_hash,
-                    writes: StateWrites::default(),
-                    beacon_witness_events: Capped::empty(),
-                    effects: Some(EffectsDigest::ZERO),
-                    events: Capped::empty(),
-                }),
+        }
+    }
+
+    /// `receipt` with its hash kept and its digest swapped for `effects`.
+    fn carrying(receipt: &StoredReceipt, effects: Option<EffectsDigest>) -> StoredReceipt {
+        StoredReceipt {
+            tx_hash: receipt.tx_hash,
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: receipt.consensus.receipt_hash(),
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                effects,
+                events: Capped::empty(),
+            }),
+        }
+    }
+
+    /// A yes stands on a digest a run could produce, and on no other: not
+    /// on none, and not on zero, which hashes alike and is no run's.
+    #[test]
+    fn a_yes_stands_on_a_real_digest_alone() {
+        let tx = TxHash::from(Hash::from_bytes(b"a yes"));
+        let real = digesting(tx, Some(stub_effects()));
+        assert!(effects_under(&real, real.consensus.receipt_hash()));
+        for undigested in [None, Some(EffectsDigest::ZERO)] {
+            let receipt = digesting(tx, undigested);
+            assert!(!effects_under(&receipt, receipt.consensus.receipt_hash()));
+        }
+    }
+
+    /// The hash binds the digest a half carries, on either half that
+    /// carries one: a server swapping it finds the half refused.
+    #[test]
+    fn a_swapped_digest_fails_the_half_carrying_it() {
+        let tx = member(9);
+        let honest = digesting(tx, Some(effects_of_seed(1)));
+        let swapped = carrying(&honest, Some(effects_of_seed(2)));
+        let hash = honest.consensus.receipt_hash();
+
+        let named =
+            |receipt: &StoredReceipt| legs_half(std::slice::from_ref(receipt)).names_stand();
+        assert_eq!(named(&honest), Ok(()));
+        assert_eq!(named(&swapped), Err(Some(tx)));
+
+        let yes = TxOutcome::new(tx, ExecutionOutcome::Succeeded { receipt_hash: hash })
+            .charging(10)
+            .awaiting([ShardId::leaf(1, 1)])
+            .as_role(Role::Core);
+        let half =
+            |receipt| stating_half(vec![yes.clone()]).with_receipts(Capped::from_array([receipt]));
+        assert_eq!(half(honest).validate_against_certificates(), Ok(()));
+        assert_eq!(
+            half(swapped).validate_against_certificates(),
+            Err(ReceiptValidationError::YesReceipt { tx_hash: tx }),
+        );
+    }
+
+    /// Nothing hashes a digest on a settling receipt, so a half carrying
+    /// one is refused, on a refusal beside a yes and on a determined
+    /// success: else one block hash would name two byte strings.
+    #[test]
+    fn a_settling_receipt_carries_no_digest() {
+        let no = refused_core(2, b"refusal", 20);
+        let charge = carrying(&receipt_under(&no, b"refusal"), Some(stub_effects()));
+        assert_eq!(
+            stating_half(vec![no.clone()])
+                .with_receipts(Capped::from_array([charge]))
+                .validate_against_certificates(),
+            Err(ReceiptValidationError::StrayDigest {
+                tx_hash: no.tx_hash()
+            }),
+        );
+
+        let alone = TxOutcome::new(
+            member(3),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"effects")),
             },
-            receipt_hash,
-        ));
-        assert!(!effects_under(&undigested, receipt_hash));
+        );
+        let settled = receipt_under(&alone, b"effects");
+        let determined = |receipt| {
+            let mut half = stating_half(vec![alone.clone()]);
+            Arc::make_mut(&mut half.0).half = TickHalf::Determined;
+            half.with_receipts(Capped::from_array([receipt]))
+        };
+        assert_eq!(
+            determined(settled.clone()).validate_against_certificates(),
+            Ok(())
+        );
+        assert_eq!(
+            determined(carrying(&settled, Some(stub_effects()))).validate_against_certificates(),
+            Err(ReceiptValidationError::StrayDigest {
+                tx_hash: alone.tx_hash()
+            }),
+        );
     }
 
     /// The half is part of what a finalization is, so it is part of its
@@ -1409,7 +1502,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
             beacon_witness_events: Capped::empty(),
-            effects: Some(EffectsDigest::ZERO),
+            effects: Some(stub_effects()),
             events: Capped::empty(),
         };
         let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -1422,7 +1515,7 @@ mod tests {
                 receipt_hash,
                 writes,
                 beacon_witness_events: Capped::empty(),
-                effects: Some(EffectsDigest::ZERO),
+                effects: Some(stub_effects()),
                 events: Capped::empty(),
             }),
         }

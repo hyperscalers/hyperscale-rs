@@ -10535,30 +10535,29 @@ mod tests {
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{
-        make_live_block, stub_abort_charge, stub_stated_terms, test_transaction,
+        make_live_block, stub_abort_charge, stub_effects, stub_stated_terms, test_transaction,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
         BeaconWitnessLeafCount, BlockHeaderParts, BlockManifestParts, BodyRoot, ChainOrigin,
         CollectionId, CommittedAt, ConsensusReceipt, ConsensusSignature, Deadline, Decision,
         Declared, DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause,
-        EffectsDigest, Engagement, Epoch, Evidence, ExecutionCertificate, ExecutionOutcome,
-        FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins,
-        LEAF_KEY_BYTES, LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_STANDING_ANSWERS_FROM_SHARD,
-        MAX_STANDING_TOWARD_SHARD, MAX_TICK_MANIFEST_BYTES, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MemberTerms,
-        MerkleInclusionProof, Mode, Modes, NetworkDefinition, NetworkId, NetworkParams, Owes,
-        PROGRESS_WAIT_MULTIPLIER, Pin, PrincipalAddr, ProvisionTxRoot, RETENTION_HORIZON,
-        ReadFence, ReadMark, Reading, RecoveryBand, RevealChain, Role, RoutePrefix, Routing, Said,
-        SectionRoots, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor,
-        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, StateWrites, StatedTerms,
-        SubstateClaim, SweepFrontier, SyncHint, TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES,
-        TICK_PIN_BYTES, TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine, TimestampRange,
-        TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope,
-        TxOutcome, Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, ValidatorInfo,
-        ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, decide,
-        encode_amount, pins_of, read_amount, receipt_hash_of, said_at, test_utils,
-        tick_terms_admit_block, verdict_leaf,
+        Engagement, Epoch, Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs,
+        GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LEAF_KEY_BYTES,
+        LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_STANDING_ANSWERS_FROM_SHARD, MAX_STANDING_TOWARD_SHARD,
+        MAX_TICK_MANIFEST_BYTES, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK,
+        MAX_UNSETTLED_TXS, MemberTerms, MerkleInclusionProof, Mode, Modes, NetworkDefinition,
+        NetworkId, NetworkParams, Owes, PROGRESS_WAIT_MULTIPLIER, Pin, PrincipalAddr,
+        ProvisionTxRoot, RETENTION_HORIZON, ReadFence, ReadMark, Reading, RecoveryBand,
+        RevealChain, Role, RoutePrefix, Routing, Said, SectionRoots, SettledTxSet, SettledTxsRoot,
+        SettledWrites, Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield,
+        StateClaimsRoot, StateWrites, StatedTerms, SubstateClaim, SweepFrontier, SyncHint,
+        TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES, TICK_PIN_BYTES, TICK_RESERVE_BYTES, Terms,
+        TickHalf, TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot,
+        Transaction, TransactionDecision, TransactionEnvelope, TxOutcome, Unresolved, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT_MAX, ValidatorId, ValidatorInfo, ValidatorSet, Value, VoteCount,
+        VrfProof, WeightedTimestamp, WitnessSources, decide, encode_amount, pins_of, read_amount,
+        receipt_hash_of, said_at, test_utils, tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{
@@ -12782,7 +12781,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
-            effects: Some(EffectsDigest::ZERO),
+            effects: Some(stub_effects()),
             events: Capped::empty(),
         };
         StoredReceipt {
@@ -12791,7 +12790,7 @@ mod tests {
                 receipt_hash: receipt_hash_of(&unhashed, true).expect("a projected success"),
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
-                effects: Some(EffectsDigest::ZERO),
+                effects: Some(stub_effects()),
                 events: Capped::empty(),
             }),
         }

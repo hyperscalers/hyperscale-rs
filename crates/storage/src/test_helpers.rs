@@ -17,19 +17,19 @@ use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, finalization_of, install_stub_protocol_statics, make_finalization,
     make_finalization_leaving, make_finalization_settling, make_leg_finalization, proven_claim,
-    rebound, stating, stating_half_on, stub_stated_terms, stub_sweepable_cell, test_key, test_pool,
-    test_transaction,
+    rebound, stating, stating_half_on, stub_effects, stub_stated_terms, stub_sweepable_cell,
+    test_key, test_pool, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, Anchor, BeaconBlock,
     BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconVote, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
-    CommittedAt, ConsensusReceipt, Deadline, Decision, DiscardCause, EffectsDigest, EntryKey,
-    EntryLeaf, Epoch, EpochWindows, Event, ExecutionCertificate, ExecutionOutcome, Finalization,
-    FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins,
-    LocalKey, MAX_SWEEP_PER_BLOCK, MemberCollection, MemberTerms, MerkleInclusionProof, Movement,
-    PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable,
+    CommittedAt, ConsensusReceipt, Deadline, Decision, DiscardCause, EntryKey, EntryLeaf, Epoch,
+    EpochWindows, Event, ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs,
+    GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins, LocalKey,
+    MAX_SWEEP_PER_BLOCK, MemberCollection, MemberTerms, MerkleInclusionProof, Movement, PcQc2,
+    PcQc3, PcSignerLengths, PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable,
     ProposerTimestamp, ProtocolHasher, Provision, ProvisionHash, QuorumCertificate,
     RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
     Reading, Role, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement,
@@ -6424,7 +6424,7 @@ pub fn test_a_stating_blocks_yes_receipts_prune_with_it<S: ShardChainReader + Te
         receipt_hash: GlobalReceiptHash::ZERO,
         writes: writes.clone(),
         beacon_witness_events: Capped::empty(),
-        effects: Some(EffectsDigest::ZERO),
+        effects: Some(stub_effects()),
         events: Capped::empty(),
     };
     let receipt_hash = receipt_hash_of(&unhashed, true).expect("a projected success");
@@ -6434,7 +6434,7 @@ pub fn test_a_stating_blocks_yes_receipts_prune_with_it<S: ShardChainReader + Te
             receipt_hash,
             writes,
             beacon_witness_events: Capped::empty(),
-            effects: Some(EffectsDigest::ZERO),
+            effects: Some(stub_effects()),
             events: Capped::empty(),
         }),
     );

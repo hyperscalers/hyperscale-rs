@@ -5446,21 +5446,21 @@ mod tests {
         genesis_charge, install_stub_protocol_statics,
         make_finalization as helpers_make_finalization, make_finalization_leaving,
         make_leg_finalization, make_live_block as helpers_make_live_block, naming, proven_claim,
-        state_and_proof, state_and_proof_holding, stating_half_on, stub_abort_charge,
+        state_and_proof, state_and_proof_holding, stating_half_on, stub_abort_charge, stub_effects,
         stub_transaction_with_reads, test_prefix, test_transaction, test_transaction_running,
         test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
         BeaconWitnessLeafCount, BlockHeader, BlockHeaderParts, ChainOrigin, ConsensusPublicKey,
-        ConsensusReceipt, ConsensusSignature, Crossings, Deadline, EffectsDigest, Epoch, EpochSeed,
-        EpochWindows, ExecutionCertificateContext, ExecutionOutcome, ExecutionVoteMessage,
-        GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
-        MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkDefinition,
-        PriceTable, PrincipalAddr, ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON,
-        Randomness, RecoveryBinding, RecoveryCause, Role, SEED_WINDOW_EPOCHS, SeedRing, SeedSource,
-        SettledTxsRoot, Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim,
-        StateRoot, Stated, StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TimestampRange,
+        ConsensusReceipt, ConsensusSignature, Crossings, Deadline, Epoch, EpochSeed, EpochWindows,
+        ExecutionCertificateContext, ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash,
+        Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
+        MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr,
+        ProvisionTxRoot, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryBinding,
+        RecoveryCause, Role, SEED_WINDOW_EPOCHS, SeedRing, SeedSource, SettledTxsRoot, Settlement,
+        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated,
+        StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TimestampRange,
         TransactionDecision, TxResolution, UnsettledTx, ValidatorInfo, ValidatorSet, Verify,
         VoteCount, Window, compute_global_receipt_root, receipt_hash_of, signed_bytes,
     };
@@ -12474,7 +12474,7 @@ mod tests {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes: StateWrites::default(),
             beacon_witness_events: Capped::empty(),
-            effects: Some(EffectsDigest::ZERO),
+            effects: Some(stub_effects()),
             events: Capped::empty(),
         };
         StoredReceipt::new(
@@ -12483,7 +12483,7 @@ mod tests {
                 receipt_hash: receipt_hash_of(&unhashed, true).expect("a projected success"),
                 writes: StateWrites::default(),
                 beacon_witness_events: Capped::empty(),
-                effects: Some(EffectsDigest::ZERO),
+                effects: Some(stub_effects()),
                 events: Capped::empty(),
             }),
         )
