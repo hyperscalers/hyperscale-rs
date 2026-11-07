@@ -1486,6 +1486,16 @@ fn assemble_executed_tx(
             .delta
             .project(locality)
             .expect("kernel-produced movements compose");
+        // The delta is the one every shard of the member derives, and the
+        // burn is this shard's alone, so it joins the writes here.
+        if let Some((vault, burned)) = receipt.burn {
+            let composed = writes.movements.get(&vault).map_or(burned, |standing| {
+                standing
+                    .then(burned)
+                    .expect("the kernel weighed the burn beside the vault's movements")
+            });
+            writes.movements.insert(vault, composed);
+        }
         // The charging member's run burns the price inside these writes,
         // or apart in its refusal receipt; the hold ends in whichever of
         // the two its finalization settles.
