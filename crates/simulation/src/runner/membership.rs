@@ -127,6 +127,7 @@ impl SimulationRunner {
         shard: ShardId,
         storage: SimShardStorage,
     ) -> JoinKind {
+        let _recording = self.recording();
         self.seat_joined_group(host, shard, &[validator], storage)
     }
 
@@ -259,6 +260,7 @@ impl SimulationRunner {
     /// orchestrators, placement on the host's committed epoch — so a driver
     /// calls this as often as it likes.
     pub fn topology_step(&mut self) {
+        let _recording = self.recording();
         self.reshape_step();
         self.reconcile_placement();
         self.reseat_step();
@@ -465,6 +467,7 @@ impl SimulationRunner {
     ///
     /// Panics if `validator` is not a registered validator.
     pub fn rehome_validator(&mut self, validator: ValidatorId, host: NodeIndex) -> bool {
+        let _recording = self.recording();
         if self.hosts.iter().any(|h| h.hosts_validator(validator)) {
             return false;
         }
@@ -501,6 +504,7 @@ impl SimulationRunner {
     ///
     /// Panics if `shard` isn't hosted on `host`.
     pub fn leave_shard(&mut self, host: NodeIndex, shard: ShardId) -> SimShardStorage {
+        let _recording = self.recording();
         let shard_loop = self.hosts[host as usize]
             .remove_shard(shard)
             .expect("leave of an unhosted shard");

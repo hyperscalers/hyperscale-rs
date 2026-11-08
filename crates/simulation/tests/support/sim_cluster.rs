@@ -17,7 +17,6 @@ use hyperscale_engine::{
     FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment,
 };
 use hyperscale_hbor::from_slice;
-use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
@@ -109,9 +108,9 @@ struct MemberRule {
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
 pub struct SimCluster {
     runner: SimulationRunner,
-    /// In-memory metrics, scoped over `run_until` so [`FaultableCluster::metric`]
-    /// can read host-emitted counters. The sim is single-threaded, so the
-    /// thread-local scoped recorder captures every emission.
+    /// In-memory metrics the runner records into on every step, whoever
+    /// takes it, so [`FaultableCluster::metric`] and the oracles at drop
+    /// read every host-emitted counter.
     recorder: MemoryRecorder,
     /// The seed-drawn tuning this cluster runs under, if any.
     tuning: Option<SimTuning>,
@@ -474,12 +473,14 @@ impl SimCluster {
             power_loss: args.power_loss,
             ..defaults
         };
+        let recorder = MemoryRecorder::new();
         let mut runner = SimulationRunner::new(&sim_config, seed);
+        runner.record_into(Arc::new(recorder.clone()));
         runner.initialize_genesis();
 
         let cluster = Self {
             runner,
-            recorder: MemoryRecorder::new(),
+            recorder,
             tuning,
             member_rules: Vec::new(),
             served_parts: ServedParts::default(),
@@ -727,8 +728,7 @@ impl SimCluster {
         while self.runner.now() < deadline {
             self.topology_step();
             let next = (self.runner.now() + poll).min(deadline);
-            let recorder: Arc<dyn MetricsRecorder> = Arc::new(self.recorder.clone());
-            with_scoped_recorder(recorder, || self.runner.run_until(next));
+            self.runner.run_until(next);
             self.assert_beacon_cadence();
             self.assert_one_identity_per_host();
             self.hold_served_parts();
@@ -858,19 +858,15 @@ impl SimCluster {
         }
     }
 
-    /// Run a fault `scenario` with the in-memory recorder scoped, so
-    /// [`FaultableCluster::metric`] reads host-emitted counters. The sim is
-    /// single-threaded, so the thread-local scoped recorder captures every
-    /// emission. Steady-state scenarios that read no metrics call the scenario
-    /// directly instead.
+    /// Run a fault `scenario`, then hold the run to its oracles.
+    /// Steady-state scenarios call the scenario directly instead.
     ///
     /// # Panics
     ///
     /// If any terminal of the run named a row that still heard: no cut
     /// may fall under a yes.
     pub fn run_faultable<R>(&mut self, scenario: impl FnOnce(&mut Self) -> R) -> R {
-        let recorder: Arc<dyn MetricsRecorder> = Arc::new(self.recorder.clone());
-        let outcome = with_scoped_recorder(recorder, || scenario(self));
+        let outcome = scenario(self);
         self.hold_served_parts();
         assert_eq!(
             self.recorder.counter("terminal_fated_hearing_rows", None),

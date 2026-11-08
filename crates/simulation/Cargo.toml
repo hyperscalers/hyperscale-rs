@@ -25,6 +25,7 @@ hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true
 hyperscale-hbor.workspace = true
 hyperscale-mempool.workspace = true
+hyperscale-metrics.workspace = true
 hyperscale-network.workspace = true
 hyperscale-network-memory.workspace = true
 hyperscale-node.workspace = true
@@ -42,7 +43,6 @@ rand_chacha.workspace = true
 hyperscale-effects-bridge.workspace = true
 hyperscale-dispatch.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
-hyperscale-metrics.workspace = true
 hyperscale-metrics-memory.workspace = true
 hyperscale-scenarios.workspace = true
 

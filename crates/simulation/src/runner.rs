@@ -22,6 +22,7 @@ use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
 use hyperscale_engine::genesis::{GenesisPackages, genesis_seats, seat_pool};
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
+use hyperscale_metrics::{MetricsRecorder, RecorderScope, scope_recorder};
 use hyperscale_network_memory::{
     BandwidthReport, DeliveryDrain, FulfillmentStats, HostLayout, LinkStreams, NetworkConfig,
     NetworkTrafficAnalyzer, NodeIndex, RegionPlan, SimNetworkAdapter, SimulatedNetwork,
@@ -534,6 +535,10 @@ pub struct SimulationRunner {
 
     /// [`SimConfig::power_loss`].
     power_loss: bool,
+
+    /// Where the hosts' metrics go while the runner steps them, if
+    /// anywhere but the thread's own recorder.
+    recorder: Option<Arc<dyn MetricsRecorder>>,
 }
 
 /// A crash armed at a host's coming storage write.
@@ -930,7 +935,20 @@ impl SimulationRunner {
                 })
                 .collect(),
             power_loss: network_config.power_loss,
+            recorder: None,
         }
+    }
+
+    /// Route every metric the hosts emit while the runner steps them to
+    /// `recorder`, whoever calls the step. The sim is single-threaded,
+    /// so the runner scopes it on its own thread around each.
+    pub fn record_into(&mut self, recorder: Arc<dyn MetricsRecorder>) {
+        self.recorder = Some(recorder);
+    }
+
+    /// The scope [`Self::record_into`] asks for, held across one step.
+    fn recording(&self) -> Option<RecorderScope> {
+        self.recorder.clone().map(scope_recorder)
     }
 
     /// Enable traffic analysis on an existing runner.
@@ -1182,6 +1200,7 @@ impl SimulationRunner {
         shard: ShardId,
         validator: ValidatorId,
     ) -> bool {
+        let _recording = self.recording();
         self.hosts[host as usize].detach_signer(shard, validator)
     }
 
@@ -1354,6 +1373,7 @@ impl SimulationRunner {
 
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
+        let _recording = self.recording();
         self.run_genesis(&self.genesis_config());
     }
 
@@ -1469,6 +1489,7 @@ impl SimulationRunner {
         // Dedup only needs to cover the window in which duplicate broadcasts
         // arrive (~cross-shard latency), so 5s is very conservative.
         const GOSSIP_DEDUP_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+        let _recording = self.recording();
 
         trace!(
             end_time_secs = end_time.as_secs_f64(),

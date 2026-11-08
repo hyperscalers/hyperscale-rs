@@ -22,6 +22,7 @@
 //! ```
 
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -596,15 +597,34 @@ pub fn set_global_recorder(recorder: Box<dyn MetricsRecorder>) {
 /// runs each test on its own thread) don't share counters. Thread-local
 /// scoping does not propagate across `spawn_blocking` / rayon workers.
 pub fn with_scoped_recorder<R>(recorder: Arc<dyn MetricsRecorder>, f: impl FnOnce() -> R) -> R {
-    struct Guard;
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            SCOPED_RECORDER.with(|cell| cell.borrow_mut().take());
-        }
-    }
-    SCOPED_RECORDER.with(|cell| *cell.borrow_mut() = Some(recorder));
-    let _guard = Guard;
+    let _scope = scope_recorder(recorder);
     f()
+}
+
+/// Install `recorder` as this thread's metrics recorder until the scope
+/// drops, when the recorder it replaced, scoped or none, is restored.
+/// Scopes nest: an inner one dropped leaves the outer one installed.
+pub fn scope_recorder(recorder: Arc<dyn MetricsRecorder>) -> RecorderScope {
+    let previous = SCOPED_RECORDER.with(|cell| cell.borrow_mut().replace(recorder));
+    RecorderScope {
+        previous,
+        thread: PhantomData,
+    }
+}
+
+/// A thread-local recorder installed by [`scope_recorder`]. Bound to its
+/// thread, since the cell it restores is that thread's.
+#[must_use = "the recorder is uninstalled when the scope drops"]
+pub struct RecorderScope {
+    previous: Option<Arc<dyn MetricsRecorder>>,
+    thread: PhantomData<*const ()>,
+}
+
+impl Drop for RecorderScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        SCOPED_RECORDER.with(|cell| *cell.borrow_mut() = previous);
+    }
 }
 
 /// Handle to the active metrics recorder. Holds either a thread-local `Arc`
@@ -1286,4 +1306,35 @@ pub fn set_replica_memory_gauge(family: MemoryFamily, field: &str, shard: u64, v
 #[inline]
 pub fn set_shard_memory_gauge(field: &str, shard: u64, value: usize) {
     recorder().set_shard_memory_gauge(field, shard, value);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Counting(AtomicUsize);
+
+    impl MetricsRecorder for Counting {
+        fn record_verdict_differed(&self, stated: usize, _accepted: usize) {
+            self.0.fetch_add(stated, Ordering::Relaxed);
+        }
+    }
+
+    /// An inner scope dropped hands the thread back to the outer one,
+    /// and the outer one dropped to none.
+    #[test]
+    fn scopes_nest() {
+        let (outer, inner) = (Arc::new(Counting::default()), Arc::new(Counting::default()));
+        with_scoped_recorder(outer.clone(), || {
+            record_verdict_differed(1, 0);
+            with_scoped_recorder(inner.clone(), || record_verdict_differed(10, 0));
+            record_verdict_differed(100, 0);
+        });
+        record_verdict_differed(1_000, 0);
+        assert_eq!(outer.0.load(Ordering::Relaxed), 101);
+        assert_eq!(inner.0.load(Ordering::Relaxed), 10);
+    }
 }

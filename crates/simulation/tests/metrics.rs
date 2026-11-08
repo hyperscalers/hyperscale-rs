@@ -55,6 +55,24 @@ fn metrics_recorder_collects_values_from_running_sim() {
     );
 }
 
+/// A runner told where to record keeps every step it takes there, with
+/// nothing scoped on the calling thread: a test stepping the runner by
+/// hand is held to the same counters as one stepping it through a
+/// cluster.
+#[test]
+fn a_runner_records_every_step_wherever_it_is_called() {
+    let recorder = MemoryRecorder::new();
+    let config = SimConfig {
+        shard_size: 4,
+        ..Default::default()
+    };
+    let mut runner = SimulationRunner::new(&config, sim_seed(42));
+    runner.record_into(Arc::new(recorder.clone()));
+    runner.initialize_genesis();
+    runner.run_until(Duration::from_secs(2));
+    assert!(recorder.counter("blocks_committed", Some("1")) > 0);
+}
+
 /// A shard whose disk writes fall behind its commits holds each
 /// `BlockCommitted` past the lag bound until the write lands, and keeps
 /// committing and persisting through it.

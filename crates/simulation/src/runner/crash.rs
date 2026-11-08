@@ -54,6 +54,7 @@ impl SimulationRunner {
     ///
     /// Panics if `host` is already down.
     pub fn crash_host(&mut self, host: NodeIndex, kind: CrashKind, downtime: Duration) {
+        let _recording = self.recording();
         self.take_down_host(host, kind);
         self.schedule(host, self.now + downtime, SimEvent::Restart);
     }
@@ -106,6 +107,7 @@ impl SimulationRunner {
     ///
     /// Panics if `host` is down.
     pub fn bounce_host(&mut self, host: NodeIndex, wiped: &[ShardId]) {
+        let _recording = self.recording();
         self.take_down_host(host, CrashKind::Process);
         for &shard in wiped {
             self.retained_storages.remove(&(host, shard));

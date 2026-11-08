@@ -548,6 +548,7 @@ impl SimulationRunner {
     /// Panics if `target_shards` is not a power of two, or if the grow does not
     /// reach the target partition within its epoch budget.
     pub fn grow_to(&mut self, target_shards: u32) {
+        let _recording = self.recording();
         assert!(
             target_shards.is_power_of_two(),
             "grow_to target must be a power of two; got {target_shards}",
