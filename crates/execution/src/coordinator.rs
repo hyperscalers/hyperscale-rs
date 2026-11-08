@@ -594,6 +594,10 @@ pub struct ExecutionMemoryStats {
     /// given up on one, zero otherwise. Either way the replica keeps
     /// voting with no execution behind it; a restart recovers it.
     pub parked_fold: usize,
+    /// Wire bytes of pushed claims held on an unproven anchor or an
+    /// unfiled want, every kind together. Each kind is held to its own
+    /// budget, so this stays under their sum.
+    pub parked_claim_bytes: usize,
 }
 
 impl ExecutionMemoryStats {
@@ -622,6 +626,7 @@ impl ExecutionMemoryStats {
             unproven_ecs,
             awaiting_window,
             parked_fold,
+            parked_claim_bytes,
         } = *self;
         vec![
             ("tick_execution_receipts", tick_execution_receipts),
@@ -642,6 +647,7 @@ impl ExecutionMemoryStats {
             ("unproven_ecs", unproven_ecs),
             ("awaiting_window", awaiting_window),
             ("parked_fold", parked_fold),
+            ("parked_claim_bytes", parked_claim_bytes),
         ]
     }
 }
@@ -5363,6 +5369,7 @@ impl ExecutionCoordinator {
             unproven_ecs: self.parked.waiting_on(|w| matches!(w, Waiting::Proof(_))),
             awaiting_window: self.awaiting_window.len(),
             parked_fold: usize::from(self.parked_evicted.is_some() || self.fold_abandoned),
+            parked_claim_bytes: self.parked_claims.weight(),
         }
     }
 

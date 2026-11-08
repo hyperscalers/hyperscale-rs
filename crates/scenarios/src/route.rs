@@ -4524,6 +4524,7 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
             Some("anchor_disagrees"),
             Some("evicted"),
             Some("outlasted"),
+            Some("crowded"),
             Some("departed"),
             Some("retired"),
             Some("unhosted"),
