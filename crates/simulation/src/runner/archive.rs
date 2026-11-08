@@ -136,6 +136,15 @@ impl ChainArchive {
         self.abandoned.contains(&(host, shard))
     }
 
+    /// The heights at which `shard`'s chain replaced the block first
+    /// archived there, ascending. The archive holds the replacing block.
+    pub fn replaced(&self, shard: ShardId) -> impl Iterator<Item = BlockHeight> + '_ {
+        self.replaced
+            .iter()
+            .filter(move |(replaced, _)| *replaced == shard)
+            .map(|(_, height)| *height)
+    }
+
     /// The shards the archive holds a chain of.
     pub fn shards(&self) -> impl Iterator<Item = ShardId> + '_ {
         self.blocks.keys().copied()

@@ -45,7 +45,9 @@ pub use book::{
     a_stalled_venue_aborts_its_route_at_the_window, book_route_genesis_accounts,
 };
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
-pub use cutoff::{a_divided_core_pays_out_under_one_clock, cutoff_genesis_accounts};
+pub use cutoff::{
+    CutoffStage, a_divided_core_pays_out_under_one_clock, cutoff_genesis_accounts, seal_cutoffs,
+};
 pub use execution::{
     STANDING_PAYMENTS, a_consumer_never_committing_declines_a_pushed_record,
     a_delivery_cut_off_past_its_window_is_owed,

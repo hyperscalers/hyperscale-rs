@@ -16,7 +16,8 @@ use std::time::Duration;
 use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    PrincipalAddr, ProtocolHasher, ShardId, SubstateKey, TransactionDecision, TransactionStatus,
+    Ed25519PrivateKey, PrincipalAddr, ProtocolHasher, ShardId, SubstateKey, TimestampRange,
+    Transaction, TransactionDecision, TransactionStatus, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{InstanceMeta, SlotId, Value, child_key};
 use hyperscale_vm_fixtures::cutoff;
@@ -26,7 +27,7 @@ use crate::route::{FIRST_VENUE_SHARD, SECOND_VENUE_SHARD, TRADER_SHARD};
 use crate::support::query::{clock, held, held_at, stands_at};
 use crate::support::tx::{build_cutoff_tx, build_instantiate_tx, cutoff_on, validity_around};
 use crate::support::wait::await_tx_terminal;
-use crate::support::{FaultableCluster, committees_on_separate_hosts, epochs};
+use crate::support::{Cluster, FaultableCluster, committees_on_separate_hosts, epochs};
 use crate::venue::{SWAPPER_FUNDING, accepted, grind_onto};
 
 /// Where the first cutoff sits: the shard that commits the payment
@@ -79,6 +80,59 @@ pub fn cutoff_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// commit it past, if the payment does not accept, if the payer is not
 /// charged it, or if it lands anywhere but the first cutoff.
 pub fn a_divided_core_pays_out_under_one_clock<C: FaultableCluster>(c: &mut C) {
+    let stage = seal_cutoffs(c);
+    a_payment_lands_under_one_clock(c, &stage);
+}
+
+/// The sealed cutoffs and the funded payer a payment runs between.
+pub struct CutoffStage {
+    payer_key: Ed25519PrivateKey,
+    payer: PrincipalAddr,
+    /// The cutoff on [`EARLY_SHARD`].
+    first: InstanceMeta,
+    /// The cutoff on [`LATE_SHARD`].
+    second: InstanceMeta,
+}
+
+impl CutoffStage {
+    /// The payment kept by the first cutoff if the core's clock is short
+    /// of `cutoff`, and by the second otherwise, valid over `validity`.
+    #[must_use]
+    pub fn payment(&self, cutoff: WeightedTimestamp, validity: TimestampRange) -> Transaction {
+        build_cutoff_tx(
+            &self.payer_key,
+            (&self.first, &self.second),
+            PAYMENT,
+            cutoff.as_millis(),
+            validity,
+        )
+    }
+
+    /// The payer, funded on its own shard.
+    #[must_use]
+    pub const fn payer(&self) -> PrincipalAddr {
+        self.payer
+    }
+
+    /// The cells the first and the second cutoff keep the payment in.
+    #[must_use]
+    pub fn kept(&self) -> [SubstateKey; 2] {
+        [kept_cell(&self.first), kept_cell(&self.second)]
+    }
+
+    /// What the first and the second cutoff keep.
+    #[must_use]
+    pub fn banked<C: Cluster + ?Sized>(&self, c: &C) -> [u128; 2] {
+        self.kept().map(|cell| held_at(c, cell))
+    }
+}
+
+/// Seal one cutoff on each core shard.
+///
+/// # Panics
+///
+/// Panics if the seal is not accepted or does not apply on both shards.
+pub fn seal_cutoffs<C: FaultableCluster>(c: &mut C) -> CutoffStage {
     let (payer_key, payer) = grind_onto(PAYER_SHARD, &mut Vec::new());
     let first = cutoff_on(EARLY_SHARD);
     let second = cutoff_on(LATE_SHARD);
@@ -97,8 +151,18 @@ pub fn a_divided_core_pays_out_under_one_clock<C: FaultableCluster>(c: &mut C) {
             .all(|meta| stands_at(c, config_key(meta.address(&ProtocolHasher))))),
         "both seals must apply on their shards",
     );
+    CutoffStage {
+        payer_key,
+        payer,
+        first,
+        second,
+    }
+}
 
-    let kept = [kept_cell(&first), kept_cell(&second)];
+/// Run the payment across its deadline, each shard committing on its own
+/// side of it, and hold it to one cutoff.
+fn a_payment_lands_under_one_clock<C: FaultableCluster>(c: &mut C, stage: &CutoffStage) {
+    let payer = stage.payer();
     let funded = held(c, payer.address(), *PROTOCOL_RESOURCE);
 
     let (_, late_hosts) = committees_on_separate_hosts(c, EARLY_SHARD, LATE_SHARD);
@@ -109,13 +173,7 @@ pub fn a_divided_core_pays_out_under_one_clock<C: FaultableCluster>(c: &mut C) {
     let _ = c.drop_type_between(&late_hosts, &others, "transaction.request");
 
     let cutoff = clock(c).plus(CUTOFF_AHEAD);
-    let tx = build_cutoff_tx(
-        &payer_key,
-        (&first, &second),
-        PAYMENT,
-        cutoff.as_millis(),
-        validity_around(c.now()),
-    );
+    let tx = stage.payment(cutoff, validity_around(c.now()));
     // At the payer's shard by name: a harness that cannot route the
     // payment itself would otherwise hand it to whichever host it holds
     // first, which may be the late shard's.
@@ -163,8 +221,9 @@ pub fn a_divided_core_pays_out_under_one_clock<C: FaultableCluster>(c: &mut C) {
 
     // Held past the first landing, so a second credit of the same
     // payment has its chance to land too.
-    let banked = |c: &C| [held_at(c, kept[0]), held_at(c, kept[1])];
-    let _ = c.run_until(epochs(4), |c| banked(c).iter().sum::<u128>() >= PAYMENT);
+    let _ = c.run_until(epochs(4), |c| {
+        stage.banked(c).iter().sum::<u128>() >= PAYMENT
+    });
     let tail = c.now() + SETTLED_TAIL;
     let _ = c.run_until(epochs(1), |c| c.now() >= tail);
     let spent = funded - held(c, payer.address(), *PROTOCOL_RESOURCE);
@@ -173,7 +232,7 @@ pub fn a_divided_core_pays_out_under_one_clock<C: FaultableCluster>(c: &mut C) {
         "the payer pays the payment and its price: {spent} against {PAYMENT}",
     );
     assert_eq!(
-        banked(c),
+        stage.banked(c),
         [PAYMENT, 0],
         "the payment lands in the first cutoff alone, under the early shard's clock",
     );
