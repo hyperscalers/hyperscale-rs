@@ -1284,15 +1284,6 @@ struct WaiterModes {
 
 /// The family as the fold changes it: each row read at most once, and
 /// written back only where it changed.
-/// What a sibling's cells said to a row, and the row's terms it was
-/// hashed under.
-struct Reading {
-    effects: EffectsDigest,
-    awaited: Awaited,
-    mark: ReadMark,
-    said: Option<Said>,
-}
-
 struct Working<'s, S: ?Sized> {
     state: &'s S,
     shard: ShardId,
@@ -1301,10 +1292,6 @@ struct Working<'s, S: ?Sized> {
     /// Each row read, as the state held it: what a changed row's seat
     /// and reservations are written against.
     read: BTreeMap<u128, Option<MemberRow>>,
-    /// What each reading of the block said to the row it names, by the
-    /// reading's anchor and transaction, as [`Self::differing`] judged it
-    /// over the rows the block found.
-    readings: BTreeMap<(usize, TxHash), Reading>,
     ticks: BTreeMap<BlockHeight, Option<TickRow>>,
     changed_members: BTreeSet<u128>,
     changed_ticks: BTreeSet<BlockHeight>,
@@ -1339,7 +1326,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             family,
             members: BTreeMap::new(),
             read: BTreeMap::new(),
-            readings: BTreeMap::new(),
             ticks: BTreeMap::new(),
             changed_members: BTreeSet::new(),
             changed_ticks: BTreeSet::new(),
@@ -2030,11 +2016,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// be taken in any order, and a second fold of the block finds
     /// every reading already held.
     ///
-    /// A reading [`Self::differing`] already judged under the row's own
-    /// terms is taken as it stands, so nothing is hashed twice.
+    /// Each reading is judged here on the row as the fold leaves it, on
+    /// nothing [`Self::differing`] judged before the lines.
     fn hear(&mut self, heard: &[AnchorReadings]) -> HeardCells {
         let mut cells = HeardCells::default();
-        for (index, at) in heard.iter().enumerate() {
+        for at in heard {
             let sibling = at.anchor.shard;
             if sibling == self.shard {
                 continue;
@@ -2051,13 +2037,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 }
                 let validity_end = row.deadline.validity_end();
                 let awaited = shared_among(&row.awaits, self.shard);
-                let judged = self
-                    .readings
-                    .get(&(index, tx))
-                    .filter(|reading| reading.effects == effects && reading.awaited == awaited)
-                    .map(|reading| (reading.mark, reading.said));
-                let Some((mark, said)) =
-                    judged.or_else(|| sibling_said(at, tx, validity_end, &awaited, effects))
+                let Some((mark, said)) = sibling_said(at, tx, validity_end, &awaited, effects)
                 else {
                     continue;
                 };
@@ -2111,7 +2091,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// it. A line of the block can take a row out of hearing on the very
     /// reading that licenses it, and [`Self::hear`] runs after the lines,
     /// so a row is counted here or the alarm misses the commonest
-    /// refusal. Moves no row: what it keeps is what `hear` would derive.
+    /// refusal. Moves no row and keeps nothing.
     ///
     /// A reading counts where the row would take it, so a copy of one an
     /// earlier block committed repeats nothing. An accepted row is among
@@ -2120,7 +2100,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// end, which is taken after them.
     fn differing(&mut self, heard: &[AnchorReadings]) -> BTreeSet<TxHash> {
         let mut differed = BTreeSet::new();
-        for (index, at) in heard.iter().enumerate() {
+        for at in heard {
             let sibling = at.anchor.shard;
             if sibling == self.shard {
                 continue;
@@ -2155,15 +2135,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 {
                     differed.insert(tx);
                 }
-                self.readings.insert(
-                    (index, tx),
-                    Reading {
-                        effects,
-                        awaited,
-                        mark,
-                        said,
-                    },
-                );
             }
         }
         differed
