@@ -293,9 +293,13 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 
     /// Rows that took a reading of a verdict leaf holding neither value
     /// they would hash: a sibling that stated another run's effects, or
-    /// a verdict among other shards. Each refuses. Outside a recovery
-    /// this is a defect, and worth a page.
-    fn record_verdict_differed(&self, rows: usize) {}
+    /// a verdict among other shards. `stated` rows each refuse, keeping
+    /// value: outside a recovery that is a defect, and worth a page to
+    /// compare the shards' kernels. `accepted` rows have applied and
+    /// end, while the sibling refuses: a recovery tore the member and
+    /// value moved on this side alone, so each is a page to reconcile
+    /// the transaction by hand.
+    fn record_verdict_differed(&self, stated: usize, accepted: usize) {}
 
     /// Members a committed block's finalizations settled whose verdict a
     /// counterpart shares: what the verdict figures are read per.
@@ -962,10 +966,11 @@ pub fn record_verdict_claims_weight(named: usize, carried: usize, changed: usize
     recorder().record_verdict_claims_weight(named, carried, changed);
 }
 
-/// Record the rows a committed block read a differing yes for.
+/// Record the stated and the accepted rows a committed block read a
+/// differing yes for.
 #[inline]
-pub fn record_verdict_differed(rows: usize) {
-    recorder().record_verdict_differed(rows);
+pub fn record_verdict_differed(stated: usize, accepted: usize) {
+    recorder().record_verdict_differed(stated, accepted);
 }
 
 /// Set the crossing answers standing under a shard's prefix.

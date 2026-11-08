@@ -444,8 +444,9 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("verdict_cells_changed", None, changed as u64);
     }
 
-    fn record_verdict_differed(&self, rows: usize) {
-        self.inc("verdict_differed", None, rows as u64);
+    fn record_verdict_differed(&self, stated: usize, accepted: usize) {
+        self.inc("verdict_differed", None, stated as u64);
+        self.inc("verdict_differed_accepted", None, accepted as u64);
     }
 
     fn set_standing_answers(&self, shard: u64, answers: usize, bytes: usize) {

@@ -8001,7 +8001,15 @@ impl ShardCoordinator {
                 "a sibling's yes differs from this shard's: the member refuses",
             );
         }
-        record_verdict_differed(heard.differed.len());
+        for tx in &heard.differed_accepted {
+            error!(
+                ?tx,
+                height = block.height().inner(),
+                "a sibling's yes differs from this shard's after this shard accepted: \
+                 a recovery tore the member, applied here and refused there",
+            );
+        }
+        record_verdict_differed(heard.differed.len(), heard.differed_accepted.len());
         for blocks in self.verdict_asks.heard(&heard.complete, block.height()) {
             record_blocks_from_stated_to_heard(blocks);
         }

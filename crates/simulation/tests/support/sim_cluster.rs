@@ -203,6 +203,11 @@ impl Drop for SimCluster {
             0,
             "a row read a sibling's verdict leaf as neither value it would hash",
         );
+        assert_eq!(
+            self.recorder.counter("verdict_differed_accepted", None),
+            0,
+            "an accepted row read a sibling's verdict leaf as neither value it would hash",
+        );
     }
 }
 

@@ -366,12 +366,20 @@ pub struct HeardCells {
     /// The rows a reading of the block changed that then hold a reading
     /// of every sibling they await.
     pub complete: BTreeSet<TxHash>,
-    /// The rows that took a reading of a verdict leaf holding neither of
-    /// the values the row would hash: a sibling's yes over other effects
-    /// or among other shards. A reader sees only a hash, so this names
-    /// what is known and no more. A row the block's own lines take out
-    /// of hearing is among them, on the terms it stood under.
+    /// The stated rows that took a reading of a verdict leaf holding
+    /// neither of the values the row would hash: a sibling's yes over
+    /// other effects or among other shards. Each refuses. A reader sees
+    /// only a hash, so this names what is known and no more. A row the
+    /// block's own lines take out of hearing is among them, on the terms
+    /// it stood under.
     pub differed: BTreeSet<TxHash>,
+    /// The accepted rows that took such a reading. Within one chain an
+    /// accepted row never reads a differing yes, since it accepted on
+    /// its siblings' values under its own digest, so one that does names
+    /// a member a recovery tore: applied here, and refused by the
+    /// sibling that recommitted it. The row ends as it would on any
+    /// leaving. Never among `differed`.
+    pub differed_accepted: BTreeSet<TxHash>,
 }
 
 impl HeardCells {
@@ -2068,6 +2076,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     .entry(at.anchor)
                     .or_default()
                     .extend(read.clone());
+                let accepted = row.state.accepted();
                 if row.hear(Heard {
                     shard: sibling,
                     mark,
@@ -2077,7 +2086,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     if said == Some(Said::Left)
                         && matches!(at.cells.get(&leaf), Some(Inclusion::Present(_)))
                     {
-                        cells.differed.insert(tx);
+                        if accepted {
+                            cells.differed_accepted.insert(tx);
+                        } else {
+                            cells.differed.insert(tx);
+                        }
                     }
                     let every = row
                         .awaits
@@ -2101,7 +2114,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// refusal. Moves no row: what it keeps is what `hear` would derive.
     ///
     /// A reading counts where the row would take it, so a copy of one an
-    /// earlier block committed repeats nothing.
+    /// earlier block committed repeats nothing. An accepted row is among
+    /// them too, and [`Self::hear`] counts it again apart: no line taken
+    /// before the readings takes an accepted row out of hearing, only an
+    /// end, which is taken after them.
     fn differing(&mut self, heard: &[AnchorReadings]) -> BTreeSet<TxHash> {
         let mut differed = BTreeSet::new();
         for (index, at) in heard.iter().enumerate() {
@@ -2980,7 +2996,12 @@ fn fold(
         family.wait(inputs, &unshared);
     }
     let mut heard = family.hear(&inputs.heard);
+    // A row the readings found accepted counts apart, whatever the
+    // block found it: it has applied.
     heard.differed.extend(differed);
+    heard
+        .differed
+        .retain(|tx| !heard.differed_accepted.contains(tx));
 
     let (mut fated, mut ended) = (Vec::new(), Vec::new());
     for line in inputs.manifest.iter() {
@@ -6528,6 +6549,40 @@ mod tests {
         ];
         let heard = left.advance(&carrying(4, &[reading(at(7), &gone, &[1])]));
         assert_eq!(left.members[&tx(1)].hearing[0].said, Some(Said::Left));
+        assert!(heard.differed.is_empty());
+    }
+
+    /// An accepted row reading a differing yes has applied, so it counts
+    /// apart from the stated rows that refuse: where it still hears,
+    /// where the block's own end takes it, and where the block accepts a
+    /// stated row.
+    #[test]
+    fn an_accepted_row_counts_a_differing_yes_apart() {
+        let [ours, theirs] = [effects_of_seed(1), effects_of_seed(2)];
+        let mut store = stated_over(ours);
+        let before = stated_over(ours);
+        store.fold(&accepting(4, 2, &[1]));
+        let mut index = MemberIndex::load(&store, LOCAL);
+        let heard = index.advance(&hearing_yes_over(5, theirs));
+        assert_eq!(heard.differed_accepted, BTreeSet::from([tx(1)]));
+        assert!(heard.differed.is_empty());
+
+        let mut index = MemberIndex::load(&store, LOCAL);
+        let heard = index.advance(&MemberInputs {
+            heard: hearing_yes_over(5, theirs).heard,
+            ..ending(5, &[1])
+        });
+        assert!(!index.members.contains_key(&tx(1)), "the end took the row");
+        assert_eq!(heard.differed_accepted, BTreeSet::from([tx(1)]));
+        assert!(heard.differed.is_empty());
+
+        let mut index = MemberIndex::load(&before, LOCAL);
+        let heard = index.advance(&MemberInputs {
+            heard: hearing_yes_over(4, theirs).heard,
+            ..accepting(4, 2, &[1])
+        });
+        assert!(index.members[&tx(1)].state.accepted());
+        assert_eq!(heard.differed_accepted, BTreeSet::from([tx(1)]));
         assert!(heard.differed.is_empty());
     }
 
