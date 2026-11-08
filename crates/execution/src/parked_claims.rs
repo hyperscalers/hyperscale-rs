@@ -197,6 +197,9 @@ impl Held {
         let mut drained = Vec::new();
         let mut lighter: BTreeMap<ShardId, usize> = BTreeMap::new();
         self.by_anchor.retain(|(shard, _), claims| {
+            if !claims.iter().any(&mut matches) {
+                return true;
+            }
             let (out, kept): (Vec<StateClaim>, Vec<StateClaim>) =
                 claims.drain(..).partition(|claim| matches(claim));
             if !out.is_empty() {
@@ -344,7 +347,7 @@ impl ParkedClaims {
 
     /// The early claims carrying any of `wanted`, now that it is.
     pub fn release_early(&mut self, wanted: &BTreeSet<SubstateKey>) -> Vec<StateClaim> {
-        let carries = |claim: &StateClaim| claim.keys().iter().any(|key| wanted.contains(key));
+        let carries = |claim: &StateClaim| claim.cells.iter().any(|(key, _)| wanted.contains(key));
         let mut released = self.early.drain_matching(carries);
         released.extend(self.unasked.drain_matching(carries));
         released
