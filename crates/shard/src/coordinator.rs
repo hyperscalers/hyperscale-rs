@@ -8009,7 +8009,12 @@ impl ShardCoordinator {
                  a recovery tore the member, applied here and refused there",
             );
         }
-        record_verdict_differed(heard.differed.len(), heard.differed_accepted.len());
+        let rows = |txs: &BTreeSet<TxHash>| txs.iter().map(|tx| *tx.as_bytes()).collect::<Vec<_>>();
+        record_verdict_differed(
+            self.local_shard.inner(),
+            &rows(&heard.differed),
+            &rows(&heard.differed_accepted),
+        );
         for blocks in self.verdict_asks.heard(&heard.complete, block.height()) {
             record_blocks_from_stated_to_heard(blocks);
         }

@@ -145,6 +145,15 @@ impl ChainArchive {
             .map(|(_, height)| *height)
     }
 
+    /// The hosts whose store of `shard` the archive ever walked, whether
+    /// or not they still hold it.
+    pub fn walked(&self, shard: ShardId) -> impl Iterator<Item = NodeIndex> + '_ {
+        self.walked
+            .keys()
+            .filter(move |(_, walked)| *walked == shard)
+            .map(|(host, _)| *host)
+    }
+
     /// The shards the archive holds a chain of.
     pub fn shards(&self) -> impl Iterator<Item = ShardId> + '_ {
         self.blocks.keys().copied()

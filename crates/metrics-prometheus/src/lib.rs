@@ -1472,11 +1472,11 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.verdict_cells_changed.inc_by(changed as f64);
     }
 
-    fn record_verdict_differed(&self, stated: usize, accepted: usize) {
-        self.metrics.verdict_differed.inc_by(stated as f64);
+    fn record_verdict_differed(&self, _shard: u64, stated: &[[u8; 32]], accepted: &[[u8; 32]]) {
+        self.metrics.verdict_differed.inc_by(stated.len() as f64);
         self.metrics
             .verdict_differed_accepted
-            .inc_by(accepted as f64);
+            .inc_by(accepted.len() as f64);
     }
 
     fn record_verdict_claims_weight(&self, named: usize, carried: usize, changed: usize) {

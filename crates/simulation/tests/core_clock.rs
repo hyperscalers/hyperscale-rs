@@ -326,18 +326,15 @@ mod recommitted_core {
                 "the beacon must fold past the recovery",
             );
             c.submit_to(A, tx);
+            let recommitted = |c: &SimCluster| {
+                c.chain_fate(A, hash).0.is_some_and(|height| {
+                    c.committed_clock(A, height)
+                        .is_some_and(|clock| clock >= cutoff)
+                })
+            };
             assert!(
-                c.run_until(epochs(3), |c| c
-                    .chain_fate(A, hash)
-                    .0
-                    .is_some_and(|height| height != lost)),
-                "A's fresh committee must commit the payment again",
-            );
-            let recommit = c.chain_fate(A, hash).0.expect("A committed it again");
-            assert!(
-                c.committed_clock(A, recommit)
-                    .is_some_and(|clock| clock >= cutoff),
-                "A must commit the payment again past the cutoff",
+                c.run_until(epochs(3), recommitted),
+                "A's fresh committee must commit the payment again past the cutoff",
             );
 
             assert_refused_on_both(c, hash);
@@ -351,11 +348,16 @@ mod recommitted_core {
             assert!(charges.burned(c) > 0, "the payer must be charged its price");
             assert_eq!(stage.banked(c), [0, 0], "neither cutoff may be credited");
 
+            for shard in [A, B] {
+                assert!(
+                    c.metric(
+                        "verdict_differed_by_shard",
+                        Some(&shard.inner().to_string())
+                    ) > 0,
+                    "{shard:?}'s rows must read the other's digest as differing",
+                );
+            }
             let differed = c.metric("verdict_differed", None);
-            assert!(
-                differed > 0,
-                "a row must read its sibling's digest as differing"
-            );
             let _ = c.run_until(epochs(2), |_| false);
             assert_eq!(
                 c.metric("verdict_differed", None),

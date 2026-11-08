@@ -299,8 +299,9 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// compare the shards' kernels. `accepted` rows have applied and
     /// end, while the sibling refuses: a recovery tore the member and
     /// value moved on this side alone, so each is a page to reconcile
-    /// the transaction by hand.
-    fn record_verdict_differed(&self, stated: usize, accepted: usize) {}
+    /// the transaction by hand. Each row is named by its transaction's
+    /// hash, and `shard` is the shard whose rows read them.
+    fn record_verdict_differed(&self, shard: u64, stated: &[[u8; 32]], accepted: &[[u8; 32]]) {}
 
     /// Members a committed block's finalizations settled whose verdict a
     /// counterpart shares: what the verdict figures are read per.
@@ -986,11 +987,11 @@ pub fn record_verdict_claims_weight(named: usize, carried: usize, changed: usize
     recorder().record_verdict_claims_weight(named, carried, changed);
 }
 
-/// Record the stated and the accepted rows a committed block read a
-/// differing yes for.
+/// Record the stated and the accepted rows a committed block of `shard`
+/// read a differing yes for, by transaction hash.
 #[inline]
-pub fn record_verdict_differed(stated: usize, accepted: usize) {
-    recorder().record_verdict_differed(stated, accepted);
+pub fn record_verdict_differed(shard: u64, stated: &[[u8; 32]], accepted: &[[u8; 32]]) {
+    recorder().record_verdict_differed(shard, stated, accepted);
 }
 
 /// Set the crossing answers standing under a shard's prefix.
@@ -1318,8 +1319,13 @@ mod tests {
     struct Counting(AtomicUsize);
 
     impl MetricsRecorder for Counting {
-        fn record_verdict_differed(&self, stated: usize, _accepted: usize) {
-            self.0.fetch_add(stated, Ordering::Relaxed);
+        fn record_verdict_differed(
+            &self,
+            _shard: u64,
+            stated: &[[u8; 32]],
+            _accepted: &[[u8; 32]],
+        ) {
+            self.0.fetch_add(stated.len(), Ordering::Relaxed);
         }
     }
 
@@ -1328,12 +1334,13 @@ mod tests {
     #[test]
     fn scopes_nest() {
         let (outer, inner) = (Arc::new(Counting::default()), Arc::new(Counting::default()));
+        let rows = |count: usize| vec![[0; 32]; count];
         with_scoped_recorder(outer.clone(), || {
-            record_verdict_differed(1, 0);
-            with_scoped_recorder(inner.clone(), || record_verdict_differed(10, 0));
-            record_verdict_differed(100, 0);
+            record_verdict_differed(0, &rows(1), &[]);
+            with_scoped_recorder(inner.clone(), || record_verdict_differed(0, &rows(10), &[]));
+            record_verdict_differed(0, &rows(100), &[]);
         });
-        record_verdict_differed(1_000, 0);
+        record_verdict_differed(0, &rows(1_000), &[]);
         assert_eq!(outer.0.load(Ordering::Relaxed), 101);
         assert_eq!(inner.0.load(Ordering::Relaxed), 10);
     }

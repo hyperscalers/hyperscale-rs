@@ -17,7 +17,7 @@ use hyperscale_engine::{
     FetchedCells, Holds, PreviewGrants, PreviewInputs, PreviewReport, TickEnvironment,
 };
 use hyperscale_hbor::from_slice;
-use hyperscale_metrics_memory::MemoryRecorder;
+use hyperscale_metrics_memory::{MemoryRecorder, hash_label};
 use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::NodeStateMachine;
@@ -139,32 +139,49 @@ pub struct SimCluster {
 /// shard that states a member later is held to what the others stated.
 #[derive(Default)]
 struct StatedEffects {
-    /// What each shard stated of each transaction.
-    stated: BTreeMap<TxHash, BTreeMap<ShardId, EffectsDigest>>,
+    /// What each shard last stated of each transaction, and the height
+    /// of the block stating it.
+    stated: BTreeMap<TxHash, BTreeMap<ShardId, (EffectsDigest, BlockHeight)>>,
     /// The statements held to another shard's so far.
     compared: usize,
     /// The transactions two shards stated under two digests.
     differed: BTreeSet<TxHash>,
+    /// The transactions two shards stated under two digests where one of
+    /// the two stated it [past a recovery](SimCluster::recommitted_past_recovery),
+    /// taken as each mismatch is noted. Only these transactions' rows may
+    /// read a sibling's verdict leaf as neither value they would hash.
+    recovered: BTreeSet<TxHash>,
 }
 
 impl StatedEffects {
-    /// Take in `shard`'s statement of `tx`, and name a sibling that
-    /// stated it under another digest.
-    fn note(&mut self, shard: ShardId, tx: TxHash, digest: EffectsDigest) -> Option<ShardId> {
+    /// Take in `shard`'s statement of `tx` from the block at `height`,
+    /// and name each sibling that stated it under another digest, with
+    /// the height it stated it at.
+    fn note(
+        &mut self,
+        shard: ShardId,
+        tx: TxHash,
+        digest: EffectsDigest,
+        height: BlockHeight,
+    ) -> Vec<(ShardId, BlockHeight)> {
         let stated = self.stated.entry(tx).or_default();
-        let differing = stated
+        let differing: Vec<(ShardId, BlockHeight)> = stated
             .iter()
-            .find(|(sibling, theirs)| **sibling != shard && **theirs != digest)
-            .map(|(sibling, _)| *sibling);
-        if stated.insert(shard, digest).is_none() && stated.len() > 1 {
+            .filter(|(sibling, (theirs, _))| **sibling != shard && *theirs != digest)
+            .map(|(sibling, (_, at))| (*sibling, *at))
+            .collect();
+        if stated.insert(shard, (digest, height)).is_none() && stated.len() > 1 {
             self.compared += 1;
         }
-        if differing.is_some() {
+        if !differing.is_empty() {
             self.differed.insert(tx);
         }
         differing
     }
 }
+
+/// A member a counterpart shares, by source, target and transaction.
+type SharedMember = (ShardId, ShardId, TxHash);
 
 /// The served reads oracle: at each shared tick, the entries the source
 /// reads as its own part are the entries a counterpart absorbed.
@@ -183,12 +200,21 @@ struct ServedParts {
     /// that replaced the first one archived there. A recovered chain's
     /// blocks below where the walk had reached are walked again.
     rewalked: BTreeSet<(ShardId, BlockHeight)>,
-    /// What each line running a member says the source read, by source,
-    /// target and transaction.
-    read: BTreeMap<(ShardId, ShardId, TxHash), (BlockHeight, Vec<SubstateEntry>)>,
-    /// What each target's blocks absorbed, by source, target and
-    /// transaction: the height serving it and its entries, ascending.
-    absorbed: BTreeMap<(ShardId, ShardId, TxHash), (BlockHeight, Vec<SubstateEntry>)>,
+    /// What each line running a member says the source read.
+    read: BTreeMap<SharedMember, (BlockHeight, Vec<SubstateEntry>)>,
+    /// What each target's blocks absorbed of each member, by the height
+    /// of the target's block: the height serving it and its entries. A
+    /// rewalked block's contributions replace the lost block's at its
+    /// height.
+    absorbed: BTreeMap<SharedMember, BTreeMap<BlockHeight, (BlockHeight, Vec<SubstateEntry>)>>,
+    /// The reads from another height than their counterpart absorbed
+    /// whose source or target [recommitted the transaction past a
+    /// recovery](SimCluster::recommitted_past_recovery): set aside
+    /// uncompared, the height read at and the height absorbed at, until a
+    /// later read of the member agrees. One still set aside when the
+    /// cluster drops must be of a transaction stated under two digests
+    /// across the recovery.
+    parked: BTreeMap<SharedMember, (BlockHeight, BlockHeight)>,
     /// The heights and clocks each shard committed each transaction at,
     /// in the order its chain committed them.
     commits: BTreeMap<TxHash, BTreeMap<ShardId, Vec<(BlockHeight, WeightedTimestamp)>>>,
@@ -196,6 +222,32 @@ struct ServedParts {
     agreed: usize,
     /// The members those parts were read for, by source and transaction.
     compared: BTreeSet<(ShardId, TxHash)>,
+}
+
+impl ServedParts {
+    /// What `member`'s target absorbed of it: the height serving its
+    /// newest block's contribution, and every block's entries, ascending.
+    fn absorbed(&self, member: &SharedMember) -> Option<(BlockHeight, Vec<SubstateEntry>)> {
+        let by_height = self.absorbed.get(member)?;
+        let (served, _) = by_height.values().next_back()?;
+        let mut entries: Vec<SubstateEntry> = by_height
+            .values()
+            .flat_map(|(_, entries)| entries.iter().cloned())
+            .collect();
+        entries.sort_by_key(|entry| entry.key);
+        Some((*served, entries))
+    }
+
+    /// Let go of what `target`'s block at `height` absorbed, ahead of
+    /// walking the block that replaced it.
+    fn forget_absorbed(&mut self, target: ShardId, height: BlockHeight) {
+        self.absorbed.retain(|(_, absorbing, _), by_height| {
+            if *absorbing == target {
+                by_height.remove(&height);
+            }
+            !by_height.is_empty()
+        });
+    }
 }
 
 impl Drop for SimCluster {
@@ -206,13 +258,22 @@ impl Drop for SimCluster {
             }
             return;
         }
-        let differed = self.recorder.counter("verdict_differed", None);
         let allowed = self.verdicts_allowed_to_differ();
-        assert!(
-            differed <= allowed,
-            "a row read a sibling's verdict leaf as neither value it would hash: \
-             {differed} times, {allowed} allowed",
-        );
+        for (tx, differed) in self.recorder.counter_labels("verdict_differed") {
+            let allowed = allowed.get(&tx).copied().unwrap_or(0);
+            assert!(
+                differed <= allowed,
+                "rows read a sibling's verdict leaf for {tx} as neither value they \
+                 would hash: {differed} times, {allowed} allowed",
+            );
+        }
+        for (member, (at, served)) in &self.served_parts.parked {
+            assert!(
+                self.stated_effects.recovered.contains(&member.2),
+                "a shared member's own part was read at {at:?} and absorbed at {served:?}, \
+                 never compared, and no recovery stated it under two digests: {member:?}",
+            );
+        }
         assert_eq!(
             self.recorder.counter("verdict_differed_accepted", None),
             0,
@@ -777,6 +838,7 @@ impl SimCluster {
                 .filter(|height| self.served_parts.rewalked.insert((shard, *height)))
                 .collect();
             for height in replaced.into_iter().filter(|height| *height < from) {
+                self.served_parts.forget_absorbed(shard, height);
                 if let Some(certified) = self.history(shard).block(height) {
                     self.note_served_parts(shard, certified.block());
                     self.note_stated_effects(shard, certified.block());
@@ -794,23 +856,26 @@ impl SimCluster {
         }
         let read = std::mem::take(&mut self.served_parts.read);
         for (member, (at, entries)) in read {
-            let Some((served, absorbed)) = self.served_parts.absorbed.get(&member) else {
+            let Some((served, absorbed)) = self.served_parts.absorbed(&member) else {
                 self.served_parts.read.insert(member, (at, entries));
                 continue;
             };
-            if *served != at {
+            let (source, target, tx) = member;
+            if served != at {
                 assert!(
-                    self.recommitted_past_recovery(member.2),
+                    self.recommitted_past_recovery(tx, source).is_some()
+                        || self.recommitted_past_recovery(tx, target).is_some(),
                     "a shared member's own part is from another height than its \
                      counterpart's: {member:?} read at {at:?}, absorbed at {served:?}",
                 );
-                self.served_parts.read.insert(member, (at, entries));
+                self.served_parts.parked.insert(member, (at, served));
                 continue;
             }
             assert_eq!(
-                &entries, absorbed,
+                entries, absorbed,
                 "a shared member's own part differs from its counterpart's: {member:?} at {at:?}",
             );
+            self.served_parts.parked.remove(&member);
             self.served_parts.agreed += 1;
             self.served_parts.compared.insert((member.0, member.2));
         }
@@ -821,8 +886,10 @@ impl SimCluster {
     /// # Panics
     ///
     /// If another shard stated a transaction under another digest, unless
-    /// it was [recommitted past a recovery](Self::recommitted_past_recovery).
+    /// one of the two stated it from a block at or past the height it
+    /// [recommitted it at past a recovery](Self::recommitted_past_recovery).
     fn note_stated_effects(&mut self, shard: ShardId, block: &Block) {
+        let height = block.height();
         for finalization in block.certificates().iter() {
             for receipt in finalization.stated_receipts() {
                 let digest = receipt
@@ -830,57 +897,61 @@ impl SimCluster {
                     .effects()
                     .expect("a stated yes carries its digest");
                 let tx = receipt.tx_hash;
-                if let Some(sibling) = self.stated_effects.note(shard, tx, digest) {
+                for (sibling, theirs) in self.stated_effects.note(shard, tx, digest, height) {
+                    let past = |stater: ShardId, at: BlockHeight| {
+                        self.recommitted_past_recovery(tx, stater)
+                            .is_some_and(|recommit| at >= recommit)
+                    };
                     assert!(
-                        self.recommitted_past_recovery(tx),
+                        past(shard, height) || past(sibling, theirs),
                         "{tx:?} is stated under two digests, by {shard:?} and {sibling:?}",
                     );
+                    self.stated_effects.recovered.insert(tx);
                 }
             }
         }
     }
 
-    /// Whether a shard committed `tx` at two heights, the earlier in the
-    /// band of a recovery of it: its replaced committee's tail, which the
-    /// recovered chain commits again past the frontier, under another
-    /// clock. Read on the replica at the highest beacon epoch.
-    fn recommitted_past_recovery(&self, tx: TxHash) -> bool {
-        let Some(schedule) = (0..self.runner.num_hosts())
+    /// The height `shard` committed `tx` at again, when it committed it
+    /// at two heights, the earlier in the band of a recovery of it: its
+    /// replaced committee's tail, which the recovered chain commits again
+    /// past the frontier, under another clock. Read on the replica at the
+    /// highest beacon epoch.
+    fn recommitted_past_recovery(&self, tx: TxHash, shard: ShardId) -> Option<BlockHeight> {
+        let schedule = (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.first_replica(host))
             .map(NodeStateMachine::schedule)
-            .max_by_key(|schedule| schedule.retained_epochs().map(|(_, newest)| newest))
-        else {
-            return false;
-        };
-        self.served_parts.commits.get(&tx).is_some_and(|shards| {
-            shards
-                .iter()
-                .any(|(shard, commits)| match commits.as_slice() {
-                    [(height, clock), _, ..] => schedule.recovery_orphaned(*shard, *clock, *height),
-                    _ => false,
-                })
-        })
+            .max_by_key(|schedule| schedule.retained_epochs().map(|(_, newest)| newest))?;
+        match self.served_parts.commits.get(&tx)?.get(&shard)?.as_slice() {
+            [(height, clock), (recommit, _), ..]
+                if schedule.recovery_orphaned(shard, *clock, *height) =>
+            {
+                Some(*recommit)
+            }
+            _ => None,
+        }
     }
 
     /// How many times rows may read a sibling's verdict leaf as neither
-    /// value they would hash: once per row of a transaction
-    /// [recommitted past a recovery](Self::recommitted_past_recovery) and
-    /// per replica of its shard, every host that ever held a store of it.
-    fn verdicts_allowed_to_differ(&self) -> u64 {
-        let replicas = |shard: ShardId| {
-            (0..self.runner.num_hosts())
-                .filter(|host| self.runner.hosts_shard(*host, shard).is_some())
-                .count()
-        };
-        let rows: usize = self
-            .served_parts
-            .commits
+    /// value they would hash, by the label the recorder counts each
+    /// transaction under: for a transaction stated under two digests
+    /// across a recovery, once per shard that stated it and per host
+    /// whose store of that shard was ever walked, so once per row and
+    /// replica. Every other transaction is allowed none.
+    fn verdicts_allowed_to_differ(&self) -> BTreeMap<String, u64> {
+        let archive = self.runner.archive();
+        self.stated_effects
+            .recovered
             .iter()
-            .filter(|(tx, _)| self.recommitted_past_recovery(**tx))
-            .flat_map(|(_, shards)| shards.keys())
-            .map(|shard| replicas(*shard))
-            .sum();
-        u64::try_from(rows).expect("a count fits")
+            .map(|tx| {
+                let replicas: usize = self.stated_effects.stated[tx]
+                    .keys()
+                    .map(|shard| archive.walked(*shard).count())
+                    .sum();
+                let allowed = u64::try_from(replicas).expect("a count fits");
+                (hash_label(tx.as_bytes()), allowed)
+            })
+            .collect()
     }
 
     /// Walk to the tip and say whether two shards stated `tx` under two
@@ -928,10 +999,11 @@ impl SimCluster {
                 .served_parts
                 .absorbed
                 .entry((source, shard, tx))
+                .or_default()
+                .entry(block.height())
                 .or_insert_with(|| (part.block_height(), Vec::new()));
             *height = part.block_height();
             entries.extend(part.entries().iter().cloned());
-            entries.sort_by_key(|entry| entry.key);
         }
         for line in block.tick_manifest().iter() {
             let TickLine::Member {

@@ -3639,6 +3639,15 @@
           "expr": "sum(rate(hyperscale_verdict_differed_total[1m]))",
           "legendFormat": "Verdicts differed/sec",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(hyperscale_verdict_differed_accepted_total[1m]))",
+          "legendFormat": "Accepted verdicts differed/sec",
+          "refId": "C"
         }
       ],
       "title": "Aborted Transactions",

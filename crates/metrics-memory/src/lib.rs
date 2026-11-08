@@ -24,6 +24,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::sync::Arc;
 
 use hyperscale_metrics::MetricsRecorder;
@@ -42,6 +43,17 @@ struct Inner {
     histogram_count: BTreeMap<Key, u64>,
     histogram_sum: BTreeMap<Key, f64>,
     histogram_buckets: BTreeMap<Key, BTreeMap<u16, u64>>,
+}
+
+/// The label a counter kept by hash records `hash` under: its bytes in
+/// lowercase hex, as a transaction hash displays.
+#[must_use]
+pub fn hash_label(hash: &[u8; 32]) -> String {
+    hash.iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("a String takes every write");
+            hex
+        })
 }
 
 /// The bucket a histogram observation falls in: a positive value's
@@ -111,6 +123,18 @@ impl MemoryRecorder {
                     .unwrap_or(0)
             },
         )
+    }
+
+    /// Every label a counter was recorded under, with its count.
+    #[must_use]
+    pub fn counter_labels(&self, name: &'static str) -> BTreeMap<String, u64> {
+        self.inner
+            .lock()
+            .counters
+            .range((name, None)..)
+            .take_while(|((entry, _), _)| *entry == name)
+            .filter_map(|((_, label), count)| label.clone().map(|label| (label, *count)))
+            .collect()
     }
 
     /// Read a gauge value. Returns 0.0 if the metric has not been recorded.
@@ -444,9 +468,19 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("verdict_cells_changed", None, changed as u64);
     }
 
-    fn record_verdict_differed(&self, stated: usize, accepted: usize) {
-        self.inc("verdict_differed", None, stated as u64);
-        self.inc("verdict_differed_accepted", None, accepted as u64);
+    fn record_verdict_differed(&self, shard: u64, stated: &[[u8; 32]], accepted: &[[u8; 32]]) {
+        let shard = shard.to_string();
+        self.inc(
+            "verdict_differed_by_shard",
+            Some(&shard),
+            stated.len() as u64,
+        );
+        for tx in stated {
+            self.inc("verdict_differed", Some(&hash_label(tx)), 1);
+        }
+        for tx in accepted {
+            self.inc("verdict_differed_accepted", Some(&hash_label(tx)), 1);
+        }
     }
 
     fn set_standing_answers(&self, shard: u64, answers: usize, bytes: usize) {
