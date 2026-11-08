@@ -29,9 +29,11 @@
 //!
 //! Over the budget, the shard holding the most bytes gives up a height in
 //! its own order, the arriving shard first where it ties the most. A
-//! shard holding no more than the budget's share for each shard is then
-//! never the one to give way, whatever every other shard pushes: one
-//! shard's members can crowd only their own shard's account.
+//! shard holding no more bytes than its share of the budget, two
+//! single-cell claims' worth, is then never the one to give way, whatever
+//! every other shard pushes: one shard's members can crowd only their own
+//! shard's account. The share is in bytes, not claims, so a shard pushing
+//! heavier claims keeps fewer of them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,8 +60,8 @@ const MAX_EARLY_CLAIM_HEIGHTS: usize = 32;
 /// two single-cell claims for every shard, whichever is more.
 ///
 /// So a lone shard at its caps fits whole, and under a flood across every
-/// shard each keeps two single-cell claims, since only the shard holding
-/// the most gives way.
+/// shard each keeps two single-cell claims' worth of bytes, since only the
+/// shard holding the most gives way.
 const fn budget(max_heights: usize) -> usize {
     let sections = max_heights * MAX_STATE_CLAIMS_BYTES;
     let shares = MAX_SHARDS * 2 * SINGLE_CELL_CLAIM_P99_BYTES;
@@ -411,7 +413,8 @@ mod tests {
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        Anchor, Hash, Inclusion, MerkleInclusionProof, StateRoot, TxHash, verdict_leaf,
+        Anchor, Hash, Inclusion, MAX_HELD_VALUE_BYTES, MerkleInclusionProof,
+        STATE_CLAIM_CROSSING_BYTES, StateRoot, TxHash, verdict_leaf,
     };
 
     use super::*;
@@ -711,10 +714,20 @@ mod tests {
 
     /// Fill `kind` from shards after the first `from` with claims of at
     /// most a section each, at height 1, until it holds `left` more bytes.
+    ///
+    /// Where the last claim would weigh under half a section, the one
+    /// before it gives up the difference, so no claim weighs less than
+    /// half a section and every one outweighs its bare terms.
     fn fill(kind: Kind, parked: &mut ParkedClaims, from: usize, mut left: usize) {
+        const HALF: usize = MAX_STATE_CLAIMS_BYTES / 2;
+        assert!(left == 0 || left >= HALF, "{left} B is less than one claim");
         let mut index = from;
         while left > 0 {
-            let weight = left.min(MAX_STATE_CLAIMS_BYTES);
+            let weight = if left <= MAX_STATE_CLAIMS_BYTES {
+                left
+            } else {
+                MAX_STATE_CLAIMS_BYTES.min(left - HALF)
+            };
             kind.hold(parked, kind.claim(nth_shard(index), 1, 3, weight))
                 .expect("within the budget");
             left -= weight;
@@ -722,28 +735,43 @@ mod tests {
         }
     }
 
-    /// What a flooding shard pushes at each height: a full section, or a
-    /// single cell, which leaves each flooder as light as it can be.
-    const FLOODS: [usize; 2] = [MAX_STATE_CLAIMS_BYTES, SINGLE_CELL_CLAIM_P99_BYTES];
+    /// What a flooding shard pushes at each height, and how many shards
+    /// flood: a full section from eight shards, which pushes every kind
+    /// past twice its budget, or a single cell from every other shard,
+    /// which leaves each flooder as light as it can be.
+    const FLOODS: [(usize, usize); 2] = [
+        (MAX_STATE_CLAIMS_BYTES, 8),
+        (SINGLE_CELL_CLAIM_P99_BYTES, MAX_SHARDS - 1),
+    ];
 
-    /// The honest shard's two single-cell claims in every kind, then
-    /// every other shard pushing a claim of `weight` at each height it
-    /// may hold, in every kind.
-    fn flooded(weight: usize) -> (ParkedClaims, Vec<(Kind, StateClaim)>) {
+    /// A one-cell record claim at the measured size that carries the
+    /// widest record value and names one crossing.
+    const RECORD_CLAIM_BYTES: usize =
+        SINGLE_CELL_CLAIM_P99_BYTES + MAX_HELD_VALUE_BYTES + STATE_CLAIM_CROSSING_BYTES;
+
+    /// The honest shard's two claims of `honest` bytes in every kind, the
+    /// lower height first, then `flooders` other shards each pushing a
+    /// claim of `weight` at each height it may hold, in every kind.
+    fn flooded(
+        honest: usize,
+        weight: usize,
+        flooders: usize,
+    ) -> (ParkedClaims, Vec<(Kind, [StateClaim; 2])>) {
         let mut parked = ParkedClaims::new();
-        let mut honest = Vec::new();
+        let mut pushed = Vec::new();
         for kind in KINDS {
             // A release takes both unproven kinds at its anchor, so the
             // heard claims sit at heights of their own.
             let below = if matches!(kind, Kind::Heard) { 2 } else { 0 };
-            for (height, seed) in [(below + 1, 1), (below + 2, 2)] {
-                let claim = kind.claim(nth_shard(0), height, seed, SINGLE_CELL_CLAIM_P99_BYTES);
+            let claims = [(below + 1, 1), (below + 2, 2)]
+                .map(|(height, seed)| kind.claim(nth_shard(0), height, seed, honest));
+            for claim in &claims {
                 kind.hold(&mut parked, claim.clone())
                     .expect("room for an honest push");
-                honest.push((kind, claim));
             }
+            pushed.push((kind, claims));
         }
-        for index in 1..MAX_SHARDS {
+        for index in 1..=flooders {
             for kind in KINDS {
                 for height in 1..=kind.held(&parked).max_heights {
                     let claim = kind.claim(nth_shard(index), height, 200, weight);
@@ -751,38 +779,85 @@ mod tests {
                 }
             }
         }
-        (parked, honest)
+        (parked, pushed)
     }
 
     /// Every other shard pushing all it may leaves the honest shard's
-    /// two single-cell claims held in every kind, and they are released
-    /// as ever.
+    /// share of bytes, two single-cell claims, held in every kind, and
+    /// they are released as ever.
     #[test]
-    fn a_flood_across_every_shard_leaves_an_honest_shards_push() {
-        for weight in FLOODS {
-            let (mut parked, honest) = flooded(weight);
-            for (kind, claim) in honest {
-                assert_eq!(
-                    kind.release(&mut parked, &claim),
-                    vec![claim],
-                    "{kind:?} kept the honest push under a flood of {weight} B claims",
-                );
+    fn a_flood_leaves_an_honest_shard_its_share_of_bytes() {
+        for (weight, flooders) in FLOODS {
+            let (mut parked, honest) = flooded(SINGLE_CELL_CLAIM_P99_BYTES, weight, flooders);
+            for (kind, claims) in honest {
+                for claim in claims {
+                    assert_eq!(
+                        kind.release(&mut parked, &claim),
+                        vec![claim],
+                        "{kind:?} kept the honest push under a flood of {weight} B claims",
+                    );
+                }
             }
         }
     }
 
-    /// Under the flood each kind holds no more than its budget, and its
-    /// counts are the claims' own weights.
+    /// The share is in bytes: under a flood of single-cell claims, an
+    /// honest shard pushing two record claims holds more than its share
+    /// and gives one up in its own order, and the one that fits its share
+    /// stays.
+    #[test]
+    fn an_honest_shard_keeps_the_record_claims_its_share_of_bytes_fits() {
+        let share = 2 * SINGLE_CELL_CLAIM_P99_BYTES;
+        assert!(
+            (RECORD_CLAIM_BYTES..2 * RECORD_CLAIM_BYTES).contains(&share),
+            "the share fits one record claim and not two",
+        );
+        let (mut parked, honest) = flooded(
+            RECORD_CLAIM_BYTES,
+            SINGLE_CELL_CLAIM_P99_BYTES,
+            MAX_SHARDS - 1,
+        );
+        for (kind, [lower, higher]) in honest {
+            let (kept, gone) = match kind.held(&parked).gives_way {
+                GivesWay::Lowest => (higher, lower),
+                GivesWay::Highest => (lower, higher),
+            };
+            assert_eq!(
+                kind.release(&mut parked, &gone),
+                vec![],
+                "{kind:?} gave one up"
+            );
+            assert_eq!(
+                kind.release(&mut parked, &kept),
+                vec![kept],
+                "{kind:?} kept the record claim its share fits",
+            );
+        }
+    }
+
+    /// Under the flood each kind holds no more than its budget, its
+    /// counts are the claims' own weights, and the flooders hold within
+    /// one claim of each other: a full kind makes room by taking from the
+    /// most, never by refusing whoever arrives last.
     #[test]
     fn the_budget_holds_under_a_flood() {
-        for weight in FLOODS {
-            let (parked, _) = flooded(weight);
+        for (weight, flooders) in FLOODS {
+            let (parked, _) = flooded(SINGLE_CELL_CLAIM_P99_BYTES, weight, flooders);
             for kind in KINDS {
                 let held = kind.held(&parked);
                 assert_accounted(held);
                 assert!(
                     held.total > held.budget - weight,
                     "{kind:?} was filled to its budget by {weight} B claims",
+                );
+                let bytes: Vec<usize> = (1..=flooders)
+                    .map(|index| held.bytes(nth_shard(index)))
+                    .collect();
+                let most = bytes.iter().max().expect("flooders");
+                let least = bytes.iter().min().expect("flooders");
+                assert!(
+                    most - least <= weight,
+                    "{kind:?} flooders hold {least} B to {most} B of {weight} B claims",
                 );
             }
             assert_eq!(
@@ -862,7 +937,8 @@ mod tests {
         for kind in KINDS {
             let mut parked = ParkedClaims::new();
             let heaviest = nth_shard(1);
-            let heights = kind.held(&parked).max_heights;
+            // Short of the whole budget, so other shards hold the rest.
+            let heights = kind.held(&parked).max_heights.min(24);
             for height in 1..=heights {
                 kind.hold(
                     &mut parked,
@@ -878,6 +954,8 @@ mod tests {
                 budget - heights * MAX_STATE_CLAIMS_BYTES,
             );
             assert_eq!(kind.held(&parked).total, budget);
+            let others = kind.held(&parked).by_shard.len() - 1;
+            assert!(others > 0, "{kind:?} has other holders");
 
             let recorder = MemoryRecorder::new();
             let lighter = kind.claim(nth_shard(0), 1, 2, SINGLE_CELL_CLAIM_P99_BYTES);
@@ -908,6 +986,11 @@ mod tests {
                 budget - MAX_STATE_CLAIMS_BYTES + SINGLE_CELL_CLAIM_P99_BYTES,
                 "{kind:?}: nothing else went",
             );
+            assert_eq!(
+                kind.held(&parked).by_shard.len(),
+                others + 2,
+                "{kind:?}: every other holder stayed",
+            );
             assert_accounted(kind.held(&parked));
             assert_eq!(kind.release(&mut parked, &lighter), vec![lighter]);
         }
@@ -935,6 +1018,43 @@ mod tests {
             assert_eq!(parked.len(), before, "{kind:?}: the others kept all");
             assert_eq!(kind.held(&parked).total, budget);
             assert_accounted(kind.held(&parked));
+        }
+    }
+
+    /// Over the budget with the arrival's shard tied for the most in a
+    /// proven kind, that shard gives up its own older height and the
+    /// arrival is held, while the shard it ties keeps everything.
+    #[test]
+    fn a_tied_arrival_in_a_proven_kind_gives_up_its_older_height() {
+        for kind in [Kind::Early, Kind::Unasked] {
+            let mut parked = ParkedClaims::new();
+            let arriving = nth_shard(0);
+            let tied = nth_shard(1);
+            let older = kind.claim(arriving, 1, 1, MAX_STATE_CLAIMS_BYTES);
+            kind.hold(&mut parked, older.clone()).expect("room");
+            for height in 1..=2 {
+                kind.hold(
+                    &mut parked,
+                    kind.claim(tied, height, 3, MAX_STATE_CLAIMS_BYTES),
+                )
+                .expect("room");
+            }
+            let budget = kind.held(&parked).budget;
+            fill(kind, &mut parked, 2, budget - 3 * MAX_STATE_CLAIMS_BYTES);
+
+            let recorder = MemoryRecorder::new();
+            let arrival = kind.claim(arriving, 2, 2, MAX_STATE_CLAIMS_BYTES);
+            let held = with_recorder(&recorder, || kind.hold(&mut parked, arrival.clone()));
+            assert_eq!(held, Ok(()), "{kind:?}");
+            assert_eq!(
+                recorder.counter("crossing_pushes_dropped", Some("crowded")),
+                1
+            );
+            assert_eq!(kind.held(&parked).bytes(tied), 2 * MAX_STATE_CLAIMS_BYTES);
+            assert_eq!(kind.held(&parked).total, budget);
+            assert_accounted(kind.held(&parked));
+            assert_eq!(kind.release(&mut parked, &older), vec![], "{kind:?}");
+            assert_eq!(kind.release(&mut parked, &arrival), vec![arrival]);
         }
     }
 }
