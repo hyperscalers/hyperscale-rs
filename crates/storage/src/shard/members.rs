@@ -516,9 +516,9 @@ fn sibling_hashes(
 /// A question's hashes turn only on the transaction, the sibling, the
 /// shards the row shares its verdict with and the digest it stated, so
 /// they are derived when the question first stands and reused while the
-/// row awaits the same shards under the same digest. The kept hashes are replaced whole at every derivation, so
-/// they number the questions the last one found: at most one per sibling
-/// a hearing row awaits.
+/// row awaits the same shards under the same digest. The kept hashes
+/// are replaced whole at every derivation, so they number the questions
+/// the last one found: at most one per sibling a hearing row awaits.
 ///
 /// The same walk measures how long a row waits to hear: the tip each
 /// hearing row was first seen at is kept beside whether its wait has
@@ -2150,9 +2150,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// under the receipt hash its certificate attests, staging the yes
     /// receipt the half carries for it, where the row stands in flight in
     /// that tick on terms a counterpart shares, and nowhere else: a row
-    /// already stated, released or named again is left as it stands. The row's share goes to zero, since the
-    /// stating half is where it was counted, and an abort line later
-    /// named for it attests nothing more. It stays awaited in its tick.
+    /// already stated, released or named again is left as it stands. The
+    /// row's share goes to zero, since the stating half is where it was
+    /// counted, and an abort line later named for it attests nothing
+    /// more. It stays awaited in its tick.
     ///
     /// The members a legs half accepts are [`Self::accept`]'s to move,
     /// once every half of the block has settled.
@@ -2192,8 +2193,9 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             if !shared_here {
                 continue;
             }
-            // A root is checked before a block's sections are, so a half
-            // that carries no digest reaches here and fails validation.
+            // Decoding refuses a stating half whose yes carries no digest,
+            // so only a half built in process reaches here without one,
+            // and its block fails validation against its certificate.
             row.state = RowState::Stated {
                 tick: height,
                 receipt: yes.consensus.receipt_hash(),
