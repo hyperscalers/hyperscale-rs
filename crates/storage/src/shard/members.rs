@@ -6469,6 +6469,40 @@ mod tests {
         );
     }
 
+    /// A yes leaf's encoding and the value hash a sibling reads it by,
+    /// pinned: both reach the state root, so a term moved or re-widened
+    /// is a consensus break.
+    #[test]
+    fn a_yes_leaf_encodes_to_the_golden_bytes() {
+        use std::fmt::Write as _;
+
+        let hex = |bytes: &[u8]| {
+            bytes.iter().fold(String::new(), |mut out, byte| {
+                write!(out, "{byte:02x}").expect("a string takes any write");
+                out
+            })
+        };
+        let tx = TxHash::from(Hash::from_bytes(b"golden-verdict-tx"));
+        let leaf = VerdictLeaf::yes(
+            tx,
+            &Capped::from_array([LOCAL]),
+            PEER,
+            EffectsDigest::from_raw(Hash::from_bytes(b"golden-verdict-effects")),
+        );
+        assert_eq!(
+            hex(&to_vec(&leaf).expect("a verdict leaf encodes")),
+            "00cbf5af3b55781aff87afadec963c9ee5e5f61449c06e185917e53a409707a8c302010000000000000000\
+             00000001000000010000000000000054fb7e2c7021906b0a1be4b364a993881fe90718348adc8794bab9cd\
+             6a4161b2",
+            "VerdictLeaf::Yes drifted from the golden bytes",
+        );
+        assert_eq!(
+            hex(&verdict_hash(PEER, tx, &leaf)),
+            "cb23fe1d369f17c24a1a2830ba7a04e85f0c092a30b38f2220875fe18585f135",
+            "the yes leaf's value hash drifted from the golden bytes",
+        );
+    }
+
     /// An accept's leaf names no digest, so a row reads a sibling's
     /// accept whatever it stated. Within a chain that sibling's accept
     /// already needed this row's yes under its own digest, and past a
@@ -6665,81 +6699,165 @@ mod tests {
         assert_eq!(second[0].yes, Hash::from_hash_bytes(&yes));
     }
 
+    /// `local`'s family where `1` stands stated over `effects`, awaiting
+    /// every other shard of `shards`.
+    fn stated_among(local: ShardId, shards: &[ShardId], effects: EffectsDigest) -> MemberIndex {
+        let others: Reach = Capped::new(
+            shards
+                .iter()
+                .copied()
+                .filter(|shard| *shard != local)
+                .collect(),
+        )
+        .expect("a few shards");
+        let line = TickLine::Member {
+            staged: 0,
+            tx: tx(1),
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+            holds: Capped::empty(),
+            pins: Capped::empty(),
+            reach: others.clone(),
+            awaits: others,
+            charge: stub_abort_charge(1),
+            share: 7,
+            reserves: Capped::empty(),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
+            crossings: Capped::empty(),
+            served_at: None,
+        };
+        let mut blocks = [
+            committing_far(1, &[1]),
+            naming(2, vec![line]),
+            stating_over(3, 2, 1, effects),
+        ];
+        let mut store = Entries::default();
+        for block in &mut blocks {
+            block.shard = local;
+            for half in &mut block.settled {
+                half.tick = TickId::new(local, half.tick.block_height());
+            }
+            store.fold(block);
+        }
+        MemberIndex::load(&store, local)
+    }
+
     /// Where each of `digests.len()` shards states the digest beside it,
-    /// run every row on its siblings' leaves until none moves, and say
-    /// which accepted.
-    fn accepted_among(digests: &[EffectsDigest]) -> Vec<bool> {
+    /// let one reader at a time take what its siblings' cells hold at a
+    /// fresh anchor of each, readers taking turns in `order` and then
+    /// round by round until none moves. Each turn folds the reader's
+    /// block through its member index and acts on the decision its row
+    /// then gives: an accept by a legs half, a refusal by leaving the
+    /// row's cells as an abort does. Says which rows accepted, and
+    /// whether any reading said accepted.
+    fn accepted_in_turn(digests: &[EffectsDigest], order: &[usize]) -> (Vec<bool>, bool) {
         use hyperscale_types::Hears;
 
-        #[derive(Clone, Copy, PartialEq)]
-        enum Standing {
-            Stated,
-            Accepted,
-            Refused,
-        }
-        let shards: Vec<ShardId> = (0..digests.len())
-            .map(|at| ShardId::leaf(3, at as u64))
+        let n = digests.len();
+        let shards: Vec<ShardId> = (0..n).map(|at| ShardId::leaf(3, at as u64)).collect();
+        let live = SiblingView {
+            epoch: Epoch::new(0),
+            recovery: Ok(None),
+            formed: Ok(None),
+        };
+        let mut indexes: Vec<MemberIndex> = (0..n)
+            .map(|at| stated_among(shards[at], &shards, digests[at]))
             .collect();
-        let awaited: Awaited = Capped::new(shards.clone()).expect("a few shards");
-        let clock = WeightedTimestamp::from_millis(1);
-        let mut standing = vec![Standing::Stated; digests.len()];
-        for _ in 0..=digests.len() {
-            let mut next = standing.clone();
-            for reader in (0..digests.len()).filter(|at| standing[*at] == Standing::Stated) {
-                let values: Vec<Value> = (0..digests.len())
-                    .filter(|sibling| *sibling != reader)
-                    .map(|sibling| {
-                        let shard = shards[sibling];
-                        let leaf = match standing[sibling] {
-                            Standing::Stated => VerdictLeaf::Yes {
-                                tx: tx(1),
-                                awaited: awaited.clone(),
-                                effects: digests[sibling],
-                            },
-                            Standing::Accepted => VerdictLeaf::Accepted {
-                                tx: tx(1),
-                                awaited: awaited.clone(),
-                            },
-                            Standing::Refused => return Value::L,
-                        };
-                        let held = Inclusion::Present(verdict_hash(shard, tx(1), &leaf));
-                        let (yes, accepted) =
-                            sibling_hashes(shard, tx(1), &awaited, digests[reader]);
-                        match said_at(held, None, clock, clock, yes, accepted) {
-                            Some(Some(Said::Yes)) => Value::Y,
-                            Some(Some(Said::Accepted)) => Value::A,
-                            _ => Value::L,
-                        }
-                    })
-                    .collect();
-                match decide(Hears::Stated, &values) {
-                    Decision::Accept => next[reader] = Standing::Accepted,
-                    Decision::Refuse => next[reader] = Standing::Refused,
-                    _ => {}
-                }
+        let mut refused = vec![false; n];
+        let mut read_accepted = false;
+        let mut height = 3;
+        let mut turn = |reader: usize| -> bool {
+            if refused[reader] || indexes[reader].members[&tx(1)].state.accepted() {
+                return false;
             }
-            standing = next;
+            height += 1;
+            let claims: Vec<StateClaim> = (0..n)
+                .filter(|sibling| *sibling != reader)
+                .map(|sibling| {
+                    let shard = shards[sibling];
+                    let [leaf, row, marker] = cells_of(shard, 1);
+                    let anchor = anchor_on(shard, height, height);
+                    if refused[sibling] {
+                        let gone = [
+                            (leaf, Inclusion::Absent),
+                            (row, Inclusion::Absent),
+                            (marker, PRESENT),
+                        ];
+                        return reading(anchor, &gone, &[1]);
+                    }
+                    let said = indexes[sibling].members[&tx(1)]
+                        .verdict(shard)
+                        .expect("a row that hears holds a leaf");
+                    let held = Inclusion::Present(verdict_hash(shard, tx(1), &said));
+                    reading(anchor, &[(leaf, held)], &[1])
+                })
+                .collect();
+            let mut block = carrying(height, &claims);
+            block.shard = shards[reader];
+            indexes[reader].advance(&block);
+            let row = &indexes[reader].members[&tx(1)];
+            let values: Vec<Value> = row
+                .awaits
+                .iter()
+                .map(|sibling| {
+                    let entry = row.hearing.iter().find(|heard| heard.shard == *sibling);
+                    read_accepted |= entry.is_some_and(|heard| heard.said == Some(Said::Accepted));
+                    value_of(entry, Some(Source::Live), &live, row.committed)
+                })
+                .collect();
+            match decide(Hears::Stated, &values) {
+                Decision::Accept => {
+                    height += 1;
+                    let mut legs = accepting(height, 2, &[1]);
+                    legs.shard = shards[reader];
+                    legs.settled[0].tick = TickId::new(shards[reader], BlockHeight::new(2));
+                    indexes[reader].advance(&legs);
+                    assert!(indexes[reader].members[&tx(1)].state.accepted());
+                    true
+                }
+                Decision::Refuse => {
+                    refused[reader] = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        for &reader in order {
+            turn(reader % n);
         }
-        standing
-            .into_iter()
-            .map(|stands| stands == Standing::Accepted)
-            .collect()
+        for _ in 0..=n {
+            let mut moved = false;
+            for reader in 0..n {
+                moved |= turn(reader);
+            }
+            if !moved {
+                break;
+            }
+        }
+        let accepted = indexes
+            .iter()
+            .map(|index| index.members[&tx(1)].state.accepted())
+            .collect();
+        (accepted, read_accepted)
     }
 
     proptest! {
-        /// Over any number of siblings and any digest each states, no row
-        /// accepts unless every digest is one, and where they are all
-        /// one every row does.
+        /// Over any number of siblings, any digest each states and any
+        /// order they read in, no row accepts unless every digest is
+        /// one, and where they are all one every row does, every row
+        /// after the first by reading a sibling's accept.
         #[test]
         fn no_row_accepts_unless_every_digest_is_equal(
-            seeds in vec(0u8..3, 2..7),
+            seeds in vec(0u8..3, 2..6),
+            order in vec(0usize..6, 0..12),
         ) {
             let digests: Vec<EffectsDigest> =
                 seeds.iter().map(|seed| effects_of_seed(*seed)).collect();
-            let accepted = accepted_among(&digests);
+            let (accepted, read_accepted) = accepted_in_turn(&digests, &order);
             let one = digests.iter().all(|digest| *digest == digests[0]);
             prop_assert_eq!(accepted.iter().any(|row| *row), one);
             prop_assert_eq!(accepted.iter().all(|row| *row), one);
+            prop_assert_eq!(read_accepted, one);
         }
     }
 
@@ -11953,28 +12071,16 @@ mod tests {
         }
 
         /// `shape`'s steady block writes exactly the collections
-        /// `expected` names, each within a quarter of the entries and
-        /// bytes measured for it.
-        fn writes_within(shape: Shape, expected: &[(&str, usize, usize)]) {
+        /// `expected` names, each exactly the entries and bytes measured
+        /// for it. The fixtures are fixed and the encoding canonical, so
+        /// any byte a row gains or loses moves a figure here.
+        fn writes_exactly(shape: Shape, expected: &[(&str, usize, usize)]) {
             let tallied = steady(shape);
-            assert_eq!(
-                tallied.keys().copied().collect::<Vec<_>>(),
-                expected.iter().map(|(name, ..)| *name).collect::<Vec<_>>(),
-                "{shape:?} writes these collections and no other",
-            );
-            let near =
-                |got: usize, measured: usize| got * 4 >= measured * 3 && got * 4 <= measured * 5;
-            for &(name, entries, bytes) in expected {
-                let (got_entries, got_bytes) = tallied[name];
-                assert!(
-                    near(got_entries, entries),
-                    "{shape:?} {name}: {got_entries} entries, measured {entries}",
-                );
-                assert!(
-                    near(got_bytes, bytes),
-                    "{shape:?} {name}: {got_bytes} bytes, measured {bytes}",
-                );
-            }
+            let measured: BTreeMap<&str, (usize, usize)> = expected
+                .iter()
+                .map(|&(name, entries, bytes)| (name, (entries, bytes)))
+                .collect();
+            assert_eq!(tallied, measured, "{shape:?} writes these and no other");
         }
 
         #[test]
@@ -11982,21 +12088,21 @@ mod tests {
             const B: usize = BATCH as usize;
             // One tick's pins written and one deleted, and its row and
             // the settled one's.
-            let ticks = [("TickPins", 2, 51 * B), ("Ticks", 2, 32 * B)];
-            writes_within(
+            let ticks = [("TickPins", 2, 51 * B + 2), ("Ticks", 2, 32 * B + 7)];
+            writes_exactly(
                 Shape::RunWhereCommitted,
-                &[("Members", 2 * B, 160 * B), ticks[0], ticks[1]],
+                &[("Members", 2 * B, 161 * B), ticks[0], ticks[1]],
             );
-            writes_within(
+            writes_exactly(
                 Shape::NamedALater,
                 &[
-                    ("Members", 3 * B, 487 * B),
+                    ("Members", 3 * B, 489 * B),
                     ticks[0],
                     ticks[1],
                     ("Waiters", 6 * B, 147 * B),
                 ],
             );
-            writes_within(
+            writes_exactly(
                 Shape::Shared,
                 &[
                     ("Members", 5 * B, 1_423 * B),
@@ -12009,10 +12115,10 @@ mod tests {
             );
             // A leg waits a block in `Waiters`, then holds in `Queue`
             // from the line running it until its stating half settles it.
-            writes_within(
+            writes_exactly(
                 Shape::Legs,
                 &[
-                    ("Members", 3 * B, 698 * B),
+                    ("Members", 3 * B, 700 * B),
                     ("Queue", 6 * B, 147 * B),
                     ticks[1],
                     ("Waiters", 6 * B, 147 * B),
