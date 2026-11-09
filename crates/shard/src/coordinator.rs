@@ -9756,10 +9756,11 @@ impl ShardCoordinator {
     /// leader extend a QC at least as high as any committed block.
     ///
     /// The carried `high_qc`s are unverified at intake, so we walk them from the
-    /// highest round down and adopt the first that *verifies*. A Byzantine
-    /// timeout can carry a forged high-round `high_qc`, but its only effect is
-    /// one failed verification — it cannot suppress the genuine quorum-max an
-    /// honest timeout carries.
+    /// highest round down and adopt the first that verifies and the gate
+    /// takes ([`Self::raise_high_qc`]). A Byzantine timeout can carry a forged
+    /// high-round `high_qc`, or a genuine one a halt recovery refuses, but its
+    /// only effect is one wasted verification — it cannot suppress the
+    /// genuine quorum-max an honest timeout carries.
     fn adopt_timeout_quorum_high_qc(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -9795,7 +9796,12 @@ impl ShardCoordinator {
                 );
                 continue;
             };
-            return self.try_adopt_verified_qc(topology_schedule, &verified);
+            // A halt recovery refuses the halted chain's QC once the fresh
+            // chain has left the bridge, however high its round; a
+            // lower-round candidate may still be the fresh chain's.
+            if self.adopt_qc(topology_schedule, &verified) {
+                return self.on_qc_adopted(&verified);
+            }
         }
         Vec::new()
     }
@@ -21749,6 +21755,43 @@ mod tests {
         );
         assert!(!state.is_block_syncing());
         assert_eq!(state.high_qc_round(), Round::new(3));
+    }
+
+    /// A timeout quorum whose highest verifying high QC is the halted
+    /// chain's, refused once the fresh chain has left the bridge, still
+    /// raises this replica to the fresh QC a lower share carries: a
+    /// member relaying a halted QC cannot shadow an honest one.
+    #[test]
+    fn a_refused_halted_qc_in_a_timeout_quorum_does_not_shadow_a_fresh_one() {
+        let (mut state, schedule, keys, halted, halted_qc) = fresh_chain_past_the_bridge();
+        install_complete_block(&mut state, &halted);
+        let fresher = empty_block_at_round(state.committed_hash, 5);
+        install_complete_block(&mut state, &fresher);
+        let fresher_qc = quorum_stamped_in(&keys, &fresher, 4_000, Epoch::new(3));
+
+        let round = Round::new(9);
+        for (voter, carried) in [(1u64, &halted_qc), (2, &fresher_qc)] {
+            let idx = usize::try_from(voter).unwrap();
+            let timeout = Timeout::new(
+                &NetworkDefinition::simulator(),
+                ShardId::ROOT,
+                round,
+                (**carried).clone(),
+                ValidatorId::new(voter),
+                &keys[idx],
+            )
+            .expect("sign");
+            state.timeouts.record(
+                Verified::<Timeout>::new_unchecked_for_test(timeout),
+                VoteCount::new(1),
+            );
+        }
+        let _ = state.adopt_timeout_quorum_high_qc(&schedule, round);
+        assert_eq!(
+            state.high_qc_round(),
+            Round::new(5),
+            "the fresh QC behind the refused halted one is adopted"
+        );
     }
 
     /// While `latest_qc` still rides the bridge, a carried halted QC of a
