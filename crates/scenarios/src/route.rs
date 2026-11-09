@@ -5042,18 +5042,31 @@ fn load_burned<C: Cluster>(c: &C, flight: &Flight, from: &[(ShardId, BlockHeight
 }
 
 /// Drive until both sides of the load's pair settle against what its
-/// routes burned, for up to `settle_within`, hold them there a few
-/// blocks, and read each side: what it held before, what it holds, and
-/// what was burned of it.
+/// routes burned, hold them there a few blocks, and read each side: what
+/// it held before, what it holds, and what was burned of it.
+///
+/// An aborted route's input comes home off its validity end, however
+/// early the route aborted: past one [`RETENTION_HORIZON`], inside two
+/// epochs, as [`the_later_comes_home_by`] holds a single route to. So the
+/// wait runs to that clock off the latest validity end of the load.
 fn load_conserved<C: Cluster>(
     c: &mut C,
     flight: &Flight,
     from: &[(ShardId, BlockHeight)],
-    settle_within: Duration,
     protocol_resource: &World,
     units: &World,
 ) -> [(&'static str, u128, u128, u128); 2] {
-    let settle_by = c.now() + settle_within;
+    let epoch =
+        Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch length"));
+    let latest_validity_end = flight
+        .routes
+        .values()
+        .map(|route| {
+            Duration::from_millis(route.validity_range().end_timestamp_exclusive.as_millis())
+        })
+        .max()
+        .unwrap_or_default();
+    let settle_by = latest_validity_end + RETENTION_HORIZON + epoch * 2;
     let settled =
         |c: &C| protocol_resource.settles(c, load_burned(c, flight, from)) && units.settles(c, 0);
     while !settled(c) && c.now() < settle_by {
@@ -5171,7 +5184,7 @@ pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) ->
         flight.tick(c, "draining");
     }
     let payers = [(TRADER_SHARD, opened_at[2])];
-    let conserved = load_conserved(c, &flight, &payers, LOAD_DRAIN, &protocol_resource, &units);
+    let conserved = load_conserved(c, &flight, &payers, &protocol_resource, &units);
     let after = LoadCounters::read(c);
 
     CoreLoadRun {
@@ -5334,11 +5347,6 @@ impl RecordReadCost {
         );
     }
 }
-
-/// Epochs an aborted route's input gets to come home to its trader, as
-/// [`crossed_routes`] gives it: [`LOAD_DRAIN`] can be a single epoch, which
-/// is too short for it.
-const ABORT_REFUND_EPOCHS: u32 = 8;
 
 /// The message a block's crossing readings are pushed in.
 const CROSSING_READINGS: &str = "crossing.readings";
@@ -5651,17 +5659,7 @@ pub fn contended_routes_through_one_pair_under_load<C: FaultableCluster>(
         flight.tick(c, "draining");
         places.read(c, &flight);
     }
-    let epoch =
-        Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch length"));
-    let refund_within = epoch * ABORT_REFUND_EPOCHS;
-    let conserved = load_conserved(
-        c,
-        &flight,
-        &payers,
-        refund_within,
-        &protocol_resource,
-        &units,
-    );
+    let conserved = load_conserved(c, &flight, &payers, &protocol_resource, &units);
     let after = LoadCounters::read(c);
     let heights = [
         opened_at,
@@ -6106,7 +6104,7 @@ pub fn standing_answers_level_off_under_sustained_load<C: FaultableCluster>(
         c.now().saturating_sub(closed),
     );
     let payers = [(TRADER_SHARD, opened_at[2])];
-    let conserved = load_conserved(c, &flight, &payers, LOAD_DRAIN, &protocol_resource, &units);
+    let conserved = load_conserved(c, &flight, &payers, &protocol_resource, &units);
     standing_within_the_answer_caps(c);
     assert_load_conserved(conserved);
     assert!(
