@@ -43,6 +43,9 @@ struct Inner {
     histogram_count: BTreeMap<Key, u64>,
     histogram_sum: BTreeMap<Key, f64>,
     histogram_buckets: BTreeMap<Key, BTreeMap<u16, u64>>,
+    /// Counters again, by the host a [`MemoryRecorder::for_host`] view
+    /// counted them for.
+    host_counters: BTreeMap<(u32, Key), u64>,
 }
 
 /// The label a counter kept by hash records `hash` under: its bytes in
@@ -91,6 +94,8 @@ fn bucket_ceiling(bucket: u16) -> f64 {
 #[derive(Clone, Default)]
 pub struct MemoryRecorder {
     inner: Arc<Mutex<Inner>>,
+    /// The host this view counts for as well, if it is one.
+    host: Option<u32>,
 }
 
 impl MemoryRecorder {
@@ -119,6 +124,40 @@ impl MemoryRecorder {
                 inner
                     .counters
                     .get(&(name, Some(label.to_owned())))
+                    .copied()
+                    .unwrap_or(0)
+            },
+        )
+    }
+
+    /// A view that records into this one's state and also counts each
+    /// counter under `host`, for a harness that steps one host at a time.
+    #[must_use]
+    pub fn for_host(&self, host: u32) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            host: Some(host),
+        }
+    }
+
+    /// [`Self::counter`] as the [`Self::for_host`] view of `host` counted
+    /// it.
+    #[must_use]
+    pub fn host_counter(&self, host: u32, name: &'static str, label: Option<&str>) -> u64 {
+        let inner = self.inner.lock();
+        label.map_or_else(
+            || {
+                inner
+                    .host_counters
+                    .range((host, (name, None))..)
+                    .take_while(|((at, (entry, _)), _)| *at == host && *entry == name)
+                    .map(|(_, count)| count)
+                    .sum()
+            },
+            |label| {
+                inner
+                    .host_counters
+                    .get(&(host, (name, Some(label.to_owned()))))
                     .copied()
                     .unwrap_or(0)
             },
@@ -224,6 +263,7 @@ impl MemoryRecorder {
         inner.histogram_count.clear();
         inner.histogram_sum.clear();
         inner.histogram_buckets.clear();
+        inner.host_counters.clear();
     }
 
     /// Snapshot all recorded values for debugging or golden-file output.
@@ -240,7 +280,11 @@ impl MemoryRecorder {
 
     fn inc(&self, name: &'static str, label: Option<&str>, by: u64) {
         let key = (name, label.map(str::to_owned));
-        *self.inner.lock().counters.entry(key).or_insert(0) += by;
+        let mut inner = self.inner.lock();
+        if let Some(host) = self.host {
+            *inner.host_counters.entry((host, key.clone())).or_insert(0) += by;
+        }
+        *inner.counters.entry(key).or_insert(0) += by;
     }
 
     fn set(&self, name: &'static str, label: Option<&str>, value: f64) {
@@ -832,6 +876,21 @@ mod tests {
         r.record_block_committed(0, 0.05, "qc");
         assert_eq!(r.counter("blocks_committed", Some("0")), 1);
         assert_eq!(r.histogram_count("block_commit_latency", Some("qc")), 1);
+    }
+
+    #[test]
+    fn a_host_view_counts_into_the_whole_and_under_its_host() {
+        let r = MemoryRecorder::new();
+        let first = r.for_host(1);
+        first.record_fetch_started("transaction");
+        first.record_fetch_started("record_proof");
+        r.for_host(2).record_fetch_started("transaction");
+        r.record_fetch_started("transaction");
+        assert_eq!(r.counter("fetch_started", Some("transaction")), 3);
+        assert_eq!(r.host_counter(1, "fetch_started", Some("transaction")), 1);
+        assert_eq!(r.host_counter(1, "fetch_started", None), 2);
+        assert_eq!(r.host_counter(2, "fetch_started", None), 1);
+        assert_eq!(r.host_counter(3, "fetch_started", None), 0);
     }
 
     #[test]

@@ -548,6 +548,8 @@ impl SimCluster {
         let recorder = MemoryRecorder::new();
         let mut runner = SimulationRunner::new(&sim_config, seed);
         runner.record_into(Arc::new(recorder.clone()));
+        let hosts = recorder.clone();
+        runner.record_hosts_into(move |host| Arc::new(hosts.for_host(host)));
         runner.initialize_genesis();
 
         let cluster = Self {
@@ -1994,6 +1996,10 @@ impl FaultableCluster for SimCluster {
 
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64 {
         self.recorder.counter(name, label)
+    }
+
+    fn host_metric(&self, host: usize, name: &'static str, label: Option<&str>) -> Option<u64> {
+        Some(self.recorder.host_counter(host_index(host), name, label))
     }
 
     fn metric_quantile_above(

@@ -539,7 +539,18 @@ pub struct SimulationRunner {
     /// Where the hosts' metrics go while the runner steps them, if
     /// anywhere but the thread's own recorder.
     recorder: Option<Arc<dyn MetricsRecorder>>,
+
+    /// The recorder a host's own steps go to in place of
+    /// [`Self::recorder`], so a harness can tell one host's counts from
+    /// the rest.
+    host_recorder: Option<HostRecorder>,
+
+    /// What [`Self::host_recorder`] has built, by host.
+    host_recorders: Vec<Arc<dyn MetricsRecorder>>,
 }
+
+/// Builds the recorder one host's steps record into.
+type HostRecorder = Box<dyn Fn(NodeIndex) -> Arc<dyn MetricsRecorder>>;
 
 /// A crash armed at a host's coming storage write.
 #[derive(Clone, Copy, Debug)]
@@ -936,6 +947,8 @@ impl SimulationRunner {
                 .collect(),
             power_loss: network_config.power_loss,
             recorder: None,
+            host_recorder: None,
+            host_recorders: Vec::new(),
         }
     }
 
@@ -946,9 +959,31 @@ impl SimulationRunner {
         self.recorder = Some(recorder);
     }
 
+    /// Route what each host emits on its own steps to the recorder
+    /// `for_host` builds for it, in place of [`Self::record_into`]'s.
+    pub fn record_hosts_into(
+        &mut self,
+        for_host: impl Fn(NodeIndex) -> Arc<dyn MetricsRecorder> + 'static,
+    ) {
+        self.host_recorder = Some(Box::new(for_host));
+        self.host_recorders.clear();
+    }
+
     /// The scope [`Self::record_into`] asks for, held across one step.
     fn recording(&self) -> Option<RecorderScope> {
         self.recorder.clone().map(scope_recorder)
+    }
+
+    /// The scope [`Self::record_hosts_into`] asks for, held across one
+    /// of `host`'s steps.
+    fn host_recording(&mut self, host: NodeIndex) -> Option<RecorderScope> {
+        let for_host = self.host_recorder.as_ref()?;
+        let i = host as usize;
+        while self.host_recorders.len() <= i {
+            let next = NodeIndex::try_from(self.host_recorders.len()).expect("a host index");
+            self.host_recorders.push(for_host(next));
+        }
+        Some(scope_recorder(Arc::clone(&self.host_recorders[i])))
     }
 
     /// Enable traffic analysis on an existing runner.
@@ -1803,6 +1838,7 @@ impl SimulationRunner {
     /// Hand `host` one event, then keep its batch wake at its nearest
     /// deadline.
     fn process_event(&mut self, host: NodeIndex, event: SimEvent) {
+        let _recording = self.host_recording(host);
         match event {
             SimEvent::Restart => self.restart_host(host),
             // A down host takes nothing: what was addressed to it is lost

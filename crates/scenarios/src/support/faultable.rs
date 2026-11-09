@@ -311,6 +311,12 @@ pub trait FaultableCluster: Cluster {
     /// a labelled counter is the sum over its labels.
     fn metric(&self, name: &'static str, label: Option<&str>) -> u64;
 
+    /// [`metric`](Self::metric) as `host` alone counted it, on its own
+    /// steps; `None` on a harness whose hosts share one recorder.
+    fn host_metric(&self, _host: usize, _name: &'static str, _label: Option<&str>) -> Option<u64> {
+        None
+    }
+
     /// Read the `q` quantile of a cluster-wide histogram over the
     /// observations above `floor`, within an eighth above the true value;
     /// `None` before any such observation.
