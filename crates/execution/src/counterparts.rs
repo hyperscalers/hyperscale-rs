@@ -4042,7 +4042,7 @@ impl Counterparts {
         // Per producer: whether only unsolicited records are held for
         // it, and its oldest anchor.
         let mut producers: BTreeMap<ShardId, (bool, WeightedTimestamp)> = BTreeMap::new();
-        let mut claims: Vec<StateClaim> = Vec::new();
+        let mut at: BTreeMap<Anchor, Vec<StateClaim>> = BTreeMap::new();
         for held in self.fetched.claims() {
             // What the chain to the parent carries at the claim's anchor
             // is passed over, and the rest offered as a claim of its own.
@@ -4070,14 +4070,27 @@ impl Counterparts {
                     *ts = (*ts).min(claim.anchor.ts);
                 })
                 .or_insert((unasked, claim.anchor.ts));
-            claims.push(if unsolicited.is_empty() {
-                claim.clone()
-            } else {
-                let named: Vec<(SubstateKey, CrossingId)> =
-                    claim.crossings.iter().copied().chain(unsolicited).collect();
-                claim.clone().naming(named)
-            });
+            at.entry(claim.anchor)
+                .or_default()
+                .push(if unsolicited.is_empty() {
+                    claim.clone()
+                } else {
+                    let named: Vec<(SubstateKey, CrossingId)> =
+                        claim.crossings.iter().copied().chain(unsolicited).collect();
+                    claim.clone().naming(named)
+                });
         }
+        // The claims held at one anchor read disjoint keys but can read
+        // interleaved spans, which a block refuses at one anchor past the
+        // first: offered as one key-ordered list in runs, they all ride
+        // in one block, and so does every reading split among them.
+        let mut claims: Vec<StateClaim> = at
+            .into_values()
+            .flat_map(|held| match held.len() {
+                1 => held,
+                _ => StateClaim::in_runs(&held),
+            })
+            .collect();
         claims.sort_by_key(|claim| {
             (
                 producers[&claim.anchor.shard],
@@ -9043,7 +9056,7 @@ mod tests {
         );
 
         producer.on_proof_fetched(anchor, &[claim1, claim2], &second, &[]);
-        let held = producer.state_claims(&CarriedClaims::default());
+        let held: Vec<StateClaim> = producer.fetched.claims().cloned().collect();
         assert_eq!(held.len(), 2, "the overlap is held once");
         let fresh = held
             .iter()
@@ -9055,6 +9068,10 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), before, "no key is held twice at one anchor");
+        let offered = producer.state_claims(&CarriedClaims::default());
+        assert_eq!(offered.len(), 1, "offered as one claim at the anchor");
+        assert_eq!(offered[0].keys(), all);
+        assert_eq!(offered[0].verify(), Ok(()));
 
         assert_eq!(
             producer.fetched.readings,
@@ -10275,6 +10292,24 @@ mod tests {
         );
         assert!(counterparts.fetched.reads(PRODUCER, cells.row));
         assert!(!counterparts.fetched.reads(PRODUCER, cells.marker));
+    }
+
+    /// Two seat readings held at one anchor read disjoint keys over
+    /// interleaved spans, which a block's order rule admits only one of:
+    /// they are offered as one key-ordered list, so one block carries
+    /// both whole.
+    #[test]
+    fn seat_readings_interleaved_at_one_anchor_are_offered_as_one_list() {
+        let (mut counterparts, _) = hearing();
+        let keys: Vec<SubstateKey> = (1..=4).map(producer_record).collect();
+        let at = producer_at(5, &keys);
+        let first = read_at(at, &keys, &[keys[0], keys[2]]);
+        let second = read_at(at, &keys, &[keys[1], keys[3]]);
+        counterparts.hold_seat_reading(&first, TxHash::from(Hash::from_bytes(b"first")));
+        counterparts.hold_seat_reading(&second, TxHash::from(Hash::from_bytes(b"second")));
+        let offered = counterparts.state_claims(&CarriedClaims::default());
+        assert_eq!(offered.len(), 1, "one claim at the anchor");
+        assert_eq!(offered[0].keys(), keys, "reading every cell of both");
     }
 
     /// The order the other claims are offered in is theirs alone: a

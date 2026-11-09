@@ -198,22 +198,7 @@ impl BoundaryOffer {
     /// merged into one claim, or the pieces where they do not merge.
     #[must_use]
     pub fn run_of(&self, run: &[SubstateKey]) -> Vec<StateClaim> {
-        let (Some(first), Some(last)) = (run.first().copied(), run.last().copied()) else {
-            return Vec::new();
-        };
-        let pieces: Vec<StateClaim> = self
-            .claims
-            .iter()
-            .filter(|claim| {
-                claim
-                    .cells
-                    .first()
-                    .zip(claim.cells.last())
-                    .is_some_and(|((lo, _), (hi, _))| *lo <= last && first <= *hi)
-            })
-            .filter_map(|claim| claim.restrict(|key| run.binary_search(&key).is_ok()))
-            .collect();
-        StateClaim::merge(&pieces).map_or(pieces, |merged| vec![merged])
+        StateClaim::run_of(&self.claims, run)
     }
 }
 
@@ -863,6 +848,47 @@ impl StateClaim {
                 .naming(crossings)
                 .hearing(verdicts),
         )
+    }
+
+    /// `claims`, all at one anchor, as one key-ordered list cut into
+    /// runs of [`MAX_PROOFS_PER_QUERY`] cells, each run carried as
+    /// [`Self::run_of`] carries it: the form a block carries one
+    /// anchor's readings in, whatever spans the claims it is cut from
+    /// read.
+    #[must_use]
+    pub fn in_runs(claims: &[Self]) -> Vec<Self> {
+        let keys: Vec<SubstateKey> = claims
+            .iter()
+            .flat_map(Self::keys)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        keys.chunks(MAX_PROOFS_PER_QUERY)
+            .flat_map(|run| Self::run_of(claims, run))
+            .collect()
+    }
+
+    /// The claims `run`, ascending keys at one anchor, rides as: its
+    /// cells cut from the `claims` that read them and merged into one
+    /// claim, so the run takes one place and the nodes its pieces'
+    /// proofs share ride once, or the pieces where they do not merge.
+    #[must_use]
+    fn run_of(claims: &[Self], run: &[SubstateKey]) -> Vec<Self> {
+        let (Some(first), Some(last)) = (run.first().copied(), run.last().copied()) else {
+            return Vec::new();
+        };
+        let pieces: Vec<Self> = claims
+            .iter()
+            .filter(|claim| {
+                claim
+                    .cells
+                    .first()
+                    .zip(claim.cells.last())
+                    .is_some_and(|((lo, _), (hi, _))| *lo <= last && first <= *hi)
+            })
+            .filter_map(|claim| claim.restrict(|key| run.binary_search(&key).is_ok()))
+            .collect();
+        Self::merge(&pieces).map_or(pieces, |merged| vec![merged])
     }
 
     /// One claim over every cell `pieces` read, all at one anchor: their
