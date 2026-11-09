@@ -24666,6 +24666,89 @@ mod tests {
         );
     }
 
+    /// A synced block's QC whose clock a serving peer lowered beneath the
+    /// block's anchor is adopted at the anchor: the clock rides outside the
+    /// QC's signature, and a proposal built over a QC beneath the anchor is
+    /// one no voter takes.
+    #[test]
+    fn a_synced_qc_dated_beneath_its_anchor_is_adopted_at_the_anchor() {
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+        state.set_block_syncing(true);
+
+        let anchor = WeightedTimestamp::from_millis(50_000);
+        let block = block_with_parent_qc_ts(BlockHeight::new(4), anchor.as_millis());
+        let block_hash = block.hash();
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let lowered = QuorumCertificate::new(
+            block_hash,
+            ShardId::ROOT,
+            BlockHeight::new(4),
+            block.header().parent_block_hash(),
+            block.header().round(),
+            Epoch::GENESIS,
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(1),
+        );
+        let _ = state.on_sync_block_ready_to_apply(
+            &topology_schedule,
+            CertifiedBlock::new_unchecked(block, lowered.clone()),
+        );
+        // SAFETY: synthetic test fixture, no real signature.
+        let verified = Verified::<QuorumCertificate>::new_unchecked_for_test(lowered);
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(block_hash),
+            Ok(verified),
+        );
+
+        let adopted = state.latest_qc().expect("the synced QC is adopted");
+        assert_eq!(adopted.block_hash(), block_hash);
+        assert!(
+            adopted.weighted_timestamp() >= anchor,
+            "adopted at {:?}, beneath the anchor {anchor:?}",
+            adopted.weighted_timestamp(),
+        );
+    }
+
+    /// A restored QC dated beneath the committed tip's anchor is held at
+    /// the anchor, as an adopted one is.
+    #[test]
+    fn a_restored_qc_dated_beneath_its_anchor_is_held_at_the_anchor() {
+        let (mut state, _) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let anchor = WeightedTimestamp::from_millis(50_000);
+        state.committed_block_anchor_wt = anchor;
+        let tip = BlockHash::from_raw(Hash::from_bytes(b"restored tip"));
+        // SAFETY: synthetic test fixture, no real signature.
+        let lowered =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+                tip,
+                ShardId::ROOT,
+                BlockHeight::new(3),
+                BlockHash::ZERO,
+                Round::new(3),
+                Epoch::GENESIS,
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(1),
+            ));
+        let _ = state.on_committed_state_restored(BlockHeight::new(3), Some(tip), Some(lowered));
+
+        let held = state.latest_qc().expect("the restored QC is held");
+        assert!(
+            held.weighted_timestamp() >= anchor,
+            "held at {:?}, beneath the anchor {anchor:?}",
+            held.weighted_timestamp(),
+        );
+    }
+
     /// A block this node was still assembling when sync delivered it is
     /// read whole by the chain walk: the synced body supersedes the
     /// pending entry, so the walk reports every part it carries and every
