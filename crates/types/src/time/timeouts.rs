@@ -53,9 +53,10 @@ pub const NAMING_WINDOW: Duration = MAX_FINALIZATION_DELAY;
 ///
 /// Shared by `hyperscale-shard` (deferral-proof verification) and
 /// `hyperscale-remote-headers` (provision/exec-cert verification). Measured
-/// against the shard consensus-authenticated `weighted_timestamp_ms` on the tip vs the
-/// stored header. Sized generously above `MAX_FINALIZATION_DELAY` so late-arriving
-/// proofs still find a header to verify against.
+/// between the tip's and the stored header's parent-QC weighted timestamps,
+/// the clock each header's hash pins; a header's own certificate clock is
+/// unsigned and plays no part. Sized generously above `MAX_FINALIZATION_DELAY`
+/// so late-arriving proofs still find a header to verify against.
 pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 
 /// Single principled retention bound for every artefact derived from a tx

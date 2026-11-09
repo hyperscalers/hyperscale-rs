@@ -2741,7 +2741,7 @@ mod tests {
     }
 
     /// A check's result is about the copy it checked. A copy whose
-    /// certificate claims an old clock is pruned by the retention while
+    /// header claims an old parent clock is pruned by the retention while
     /// its check is in flight, and the same source can then hold a
     /// different copy at the height, queued behind another check: the
     /// stale failure neither drops that unchecked copy nor dispatches a
@@ -2766,20 +2766,7 @@ mod tests {
         let window = Epoch::new(1);
         let in_flight =
             chained_remote_header_signed(remote, height, BlockHash::ZERO, window, 2 * ED - 2);
-        let checked = CertifiedBlockHeader::new(
-            in_flight.header().clone(),
-            QuorumCertificate::new(
-                in_flight.qc().block_hash(),
-                remote,
-                height,
-                BlockHash::ZERO,
-                Round::INITIAL,
-                window,
-                SignerBitfield::empty(),
-                AggregateSignature::ZERO,
-                WeightedTimestamp::from_millis(ED + 1),
-            ),
-        );
+        let checked = chained_remote_header_signed(remote, height, BlockHash::ZERO, window, ED + 1);
         let actions =
             coord.on_remote_header_received(&schedule, checked.clone(), HeaderSource::Fetched);
         assert_eq!(verify_qc_count(&actions), 1);
@@ -3155,8 +3142,8 @@ mod tests {
         );
     }
 
-    /// A header nobody has checked moves no retention. Its certificate's
-    /// clock is the sender's to write, bounded only by the committed
+    /// A header nobody has checked moves no retention. Its parent clock
+    /// is the sender's to write, bounded only by the committed
     /// window its parent anchor must resolve in, and its height not at
     /// all: taken as the tip, a forged far height with a clock late in
     /// that window would prune every honest header held from the shard,
@@ -5242,9 +5229,9 @@ mod tests {
         assert_eq!(committed, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
-    /// `chain_header_dated` with the header's own parent-QC clock set
-    /// apart from its certificate's date: the replaced committee signs
-    /// whatever header it likes, and nothing checks the embedded parent QC.
+    /// `chain_header_dated` with its certificate's clock set apart from
+    /// its parent QC's: the certificate's clock rides outside its signed
+    /// message, so whoever relays the header writes it.
     fn header_with_parent_clock(
         shard: ShardId,
         height: u64,
@@ -5345,60 +5332,49 @@ mod tests {
         );
     }
 
-    /// The replaced committee chooses the parent-QC clock its headers
-    /// embed. Orphans at 5 on the held frontier block, each carrying a
-    /// parent clock far in the future, are retained on their certificates'
-    /// date, so a fresh tip past the horizon drops every one.
-    #[test]
-    fn a_future_parent_clock_buys_no_retention() {
-        let local = ShardId::leaf(1, 0);
-        let remote = ShardId::leaf(1, 1);
-        let mut coord = RemoteHeaderCoordinator::new(local);
-        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
-        commit_local(&mut coord, &cleared, 1);
-
-        let shared = shared_history(remote);
-        let refs: Vec<&Verified<CertifiedBlockHeader>> = shared.iter().collect();
-        admit_under(&mut coord, &cleared, &refs);
-        let far = u64::MAX / 4;
-        for round in 0..100u64 {
-            let orphan = header_with_parent_clock(remote, 5, 100 + round, &shared[3], 7_000, far);
-            admit_under(&mut coord, &cleared, &[&orphan]);
+    /// The headers held, and the tip's clock, after a chain of 300 genuine
+    /// headers a second apart is delivered and checked, each carrying its
+    /// certificate's clock as aggregated or, `lowered`, rewritten to zero.
+    fn held_after_relayed_chain(lowered: bool) -> (usize, WeightedTimestamp) {
+        let remote = ShardId::leaf(2, 1);
+        let schedule = fast_path_schedule();
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
+        let mut parent = chain_header(remote, 1, 1, None);
+        for height in 2..=300u64 {
+            let honest = height * 1_000;
+            let qc_ms = if lowered { 0 } else { honest };
+            let header = header_with_parent_clock(remote, height, height, &parent, qc_ms, honest);
+            let _ = coord.on_remote_header_received(&schedule, (*header).clone(), gossip(1));
+            let _ = coord.on_remote_header_qc_verified(
+                &schedule,
+                &header,
+                gossip(1),
+                Ok(header.clone()),
+            );
+            parent = header;
         }
-        let held = coord.memory_stats();
-        let horizon = u64::try_from(TRANSACTION_EVIDENCE_HORIZON.as_millis()).unwrap();
-        let tip_ms = 20_000 + horizon + 10_000;
-        let mut parent = chain_header_dated(remote, 5, 1_000, Some(&shared[3]), 10_500);
-        admit_under(&mut coord, &cleared, &[&parent]);
-        for height in 6..=8u64 {
-            let next = chain_header_dated(remote, height, 1_000 + height, Some(&parent), tip_ms);
-            admit_under(&mut coord, &cleared, &[&next]);
-            parent = next;
-        }
-        assert_eq!(held.fork_siblings, 99);
-        assert_eq!(coord.memory_stats().fork_siblings, 0);
+        coord.cleanup();
+        (
+            coord.memory_stats().verified_headers,
+            coord.shards[&remote].tip().1,
+        )
     }
 
-    /// A header carrying a future parent clock, held highest, raises the
-    /// tip only to its certificate's date, so the walked headers beneath
-    /// the frontier stay.
+    /// A relay that delivers each genuine header first, its certificate's
+    /// clock rewritten to zero, moves no retention: the clock rides outside
+    /// the signed message, so the check passes. Read as the retention
+    /// clock, every header would date from zero, the tip with them, and
+    /// nothing would ever age out of the shard's store.
     #[test]
-    fn a_future_parent_clock_does_not_raise_the_tip() {
-        let local = ShardId::leaf(1, 0);
-        let remote = ShardId::leaf(1, 1);
-        let mut coord = RemoteHeaderCoordinator::new(local);
-        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
-        commit_local(&mut coord, &cleared, 1);
-
-        let shared = shared_history(remote);
-        let refs: Vec<&Verified<CertifiedBlockHeader>> = shared.iter().collect();
-        admit_under(&mut coord, &cleared, &refs);
-        assert_eq!(coord.verified_frontier(remote), Some(BlockHeight::new(4)));
-        let far = header_with_parent_clock(remote, 5, 5, &shared[3], 7_000, u64::MAX / 4);
-        admit_under(&mut coord, &cleared, &[&far]);
-        for height in 1..=3 {
-            assert!(coord.has_verified(remote, BlockHeight::new(height)));
-        }
+    fn a_relayed_lower_clock_keeps_retention() {
+        let (honest_held, honest_tip) = held_after_relayed_chain(false);
+        let (lowered_held, lowered_tip) = held_after_relayed_chain(true);
+        assert_eq!(honest_held, 31, "a second apart, 30 seconds of headers");
+        assert_eq!(
+            lowered_held, honest_held,
+            "a relay-lowered clock moved the retention"
+        );
+        assert_eq!(lowered_tip, honest_tip);
     }
 
     #[test]

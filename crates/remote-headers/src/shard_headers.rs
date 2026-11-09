@@ -11,15 +11,13 @@ use crate::coordinator::RemoteHeaderMemoryStats;
 
 /// The weighted timestamp a held header's retention is measured on: its
 /// parent QC's, the moment the remote committee certified the block it
-/// extends, clamped to its own certificate's. Nothing verifies the parent
-/// QC a header embeds, so a committee can stamp any clock there; its own
-/// certificate is never earlier for an honest header.
+/// extends. The header's hash pins that clock, so once the certificate
+/// verifies, the committee stands behind it. The certificate's own clock
+/// rides outside its signed message, free for any relay to rewrite, and
+/// honest aggregation clamps it to at least the parent's: the parent's
+/// clock is its floor and the only clock the header pins.
 pub fn retention_ts(header: &CertifiedBlockHeader) -> WeightedTimestamp {
-    header
-        .header()
-        .parent_qc()
-        .weighted_timestamp()
-        .min(header.qc().weighted_timestamp())
+    header.header().parent_qc().weighted_timestamp()
 }
 
 /// What [`ShardHeaders::add_candidate`] did with a sender's header.
