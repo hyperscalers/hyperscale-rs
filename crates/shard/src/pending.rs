@@ -408,6 +408,19 @@ impl PendingBlocks {
         )
     }
 
+    /// How long until the first incomplete block whose missing data has
+    /// been outstanding less than `timeout` reaches it; `None` where no
+    /// such block waits.
+    pub fn next_fetch_due(&self, now: LocalTimestamp, timeout: Duration) -> Option<Duration> {
+        self.0
+            .values()
+            .filter(|pending| !pending.is_complete())
+            .map(|pending| now.elapsed_since(pending.created_at()))
+            .filter(|age| *age < timeout)
+            .map(|age| timeout.saturating_sub(age))
+            .min()
+    }
+
     /// Emit fetch actions for pending blocks whose missing data has been
     /// outstanding longer than `timeout`. Skips complete blocks.
     /// `force_immediate` bypasses the age check.
@@ -1045,6 +1058,55 @@ mod tests {
         assert!(pb.missing_transactions().contains(&tx2));
         assert!(!pb.is_complete());
         assert!(pb.block().is_none());
+    }
+
+    /// The grace runs from each incomplete block's arrival: the first one
+    /// still inside it names the wait, and a complete block or one past it
+    /// names none.
+    #[test]
+    fn the_next_fetch_falls_due_at_the_first_grace_still_running() {
+        let grace = Duration::from_millis(600);
+        let wanting = |height: u64, at: u64| {
+            PendingBlock::from_manifest(
+                make_header(BlockHeight::new(height)),
+                BlockManifest::new(BlockManifestParts {
+                    cert_ids: Capped::from_array([FinalizationHash::from_raw(Hash::from_bytes(
+                        &height.to_be_bytes(),
+                    ))]),
+                    ..Default::default()
+                }),
+                LocalTimestamp::from_millis(at),
+            )
+        };
+        let mut pending = PendingBlocks::new();
+        let now = LocalTimestamp::from_millis(1_000);
+        assert_eq!(pending.next_fetch_due(now, grace), None);
+
+        pending.insert(PendingBlock::from_manifest(
+            make_header(BlockHeight::new(1)),
+            BlockManifest::default(),
+            LocalTimestamp::from_millis(900),
+        ));
+        assert_eq!(
+            pending.next_fetch_due(now, grace),
+            None,
+            "a complete block waits on nothing"
+        );
+
+        pending.insert(wanting(2, 300));
+        assert_eq!(
+            pending.next_fetch_due(now, grace),
+            None,
+            "one past its grace is due already"
+        );
+
+        pending.insert(wanting(3, 700));
+        pending.insert(wanting(4, 900));
+        assert_eq!(
+            pending.next_fetch_due(now, grace),
+            Some(Duration::from_millis(300)),
+            "the earliest arrival still inside its grace",
+        );
     }
 
     #[test]

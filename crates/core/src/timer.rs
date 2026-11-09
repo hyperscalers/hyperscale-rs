@@ -15,10 +15,12 @@ pub enum TimerId {
     /// following at once, and while an empty block is held, for when the
     /// hold ends or withheld content's dwell does. Shard-scoped.
     ProposalPace,
-    /// Gossip grace for a proposal a vote named and this replica never
-    /// received — one-shot, armed when the vote arrives; on fire, the
-    /// proposals still missing are fetched. Shard-scoped.
-    ProposalFetch,
+    /// Gossip grace for what a proposal needs and gossip has not brought:
+    /// a proposal a vote named and this replica never received, or the
+    /// content a received proposal names and this replica does not hold.
+    /// One-shot, armed for the earliest grace still running; on fire, what
+    /// is overdue is fetched. Shard-scoped.
+    FetchGrace,
     /// Periodic tick for the fetch protocol (retry pending fetches).
     /// Process-scoped — fans out across all hosted shards on fire.
     FetchTick,

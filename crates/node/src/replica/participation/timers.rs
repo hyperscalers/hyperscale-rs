@@ -81,8 +81,9 @@ impl ShardParticipation {
             duration: self.shard_coordinator.config().cleanup_interval,
         }];
 
-        // Pending blocks that need fetch requests. Delayed to give gossip
-        // and local certificate creation time to fill in missing data first.
+        // Pending blocks still short of content past their gossip grace:
+        // what the fetch grace timer asked for and has not arrived is asked
+        // again.
         actions.extend(self.shard_coordinator.check_pending_block_fetches(false));
 
         // Check if we're behind and need to catch up via sync. Handles the

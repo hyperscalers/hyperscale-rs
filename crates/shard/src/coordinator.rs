@@ -4696,7 +4696,7 @@ impl ShardCoordinator {
         if !scheduled_vote_verification
             && !self.finalize_complete_block(topology_schedule, block_hash, &mut actions)
         {
-            self.log_incomplete_block(block_hash);
+            actions.extend(self.await_missing_content(block_hash));
         }
 
         // A header for `block_hash` just landed, so `committee(block_hash)` now
@@ -5325,11 +5325,11 @@ impl ShardCoordinator {
         true
     }
 
-    /// Log an incomplete block. The cleanup timer's
-    /// `check_pending_block_fetches()` will eventually emit fetch requests;
-    /// deferring here avoids unnecessary traffic when gossip or local cert
-    /// creation fills in the data.
-    fn log_incomplete_block(&self, block_hash: BlockHash) {
+    /// Wait out the gossip grace for what an incomplete block lacks: it is
+    /// fetched on the fetch grace timer this arms ([`Self::fetch_overdue`])
+    /// once the grace runs out, which avoids unnecessary traffic when
+    /// gossip or local cert creation fills in the data.
+    fn await_missing_content(&self, block_hash: BlockHash) -> Option<Action> {
         if let Some(pending) = self.pending_blocks.get(block_hash) {
             debug!(
                 signers = ?self.signers.keys(),
@@ -5340,6 +5340,7 @@ impl ShardCoordinator {
                 "Block incomplete, will fetch after timeout if still missing"
             );
         }
+        self.arm_fetch_grace()
     }
 
     /// Trigger QC verification (if needed) and then vote on a complete block.
@@ -6291,9 +6292,6 @@ impl ShardCoordinator {
         {
             return actions;
         }
-        // An entry still waiting has the timer armed for a grace that ends
-        // no later than this one's.
-        let armed = self.proposal_fetches.values().any(|wanted| !wanted.asked);
         self.proposal_fetches.insert(
             voter,
             ProposalWanted {
@@ -6303,29 +6301,19 @@ impl ShardCoordinator {
                 asked: false,
             },
         );
-        if !armed {
-            actions.push(Action::SetTimer {
-                id: TimerId::ProposalFetch,
-                duration: self.view_change.fetch_timeout(),
-            });
-        }
+        actions.extend(self.arm_fetch_grace());
         actions
     }
 
     /// Fetch every wanted proposal whose gossip grace has run out, from
-    /// the member whose vote named it, and re-arm for the rest.
-    pub fn fetch_overdue_proposals(&mut self) -> Vec<Action> {
+    /// the member whose vote named it, and what every pending block
+    /// whose grace has run out still lacks, from its proposer; then
+    /// re-arm for the rest.
+    pub fn fetch_overdue(&mut self) -> Vec<Action> {
         let mut actions = self.release_passed_proposal_fetches();
         let grace = self.view_change.fetch_timeout();
-        let mut next_due: Option<Duration> = None;
         for (voter, wanted) in &mut self.proposal_fetches {
-            if wanted.asked {
-                continue;
-            }
-            let waited = self.now.saturating_sub(wanted.since);
-            if waited < grace {
-                let due = grace.saturating_sub(waited);
-                next_due = Some(next_due.map_or(due, |next| next.min(due)));
+            if wanted.asked || self.now.saturating_sub(wanted.since) < grace {
                 continue;
             }
             wanted.asked = true;
@@ -6336,13 +6324,31 @@ impl ShardCoordinator {
                 class: None,
             }));
         }
-        if let Some(duration) = next_due {
-            actions.push(Action::SetTimer {
-                id: TimerId::ProposalFetch,
-                duration,
-            });
-        }
+        actions.extend(self.check_pending_block_fetches(false));
+        actions.extend(self.arm_fetch_grace());
         actions
+    }
+
+    /// The fetch grace timer, armed for the earliest gossip grace still
+    /// running: a wanted proposal not yet asked for, or a pending block
+    /// whose missing content is not yet due. `None` where none runs.
+    ///
+    /// A grace waited out on the cleanup timer would end on its next
+    /// tick, up to a whole interval late, and every voter short of one
+    /// finalization holds its vote that long.
+    fn arm_fetch_grace(&self) -> Option<Action> {
+        let grace = self.view_change.fetch_timeout();
+        let proposals = self
+            .proposal_fetches
+            .values()
+            .filter(|wanted| !wanted.asked)
+            .map(|wanted| grace.saturating_sub(self.now.saturating_sub(wanted.since)));
+        let blocks = self.pending_blocks.next_fetch_due(self.now, grace);
+        let duration = proposals.chain(blocks).min()?;
+        Some(Action::SetTimer {
+            id: TimerId::FetchGrace,
+            duration,
+        })
     }
 
     /// Release the proposal fetches for rounds the view has passed: a
@@ -17102,7 +17108,7 @@ mod tests {
         );
         assert!(actions.iter().any(|action| matches!(
             action,
-            Action::SetTimer { id: TimerId::ProposalFetch, duration } if *duration == grace
+            Action::SetTimer { id: TimerId::FetchGrace, duration } if *duration == grace
         )));
         let actions =
             state.on_unverified_block_vote(&schedule, unchecked_vote_for(voters[1], &missed));
@@ -17120,12 +17126,12 @@ mod tests {
 
         state.set_time(LocalTimestamp::from_millis(100_000).plus(grace));
         assert_eq!(
-            proposal_fetches(&state.fetch_overdue_proposals()),
+            proposal_fetches(&state.fetch_overdue()),
             vec![(vec![hash], Some(ValidatorId::new(voters[0])))],
             "the voter holds the header it voted for",
         );
         assert!(
-            proposal_fetches(&state.fetch_overdue_proposals()).is_empty(),
+            proposal_fetches(&state.fetch_overdue()).is_empty(),
             "a proposal is asked for once",
         );
 
@@ -17150,7 +17156,7 @@ mod tests {
         assert!(state.release_proposal_fetch(missed.hash()).is_empty());
         state
             .set_time(LocalTimestamp::from_millis(100_000).plus(state.view_change.fetch_timeout()));
-        assert!(proposal_fetches(&state.fetch_overdue_proposals()).is_empty());
+        assert!(proposal_fetches(&state.fetch_overdue()).is_empty());
     }
 
     /// A fetch for a round the view has passed is released: its header
@@ -17166,13 +17172,59 @@ mod tests {
         let _ = state.on_unverified_block_vote(&schedule, unchecked_vote_for(voter, &missed));
         state
             .set_time(LocalTimestamp::from_millis(100_000).plus(state.view_change.fetch_timeout()));
-        assert_eq!(proposal_fetches(&state.fetch_overdue_proposals()).len(), 1);
+        assert_eq!(proposal_fetches(&state.fetch_overdue()).len(), 1);
 
         assert!(state.release_passed_proposal_fetches().is_empty());
         state.view_change.advance_to(view.next());
         assert_eq!(
             proposal_abandons(&state.release_passed_proposal_fetches()),
             vec![hash]
+        );
+    }
+
+    /// A block short of a finalization arms the fetch grace for its own
+    /// arrival, and is fetched from its proposer the moment the grace runs
+    /// out rather than on the next cleanup tick.
+    #[test]
+    fn missing_content_is_fetched_when_its_grace_runs_out() {
+        let (mut state, _schedule, _keys) = make_multi_validator_state_with_keys(0);
+        let arrived = LocalTimestamp::from_millis(100_000);
+        state.set_time(arrived);
+        let grace = state.view_change.fetch_timeout();
+        let missing = FinalizationHash::from_raw(Hash::from_bytes(b"a stated half"));
+        let header = empty_block_at_round(state.committed_hash, state.view().inner())
+            .header()
+            .clone();
+        let proposer = header.proposer();
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            header,
+            BlockManifest::new(BlockManifestParts {
+                cert_ids: Capped::from_array([missing]),
+                ..Default::default()
+            }),
+            arrived,
+        ));
+        assert!(matches!(
+            state.arm_fetch_grace(),
+            Some(Action::SetTimer { id: TimerId::FetchGrace, duration }) if duration == grace
+        ));
+
+        state.set_time(arrived.plus(grace));
+        let actions = state.fetch_overdue();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Finalizations(ids),
+                    preferred,
+                    ..
+                }) if *ids == vec![missing] && *preferred == Some(proposer)
+            )),
+            "the missing finalization is asked of the proposer: {actions:?}",
+        );
+        assert!(
+            state.arm_fetch_grace().is_none(),
+            "no grace is left running"
         );
     }
 

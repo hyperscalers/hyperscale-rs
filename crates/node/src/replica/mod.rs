@@ -339,9 +339,7 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::CleanupTimer => self.shard.on_cleanup_timer(sched),
             ProtocolEvent::ViewChangeTimer => self.shard.on_view_change_timer(sched),
             ProtocolEvent::ProposalPaceTimer => self.shard.try_event_driven_proposal(sched),
-            ProtocolEvent::ProposalFetchTimer => {
-                self.shard.shard_coordinator.fetch_overdue_proposals()
-            }
+            ProtocolEvent::FetchGraceTimer => self.shard.shard_coordinator.fetch_overdue(),
 
             // ── Cross-coordinator orchestration (drives the beacon too) ────
             ProtocolEvent::BlockCommitted {

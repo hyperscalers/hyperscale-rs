@@ -1166,7 +1166,7 @@ mod tests {
         );
         let actions = node.handle(
             LocalTimestamp::from_millis(10_000),
-            ProtocolEvent::ProposalFetchTimer,
+            ProtocolEvent::FetchGraceTimer,
         );
         assert!(
             actions.iter().any(|action| matches!(

@@ -115,9 +115,9 @@ pub enum ProtocolEvent {
     /// A leader's proposal pace elapsed — try the proposal it held.
     ProposalPaceTimer,
 
-    /// The gossip grace for a proposal a vote named elapsed — fetch the
-    /// proposals still missing.
-    ProposalFetchTimer,
+    /// A gossip grace elapsed — fetch the proposals and the proposal
+    /// content still missing.
+    FetchGraceTimer,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Shard Consensus

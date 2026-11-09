@@ -450,7 +450,7 @@ impl ShardScopedInput {
                 ProtocolEvent::ViewChangeTimer
                 | ProtocolEvent::CleanupTimer
                 | ProtocolEvent::ProposalPaceTimer
-                | ProtocolEvent::ProposalFetchTimer => EventPriority::Timer,
+                | ProtocolEvent::FetchGraceTimer => EventPriority::Timer,
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
                 | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
@@ -1002,7 +1002,7 @@ pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
         TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
         TimerId::Cleanup => ProtocolEvent::CleanupTimer,
         TimerId::ProposalPace => ProtocolEvent::ProposalPaceTimer,
-        TimerId::ProposalFetch => ProtocolEvent::ProposalFetchTimer,
+        TimerId::FetchGrace => ProtocolEvent::FetchGraceTimer,
         TimerId::FetchTick => {
             return match owner {
                 TimerOwner::Loop(shard) => HostEvent::shard(shard, ShardScopedInput::FetchTick),
