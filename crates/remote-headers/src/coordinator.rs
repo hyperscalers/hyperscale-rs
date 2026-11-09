@@ -453,7 +453,10 @@ impl RemoteHeaderCoordinator {
         // next header of its shard arrives: a commit-proof range is older
         // than the retention by construction, and the next header in it
         // resolves its committee through this one as its pending parent.
-        self.update_tip_and_prune(shard, height, retention_ts(&certified_header));
+        // The tip stays where checked headers put it: this one's clock and
+        // height are the sender's to write until its certificate verifies.
+        let tip_ts = self.store_mut(shard).tip().1;
+        self.prune_shard_behind(shard, tip_ts);
 
         let candidate =
             self.store_mut(shard)
@@ -525,9 +528,12 @@ impl RemoteHeaderCoordinator {
             "Remote header QC verified — promoting"
         );
 
-        if let Some(store) = self.shards.get_mut(&shard) {
-            store.clear_pending(height);
-        }
+        // Raise the tip without pruning: the candidates of a commit-proof
+        // range queued above this one are older than the retention, and go
+        // at the next arrival's prune as they always do.
+        let store = self.store_mut(shard);
+        store.raise_tip(height, retention_ts(&verified));
+        store.clear_pending(height);
         let mut actions = self.admit_verified_header(topology_schedule, verified);
         actions.extend(self.reoffer_awaiting_parent(topology_schedule, shard));
         actions
@@ -2785,7 +2791,11 @@ mod tests {
             window,
             2 * ED - 1,
         );
-        let _ = coord.on_remote_header_received(&schedule, tip, gossip(1));
+        let _ = coord.on_verified_remote_header_received(
+            &schedule,
+            Verified::new_unchecked_for_test(tip),
+            ValidatorId::new(1),
+        );
         assert!(coord.get_pending(remote, height).is_none());
 
         let actions = coord.on_remote_header_received(&schedule, in_flight.clone(), gossip(2));
@@ -3142,6 +3152,76 @@ mod tests {
         assert!(
             coord.has_verified(remote, BlockHeight::new(7)),
             "but the walked frontier stays: the next header anchors on it",
+        );
+    }
+
+    /// A header nobody has checked moves no retention. Its certificate's
+    /// clock is the sender's to write, bounded only by the committed
+    /// window its parent anchor must resolve in, and its height not at
+    /// all: taken as the tip, a forged far height with a clock late in
+    /// that window would prune every honest header held from the shard,
+    /// and freeze the tip there, since only a higher height moves it.
+    #[test]
+    fn an_unchecked_header_moves_no_retention() {
+        const ED: u64 = 100_000;
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let mut schedule = TopologySchedule::new(
+            EpochWindows::new(0, ED),
+            Epoch::new(0),
+            Arc::new(shard_snapshot(2, &ids, 0)),
+        );
+        schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        coord.expected.insert(
+            remote,
+            ExpectedHeader {
+                discovered_at: WeightedTimestamp::from_millis(1),
+                last_verified_height: BlockHeight::new(1),
+                verified_tip: BlockHeight::new(1),
+                last_verified_at: Some(WeightedTimestamp::from_millis(1)),
+            },
+        );
+        let mut parent = None;
+        for height in 2..=5 {
+            let header = chain_header(remote, height, height, parent.as_ref());
+            coord.on_verified_remote_header_received(
+                &schedule,
+                header.clone(),
+                ValidatorId::new(0),
+            );
+            parent = Some(header);
+        }
+        assert_eq!(coord.verified_frontier(remote), Some(BlockHeight::new(5)));
+
+        // Late in the last committed window, at a height far past the tip.
+        let forged = chained_remote_header_signed(
+            remote,
+            BlockHeight::new(1_000_000),
+            BlockHash::from_raw(Hash::from_bytes(b"no such parent")),
+            Epoch::new(1),
+            2 * ED - 1,
+        );
+        let actions = coord.on_remote_header_received(&schedule, forged.clone(), gossip(3));
+        assert_eq!(verify_qc_count(&actions), 1, "the forged copy is checked");
+        assert!(
+            (2..=5).all(|height| coord.has_verified(remote, BlockHeight::new(height))),
+            "an unchecked clock pruned honest headers",
+        );
+
+        let _ = coord.on_remote_header_qc_verified(
+            &schedule,
+            &forged,
+            gossip(3),
+            Err(CertifiedHeaderVerifyError::Qc(
+                QcVerifyError::InvalidSignature,
+            )),
+        );
+        assert_eq!(
+            coord.shards[&remote].tip(),
+            (BlockHeight::new(5), WeightedTimestamp::from_millis(5_000)),
+            "the tip is the highest checked header's",
         );
     }
 
