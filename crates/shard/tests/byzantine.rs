@@ -415,3 +415,46 @@ fn the_rushed_vote_baseline_commits() {
         assert_no_fork(&sim, TARGET);
     }
 }
+
+/// A QC sent with its clock lowered below its block's anchor is never built on.
+///
+/// A QC's `weighted_timestamp` rides outside its signed message, so a member
+/// can lower it on a genuine QC it announces or carries as a timeout's high
+/// QC, and the copy still verifies. Every honest voter refuses a header whose
+/// parent QC sits below the parent's anchor, so a proposer that adopted such
+/// a copy and built on it proposes a block no honest voter takes, and its
+/// own self-vote, cast without that check, is a vote for a regressed anchor.
+#[test]
+fn a_lowered_qc_clock_is_never_built_on() {
+    const TARGET: usize = 25;
+
+    for seed in [0x7C_01, 0x7C_02, 0x7C_03, 0x7C_04, 0x7C_05, 0x7C_06] {
+        let mut sim = ShardCoordinatorSim::new(4, seed);
+        sim.clock_step = Duration::from_millis(5);
+        let adversary = ValidatorId::new(1);
+        sim.with_byzantine(
+            adversary,
+            ByzantineBehaviour::LowerSentQcClock {
+                to: WeightedTimestamp::from_millis(1),
+            },
+        );
+        sim.kick_off();
+        let all: Vec<usize> = (0..sim.n()).collect();
+        sim.run_until_committed_paced(&all, TARGET, 400);
+
+        assert!(
+            sim.byzantine_fires[1] >= 1,
+            "seed {seed:#x}: the adversary never sent a QC",
+        );
+        let honest: Vec<_> = sim
+            .regressing_headers()
+            .into_iter()
+            .filter(|(proposer, _)| *proposer != adversary)
+            .collect();
+        assert!(
+            honest.is_empty(),
+            "seed {seed:#x}: honest proposers built on a lowered QC clock: {honest:?}",
+        );
+        assert_no_fork(&sim, TARGET);
+    }
+}

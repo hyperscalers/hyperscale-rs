@@ -246,6 +246,22 @@ pub enum ByzantineBehaviour {
         /// How far past the sim clock the forged vote timestamp sits.
         ahead: Duration,
     },
+    /// Rewrite the `weighted_timestamp` of every non-genesis QC this
+    /// replica sends in a QC announcement or as a timeout's high QC to
+    /// `to`. The field rides outside the QC's signed message, so the
+    /// rewritten QC still verifies. Sustained.
+    LowerSentQcClock {
+        /// The weighted timestamp every sent QC carries.
+        to: WeightedTimestamp,
+    },
+}
+
+/// `qc` carrying `to` as its weighted timestamp, every signed field kept.
+fn with_qc_clock(qc: QuorumCertificate, to: WeightedTimestamp) -> QuorumCertificate {
+    let (block_hash, shard, height, parent, round, epoch, signers, signature, _) = qc.into_parts();
+    QuorumCertificate::new(
+        block_hash, shard, height, parent, round, epoch, signers, signature, to,
+    )
 }
 
 /// Wire-shape events translated from emitted [`Action`]s by
@@ -1083,6 +1099,25 @@ impl ShardCoordinatorSim {
         true
     }
 
+    /// Every proposed header whose parent QC's weighted timestamp sits
+    /// below its parent's own anchor, as `(proposer, block hash)`. Only
+    /// headers whose parent header the sim saw are judged.
+    #[must_use]
+    pub fn regressing_headers(&self) -> Vec<(ValidatorId, BlockHash)> {
+        self.header_by_block
+            .values()
+            .filter(|header| {
+                self.header_by_block
+                    .get(&header.parent_block_hash())
+                    .is_some_and(|parent| {
+                        header.parent_qc().weighted_timestamp()
+                            < parent.parent_qc().weighted_timestamp()
+                    })
+            })
+            .map(|header| (header.proposer(), header.hash()))
+            .collect()
+    }
+
     /// Flag `replica` to apply `behaviour` to its next matching
     /// outbound action. Fires exactly once, then clears. Overwrites
     /// any previously-set unfired behaviour for that replica.
@@ -1662,6 +1697,13 @@ impl ShardCoordinatorSim {
                 recipients,
                 ..
             }) => {
+                let qc = match self.byzantine[emitter_idx] {
+                    Some(ByzantineBehaviour::LowerSentQcClock { to }) => {
+                        self.byzantine_fires[emitter_idx] += 1;
+                        with_qc_clock(qc, to)
+                    }
+                    _ => qc,
+                };
                 let mut announcement = QcAnnouncementNotification {
                     qc,
                     sender: me,
@@ -1693,6 +1735,13 @@ impl ShardCoordinatorSim {
                 // Mirror the production sign handler: the registers
                 // are durable before the signature exists.
                 self.storages[emitter_idx].persist_vote_position(me, &position);
+                let high_qc = match self.byzantine[emitter_idx] {
+                    Some(ByzantineBehaviour::LowerSentQcClock { to }) if !high_qc.is_genesis() => {
+                        self.byzantine_fires[emitter_idx] += 1;
+                        with_qc_clock(high_qc, to)
+                    }
+                    _ => high_qc,
+                };
                 let verified = Verified::<Timeout>::sign_local(
                     &self.network,
                     self.shard,

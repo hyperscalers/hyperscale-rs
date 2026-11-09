@@ -324,6 +324,22 @@ impl Verified<QuorumCertificate> {
         Self::new_unchecked(qc)
     }
 
+    /// This QC with its clock raised to `floor` where it sits below.
+    ///
+    /// The clock rides outside the signed message, so raising it keeps
+    /// every fact verification established. A QC's floor is its block's
+    /// anchor: honest aggregation clamps every vote to it, and every voter
+    /// refuses a header whose parent QC sits beneath it.
+    #[must_use]
+    pub fn with_clock_at_least(self, floor: WeightedTimestamp) -> Self {
+        if self.weighted_timestamp >= floor {
+            return self;
+        }
+        let mut qc = self.into_inner();
+        qc.weighted_timestamp = floor;
+        Self::new_unchecked(qc)
+    }
+
     /// Aggregate a verified vote set into a `Verified<QuorumCertificate>`.
     ///
     /// Sorts by committee index so the signer bitfield matches the order

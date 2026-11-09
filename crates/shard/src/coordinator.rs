@@ -1185,6 +1185,17 @@ impl ShardCoordinator {
             .map(|header| header.parent_qc().weighted_timestamp())
     }
 
+    /// `qc` with its clock at least its block's anchor, where that anchor
+    /// resolves. A relayed copy of a genuine QC can carry any clock, and a
+    /// header built over one beneath the anchor is one no voter takes, so
+    /// a QC this replica builds on never sits beneath it.
+    fn floored_qc(&self, qc: Verified<QuorumCertificate>) -> Verified<QuorumCertificate> {
+        match self.block_anchor(qc.block_hash()) {
+            Some(anchor) if !qc.is_genesis() => qc.with_clock_at_least(anchor),
+            _ => qc,
+        }
+    }
+
     /// Weighted timestamp selecting `block_hash`'s committee — its parent's
     /// [`Self::block_anchor`]. `None` when the block or its parent is unknown,
     /// so the committee can't be resolved (caller stalls or defers).
@@ -2661,7 +2672,8 @@ impl ShardCoordinator {
         // understated is a bound another replica may vote beneath.
         let held = self.latest_qc.as_deref().map(QuorumCertificate::round);
         if qc.as_deref().map(QuorumCertificate::round) > held {
-            self.latest_qc = qc;
+            let floored = qc.map(|qc| self.floored_qc(qc));
+            self.latest_qc = floored;
         }
 
         self.view_change.reset_for_height_advance();
@@ -5065,7 +5077,7 @@ impl ShardCoordinator {
             qc_round = qc.round().inner(),
             "Adopted verified parent QC"
         );
-        self.latest_qc = Some(qc.clone());
+        self.latest_qc = Some(self.floored_qc(qc.clone()));
         self.advance_view_for_qc(qc);
         true
     }
@@ -8578,7 +8590,11 @@ impl ShardCoordinator {
             .is_none_or(|existing| verified_qc.round() > existing.round())
         {
             self.advance_view_for_qc(&verified_qc);
-            self.latest_qc = Some(verified_qc.clone());
+            self.latest_qc = Some(
+                verified_qc
+                    .clone()
+                    .with_clock_at_least(block.header().parent_qc().weighted_timestamp()),
+            );
         }
 
         // The synced block's QC BFT-transitively attests every embedded tick's
