@@ -1215,10 +1215,12 @@ impl ShardCoordinator {
     /// Take `qc` as `latest_qc` when it is in a higher round than the one
     /// held and a pending halt recovery does not refuse it
     /// ([`Self::halt_refuses_left_bridge`]), with its clock floored at its
-    /// block's anchor ([`Self::floored_qc`]). The one write to `latest_qc`
-    /// past construction, so no path — adoption, sync, restore, or this
-    /// replica's own aggregate — takes a high QC another would refuse.
-    /// `true` when it replaced the held one.
+    /// block's anchor and its committee's window ([`Self::floored_qc`]).
+    /// The one place a new high QC is taken, so no path — adoption, sync,
+    /// restore, or this replica's own aggregate — takes one another would
+    /// refuse. Construction seeds the store's committed QC with no schedule
+    /// to floor it by; [`Self::on_committed_state_restored`] floors it
+    /// before the replica opens. `true` when it replaced the held one.
     fn raise_high_qc(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -2693,6 +2695,12 @@ impl ShardCoordinator {
         // understated is a bound another replica may vote beneath.
         if let Some(qc) = qc {
             self.raise_high_qc(topology_schedule, qc);
+        }
+        // The constructor seeds `latest_qc` from the store's committed QC
+        // with no schedule to floor it by, and this restore hands back that
+        // same QC, which the raise does not replace: floor what is held.
+        if let Some(held) = self.latest_qc.take() {
+            self.latest_qc = Some(self.floored_qc(topology_schedule, held));
         }
 
         self.view_change.reset_for_height_advance();
@@ -24998,6 +25006,54 @@ mod tests {
             Some(lowered),
         );
 
+        let held = state.latest_qc().expect("the restored QC is held");
+        assert!(
+            held.weighted_timestamp() >= anchor,
+            "held at {:?}, beneath the anchor {anchor:?}",
+            held.weighted_timestamp(),
+        );
+    }
+
+    /// A restart seeds the high QC from the store's committed QC, and the
+    /// restore hands back that same QC in no higher round. Dated beneath
+    /// the committed tip's anchor, it is held at the anchor all the same.
+    #[test]
+    fn a_restarted_qc_dated_beneath_its_anchor_is_held_at_the_anchor() {
+        let (_, schedule) = make_test_state();
+        let anchor = WeightedTimestamp::from_millis(50_000);
+        let tip = BlockHash::from_raw(Hash::from_bytes(b"restored tip"));
+        let lowered =
+            Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+                tip,
+                ShardId::ROOT,
+                BlockHeight::new(3),
+                BlockHash::ZERO,
+                Round::new(3),
+                Epoch::GENESIS,
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(1),
+            ));
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState {
+                committed_height: BlockHeight::new(3),
+                committed_hash: Some(tip),
+                committed_block_anchor_wt: Some(anchor),
+                latest_qc: Some(lowered.clone()),
+                ..RecoveredState::default()
+            },
+            WeightedTimestamp::ZERO,
+        );
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let _ = state.on_committed_state_restored(
+            &schedule,
+            BlockHeight::new(3),
+            Some(tip),
+            Some(lowered),
+        );
         let held = state.latest_qc().expect("the restored QC is held");
         assert!(
             held.weighted_timestamp() >= anchor,
