@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_execution::MAX_RECORD_ASK_GAP;
 use hyperscale_storage::{FeeTerms, Place, RowState, seat_leaf};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
@@ -428,21 +429,11 @@ pub fn a_lost_record_on_a_busy_holder_is_read_inside_ten_seconds<C: FaultableClu
     );
 }
 
-/// What a reread takes past the ladder's next rung: the answer's round
-/// trip, and the block that carries the arrival.
-const REREAD_ALLOWANCE: Duration = Duration::from_secs(2);
-
-/// The ladder's gap in holder heights once `passed` heights have gone by
-/// since a key's first ask: 2 past the first ask, doubling on each rung.
-const fn ladder_gap(passed: u64) -> u64 {
-    let mut gap = 2;
-    let mut rung = gap;
-    while rung <= passed {
-        gap *= 2;
-        rung += gap;
-    }
-    gap
-}
+/// What a reread takes past the ask that reads the record: the holder's
+/// header over the record reaching the venue proven, the answer's round
+/// trip, and the venue's blocks that carry the arrival. On a loaded
+/// holder at 150 ms this runs to about 4 s.
+const REREAD_ALLOWANCE: Duration = Duration::from_secs(4);
 
 /// How finely a scenario watches for a state only a moment separates
 /// from what follows it, well under a block.
@@ -486,22 +477,22 @@ impl LocalTransfers<'_> {
     }
 }
 
-/// How long a leg's votes are dropped from the first of them, short of
-/// their 8 s retry, so the retry goes through and finishes the leg past
-/// the venue's first read.
-const VOTES_HELD: Duration = Duration::from_millis(7_500);
+/// How long a leg's votes are dropped from the first of them, past their
+/// first 8 s retry and short of the second, so the second goes through
+/// and finishes the leg well past the venue's first read: late enough
+/// that the backoff in holder heights has climbed past
+/// [`MAX_RECORD_ASK_GAP`].
+const VOTES_HELD: Duration = Duration::from_millis(15_500);
 
 /// A read that finds no record yet holds nothing and asks again.
 ///
 /// The leg's votes are dropped, so the venue's first read comes back
 /// absent, and no block ever carries the absence. What this bounds is the
-/// ladder: the record is carried within one ladder gap of its leg
-/// finalizing, the gap read off the holder heights since the first ask
-/// and timed at the rate the holder passed them, plus
-/// [`REREAD_ALLOWANCE`]. The trader's chain carries transfers throughout,
-/// so those heights pass at the loaded rate. A leg's lateness sets how
-/// far up the ladder it lands, so the wait is not a constant: it grows
-/// with the gap, up to the finalization delay.
+/// ladder: the record is carried within [`MAX_RECORD_ASK_GAP`] of its
+/// leg finalizing, plus [`REREAD_ALLOWANCE`], however far up the backoff
+/// in holder heights the leg's lateness has carried the key. The trader's
+/// chain carries transfers throughout, so those heights pass at the
+/// loaded rate and the backoff climbs as it would on a busy holder.
 ///
 /// Requires disjoint committees, as the cuts are keyed on them.
 ///
@@ -509,7 +500,7 @@ const VOTES_HELD: Duration = Duration::from_millis(7_500);
 ///
 /// Panics if a venue misses its budget standing up, if no read went out
 /// while the leg was held, if a block carries an absent reading of the
-/// record, or if the reread takes longer than the ladder's gap and
+/// record, or if the reread takes longer than [`MAX_RECORD_ASK_GAP`] and
 /// [`REREAD_ALLOWANCE`].
 pub fn a_read_that_finds_no_record_yet_reads_again<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
@@ -564,21 +555,17 @@ pub fn a_read_that_finds_no_record_yet_reads_again<C: FaultableCluster>(c: &mut 
         "the venue must carry a reading of the record",
     );
     let waited = c.now().saturating_sub(written);
-    let gap = ladder_gap(written_height.saturating_sub(asked_height));
-    let passed = written_height.saturating_sub(asked_height).max(1);
-    let per_height = written.saturating_sub(asked) / u32::try_from(passed).expect("a short run");
-    let ladder =
-        (per_height * u32::try_from(gap).expect("a short run")).min(MAX_FINALIZATION_DELAY);
-    let bound = ladder + REREAD_ALLOWANCE;
+    let bound = MAX_RECORD_ASK_GAP + REREAD_ALLOWANCE;
     println!(
-        "record read: record written {:?} past the first read, {passed} holder heights, ladder \
-         gap {gap} heights at {per_height:?} each is {ladder:?}; carried {waited:?} past the \
-         record, bound {bound:?}",
+        "record read: record written {:?} past the first read, {} holder heights; carried \
+         {waited:?} past the record, bound {bound:?}",
         written.saturating_sub(asked),
+        written_height.saturating_sub(asked_height),
     );
     assert!(
         waited < bound,
-        "the ladder's next rung must read the record, and it took {waited:?} against {bound:?}",
+        "the read must ask again within the gap and read the record, and it took {waited:?} \
+         against {bound:?}",
     );
     for record in records {
         assert_eq!(
@@ -959,23 +946,39 @@ const PAST_THE_CLOCK: Duration = MAX_FINALIZATION_DELAY.saturating_add(Duration:
 /// header of the record's holder it needs to ask at.
 const RESTART_WATCH: Duration = Duration::from_secs(8);
 
+/// The record reads `host` has open of its own: started, less those
+/// answered or let go of. `None` on a harness that cannot tell a host's
+/// counts apart.
+fn host_reads_open<C: FaultableCluster>(c: &C, host: usize) -> Option<u64> {
+    let count = |name| c.host_metric(host, name, Some("record_proof"));
+    Some(
+        count("fetch_started")?
+            .saturating_sub(count("fetch_completed")? + count("fetch_abandoned")?),
+    )
+}
+
 /// A consumer restarted with wants past the finalization delay asks each
 /// of them at first sight, once per key, and its route still accepts.
 ///
 /// The restart comes once the wants are past the delay, so the validator
 /// is back at once and holds nothing but what it re-derives. Its own
-/// reads are cut from there, which counts that it asked and leaves its
-/// ids standing. The other validators read on up their ladders, each
-/// read holding nothing as the leg stays held, so what the run bounds is
-/// every validator's one read of each key.
+/// reads are cut from there, which leaves its ids standing. Its first
+/// asks go out at one commit, one per key; past them it climbs a fresh
+/// ladder. The other validators read on at the ladder's gap, each read
+/// holding nothing as the leg stays held, so they put at most one ask per
+/// key per [`MAX_RECORD_ASK_GAP`] begun in the watch. No validator has
+/// more reads open than it has keys, the restarted one counted from its
+/// restart, since what its crashed process had open is never closed.
 ///
-/// Requires disjoint committees, as the held leg is keyed on them.
+/// Requires disjoint committees, as the held leg is keyed on them, and a
+/// harness that counts each host's metrics apart.
 ///
 /// # Panics
 ///
 /// Panics if a venue misses its budget standing up, if the restarted
-/// validator asks nothing, if more reads go out or stand open than there
-/// are wants, or if a route is not accepted.
+/// validator asks nothing or asks a key twice at first sight, if the
+/// other validators ask faster than the gap, if a validator has more
+/// reads open than keys, or if a route is not accepted.
 pub fn a_restart_with_wants_past_the_clock_asks_each_once<C>(c: &mut C)
 where
     C: FaultableCluster + RestartableCluster,
@@ -989,33 +992,78 @@ where
     let past_the_clock = c.now() + PAST_THE_CLOCK;
     let _ = c.run_until(epochs(2), |c| c.now() >= past_the_clock);
 
-    let restarted = c.committee_hosts(FIRST_VENUE_SHARD)[0];
+    let venue_hosts: Vec<usize> = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+        .into_iter()
+        .flat_map(|shard| c.committee_hosts(shard))
+        .collect();
+    let restarted = venue_hosts[0];
+    let own_asks = |c: &C| {
+        c.host_metric(restarted, "record_asks", None)
+            .expect("the harness counts each host apart")
+    };
+    let keys = wide(records.len());
     c.stop_host(restarted, epochs(0));
+    let crashed_open = host_reads_open(c, restarted).expect("the harness counts each host apart");
     assert!(
         c.run_until(epochs(1), |c| c.is_up(restarted)),
         "the validator must come back",
     );
-    let own_reads = c.drop_type_between(&[restarted], &leg_hosts, "state_proof.request");
+    let _ = c.drop_type_between(&[restarted], &leg_hosts, "state_proof.request");
     let asks = c.metric("record_asks", None);
-    let most = most_reads_open(c, RESTART_WATCH);
+    let own_before = own_asks(c);
+    let watched = c.now();
+    let watch_end = watched + RESTART_WATCH;
+
+    assert!(
+        c.run_polling(epochs(1), FINE_POLL, |c| own_asks(c) > own_before
+            || c.now() >= watch_end),
+        "the watch must run out",
+    );
+    let first_sight = own_asks(c) - own_before;
+    let mut most = 0;
+    while c.now() < watch_end {
+        let next = (c.now() + Duration::from_secs(1)).min(watch_end);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+        for &host in &venue_hosts {
+            let open = host_reads_open(c, host).expect("the harness counts each host apart");
+            let open = if host == restarted {
+                open.saturating_sub(crashed_open)
+            } else {
+                open
+            };
+            most = most.max(open);
+        }
+    }
     let asked = c.metric("record_asks", None).saturating_sub(asks);
+    let own = own_asks(c) - own_before;
+    let others = asked.saturating_sub(own);
     let wants = wanted_reads(c, &records);
+    let rounds = wide(
+        usize::try_from(
+            RESTART_WATCH
+                .as_millis()
+                .div_ceil(MAX_RECORD_ASK_GAP.as_millis()),
+        )
+        .expect("a short watch"),
+    );
+    let cadence = (wants - keys) * rounds;
     println!(
-        "record read: {asked} asks past a restart, of its own {}, at most {most} reads open of \
-         {wants} wants",
-        own_reads.fired(),
+        "record read: {first_sight} asks at first sight and {own} in all by the restarted \
+         validator, {others} by the others against {cadence}; at most {most} reads open on one \
+         validator of {keys} keys",
+    );
+    assert_eq!(
+        first_sight, keys,
+        "the restarted validator asks each of its keys once at first sight",
     );
     assert!(
-        own_reads.fired() > 0,
-        "the restarted validator must ask what it re-derived",
+        others <= cadence,
+        "the other validators ask once per key per gap begun, {cadence} in the watch, and \
+         asked {others}",
     );
     assert!(
-        asked <= wants + read_bound(1),
-        "one read goes out for a key, and {asked} went out for {wants} wants",
-    );
-    assert!(
-        most > 0 && most <= wants,
-        "one read stands for a key, and {most} stood for {wants} wants",
+        most > 0 && most <= keys,
+        "one read stands for a key, and {most} stood on one validator of {keys} keys",
     );
     c.clear_drops();
     for venue in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD] {

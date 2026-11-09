@@ -7,7 +7,7 @@
 //! decides when that read is put: a key arms on the first evidence that
 //! the producer's leg has run or never will, and once armed is asked at
 //! a proven anchor of the record's holder, backing off in the holder's
-//! heights and never waiting longer than one finalization delay between
+//! heights and never waiting longer than [`MAX_RECORD_ASK_GAP`] between
 //! asks, of the holder's clock or of this chain's where the holder's
 //! has stopped. One ask stands for a key at a time: a
 //! later one takes the earlier's place, so no key queues twice.
@@ -47,6 +47,14 @@ pub const RECORD_PUSH_GRACE_FLOOR: Duration = Duration::from_secs(5);
 /// The most grace a holder's records get, which keeps a lost record
 /// inside a route's naming window on any network.
 pub const RECORD_PUSH_GRACE_CEILING: Duration = Duration::from_secs(15);
+
+/// The longest a read waits between asks, of the holder's clock or of
+/// this chain's.
+///
+/// A record written just past an ask is read within it, however far up
+/// the height backoff the key has climbed. A key whose record never
+/// comes asks about once per gap per validator until its want ends.
+pub const MAX_RECORD_ASK_GAP: Duration = Duration::from_secs(5);
 
 /// How many of a holder's heights the grace is derived over, about 11 s
 /// of its blocks.
@@ -343,17 +351,21 @@ impl RecordReads {
     /// and if so the ask is counted as put there.
     ///
     /// The k-th ask after arming waits for a holder anchor `2^k` heights
-    /// above the last, and no longer than one finalization delay of the
-    /// holder's clock past it, so a record a producer is slow to write
-    /// is asked less and less often while one the consumer is about to
-    /// need is asked at least once per finality delay.
+    /// above the last, and no longer than [`MAX_RECORD_ASK_GAP`] of the
+    /// holder's clock past it, so the backoff thins the asks of a busy
+    /// holder's heights while a record written past any ask is read
+    /// within the gap.
     ///
-    /// A holder whose headers froze runs neither of those out, so one
-    /// finalization delay of this chain's clock `now` past the last ask
-    /// also calls one, at any anchor above the last: the record may
-    /// stand in the last block it wrote. At the anchor of the last ask
-    /// there is nothing new to read, so a frozen holder draws one such
-    /// ask and no more.
+    /// A holder whose headers froze runs neither of those out, so the
+    /// gap on this chain's clock `now` past the last ask also calls one,
+    /// at any anchor above the last: the record may stand in the last
+    /// block it wrote. At the anchor of the last ask there is nothing
+    /// new to read, so a frozen holder draws one such ask and no more.
+    ///
+    /// Whatever the rungs say, a key is asked at most once per reading of
+    /// this chain's clock: a replica catching up folds many commits at
+    /// one clock while the holder's anchors fill in under it, and each
+    /// would otherwise call a rung and replace the ask before.
     pub fn due_at(&mut self, key: SubstateKey, anchor: Anchor, now: WeightedTimestamp) -> bool {
         let Some(read) = self.reads.get_mut(&key) else {
             return false;
@@ -365,10 +377,11 @@ impl RecordReads {
             None => true,
             Some((last, asked_at)) => {
                 let gap = 1u64 << read.step.min(32);
-                anchor.height.inner() >= last.height.inner().saturating_add(gap)
-                    || anchor.ts.elapsed_since(last.ts) >= MAX_FINALIZATION_DELAY
-                    || (anchor.height > last.height
-                        && now.elapsed_since(asked_at) >= MAX_FINALIZATION_DELAY)
+                now > asked_at
+                    && (anchor.height.inner() >= last.height.inner().saturating_add(gap)
+                        || anchor.ts.elapsed_since(last.ts) >= MAX_RECORD_ASK_GAP
+                        || (anchor.height > last.height
+                            && now.elapsed_since(asked_at) >= MAX_RECORD_ASK_GAP))
             }
         };
         if due {
@@ -491,7 +504,7 @@ mod tests {
 
     /// Nothing is asked before the arming evidence; once armed the
     /// asks double in holder heights, and no gap between them exceeds
-    /// one finalization delay of the holder's clock.
+    /// [`MAX_RECORD_ASK_GAP`] of the holder's clock.
     #[test]
     fn a_read_arms_on_its_evidence_and_backs_off_in_holder_heights() {
         let mut reads = RecordReads::new();
@@ -522,10 +535,14 @@ mod tests {
             "the fourth waits eight"
         );
 
-        let much_later = 10_005 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+        let reach = 10_005 + u64::try_from(MAX_RECORD_ASK_GAP.as_millis()).unwrap();
         assert!(
-            reads.due(key, anchor(9, much_later)),
-            "but never longer than one finalization delay of the holder's clock",
+            !reads.due(key, anchor(9, reach - 1)),
+            "a millisecond short of the gap"
+        );
+        assert!(
+            reads.due(key, anchor(9, reach)),
+            "but never longer than the gap of the holder's clock",
         );
     }
 
@@ -597,7 +614,7 @@ mod tests {
     }
 
     /// A key the grace armed and walked up the ladder, whose holder then
-    /// froze short of the next rung, still asks: one finalization delay
+    /// froze short of the next rung, still asks: [`MAX_RECORD_ASK_GAP`]
     /// of this chain's clock past the last ask, at the newest anchor
     /// held. Its holder's clock has stopped, and the record may stand in
     /// the last block it wrote. A frozen holder draws that one ask and
@@ -618,7 +635,7 @@ mod tests {
 
         let frozen = anchor(37, 18_000);
         let asked_at = last.ts;
-        let reach = asked_at.plus(MAX_FINALIZATION_DELAY);
+        let reach = asked_at.plus(MAX_RECORD_ASK_GAP);
         let short = reach.minus(Duration::from_millis(1));
         assert!(!reads.due_at(key, frozen, short), "a millisecond short");
         reads.arm(&want, HOLDER, reach, Some(frozen));
@@ -628,7 +645,7 @@ mod tests {
         );
         assert!(reads.due_at(key, frozen, reach), "the clock's reach asks");
 
-        let much_later = reach.plus(MAX_FINALIZATION_DELAY * 4);
+        let much_later = reach.plus(MAX_RECORD_ASK_GAP * 4);
         assert!(!reads.due_at(key, frozen, much_later), "and only once");
     }
 
@@ -1042,7 +1059,7 @@ mod tests {
             key,
             anchor(9, 10_000),
             Duration::ZERO,
-            WeightedTimestamp::ZERO,
+            WeightedTimestamp::from_millis(10_000),
         );
         assert!(reads.is_armed(key), "a push never disarms");
         assert!(
@@ -1050,9 +1067,33 @@ mod tests {
             "not asked where the push answered"
         );
         assert!(
-            !reads.due(key, anchor(10, 10_000)),
+            !reads.due(key, anchor(10, 10_001)),
             "the next ask waits two heights"
         );
-        assert!(reads.due(key, anchor(11, 10_000)));
+        assert!(reads.due(key, anchor(11, 10_002)));
+    }
+
+    /// A replica catching up folds commits at one reading of its clock
+    /// while the holder's anchors fill in under it: each would call a
+    /// rung, and the key is asked once until the clock moves.
+    #[test]
+    fn a_catching_up_replica_asks_a_key_once_per_clock_reading() {
+        let mut reads = RecordReads::new();
+        let want = wanted(0);
+        let key = want.key;
+        let now = delay_past(0).plus(MAX_RECORD_ASK_GAP * 10);
+        reads.arm(&want, HOLDER, now, None);
+        let asked = (0..10u64)
+            .filter(|rung| {
+                let ts = 1_000 + rung * u64::try_from(MAX_RECORD_ASK_GAP.as_millis()).unwrap();
+                reads.due_at(key, anchor(1 + rung * 4, ts), now)
+            })
+            .count();
+        assert_eq!(asked, 1, "one ask for the whole catch-up");
+        let moved = now.plus(Duration::from_millis(1));
+        assert!(
+            reads.due_at(key, anchor(41, 60_000), moved),
+            "and the ladder runs on once the clock moves",
+        );
     }
 }

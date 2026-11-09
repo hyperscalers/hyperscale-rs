@@ -8218,8 +8218,9 @@ mod tests {
 
         let (next, _) = producer_read(5, None, key);
         consumer.proven_anchors.record(next);
+        let later = now.plus(Duration::from_millis(1));
         assert_eq!(
-            record_asks(&consumer.probe(&trie, now, &want, windows)),
+            record_asks(&consumer.probe(&trie, later, &want, windows)),
             vec![(next, key)],
             "the next due anchor is asked again",
         );
@@ -8492,6 +8493,7 @@ mod tests {
             );
             let (newer, _) = producer_read(5, Some(&cell), key);
             consumer.proven_anchors.record(newer);
+            let now = now.plus(Duration::from_millis(1));
             let replaced = consumer.probe(&trie, now, &want, windows);
             assert_eq!(record_asks(&replaced), vec![(newer, key)]);
             assert_eq!(
@@ -8556,6 +8558,7 @@ mod tests {
         );
         let (newer, _) = producer_read(5, Some(&cell), key);
         consumer.proven_anchors.record(newer);
+        let now = now.plus(Duration::from_millis(1));
         assert_eq!(
             record_asks(&consumer.probe(&trie, now, &want, windows)),
             vec![(newer, key)],

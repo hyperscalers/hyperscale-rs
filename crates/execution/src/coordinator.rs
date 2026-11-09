@@ -15525,11 +15525,22 @@ mod tests {
         );
         let third = proven_anchor_of(PEER, 12, armed);
         state.counterparts.proven_anchors.record(third);
-        assert_eq!(
+        assert!(
             record_asks(
                 &state
                     .counterparts
                     .probe(&trie, armed, &wanted, EpochWindows::new(0, 0)),
+                record_key
+            )
+            .is_empty(),
+            "nor twice at one reading of this chain's clock",
+        );
+        let later = armed.plus(Duration::from_millis(1));
+        assert_eq!(
+            record_asks(
+                &state
+                    .counterparts
+                    .probe(&trie, later, &wanted, EpochWindows::new(0, 0)),
                 record_key
             ),
             vec![third],
