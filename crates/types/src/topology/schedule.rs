@@ -417,8 +417,7 @@ pub enum QcAdmission<'a> {
     /// that would place it, is ahead of this schedule. Buffer and ask
     /// again once the beacon catches up.
     Wait,
-    /// No candidate committee of the block resolves to the epoch at the
-    /// QC's stamp. Read off the committee anchor the caller supplied, so a
+    /// No candidate committee of the block resolves to the epoch. Read off the committee anchor the caller supplied, so a
     /// caller that guessed it asks again under the parent's.
     Refuse,
     /// The signed-epoch fence refused it
@@ -1283,97 +1282,73 @@ impl TopologySchedule {
     }
 
     /// Whether a QC over a block of `shard`, whose committee anchor is
-    /// `committee_anchor`, stamped `qc_wt` and signed under `epoch`, is one
-    /// honest voters can have signed — and if so, the committee to verify
-    /// its aggregate under.
+    /// `committee_anchor`, signed under `epoch` is one honest voters can
+    /// have signed — and if so, the committee to verify its aggregate
+    /// under.
     ///
     /// A block's candidate committees are its anchor's own window (raw)
-    /// and the window each recovery bridging the anchor seated, `B_1 <
-    /// … < B_n`, every binding whose bridge sits above the anchor's epoch.
-    /// The stamp places the QC between them. With `e` the stamp's epoch
-    /// and `r_k = B_k - 1` the epoch binding `k` was seated in:
+    /// and the window each recovery bridging the anchor seated: every
+    /// binding whose bridge sits above the anchor's epoch. Each is keyed
+    /// by a distinct epoch, so the signed epoch alone names the candidate:
+    /// a bridge the shard's history holds names its seated window, any
+    /// other epoch the raw one. The QC's weighted timestamp rides outside
+    /// its signature and plays no part.
     ///
-    /// - raw is a candidate while no binding was seated before the QC's
-    ///   epoch: `n == 0` or `e <= r_1`;
-    /// - `bridged(B_k)` is a candidate from its seating until the next one:
-    ///   `r_k <= e`, and `e <= r_{k+1}` where `k < n`.
+    /// Otherwise the QC waits where this schedule may yet learn what
+    /// places it: the named window is not committed here, or the epoch
+    /// is past the head's next, where a binding this head has not folded
+    /// can bridge. A binding this head has not folded was seated past it,
+    /// so its bridge lies at least two windows past the head, and a QC
+    /// naming an epoch below that is refused at once. A QC refused here
+    /// was refused under `committee_anchor`, so a caller that guessed the
+    /// anchor asks again under the parent's.
     ///
-    /// Honest raw votes are stamped before the first such recovery is
-    /// seated; honest `bridged(B_k)` votes at or past the bridge window,
-    /// which the seating quiesce holds them to, and before the voter folds
-    /// the next re-draw. The windows overlap at each seating epoch, so a
-    /// fresh committee that certified there before folding the next
-    /// re-draw is still admitted after it.
-    ///
-    /// Admitted when some candidate resolves to `epoch`. Otherwise the QC
-    /// waits where this schedule may yet learn
-    /// what places it: a candidate window not committed here, or a head
-    /// behind `e`, which may not have folded a binding seated by then. A
-    /// binding this head has not folded was seated past it, so its bridge
-    /// lies at least two windows past the head, and a QC naming an epoch
-    /// below that is refused at once. A QC refused here was refused under
-    /// `committee_anchor`, so a caller that guessed the anchor asks again
-    /// under the parent's.
-    ///
-    /// The stamp chooses no committee: it bounds which candidates count.
     /// Callers skip the genesis QC, which no committee signed.
     #[must_use]
     pub fn admits(
         &self,
         shard: ShardId,
         committee_anchor: WeightedTimestamp,
-        qc_wt: WeightedTimestamp,
         epoch: Epoch,
     ) -> QcAdmission<'_> {
-        let anchor = self.epoch_for(committee_anchor);
-        let stamped = self.epoch_for(qc_wt);
-        let bridges: Vec<Epoch> = self
-            .bindings(shard)
-            .map(RecoveryBinding::bridge)
-            .filter(|bridge| anchor < *bridge)
-            .collect();
-        let raw = bridges
-            .first()
-            .is_none_or(|first| stamped < *first)
-            .then(|| self.resolve_for_shard(shard, committee_anchor));
-        let seated_since = bridges.iter().enumerate().filter_map(|(k, bridge)| {
-            let seated = *bridge <= stamped.next();
-            let superseded = bridges.get(k + 1).is_some_and(|next| stamped >= *next);
-            (seated && !superseded).then(|| self.bridged_for_shard(shard, *bridge))
-        });
-        let mut waiting = false;
-        for candidate in raw.into_iter().chain(seated_since) {
-            match candidate {
-                BlockResolution::Committee(committee) if committee.epoch == epoch => {
-                    return QcAdmission::Admit(committee);
-                }
-                BlockResolution::NotYetCommitted => waiting = true,
-                BlockResolution::Committee(_) | BlockResolution::Evicted => {}
-            }
-        }
-        if waiting || (self.head_epoch < stamped && epoch > self.head_epoch.next()) {
-            QcAdmission::Wait
+        let bridged = epoch > self.epoch_for(committee_anchor)
+            && self
+                .bindings(shard)
+                .any(|binding| binding.bridge() == epoch);
+        let candidate = if bridged {
+            self.bridged_for_shard(shard, epoch)
         } else {
-            QcAdmission::Refuse
+            self.resolve_for_shard(shard, committee_anchor)
+        };
+        match candidate {
+            BlockResolution::Committee(committee) if committee.epoch == epoch => {
+                QcAdmission::Admit(committee)
+            }
+            BlockResolution::NotYetCommitted => QcAdmission::Wait,
+            BlockResolution::Committee(_) | BlockResolution::Evicted
+                if epoch > self.head_epoch.next() =>
+            {
+                QcAdmission::Wait
+            }
+            BlockResolution::Committee(_) | BlockResolution::Evicted => QcAdmission::Refuse,
         }
     }
 
     /// [`Self::admits`] for the sites that see only new production during
     /// a recovery, behind the signed-epoch fence
     /// ([`Self::fence_admits`]): [`Fenced`](QcAdmission::Fenced) for a QC a
-    /// pending recovery replaced, whatever its stamp.
+    /// pending recovery replaced.
     #[must_use]
     pub fn admits_fenced(
         &self,
         shard: ShardId,
         committee_anchor: WeightedTimestamp,
-        qc_wt: WeightedTimestamp,
         epoch: Epoch,
     ) -> QcAdmission<'_> {
         if !self.fence_admits(shard, epoch) {
             return QcAdmission::Fenced;
         }
-        self.admits(shard, committee_anchor, qc_wt, epoch)
+        self.admits(shard, committee_anchor, epoch)
     }
 
     /// The anchor that selects the committee which signed the QC over
@@ -2824,10 +2799,7 @@ mod tests {
             _ => panic!("expected a resolved committee"),
         };
         let stale_anchor = WeightedTimestamp::from_millis(2_500);
-        let suffix_qc = WeightedTimestamp::from_millis(2_900);
-        let bridge_qc = WeightedTimestamp::from_millis(21_100);
-        // Stamped in the seating epoch, where the windows overlap.
-        let edge_qc = WeightedTimestamp::from_millis(20_900);
+        let current_anchor = WeightedTimestamp::from_millis(21_100);
         let (raw, bridged) = (Epoch::new(2), Epoch::new(21));
 
         // Live work at the stale anchor binds to the fresh committee. Each
@@ -2845,45 +2817,34 @@ mod tests {
         // A suffix block — signed while the old committee governed — keeps
         // verifying against it.
         assert_eq!(
-            admitted(
-                &sched,
-                shard,
-                sched.admits(shard, stale_anchor, suffix_qc, raw)
-            ),
+            admitted(&sched, shard, sched.admits(shard, stale_anchor, raw)),
             old,
         );
         // A bridge block — signed under the bridge — verifies against the
-        // fresh committee, stamped in the seating epoch or past it.
-        for qc_wt in [bridge_qc, edge_qc] {
-            assert_eq!(
-                admitted(
-                    &sched,
-                    shard,
-                    sched.admits(shard, stale_anchor, qc_wt, bridged)
-                ),
-                fresh,
-            );
-        }
+        // fresh committee.
+        assert_eq!(
+            admitted(&sched, shard, sched.admits(shard, stale_anchor, bridged)),
+            fresh,
+        );
         // Current anchors resolve normally on both paths.
         assert_eq!(
-            members_of(&sched, shard, sched.live_committee(shard, bridge_qc)),
+            members_of(&sched, shard, sched.live_committee(shard, current_anchor)),
             fresh,
         );
 
-        // The fence refuses what the pending recovery replaced, whatever
-        // the stamp, and admits the fresh committee's epochs.
+        // The fence refuses what the pending recovery replaced, and admits the fresh committee's epochs.
         assert!(!sched.fence_admits(shard, raw));
         assert!(sched.fence_admits(shard, bridged));
         assert!(sched.fence_admits(shard, Epoch::new(25)));
         assert!(matches!(
-            sched.admits_fenced(shard, stale_anchor, suffix_qc, raw),
+            sched.admits_fenced(shard, stale_anchor, raw),
             QcAdmission::Fenced
         ));
         assert_eq!(
             admitted(
                 &sched,
                 shard,
-                sched.admits_fenced(shard, stale_anchor, bridge_qc, bridged)
+                sched.admits_fenced(shard, stale_anchor, bridged)
             ),
             fresh,
         );
@@ -2905,16 +2866,14 @@ mod tests {
         assert!(!plain.replaced(shard, raw));
     }
 
-    /// The seating-epoch forgery: a retained committee beyond f certifies
-    /// an orphan extending the halted tip under the window it was seated
-    /// in, and sets the stamp inside the epoch the recovery was seated, the
-    /// one where the raw and bridged intervals meet. The interval admits
-    /// it; the fence refuses it whatever the stamp. In the chained case the
-    /// first fresh committee, retained by the second recovery, states the
-    /// first bridge and stamps in the second seating epoch: refused
-    /// against the pending second bridge.
+    /// The retained-quorum forgery: a retained committee beyond f
+    /// certifies an orphan extending the halted tip under the window it
+    /// was seated in. Its own keys sign that window, so the unfenced rule
+    /// admits it; the fence refuses it. In the chained case the first
+    /// fresh committee, retained by the second recovery, states the first
+    /// bridge: refused against the pending second bridge.
     #[test]
-    fn a_retained_quorum_stamped_in_the_seating_epoch_is_fenced() {
+    fn a_retained_quorum_is_fenced() {
         let (set, old, fresh) = recovery_committees();
         let shard = BOUNDED;
         let snap =
@@ -2933,8 +2892,7 @@ mod tests {
             attested_frontier: BlockHeight::GENESIS,
             completed,
         };
-        let at = |ms: u64| WeightedTimestamp::from_millis(ms);
-        let stale_anchor = at(2_500);
+        let stale_anchor = WeightedTimestamp::from_millis(2_500);
 
         // Single: seated at 20, bridge 21.
         let head = snap(&fresh, vec![binding(20, false)], Some(20));
@@ -2945,21 +2903,19 @@ mod tests {
         );
         single.insert(Epoch::new(21), Arc::clone(&head));
         single.set_head(Epoch::new(20), head);
-        for stamp in [at(20_100), at(20_900)] {
-            assert_eq!(
-                admitted(
-                    &single,
-                    shard,
-                    single.admits(shard, stale_anchor, stamp, Epoch::new(2))
-                ),
-                old,
-                "the interval admits a raw QC stamped in the seating epoch",
-            );
-            assert!(matches!(
-                single.admits_fenced(shard, stale_anchor, stamp, Epoch::new(2)),
-                QcAdmission::Fenced
-            ));
-        }
+        assert_eq!(
+            admitted(
+                &single,
+                shard,
+                single.admits(shard, stale_anchor, Epoch::new(2))
+            ),
+            old,
+            "the unfenced rule admits the retained committee's own window",
+        );
+        assert!(matches!(
+            single.admits_fenced(shard, stale_anchor, Epoch::new(2)),
+            QcAdmission::Fenced
+        ));
 
         // Chained: first seated at 20 (bridge 21), second at 40 (bridge
         // 41), pending. The first fresh committee states 21.
@@ -2975,18 +2931,17 @@ mod tests {
         );
         chained.insert(Epoch::new(41), Arc::clone(&head));
         chained.set_head(Epoch::new(40), head);
-        let seating_stamp = at(40_500);
         assert_eq!(
             admitted(
                 &chained,
                 shard,
-                chained.admits(shard, stale_anchor, seating_stamp, Epoch::new(21))
+                chained.admits(shard, stale_anchor, Epoch::new(21))
             ),
             fresh,
-            "the interval admits the first bridge at the second seating epoch",
+            "the unfenced rule admits the first bridge",
         );
         assert!(matches!(
-            chained.admits_fenced(shard, stale_anchor, seating_stamp, Epoch::new(21)),
+            chained.admits_fenced(shard, stale_anchor, Epoch::new(21)),
             QcAdmission::Fenced
         ));
         // The second fresh committee, here the original one redrawn at
@@ -2995,15 +2950,16 @@ mod tests {
             admitted(
                 &chained,
                 shard,
-                chained.admits_fenced(shard, stale_anchor, seating_stamp, Epoch::new(41))
+                chained.admits_fenced(shard, stale_anchor, Epoch::new(41))
             ),
             old,
         );
     }
 
-    /// Every interval and boundary of the rule: no bindings, one, and two,
-    /// with the second fresh committee the original one redrawn at the
-    /// same indexes.
+    /// Every candidate of the rule: no bindings, one, and two, with the
+    /// second fresh committee the original one redrawn at the same
+    /// indexes. A candidate is the anchor's own window or a bridge above
+    /// it; no other epoch is admitted.
     #[test]
     fn admits_the_epoch_honest_voters_sign() {
         let (set, old, fresh) = recovery_committees();
@@ -3027,7 +2983,6 @@ mod tests {
             )
         };
         let at = |epoch: u64| WeightedTimestamp::from_millis(epoch * 1_000 + 500);
-        let anchor = at(2);
         let schedule = |history: &[u64]| {
             let mut sched =
                 TopologySchedule::new(EpochWindows::new(0, 1000), Epoch::new(2), window(&old, &[]));
@@ -3039,10 +2994,9 @@ mod tests {
             sched.set_head(Epoch::new(50), window(&old, history));
             sched
         };
-        let admits = |sched: &TopologySchedule, stamp: u64, epoch: u64| match sched.admits(
+        let admits = |sched: &TopologySchedule, anchor: u64, epoch: u64| match sched.admits(
             shard,
-            anchor,
-            at(stamp),
+            at(anchor),
             Epoch::new(epoch),
         ) {
             QcAdmission::Admit(committee) => Some(committee.epoch.inner()),
@@ -3050,46 +3004,45 @@ mod tests {
             QcAdmission::Wait | QcAdmission::Fenced => panic!("a head at 50 decides"),
         };
 
-        // No bindings: only raw, at any stamp.
+        // No bindings: only raw.
         let none = schedule(&[]);
-        for stamp in [2, 20, 30] {
-            assert_eq!(admits(&none, stamp, 2), Some(2));
-            assert_eq!(admits(&none, stamp, 21), None);
-        }
+        assert_eq!(admits(&none, 2, 2), Some(2));
+        assert_eq!(admits(&none, 2, 21), None);
+        assert_eq!(admits(&none, 2, 3), None);
 
-        // One binding seated at 20: raw through 20, bridged from 20.
+        // One binding seated at 20: raw and the bridge.
         let one = schedule(&[20]);
-        assert_eq!(admits(&one, 19, 2), Some(2));
-        assert_eq!(admits(&one, 20, 2), Some(2));
-        assert_eq!(admits(&one, 21, 2), None);
-        assert_eq!(admits(&one, 19, 21), None);
-        assert_eq!(admits(&one, 20, 21), Some(21));
-        assert_eq!(admits(&one, 45, 21), Some(21));
+        assert_eq!(admits(&one, 2, 2), Some(2));
+        assert_eq!(admits(&one, 2, 21), Some(21));
+        assert_eq!(admits(&one, 2, 20), None);
+        assert_eq!(admits(&one, 2, 41), None);
 
-        // Two bindings, seated at 20 and 40: raw through 20, the first
-        // bridge 20 through 40, the second from 40. The second fresh
-        // committee is the original at its own indexes, but its window is
-        // keyed 41, so the epoch tells it from raw.
+        // Two bindings, seated at 20 and 40: raw and both bridges. The
+        // second fresh committee is the original at its own indexes, but
+        // its window is keyed 41, so the epoch tells it from raw.
         let two = schedule(&[20, 40]);
-        assert_eq!(admits(&two, 20, 2), Some(2));
+        assert_eq!(admits(&two, 2, 2), Some(2));
+        assert_eq!(admits(&two, 2, 21), Some(21));
+        assert_eq!(admits(&two, 2, 41), Some(41));
+        assert_eq!(admits(&two, 2, 40), None);
+
+        // A bridge at or below the anchor's window is no candidate: an
+        // anchor in the first fresh committee's era names its own window
+        // or the later bridge.
+        assert_eq!(admits(&two, 21, 21), Some(21));
+        assert_eq!(admits(&two, 21, 41), Some(41));
         assert_eq!(admits(&two, 21, 2), None);
-        assert_eq!(admits(&two, 20, 21), Some(21));
-        assert_eq!(admits(&two, 40, 21), Some(21));
-        assert_eq!(admits(&two, 41, 21), None);
-        assert_eq!(admits(&two, 39, 41), None);
-        assert_eq!(admits(&two, 40, 41), Some(41));
-        assert_eq!(admits(&two, 45, 41), Some(41));
     }
 
-    /// A verifier whose beacon has not reached a QC's stamp waits rather
-    /// than refusing: a binding seated by then may be one it has yet to
-    /// fold. Once its head reaches the stamp the same QC is decided.
+    /// A verifier whose head is more than a window behind a QC's signed
+    /// epoch waits rather than refusing: a binding bridging to it may be
+    /// one it has yet to fold. Once its head reaches the epoch the same
+    /// QC is decided.
     #[test]
     fn a_lagging_verifier_waits_for_the_binding() {
         let (set, old, fresh) = recovery_committees();
         let shard = BOUNDED;
         let anchor = WeightedTimestamp::from_millis(2_500);
-        let stamp = WeightedTimestamp::from_millis(21_100);
         // A head at 5 that has folded no recovery.
         let mut lagging = TopologySchedule::new(
             EpochWindows::new(0, 1000),
@@ -3098,7 +3051,7 @@ mod tests {
         );
         lagging.insert(Epoch::new(2), Arc::new(seating(&set, &old, None)));
         assert!(matches!(
-            lagging.admits(shard, anchor, stamp, Epoch::new(21)),
+            lagging.admits(shard, anchor, Epoch::new(21)),
             QcAdmission::Wait
         ));
         // Caught up, with the recovery folded: admitted.
@@ -3113,29 +3066,28 @@ mod tests {
             admitted(
                 &caught_up,
                 shard,
-                caught_up.admits(shard, anchor, stamp, Epoch::new(21))
+                caught_up.admits(shard, anchor, Epoch::new(21))
             ),
             fresh,
         );
-        // A head past the stamp that holds no binding placing it refuses.
+        // A head within a window of the epoch that holds no binding
+        // placing it refuses.
         let mut decided = lagging;
         decided.set_head(Epoch::new(30), Arc::new(seating(&set, &old, None)));
         assert!(matches!(
-            decided.admits(shard, anchor, stamp, Epoch::new(21)),
+            decided.admits(shard, anchor, Epoch::new(21)),
             QcAdmission::Refuse
         ));
     }
 
     /// The window every role resolves for a block of `shard` whose
-    /// committee anchor is `anchor`, certified with stamp `stamp`: built
-    /// and voted under `live`, its QC verified and the block folded under
+    /// committee anchor is `anchor`: built and voted under `live`, its QC verified and the block folded under
     /// `verifier`. Panics where two roles part.
     fn agree(
         live: &TopologySchedule,
         verifier: &TopologySchedule,
         shard: ShardId,
         anchor: WeightedTimestamp,
-        stamp: WeightedTimestamp,
     ) -> (Epoch, Vec<ValidatorId>) {
         let members =
             |committee: BlockCommittee<'_>| committee.snapshot.committee_for_shard(shard).to_vec();
@@ -3144,8 +3096,8 @@ mod tests {
             .committee()
             .expect("the proposer resolves its committee");
         let signed = proposed.epoch;
-        let QcAdmission::Admit(checked) = verifier.admits(shard, anchor, stamp, signed) else {
-            panic!("the verifier refuses {signed:?} at {anchor:?} stamped {stamp:?}");
+        let QcAdmission::Admit(checked) = verifier.admits(shard, anchor, signed) else {
+            panic!("the verifier refuses {signed:?} at {anchor:?}");
         };
         let folded = verifier
             .signed_committee(shard, signed)
@@ -3183,12 +3135,12 @@ mod tests {
         reshaped.insert(Epoch::new(1), Arc::clone(&split));
         reshaped.set_head(Epoch::new(1), split);
         assert_eq!(
-            agree(&reshaped, &reshaped, ShardId::ROOT, at(900), at(1_100)),
+            agree(&reshaped, &reshaped, ShardId::ROOT, at(900)),
             (Epoch::new(0), old),
             "a block whose own anchor lies past the cut",
         );
         assert_eq!(
-            agree(&reshaped, &reshaped, left, at(1_100), at(1_200)),
+            agree(&reshaped, &reshaped, left, at(1_100)),
             (Epoch::new(1), fresh),
             "the split child's first block",
         );
@@ -3237,15 +3189,13 @@ mod tests {
         );
         recovered.insert(Epoch::new(21), Arc::clone(&seated));
         recovered.set_head(Epoch::new(21), seated);
-        let t = agree(&halted, &recovered, shard, at(2_400), at(2_900));
+        let t = agree(&halted, &recovered, shard, at(2_400));
         assert_eq!(t, (Epoch::new(2), old.clone()), "T");
-        for (block, stamp) in [("X1", at(20_500)), ("X2", at(21_100))] {
-            assert_eq!(
-                agree(&recovered, &recovered, shard, at(2_900), stamp),
-                (Epoch::new(21), fresh.clone()),
-                "{block}",
-            );
-        }
+        assert_eq!(
+            agree(&recovered, &recovered, shard, at(2_900)),
+            (Epoch::new(21), fresh.clone()),
+            "X1 and X2",
+        );
 
         // A chained recovery whose second draw seats the original
         // committee at its own indexes: the stalled chain's next block,
@@ -3264,12 +3214,12 @@ mod tests {
         chained.insert(Epoch::new(41), Arc::clone(&redrawn));
         chained.set_head(Epoch::new(41), redrawn);
         assert_eq!(
-            agree(&chained, &chained, shard, at(2_900), at(41_100)),
+            agree(&chained, &chained, shard, at(2_900)),
             (Epoch::new(41), old.clone()),
             "the redrawn committee",
         );
         assert_eq!(
-            agree(&first, &chained, shard, at(21_500), at(21_900)),
+            agree(&first, &chained, shard, at(21_500)),
             (Epoch::new(21), fresh.clone()),
             "the first fresh committee's own block, verified after the redraw",
         );
@@ -3279,7 +3229,7 @@ mod tests {
         let mut lagging = halted;
         lagging.set_head(Epoch::new(5), window(&old, vec![]));
         assert!(matches!(
-            lagging.admits(shard, at(2_900), at(21_100), Epoch::new(21)),
+            lagging.admits(shard, at(2_900), Epoch::new(21)),
             QcAdmission::Wait
         ));
         let mut caught_up = lagging;
@@ -3287,16 +3237,16 @@ mod tests {
         caught_up.insert(Epoch::new(21), Arc::clone(&folded));
         caught_up.set_head(Epoch::new(21), folded);
         assert_eq!(
-            agree(&recovered, &caught_up, shard, at(2_900), at(21_100)),
+            agree(&recovered, &caught_up, shard, at(2_900)),
             (Epoch::new(21), fresh),
         );
     }
 
-    /// A fresh committee that certified in the epoch a re-draw was seated,
-    /// before folding the re-draw, is still admitted once the verifier has
-    /// folded it: the windows overlap at the seating epoch.
+    /// A fresh committee that certified before folding a re-draw is still
+    /// admitted once the verifier has folded it: its bridge stays a
+    /// candidate for every block anchored below it.
     #[test]
-    fn a_qc_certified_in_the_redraw_epoch_is_admitted_after_the_fold() {
+    fn a_fresh_qc_is_admitted_after_the_redraw_folds() {
         let (set, old, fresh) = recovery_committees();
         let shard = BOUNDED;
         let binding = |rotated_at: u64| RecoveryBinding {
@@ -3323,12 +3273,7 @@ mod tests {
             admitted(
                 &sched,
                 shard,
-                sched.admits(
-                    shard,
-                    WeightedTimestamp::from_millis(2_500),
-                    WeightedTimestamp::from_millis(40_700),
-                    Epoch::new(21)
-                )
+                sched.admits(shard, WeightedTimestamp::from_millis(2_500), Epoch::new(21))
             ),
             fresh,
         );
@@ -3815,8 +3760,6 @@ mod tests {
         sched.set_head(Epoch::new(23), completed(&shuffled));
 
         let stale_anchor = WeightedTimestamp::from_millis(2_500);
-        let suffix_qc = WeightedTimestamp::from_millis(2_900);
-        let bridge_qc = WeightedTimestamp::from_millis(21_100);
 
         // A bridge block is still admitted under the fresh committee — the
         // bridge window's own entry, not the shuffled head.
@@ -3824,7 +3767,7 @@ mod tests {
             admitted(
                 &sched,
                 shard,
-                sched.admits(shard, stale_anchor, bridge_qc, Epoch::new(21))
+                sched.admits(shard, stale_anchor, Epoch::new(21))
             ),
             fresh,
         );
@@ -3833,7 +3776,7 @@ mod tests {
             admitted(
                 &sched,
                 shard,
-                sched.admits(shard, stale_anchor, suffix_qc, Epoch::new(2))
+                sched.admits(shard, stale_anchor, Epoch::new(2))
             ),
             old,
         );
@@ -3963,9 +3906,7 @@ mod tests {
             _ => panic!("expected a resolved committee"),
         };
         let stale_anchor = WeightedTimestamp::from_millis(2_500);
-        let first_bridge_qc = WeightedTimestamp::from_millis(21_100);
         let first_era_anchor = WeightedTimestamp::from_millis(21_500);
-        let first_era_qc = WeightedTimestamp::from_millis(21_900);
 
         for second_completed in [false, true] {
             let mut sched =
@@ -3981,7 +3922,7 @@ mod tests {
                 admitted(
                     &sched,
                     shard,
-                    sched.admits(shard, stale_anchor, first_bridge_qc, Epoch::new(21))
+                    sched.admits(shard, stale_anchor, Epoch::new(21))
                 ),
                 first,
             );
@@ -3991,7 +3932,7 @@ mod tests {
                 admitted(
                     &sched,
                     shard,
-                    sched.admits(shard, first_era_anchor, first_era_qc, Epoch::new(21))
+                    sched.admits(shard, first_era_anchor, Epoch::new(21))
                 ),
                 first,
             );

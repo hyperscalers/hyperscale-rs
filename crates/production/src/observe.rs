@@ -335,12 +335,7 @@ fn summarise(
     let anchor = schedule
         .signing_anchor(shard, header, parent_anchor)
         .weighted_timestamp();
-    let committee = match schedule.admits_fenced(
-        shard,
-        anchor,
-        qc.weighted_timestamp(),
-        qc.committee_epoch(),
-    ) {
+    let committee = match schedule.admits_fenced(shard, anchor, qc.committee_epoch()) {
         QcAdmission::Admit(committee) if !qc.is_genesis() => Some(Arc::clone(committee.snapshot)),
         _ => None,
     };

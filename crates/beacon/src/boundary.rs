@@ -476,7 +476,7 @@ fn boundary_header_for(
 /// frontier has passed.
 ///
 /// The QC verifies under the window its signers signed, admitted at the
-/// committee anchor and its stamp ([`TopologySchedule::admits_fenced`]).
+/// committee anchor ([`TopologySchedule::admits_fenced`]).
 /// A splitting shard's terminal crossing can be anchored exactly on its
 /// cut — a crossing is parent-inclusive at the cut — and a terminal is
 /// anchored past it, where the anchor's half-open window no longer carries
@@ -511,41 +511,36 @@ fn boundary_qc_authentic(
     if qc.is_genesis() {
         return false;
     }
-    let snapshot = match topology_schedule.admits_fenced(
-        shard,
-        committee_anchor_wt,
-        qc.weighted_timestamp(),
-        qc.committee_epoch(),
-    ) {
-        QcAdmission::Admit(committee) => committee.snapshot,
-        QcAdmission::Fenced => {
-            warn!(
-                shard = shard.inner(),
-                epoch = qc.committee_epoch().inner(),
-                "Rejecting boundary QC signed under a committee a pending recovery replaced"
-            );
-            return false;
-        }
-        QcAdmission::Wait => {
-            debug!(
-                shard = shard.inner(),
-                "Boundary QC's committee epoch not decidable yet — abstaining"
-            );
-            return false;
-        }
-        // Under the boundary's own anchor, standing in for a parent not
-        // held, the parent is what decides: `awaited_boundaries` names it.
-        QcAdmission::Refuse => {
-            debug!(
-                shard = shard.inner(),
-                anchor_epoch = topology_schedule.epoch_for(committee_anchor_wt).inner(),
-                qc_epoch = topology_schedule.epoch_for(qc.weighted_timestamp()).inner(),
-                epoch = qc.committee_epoch().inner(),
-                "Boundary QC's signed epoch is not admitted at its anchor — abstaining"
-            );
-            return false;
-        }
-    };
+    let snapshot =
+        match topology_schedule.admits_fenced(shard, committee_anchor_wt, qc.committee_epoch()) {
+            QcAdmission::Admit(committee) => committee.snapshot,
+            QcAdmission::Fenced => {
+                warn!(
+                    shard = shard.inner(),
+                    epoch = qc.committee_epoch().inner(),
+                    "Rejecting boundary QC signed under a committee a pending recovery replaced"
+                );
+                return false;
+            }
+            QcAdmission::Wait => {
+                debug!(
+                    shard = shard.inner(),
+                    "Boundary QC's committee epoch not decidable yet — abstaining"
+                );
+                return false;
+            }
+            // Under the boundary's own anchor, standing in for a parent not
+            // held, the parent is what decides: `awaited_boundaries` names it.
+            QcAdmission::Refuse => {
+                debug!(
+                    shard = shard.inner(),
+                    anchor_epoch = topology_schedule.epoch_for(committee_anchor_wt).inner(),
+                    epoch = qc.committee_epoch().inner(),
+                    "Boundary QC's signed epoch is not admitted at its anchor — abstaining"
+                );
+                return false;
+            }
+        };
     let committee = snapshot.consensus_committee_for_shard(shard);
     if committee.is_empty() {
         return false;

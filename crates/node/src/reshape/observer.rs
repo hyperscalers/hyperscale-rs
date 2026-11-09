@@ -325,14 +325,12 @@ pub struct TerminalCommitProof {
 }
 
 /// What selects the committee a QC verifies against: the anchor of the
-/// certified block's parent, and the QC's own stamp and signed epoch,
-/// which the schedule admits at that anchor.
+/// certified block's parent, and the QC's signed epoch, which the
+/// schedule admits at that anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QcWindow {
     /// The certified block's committee anchor: its parent's own anchor.
     pub anchor: WeightedTimestamp,
-    /// The QC's stamp.
-    pub qc_wt: WeightedTimestamp,
     /// The epoch the QC's signers signed.
     pub epoch: Epoch,
 }
@@ -344,7 +342,6 @@ impl QcWindow {
     pub const fn of(anchor: WeightedTimestamp, qc: &QuorumCertificate) -> Self {
         Self {
             anchor,
-            qc_wt: qc.weighted_timestamp(),
             epoch: qc.committee_epoch(),
         }
     }
@@ -2112,12 +2109,10 @@ mod tests {
             [
                 QcWindow {
                     anchor: wt(4_000),
-                    qc_wt: wt(CUT_MS + 500),
                     epoch: Epoch::GENESIS,
                 },
                 QcWindow {
                     anchor: wt(CUT_MS + 250),
-                    qc_wt: wt(9_999),
                     epoch: Epoch::GENESIS,
                 },
             ],

@@ -1657,7 +1657,6 @@ impl RemoteHeaderCoordinator {
         topology_schedule.admits_fenced(
             certified_header.shard_id(),
             anchor.weighted_timestamp(),
-            qc.weighted_timestamp(),
             qc.committee_epoch(),
         )
     }
@@ -4580,16 +4579,15 @@ mod tests {
         )
     }
 
-    /// The seating-epoch forgery at remote-header intake. A header anchored
-    /// on the halted tip (epoch 2), whose QC signs that window and is
-    /// stamped in the epoch the recovery was seated (9, bridge 10), is
-    /// admitted by the stamp's interval and verifies under the replaced
-    /// committee's keys: the signed-epoch fence drops it, with no check and
-    /// no fetch for its parent, since no parent changes the verdict. The
-    /// fresh committee's bridge header, signed under 10 at the same stamp,
-    /// is checked.
+    /// The retained-quorum forgery at remote-header intake. A header
+    /// anchored on the halted tip (epoch 2), whose QC signs that window,
+    /// verifies under the replaced committee's keys: the signed-epoch
+    /// fence drops it at any stamp, here around the epoch the recovery was
+    /// seated (9, bridge 10), with no check and no fetch for its parent,
+    /// since no parent changes the verdict. The fresh committee's bridge
+    /// header, signed under 10, is checked.
     #[test]
-    fn a_retained_quorum_stamped_in_the_seating_epoch_is_fenced() {
+    fn a_retained_quorum_is_fenced_at_any_stamp() {
         let remote = ShardId::leaf(1, 1);
         let schedule = schedule_under(recovery_head(remote, Recovery::Pending));
         let stamped = |epoch: u64, stamp: u64| {
@@ -4962,50 +4960,55 @@ mod tests {
     /// The stamp rides outside the signed message, so a relay can rewrite
     /// it, but not the epoch the quorum signed. The fresh committee's
     /// bridge block, its stamp rewritten to before the recovery was
-    /// seated, places no committee of its anchor at the epoch it names:
-    /// the copy is refused and checked under no window, while the copy
-    /// carrying the quorum's own stamp is checked.
+    /// seated or far past it, is checked under the committee the copy
+    /// carrying the quorum's own stamp is checked under.
     #[test]
-    fn a_rewritten_stamp_refuses_the_copy_and_moves_no_epoch() {
+    fn a_rewritten_stamp_moves_no_committee() {
         let local = ShardId::leaf(1, 0);
         let remote = ShardId::leaf(1, 1);
-        let mut coord = RemoteHeaderCoordinator::new(local);
         let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
-        commit_local(&mut coord, &cleared, 1);
-
         let parent = chain_header_dated(remote, 5, 5, None, 9_500);
         let honest = chain_header_signed(remote, 6, 6, Some(&parent), Epoch::new(10), 10_200);
-        coord.on_verified_remote_header_received(&cleared, parent, ValidatorId::new(1));
-        let qc = honest.qc();
-        let restamped = CertifiedBlockHeader::new(
-            honest.header().clone(),
-            QuorumCertificate::new(
-                qc.block_hash(),
-                qc.shard_id(),
-                qc.height(),
-                qc.parent_block_hash(),
-                qc.round(),
-                qc.committee_epoch(),
-                qc.signers().clone(),
-                qc.aggregated_signature(),
-                WeightedTimestamp::from_millis(8_500),
-            ),
-        );
-        assert_eq!(restamped.qc().committee_epoch(), Epoch::new(10));
-
-        let actions = coord.on_remote_header_received(&cleared, restamped, gossip(2));
-        assert!(
-            actions.is_empty(),
-            "the restamped copy is refused: {actions:?}"
-        );
-        assert!(coord.get_pending(remote, BlockHeight::new(6)).is_none());
-
-        let actions = coord.on_remote_header_received(&cleared, unverified(&honest), gossip(1));
-        assert_eq!(
-            verify_qc_count(&actions),
-            1,
-            "the quorum's own copy is checked"
-        );
+        let checked_under = |certified: CertifiedBlockHeader| {
+            let mut coord = RemoteHeaderCoordinator::new(local);
+            commit_local(&mut coord, &cleared, 1);
+            coord.on_verified_remote_header_received(&cleared, parent.clone(), ValidatorId::new(1));
+            let actions = coord.on_remote_header_received(&cleared, certified, gossip(2));
+            let checks: Vec<_> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Consensus(ConsensusAction::VerifyRemoteHeaderQc {
+                        committee_public_keys,
+                        quorum_threshold,
+                        ..
+                    }) => Some((committee_public_keys.clone(), *quorum_threshold)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(checks.len(), 1, "one check: {actions:?}");
+            checks.into_iter().next()
+        };
+        let own = checked_under(unverified(&honest));
+        let restamped = |ms: u64| {
+            let qc = honest.qc();
+            CertifiedBlockHeader::new(
+                honest.header().clone(),
+                QuorumCertificate::new(
+                    qc.block_hash(),
+                    qc.shard_id(),
+                    qc.height(),
+                    qc.parent_block_hash(),
+                    qc.round(),
+                    qc.committee_epoch(),
+                    qc.signers().clone(),
+                    qc.aggregated_signature(),
+                    WeightedTimestamp::from_millis(ms),
+                ),
+            )
+        };
+        for ms in [0, 8_500, 9_999, 40_000] {
+            assert_eq!(checked_under(restamped(ms)), own, "restamped to {ms}");
+        }
     }
 
     /// Shared history at or below the frontier, certified by the replaced

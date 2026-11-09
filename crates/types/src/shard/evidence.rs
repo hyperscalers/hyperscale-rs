@@ -246,7 +246,7 @@ impl ShardForkProof {
     /// Resolve each QC's committee from the schedule: the window its
     /// signers signed, admitted ([`TopologySchedule::admits`]) at the
     /// block's committee anchor — its *parent's* weighted timestamp — and
-    /// the QC's stamp. `None` if any QC is not admitted, or if a proof
+    /// the QC's signed epoch. `None` if any QC is not admitted, or if a proof
     /// carries no parent for its certified block; the caller defers,
     /// exactly as cross-shard consumption does. The result lines up
     /// positionally with [`Self::qc_headers`].
@@ -270,12 +270,9 @@ impl ShardForkProof {
                 if qc.is_genesis() {
                     return None;
                 }
-                let QcAdmission::Admit(committee) = schedule.admits(
-                    shard,
-                    anchor_wt,
-                    qc.weighted_timestamp(),
-                    qc.committee_epoch(),
-                ) else {
+                let QcAdmission::Admit(committee) =
+                    schedule.admits(shard, anchor_wt, qc.committee_epoch())
+                else {
                     return None;
                 };
                 let snapshot = committee.snapshot;

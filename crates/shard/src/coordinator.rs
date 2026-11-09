@@ -1378,8 +1378,7 @@ impl ShardCoordinator {
     }
 
     /// Committee that signed `qc`: the window its signers signed, admitted
-    /// at its block's committee anchor and its stamp
-    /// ([`TopologySchedule::admits`]). Unlike [`Self::committee_of_block`]
+    /// at its block's committee anchor ([`TopologySchedule::admits`]). Unlike [`Self::committee_of_block`]
     /// this reads what the quorum stated, so a halt recovery's suffix
     /// verifies against the windows that produced it and a bridge block
     /// against the fresh committee, however late a replica reads either.
@@ -1432,7 +1431,7 @@ impl ShardCoordinator {
     /// is tried as [`TopologySchedule::admits`] places it at the
     /// stand-in, then at the start of the window below: the raw window
     /// at either anchor, or a window a recovery bridging that anchor
-    /// seated, where the QC's stamp falls in that committee's term.
+    /// seated.
     /// Unfenced: the tip is committed history.
     fn unsigned_tip_committee<'t>(
         &self,
@@ -1482,12 +1481,7 @@ impl ShardCoordinator {
         if qc.is_genesis() {
             return QcAdmission::Refuse;
         }
-        topology_schedule.admits(
-            self.local_shard,
-            committee_anchor,
-            qc.weighted_timestamp(),
-            qc.committee_epoch(),
-        )
+        topology_schedule.admits(self.local_shard, committee_anchor, qc.committee_epoch())
     }
 
     /// The committee a committed or committing block was certified under:
@@ -8355,7 +8349,7 @@ impl ShardCoordinator {
         // up — discarding it here would leave a hole the drain can never
         // refill without a network re-fetch. A refused one rejects: its
         // signed epoch is not one honest voters can have signed for the
-        // block at its stamp, or its window is below the schedule floor,
+        // block, or its window is below the schedule floor,
         // which retains every epoch the local chain can still verify
         // against — no amount of retrying resolves it. A halt recovery's
         // bridge block signs the bridge and verifies against the fresh
@@ -21773,14 +21767,54 @@ mod tests {
         )
     }
 
-    /// A fresh-committee QC a member relays with its clock lowered into the
-    /// window below the bridge still verifies, and does not reopen the
-    /// halted chain: once this replica holds the fresh committee's QC, a
-    /// halted QC above its round is refused whatever clock the copy it
-    /// adopted carried.
+    /// A QC's weighted timestamp rides outside its signature, so a relay
+    /// can re-date any copy. Each re-dated copy resolves the committee the
+    /// quorum's own copy does, and verifies under it: the fresh
+    /// committee's bridge QC dated below the seating window or far past
+    /// it, and the halted chain's QC dated past the bridge.
+    #[test]
+    fn a_redated_qc_resolves_the_committee_its_honest_copy_does() {
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(0);
+        let schedule = bridged_halt_schedule(&schedule);
+        state.set_time(LocalTimestamp::from_millis(5_000));
+        let fresh = empty_block_at_round(state.committed_hash, 3);
+        install_complete_block(&mut state, &fresh);
+        let fresh_qc = quorum_stamped_in(&keys, &fresh, 3_500, Epoch::new(3));
+        let halted = empty_block_at_round(state.committed_hash, 7);
+        install_complete_block(&mut state, &halted);
+        let halted_qc = quorum_stamped(&keys, &halted, 1_000);
+
+        for honest in [fresh_qc, halted_qc] {
+            let epoch = honest.committee_epoch();
+            let own = std::ptr::from_ref(
+                state
+                    .committee_of_qc(&schedule, &honest)
+                    .unwrap_or_else(|| panic!("{epoch:?}: the quorum's own copy resolves")),
+            );
+            for ms in [0, 1_000, 2_000, 2_999, 3_000, 4_999, 60_000] {
+                let copy = restamped(&honest, ms);
+                assert_eq!(
+                    state
+                        .committee_of_qc(&schedule, &copy)
+                        .map(std::ptr::from_ref),
+                    Some(own),
+                    "{epoch:?} re-dated to {ms}",
+                );
+                assert!(
+                    state.verify_qc_sync(&schedule, &copy).is_some(),
+                    "{epoch:?} re-dated to {ms} fails verification",
+                );
+            }
+        }
+    }
+
+    /// A fresh-committee QC a member relays with its clock lowered below
+    /// the bridge still verifies, and does not reopen the halted chain:
+    /// once this replica holds the fresh committee's QC, a halted QC above
+    /// its round is refused whatever clock the copy it adopted carried.
     #[test]
     fn a_fresh_qc_relayed_beneath_the_bridge_keeps_the_halted_chain_out() {
-        for lowered_ms in [2_000, 2_999] {
+        for lowered_ms in [0, 1_000, 2_000, 2_999] {
             let (mut state, schedule, keys) = make_multi_validator_state_with_keys(0);
             let schedule = bridged_halt_schedule(&schedule);
             state.set_time(LocalTimestamp::from_millis(5_000));

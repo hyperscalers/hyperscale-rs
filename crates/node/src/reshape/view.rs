@@ -131,7 +131,7 @@ impl<'a> ReshapeView<'a> {
     /// The committee that signed a QC of `shard`'s in `window`.
     ///
     /// The window the QC's signers signed, admitted at the certified
-    /// block's committee anchor and the QC's stamp, so a block certified in
+    /// block's committee anchor, so a block certified in
     /// an earlier window verifies against the set that signed it, and a
     /// terminating shard's coast QCs against its final window. Fenced: a
     /// halt recovery's retained cohort, which is beyond f, resolves
@@ -140,7 +140,7 @@ impl<'a> ReshapeView<'a> {
     pub(crate) fn certifying_committee(&self, shard: ShardId, window: QcWindow) -> CommitteeLookup {
         match self
             .schedule
-            .admits_fenced(shard, window.anchor, window.qc_wt, window.epoch)
+            .admits_fenced(shard, window.anchor, window.epoch)
         {
             QcAdmission::Admit(committee) => resolve(committee.snapshot, shard)
                 .map_or(CommitteeLookup::Unresolvable, CommitteeLookup::Resolved),
