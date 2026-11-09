@@ -61,7 +61,7 @@ impl ShardParticipation {
     ) -> Vec<Action> {
         let mut actions = self
             .shard_coordinator
-            .on_committed_state_restored(height, hash, qc);
+            .on_committed_state_restored(sched, height, hash, qc);
         self.shard_coordinator.latch_dissolution(sched);
         let effects = self
             .execution_coordinator

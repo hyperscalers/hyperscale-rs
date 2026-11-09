@@ -1196,6 +1196,29 @@ impl ShardCoordinator {
         }
     }
 
+    /// Take `qc` as `latest_qc` when it is in a higher round than the one
+    /// held and a pending halt recovery does not refuse it
+    /// ([`Self::halt_refuses_left_bridge`]), with its clock floored at its
+    /// block's anchor ([`Self::floored_qc`]). The one write to `latest_qc`
+    /// past construction, so no path — adoption, sync, restore, or this
+    /// replica's own aggregate — takes a high QC another would refuse.
+    /// `true` when it replaced the held one.
+    fn raise_high_qc(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        qc: Verified<QuorumCertificate>,
+    ) -> bool {
+        let advances = self
+            .latest_qc
+            .as_ref()
+            .is_none_or(|existing| qc.round() > existing.round());
+        if !advances || self.halt_refuses_left_bridge(topology_schedule, &qc) {
+            return false;
+        }
+        self.latest_qc = Some(self.floored_qc(qc));
+        true
+    }
+
     /// Weighted timestamp selecting `block_hash`'s committee — its parent's
     /// [`Self::block_anchor`]. `None` when the block or its parent is unknown,
     /// so the committee can't be resolved (caller stalls or defers).
@@ -2617,6 +2640,7 @@ impl ShardCoordinator {
     #[instrument(skip(self, qc), fields(height = height.inner(), has_hash = hash.is_some(), has_qc = qc.is_some()))]
     pub fn on_committed_state_restored(
         &mut self,
+        topology_schedule: &TopologySchedule,
         height: BlockHeight,
         hash: Option<BlockHash>,
         qc: Option<Verified<QuorumCertificate>>,
@@ -2657,10 +2681,8 @@ impl ShardCoordinator {
         // here would drop back to a certificate beneath this node's own
         // lock, which is what it reports in a timeout — and a bound
         // understated is a bound another replica may vote beneath.
-        let held = self.latest_qc.as_deref().map(QuorumCertificate::round);
-        if qc.as_deref().map(QuorumCertificate::round) > held {
-            let floored = qc.map(|qc| self.floored_qc(qc));
-            self.latest_qc = floored;
+        if let Some(qc) = qc {
+            self.raise_high_qc(topology_schedule, qc);
         }
 
         self.view_change.reset_for_height_advance();
@@ -4626,7 +4648,7 @@ impl ShardCoordinator {
             lookup_provision,
         );
         self.record_header_activity(topology_schedule, header);
-        self.adopt_deferred_qc_if_matches(block_hash);
+        self.adopt_deferred_qc_if_matches(topology_schedule, block_hash);
 
         // Admit any pre-header votes for this block (held raw until now), then
         // re-check the tally — both against the exact committee the
@@ -5051,11 +5073,7 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         qc: &Verified<QuorumCertificate>,
     ) -> bool {
-        let advances = self
-            .latest_qc
-            .as_ref()
-            .is_none_or(|existing| qc.round() > existing.round());
-        if !advances || self.halt_refuses_left_bridge(topology_schedule, qc) {
+        if !self.raise_high_qc(topology_schedule, qc.clone()) {
             return false;
         }
         debug!(
@@ -5064,7 +5082,6 @@ impl ShardCoordinator {
             qc_round = qc.round().inner(),
             "Adopted verified parent QC"
         );
-        self.latest_qc = Some(self.floored_qc(qc.clone()));
         self.advance_view_for_qc(qc);
         true
     }
@@ -5163,17 +5180,16 @@ impl ShardCoordinator {
     /// (votes arrived before this header), adopt it now. Latches a
     /// proposal-retry on adoption. If the deferred QC is for a different
     /// block, it's put back.
-    fn adopt_deferred_qc_if_matches(&mut self, block_hash: BlockHash) {
+    fn adopt_deferred_qc_if_matches(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+    ) {
         let Some(deferred_qc) = self.deferred_qc.take_for(block_hash) else {
             return;
         };
 
-        let should_adopt = self
-            .latest_qc
-            .as_ref()
-            .is_none_or(|existing| deferred_qc.round() > existing.round());
-        if should_adopt {
-            self.latest_qc = Some(deferred_qc.clone());
+        if self.raise_high_qc(topology_schedule, deferred_qc.clone()) {
             self.advance_view_for_qc(&deferred_qc);
             self.queue_ready_proposal();
         }
@@ -7212,31 +7228,29 @@ impl ShardCoordinator {
         // Record leader activity - QC forming indicates progress
         self.record_leader_activity();
 
-        // Update latest QC if this is newer (by round — see `try_adopt_verified_qc`)
-        let should_update = self
-            .latest_qc
-            .as_ref()
-            .is_none_or(|existing| qc.round() > existing.round());
-
-        if should_update {
-            // Defer adoption if the header isn't in memory yet — we need it
-            // to look up parent_state_root / parent_in_flight at proposal time.
-            if self.chain_view().get_header(block_hash).is_some() {
-                self.latest_qc = Some(qc.clone());
+        // Adopt the QC if it is newer (by round — see `try_adopt_verified_qc`),
+        // or defer it while the header isn't in memory yet — proposing over
+        // it reads parent_state_root / parent_in_flight off that header.
+        if self.chain_view().get_header(block_hash).is_some() {
+            if self.raise_high_qc(topology_schedule, qc.clone()) {
                 self.advance_view_for_qc(qc);
                 // Cache the just-formed QC so the next 2-chain commit
                 // (driven by the *next* QC certifying our successor)
                 // can look up this QC as the certifying handle for the
                 // committable block.
                 self.verification.cache_verified_qc(qc.clone());
-            } else {
-                debug!(
-                    block_hash = ?block_hash,
-                    height = height.inner(),
-                    "Deferring QC adoption — block header not yet in memory"
-                );
-                self.deferred_qc.defer(block_hash, qc.clone());
             }
+        } else if self
+            .latest_qc
+            .as_ref()
+            .is_none_or(|existing| qc.round() > existing.round())
+        {
+            debug!(
+                block_hash = ?block_hash,
+                height = height.inner(),
+                "Deferring QC adoption — block header not yet in memory"
+            );
+            self.deferred_qc.defer(block_hash, qc.clone());
         }
 
         // Reset the view change timer to count from now (leader progress).
@@ -8569,21 +8583,6 @@ impl ShardCoordinator {
             "Admitting synced block"
         );
 
-        // Update latest QC if this one is newer (by round).
-        let held_round = self.latest_qc.as_ref().map(|qc| qc.round());
-        if self
-            .latest_qc
-            .as_ref()
-            .is_none_or(|existing| verified_qc.round() > existing.round())
-        {
-            self.advance_view_for_qc(&verified_qc);
-            self.latest_qc = Some(
-                verified_qc
-                    .clone()
-                    .with_clock_at_least(block.header().parent_qc().weighted_timestamp()),
-            );
-        }
-
         // The synced block's QC BFT-transitively attests every embedded tick's
         // per-EC signature predicate via the source committee's signature over
         // the body root, so the ticks can be
@@ -8603,9 +8602,6 @@ impl ShardCoordinator {
                 }
             })
             .collect();
-        let parent_qc_round = block.header().parent_qc().round();
-        let parent_qc_not_genesis = !block.header().parent_qc().is_genesis();
-
         // Assemble the synced block into a `Verified<CertifiedBlock>` via the
         // BFT-transitive trust gate: the source committee's QC attests to the
         // block's per-root verifications.
@@ -8619,25 +8615,7 @@ impl ShardCoordinator {
                 }
             };
 
-        // Adopt the parent_qc from the block header if it's newer still.
-        if parent_qc_not_genesis
-            && self
-                .latest_qc
-                .as_ref()
-                .is_none_or(|existing| parent_qc_round > existing.round())
-        {
-            let verified_parent = certified.parent_qc_attested();
-            self.advance_view_for_qc(&verified_parent);
-            self.latest_qc = Some(verified_parent);
-        }
-        // A high QC learned by sync names the round after it, and this
-        // replica may be that round's proposer: a QC formed while its block
-        // was not held here, or announced to the next proposer, reaches it
-        // this way. Nothing else re-enters the proposer for that round
-        // before its timer abandons it.
-        if self.latest_qc.as_ref().map(|qc| qc.round()) > held_round {
-            self.queue_ready_proposal();
-        }
+        self.raise_high_qc_from_synced(topology_schedule, &certified);
 
         // Cache the certified handle so the round-contiguous two-chain rule can
         // find this block as a committable parent — and as a
@@ -8672,7 +8650,15 @@ impl ShardCoordinator {
         actions.extend(superseded);
         actions.extend(certified_block_landed(Arc::clone(&certified)));
         let own = certified.qc_verified();
-        let mut commits = self.try_two_chain_commit(own, CommitSource::Sync);
+        // A halted block the fresh chain has left behind commits nothing
+        // through its own QC: it is a sibling of what the fresh chain
+        // built, and an ancestor of the fresh chain commits through the
+        // fresh chain's QCs instead.
+        let mut commits = if self.halt_refuses_left_bridge(topology_schedule, own) {
+            Vec::new()
+        } else {
+            self.try_two_chain_commit(own, CommitSource::Sync)
+        };
         // A QC held above this block's own is a child's, adopted when the
         // child applied over a sibling at this height that never
         // committed. Its commit deferred on the handle this block now
@@ -8701,6 +8687,38 @@ impl ShardCoordinator {
         }
 
         actions
+    }
+
+    /// Raise `latest_qc` from a synced block: its own QC, floored at the
+    /// block's anchor, then the parent QC its header carries, each through
+    /// [`Self::raise_high_qc`].
+    ///
+    /// A high QC learned by sync names the round after it, and this
+    /// replica may be that round's proposer: a QC formed while its block
+    /// was not held here, or announced to the next proposer, reaches it
+    /// this way. Nothing else re-enters the proposer for that round
+    /// before its timer abandons it, so a raise queues a proposal.
+    fn raise_high_qc_from_synced(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        certified: &Verified<CertifiedBlock>,
+    ) {
+        let anchor = certified.block().header().parent_qc().weighted_timestamp();
+        let own = certified.qc_verified().clone().with_clock_at_least(anchor);
+        let mut raised = self.raise_high_qc(topology_schedule, own.clone());
+        if raised {
+            self.advance_view_for_qc(&own);
+        }
+        if !certified.block().header().parent_qc().is_genesis() {
+            let parent = certified.parent_qc_attested();
+            if self.raise_high_qc(topology_schedule, parent.clone()) {
+                self.advance_view_for_qc(&parent);
+                raised = true;
+            }
+        }
+        if raised {
+            self.queue_ready_proposal();
+        }
     }
 
     /// Queue a sync-admitted block's state-root verification, so its tree
@@ -18662,7 +18680,7 @@ mod tests {
         // The restore must not roll the registers back to the QC round, or
         // the one-vote-per-round guard would admit a second vote at a round
         // already signed.
-        let (mut state, _topology) = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.sole_mut().last_voted_round = Round::new(7);
         state.sole_mut().locked_round = Round::new(6);
 
@@ -18679,6 +18697,7 @@ mod tests {
                 WeightedTimestamp::from_millis(100_000),
             ));
         state.on_committed_state_restored(
+            &topology,
             BlockHeight::new(4),
             Some(BlockHash::ZERO),
             Some(trailing_qc),
@@ -21591,17 +21610,15 @@ mod tests {
     /// A 3-of-4 QC over `block` at its own height and round, its votes
     /// stamped at `stamp_ms`.
     fn quorum_stamped(
-        state: &ShardCoordinator,
         keys: &[BlsSigner],
         block: &Block,
         stamp_ms: u64,
     ) -> Verified<QuorumCertificate> {
-        quorum_stamped_in(state, keys, block, stamp_ms, Epoch::GENESIS)
+        quorum_stamped_in(keys, block, stamp_ms, Epoch::GENESIS)
     }
 
     /// [`quorum_stamped`] signed by the committee keyed `epoch`.
     fn quorum_stamped_in(
-        state: &ShardCoordinator,
         keys: &[BlsSigner],
         block: &Block,
         stamp_ms: u64,
@@ -21615,7 +21632,7 @@ mod tests {
                 let vote = Verified::<BlockVote>::sign_local(
                     &net,
                     block.hash(),
-                    state.committed_hash,
+                    header.parent_block_hash(),
                     ShardId::ROOT,
                     header.height(),
                     header.round(),
@@ -21635,7 +21652,7 @@ mod tests {
             header.height(),
             header.round(),
             epoch,
-            state.committed_hash,
+            header.parent_block_hash(),
             WeightedTimestamp::ZERO,
             &votes,
         )
@@ -21670,11 +21687,11 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(5_000));
         let fresh = empty_block_at_round(state.committed_hash, 3);
         install_complete_block(&mut state, &fresh);
-        let fresh_qc = quorum_stamped_in(&state, &keys, &fresh, 3_500, Epoch::new(3));
+        let fresh_qc = quorum_stamped_in(&keys, &fresh, 3_500, Epoch::new(3));
         let _ = state.try_adopt_verified_qc(&schedule, &fresh_qc);
         assert_eq!(state.high_qc_round(), Round::new(3));
         let halted = empty_block_at_round(state.committed_hash, 7);
-        let halted_qc = quorum_stamped(&state, &keys, &halted, 1_000);
+        let halted_qc = quorum_stamped(&keys, &halted, 1_000);
         (state, schedule, keys, halted, halted_qc)
     }
 
@@ -21726,13 +21743,13 @@ mod tests {
         state.set_time(LocalTimestamp::from_millis(5_000));
         let anchor = empty_block_at_round(state.committed_hash, 3);
         install_complete_block(&mut state, &anchor);
-        let anchor_qc = quorum_stamped(&state, &keys, &anchor, 500);
+        let anchor_qc = quorum_stamped(&keys, &anchor, 500);
         let _ = state.try_adopt_verified_qc(&schedule, &anchor_qc);
         assert_eq!(state.high_qc_round(), Round::new(3));
 
         let halted = empty_block_at_round(state.committed_hash, 7);
         install_complete_block(&mut state, &halted);
-        let halted_qc = quorum_stamped(&state, &keys, &halted, 1_000);
+        let halted_qc = quorum_stamped(&keys, &halted, 1_000);
         let below_view = member_timeout(&keys, Round::new(1), &halted_qc);
         let _ = state.on_unverified_timeout(&schedule, &below_view);
         assert_eq!(state.high_qc_round(), Round::new(7));
@@ -21769,7 +21786,7 @@ mod tests {
             state.set_time(LocalTimestamp::from_millis(5_000));
             let fresh = empty_block_at_round(state.committed_hash, 3);
             install_complete_block(&mut state, &fresh);
-            let fresh_qc = quorum_stamped_in(&state, &keys, &fresh, 3_500, Epoch::new(3));
+            let fresh_qc = quorum_stamped_in(&keys, &fresh, 3_500, Epoch::new(3));
             let lowered = restamped(&fresh_qc, lowered_ms);
             // The check every relay path (announcement, timeout share,
             // timeout quorum) runs before adoption.
@@ -21785,7 +21802,7 @@ mod tests {
 
             let halted = empty_block_at_round(state.committed_hash, 7);
             install_complete_block(&mut state, &halted);
-            let halted_qc = quorum_stamped(&state, &keys, &halted, 1_000);
+            let halted_qc = quorum_stamped(&keys, &halted, 1_000);
             let carrying = member_timeout(&keys, Round::new(2), &halted_qc);
             let _ = state.on_unverified_timeout(&schedule, &carrying);
             assert_eq!(
@@ -21794,6 +21811,96 @@ mod tests {
                 "stamp {lowered_ms}: a halted QC was adopted over the fresh committee's"
             );
         }
+    }
+
+    /// `block` and `qc` through block sync: the arrival, then the QC
+    /// check that applies it.
+    fn sync_certified(
+        state: &mut ShardCoordinator,
+        schedule: &TopologySchedule,
+        block: Block,
+        qc: Verified<QuorumCertificate>,
+    ) -> Vec<Action> {
+        let hash = block.hash();
+        let _ = state.on_sync_block_ready_to_apply(
+            schedule,
+            CertifiedBlock::new_unchecked(block, (*qc).clone()),
+        );
+        state.on_qc_signature_verified(schedule, QcSubject::SyncedBlock(hash), Ok(qc))
+    }
+
+    /// Block sync takes any certified block at a height it asks for, and
+    /// a retained ex-member serves the halted chain's. Once the fresh
+    /// chain has left the bridge, a halted block synced at a height the
+    /// fresh chain also holds is applied but raises nothing: its QC, in a
+    /// round above the fresh chain's, is not this replica's high QC.
+    #[test]
+    fn a_synced_halted_block_raises_no_high_qc_once_the_fresh_chain_left_the_bridge() {
+        let (mut state, schedule, _keys, halted, halted_qc) = fresh_chain_past_the_bridge();
+        state.set_block_syncing(true);
+        let actions = sync_certified(&mut state, &schedule, halted, halted_qc);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SyncBlockApplied { .. })),
+            "the halted block still applies; got {actions:?}"
+        );
+        assert_eq!(
+            state.high_qc_round(),
+            Round::new(3),
+            "a synced halted QC was adopted over the fresh committee's"
+        );
+    }
+
+    /// A round-contiguous pair of halted blocks synced once the fresh
+    /// chain has left the bridge commits neither: the child's QC would
+    /// commit its parent by the two-chain rule, over the height the fresh
+    /// chain holds.
+    #[test]
+    fn a_synced_halted_two_chain_commits_nothing_once_the_fresh_chain_left_the_bridge() {
+        let (mut state, schedule, keys, halted, halted_qc) = fresh_chain_past_the_bridge();
+        state.set_block_syncing(true);
+        let child = {
+            let header = BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(2),
+                parent_block_hash: halted.hash(),
+                parent_qc: (*halted_qc).clone().into(),
+                proposer: ValidatorId::new(0),
+                timestamp: ProposerTimestamp::from_millis(100_000),
+                round: Round::new(8),
+                state_root: halted.header().state_root(),
+                load: halted.header().load().advance(0, DeclaredWork::ZERO, None),
+                ..Default::default()
+            });
+            Block::Live {
+                header,
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            }
+        };
+        let child_qc = quorum_stamped(&keys, &child, 1_500);
+        let _ = sync_certified(&mut state, &schedule, halted, halted_qc);
+        let actions = sync_certified(&mut state, &schedule, child, child_qc);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SyncBlockApplied { .. })),
+            "the halted child still applies; got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Continuation(ProtocolEvent::BlockReadyToCommit { .. })
+            )),
+            "a halted block committed over the fresh chain; got {actions:?}"
+        );
+        assert_eq!(state.high_qc_round(), Round::new(3));
     }
 
     /// A harvest still under way when the fresh chain leaves the bridge
@@ -24778,7 +24885,7 @@ mod tests {
     /// the anchor, as an adopted one is.
     #[test]
     fn a_restored_qc_dated_beneath_its_anchor_is_held_at_the_anchor() {
-        let (mut state, _) = make_test_state();
+        let (mut state, schedule) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
         let anchor = WeightedTimestamp::from_millis(50_000);
         state.committed_block_anchor_wt = anchor;
@@ -24796,7 +24903,12 @@ mod tests {
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(1),
             ));
-        let _ = state.on_committed_state_restored(BlockHeight::new(3), Some(tip), Some(lowered));
+        let _ = state.on_committed_state_restored(
+            &schedule,
+            BlockHeight::new(3),
+            Some(tip),
+            Some(lowered),
+        );
 
         let held = state.latest_qc().expect("the restored QC is held");
         assert!(
@@ -30385,7 +30497,8 @@ mod tests {
             "no proposal is queued before the restore"
         );
 
-        let _ = state.on_committed_state_restored(BlockHeight::new(3), Some(tip), Some(qc));
+        let _ =
+            state.on_committed_state_restored(&schedule, BlockHeight::new(3), Some(tip), Some(qc));
         assert!(state.take_ready_proposal(), "the restore drives the leader");
     }
 
@@ -30394,6 +30507,7 @@ mod tests {
     /// restore opens it.
     #[test]
     fn fence_evidence_waits_for_the_replica_to_open() {
+        let (_, schedule) = make_test_state();
         let tip = BlockHash::from_raw(Hash::from_bytes(b"restored tip"));
         let qc = make_test_qc(tip, BlockHeight::new(3));
         let mut state = ShardCoordinator::new(
@@ -30411,7 +30525,8 @@ mod tests {
         state.precut_generation += 1;
         assert!(!state.take_fence_evidence_advanced());
 
-        let _ = state.on_committed_state_restored(BlockHeight::new(3), Some(tip), Some(qc));
+        let _ =
+            state.on_committed_state_restored(&schedule, BlockHeight::new(3), Some(tip), Some(qc));
         assert!(state.take_fence_evidence_advanced());
     }
 
@@ -30472,12 +30587,13 @@ mod tests {
     /// round and lowers none.
     #[test]
     fn a_committed_state_restore_raises_every_signer() {
-        let (mut state, _) = make_multi_validator_state_at(1);
+        let (mut state, schedule) = make_multi_validator_state_at(1);
         attach_siblings(&mut state, &[2]);
         position_mut_of(&mut state, 2).locked_round = Round::new(6);
         position_mut_of(&mut state, 2).last_voted_round = Round::new(7);
 
         let _ = state.on_committed_state_restored(
+            &schedule,
             BlockHeight::new(4),
             Some(BlockHash::ZERO),
             Some(make_test_qc(BlockHash::ZERO, BlockHeight::new(4))),
