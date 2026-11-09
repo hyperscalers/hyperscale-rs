@@ -2948,10 +2948,21 @@ fn a_rebuilt_store_resumes_across_a_restart_under_its_pending_fork() {
             .is_some_and(|s| s.pending_recoveries.contains_key(&run.shard)),
         "fixture precondition: the fork is still pending",
     );
-    let host = cluster
-        .committee_hosts(run.shard)
-        .into_iter()
-        .find(|host| run.committee.contains(host))
+    // Found by placement, not by the head committee: while the recovery is
+    // pending the head may still name the forked committee, whose members a
+    // rebuilt replica no longer signs for.
+    let host = run
+        .committee
+        .iter()
+        .copied()
+        .find(|host| {
+            let node = u32::try_from(*host).expect("host index fits a node index");
+            cluster
+                .runner()
+                .signers_in(node, run.shard)
+                .iter()
+                .any(|signer| run.fresh.contains(signer))
+        })
         .expect("a host that kept the forked shard rebuilt it for a fresh member");
     let node = u32::try_from(host).expect("host index fits a node index");
     let anchor = RecoveryAnchor {
