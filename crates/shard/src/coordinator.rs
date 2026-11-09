@@ -1186,13 +1186,29 @@ impl ShardCoordinator {
     }
 
     /// `qc` with its clock at least its block's anchor, where that anchor
-    /// resolves. A relayed copy of a genuine QC can carry any clock, and a
-    /// header built over one beneath the anchor is one no voter takes, so
-    /// a QC this replica builds on never sits beneath it.
-    fn floored_qc(&self, qc: Verified<QuorumCertificate>) -> Verified<QuorumCertificate> {
+    /// resolves, and at least the opening of the window its signed
+    /// committee epoch names. A relayed copy of a genuine QC can carry any
+    /// clock: a header built over one beneath the anchor is one no voter
+    /// takes, and one beneath its committee's window anchors this
+    /// replica's next proposal before that committee was seated, as a
+    /// bridging committee's QC re-dated below its bridge would. Honest
+    /// copies sit at or past both, so neither floor moves them.
+    fn floored_qc(
+        &self,
+        topology_schedule: &TopologySchedule,
+        qc: Verified<QuorumCertificate>,
+    ) -> Verified<QuorumCertificate> {
+        if qc.is_genesis() {
+            return qc;
+        }
+        let seated = topology_schedule
+            .windows()
+            .window_of(qc.committee_epoch())
+            .start;
+        let qc = qc.with_clock_at_least(seated);
         match self.block_anchor(qc.block_hash()) {
-            Some(anchor) if !qc.is_genesis() => qc.with_clock_at_least(anchor),
-            _ => qc,
+            Some(anchor) => qc.with_clock_at_least(anchor),
+            None => qc,
         }
     }
 
@@ -1215,7 +1231,7 @@ impl ShardCoordinator {
         if !advances || self.halt_refuses_left_bridge(topology_schedule, &qc) {
             return false;
         }
-        self.latest_qc = Some(self.floored_qc(qc));
+        self.latest_qc = Some(self.floored_qc(topology_schedule, qc));
         true
     }
 
@@ -21843,6 +21859,44 @@ mod tests {
                 state.high_qc_round(),
                 Round::new(3),
                 "stamp {lowered_ms}: a halted QC was adopted over the fresh committee's"
+            );
+        }
+    }
+
+    /// A fresh-committee QC relayed with its clock below the bridge is
+    /// held at the bridge window's opening, so this replica's next
+    /// proposal anchors where the committee that signed it was seated.
+    /// The honest copy, already past the opening, is held as it came.
+    #[test]
+    fn a_fresh_qc_relayed_beneath_the_bridge_is_held_at_the_bridge() {
+        let bridge_opens = WeightedTimestamp::from_millis(3_000);
+        for (stamp_ms, held_ms) in [(0, 3_000), (2_999, 3_000), (3_500, 3_500)] {
+            let (mut state, schedule, keys) = make_multi_validator_state_with_keys(0);
+            let schedule = bridged_halt_schedule(&schedule);
+            assert_eq!(
+                schedule.windows().window_of(Epoch::new(3)).start,
+                bridge_opens,
+            );
+            state.set_time(LocalTimestamp::from_millis(5_000));
+            let fresh = empty_block_at_round(state.committed_hash, 3);
+            install_complete_block(&mut state, &fresh);
+            let relayed = restamped(
+                &quorum_stamped_in(&keys, &fresh, 3_500, Epoch::new(3)),
+                stamp_ms,
+            );
+            let verified = state
+                .verify_qc_sync(&schedule, &relayed)
+                .unwrap_or_else(|| panic!("stamp {stamp_ms}: the relayed copy does not verify"));
+            let _ = state.try_adopt_verified_qc(&schedule, &verified);
+            let held = state
+                .latest_qc
+                .as_ref()
+                .map(|qc| qc.weighted_timestamp())
+                .expect("the fresh QC is held");
+            assert_eq!(
+                held,
+                WeightedTimestamp::from_millis(held_ms),
+                "stamp {stamp_ms}: held at the wrong clock",
             );
         }
     }
