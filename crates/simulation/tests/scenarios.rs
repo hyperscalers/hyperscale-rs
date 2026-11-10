@@ -8,16 +8,17 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::process::{self, Command};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_execution::{MAX_RECORD_ASKS_PER_HOLDER, RECORD_PUSH_GRACE_FLOOR};
+use hyperscale_hbor::from_slice;
 use hyperscale_node::event::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
-    cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
+    build_probe_transfer_tx, cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
     cross_shard_genesis_accounts, genesis_accounts, halt_recovery_config, halt_straddler_setup,
     harvested_tick_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
     merge_convergence_setup, merge_split_bytes, merge_straddler_setup, native_pq_genesis_accounts,
@@ -25,7 +26,8 @@ use hyperscale_scenarios::tx::{
     probe_train_genesis_accounts, remote_delegator, reshape_lifecycle_accounts,
     securify_genesis_accounts, shared_recipient_genesis_accounts, split_issuer_straddler_setup,
     split_straddler_setup, staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts,
-    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    unbound_genesis_accounts, unbound_remote_genesis_accounts, validity_around,
+    withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Budget, Ceiling, Certificates, Cluster, ContendedLoad, CoreLoad, FIRST_VENUE_SHARD,
@@ -182,6 +184,7 @@ use hyperscale_scenarios::{
 };
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode};
 use hyperscale_storage::{BoundaryStore, RecoveryAnchor, RowState, ShardChainReader};
+use hyperscale_types::network::notification::{BlockHeaderNotification, BlockVoteNotification};
 use hyperscale_types::test_utils::{Withheld, shard_fork_proof_signed_by};
 use hyperscale_types::{
     BeaconChainConfig, BlockHash, BlockHeight, Epoch, IDLE_PROPOSAL_INTERVAL, NetworkDefinition,
@@ -620,6 +623,124 @@ fn an_idle_member_down_for_part_of_an_epoch_sim() {
 fn gossip_drop_engages_fetch_fallback_sim() {
     let mut cluster = SimCluster::with_accounts(&liveness_config(), 42, &genesis_accounts(1, 1));
     cluster.run_faultable(gossip_drop_engages_fetch_fallback);
+}
+
+/// `mutex` held, whatever a panicking holder left in it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The probes a voter short of their transactions votes on, one a block.
+const GRACE_PROBES: u32 = 8;
+
+/// A voter that gossip never brings a proposal's transactions fetches them
+/// as its fetch grace runs out, not on the cleanup tick after, and so votes
+/// inside that grace and the fetch's round trip.
+///
+/// One member withholds its votes, so every quorum needs the voter's and
+/// a round waits on it rather than certifying past it. Each probe rides a
+/// block whose transactions the voter lacks, and its vote on that block
+/// must trail the last other vote on it by no more than five delays: two
+/// of fetch grace, a round trip for the fetch, and one to spare. Waiting
+/// on the cleanup tick instead, it trails by up to a whole interval more.
+///
+/// Sim-only: the votes and headers are read off the wire as they are sent.
+#[test]
+fn a_voter_short_of_a_proposals_transactions_votes_at_its_fetch_grace_sim() {
+    let mut cluster = SimCluster::with_accounts(
+        &liveness_config(),
+        42,
+        &probe_train_genesis_accounts(GRACE_PROBES),
+    );
+    let c = &mut cluster;
+    let members: Vec<ValidatorId> = c
+        .beacon_state()
+        .and_then(|state| state.shard_consensus_members.get(&ShardId::ROOT).cloned())
+        .expect("the shard has a consensus committee");
+    let voter = c.host_of(members[1]).expect("the voter runs on a host");
+    let others: Vec<usize> = (0..c.host_count()).filter(|host| *host != voter).collect();
+    let delay = |c: &SimCluster| c.shard_stats(voter, ShardId::ROOT)?.delay_estimate;
+    assert!(
+        c.run_until(epochs(1), |c| delay(c).is_some()),
+        "the chain measures its delay",
+    );
+
+    let sent: Arc<Mutex<Vec<(usize, BlockHash)>>> = Arc::default();
+    let carrying: Arc<Mutex<BTreeSet<BlockHash>>> = Arc::default();
+    for host in 0..c.host_count() {
+        let sent = Arc::clone(&sent);
+        let _ = c.rewrite_notifications(
+            host,
+            "block.vote",
+            Arc::new(move |_: &[u8], honest: &[u8]| {
+                if let Ok(notification) = from_slice::<BlockVoteNotification>(honest) {
+                    lock(&sent).push((host, notification.vote().block_hash()));
+                }
+                honest.to_vec()
+            }),
+        );
+        let carrying = Arc::clone(&carrying);
+        let _ = c.rewrite_notifications(
+            host,
+            "block.header",
+            Arc::new(move |_: &[u8], honest: &[u8]| {
+                if let Ok(notification) = from_slice::<BlockHeaderNotification>(honest) {
+                    let (header, manifest, _) = notification.into_parts();
+                    if !manifest.tx_hashes().is_empty() {
+                        lock(&carrying).insert(header.hash());
+                    }
+                }
+                honest.to_vec()
+            }),
+        );
+    }
+    let _withheld = c.withhold(&members[..1], Withheld::Votes);
+    let dropped = c.drop_type_between(&others, &[voter], "transaction.gossip");
+
+    // When each host first sent its vote on each block, to the poll.
+    let first_votes: Mutex<BTreeMap<(usize, BlockHash), Duration>> = Mutex::default();
+    let stamp = |c: &SimCluster| {
+        let now = c.now();
+        let mut first_votes = lock(&first_votes);
+        for vote in lock(&sent).drain(..) {
+            first_votes.entry(vote).or_insert(now);
+        }
+    };
+    for _ in 0..GRACE_PROBES {
+        c.submit_at_host(others[0], build_probe_transfer_tx(validity_around(c.now())));
+        let until = c.now() + Duration::from_secs(3);
+        c.run_polling(epochs(1), Duration::from_millis(10), |c| {
+            stamp(c);
+            c.now() >= until
+        });
+    }
+
+    let delay = delay(c).expect("the chain measured its delay");
+    let bound = delay * 5;
+    let first_votes = first_votes
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    let carrying = lock(&carrying).clone();
+    assert!(
+        dropped.fired() > 0 && !carrying.is_empty(),
+        "the voter must lack a proposal's transactions, or the guard measures nothing",
+    );
+    for block in carrying {
+        let last_other = others
+            .iter()
+            .filter_map(|host| first_votes.get(&(*host, block)))
+            .max()
+            .expect("the rest of the quorum votes on the block");
+        let late = first_votes
+            .get(&(voter, block))
+            .expect("the voter votes on a block the quorum waits on")
+            .saturating_sub(*last_other);
+        assert!(
+            late <= bound,
+            "the voter voted on {block:?} {late:?} after the last other vote, past five delays of \
+             {delay:?}: its fetch grace ran out on a later tick",
+        );
+    }
 }
 
 #[test]
@@ -1612,6 +1733,17 @@ fn contended_load(pairs: usize, twins_per_second: usize, seconds: u64) {
 #[test]
 fn contended_routes_lose_only_the_later_hash_sim() {
     contended_load(4, 1, 60);
+}
+
+/// Thirty-two pairs for ten seconds: enough twins wounded at once that
+/// seat readings of two cycles fall at one anchor over interleaved keys,
+/// which one block carries whole only offered as one key-ordered list.
+/// Offered claim by claim, the order rule carries one a block and a cell
+/// they share leaves the other short, so its question is asked again
+/// after it was proven, which the load refuses.
+#[test]
+fn contended_routes_prove_each_wound_in_one_round_sim() {
+    contended_load(32, 8, 10);
 }
 
 /// Ignored, as every load this size is: minutes of wall time, run alone.

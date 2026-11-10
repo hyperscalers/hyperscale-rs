@@ -467,6 +467,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("sibling_questions_pending", None, 1);
     }
 
+    fn record_proven_seat_asked_again(&self) {
+        self.inc("proven_seats_asked_again", None, 1);
+    }
+
     fn record_hold_contentions(&self, pairs: usize) {
         self.inc("hold_contentions", None, pairs as u64);
     }

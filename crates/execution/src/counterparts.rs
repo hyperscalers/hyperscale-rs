@@ -20,9 +20,9 @@ use hyperscale_engine::tick_select::SeatQuestion;
 use hyperscale_metrics::{
     record_boundary_cells_asked, record_boundary_claims_carried, record_boundary_drained,
     record_crossing_push_dropped, record_decline_folded, record_fenced_claim,
-    record_rebuilt_record_entry, record_reclaim_folded, record_records_repushed, record_repush_due,
-    record_repush_paused, record_sibling_absence_read, record_sibling_question_pending,
-    set_standing_answers, set_wanted_records,
+    record_proven_seat_asked_again, record_rebuilt_record_entry, record_reclaim_folded,
+    record_records_repushed, record_repush_due, record_repush_paused, record_sibling_absence_read,
+    record_sibling_question_pending, set_standing_answers, set_wanted_records,
 };
 #[cfg(test)]
 use hyperscale_storage::CrossingJournal;
@@ -1804,6 +1804,10 @@ struct SeatProbe {
     returned: bool,
     keys: Vec<SubstateKey>,
     parts: Vec<SeatPart>,
+    /// Whether the readings it closed on proved the question, so they
+    /// were held to offer: one asked again past that is a wound a block
+    /// never carried whole at one anchor.
+    proven: bool,
 }
 
 impl SeatProbe {
@@ -2431,10 +2435,15 @@ impl Counterparts {
             if question.proven_by(self.fetched.claims()) {
                 continue;
             }
-            let keys = self
-                .seats
-                .remove(&question)
-                .map_or_else(|| SeatProbe::keys_of(&question), |probe| probe.keys);
+            let keys = match self.seats.remove(&question) {
+                Some(probe) => {
+                    if probe.proven {
+                        record_proven_seat_asked_again();
+                    }
+                    probe.keys
+                }
+                None => SeatProbe::keys_of(&question),
+            };
             wanted
                 .entry(anchor)
                 .or_default()
@@ -2446,6 +2455,7 @@ impl Counterparts {
                     returned: false,
                     keys,
                     parts: Vec::new(),
+                    proven: false,
                 },
             );
         }
@@ -3814,6 +3824,7 @@ impl Counterparts {
                 MerkleInclusionProof::new(Vec::new()),
             );
             if question.proven_by([&readings]) {
+                probe.proven = true;
                 let victim = question.victim();
                 held.extend(
                     parts
@@ -9604,6 +9615,71 @@ mod tests {
                 "the question is asked again at {round}, with no backoff",
             );
         }
+    }
+
+    /// A seat question asked again on an answer that proved nothing is
+    /// plain contention and goes uncounted. One asked again after its
+    /// readings proved it is counted: they were held to offer and went
+    /// without a block carrying them whole, so its wound takes a second
+    /// proven round.
+    #[test]
+    fn a_proven_seat_question_asked_again_is_counted() {
+        // The holder's verdict leaf stands at every height but the one
+        // the cycle is read at.
+        const CROSSED: u64 = 8;
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            Arc::new(TestRows::default()) as _,
+            ReadFrontier::default(),
+        );
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let question = SeatQuestion {
+            shard: PRODUCER,
+            waiting: tx(2),
+            holder: tx(1),
+            validity_end: WeightedTimestamp::from_millis(u64::MAX / 2),
+        };
+        let keys = question.keys();
+        let (seat, row, verdict) = (keys[0], keys[1], keys[3]);
+        let mut proofs = BTreeMap::new();
+        for height in 1..=15 {
+            let present: &[SubstateKey] = if height == CROSSED {
+                &[seat, row]
+            } else {
+                &[seat, row, verdict]
+            };
+            let (state_root, proof) = state_and_proof(PRODUCER, present, &keys);
+            let anchor = Anchor {
+                shard: PRODUCER,
+                height: BlockHeight::new(height),
+                state_root,
+                ts: WeightedTimestamp::from_millis(height * 1_000),
+            };
+            anchors.record(anchor);
+            proofs.insert(height, (anchor, proof));
+        }
+        let now = |height: u64| WeightedTimestamp::from_millis(height * 1_000);
+        let recorder = MemoryRecorder::new();
+        let asked_again = || recorder.counter("proven_seats_asked_again", None);
+
+        with_recorder(&recorder, || {
+            assert!(!counterparts.ask_seats(&[question], now(6)).is_empty());
+            let (anchor, proof) = &proofs[&4];
+            counterparts.on_proof_fetched(*anchor, &keys, proof, &[]);
+            assert!(counterparts.fetched.is_empty(), "plain contention");
+            assert!(!counterparts.ask_seats(&[question], now(11)).is_empty());
+            assert_eq!(asked_again(), 0, "contention asked again is not counted");
+
+            let (anchor, proof) = &proofs[&CROSSED];
+            counterparts.on_proof_fetched(*anchor, &keys, proof, &[]);
+            assert!(question.proven_by(counterparts.fetched.claims()));
+            counterparts.fetched = HeldClaims::default();
+            assert!(!counterparts.ask_seats(&[question], now(15)).is_empty());
+        });
+        assert_eq!(asked_again(), 1, "a proven question asked again is counted");
     }
 
     /// A seat question answered with the holder's verdict leaf standing

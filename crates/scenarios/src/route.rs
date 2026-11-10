@@ -4590,6 +4590,7 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
     ("block_commit_deferred", &[None]),
     ("hold_contentions", &[None]),
     ("hold_inversions_proven", &[None]),
+    ("proven_seats_asked_again", &[None]),
     ("heads_windowed", &[None]),
     ("transactions_aborted", &[None]),
     ("unresolvable_txs", &[None]),
@@ -5660,7 +5661,8 @@ fn watch_seats(meter: &ProofMeter, flight: &Flight) {
 ///
 /// Panics if a venue misses its budget standing up, if either side of the
 /// pair is not conserved, if a route is still undecided past the drain, if
-/// a head leaves at its window or a route aborts at its deadline, if both
+/// a head leaves at its window, if a replica asks a seat question again
+/// once its readings proved it, if a route aborts at its deadline, if both
 /// routes of a twin abort, if an aborted route is not the later of its
 /// twin or its twin does not accept, if the aborted outnumber the twins
 /// seen inverted, if no twin inverts, or if the p99 survivor resolves half
@@ -5739,10 +5741,12 @@ pub fn contended_routes_through_one_pair_under_load<C: FaultableCluster>(
     read.report(label, &flight, dropped);
     let delta = |name| after.since(&before, name, None);
     let windowed = delta("heads_windowed");
+    let asked_again = delta("proven_seats_asked_again");
     let deadlines = deadline_aborts(c, &flight);
     println!(
         "{label} [wounds and windows, summed over replicas]: hold_inversions_proven {}, \
-         heads_windowed {windowed}; deadline aborts {deadlines}",
+         proven_seats_asked_again {asked_again}, heads_windowed {windowed}; deadline aborts \
+         {deadlines}",
         delta("hold_inversions_proven"),
     );
     if metered {
@@ -5758,6 +5762,11 @@ pub fn contended_routes_through_one_pair_under_load<C: FaultableCluster>(
         flight.routes.len(),
     );
     assert_eq!(windowed, 0, "no head leaves at its naming window");
+    assert_eq!(
+        asked_again, 0,
+        "every wound resolves on its first proven round: no replica asks a seat question again \
+         once its readings proved it",
+    );
     assert_eq!(deadlines, 0, "no route aborts at its deadline");
     read.assert_the_later_hash_lost(&flight);
     read.assert_survivors_resolved_in_time();

@@ -156,6 +156,9 @@ pub struct Metrics {
     /// Siblings' committed cells this validator's own fetch read as
     /// answering nothing; a member still waiting asks at a newer header.
     pub sibling_questions_pending: Counter,
+    /// Seat questions asked again after their last answer proved them;
+    /// any count is a wound that took a second proven round.
+    pub proven_seats_asked_again: Counter,
     /// Dispatched ticks a node could not run for want of a package's
     /// code; any rate is a stalled replica.
     pub batches_unavailable: Counter,
@@ -824,6 +827,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            proven_seats_asked_again: register_counter!(
+                "hyperscale_proven_seats_asked_again_total",
+                "Seat questions asked again after their last answer proved them; any count is a wound that took a second proven round"
+            )
+            .unwrap(),
+
             batches_unavailable: register_counter!(
                 "hyperscale_batches_unavailable_total",
                 "Dispatched ticks this node could not run for want of a package's code; any rate is a stalled replica"
@@ -1421,6 +1430,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_sibling_question_pending(&self) {
         self.metrics.sibling_questions_pending.inc();
+    }
+
+    fn record_proven_seat_asked_again(&self) {
+        self.metrics.proven_seats_asked_again.inc();
     }
 
     fn record_hold_contentions(&self, pairs: usize) {

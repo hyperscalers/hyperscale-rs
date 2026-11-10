@@ -240,6 +240,12 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// A member still waiting puts its question again at a newer header.
     fn record_sibling_question_pending(&self) {}
 
+    /// A seat question asked again after its last answer proved it: the
+    /// readings that proved it were held to offer and went without a
+    /// block carrying them whole at one anchor. Any count is a wound
+    /// that took a second proven round.
+    fn record_proven_seat_asked_again(&self) {}
+
     /// Pending core members a proposed block leaves out behind the holds
     /// of a core member awaiting a shard they await too, one per pair:
     /// summed over blocks, how long such pairs stand.
@@ -935,6 +941,12 @@ pub fn record_decline_folded(records: usize) {
 #[inline]
 pub fn record_sibling_question_pending() {
     recorder().record_sibling_question_pending();
+}
+
+/// Record a seat question asked again after its last answer proved it.
+#[inline]
+pub fn record_proven_seat_asked_again() {
+    recorder().record_proven_seat_asked_again();
 }
 
 /// Record the hold contentions a proposed block leaves standing.
