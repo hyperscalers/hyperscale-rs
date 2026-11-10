@@ -10373,19 +10373,57 @@ mod tests {
     /// Two seat readings held at one anchor read disjoint keys over
     /// interleaved spans, which a block's order rule admits only one of:
     /// they are offered as one key-ordered list, so one block carries
-    /// both whole.
+    /// both whole. A list longer than a claim's cap is cut into runs of
+    /// the cap, each reading split across the cut, and every run is a
+    /// claim in its own right that its union proof bears out.
     #[test]
     fn seat_readings_interleaved_at_one_anchor_are_offered_as_one_list() {
-        let (mut counterparts, _) = hearing();
+        let offered = |keys: &[SubstateKey]| {
+            let (mut counterparts, _) = hearing();
+            let at = producer_at(5, keys);
+            let half = |parity: usize| -> Vec<SubstateKey> {
+                keys.iter().skip(parity).step_by(2).copied().collect()
+            };
+            let first = read_at(at, keys, &half(0));
+            let second = read_at(at, keys, &half(1));
+            counterparts.hold_seat_reading(&first, TxHash::from(Hash::from_bytes(b"first")));
+            counterparts.hold_seat_reading(&second, TxHash::from(Hash::from_bytes(b"second")));
+            let offered = counterparts.state_claims(&CarriedClaims::default());
+            for run in &offered {
+                assert!(run.is_well_formed());
+                assert_eq!(run.verify(), Ok(()), "a run's union proof bears it out");
+            }
+            offered
+        };
+
         let keys: Vec<SubstateKey> = (1..=4).map(producer_record).collect();
-        let at = producer_at(5, &keys);
-        let first = read_at(at, &keys, &[keys[0], keys[2]]);
-        let second = read_at(at, &keys, &[keys[1], keys[3]]);
-        counterparts.hold_seat_reading(&first, TxHash::from(Hash::from_bytes(b"first")));
-        counterparts.hold_seat_reading(&second, TxHash::from(Hash::from_bytes(b"second")));
-        let offered = counterparts.state_claims(&CarriedClaims::default());
-        assert_eq!(offered.len(), 1, "one claim at the anchor");
-        assert_eq!(offered[0].keys(), keys, "reading every cell of both");
+        let few = offered(&keys);
+        assert_eq!(few.len(), 1, "one claim at the anchor");
+        assert_eq!(few[0].keys(), keys, "reading every cell of both");
+
+        let mut keys: Vec<SubstateKey> = (0..MAX_PROOFS_PER_QUERY + 44)
+            .map(|i| {
+                let [hi, lo] = u16::try_from(i).expect("a small list").to_be_bytes();
+                let mut local = [0u8; 16];
+                local[..2].copy_from_slice(&[hi, lo]);
+                SubstateKey {
+                    owner: Address::new([0xAA; 31], AddressClass::Component),
+                    local: LocalKey(local),
+                }
+            })
+            .collect();
+        keys.sort_unstable();
+        let many = offered(&keys);
+        assert_eq!(
+            many.iter().map(|run| run.cells.len()).collect::<Vec<_>>(),
+            vec![MAX_PROOFS_PER_QUERY, 44],
+            "cut at the cap, each reading split across the cut",
+        );
+        assert_eq!(
+            many.iter().flat_map(StateClaim::keys).collect::<Vec<_>>(),
+            keys,
+            "the runs ascend, disjoint, over every cell of both",
+        );
     }
 
     /// The order the other claims are offered in is theirs alone: a
