@@ -17228,6 +17228,64 @@ mod tests {
         );
     }
 
+    /// A header that lands short of a finalization after a quorum of its
+    /// votes has already arrived starts the quorum's batch verification and
+    /// still arms the fetch grace for what it lacks: its content is asked at
+    /// the grace's end, not at the next cleanup tick.
+    #[test]
+    fn a_header_landing_behind_its_quorum_arms_the_fetch_grace() {
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(0);
+        let arrived = LocalTimestamp::from_millis(100_000);
+        state.set_time(arrived);
+        let grace = state.view_change.fetch_timeout();
+        let block = empty_block_at_round(state.committed_hash, state.view().inner());
+        for voter in 1..=3 {
+            assert!(
+                state
+                    .votes
+                    .buffer_unanchored_vote(wire_vote_for(&keys, voter, &block))
+            );
+        }
+        let missing = FinalizationHash::from_raw(Hash::from_bytes(b"a stated half"));
+        let actions = state.on_block_header(
+            &schedule,
+            block.header(),
+            BlockManifest::new(BlockManifestParts {
+                cert_ids: Capped::from_array([missing]),
+                ..Default::default()
+            }),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Consensus(ConsensusAction::VerifyAndBuildQuorumCertificate { .. })
+            )),
+            "the buffered quorum goes to verification: {actions:?}",
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::SetTimer { id: TimerId::FetchGrace, duration } if *duration == grace
+            )),
+            "the missing finalization waits out its grace: {actions:?}",
+        );
+
+        state.set_time(arrived.plus(grace));
+        assert!(
+            state.fetch_overdue().iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Finalizations(ids),
+                    ..
+                }) if *ids == vec![missing]
+            )),
+            "and is asked when the grace runs out",
+        );
+    }
+
     #[test]
     fn a_header_ahead_of_its_parent_keeps_its_buffered_votes() {
         // A block's committee anchors on its parent, so a header can land
