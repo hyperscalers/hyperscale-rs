@@ -529,9 +529,13 @@ pub fn select_abandonment_records(
 /// the next proposal, which passes over what the chain to its parent
 /// carries.
 /// What was kept is then sorted into the section's order and admitted.
-/// What the order rule refuses waits a block, with every claim of its
-/// producer's lineage anchored above it, so the frontier this block
-/// raises never passes a claim it held back.
+/// A claim admission refuses is cut to the cells it admits one by one
+/// ([`admissible_cells`]), and that piece rides in its place. What the
+/// order rule refuses, and a piece admission still refuses, waits a
+/// block, with every claim of its producer's lineage anchored above it,
+/// so the frontier this block raises never passes a reading it held
+/// back. A cell admission refuses on its own holds nothing back: no
+/// block carries it at its anchor.
 ///
 /// A claim anchored more than a horizon before the block
 /// ([`StateClaim::at_boundary`]) is passed over and charged nothing,
@@ -577,22 +581,55 @@ pub fn select_state_claims(
     // refuses it unread.
     let mut refused: Vec<Anchor> = Vec::new();
     kept.into_iter()
-        .filter(|claim| {
+        .filter_map(|claim| {
             let behind = |anchor: &Anchor| {
                 claim.anchor.height > anchor.height
                     && (anchor.shard.is_ancestor_of(claim.anchor.shard)
                         || claim.anchor.shard.is_ancestor_of(anchor.shard))
             };
             if refused.iter().any(behind) {
-                return false;
+                return None;
             }
-            if !fold.in_order(claim) {
+            if !fold.in_order(&claim) {
                 refused.push(claim.anchor);
-                return false;
+                return None;
             }
-            StateClaimsSection::admit(ctx, fold, claim).is_ok()
+            if StateClaimsSection::admit(ctx, fold, &claim).is_ok() {
+                return Some(claim);
+            }
+            let piece = admissible_cells(ctx, &claim)?;
+            if piece != claim
+                && fold.in_order(&piece)
+                && StateClaimsSection::admit(ctx, fold, &piece).is_ok()
+            {
+                return Some(piece);
+            }
+            refused.push(claim.anchor);
+            None
         })
         .collect()
+}
+
+/// `claim` cut to the cells admission takes each on its own, where
+/// admission refuses it whole; `None` where it takes none of them.
+///
+/// One anchor's held claims ride as one merged run, so a cell admission
+/// refuses would otherwise take every reading beside it down with it.
+/// Each refusal a cell can draw is one of its own reading, its value or
+/// the crossing it names, or one of the anchor's, which refuses every
+/// cell alike: so the cut keeps exactly what can ride, and leaves out
+/// only what no block would carry at this anchor.
+fn admissible_cells(ctx: &Committed<'_>, claim: &StateClaim) -> Option<StateClaim> {
+    let admitted: Vec<SubstateKey> = claim
+        .keys()
+        .into_iter()
+        .filter(|key| {
+            claim.restrict(|cell| cell == *key).is_some_and(|cell| {
+                StateClaimsSection::admit(ctx, &mut StateClaimsFold::default(), &cell).is_ok()
+            })
+        })
+        .collect();
+    claim.restrict(|key| admitted.binary_search(&key).is_ok())
 }
 
 /// What a block reads at its own parent beside the claims it carries of
@@ -4968,6 +5005,93 @@ mod tests {
             (0, 0),
         );
         assert_eq!(selected, vec![first, elsewhere]);
+    }
+
+    /// A merged run admission refuses for one of its cells, an owed
+    /// record whose consumer routes elsewhere, still carries every other
+    /// reading at the anchor: the run is cut to the cells admission takes
+    /// one by one, and the refused cell holds back no newer anchor of its
+    /// producer, since no block carries it.
+    #[test]
+    fn a_run_refused_for_one_cell_carries_the_rest() {
+        use hyperscale_hbor::Bytes;
+        use hyperscale_types::Stated;
+        use hyperscale_types::test_utils::{proven_claim, state_and_proof_holding, test_key};
+        use hyperscale_vm_effects::{Hash32, IntentHash, ProtocolHasher, Terms};
+        use hyperscale_vm_types::ResourceAddr;
+
+        let producer = ShardId::leaf(1, 0);
+        let id = CrossingId {
+            producer: Address::new([0x21; 31], AddressClass::Component),
+            consumer: Address::new([0x20; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x21; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record = id.record_key(&ProtocolHasher);
+        let value = id
+            .cell(
+                TxHash::from(Hash::from_bytes(b"issuer")),
+                ResourceAddr::new([0xE1; 31]),
+                40,
+                60_000,
+                Terms::Owed,
+            )
+            .to_bytes();
+        let beside: Vec<SubstateKey> = [0x11, 0x12, 0x13].into_iter().map(test_key).collect();
+        let mut asked = beside.clone();
+        asked.push(record);
+        asked.sort_unstable();
+        let held: Vec<(SubstateKey, Vec<u8>)> = std::iter::once((record, value.clone()))
+            .chain(beside.iter().map(|key| (*key, key.to_bytes().to_vec())))
+            .collect();
+        let (state_root, proof) = state_and_proof_holding(producer, &held, &asked);
+        let anchor = Anchor {
+            shard: producer,
+            height: BlockHeight::new(3),
+            state_root,
+            ts: ts(3_000),
+        };
+        let readings = proof
+            .inclusions(state_root, producer, &asked)
+            .expect("the fixture proof answers for its keys");
+        let run = StateClaim::new(
+            anchor,
+            readings.into_iter().map(|(key, inclusion)| {
+                if key == record {
+                    (key, Stated::Held(Bytes::new(value.clone()).unwrap()))
+                } else {
+                    (key, Stated::Inclusion(inclusion))
+                }
+            }),
+            proof,
+        )
+        .naming([(record, id)]);
+        let newer = proven_claim(producer, 4, &[], &[test_key(0x14)]);
+        let ctx = beside_a_producer();
+        assert!(
+            StateClaimsSection::admit(&ctx.ctx(), &mut StateClaimsFold::default(), &run)
+                .expect_err("the owed record refuses the run whole")
+                .contains("owed record whose consumer this shard does not hold"),
+        );
+
+        let mut fold = StateClaimsFold::default();
+        let selected = select_state_claims(&ctx.ctx(), &mut fold, vec![run, newer.clone()], (0, 0));
+        assert_eq!(
+            selected.len(),
+            2,
+            "the rest of the run, and the newer anchor"
+        );
+        assert_eq!(selected[0].anchor, anchor);
+        assert_eq!(selected[0].keys(), beside, "every cell but the owed record");
+        assert!(selected[0].crossings.is_empty());
+        assert_eq!(selected[0].verify(), Ok(()));
+        assert_eq!(selected[1], newer);
+        assert_eq!(
+            admit_all::<StateClaimsSection>(&ctx.ctx(), &mut StateClaimsFold::default(), &selected),
+            Ok(()),
+            "a voter takes what the proposer carries",
+        );
     }
 
     /// A proposer reads, at its parent, the member row of every
